@@ -54,6 +54,11 @@ Plans, roadmaps, to-do lists, and development notes live in
   keyed instances, storage handles, fencing.
 - [Volumes](volumes.md): persistent storage for stateful tasks. Covers plugins,
   the driver contract, node pinning, and reclaim.
+- [Suspend and Resume](suspend-and-resume.md): suspending a keyed instance to
+  free its reservation and resuming it where it left off, automatic suspend
+  when idle or under memory pressure, identity refresh after a restore, disk
+  and memory snapshots, restoring an instance in place, expiry, and the
+  `snapshot` ACL resource.
 - [Rollouts](rollouts.md): update strategies, health gating, manual/auto
   progression.
 - [Rollout Strategy Plugins](rollout-strategy-plugins.md)
@@ -66,6 +71,16 @@ Plans, roadmaps, to-do lists, and development notes live in
   the scheduler displaces lower-band work, and how to preview or prevent it.
 - [Edge Boot](edge-boot.md): starting work before the placement is durable.
   Covers gate levels, boot tickets, ratification, and the kill path.
+
+## Guides
+
+- [Running Postgres](guides/postgres.md): a single-writer database on a
+  stateful slot, and what happens when its node dies.
+- [Running Redis](guides/redis.md): the same machinery when durability is
+  optional.
+- [Running Agent Sandboxes](guides/agent-sandboxes.md): thousands of microVM
+  sandboxes that suspend when idle and resume in place. Covers worker setup,
+  oversubscription, the platform lifecycle, capacity, and failure modes.
 
 ## Platform Services
 

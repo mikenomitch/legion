@@ -66,6 +66,9 @@ architecture and behavior docs are public.
   in the same session.
 - [development.md](development.md) — running locally, Linux worker containers,
   gRPC poking, CI lint baseline.
+- [suspend-resume-linux-verification.md](suspend-resume-linux-verification.md)
+  — Linux-only checks (KVM, cgroup v2, `/proc`) for each phase of the
+  suspend/resume/oversubscription plan, with commands and pass criteria.
 - [rustyriver-migration.md](rustyriver-migration.md) — porting streaming
   persistence from the Litestream binary to the embeddable rustyriver crate.
 - [ui-api-explorer.md](ui-api-explorer.md) — library evaluation behind the in-app
@@ -86,7 +89,7 @@ When one is required and what goes in it:
 | --- | --- |
 | [adaptive-scheduler-concurrency-plan.md](plans/adaptive-scheduler-concurrency-plan.md) | planned (Phase 0 is a gate; sequenced behind late-binding Phase 4 striping) |
 | [artifact-system-plan.md](plans/artifact-system-plan.md) | shipped |
-| [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | planned |
+| [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | in execution (Phase 1 partly shipped as the node content store, Phase 3 partly as suspend plan Phase 7a) |
 | [autoscaler-plan.md](plans/autoscaler-plan.md) | planned |
 | [auth-acl-plan.md](plans/auth-acl-plan.md) | phases 1–4 executed |
 | [container-runtime-exec-and-signals-plan.md](plans/container-runtime-exec-and-signals-plan.md) | shipped (all seven phases, 2026-07-31) |
@@ -141,7 +144,7 @@ When one is required and what goes in it:
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
 | [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
 | [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | superseded in part by suspend-resume-and-oversubscription (§0 convergence shipped; mechanics still the reference) |
-| [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | planned |
+| [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | in execution (Phases 1-7 shipped, Phase 8 deferred, KVM checks pending) |
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
 | [data-dir-env-plan.md](plans/data-dir-env-plan.md) | shipped (`LEGION_DATA_DIR`; no config-file field, by design) |
 

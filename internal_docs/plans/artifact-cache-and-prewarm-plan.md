@@ -2,6 +2,23 @@
 
 > **Judgement calls:** [`calls/artifact-cache-and-prewarm-plan_calls.md`](../calls/artifact-cache-and-prewarm-plan_calls.md)
 
+Status: **IN EXECUTION.** Phase 1 shipped in part as the node content store
+(suspend plan Phase 3a): digest-pinned single-file artifacts only, per-class
+budgets, copies instead of hardlinks. The deviations are recorded in
+[suspend plan calls 31, 59, 92, 93, 101](../calls/suspend-resume-and-oversubscription-plan_calls.md),
+and what is left of Phase 1 is in `internal_docs/TODO.md` under Artifacts. Phase 3 shipped in
+part as suspend plan Phase 7a: advertisement is heartbeat deltas into an
+off-raft location index (not `ReportArtifactCache` and a dynamic attribute),
+and the score term is `schedulerSettings.weights.locality`, default 1.0 (not
+`artifact_locality: 0.3`). See
+[suspend plan calls 32, 78, 80, 89, 90, 91, 105, 106](../calls/suspend-resume-and-oversubscription-plan_calls.md#32-weightslocality-defaults-to-10-the-day-phase-7a-ships).
+Suspend plan Phase 7b finished Phase 3's warming half for snapshots:
+`legion snapshot warm` (the `WarmSnapshot` RPC) fetches a published
+snapshot's parts onto matching nodes, as an in-memory queue on the heartbeat
+rather than an `artifact_warm` eval and table (suspend plan call 82). Phase 3
+is checked off in TODO.md. The Nodes-page cache card, and warming artifacts
+(Phase 2), are still open.
+
 ## Problem Statement
 
 The artifact system ([artifact-system-plan.md](artifact-system-plan.md))

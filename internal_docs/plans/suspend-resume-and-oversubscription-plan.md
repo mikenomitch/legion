@@ -2,7 +2,7 @@
 
 > **Judgement calls:** [`calls/suspend-resume-and-oversubscription-plan_calls.md`](../calls/suspend-resume-and-oversubscription-plan_calls.md)
 
-Status: **PLANNED** (written 2026-10-09). Nothing below is implemented.
+Status: **IN EXECUTION** (written 2026-10-09, execution started 2026-10-10). Phases 1-7 shipped (3a content store, 3b runtime checkpoints, 3c snapshots API and restore, 4 suspend and resume, 5 automatic suspend, 6 fork, create from a snapshot, and named snapshots, 7a content publishing, the location index, and the `locality` score, 7b `durability = "store"`, cross-node resume, and `snapshot warm`). The integration of Phases 5, 6, and 7b finished their seams: `--spread` forks across nodes from a published checkpoint, published snapshots as named seeds, a bounded publish retry, and placement that binds each restore to its planned instance on a worker that can fetch. Phase 8 (fast paths: wake on connect, the `hint` idle signal, lazy memory restore, diff snapshots) is deferred. The Linux and KVM checks for Phases 1-7 are pending ([verification plan](../suspend-resume-linux-verification.md)).
 
 **Relationship to existing plans.** This plan supersedes the *phasing and
 scope* of
@@ -38,7 +38,7 @@ primitives** that each stand on their own and also serve ordinary services:
 | --- | --- | --- | --- |
 | 1 | **Usage and enforcement** for every runtime | Real memory/CPU per allocation, governed sandboxes | §6.2 |
 | 2 | **Burstable reservations** (`memoryMax`) and **node oversubscription** | Pack more on a node, Nomad-style | §6.3 |
-| 3 | **Pressure ladder** on the worker | Overcommit that degrades predictably instead of OOM-roulette | §6.4 |
+| 3 | **Memory pressure response** on the worker (named steps, previewable order) | Overcommit that degrades predictably instead of OOM-roulette | §6.4 |
 | 4 | **Checkpoints** (memory or disk) as a runtime capability | Snapshot and roll back a workspace | §6.5 |
 | 5 | **Suspended instances** that hold no resources | Park a sandbox, resume it later | §6.6 |
 | 6 | **Idle policy** | Automatic suspend when nothing is happening | §6.7 |
@@ -58,7 +58,7 @@ And the agent use case is a jobspec, with no agent-specific subsystem (§6.11):
     name = "workspace",
     runtime = "sandbox",
     stateful = { mode = "keyed", storage = { path = "/workspace", mode = "block" } },
-    resources = { cpus = 1, memory = 512, memoryMax = 4096 },
+    resources = { cpu = 1000, memory = 512, memoryMax = 4096 },
     suspend = {
         checkpoint = "memory",
         idle = { after = "3m" },
@@ -67,7 +67,7 @@ And the agent use case is a jobspec, with no agent-specific subsystem (§6.11):
 }
 ```
 
-On a worker with `oversubscription = { memory = 2.0 }`, that fleet packs at
+On a worker with `resourceEnforcement.oversubscribe = { memory = 2.0 }`, that fleet packs at
 512 MiB per *running* sandbox against a doubled memory budget, bursts to
 4 GiB when there is room, suspends to disk after three quiet minutes or
 sooner when the node is under pressure, and resumes where it left off.
@@ -318,7 +318,7 @@ intact.
 
 **S2. A bursty API under oversubscription.** An app developer sets
 `memory = 400, memoryMax = 2048` on a service. The operator has set
-`oversubscription = { memory = 1.5 }` on the `general` pool. The scheduler
+`oversubscribe = { memory = 1.5 }` on the `general` pool. The scheduler
 packs on 400 MiB. A traffic spike pushes three replicas on one node past
 their reservations at once. The node crosses its pressure threshold, the
 worker evicts a `low`-band batch job that is over its own reservation, and
@@ -546,7 +546,7 @@ room. Unset means today's behavior exactly: the reservation is the limit.
 
 ```nickel
 resources = {
-    cpus = 0.5,
+    cpu = 500,          # MHz
     memory = 400,       # reserved: what the scheduler packs on
     memoryMax = 2048,   # ceiling: hard limit, enforced where the runtime can
 },
@@ -571,18 +571,19 @@ pages the guest frees, so an idle-but-running guest's real footprint shrinks
 toward its working set.
 
 **Node oversubscription.** A worker may declare that its schedulable
-capacity is a multiple of its physical capacity:
+capacity is a multiple of its physical capacity. The ratio lives *inside*
+`resourceEnforcement`, because oversubscription without cgroups to act on is
+a bet on the kernel OOM killer. Nesting it makes that misconfiguration
+impossible to write rather than a warning to ignore.
 
 ```nickel
 # configs/workers/default.ncl
-oversubscription = {
+resourceEnforcement = {
+    enabled = true,
     # Schedulable memory = (physical − reservedResources.memory) × 1.5.
-    # Default 1.0 (off). Only takes effect with resourceEnforcement on,
-    # because the pressure ladder needs cgroups to act.
-    memory = 1.5,
-    # CPU MHz multiplier. CPU is weight-shared, so this only changes how
-    # much the scheduler is willing to place, never throttles anything.
-    cpu = 1.0,
+    # CPU is weight-shared, so `cpu` only changes how much the scheduler
+    # is willing to place and never throttles anything. Default 1.0 (off).
+    oversubscribe = { memory = 1.5, cpu = 1.0 },
 },
 ```
 
@@ -600,53 +601,99 @@ memory, and the ladder may have to act on tasks within their reservation.
 That is why the ratio is per node, off by default, and documented as "use
 it where the workloads are idle-heavy or suspendable."
 
-### 6.4 Primitive 3: the pressure ladder
+### 6.4 Primitive 3: memory pressure response
 
-A worker with enforcement on watches node memory pressure: the root
-`memory.pressure` `some avg10` and `MemAvailable`. When either crosses its
-threshold, it runs the ladder **locally**, without waiting for the manager,
-then reports what it did. Each rung runs only until pressure clears.
+> **Revised at execution time** (see calls doc). The first draft exposed
+> numbered "rungs", PSI field names (`psiSomeAvg10`), and a top-level
+> `pressure` block that silently did nothing without enforcement. Users had
+> to learn the kernel's vocabulary and a five-row table to answer one
+> question: *what happens to my task when the node runs short?* The shape
+> below answers that question directly.
+
+**What a job author needs to know, in three sentences.** A task using no
+more than its `memory` reservation is left alone (on nodes with no
+oversubscription, always). A task *bursting* above its reservation gives
+memory back first and is the first thing stopped if that isn't enough. A
+task that sets `suspend.onPressure = true` is suspended with its state
+intact instead of stopped.
+
+**Operators set nothing to get it.** The response is on whenever
+`resourceEnforcement.enabled` is, with defaults that scale with the node.
+The block exists for tuning:
 
 ```nickel
-pressure = {
-    # Trigger when PSI memory some avg10 exceeds this percentage...
-    psiSomeAvg10 = 10,
-    # ...or available memory falls below this watermark.
-    minAvailable = "1GiB",
-    # How long a rung waits for pressure to clear before the next one.
-    settle = "5s",
+resourceEnforcement = {
+    enabled = true,
+    oversubscribe = { memory = 1.5 },
+    memoryPressure = {
+        # Act when free memory (MemAvailable) drops below this.
+        # Default: 5% of node memory, at least 256MiB, at most 4GiB.
+        freeBelow = "2GiB",
+        # ...or when tasks spend more than this share of time stalled
+        # waiting on memory (kernel PSI "some", 10s average). Default 10%.
+        stallAbove = "10%",
+        # After each step, wait this long for pressure to clear before
+        # taking the next one. Default 5s.
+        settle = "5s",
+        # The steps this node may take, always in this order. Remove one
+        # to forbid it. "evict-reserved" only ever runs when
+        # oversubscribe.memory > 1. Default: all four.
+        steps = ["reclaim", "suspend", "evict-bursting", "evict-reserved"],
+        # Set false to keep enforcement but turn the response off.
+        enabled = true,
+    },
 },
 ```
 
-| Rung | Action | Who it can touch | Reversible |
+**The steps.** Named, not numbered, so an event or stop reason reads on its
+own. Each step runs only until pressure clears. The kernel OOM killer stays
+the backstop after the last step.
+
+| Step | What it does | Who it can touch | Reversible |
 | --- | --- | --- | --- |
-| 1. Reclaim | `memory.reclaim` on cgroups above reservation, and inflate balloons on sandboxes above reservation | Allocations using more than `memory` | Yes, transparent |
-| 2. Suspend | Checkpoint and suspend idle allocations whose job sets `suspend.onPressure = true` | Opted-in instances, most idle first | Yes, resumes later |
-| 3. Evict | Stop allocations above their reservation, lowest band first, then most over | Over-reservation allocations | Rescheduled, `cause = node_pressure` |
-| 4. Evict within reservation | Only when the ratio is above 1.0: stop lowest band, newest first | Anyone below `critical` | Rescheduled |
-| 5. Kernel OOM | The backstop, unchanged | Whatever the kernel picks | No |
+| `reclaim` | `memory.reclaim` on cgroups above their reservation, inflate balloons on sandboxes above theirs | Bursting allocations | Yes, transparent |
+| `suspend` | Checkpoint and suspend idle instances whose task sets `suspend.onPressure = true` | Opted-in instances, most idle first | Yes, resumes later |
+| `evict-bursting` | Stop allocations above their reservation | Bursting allocations | Rescheduled, `cause = node_pressure` |
+| `evict-reserved` | Stop allocations within their reservation. Only when `oversubscribe.memory > 1` | Anyone below `critical` | Rescheduled, `cause = node_pressure` |
 
-Within a rung, candidates sort by band ascending (the preemption order from
-`preemption.rs`), then by amount freed descending. Node-pinned storage is
-never evicted by rungs 3–4, matching preemption's rule. It can still be
-suspended at rung 2, which is the point: suspend keeps the storage where it
-is.
+Within a step, candidates sort by band ascending (the preemption order from
+`preemption.rs`), then by bytes freed descending (`suspend` uses idle time
+descending). Node-pinned storage is never evicted, matching preemption's
+rule. It can still be suspended, which is the point: suspend keeps the
+storage where it is.
 
-Every action is reported in the heartbeat (`pressure_actions`) and becomes an
-event and a `StopCause`:
+**See the order before it matters.** The ordering is a pure function of
+usage, bands, and job config, so the worker computes it continuously and
+reports it with usage. `legion node usage` prints it, which turns "what
+will happen" from a docs lookup into a command:
+
+```console
+$ legion node usage w-03
+RESOURCE   CAPACITY      RESERVED          USED            PRESSURE
+memory     96 GiB ×1.5   131 GiB (91%)     61 GiB (64%)    ok (free 35 GiB, stall 0.4%)
+
+UNDER PRESSURE, IN ORDER
+#  ALLOCATION        BAND     RES/USED MiB   STEP
+1  a-91c2 workspace  normal   512/1830       reclaim, then suspend
+2  a-31f0 batch      low      400/1900       reclaim, then evict-bursting
+3  a-77e0 api        high     2048/1900      evict-reserved
+```
+
+Every action is reported in the heartbeat (`pressure_actions`) and becomes
+a `node.pressure` event and a `StopCause`:
 
 ```console
 $ legion alloc status a-31f0
 Status:  stopped (node_pressure)
-Detail:  evicted at rung 3 on w-03: using 1.9 GiB of a 400 MiB reservation
-         while node memory pressure was 34% (threshold 10%)
+Detail:  evicted by evict-bursting on w-03: using 1.9 GiB of a 400 MiB
+         reservation while free memory was 1.1 GiB (threshold 2 GiB)
 Hint:    raise resources.memory toward real usage, or move this job to a
          pool without oversubscription
 ```
 
 That message answers the app developer's job: "my own limit or the
-machine?" An OOM at `memoryMax` keeps today's annotation
-(`oom_kill` from `memory.events`), so the two are distinguishable.
+machine?" An OOM at `memoryMax` keeps today's annotation (`oom_kill` from
+`memory.events`), so the two are distinguishable.
 
 ### 6.5 Primitive 4: checkpoints
 
@@ -832,7 +879,7 @@ suspend = {
         signals = ["network", "cpu", "exec"],
         cpuBelow = 0.02,
     },
-    onPressure = true,              # rung 2 of the ladder may suspend this
+    onPressure = true,              # the `suspend` pressure step may suspend this
     reserve = false,
     onRestoreFailure = "cold",      # "cold" | "fail"
     durability = "local",           # "local" | "store" (Phase 7)
@@ -1032,7 +1079,7 @@ also how Fly and E2B are driven.
             image = "ghcr.io/acme/agent-base:2026-10",
             command = ["/usr/local/bin/harness"],
         },
-        resources = { cpus = 1, memory = 512, memoryMax = 4096 },
+        resources = { cpu = 1000, memory = 512, memoryMax = 4096 },
         suspend = {
             checkpoint = "memory",
             idle = { after = "3m" },
@@ -1090,11 +1137,11 @@ used by a non-agent workload somewhere in §3.
 - Events: `instance.suspended`, `instance.suspend_failed`,
   `instance.resumed`, `instance.restore_failed`, `instance.forked`,
   `snapshot.created`, `snapshot.published`, `snapshot.deleted`,
-  `node.pressure` (rung, freed bytes). There are no `instance.*` events
+  `node.pressure` (step, freed bytes). There are no `instance.*` events
   today, so this plan adds the topic.
 - `allocation.removed` gains `cause = node_pressure` and
   `cause = suspended`.
-- Metrics: per-node reserved/used/capacity memory, ladder actions by rung,
+- Metrics: per-node reserved/used/capacity memory, pressure actions by step,
   suspend/resume latency histograms, checkpoint bytes, content store bytes
   by class, locality hit ratio at placement.
 - `instance get` shows the last suspend and restore with durations, the
@@ -1155,8 +1202,8 @@ used by a non-agent workload somewhere in §3.
 - Sandbox `config.memory_mib` becomes derived. An explicit value that
   disagrees with `memoryMax`/`memory` is a submit error.
 
-**Worker config:** `oversubscription { memory, cpu }`,
-`pressure { psiSomeAvg10, minAvailable, settle }`,
+**Worker config:** `resourceEnforcement.oversubscribe { memory, cpu }`,
+`resourceEnforcement.memoryPressure { enabled, freeBelow, stallAbove, settle, steps }`,
 `contentStore { url, auth }`, `content { budgets { artifacts, snapshots } }`,
 `sandbox.vmmOverheadMiB`.
 
@@ -1208,8 +1255,9 @@ sandboxes stop being ungoverned.
 
 **Phase 2: burst and oversubscribe.** `resources.memoryMax` with
 `memory.low`/`memory.max` enforcement, sandbox guest size derived from
-`resources`, worker `oversubscription` ratios, the pressure ladder rungs 1,
-3, 4, 5 (no suspend yet), `cause = node_pressure`. Scheduler benchmarks.
+`resources`, worker `oversubscribe` ratios, the pressure steps `reclaim`,
+`evict-bursting`, `evict-reserved` (no `suspend` yet), the pressure-order
+preview in `node usage`, `cause = node_pressure`. Scheduler benchmarks.
 *Value:* Nomad-parity overcommit with a better failure mode, for every
 workload.
 
@@ -1230,8 +1278,8 @@ disk-mode suspend for `exec` and `container`, `instance.*` events.
 density win.
 
 **Phase 5: automatic suspend.** The `idle` policy (worker detection, manager
-sweep), ladder rung 2 (`onPressure`), balloon or free page reporting on
-sandboxes for rung 1. *Value:* density without the platform writing its own
+sweep), the `suspend` pressure step (`onPressure`), balloon or free page
+reporting on sandboxes for `reclaim`. *Value:* density without the platform writing its own
 idle timer.
 
 **Phase 6: fork.** `ForkInstance`, `CreateInstance(from_snapshot, count)`,
@@ -1246,6 +1294,18 @@ plan's Phase 3 with the §6.8 amendments. Scheduler benchmarks. *Value:* S4,
 suspended instances that survive node loss, and locality for every artifact
 and image.
 
+Phase 7 splits in two. **7a** is everything that needs no snapshots, and
+shipped: `ContentPublisher` (`s3`, `file`) and the worker `contentStore`
+block, the location index with epoch deltas on the heartbeat, and the
+`locality` score term at weight 1.0 in both scoring paths, with a
+`Scheduler::restore_content` hook for manifest parts. **7b** is
+`durability = "store"`, `snapshot warm`, and cross-node resume and fork,
+which need Phases 3c and 4, and shipped too. Fork's cross-node placement is
+the generic rule for any instance with `restore_from`, so it applies once
+Phase 6 lands. A published checkpoint needs instance data that can move:
+node-local volumes are refused, not migrated (calls entry 6). Image layers join the content set once the
+content store holds OCI blobs. Calls 32, 78, 80, 89, 90, 91, 105, 106 record the 7a decisions.
+
 Phases 6 and 7 depend only on Phase 3 and 4, not on each other, and can run
 in parallel.
 
@@ -1258,6 +1318,10 @@ are reach.
 ---
 
 ## 9. Testing plan
+
+Everything that needs real Linux (KVM, cgroup v2, `/proc`) and could not run
+on the macOS dev machine is tracked, with commands and pass criteria, in
+[`../suspend-resume-linux-verification.md`](../suspend-resume-linux-verification.md).
 
 **Phase 1**
 - Unit: cgroup readers against fixture `memory.stat`/`cpu.stat`/`memory.pressure`.
@@ -1272,14 +1336,44 @@ are reach.
   fingerprint invalidates on ratio change, `memoryMax < memory` rejected,
   sandbox `memory_mib` disagreement rejected.
 - Ladder unit tests with a fake pressure source: candidate order by band
-  then bytes, node-pinned storage never evicted, rung 4 never runs at
-  ratio 1.0.
+  then bytes, node-pinned storage never evicted, `evict-reserved` never
+  runs at ratio 1.0, a step removed from `steps` never runs.
 - Integration: two `exec` tasks bursting past reservation on a node with a
   small watermark. The lower band is evicted with `cause = node_pressure`,
   the higher survives.
 - Benchmarks: `scheduler_speed` and `candidate_construction` before/after.
 
-**Phase 3**
+*Phase 2 results (2026-10-10, base 1a65654 vs. the Phase 2 commit, Apple
+Silicon dev machine).* Criterion medians in ms, `--sample-size 10`, the
+`allocs_100000` rows skipped (one sample took over a minute). **The machine
+was shared with other agents building and benchmarking (load average 4 to
+60), so these are noise-dominated and not PR-grade.** The two runs moved in
+opposite directions on the same code path (bin_pack geomean 0.63x, spread
+geomean 1.32x), which is load drift, not the change. The change adds one map
+lookup per `ResourcePool::from_node` and one string compare per resource key
+in `ResourceRequest::from_value`, and nothing per candidate. Rerun on a quiet
+host before the PR.
+
+| Benchmark | Before | After |
+| --- | --- | --- |
+| `candidate_construction/indexes_off/nodes_1000` | 2.183 | 1.570 |
+| `candidate_construction/indexes_on/nodes_1000` | 3.455 | 1.401 |
+| `candidate_construction/indexes_off/nodes_5000` | 9.571 | 5.718 |
+| `candidate_construction/indexes_on/nodes_5000` | 6.373 | 3.679 |
+| `candidate_construction/indexes_off/nodes_10000` | 15.260 | 13.306 |
+| `candidate_construction/indexes_on/nodes_10000` | 19.947 | 14.459 |
+| `scheduler_speed/bin_pack/nodes_1000_allocs_1000` | 162.850 | 84.335 |
+| `scheduler_speed/bin_pack/nodes_10000_allocs_1000` | 134.290 | 105.290 |
+| `scheduler_speed/bin_pack/nodes_10000_allocs_10000` | 7808.6 | 16498.0 |
+| `scheduler_speed/spread/nodes_1000_allocs_1000` | 98.935 | 100.910 |
+| `scheduler_speed/spread/nodes_10000_allocs_1000` | 285.090 | 317.470 |
+| `scheduler_speed/spread/nodes_10000_allocs_10000` | 14050.0 | 11186.0 |
+
+**Phase 3** (Linux steps: [Linux verification plan,
+Phase 3a](../suspend-resume-linux-verification.md#phase-3a) for the content
+store, [Phase 3b](../suspend-resume-linux-verification.md#phase-3b) for the
+runtime slice, [Phase 3c](../suspend-resume-linux-verification.md#phase-3c)
+for the snapshot API and restore)
 - Volume harness extends with `snapshot` and double-call idempotency for
   `local-dir` in both modes (no KVM).
 - Round trip (exec, no KVM): write marker → disk snapshot → mutate →
@@ -1291,7 +1385,8 @@ are reach.
 - Content store: LRU never evicts a pinned snapshot, and per-class budgets
   are honored.
 
-**Phase 4**
+**Phase 4** (KVM steps: [Linux verification plan,
+Phase 4](../suspend-resume-linux-verification.md#phase-4))
 - State machine: suspend/start/stop/destroy interleavings, double suspend
   with one idempotency key, suspend of a `stopped` instance rejected.
 - Failure: checkpoint failure leaves the allocation running, restore failure
@@ -1301,17 +1396,79 @@ are reach.
 - Identity: a restored guest's token names the new allocation id.
 - `acl_endpoints` covers every new RPC.
 
-**Phase 5**
+Phase 4 shipped with these as `tests/suspend_integration.rs` (the manager
+side, against a simulated worker), `an_exec_disk_suspend_cold_boots_on_its_retained_volume`
+and `a_suspend_that_cannot_capture_leaves_the_task_running` in the worker (a
+real `exec` task), `a_restored_guest_gets_a_token_naming_the_new_allocation`
+(the token chain), and `guest_resume` unit tests against a fake guest. The
+KVM latency target and the in-guest refresh are in the verification plan.
+Two deviations: allocation ids became monotonic (calls entry 23), and the
+memory suspend keeps the guest paused through the content-store ingest
+(calls entry 26).
+
+*Phase 4 scheduler results (2026-10-10, base f3ea60c, the 3c and 7a merge,
+vs. the Phase 4 commit, Apple Silicon dev machine, `--sample-size 10`,
+medians in ms).* The scheduler changes are the restore lookup moving ahead of
+the locality term (so `restore_content` can read it) and the keyed desired
+count counting held reservations. The bench jobs are stateless, so neither
+path runs here beyond one empty slice per task. **The host was loaded (load
+average 16 to 28) and the control rows moved as much as anything:
+`candidate_construction` never reaches either change and slowed 7 to 75%.
+Treat these as a smoke test and rerun on a quiet host before the PR.**
+
+| Benchmark | Before | After |
+| --- | --- | --- |
+| `scheduler_speed/bin_pack/nodes_1000_allocs_1000` | 68.05 | 83.92 |
+| `scheduler_speed/spread/nodes_1000_allocs_1000` | 74.03 | 94.55 |
+| `candidate_construction/indexes_off/nodes_1000` (control) | 1.005 | 1.637 |
+| `candidate_construction/indexes_on/nodes_1000` (control) | 1.048 | 1.789 |
+| `candidate_construction/indexes_off/nodes_5000` (control) | 4.085 | 7.177 |
+| `candidate_construction/indexes_on/nodes_5000` (control) | 2.727 | 2.906 |
+| `locality/content_absent/nodes_1000` | 1.065 | 1.107 |
+| `locality/content_present/nodes_1000` | 1.181 | 1.254 |
+| `locality/content_absent/nodes_5000` | 2.289 | 2.472 |
+| `locality/content_present/nodes_5000` | 2.966 | 3.083 |
+
+**Phase 5** (Linux steps: [Linux verification plan,
+Phase 5](../suspend-resume-linux-verification.md#phase-5))
 - Idle detector unit tests per signal, including "quiet open connection"
   with and without `connections`.
 - Integration: an idle sandbox suspends after `after`, a busy one never
   does, and a pressured node suspends opted-in idle instances before
   evicting anything.
 
+Phase 5 shipped with these as `src/worker/idle.rs` (one test per signal, the
+quiet-connection pair, the `cpuBelow` scaling, the idle-since tracker),
+`idle_since_follows_the_policys_signals` in the usage sampler,
+`an_idle_instance_suspends_after_its_window_and_a_busy_one_never_does` and
+the local-suspension tests in `tests/suspend_integration.rs` (manager side,
+fake usage and simulated reports),
+`opted_in_instances_are_suspended_most_idle_first_before_evict_bursting` in
+`src/worker/pressure.rs` (a fake node), a pressure suspend of a real `exec`
+task in the worker, and the balloon against fake Firecracker and
+cloud-hypervisor API servers. The idle "sandbox" is an `exec` task with fake
+usage: a real idle suspend needs cgroups, so it is in the verification plan.
+Phase 5 made no scheduler change, so it has no benchmark numbers. Open
+question 3 is answered by calls entry 25, and §7's
+`local_suspensions` / `suspend_allocations` heartbeat fields were not needed
+(calls entry 14).
+
 **Phase 6**
 - Fork divergence: three forks have distinct instance ids, hostnames, MACs,
   `/dev/urandom` reads, UUIDs, and volumes, and the origin keeps running.
 - Idempotent fork: the same key twice yields one set of forks.
+
+Phase 6 shipped with the manager half end to end against a simulated worker
+(`tests/fork_integration.rs`: three forks wait for the checkpoint and run as
+distinct instances with their own allocations and volumes, idempotent retry,
+never-recycled ids, a failed capture, the refusals, named snapshots, and
+`onRestoreFailure`), a real `exec` disk fork with three `local-dir` clones
+(`an_exec_disk_fork_gives_every_fork_its_own_copy_of_the_volume`), and the
+divergent identities, MACs, and TAPs against fakes. The `/dev/urandom` check
+is `sandbox_fork_divergence_*`, ignored without KVM, and listed with the
+rest in the [Linux verification plan](../suspend-resume-linux-verification.md#phase-6).
+The plan's UUID check folds into the RNG one: a guest's UUIDs come from its
+RNG.
 
 **Phase 7**
 - Location index: deltas, epochs, full resync after manager failover, and
@@ -1321,6 +1478,58 @@ are reach.
 - Published resume: suspend on node A with `durability = "store"`, kill A,
   resume on B.
 - Benchmarks before/after with content sets present and absent.
+
+Phase 7a shipped with the location index, publisher, and score tests above
+(`src/storage/content_index.rs`, `src/worker/content_report.rs`,
+`src/content_publish.rs`, `tests/content_locality.rs`, and
+`placement_prefers_the_node_holding_the_content` in the scheduler). The
+published-resume test is 7b. The `scheduler_bench` `locality` group measures
+content present and absent. One `plan_only` of 100 placements (4 tasks x 25), bin_pack, half the fleet
+holding one digest and a quarter the other, medians:
+
+| Cell | 1,000 nodes | 5,000 nodes |
+|---|---|---|
+| `content_absent` (run 1 / run 2) | 1.03 / 1.18 ms | 2.28 / 3.05 ms |
+| `content_present` (run 1 / run 2) | 1.17 / 2.04 ms | 3.30 / 2.93 ms |
+
+Run 1 copied the score map into the scoring cache per task. Run 2 shares
+it through an `Arc`. The run-to-run spread is larger than the difference
+between cells, so the only defensible reading is that the term costs at
+most a few hundred microseconds per 100-placement plan at 5,000 nodes and
+nothing when the content set is empty (the `content_absent` cells skip the
+lookup entirely).
+**A quiet-host before/after run is still pending**: these numbers came from
+a shared machine under load from another session, so treat them as a smoke
+test, not the PR's evidence.
+
+Phase 7b shipped the published-resume test as
+`tests/published_resume_integration.rs` (suspend on A with `durability =
+"store"`, publish, remove A or mark it lost, resume on B; locality prefers
+the node holding the parts; `compat` filters every candidate; warm), the
+worker transport for real with the `file` publisher
+(`a_published_snapshot_restores_on_a_node_that_never_held_it`,
+`warm_fetches_published_parts_into_the_store_once` in
+`src/worker/task_manager.rs`), and `tests/restore_placement_indexed.rs` for
+the truncation fix (calls entry 74). It added a `restore` group to
+`scheduler_bench`: 25 keyed instances restoring from their own `local`
+snapshots (`local_pinned`) or `published` ones (`published_floating`, compat
+on every candidate, parts seeded on a quarter of the fleet). One run
+(2026-10-10, Apple Silicon, load average 10 to 22 from other sessions,
+criterion medians):
+
+| Cell | 1,000 nodes | 5,000 nodes |
+|---|---|---|
+| `locality/content_absent` | 1.24 ms | 2.34 ms |
+| `locality/content_present` | 1.25 ms | 3.75 ms |
+| `restore/local_pinned` | 1.08 ms | 7.07 ms |
+| `restore/published_floating` | 4.58 ms | 26.9 ms |
+
+There is no "before" for `restore`: on the base commit the `local_pinned`
+cell fails at 1,000 nodes, because the armed index truncated the pinned node
+out of the candidate list (the bug calls entry 74 fixes). A floating restore
+scores and compat-checks the whole fleet for each placement, about 1 ms per
+placement at 5,000 nodes. Restores are rare, so this is acceptable, but the
+coordinator's clean pass should rerun both groups.
 
 ---
 
@@ -1407,11 +1616,13 @@ to tune it on. Phase 1 starts collecting that history.
    vsock. For `exec` and `container`, a unix socket in the alloc dir.
    *Lean:* one tiny line protocol (`busy`, `idle`, `idle-until <deadline>`)
    for both, specified with Phase 8.
-3. **Balloon versus free page reporting** for rung 1 on sandboxes. Free page
+3. **Balloon versus free page reporting** for the `reclaim` step on sandboxes. Free page
    reporting is automatic but needs guest kernel support. Balloon inflation
    is explicit but needs a target. *Lean:* free page reporting by default
    where the guest kernel has it, balloon as the explicit pressure lever.
-   Verify against the VMM versions we pin before Phase 5.
+   Verify against the VMM versions we pin before Phase 5. *Answered in
+   Phase 5:* both, with free page reporting on cloud-hypervisor only until
+   the pinned Firecracker is confirmed to accept it (calls entry 25).
 4. **Encrypting published snapshot parts** with the KV keyring's data keys.
    *Lean:* yes, as a follow-up plan, because the keyring rotation and
    rewrap story would need to cover multi-GiB blobs.
@@ -1430,7 +1641,7 @@ to tune it on. Phase 1 starts collecting that history.
   within 10% of `memory.current` for exec, container, and sandbox tasks. A
   sandbox's VMM is in its allocation cgroup. Usage never appears in the
   state store.
-- **Phase 2:** a node with `oversubscription.memory = 1.5` admits 1.5× its
+- **Phase 2:** a node with `oversubscribe.memory = 1.5` admits 1.5× its
   memory in reservations. A burst past the watermark evicts the lower-band,
   over-reservation allocation with `cause = node_pressure` and a hint, and
   never a within-reservation allocation at ratio 1.0. Benchmarks are in the
@@ -1446,7 +1657,7 @@ to tune it on. Phase 1 starts collecting that history.
   its retained volume.
 - **Phase 5:** an idle sandbox suspends within `after` + 30s, a busy one
   never does, and a pressured node suspends opted-in idle instances before
-  rung 3 evicts anything.
+  `evict-bursting` stops anything.
 - **Phase 6:** `instance fork --count 3` returns three ids in one envelope,
   the origin keeps running, and the forks differ in id, MAC, hostname, and
   RNG output. Retrying with the same key creates nothing new.

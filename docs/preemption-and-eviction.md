@@ -348,12 +348,22 @@ be preempted. The placement error says so.
 - **`low` evals can starve behind sustained higher-band load.** The queue is
   strict priority with no aging. At typical queue depths this doesn't happen
   today, but it is not fixed.
-- **No oversubscription and no node-pressure eviction.** Legion resources are
-  reservations with no request/limit split, so the platform never creates
-  resource pressure that needs relieving.
-- **No suspend- or checkpoint-based preemption.** Victims are stopped with
-  grace and requeued. Suspending keeps the victim's memory tied up, and
-  checkpoint-based schemes have a poor track record.
+- **Node-pressure eviction is a separate mechanism.** Preemption makes room
+  for a placement, decided by the scheduler. When a node runs short of memory
+  because tasks burst past their reservation (`resources.memoryMax`), or
+  because its worker type oversubscribes memory, the node's own memory
+  pressure response acts instead. It uses the same order (lowest band first)
+  and the same rule that node-pinned storage is never evicted, and its
+  evictions stop with `cause = node_pressure`. Before it evicts anything it
+  suspends the instances whose task sets `suspend.onPressure = true`, which
+  keeps their state (see
+  [suspend and resume](suspend-and-resume.md#under-memory-pressure)). See
+  [Memory pressure](resource-enforcement.md#memory-pressure) and
+  [Oversubscription](resource-enforcement.md#oversubscription).
+- **No suspend- or checkpoint-based preemption.** Preemption victims are
+  stopped with grace and requeued, even when their task sets
+  `suspend.onPressure`: that opt-in covers node memory pressure only, where
+  the alternative is an eviction, not a placement decision.
 - **No descheduler-style rebalancing.** Evicting work just to improve packing
   carries different risks. The eviction code is built so a future rebalancer
   can reuse it, and `disruption.minAvailable` is already defined as the budget

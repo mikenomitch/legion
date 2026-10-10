@@ -120,7 +120,8 @@ an unratified workload can do to the outside world.
     onRefused = "kill",      # 'kill' (default) | 'stop' (graceful, then remove)
   },
 
-  config = { image = "alpine:latest", vcpus = 2, memory_mib = 1024 },
+  config = { image = "alpine:latest", vcpus = 2 },
+  resources = { memory = 1024 },
 }
 ```
 

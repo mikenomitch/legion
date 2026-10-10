@@ -313,6 +313,25 @@ is a single manager, and it is always primary.
    without tokens. Job specs still validate, so you can declare identities
    before the cluster enables the feature.
 
+### Suspended and restored instances
+
+A [suspended](suspend-and-resume.md) sandbox resumes, and a snapshot restores,
+as a **new allocation with a new id**: allocation ids are never reused. The
+worker issues that allocation's tokens before the restore exactly as it does
+before any start, so their `legion.io/alloc` claim names the new allocation.
+It writes them to the guest's identity disk, and the guest's resume handler
+publishes them under `/legion/identity/<ENV>` and in `/legion/resume.env`
+before `suspend.onResume` runs (see [Identity after a
+resume](suspend-and-resume.md#identity-after-a-resume)). Processes already
+running in the guest keep the env they started with, so re-read the file or
+restart them from `onResume`.
+
+Tokens can't be revoked. A memory checkpoint holds whatever token the guest
+had in memory at capture, and that token stays valid until it expires: up
+to one TTL (`ttl`, 15 minutes by default) after the capture. Short TTLs are
+the mitigation. Keep them short on tasks you suspend or snapshot, and treat
+`snapshot:write` on a job as access to its in-memory secrets.
+
 ### What each change mode does on refresh
 
 - `noop`: the file is atomically rewritten, and nothing else happens. Cloud
