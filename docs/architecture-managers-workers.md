@@ -147,6 +147,11 @@ how to measure), see
 - Worker reports current allocations in heartbeat.
 - Manager returns desired allocations for that node.
 - Worker reconciles by stopping undesired tasks and starting missing ones.
+- An empty desired set is authoritative. It means "run nothing here," so the
+  worker stops everything it has, including the last allocation on a node that
+  was drained or had its work stopped or preempted. A failed heartbeat is never
+  read this way: the worker reconciles only against a reply the manager
+  actually sent.
 
 ## Node Loss and Recovery Behavior
 

@@ -1048,129 +1048,132 @@ async fn heartbeat_tick(
         }
 
         let mut launched_this_tick: Vec<i64> = Vec::new();
-        if !reply.desired_allocations.is_empty() {
-            // Deliver identity tokens for not-yet-running allocations BEFORE
-            // reconcile starts them: env tokens must be present at exec time.
-            let mut desired = reply.desired_allocations;
-            let mut prepared_by_alloc: HashMap<i64, Vec<PreparedIdentity>> = HashMap::new();
-            let running_set: std::collections::HashSet<i64> = running.iter().copied().collect();
-            let mut failed_prepare = Vec::new();
-            for allocation in desired
-                .iter_mut()
-                .filter(|allocation| !running_set.contains(&allocation.allocation_id))
-            {
-                let delivery_base = task_manager
-                    .lock()
-                    .expect("task manager")
-                    .file_delivery_base(
-                        allocation.allocation_id,
-                        &allocation.task_name,
-                        &allocation.task_runtime,
-                    )
-                    .map(|(in_task_root, host_task_dir)| {
-                        crate::worker::identity::FileDeliveryBase {
-                            in_task_root,
-                            host_task_dir,
-                        }
-                    });
-                match identity_manager
-                    .prepare_task_allocation(allocation, delivery_base)
-                    .await
-                {
-                    Ok(prepared) => {
-                        prepared_by_alloc.insert(allocation.allocation_id, prepared);
-                    }
-                    Err(err) => {
-                        // The task must not start without its identities;
-                        // report the failure so the manager can reschedule.
-                        failed_prepare.push(allocation.allocation_id);
-                        task_manager.lock().expect("task manager").record_failure(
-                            allocation.allocation_id,
-                            format!("Failed to deliver workload identities: {err}"),
-                        );
-                    }
-                }
-            }
-            desired.retain(|allocation| !failed_prepare.contains(&allocation.allocation_id));
-
-            // Why the manager is stopping things, delivered before the
-            // reconcile that acts on it: `reconcile_allocations` consumes
-            // these as it stops each undesired allocation, so a notice that
-            // landed after the reconcile would describe a stop that already
-            // happened.
-            let stop_causes = reply
-                .stop_notices
-                .iter()
-                .map(|notice| {
-                    (
-                        notice.allocation_id,
-                        crate::structs::StopCause::from_wire(&notice.cause),
-                    )
-                })
-                .collect();
-            // Preemptor links ride the same feed; only preemption notices
-            // carry one, so this map is empty on every other cause.
-            let stop_preemptors = reply
-                .stop_notices
-                .iter()
-                .filter(|notice| !notice.preemptor_job.is_empty())
-                .map(|notice| {
-                    (
-                        notice.allocation_id,
-                        crate::structs::StopNoticePreemptor {
-                            job: notice.preemptor_job.clone(),
-                            band: notice.preemptor_band.clone(),
-                        },
-                    )
-                })
-                .collect();
-
-            // Gated namespaces exist before anything starts (and the
-            // datapath listeners inside them are bound by apply_upstreams,
-            // which ran above on this same reply).
-            {
-                // The guard is never held across the await: take the set
-                // out, reconcile, put it back.
-                let mut gated = std::mem::take(
-                    &mut *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()),
+        // Reconcile on EVERY acknowledged reply, an empty desired set included:
+        // empty is the manager saying "this node should run nothing" (the last
+        // allocation was stopped, drained, or preempted). Failures never reach
+        // here, since a failed heartbeat returned above, so an empty list is
+        // always authoritative and never a partial read.
+        //
+        // Deliver identity tokens for not-yet-running allocations BEFORE
+        // reconcile starts them: env tokens must be present at exec time.
+        let mut desired = reply.desired_allocations;
+        let mut prepared_by_alloc: HashMap<i64, Vec<PreparedIdentity>> = HashMap::new();
+        let running_set: std::collections::HashSet<i64> = running.iter().copied().collect();
+        let mut failed_prepare = Vec::new();
+        for allocation in desired
+            .iter_mut()
+            .filter(|allocation| !running_set.contains(&allocation.allocation_id))
+        {
+            let delivery_base = task_manager
+                .lock()
+                .expect("task manager")
+                .file_delivery_base(
+                    allocation.allocation_id,
+                    &allocation.task_name,
+                    &allocation.task_runtime,
+                )
+                .map(
+                    |(in_task_root, host_task_dir)| crate::worker::identity::FileDeliveryBase {
+                        in_task_root,
+                        host_task_dir,
+                    },
                 );
-                apply_net_capture(&desired, &mut gated).await;
-                *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()) = gated;
-            }
-            let new_allocations = {
-                let mut manager = task_manager.lock().expect("task manager");
-                manager.set_stop_causes(stop_causes);
-                manager.set_stop_preemptors(stop_preemptors);
-                manager.reconcile_allocations(&desired)
-            };
-            if !new_allocations.is_empty() {
-                // Refresh loops are keyed by allocation id and start slightly
-                // before the task process registers (the launch below is
-                // dispatched but not awaited); record the ids as live-this-tick
-                // so retain() doesn't abort the loops before registration. If a
-                // launch actually fails, the allocation is absent from the next
-                // tick's snapshot and that tick's retain prunes its loops.
-                launched_this_tick.extend(new_allocations.iter().map(|a| a.allocation_id));
-                for allocation in &new_allocations {
-                    if let Some(prepared) = prepared_by_alloc.remove(&allocation.allocation_id) {
-                        identity_manager.spawn_refreshers(
-                            allocation.allocation_id,
-                            prepared,
-                            task_manager.clone(),
-                        );
-                    }
+            match identity_manager
+                .prepare_task_allocation(allocation, delivery_base)
+                .await
+            {
+                Ok(prepared) => {
+                    prepared_by_alloc.insert(allocation.allocation_id, prepared);
                 }
-                // Launch off the heartbeat task: artifact-less tasks spawn
-                // processes synchronously, artifact tasks kick off staging
-                // threads; neither should stall the heartbeat loop.
-                let task_manager = task_manager.clone();
-                tokio::task::spawn_blocking(move || {
-                    for allocation in &new_allocations {
-                        // Failures are recorded inside (heartbeat failure path).
-                        let _ = launch_task_allocation(&task_manager, allocation);
-                    }
-                });
+                Err(err) => {
+                    // The task must not start without its identities;
+                    // report the failure so the manager can reschedule.
+                    failed_prepare.push(allocation.allocation_id);
+                    task_manager.lock().expect("task manager").record_failure(
+                        allocation.allocation_id,
+                        format!("Failed to deliver workload identities: {err}"),
+                    );
+                }
             }
+        }
+        desired.retain(|allocation| !failed_prepare.contains(&allocation.allocation_id));
+
+        // Why the manager is stopping things, delivered before the
+        // reconcile that acts on it: `reconcile_allocations` consumes
+        // these as it stops each undesired allocation, so a notice that
+        // landed after the reconcile would describe a stop that already
+        // happened.
+        let stop_causes = reply
+            .stop_notices
+            .iter()
+            .map(|notice| {
+                (
+                    notice.allocation_id,
+                    crate::structs::StopCause::from_wire(&notice.cause),
+                )
+            })
+            .collect();
+        // Preemptor links ride the same feed; only preemption notices
+        // carry one, so this map is empty on every other cause.
+        let stop_preemptors = reply
+            .stop_notices
+            .iter()
+            .filter(|notice| !notice.preemptor_job.is_empty())
+            .map(|notice| {
+                (
+                    notice.allocation_id,
+                    crate::structs::StopNoticePreemptor {
+                        job: notice.preemptor_job.clone(),
+                        band: notice.preemptor_band.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        // Gated namespaces exist before anything starts (and the
+        // datapath listeners inside them are bound by apply_upstreams,
+        // which ran above on this same reply).
+        {
+            // The guard is never held across the await: take the set
+            // out, reconcile, put it back.
+            let mut gated =
+                std::mem::take(&mut *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()));
+            apply_net_capture(&desired, &mut gated).await;
+            *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()) = gated;
+        }
+        let new_allocations = {
+            let mut manager = task_manager.lock().expect("task manager");
+            manager.set_stop_causes(stop_causes);
+            manager.set_stop_preemptors(stop_preemptors);
+            manager.reconcile_allocations(&desired)
+        };
+        if !new_allocations.is_empty() {
+            // Refresh loops are keyed by allocation id and start slightly
+            // before the task process registers (the launch below is
+            // dispatched but not awaited); record the ids as live-this-tick
+            // so retain() doesn't abort the loops before registration. If a
+            // launch actually fails, the allocation is absent from the next
+            // tick's snapshot and that tick's retain prunes its loops.
+            launched_this_tick.extend(new_allocations.iter().map(|a| a.allocation_id));
+            for allocation in &new_allocations {
+                if let Some(prepared) = prepared_by_alloc.remove(&allocation.allocation_id) {
+                    identity_manager.spawn_refreshers(
+                        allocation.allocation_id,
+                        prepared,
+                        task_manager.clone(),
+                    );
+                }
+            }
+            // Launch off the heartbeat task: artifact-less tasks spawn
+            // processes synchronously, artifact tasks kick off staging
+            // threads; neither should stall the heartbeat loop.
+            let task_manager = task_manager.clone();
+            tokio::task::spawn_blocking(move || {
+                for allocation in &new_allocations {
+                    // Failures are recorded inside (heartbeat failure path).
+                    let _ = launch_task_allocation(&task_manager, allocation);
+                }
+            });
         }
 
         // Refresh loops must never outlive their allocation — but treat
@@ -2340,6 +2343,112 @@ mod tests {
         );
 
         heartbeats.abort();
+        Ok(())
+    }
+
+    /// Serve a real manager on an ephemeral loopback port, with one active
+    /// node and no allocations, so every heartbeat reply carries an empty
+    /// desired set.
+    async fn serve_empty_manager(
+        dir: &TempDir,
+        node_id: &str,
+    ) -> R<(ManagerClient<Channel>, tokio::task::JoinHandle<()>)> {
+        let store = crate::storage::store::Store::start_storage(
+            &crate::structs::config::ManagerConfigFull {
+                store_path: dir.path().join("store").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        )?;
+        store.insert_node(crate::structs::NodeMsg {
+            id: node_id.into(),
+            pool: "default".into(),
+            status: "active".into(),
+            availability: "available".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: "{}".into(),
+            health_checks: "{}".into(),
+            last_heartbeat: "2026-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
+        })?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+        let service = crate::structs::manager_server::ManagerServer::new(
+            crate::manager::server::ManagerDaemonService::new(store),
+        );
+        let server = tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let _ = tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        let client = ManagerClient::new(Channel::from_shared(addr)?.connect_lazy());
+        Ok((client, server))
+    }
+
+    /// Regression (audit W1): the daemon skipped the reconcile whenever the
+    /// desired set was empty, so stopping a node's LAST allocation left it
+    /// running forever. Drives the real heartbeat path against a real
+    /// manager that wants nothing on this node.
+    #[tokio::test]
+    async fn an_empty_desired_set_stops_the_last_allocation() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let node_id = "w1-node";
+        let (client, server) = serve_empty_manager(&temp_dir, node_id).await?;
+        let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
+            WorkerStateStore::new(temp_dir.path().join("worker_state.json")),
+        )));
+        {
+            let mut manager = task_manager.lock().expect("task manager");
+            manager.load_builtin_plugins();
+            let allocation = crate::structs::Allocation {
+                id: 41,
+                status: "running".into(),
+                resources: json!({}),
+                node_id: node_id.into(),
+                job_config_id: "job-1".into(),
+                task_config_id: 1,
+                job_id: "web".into(),
+                instance_id: None,
+                network: None,
+            };
+            let task = crate::structs::TaskConfig {
+                config: json!({"command": ["sleep", "30"]}),
+                ..crate::structs::TaskConfig::new("server", "exec")
+            };
+            manager.run_allocation(&allocation, &task)?;
+        }
+        let credentials = Arc::new(WorkerCredentials::default());
+        let identity_manager = Arc::new(WorkerIdentityManager::new(Arc::new(ManagerTokenIssuer {
+            client: client.clone(),
+            node_id: node_id.into(),
+            credentials: credentials.clone(),
+        })));
+
+        heartbeat_tick(
+            node_id,
+            &client,
+            &task_manager,
+            &identity_manager,
+            &credentials,
+            &Arc::new(UpstreamForwarder::new()),
+            None,
+        )
+        .await?;
+
+        let mut manager = task_manager.lock().expect("task manager");
+        assert!(
+            !manager.has_allocation(41),
+            "an empty desired set must stop the node's last allocation"
+        );
+        // Finish the stop so no `sleep` outlives the test.
+        while manager.has_terminating() || manager.has_draining() {
+            manager.reap_draining();
+            manager.reap_terminating();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server.abort();
         Ok(())
     }
 
