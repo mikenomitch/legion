@@ -127,8 +127,11 @@ a job without the right to redeploy it. See [auth-and-acls.md](auth-and-acls.md)
   candidates.
 - **Keyed or `count.per` task**: `invalid_argument` with the reason.
 - **No capacity for the new count**: the `job_scale` eval places what fits,
-  and the normal reschedule/retry logic handles the rest. The override stays,
-  and later `node_join` evals bring the job up to the count.
+  and the override stays. The rest is placed when capacity appears: a worker
+  registering or a node being uncordoned queues a capacity pass that
+  reschedules jobs short of their count
+  ([jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#node-added)).
+  Capacity freed by other jobs stopping does not trigger it.
 - **Manager is not the scheduler-lane leader**: the standard retryable
   `failed_precondition` envelope with the leader hint.
 

@@ -25,6 +25,12 @@ service Manager {
   // Registers or upserts a worker node in manager state.
   //
   // A worker should call this after pre-registration and after local fingerprinting.
+  //
+  // A registration is new capacity, so it also queues a capacity pass (a
+  // `node_join` evaluation with no node) that re-evaluates jobs short of
+  // their count and jobs with `count.per` tasks. While one pass is pending,
+  // further registrations queue nothing. Failing to queue the pass does not
+  // fail the registration.
   rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
 
   // Submits or updates a job from a fully rendered jobspec.
@@ -532,7 +538,8 @@ service Manager {
   //   force-moved by a drain (use ReplaceInstance for an operator override).
   // - Uncordon: `availability = "available"`. The node re-enters the
   //   scheduling pool; existing allocations elsewhere are not moved back
-  //   automatically.
+  //   automatically. Like a worker registration, it queues a capacity pass
+  //   that re-evaluates jobs short of their count.
   //
   // The call is level-triggered and idempotent: setting the value a node
   // already has is a no-op besides the emitted event, and eviction works by

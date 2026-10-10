@@ -57,7 +57,12 @@ impl Eval {
         let node_id = self.node_name.trim();
 
         if node_id.is_empty() {
-            bail!("Eval node_join missing node name");
+            // The capacity pass a worker registration or an uncordon queues
+            // (`Store::request_capacity_reconcile`). The node is already
+            // registered and live; only the jobs waiting on capacity need
+            // another look.
+            store.reschedule_allocations_for_new_node()?;
+            return Ok("Re-evaluated jobs waiting on capacity".to_string());
         }
 
         let node_id = node_id.to_owned();

@@ -6021,6 +6021,12 @@ impl Manager for ManagerDaemonService {
         self.store
             .insert_node(node_msg)
             .map_err(|e| map_store_error("Error registering worker", e))?;
+        // New capacity: let jobs that are short of their count (or have a
+        // `count.per` task) try again. Not fatal to the registration; the
+        // next leader's regeneration pass reschedules every active job.
+        if let Err(err) = self.store.request_capacity_reconcile() {
+            warn!(node_id = %node_id, error = %err, "Failed to queue the capacity pass after registration");
+        }
 
         let node_token = if self.auth.enabled {
             let secret = self.auth.mint_node_token(&self.store, &node_id)?;
@@ -6264,6 +6270,14 @@ impl Manager for ManagerDaemonService {
             self.store
                 .enqueue_eval("node_drain", None, None, Some(&node_id), None)
                 .map_err(|e| map_store_error("Error enqueueing drain eval", e))?;
+        }
+        if availability == "available" {
+            // An uncordoned node is new capacity, like a registration. The
+            // uncordon itself already committed, so a failed enqueue is
+            // logged rather than reported as a failed request.
+            if let Err(err) = self.store.request_capacity_reconcile() {
+                warn!(%node_id, error = %err, "Failed to queue the capacity pass after uncordon");
+            }
         }
 
         let message = if availability == "available" {

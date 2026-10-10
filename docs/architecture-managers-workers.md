@@ -176,8 +176,12 @@ Two code paths exist:
     be marked lost in a single tick, none of them are, and the manager logs at
     `error`. Losing half the fleet at once almost always points at a
     control-plane problem rather than at the workers.
+- Capacity pass: a worker registration or an uncordon queues one `node_join`
+  eval with no node. It re-evaluates jobs short of their count and jobs with
+  `count.per` tasks (see
+  [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#node-added)).
 - Eval path (used in tests/manual eval insertion):
-  - `node_drop` / `node_join` eval kinds call equivalent store reconciliation logic.
+  - `node_drop` / `node_join` eval kinds with a node call equivalent store reconciliation logic.
 
 ## What Is Not Implemented Yet
 

@@ -6933,15 +6933,6 @@ impl Store {
         Ok(nodes)
     }
 
-    pub fn job_config_ids_with_count_per(&self) -> R<Vec<String>> {
-        let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT job_config_id FROM task_config WHERE count_per IS NOT NULL AND count_per != '';",
-        )?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
-        Self::collect_rows(rows)
-    }
-
     /// Mark a node's liveness ready. Composite across the lane boundary of
     /// the node/node_health split (plan §7-C2, C-2): the STATUS lane upserts
     /// the `node_health` liveness row, then the CONTROL lane flips the
@@ -14243,6 +14234,143 @@ impl Store {
         }
     }
 
+    /// The config an active job with no live rollout should converge to,
+    /// or `None` to leave it alone.
+    ///
+    /// Normally that is the latest config. A rollout to the latest config
+    /// that failed or was cancelled settles the job elsewhere (SC1):
+    ///
+    /// - the latest config has no allocations (rolled back, or failed
+    ///   before placing anything): the rollout's source config, which is
+    ///   what runs. No source (a first deploy) leaves nothing to converge;
+    /// - only the latest config has allocations (failed after replacing
+    ///   everything): the latest config;
+    /// - both have allocations (stopped part way without a revert): `None`.
+    ///   The mix is the operator's call, and no single-config reschedule
+    ///   can converge it without picking a side.
+    pub(crate) fn settled_convergence_config(
+        &self,
+        job_id: &str,
+        latest_config: &str,
+    ) -> R<Option<String>> {
+        let aborted = self
+            .latest_rollout_for_job_config(latest_config)?
+            .filter(|rollout| matches!(rollout.status.as_str(), "failed" | "cancelled"));
+        let Some(rollout) = aborted else {
+            return Ok(Some(latest_config.to_owned()));
+        };
+        let conn = self.read_connection()?;
+        let (latest_running, others_running): (bool, bool) = conn.query_row(
+            "SELECT
+                 EXISTS (SELECT 1 FROM allocation WHERE job_config_id = ?2),
+                 EXISTS (
+                     SELECT 1 FROM allocation a
+                     INNER JOIN job_config jc ON jc.id = a.job_config_id
+                     WHERE jc.job_id = ?1 AND a.job_config_id != ?2
+                 );",
+            params![job_id, latest_config],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(match (latest_running, others_running) {
+            (false, _) => rollout.from_job_config_id,
+            (true, false) => Some(latest_config.to_owned()),
+            (true, true) => None,
+        })
+    }
+
+    /// Job configs that new capacity could help: for every active job with
+    /// no live rollout and nothing queued, its convergence config
+    /// ([`Self::settled_convergence_config`]) when that config has a
+    /// `count.per` task (one more node may want one more replica) or a
+    /// service task with fewer allocations than its effective count.
+    ///
+    /// The count check is deliberately loose: keyed and staged-slot tasks
+    /// can read short when they are not, and that only costs a no-op
+    /// reschedule plan. Batch tasks are skipped: one that ran to
+    /// completion must not run again, and its allocation count cannot tell
+    /// finished from never placed. Jobs with a queued
+    /// eval are skipped too, which is what keeps a burst of registrations
+    /// from piling up reschedules: whatever is queued runs against the new
+    /// capacity anyway.
+    pub(crate) fn job_configs_waiting_on_capacity(&self) -> R<Vec<String>> {
+        const WANTS_CAPACITY: &str = "EXISTS (
+            SELECT 1 FROM task_config tc
+            LEFT JOIN task_scale ts
+              ON ts.job_id = tc.job_id AND ts.task_group = tc.group_name
+             AND ts.task_name = tc.name AND ts.base_count = tc.count
+            WHERE tc.job_config_id = ?1
+              AND (
+                (tc.count_per IS NOT NULL AND tc.count_per != '')
+                OR (
+                  tc.lifecycle != 'batch'
+                  AND (SELECT COUNT(*) FROM allocation a WHERE a.task_config_id = tc.id)
+                      < COALESCE(ts.count, tc.count)
+                )
+              )
+        )";
+        let candidates: Vec<(String, String)> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT j.id, latest.id
+                 FROM job j
+                 INNER JOIN job_config latest ON latest.id = {LATEST_CONFIG_FOR_JOB}
+                 WHERE j.status NOT IN ('stopped', 'failed')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM eval e
+                     WHERE e.status IN ('pending', 'in_flight') AND e.job_id = j.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM rollout r
+                     WHERE r.job_id = j.id
+                       AND r.status NOT IN ('completed', 'failed', 'cancelled', 'completed_incomplete')
+                   );"
+            ))?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Self::collect_rows(rows)?
+        };
+        let mut waiting = Vec::new();
+        for (job_id, latest_config) in candidates {
+            let Some(target) = self.settled_convergence_config(&job_id, &latest_config)? else {
+                continue;
+            };
+            let conn = self.read_connection()?;
+            let wants: bool =
+                conn.query_row(&format!("SELECT {WANTS_CAPACITY};"), [&target], |row| {
+                    row.get(0)
+                })?;
+            if wants {
+                waiting.push(target);
+            }
+        }
+        Ok(waiting)
+    }
+
+    /// Queue the capacity pass ([`Self::reschedule_allocations_for_new_node`])
+    /// after a node registers or is uncordoned, as a `node_join` eval with no
+    /// node: the pass is cluster-wide, so one queued pass covers any number
+    /// of joins. Skipped while one is already pending (a burst of
+    /// registrations queues one pass, not one per node), and the claim
+    /// sweep collapses any duplicate that races past this check.
+    pub fn request_capacity_reconcile(&self) -> R<()> {
+        let pending: bool = {
+            let conn = self.read_connection()?;
+            conn.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM eval
+                     WHERE type = 'node_join' AND status = 'pending'
+                       AND COALESCE(node_id, '') = '' AND COALESCE(job_id, '') = ''
+                 );",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        if pending {
+            return Ok(());
+        }
+        self.enqueue_eval("node_join", None, None, None, None)?;
+        Ok(())
+    }
+
     /// Free a lost node's allocations for replacement — gated for stateful
     /// tasks (the at-most-one fencing guarantee, see
     /// docs/stateful-workloads.md "Node loss and fencing"):
@@ -14418,13 +14546,22 @@ impl Store {
             .collect())
     }
 
+    /// Re-evaluate the jobs that new capacity can help: the `node_join`
+    /// eval's pass, run when a worker registers or a node is uncordoned.
+    ///
+    /// A plan that finds no capacity fails its eval terminally, so without
+    /// this pass a job left short of its count stayed short as nodes
+    /// joined, and a `count.per` task never reached a new node. The set is
+    /// [`Self::job_configs_waiting_on_capacity`] plus the targets of
+    /// rollouts that completed incomplete.
+    ///
     /// Since C-2 each per-config reconcile is its own scheduler-lane op
     /// (see [`Self::reschedule_allocations_for_drained_node`] for the
     /// capture-visibility rationale); every pass is an idempotent
     /// convergence step, so no cross-op atomicity is needed.
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_new_node(&self) -> R<()> {
-        let mut job_config_ids = self.job_config_ids_with_count_per()?;
+        let mut job_config_ids = self.job_configs_waiting_on_capacity()?;
         for job_config_id in self.job_config_ids_with_incomplete_rollouts()? {
             if !job_config_ids.contains(&job_config_id) {
                 job_config_ids.push(job_config_id);
@@ -15737,7 +15874,9 @@ impl Store {
         // rollout. Node-scoped kinds (`node_drain`, `node_lost_reschedule`)
         // carry no job, so they still collapse per node; job-scoped kinds
         // collapse per job config (and per excluded node for reschedules,
-        // whose node is the one the replacement must avoid).
+        // whose node is the one the replacement must avoid); the
+        // cluster-wide capacity pass (a `node_join` with neither) collapses
+        // with its own kind.
         //
         // Matching on kind matters because different kinds are not
         // interchangeable — dropping a job's `rollout_tick` because a
@@ -15754,7 +15893,6 @@ impl Store {
               AND id != :id
               AND type = :type
               AND ready_at <= :now
-              AND (:job_id != '' OR :node_id != '')
               AND COALESCE(job_id, '') = :job_id
               AND COALESCE(job_config_id, '') = :job_config_id
               AND COALESCE(node_id, '') = :node_id;",
@@ -16025,24 +16163,6 @@ impl Store {
             let Some(latest_config) = latest_config else {
                 continue;
             };
-            let stale_configs: Vec<String> = {
-                let conn = self.read_connection()?;
-                let mut stmt = conn.prepare(
-                    "SELECT DISTINCT a.job_config_id FROM allocation a
-                     INNER JOIN job_config jc ON jc.id = a.job_config_id
-                     WHERE jc.job_id = ?1 AND a.job_config_id != ?2;",
-                )?;
-                let rows = stmt.query_map(params![job_id, latest_config], |row| row.get(0))?;
-                Self::collect_rows(rows)?
-            };
-            let latest_count: i64 = {
-                let conn = self.read_connection()?;
-                conn.query_row(
-                    "SELECT COUNT(*) FROM allocation WHERE job_config_id = ?1;",
-                    [&latest_config],
-                    |row| row.get(0),
-                )?
-            };
             // A rollout to the latest config that failed or was cancelled
             // settled the job somewhere other than "latest at full count",
             // and the passes below would undo that: "latest has no
@@ -16050,58 +16170,63 @@ impl Store {
             // a `job_submit` that brought the bad version back at full
             // count with no gating, and a rollout stopped part way had its
             // old allocations removed and the new version topped up.
-            // Converge whatever the rollout left running instead.
-            let aborted_rollout = if restart_requested {
-                None
-            } else {
-                self.latest_rollout_for_job_config(&latest_config)?
-                    .filter(|rollout| matches!(rollout.status.as_str(), "failed" | "cancelled"))
-            };
-            if let Some(rollout) = aborted_rollout {
-                let target = if latest_count == 0 {
-                    // Rolled back, or failed before placing anything: the
-                    // source config is what runs. No source (a first
-                    // deploy) leaves nothing to converge.
-                    rollout.from_job_config_id
-                } else if stale_configs.is_empty() {
-                    // Failed after replacing everything: latest is all
-                    // there is.
-                    Some(latest_config.clone())
-                } else {
-                    // Stopped part way without a revert: the mix of old and
-                    // new is the operator's call, and no single-config
-                    // reschedule can converge it without picking a side.
-                    None
-                };
-                if let Some(target) = target {
-                    job_requests.push(EvalRequest::for_job("job_reschedule", &job_id, &target));
+            // Converge whatever the rollout left running instead (SC1).
+            if !restart_requested {
+                match self.settled_convergence_config(&job_id, &latest_config)? {
+                    None => continue,
+                    Some(target) if target != latest_config => {
+                        job_requests.push(EvalRequest::for_job("job_reschedule", &job_id, &target));
+                        continue;
+                    }
+                    Some(_) => {}
                 }
-                continue;
             }
             let kind = if restart_requested {
                 // A KV-triggered restart was acknowledged but its
                 // leader-local job_update eval died: regenerate it (the
                 // handler clears the marker before restarting).
                 "job_update"
-            } else if stale_configs.is_empty() {
-                "job_reschedule"
-            } else if latest_count == 0 {
-                // The acknowledged submit's eval was lost whole:
-                // job_submit replays it (migrate-or-place, THEN
-                // remove the predecessor — no avoidable downtime).
-                "job_submit"
             } else {
-                // The submit partially ran (latest placed, stale
-                // cleanup lost): finish the cleanup here, then
-                // converge counts.
-                for stale in &stale_configs {
-                    if self.job_configs_schedule_equivalent(stale, &latest_config)? {
-                        self.migrate_allocations_to_job_config(stale, &latest_config)?;
+                let stale_configs: Vec<String> = {
+                    let conn = self.read_connection()?;
+                    let mut stmt = conn.prepare(
+                        "SELECT DISTINCT a.job_config_id FROM allocation a
+                         INNER JOIN job_config jc ON jc.id = a.job_config_id
+                         WHERE jc.job_id = ?1 AND a.job_config_id != ?2;",
+                    )?;
+                    let rows = stmt.query_map(params![job_id, latest_config], |row| row.get(0))?;
+                    Self::collect_rows(rows)?
+                };
+                if stale_configs.is_empty() {
+                    "job_reschedule"
+                } else {
+                    let latest_count: i64 = {
+                        let conn = self.read_connection()?;
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM allocation WHERE job_config_id = ?1;",
+                            [&latest_config],
+                            |row| row.get(0),
+                        )?
+                    };
+                    if latest_count == 0 {
+                        // The acknowledged submit's eval was lost whole:
+                        // job_submit replays it (migrate-or-place, THEN
+                        // remove the predecessor — no avoidable downtime).
+                        "job_submit"
                     } else {
-                        self.remove_allocs_for_job_config(stale)?;
+                        // The submit partially ran (latest placed, stale
+                        // cleanup lost): finish the cleanup here, then
+                        // converge counts.
+                        for stale in &stale_configs {
+                            if self.job_configs_schedule_equivalent(stale, &latest_config)? {
+                                self.migrate_allocations_to_job_config(stale, &latest_config)?;
+                            } else {
+                                self.remove_allocs_for_job_config(stale)?;
+                            }
+                        }
+                        "job_reschedule"
                     }
                 }
-                "job_reschedule"
             };
             job_requests.push(EvalRequest::for_job(kind, &job_id, &latest_config));
         }
@@ -20556,6 +20681,75 @@ mod tests {
             store.claim_eval()?.is_none(),
             "the retry is delayed, not immediately claimable"
         );
+        Ok(())
+    }
+
+    /// SC4: a job that could not place for lack of nodes converges once a
+    /// node registers, through one cluster-wide capacity pass however many
+    /// times it is requested.
+    #[test]
+    fn capacity_pass_places_jobs_left_short_when_a_node_joins() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(&store, "waiting", vec![task("web")])?;
+        store.enqueue_eval(
+            "job_submit",
+            Some("waiting"),
+            Some(&job_config_id),
+            None,
+            None,
+        )?;
+        let submit = store.claim_eval()?.context("submit eval")?;
+        assert!(submit.handle(&store).is_err(), "no nodes yet");
+        store.complete_eval(&submit.id, false)?;
+        assert_eq!(
+            store.job_configs_waiting_on_capacity()?,
+            vec![job_config_id.clone()]
+        );
+
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.request_capacity_reconcile()?;
+        store.request_capacity_reconcile()?;
+        let queued: Vec<_> = store
+            .get_evals()?
+            .into_iter()
+            .filter(|eval| eval.status == "pending")
+            .collect();
+        assert_eq!(queued.len(), 1, "a burst of joins queues one pass");
+        assert_eq!(queued[0].kind, "node_join");
+        assert!(queued[0].node_name.is_empty());
+
+        run_pending_evals(&store)?;
+        assert_eq!(store.allocs_for_job_config(&job_config_id)?.len(), 1);
+        assert!(store.job_configs_waiting_on_capacity()?.is_empty());
+        Ok(())
+    }
+
+    /// SC4 x SC1: the capacity pass converges what a failed rollout left
+    /// running, never the rolled-back latest config.
+    #[test]
+    fn capacity_pass_targets_the_rolled_back_source_config() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        let mut two = task("web");
+        two.count = TaskCount::new(2);
+        let v1 = submit_job(&store, "rolled", vec![two.clone()])?;
+        store.place_alloc("node-one", task_id_for(&store, "web", "rolled")?)?;
+        two.config = json!({ "version": 2 });
+        let v2 = submit_job(&store, "rolled", vec![two])?;
+        let rollout = store.create_rollout(
+            "rolled",
+            Some(&v1),
+            &v2,
+            "running",
+            None,
+            None,
+            None,
+            None,
+            "{}",
+        )?;
+        store.update_rollout_status(rollout.id, "failed", false, None)?;
+
+        assert_eq!(store.job_configs_waiting_on_capacity()?, vec![v1]);
         Ok(())
     }
 

@@ -123,7 +123,8 @@ not a queued duplicate (for example, a batch task's next scheduled
 
 `Eval::handle()` supports:
 
-- `node_join`
+- `node_join` (with no node, the capacity pass queued by a worker
+  registration or an uncordon)
 - `node_drop`
 - `job_submit`
 - `job_update`
