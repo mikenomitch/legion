@@ -1133,7 +1133,7 @@ fn restore_benchmark(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot budget (capacity for resumes, Track 2)
+// Snapshot budget (capacity for resumes)
 // ---------------------------------------------------------------------------
 //
 // The cost of the `snapshots` budget placement filter: new keyed instances of

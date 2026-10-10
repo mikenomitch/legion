@@ -908,7 +908,7 @@ async fn a_published_restore_skips_workers_that_cannot_fetch() -> R<()> {
     Ok(())
 }
 
-/// Track 3 (suspend/resume UI plan §6.7): GetSnapshot names the nodes that
+/// Suspend/resume UI plan §6.7: GetSnapshot names the nodes that
 /// hold a published checkpoint's parts, and GetNodeContent shows the same
 /// fact from the node's side, with the entry labeled by its snapshot.
 #[tokio::test(flavor = "multi_thread")]

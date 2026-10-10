@@ -1210,7 +1210,7 @@ async fn heartbeat_tick(
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .prepare(current);
-                    // Checkpoint headroom rides every report (Track 2): the
+                    // Checkpoint headroom rides every report: the
                     // manager shows it and keeps new memory-checkpoint
                     // instances off a node whose budget is full.
                     pending.report.snapshot_budget =

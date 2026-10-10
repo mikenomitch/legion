@@ -5823,7 +5823,7 @@ export class InstanceInfo extends Message<InstanceInfo> {
    * Replaced by each later stop, so a rollout after a pressure eviction
    * shows `update`.
    *
-   * @generated from field: optional legion.InstanceStop last_stop = 100;
+   * @generated from field: optional legion.InstanceStop last_stop = 29;
    */
   lastStop?: InstanceStop;
 
@@ -5836,7 +5836,7 @@ export class InstanceInfo extends Message<InstanceInfo> {
    * spec cannot show). Set only while the instance is `active` with a
    * running allocation; unset otherwise, since nothing can be checkpointed.
    *
-   * @generated from field: optional legion.CheckpointSupport checkpoint_support = 101;
+   * @generated from field: optional legion.CheckpointSupport checkpoint_support = 30;
    */
   checkpointSupport?: CheckpointSupport;
 
@@ -5845,7 +5845,7 @@ export class InstanceInfo extends Message<InstanceInfo> {
    * instance's lifetime so fork lineage survives the fork checkpoint being
    * reclaimed. Unset for instances not created by a fork.
    *
-   * @generated from field: optional string forked_from = 102;
+   * @generated from field: optional string forked_from = 31;
    */
   forkedFrom?: string;
 
@@ -5857,7 +5857,7 @@ export class InstanceInfo extends Message<InstanceInfo> {
    * or is not suspended. With `reserve = true` this is the whole
    * reservation.
    *
-   * @generated from field: optional double held_memory_mib = 200;
+   * @generated from field: optional double held_memory_mib = 32;
    */
   heldMemoryMib?: number;
 
@@ -5866,7 +5866,7 @@ export class InstanceInfo extends Message<InstanceInfo> {
    * way as `held_memory_mib`. Exclusive cores are held only with a full
    * hold, and are not counted here.
    *
-   * @generated from field: optional double held_cpu_mhz = 201;
+   * @generated from field: optional double held_cpu_mhz = 33;
    */
   heldCpuMhz?: number;
 
@@ -5906,11 +5906,11 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 26, name: "idle_since", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 27, name: "idle_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
     { no: 28, name: "checkpoint_state", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
-    { no: 100, name: "last_stop", kind: "message", T: InstanceStop, opt: true },
-    { no: 101, name: "checkpoint_support", kind: "message", T: CheckpointSupport, opt: true },
-    { no: 102, name: "forked_from", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
-    { no: 200, name: "held_memory_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
-    { no: 201, name: "held_cpu_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
+    { no: 29, name: "last_stop", kind: "message", T: InstanceStop, opt: true },
+    { no: 30, name: "checkpoint_support", kind: "message", T: CheckpointSupport, opt: true },
+    { no: 31, name: "forked_from", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 32, name: "held_memory_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
+    { no: 33, name: "held_cpu_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
@@ -6317,7 +6317,7 @@ export class SnapshotInfo extends Message<SnapshotInfo> {
    * on a manager that holds no content reports (it just started or took
    * over). Best effort: the index is soft state, refreshed every heartbeat.
    *
-   * @generated from field: repeated legion.SnapshotHolder holders = 100;
+   * @generated from field: repeated legion.SnapshotHolder holders = 21;
    */
   holders: SnapshotHolder[] = [];
 
@@ -6349,7 +6349,7 @@ export class SnapshotInfo extends Message<SnapshotInfo> {
     { no: 18, name: "aliases", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 19, name: "durability", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 20, name: "published_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 100, name: "holders", kind: "message", T: SnapshotHolder, repeated: true },
+    { no: 21, name: "holders", kind: "message", T: SnapshotHolder, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SnapshotInfo {
@@ -9667,12 +9667,11 @@ export class ContentLocationReport extends Message<ContentLocationReport> {
   removed: string[] = [];
 
   /**
-   * Track 2: the store's `snapshots` budget class, sent on every report
-   * whatever its epoch outcome, so the manager can show checkpoint headroom
-   * and keep new memory-checkpoint instances off a node whose budget is
-   * full. Numbered from 200 so parallel work cannot collide.
+   * The store's `snapshots` budget class, sent on every report whatever its
+   * epoch outcome, so the manager can show checkpoint headroom and keep new
+   * memory-checkpoint instances off a node whose budget is full.
    *
-   * @generated from field: optional legion.SnapshotBudget snapshot_budget = 200;
+   * @generated from field: optional legion.SnapshotBudget snapshot_budget = 6;
    */
   snapshotBudget?: SnapshotBudget;
 
@@ -9689,7 +9688,7 @@ export class ContentLocationReport extends Message<ContentLocationReport> {
     { no: 3, name: "full", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 4, name: "added", kind: "message", T: ContentLocation, repeated: true },
     { no: 5, name: "removed", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
-    { no: 200, name: "snapshot_budget", kind: "message", T: SnapshotBudget, opt: true },
+    { no: 6, name: "snapshot_budget", kind: "message", T: SnapshotBudget, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ContentLocationReport {
@@ -11614,12 +11613,11 @@ export class GetNodeUsageReply extends Message<GetNodeUsageReply> {
   allocations: NodeAllocationUsage[] = [];
 
   /**
-   * Track 2: capacity for resumes. Suspended instances whose checkpoint is
-   * on this node, what they keep charged, and the node's `snapshots`
-   * content budget their checkpoints fill. Field numbers start at 200 so
-   * parallel work on this message cannot collide.
+   * Capacity for resumes: suspended instances whose checkpoint is on this
+   * node, what they keep charged, and the node's `snapshots` content budget
+   * their checkpoints fill.
    *
-   * @generated from field: legion.SuspendedCapacity suspended = 200;
+   * @generated from field: legion.SuspendedCapacity suspended = 9;
    */
   suspended?: SuspendedCapacity;
 
@@ -11639,7 +11637,7 @@ export class GetNodeUsageReply extends Message<GetNodeUsageReply> {
     { no: 6, name: "memory", kind: "message", T: NodeResourceUsage },
     { no: 7, name: "cpu", kind: "message", T: NodeResourceUsage },
     { no: 8, name: "allocations", kind: "message", T: NodeAllocationUsage, repeated: true },
-    { no: 200, name: "suspended", kind: "message", T: SuspendedCapacity },
+    { no: 9, name: "suspended", kind: "message", T: SuspendedCapacity },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNodeUsageReply {
@@ -11660,7 +11658,7 @@ export class GetNodeUsageReply extends Message<GetNodeUsageReply> {
 }
 
 /**
- * Track 2. Suspended instances on one node, as `legion node usage` prints
+ * Suspended instances on one node, as `legion node usage` prints
  * them: "suspended: 3 instances, 768 MiB held". A suspended instance counts
  * here when its checkpoint is stored on this node, whether or not it holds
  * any capacity (see docs/suspend-and-resume.md, "Capacity for resumes").
@@ -11762,7 +11760,7 @@ export class SuspendedCapacity extends Message<SuspendedCapacity> {
 }
 
 /**
- * Track 2. A node content store's `snapshots` budget class
+ * A node content store's `snapshots` budget class
  * (`content.budgets.snapshots`), which holds memory checkpoints. Workers
  * report it on every heartbeat with a content report.
  *
@@ -11914,7 +11912,7 @@ export class NodeResourceUsage extends Message<NodeResourceUsage> {
    * when the platform reports no usable clock speed (Apple Silicon), where
    * `capacity` in MHz is 0 and cores are the only honest figure.
    *
-   * @generated from field: double cores = 100;
+   * @generated from field: double cores = 10;
    */
   cores = 0;
 
@@ -11924,7 +11922,7 @@ export class NodeResourceUsage extends Message<NodeResourceUsage> {
    * MHz-per-core figure, so it is filled on nodes that report no clock
    * speed. Zero when no usage has been reported.
    *
-   * @generated from field: uint64 used_millicores = 101;
+   * @generated from field: uint64 used_millicores = 11;
    */
   usedMillicores = protoInt64.zero;
 
@@ -11945,8 +11943,8 @@ export class NodeResourceUsage extends Message<NodeResourceUsage> {
     { no: 7, name: "pressure_available", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 8, name: "oversubscribe_ratio", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
     { no: 9, name: "pressure_response", kind: "message", T: MemoryPressureStatus, opt: true },
-    { no: 100, name: "cores", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
-    { no: 101, name: "used_millicores", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 10, name: "cores", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 11, name: "used_millicores", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeResourceUsage {
@@ -12059,12 +12057,11 @@ export class NodeAllocationUsage extends Message<NodeAllocationUsage> {
   pressureSteps: string[] = [];
 
   /**
-   * Track 2: true when this row is a suspended instance's held charge
-   * (status `suspended`), not running work. Its `reserved_*` figures are
-   * the held share, and it has no `usage`. Numbered from 200 so parallel
-   * work on this message cannot collide.
+   * True when this row is a suspended instance's held charge (status
+   * `suspended`), not running work. Its `reserved_*` figures are the held
+   * share, and it has no `usage`.
    *
-   * @generated from field: bool suspended = 200;
+   * @generated from field: bool suspended = 12;
    */
   suspended = false;
 
@@ -12087,7 +12084,7 @@ export class NodeAllocationUsage extends Message<NodeAllocationUsage> {
     { no: 9, name: "band", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "pressure_rank", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 11, name: "pressure_steps", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
-    { no: 200, name: "suspended", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 12, name: "suspended", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeAllocationUsage {
@@ -20472,9 +20469,6 @@ export class TaskAllocation extends Message<TaskAllocation> {
   restore?: SnapshotRestore;
 
   /**
-   * Track 1: the task's suspend and snapshot declarations, which the node
-   * acts on itself.
-   *
    * The task's `suspend` block as JSON (docs/suspend-and-resume.md). The
    * worker reads its idle policy (`suspend.idle`) to report idle-since with
    * usage, `suspend.onPressure` to let its memory pressure response suspend

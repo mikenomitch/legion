@@ -58,9 +58,9 @@ struct IndexInner {
     nodes: HashMap<String, NodeContent>,
     /// The reverse map the scheduler reads: digest -> node -> bytes.
     by_digest: HashMap<String, HashMap<String, u64>>,
-    /// Each node's `snapshots` budget class as last reported (Track 2,
-    /// "Capacity for resumes"). Soft state like the rest: a node missing
-    /// here is treated as having room.
+    /// Each node's `snapshots` budget class as last reported
+    /// (docs/suspend-and-resume.md, "Capacity for resumes"). Soft state like
+    /// the rest: a node missing here is treated as having room.
     snapshot_budgets: HashMap<String, SnapshotBudget>,
     last_sweep: Option<Instant>,
 }

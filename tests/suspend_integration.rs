@@ -1218,7 +1218,7 @@ async fn a_local_suspension_overtakes_a_pending_requested_suspend() -> R<()> {
     Ok(())
 }
 
-/// Track 3 (suspend/resume UI plan §7.3): a pressure eviction leaves the
+/// Suspend/resume UI plan §7.3: a pressure eviction leaves the
 /// worker's detail and hint on the instance as `last_stop`, names the
 /// instance in the `node.pressure` event, and a running instance reports
 /// which checkpoints it can take with the RPCs' own refusals.
@@ -1320,7 +1320,7 @@ async fn an_instance_records_its_last_stop_and_its_checkpoint_support() -> R<()>
 }
 
 // ---------------------------------------------------------------------------
-// Capacity for resumes (Track 2): partial holds, the node floor, make-room.
+// Capacity for resumes: partial holds, the node floor, make-room.
 // ---------------------------------------------------------------------------
 
 /// `job` with explicit resources on its task.

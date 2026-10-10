@@ -992,9 +992,6 @@ service Manager {
   // See docs/resource-enforcement.md, "Measuring usage".
   rpc GetNodeUsage (GetNodeUsageRequest) returns (GetNodeUsageReply);
 
-  // Track 3 (suspend/resume UI, internal_docs/plans/suspend-resume-ui-plan.md
-  // §7.3) -------------------------------------------------------------------
-
   // Reports capacity, reservations, and measured usage for many nodes in one
   // call: the batch form of GetNodeUsage, for fleet views such as the
   // workers index and `legion node usage` with no node.
@@ -3246,9 +3243,6 @@ message InstanceInfo {
   // `local` until its upload finishes. See `checkpoint_durability`.
   optional string checkpoint_state = 28;
 
-  // Track 3 (suspend/resume UI, internal_docs/plans/suspend-resume-ui-plan.md
-  // §7.3). Numbered from 100 so concurrent additions never collide.
-
   // Why the instance's last allocation stopped: the cause, a detail
   // sentence, a hint when there is something to change, and when. Recorded
   // by the manager in the same transaction that removes the allocation, so
@@ -3259,7 +3253,7 @@ message InstanceInfo {
   // stopped, and for stops recorded by a manager that predates the field.
   // Replaced by each later stop, so a rollout after a pressure eviction
   // shows `update`.
-  optional InstanceStop last_stop = 100;
+  optional InstanceStop last_stop = 29;
 
   // Which checkpoints the instance can take right now: memory, disk,
   // published, and spread, each with the reason when not. Computed by the
@@ -3268,16 +3262,12 @@ message InstanceInfo {
   // (including a stored network policy that gates the task, which the job
   // spec cannot show). Set only while the instance is `active` with a
   // running allocation; unset otherwise, since nothing can be checkpointed.
-  optional CheckpointSupport checkpoint_support = 101;
+  optional CheckpointSupport checkpoint_support = 30;
 
   // The instance this one was forked from (ForkInstance), kept for the
   // instance's lifetime so fork lineage survives the fork checkpoint being
   // reclaimed. Unset for instances not created by a fork.
-  optional string forked_from = 102;
-
-  // Track 2: capacity for resumes (docs/suspend-and-resume.md, "Capacity
-  // for resumes"). Field numbers start at 200 so parallel work on this
-  // message cannot collide.
+  optional string forked_from = 31;
 
   // MiB of memory a suspended instance keeps charged to its node, so a
   // resume finds room: `max(suspend.reserve, the node's
@@ -3285,12 +3275,12 @@ message InstanceInfo {
   // the suspend landed. Unset when the instance holds nothing (the default)
   // or is not suspended. With `reserve = true` this is the whole
   // reservation.
-  optional double held_memory_mib = 200;
+  optional double held_memory_mib = 32;
 
   // CPU (MHz) the suspended instance keeps charged to its node, the same
   // way as `held_memory_mib`. Exclusive cores are held only with a full
   // hold, and are not counted here.
-  optional double held_cpu_mhz = 201;
+  optional double held_cpu_mhz = 33;
 }
 
 // Request payload for ListInstances.
@@ -3432,9 +3422,6 @@ message SnapshotInfo {
   // RFC3339 time the upload finished. Empty unless `published`.
   string published_at = 20;
 
-  // Track 3 (suspend/resume UI). Numbered from 100 so concurrent additions
-  // never collide.
-
   // Which nodes hold the snapshot's memory parts right now, from this
   // manager's content location index: the capturing node while it keeps
   // them, plus every node that fetched or warmed a `published` snapshot.
@@ -3442,7 +3429,7 @@ message SnapshotInfo {
   // for a disk snapshot, whose volume copy lives in the volume driver, and
   // on a manager that holds no content reports (it just started or took
   // over). Best effort: the index is soft state, refreshed every heartbeat.
-  repeated SnapshotHolder holders = 100;
+  repeated SnapshotHolder holders = 21;
 }
 
 // Request payload for CreateSnapshot.
@@ -4434,11 +4421,10 @@ message ContentLocationReport {
   // or dropped as corrupt.
   repeated string removed = 5;
 
-  // Track 2: the store's `snapshots` budget class, sent on every report
-  // whatever its epoch outcome, so the manager can show checkpoint headroom
-  // and keep new memory-checkpoint instances off a node whose budget is
-  // full. Numbered from 200 so parallel work cannot collide.
-  optional SnapshotBudget snapshot_budget = 200;
+  // The store's `snapshots` budget class, sent on every report whatever its
+  // epoch outcome, so the manager can show checkpoint headroom and keep new
+  // memory-checkpoint instances off a node whose budget is full.
+  optional SnapshotBudget snapshot_budget = 6;
 }
 
 // Content locality. One piece of content a node holds.
@@ -5185,14 +5171,13 @@ message GetNodeUsageReply {
   // by allocation id.
   repeated NodeAllocationUsage allocations = 8;
 
-  // Track 2: capacity for resumes. Suspended instances whose checkpoint is
-  // on this node, what they keep charged, and the node's `snapshots`
-  // content budget their checkpoints fill. Field numbers start at 200 so
-  // parallel work on this message cannot collide.
-  SuspendedCapacity suspended = 200;
+  // Capacity for resumes: suspended instances whose checkpoint is on this
+  // node, what they keep charged, and the node's `snapshots` content budget
+  // their checkpoints fill.
+  SuspendedCapacity suspended = 9;
 }
 
-// Track 2. Suspended instances on one node, as `legion node usage` prints
+// Suspended instances on one node, as `legion node usage` prints
 // them: "suspended: 3 instances, 768 MiB held". A suspended instance counts
 // here when its checkpoint is stored on this node, whether or not it holds
 // any capacity (see docs/suspend-and-resume.md, "Capacity for resumes").
@@ -5229,7 +5214,7 @@ message SuspendedCapacity {
   optional SnapshotBudget snapshot_budget = 7;
 }
 
-// Track 2. A node content store's `snapshots` budget class
+// A node content store's `snapshots` budget class
 // (`content.budgets.snapshots`), which holds memory checkpoints. Workers
 // report it on every heartbeat with a content report.
 message SnapshotBudget {
@@ -5292,18 +5277,16 @@ message NodeResourceUsage {
   // predate the response.
   optional MemoryPressureStatus pressure_response = 9;
 
-  // Track 3 (suspend/resume UI) ---------------------------------------------
-
   // CPU only: the node's fingerprinted core count, 0 when unknown. Set even
   // when the platform reports no usable clock speed (Apple Silicon), where
   // `capacity` in MHz is 0 and cores are the only honest figure.
-  double cores = 100;
+  double cores = 10;
 
   // CPU only: measured use in thousandths of a core, summed over governed
   // allocations (1000 = one full core). Unlike `used`, this needs no
   // MHz-per-core figure, so it is filled on nodes that report no clock
   // speed. Zero when no usage has been reported.
-  uint64 used_millicores = 101;
+  uint64 used_millicores = 11;
 }
 
 // One allocation on a node, with its reservation and measured usage.
@@ -5350,14 +5333,11 @@ message NodeAllocationUsage {
   // `usage.pressure_steps`.
   repeated string pressure_steps = 11;
 
-  // Track 2: true when this row is a suspended instance's held charge
-  // (status `suspended`), not running work. Its `reserved_*` figures are
-  // the held share, and it has no `usage`. Numbered from 200 so parallel
-  // work on this message cannot collide.
-  bool suspended = 200;
+  // True when this row is a suspended instance's held charge (status
+  // `suspended`), not running work. Its `reserved_*` figures are the held
+  // share, and it has no `usage`.
+  bool suspended = 12;
 }
-
-// Track 3 (suspend/resume UI) -------------------------------------------------
 
 // Request payload for ListNodeUsage.
 message ListNodeUsageRequest {
@@ -7697,9 +7677,6 @@ message TaskAllocation {
   // Absent for every ordinary allocation.
   optional SnapshotRestore restore = 22;
 
-  // Track 1: the task's suspend and snapshot declarations, which the node
-  // acts on itself.
-  //
   // The task's `suspend` block as JSON (docs/suspend-and-resume.md). The
   // worker reads its idle policy (`suspend.idle`) to report idle-since with
   // usage, `suspend.onPressure` to let its memory pressure response suspend

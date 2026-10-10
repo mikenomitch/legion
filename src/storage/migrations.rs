@@ -1834,7 +1834,7 @@ fn migration_list() -> Vec<M<'static>> {
         ALTER TABLE snapshot ADD COLUMN publish_retry_at INTEGER;",
         )
         .down(""),
-        // Track 3 (suspend/resume UI plan §7.3). `last_stop` is JSON
+        // Suspend/resume UI plan §7.3. `last_stop` is JSON
         // ([`crate::structs::instance::InstanceLastStop`]): why the
         // instance's last allocation stopped, written in the transaction that
         // removes it. `forked_from` names a fork's origin instance, so lineage

@@ -1568,7 +1568,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         first" preview in `legion node usage`, `node.pressure` events, and
         `cause = node_pressure`
         ([docs](../docs/resource-enforcement.md#memory-pressure),
-        [calls 24, 27, 49, 50, 51, 59, 60, 85, 92](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+        [calls 26, 29, 56, 57, 58, 66, 67, 93, 100](calls/suspend-resume-and-oversubscription-plan_calls.md)).
         Follow-ups it left:
     - [ ] Run the Linux verification for Phase 2:
           [suspend-resume-linux-verification.md § Phase 2](suspend-resume-linux-verification.md#phase-2)
@@ -1577,7 +1577,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           guest size). Built and tested against fakes on macOS only.
     - [ ] A pressure-evicted allocation's replacement can be placed back on
           the node that evicted it. A short-lived anti-affinity for the
-          evicting node would stop the bounce (calls entry 34).
+          evicting node would stop the bounce (calls entry 58).
     - [ ] `reclaim` needs Linux 5.19 (`memory.reclaim`). On an older kernel
           it frees nothing from host-process tasks and the response moves on
           to eviction.
@@ -1600,7 +1600,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           idle TTL, owner pins, `minFreeDisk`, digest verification. Digest-pinned
           artifacts are served from it on the second allocation.
           [docs](../docs/artifacts.md#the-node-content-store) ·
-          [calls 35, 65, 98, 99, 109](calls/suspend-resume-and-oversubscription-plan_calls.md#65-the-node-content-store-caches-only-digest-pinned-single-files)
+          [calls 38, 72, 106, 107, 117](calls/suspend-resume-and-oversubscription-plan_calls.md#72-the-node-content-store-caches-only-digest-pinned-single-files)
     - [ ] Run the Phase 3a Linux checks
           ([§ Phase 3a](suspend-resume-linux-verification.md#phase-3a)): a
           cache hit on a Linux worker, and `minFreeDisk` against a real
@@ -1662,7 +1662,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
     - [x] Allocation ids are never reused: the `allocation` table was rebuilt
           with `AUTOINCREMENT` in Phase 4, so a restore's or resume's
           replacement always has a new id
-          ([call 26](calls/suspend-resume-and-oversubscription-plan_calls.md#26-allocation-ids-are-never-reused-phase-4)).
+          ([call 28](calls/suspend-resume-and-oversubscription-plan_calls.md#28-allocation-ids-are-never-reused-phase-4)).
     - [ ] `snapshot.restored` does not carry the restore's duration, although
           the worker reports it. `instance get` shows it now (`last_restore_ms`,
           Phase 4) and `instance.resumed` carries it for resumes. Add it to the
@@ -1683,7 +1683,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           record restore latency per VMM.
     - [ ] Memory checkpoints of gated sandboxes: route the vsock socket
           through the device-link dir
-          ([call 48](calls/suspend-resume-and-oversubscription-plan_calls.md#48-gated-sandboxes-are-not-memory-checkpointable-yet)).
+          ([call 55](calls/suspend-resume-and-oversubscription-plan_calls.md#55-gated-sandboxes-are-not-memory-checkpointable-yet)).
     - [ ] Hashing a multi-GiB memory part adds seconds to a checkpoint (after
           the guest resumes, so not paused time). Let the content store hash
           on ingest instead of hashing twice.
@@ -1704,7 +1704,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `legion_instance_suspend` MCP tool, mixed-version
         `FailedPrecondition`.
         [docs](../docs/suspend-and-resume.md) ·
-        [calls 26, 29, 30, 32, 41, 47, 54, 72, 74, 115](calls/suspend-resume-and-oversubscription-plan_calls.md) ·
+        [calls 28, 32, 33, 35, 45, 51, 61, 79, 82, 123](calls/suspend-resume-and-oversubscription-plan_calls.md) ·
         [Linux verification](suspend-resume-linux-verification.md#phase-4).
         Follow-ups it left:
     - [ ] Run the Phase 4 Linux checks
@@ -1761,7 +1761,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `legion_instance_suspends_total` / `legion_idle_sweep_suspends_total`
         metrics. No scheduler change, so no benchmarks.
         [docs](../docs/suspend-and-resume.md#automatic-suspend) ·
-        [calls 17, 18, 28, 47, 52, 68, 82, 94, 116](calls/suspend-resume-and-oversubscription-plan_calls.md) ·
+        [calls 19, 20, 31, 51, 59, 75, 90, 102, 124](calls/suspend-resume-and-oversubscription-plan_calls.md) ·
         [Linux verification](suspend-resume-linux-verification.md#phase-5).
         Follow-ups it left:
     - [ ] Run the Phase 5 Linux checks
@@ -1777,14 +1777,14 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           record: the checkpoint stays pinned with no row and the allocation
           relaunches cold. Persist pending local suspensions in the worker
           state store
-          ([call 17](calls/suspend-resume-and-oversubscription-plan_calls.md#17-the-suspend-step-acts-first-reports-a-local-suspension-and-the-desired-set-is-its-acknowledgment-phase-5)).
+          ([call 19](calls/suspend-resume-and-oversubscription-plan_calls.md#19-the-suspend-step-acts-first-reports-a-local-suspension-and-the-desired-set-is-its-acknowledgment-phase-5)).
     - [ ] Turn on `free_page_reporting` for Firecracker guests once the pinned
           release is confirmed to accept it (verification item 5.5). Off
           today because older supported releases reject the field.
     - [ ] The idle policy cannot act on a node without resource enforcement,
           and a raw host port (no ingress chain) is invisible to `network` and
           `connections`. Both are in the public limitations
-          ([calls 18, 52](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+          ([calls 20, 59](calls/suspend-resume-and-oversubscription-plan_calls.md)).
     - [ ] Revisit the 3-minute `idle.after` default with data from real agent
           fleets (plan §12, open question 5).
     - [ ] The idle sweep tries each idle allocation at most once a minute and
@@ -1806,7 +1806,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `pause_ms` on snapshots; `instance.forked`, `instance.fork_failed`;
         `legion_instance_fork` and `legion_snapshot_alias_set` MCP tools.
         [docs](../docs/suspend-and-resume.md#fork) ·
-        [calls 20, 21, 22, 42, 57, 69, 70, 75, 78, 83, 106, 108, 117](calls/suspend-resume-and-oversubscription-plan_calls.md) ·
+        [calls 22, 23, 24, 46, 64, 76, 77, 83, 86, 91, 114, 116, 125](calls/suspend-resume-and-oversubscription-plan_calls.md) ·
         [Linux verification](suspend-resume-linux-verification.md#phase-6).
         Follow-ups it left:
     - [ ] Run the Phase 6 Linux checks
@@ -1830,24 +1830,24 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
     - [x] A disk fork or a cold-booted fork of a fixed-TAP task reused the
           origin's TAP. A disk fork of a TAP-wired sandbox is now refused at
           the API, and a fresh boot on a held TAP fails with a named reason
-          ([call 79](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+          ([call 87](calls/suspend-resume-and-oversubscription-plan_calls.md)).
           A per-instance TAP for fresh boots is still open, so a fixed-TAP
           task runs one instance per node.
     - [x] A fork stopped while it waited for its checkpoint booted on an
           empty volume when started. A new instance now keeps its restore
           source across a stop and restores when started
-          ([call 76](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+          ([call 84](calls/suspend-resume-and-oversubscription-plan_calls.md)).
     - [x] Fork ids under `idSource = "caller"`: verified derived
           `<origin>-f<n>` ids work, and an origin id too long to suffix is
           refused there instead of given a minted id
-          ([call 70](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+          ([call 77](calls/suspend-resume-and-oversubscription-plan_calls.md)).
     - [ ] Caller-supplied fork ids (`ForkInstanceRequest.instance_ids`),
           for platforms whose `idSource = "caller"` naming must choose
           fork ids themselves.
     - [x] Cross-node fork and `--spread`: done at the Phase 6 and 7b
           integration. `--spread` publishes the memory checkpoint and places
           each fork on a node no sibling runs on
-          ([call 22](calls/suspend-resume-and-oversubscription-plan_calls.md),
+          ([call 24](calls/suspend-resume-and-oversubscription-plan_calls.md),
           [docs](../docs/suspend-and-resume.md#spreading-forks-across-nodes)).
     - [ ] Spread is enforced on a fork's first placement only. A spread
           fork rescheduled later (node lost, stop and start) can land next
@@ -1866,7 +1866,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         cache plan's Phases 1 and 3.
     - [x] Phase 7a: the parts that need no snapshots.
           [docs](../docs/artifacts.md#content-locality) ·
-          [calls 36, 84, 86, 95, 96, 97, 113, 114](calls/suspend-resume-and-oversubscription-plan_calls.md#36-weightslocality-defaults-to-10-the-day-phase-7a-ships)
+          [calls 39, 92, 94, 103, 104, 105, 121, 122](calls/suspend-resume-and-oversubscription-plan_calls.md#39-weightslocality-defaults-to-10-the-day-phase-7a-ships)
       - [x] `ContentPublisher` trait with `s3` and `file` backends
             (`src/content_publish.rs`), worker `contentStore { url, auth }`,
             idempotent publish by digest, published URL recorded per digest
@@ -1885,7 +1885,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       - [x] `scheduler_bench` `locality` group (content present / absent)
     - [x] Phase 7b: durable checkpoints and cross-node resume.
           [docs](../docs/suspend-and-resume.md#durability-surviving-the-node) ·
-          [calls 8, 14, 33, 39, 45, 55, 62, 66, 71, 80, 88, 100, 118](calls/suspend-resume-and-oversubscription-plan_calls.md#8-a-published-checkpoint-needs-instance-data-that-can-move-so-node-local-volumes-are-refused-rather-than-copied-phase-7b) ·
+          [calls 8, 15, 36, 42, 49, 62, 69, 73, 78, 88, 96, 108, 126](calls/suspend-resume-and-oversubscription-plan_calls.md#8-a-published-checkpoint-needs-instance-data-that-can-move-so-node-local-volumes-are-refused-rather-than-copied-phase-7b) ·
           [Linux verification](suspend-resume-linux-verification.md#phase-7b)
       - [x] `suspend.durability = "store"` and `snapshot create --publish`:
             the snapshot is `local` once captured (the instance is
@@ -1916,7 +1916,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       - [x] Fixed: index candidate truncation dropped the pinned node of a
             stateful task (a `local` restore, a node-local volume) on fleets
             large enough to arm the index. Stateful tasks no longer truncate
-            (call 74, `tests/restore_placement_indexed.rs`).
+            (call 88, `tests/restore_placement_indexed.rs`).
       - [x] `scheduler_bench` `restore` group (`local_pinned`,
             `published_floating`), run once on a loaded host
             ([plan §9](plans/suspend-resume-and-oversubscription-plan.md#9-testing-plan)).
@@ -1927,37 +1927,37 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           check). Record publish and fetch times.
     - [ ] Volume migration: a `local-dir` instance volume cannot follow a
           published checkpoint, so `durability = "store"` is refused with
-          one (call 6). A driver op that publishes and recreates a volume
+          one (call 8). A driver op that publishes and recreates a volume
           would lift this.
     - [ ] Encrypt published checkpoint parts with keyring data keys (plan
-          open question 4, call 30). Parts are uploaded as plain objects
+          open question 4, call 36). Parts are uploaded as plain objects
           today.
     - [ ] Garbage-collect published parts: Legion never deletes from the
-          content store (call 49). A reference-counted sweep, or document a
+          content store (call 62). A reference-counted sweep, or document a
           lifecycle-rule recipe per provider. Spent spread-fork checkpoints
           add to this: their node copy is reclaimed
-          ([call 75](calls/suspend-resume-and-oversubscription-plan_calls.md)),
+          ([call 83](calls/suspend-resume-and-oversubscription-plan_calls.md)),
           their published parts are not.
     - [x] Retry a failed publish: the manager re-sends `op = publish` after
           one minute, then five, three attempts in all
-          ([call 39](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+          ([call 42](calls/suspend-resume-and-oversubscription-plan_calls.md)).
     - [ ] A manual `snapshot publish <id>` for a snapshot whose attempts are
           spent.
     - [x] Placement did not know which workers can fetch published parts.
           Workers advertise `checkpoint-fetch`, and published restores and
           warms only go to them
-          ([call 46](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+          ([call 50](calls/suspend-resume-and-oversubscription-plan_calls.md)).
     - [ ] A pressure suspend stays `local` even with `durability =
           "store"`, and an idle suspend that cannot publish is skipped
-          ([call 40](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+          ([call 44](calls/suspend-resume-and-oversubscription-plan_calls.md)).
           Publish pressure checkpoints once the node has recovered, and
           surface the idle skip on the instance.
-    - [ ] Warms are leader-local and lost on manager restart (call 82).
+    - [ ] Warms are leader-local and lost on manager restart (call 96).
           Show queued and finished warms (`snapshot get` or a status RPC).
     - [x] The binder paired restoring instances with allocations in its
           own order, so restores with different `compat` placed in one plan
           could be crossed. Placements now carry the planned instance id
-          ([call 15](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+          ([call 16](calls/suspend-resume-and-oversubscription-plan_calls.md)).
     - [ ] With `plan_candidates.count = 0` (format-1 plans) placements carry
           no instance id, so restores bind in the binder's order again.
           Carry the id in format 1 too, or drop the kill switch.
@@ -2005,7 +2005,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `instance get`, and the `suspended:` and `checkpoints:` lines in
         `node usage`.
         [docs](../docs/suspend-and-resume.md#capacity-for-resumes) ·
-        [calls 5, 6, 10, 34, 43, 53, 101, 103, 120](calls/suspend-resume-and-oversubscription-plan_calls.md#5-a-resume-on-a-full-node-makes-room-by-suspending-idle-suspendable-work-there-track-2) ·
+        [calls 5, 6, 10, 37, 47, 60, 109, 111, 128](calls/suspend-resume-and-oversubscription-plan_calls.md#5-a-resume-on-a-full-node-makes-room-by-suspending-idle-suspendable-work-there-resume-guards) ·
         [Linux verification](suspend-resume-linux-verification.md#track-2).
     - [ ] Run the Track 2 Linux checks
           ([§ Track 2](suspend-resume-linux-verification.md#track-2)): a
@@ -2019,11 +2019,11 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           last report, so a plan placing many memory-suspend instances can
           still overfill one node's budget. Count checkpoints the plan itself
           places if that shows up
-          ([call 43](calls/suspend-resume-and-oversubscription-plan_calls.md#43-the-checkpoint-budget-is-a-placement-filter-on-soft-state-for-fresh-placements-of-memory-suspend-tasks-only-track-2)).
+          ([call 47](calls/suspend-resume-and-oversubscription-plan_calls.md#47-the-checkpoint-budget-is-a-placement-filter-on-soft-state-for-fresh-placements-of-memory-suspend-tasks-only-resume-guards)).
     - [ ] A held share is fixed when the suspend lands: a changed
           `suspend.reserve` or `suspendedReserve` does not re-charge instances
           already suspended
-          ([call 34](calls/suspend-resume-and-oversubscription-plan_calls.md#34-the-suspendedreserve-floor-lives-under-resourceenforcement-needs-no-cgroups-and-applies-when-a-suspend-lands-track-2)).
+          ([call 37](calls/suspend-resume-and-oversubscription-plan_calls.md#37-the-suspendedreserve-floor-lives-under-resourceenforcement-needs-no-cgroups-and-applies-when-a-suspend-lands-resume-guards)).
     - [ ] Make-room only knows an instance is quiet from nodes that send usage
           reports. Without `resourceEnforcement.enabled`, only
           `onPressure = true` makes an instance eligible. Its cooldown
@@ -2033,7 +2033,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           `fill_suspended_capacity`.
   - [x] Track 1, the agent-sandbox use case
         ([guide](../docs/guides/agent-sandboxes.md) ·
-        [Track 1 calls](calls/suspend-resume-and-oversubscription-plan_calls.md#track-1-the-agent-sandbox-use-case) ·
+        [calls 14, 17, 30, 43, 52, 53, 54, 81](calls/suspend-resume-and-oversubscription-plan_calls.md#14-suspend-and-snapshots-ride-the-allocation-payload-and-the-worker-knows-its-instance) ·
         [Linux verification](suspend-resume-linux-verification.md#track-1)).
     - [x] Auto TAPs: `config.network = { mode = "tap", tap = "auto", bridge
           }` creates a TAP per instance with the fork naming, attaches it to
@@ -2067,14 +2067,14 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           The `hint` signal (Phase 8) is the real fix.
     - [ ] Auto-TAP egress is whatever the operator enforces on the bridge.
           Per-sandbox egress policy needs gated networking, which still
-          cannot take memory checkpoints (call 43).
+          cannot take memory checkpoints (call 55).
     - [ ] Dev mode (Apple `container`) does not mirror env-delivered tokens
           into `/legion/identity`, so env tokens there keep their boot value.
     - [ ] The `container stats` call runs synchronously on the heartbeat
           path every 10s while a dev sandbox runs. Move it off the loop if it
           ever shows up in heartbeat latency.
-    - [ ] Track 1's calls are appended with their intended ranks. Insert
-          them at rank and renumber when the tracks merge.
+    - [x] Track 1's calls are inserted at their ranks and every citation
+          renumbered.
   - [ ] Phase 8: fast paths, each needing its own review (wake on connect,
         `hint` idle signal, UFFD lazy memory, diff snapshots). Deferred.
 - [ ] Split a task runtime's implementation into parts — isolation vs. runner vs.
