@@ -156,6 +156,7 @@ header. Entries give the call, the alternatives, the trade-off, and why — rank
 by project impact. The full template and a worked example:
 [`calls/README.md`](calls/README.md).
 
+- [architecture-audit-2026-10-09_calls.md](calls/architecture-audit-2026-10-09_calls.md)
 - [artifact-system-plan_calls.md](calls/artifact-system-plan_calls.md)
 - [artifact-cache-and-prewarm-plan_calls.md](calls/artifact-cache-and-prewarm-plan_calls.md)
 - [autoscaler-plan_calls.md](calls/autoscaler-plan_calls.md)

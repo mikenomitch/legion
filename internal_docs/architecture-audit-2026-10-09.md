@@ -13,7 +13,8 @@ cluster at the edges: retries across failover, upgrades, empty or stuck nodes,
 and trust between workers.
 
 Each finding has an ID used by the fix PR, its commits, and the calls doc. The
-**Status** line records what the fix PR did. Line numbers are from the review
+**Status** line records what the fix PR did, and the
+[calls doc](calls/architecture-audit-2026-10-09_calls.md) records why. Line numbers are from the review
 and may have drifted.
 
 ## Critical
@@ -27,6 +28,7 @@ and may have drifted.
   stopped.
 - Unit tests call `reconcile_allocations(&[])` directly and the simulator
   reconciles unconditionally, so neither covers the daemon's guard.
+- **Status:** Fixed. Every acknowledged reply reconciles, including an empty one. The guard protected nothing: failed heartbeats return early, and the manager errors rather than returning an empty list.
 
 ### S1. Worker registration lets any node take over any other node's identity
 - `verify_join_for_registration` (`src/manager/server.rs`) returns `Ok` for any
@@ -40,6 +42,7 @@ and may have drifted.
   `docs/auth-and-acls.md`.
 - `Heartbeat`, `HealthCheck`, `RatifyClaim`, and `FetchNetPolicy` never bind
   the request's node id to the caller's principal.
+- **Status:** Fixed. Join tokens pin worker type and pool, node tokens may only re-register their own node, and worker-plane node ids are bound to the caller. Open: a join secret can still claim an existing node name (calls #3, TODO).
 
 ### R1. A new raft leader captures writes before it has applied the log
 - `execute_replicated` (`src/storage/raft/driver.rs`) only checks
@@ -50,6 +53,7 @@ and may have drifted.
   entry 102. Entry 100 applies first, entry 102 conflicts, and
   `resolve_apply_conflict` aborts. That is deterministic, so every replica
   including the leader halts the lane on the same entry.
+- **Status:** Fixed. A new leader calls `ensure_linearizable` before its first capture in a term.
 
 ### R2. Rolling manager upgrades across an `ADD COLUMN` silently split replicas
 - Raft entries are SQLite session changesets. SQLite skips every change for a
@@ -60,6 +64,7 @@ and may have drifted.
   them later never replays the lost writes.
 - `docs/upgrades.md` recommends rolling upgrades. `raft/types.rs` says mixed
   versions are unsupported. Only the keyring has a schema-version gate.
+- **Status:** Fixed. Apply errors on a schema mismatch instead of skipping, and the leader refuses writes an older member can't apply. `docs/upgrades.md` now says leader last (calls #2).
 
 ### R4. Streaming-mode lease fencing does not fence
 - `Store::is_raft_leader` returns `true` for every non-raft backend, so a
@@ -68,6 +73,7 @@ and may have drifted.
   two managers ship to one replica prefix.
 - Nothing restores a standby from the replica when it takes the lease.
   `docs/persistence-streaming.md` promises "automatic primary election/fencing".
+- **Status:** Fixed. Standbys idle and refuse writes, a lease winner restores from the replica before shipping, and a primary that loses the lease is fenced (calls #4).
 
 ### SC1. A rollback is undone by the next leader failover
 - `rollback_rollout` re-places the old config but the job's latest config is
@@ -77,6 +83,7 @@ and may have drifted.
   health gating. Rollback is the default `onHealthDeadline`.
 - A stopped rollout without revert leaves a mixed state that the same pass
   force-completes.
+- **Status:** Fixed for reconciliation. Open: forced reschedule, KV restart, and `job scale` after a rollback still target the rolled-back config (calls #5, TODO).
 
 ## High
 
@@ -86,6 +93,7 @@ and may have drifted.
 - Reschedule evals for jobs A, B, and C on one node collapse into A's, leaving
   B and C under-replicated. A stale v2 `rollout_tick` sweeps the v3 tick and
   stalls the new rollout.
+- **Status:** Fixed. The sweep collapses only the same kind, job, config, and node.
 
 ### SC3. Lost-node and drain rescheduling can strand jobs
 - `reschedule_allocations_for_lost_node` and the drain variant remove
@@ -93,6 +101,7 @@ and may have drifted.
   config aborts the rest.
 - The re-enqueue that the code comment relies on only fires for nodes that
   still have allocations, so nothing heals it.
+- **Status:** Fixed. Each config reconciles on its own, and a failure queues a delayed retry.
 
 ### SC4. Nothing retries placement when capacity appears
 - "No capacity" fails the eval terminally. Production never enqueues
@@ -100,11 +109,13 @@ and may have drifted.
 - Under-capacity jobs never converge as nodes join, and per-node
   (`count.per`) tasks never reach new nodes. `docs/autoscaling.md` says
   otherwise.
+- **Status:** Partly fixed. Registration and uncordon queue one capacity pass. Open: stop and scale-in, heartbeat recovery, and batch tasks don't trigger it (calls #10, TODO).
 
 ### SC5. Plans don't check the job or config is still wanted
 - `plan_and_apply_internal` never checks job status or that `job_config_id` is
   still the latest. A delayed reschedule after `job stop`, or after a v2
   rollout completes, places the full count for a stopped or superseded config.
+- **Status:** Fixed. Plans check the config is still wanted, before planning and at apply (calls #7).
 
 ### S2. With ACLs off, any website can drive the cluster
 - gRPC-Web is served with `CorsLayer::allow_origin(Any)`, and the exec
@@ -112,12 +123,14 @@ and may have drifted.
 - The default `configs/manager.ncl` has ACLs off, which makes every caller
   management. A malicious page can call `RunJob` against `127.0.0.1`, and DNS
   rebinding works the same way.
+- **Status:** Fixed. Browser origins must be loopback or in the new `server.allowedOrigins` (calls #1).
 
 ### S3. `state:read` exposes plaintext private keys
 - `QueryStateStore` runs arbitrary SELECTs. `signing_key.private_key_pem` and
   `net_mesh_ca.key_pem` are stored in plaintext.
 - A `state:read` holder can forge workload-identity JWTs and boot tickets and
   mint mesh certs. `docs/auth-and-acls.md` implies only KV values are hidden.
+- **Status:** Fixed. `QueryStateStore` reads private keys and password hashes as NULL. State backups still contain them (calls #13).
 
 ### S4. Idempotency keys are one global namespace and never expire
 - `idempotency_lookup` selects by `key` only and never compares `operation`.
@@ -125,6 +138,7 @@ and may have drifted.
   returns `deduplicated: true`. A second user can replay another's key and read
   their recorded reply.
 - No code path ever deletes from `idempotency_record`.
+- **Status:** Fixed. Keys are scoped by operation and caller, and records are pruned after 24 hours (calls #6).
 
 ### R3. Clusters formed before KV encryption get the root key only on the leader
 - The root key reaches a manager only through the raft join reply. Existing
@@ -133,6 +147,7 @@ and may have drifted.
   KV writes fail cluster-wide. Losing the original leader's disk loses every
   KV value. `docs/kv-encryption.md` says the rolling upgrade turns encryption
   on by itself.
+- **Status:** Fixed. Members fetch the existing root key over a new `FetchRootKey` raft RPC (calls #9).
 
 ### W2. Tasks are re-adopted by bare pid
 - `restore_allocations` accepts any pid that `pid_is_running`. After a host
@@ -140,6 +155,7 @@ and may have drifted.
   reports as running, and later kills on stop.
 - `pid_is_running` rescans the process table per call, once per allocation per
   second, under the task-manager mutex.
+- **Status:** Fixed. Re-adoption checks the process start time, and the liveness check reads one pid.
 
 ### W3. Blocking work under the task-manager mutex starves heartbeats
 - Volume mounts, `plugin.prepare`/`start`, and OCI registry pulls run while
@@ -147,16 +163,19 @@ and may have drifted.
   self-fence watchdog also need.
 - A slow pull or attach past the lost window gets the node marked lost and its
   stateless work replaced, so it runs twice.
+- **Status:** Partly fixed. Launches run outside the lock. Open: stop, destroy, unmount, edge-boot starts, and `ratify_claim` still run under it (calls #11, TODO).
 
 ### M1. One template upload can hang a manager core forever
 - `UpsertJobTemplate` evaluates Nickel with no timeout through
   `block_in_place`. A non-terminating program pins a thread per call, and a few
   calls starve raft heartbeats.
+- **Status:** Fixed. Evaluation runs on a capped thread pool with a 5-second budget (calls #14).
 
 ### M2. A failed gRPC bind leaves a headless manager running
 - The serve future's result is discarded inside a `join!`. A bind or TLS
   failure leaves eval workers and the node checker running with no API and no
   raft transport.
+- **Status:** Fixed. A gRPC server exit ends `run_manager` with an error.
 
 ## Medium
 
@@ -164,54 +183,67 @@ and may have drifted.
 - `stop_allocation_inner` removes the allocation before draining, and
   `persist_state` only serializes `self.allocations`. A worker restart orphans a
   task that ignores SIGTERM, and its volume loses its in-use guard.
+- **Status:** Fixed. Stopping allocations are persisted and finished after a restart.
 
 ### W5. The hard kill hits only the leader pid
 - SIGTERM goes to the process group, but the deadline SIGKILL goes to the pid
   alone. `sh -c server` orphans the server.
+- **Status:** Fixed. The hard kill SIGKILLs the process group.
 
 ### W6. The self-fence clock resets on every worker restart
 - `last_successful_heartbeat` starts at `Instant::now()` on boot and is never
   persisted, so a crash-looping partitioned worker pushes its fence out each
   restart while the manager's `replaceAfter` keeps counting.
+- **Status:** Fixed, and the gap was bigger than described: a worker that couldn't reach the manager never restored or fenced at all. A boot fence now uses a persisted last-contact time (calls #12).
 
 ### SC6. `job_update` and rollback delete everything, then place with no recovery
 - If the plan fails, the job sits at zero allocations with a terminal failed
   eval, and nothing re-derives it in steady state.
+- **Status:** Fixed. Failed placements queue a retry, and stale updates are skipped before anything is removed.
 
 ### SC7. Fresh plans spend capacity the old config still holds
 - Apply counts the replaced job's allocations as free, and the old config is
   removed only after apply, so nodes briefly overcommit.
+- **Status:** Not changed. Deliberate: without it, resubmitting a job that uses more than half a node fails. The atomic swap is in TODO (calls #17).
 
 ### S5. `RotateMeshCa` is cluster-wide behind a pool-scoped check
 - It uses `check_acl(Net, Write, AclScope::any())`, which any pool-scoped net
   admin passes.
+- **Status:** Fixed. Requires unscoped `net:write`.
 
 ### S6. Re-registration resets node availability
 - `worker_register` hardcodes `availability: "available"`, so a worker restart
   silently un-drains a node.
+- **Status:** Fixed. Re-registration keeps the stored availability.
 
 ### S7. Fetch-before-check, unscoped volume delete, and streams that never re-auth
 - `GetNode` and `RestartWorker` fetch before enforcing ACLs. `DeleteVolume`
   enforces no scope on volumes without a job. `StreamEvents` and exec sessions
   keep running after their token is revoked.
+- **Status:** Fixed. Coarse checks before fetch (also on `UpdateNodeDynamic`), jobless volumes need cluster-wide `job:write`, and streams re-check credentials every 30 seconds (calls #18).
 
 ### M3. The manager has no shutdown path
 - No SIGTERM handler, so raft leaders die without transferring leadership and
   streaming mode never does its final sync.
+- **Status:** Fixed. SIGTERM and SIGINT drain, stop loops, and shut persistence down. No leadership transfer, since openraft 0.9 has none (calls #16).
 
 ### M4. KV-driven reconciliation is best-effort, though the docs say "never dropped"
 - KV events are queued in memory and discarded on error, crash, or
   `NotRaftLeader`. No sweep recovers them.
+- **Status:** Fixed with a known gap. A leader sweep recovers missed puts and fail-on-delete. Missed deletes under `restart` or `rollout` policies are undetectable (calls #15, TODO).
 
 ### M5. Nothing guards the wire contract
 - No `buf breaking`-style check in CI, and proto history already shows a
   renumbered field and a reused number.
+- **Status:** Fixed. A `proto-breaking` CI job runs `buf breaking` against the base branch.
 
 ### M6. The dylib plugin ABI is Rust-to-Rust and unchecked
 - Plugins export `Box<dyn Trait>` across a dylib boundary, guarded only by
   hand-bumped integers. A different rustc or serde feature set passes the check
   and is undefined behavior. Rollout plugins run inside the manager.
+- **Status:** Partly fixed. Mismatched plugin builds are refused at load. Open: a stable ABI, and rollout plugins still run in the manager (calls #8, TODO).
 
 ### R5. Snapshot builds stall every write and load the database into memory
 - `VACUUM INTO` runs under the process-global capture mutex, and the image is
   read fully into memory on build and install.
+- **Status:** Partly fixed. Snapshot builds no longer block writes. Open: snapshots are still held in memory (calls #26, TODO).
