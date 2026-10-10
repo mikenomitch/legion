@@ -5,7 +5,9 @@
     # advertiseAddr = "http://10.0.0.5:4747",  # address embedded in join tokens
     # tls = { enabled = true, certPath = "/etc/legion/server.pem", keyPath = "/etc/legion/server.key" },
   },
-  storePath = ".legion",
+  # State store dir (store.sqlite, keys/, backups/). Defaults to
+  # $LEGION_DATA_DIR, else ./.legion (docs/data-directory.md).
+  # storePath = "/var/lib/legion",
   workerConfigPath = "./configs/workers/",
   evalThreads = 4,
   schedulingPolicy = "bin_pack",

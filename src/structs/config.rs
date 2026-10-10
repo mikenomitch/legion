@@ -7,13 +7,13 @@ use serde_json::Value;
 pub const DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT: f64 = 0.2;
 
 use crate::prelude::{
-    bail, Context, DEF_EVAL_PRIORITY, DEF_HEARTBEAT_HEADROOM, DEF_HEARTBEAT_MAX_INTERVAL_SEC,
-    DEF_HEARTBEAT_MIN_INTERVAL_SEC, DEF_KV_DEBOUNCE_MS, DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC,
-    DEF_LIVENESS_DIGEST_INTERVAL_SEC, DEF_LIVENESS_FAILOVER_GRACE_SEC,
-    DEF_LIVENESS_PEER_DIGEST_GRACE_SEC, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT,
-    DEF_MANAGER_SERVER_PORT, DEF_MISSED_BEATS_BEFORE_LOST, DEF_ROLLOUT_RETENTION_DAYS,
-    DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
-    MIN_LIVENESS_CHECKPOINT_INTERVAL_SEC, R,
+    bail, default_raft_data_dir, default_store_path, Context, DEF_EVAL_PRIORITY,
+    DEF_HEARTBEAT_HEADROOM, DEF_HEARTBEAT_MAX_INTERVAL_SEC, DEF_HEARTBEAT_MIN_INTERVAL_SEC,
+    DEF_KV_DEBOUNCE_MS, DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC, DEF_LIVENESS_DIGEST_INTERVAL_SEC,
+    DEF_LIVENESS_FAILOVER_GRACE_SEC, DEF_LIVENESS_PEER_DIGEST_GRACE_SEC, DEF_MANAGER_HOSTNAME,
+    DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT, DEF_MISSED_BEATS_BEFORE_LOST,
+    DEF_ROLLOUT_RETENTION_DAYS, DEF_SCHEDULING_POLICY, DEF_WORKER_CHECK_SEC,
+    DEF_WORKER_CONFIG_PATH, MIN_LIVENESS_CHECKPOINT_INTERVAL_SEC, R,
 };
 use crate::structs::workload_identity::NodeIdentityConfig;
 
@@ -1478,8 +1478,6 @@ impl Default for RaftPersistenceConfig {
     }
 }
 
-/// Default root directory for raft engine state (logs + cluster identity).
-pub const DEF_RAFT_DATA_DIR: &str = ".legion/raft";
 /// Default raft topology: one group carries every lane (plan JC-2).
 pub const DEF_RAFT_TOPOLOGY: &str = "single";
 /// Default snapshot/compaction threshold: applied log entries between
@@ -1675,7 +1673,7 @@ impl Default for RaftPersistenceConfigFull {
             bootstrap: false,
             peers: Vec::new(),
             join_token_ttl_seconds: 900,
-            data_dir: DEF_RAFT_DATA_DIR.to_string(),
+            data_dir: default_raft_data_dir(),
             topology: DEF_RAFT_TOPOLOGY.to_string(),
             advertise_addr: None,
             cluster_secret: None,
@@ -1780,10 +1778,7 @@ impl ManagerConfig {
 
         ManagerConfigFull {
             server: server_config,
-            store_path: self
-                .store_path
-                .clone()
-                .unwrap_or_else(|| DEF_STORE_PATH.into()),
+            store_path: self.store_path.clone().unwrap_or_else(default_store_path),
             worker_config_path: self
                 .worker_config_path
                 .clone()
@@ -1860,7 +1855,7 @@ impl Default for ManagerConfigFull {
     fn default() -> Self {
         ManagerConfigFull {
             server: ServerConfig::full_default(),
-            store_path: DEF_STORE_PATH.into(),
+            store_path: default_store_path(),
             worker_config_path: DEF_WORKER_CONFIG_PATH.into(),
             worker_check_seconds: DEF_WORKER_CHECK_SEC,
             scheduling_policy: DEF_SCHEDULING_POLICY.into(),
@@ -1947,10 +1942,7 @@ impl RaftPersistenceConfig {
             bootstrap: self.bootstrap.unwrap_or(false),
             peers: self.peers.clone().unwrap_or_default(),
             join_token_ttl_seconds: self.join_token_ttl_seconds.unwrap_or(900),
-            data_dir: self
-                .data_dir
-                .clone()
-                .unwrap_or_else(|| DEF_RAFT_DATA_DIR.to_string()),
+            data_dir: self.data_dir.clone().unwrap_or_else(default_raft_data_dir),
             topology: self
                 .topology
                 .clone()

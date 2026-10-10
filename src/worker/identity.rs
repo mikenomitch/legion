@@ -52,9 +52,9 @@ use tonic::Code;
 /// Default token file mode: owner-read only.
 pub const DEFAULT_TOKEN_FILE_MODE: u32 = 0o400;
 
-/// Root (relative to the worker's working directory) for the well-known
-/// per-identity token files that back env-delivered identities.
-pub const IDENTITY_TOKEN_DIR: &str = ".legion/identity";
+/// Subdirectory of the data dir (`LEGION_DATA_DIR`, else `./.legion`) for the
+/// well-known per-identity token files that back env-delivered identities.
+pub const IDENTITY_TOKEN_SUBDIR: &str = "identity";
 
 /// Maximum backoff between re-issue retries inside the refresh loop.
 const REFRESH_RETRY_MAX: Duration = Duration::from_secs(30);
@@ -356,15 +356,7 @@ impl WorkerIdentityManager {
             }
         }
         // Drop the per-allocation env-fallback tree, if any.
-        let fallback_dir = {
-            let mut root = PathBuf::from(IDENTITY_TOKEN_DIR);
-            if !root.is_absolute() {
-                if let Ok(cwd) = std::env::current_dir() {
-                    root = cwd.join(root);
-                }
-            }
-            root.join(alloc_id.to_string())
-        };
+        let fallback_dir = identity_token_root().join(alloc_id.to_string());
         if let Err(err) = fs::remove_dir_all(&fallback_dir) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 debug!(allocation_id = alloc_id, error = ?err, "Failed to remove identity fallback dir");
@@ -420,8 +412,8 @@ fn backing_file_path(
 }
 
 /// Well-known per-identity token path backing env-delivered identities:
-/// `<cwd>/.legion/identity/<alloc>/<name>/token`, **absolute** (rooted at the
-/// worker's working directory at startup).
+/// `<data dir>/identity/<alloc>/<name>/token`, **absolute** (a relative data
+/// dir is rooted at the worker's working directory).
 ///
 /// It must be absolute because the same value is injected as the `<ENV>_FILE`
 /// companion for a `changeMode: signal` handler to re-read, and a task's own
@@ -438,15 +430,22 @@ fn backing_file_path(
 /// instead of writing outside the task dir.
 pub fn fallback_token_path(alloc_id: i64, identity_name: &str) -> PathBuf {
     let safe_name = sanitize_identity_name_component(identity_name);
-    let mut root = PathBuf::from(IDENTITY_TOKEN_DIR);
-    if !root.is_absolute() {
-        if let Ok(cwd) = std::env::current_dir() {
-            root = cwd.join(root);
-        }
-    }
-    root.join(alloc_id.to_string())
+    identity_token_root()
+        .join(alloc_id.to_string())
         .join(safe_name)
         .join("token")
+}
+
+/// `<data dir>/identity`, made absolute against the worker's cwd.
+fn identity_token_root() -> PathBuf {
+    let root = data_dir().join(IDENTITY_TOKEN_SUBDIR);
+    if root.is_absolute() {
+        return root;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(root),
+        Err(_) => root,
+    }
 }
 
 /// Return `identity_name` unchanged if it passes the strict admission charset,
@@ -927,7 +926,7 @@ mod tests {
         let s = p.to_string_lossy();
         assert!(!s.contains(".."), "path still contains traversal: {s}");
         // Absolute (rooted at cwd) but still under the identity token dir.
-        assert!(s.contains(IDENTITY_TOKEN_DIR), "{s}");
+        assert!(s.contains("/identity/7/"), "{s}");
         assert!(s.ends_with("token"), "{s}");
         // A valid name is preserved verbatim.
         let ok = fallback_token_path(7, "vault");

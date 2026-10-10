@@ -32,8 +32,9 @@ two append-mode files in a per-allocation directory:
 └── meta.json          # resource manifest for log shippers
 ```
 
-The state dir defaults to `.legion/workers/<worker-id>/` (override the worker
-state path with `LEGION_WORKER_STATE_PATH`).
+The state dir defaults to `.legion/workers/<worker-id>/`. Move the whole tree
+with `LEGION_DATA_DIR` (see [data-directory.md](data-directory.md)), or just the
+worker state path with `LEGION_WORKER_STATE_PATH`.
 
 The per-allocation log directory is owner-only (`0700` on Unix). Captured
 output can contain secrets, so other tasks and local users on the node can't
@@ -233,7 +234,7 @@ Each worker writes (relative to the **worker process's working directory**):
 > find / -path '*/.legion/workers/*/logs/*/stdout.log' 2>/dev/null | head
 > ```
 >
-> (`LEGION_WORKER_STATE_PATH` overrides the base directory.)
+> (`LEGION_DATA_DIR` or `LEGION_WORKER_STATE_PATH` overrides the base directory.)
 
 Run the collector on the same host as the worker so it can read those local
 files. You need one collector per worker host.

@@ -46,14 +46,20 @@ LEGION_ADDR=http://127.0.0.1:4747 cargo run -- ledger
 A worker serves its own gRPC endpoint on port 4848 and advertises that address
 to the manager, so two workers on one host collide (the manager dispatches both
 allocations to whichever process owns the port). Set `LEGION_WORKER_PORT` to
-give a second worker its own, and point the manager at a free port and store
-path:
+give a second worker its own. Point the manager at a free port, and give both
+processes their own `LEGION_DATA_DIR` so they share no state with your main
+cluster (see `docs/data-directory.md`):
 
 ```bash
-LEGION_WORKER_PORT=4858 \
-LEGION_WORKER_STATE_PATH=/tmp/legion-test/worker-state.json \
-  cargo run -- start worker "$TOKEN" --name test-worker
+LEGION_DATA_DIR=/tmp/legion-test \
+  cargo run -- start manager -c /tmp/legion-test/manager.ncl  # server.port changed
+LEGION_DATA_DIR=/tmp/legion-test LEGION_WORKER_PORT=4858 \
+  cargo run -- start worker "$TOKEN"
 ```
+
+The same variable is the quickest way around a local `.legion` store left
+broken by another branch: start against a fresh `LEGION_DATA_DIR` instead of
+deleting it.
 
 ### Linux worker containers for local manager testing
 

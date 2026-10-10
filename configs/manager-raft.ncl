@@ -24,7 +24,9 @@
     port = 4747,
     host = "0.0.0.0",
   },
-  storePath = ".legion",
+  # State store dir (store.sqlite, keys/, backups/). Defaults to
+  # $LEGION_DATA_DIR, else ./.legion (docs/data-directory.md).
+  # storePath = "/var/lib/legion",
   workerConfigPath = "./configs/workers/",
   evalThreads = 4,
   schedulingPolicy = "bin_pack",
@@ -66,7 +68,8 @@
       expectedVoters = 3,
 
       # Raft log + cluster secret live here (state DB stays in storePath).
-      dataDir = ".legion/raft",
+      # Defaults to <data dir>/raft (docs/data-directory.md).
+      # dataDir = "/var/lib/legion/raft",
 
       # 'single' (default): one raft group carries all state — the
       # recommended topology. 'lanes': three independent raft groups

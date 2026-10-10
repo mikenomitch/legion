@@ -8,7 +8,7 @@ A Legion cluster has one or more managers and one or more workers. By default it
 
 - Manager:
   - Owns the scheduler and eval loop.
-  - Persists cluster state in local SQLite (`.legion/store.sqlite/store.sqlite` by default).
+  - Persists cluster state in local SQLite (`.legion/store.sqlite` by default, movable with `LEGION_DATA_DIR`. See [data-directory.md](data-directory.md)).
   - Exposes the main gRPC API on `:4747`. Join tokens are minted here through
     the authenticated `CreateJoinToken` RPC.
 - Worker:

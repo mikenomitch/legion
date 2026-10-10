@@ -301,7 +301,8 @@ is a single manager, and it is always primary.
    - **env**: injected into the task's env map before start. This happens on
      the worker, so tokens never pass through the scheduler. A live process's
      env can't change, so every env-delivered identity is also mirrored to a
-     backing file at `.legion/identity/<alloc-id>/<name>/token` (mode
+     backing file at `<data dir>/identity/<alloc-id>/<name>/token`, where the
+     data dir is `$LEGION_DATA_DIR` or `.legion` (mode
      `0400`). A companion `<ENV>_FILE` variable points at it.
 4. A refresh loop on the worker, one per identity, re-issues the token at
    roughly half its remaining TTL. It adds jitter, and retries with backoff if
