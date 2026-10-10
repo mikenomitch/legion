@@ -1,12 +1,10 @@
 # Volumes
 
 A stateful task needs its data to still be there after the task moves. The
-[stateful workloads](stateful-workloads.md) doc covers the *identity* half of
-that — replica 2 always comes back as replica 2. This doc covers the *storage*
-half: what replica 2's disk actually is, who creates it, and what happens to it
-when the replica goes away.
+[stateful workloads](stateful-workloads.md) doc covers identity: replica 2
+always comes back as replica 2. This doc covers storage: what replica 2's disk
+is, who creates it, and what happens to it when the replica goes away.
 
-> Design plan: [volume-plugin-system-plan.md](../internal_docs/plans/volume-plugin-system-plan.md).
 > Guides: [Postgres](guides/postgres.md), [Redis](guides/redis.md).
 
 ## The short version
@@ -26,20 +24,20 @@ when the replica goes away.
 }
 ```
 
-Three replicas (slot mode is the default), three independent data
-directories, each reattached to its own replica across restarts, redeploys,
-and reschedules. Nothing to install and
-nothing to configure: the default `local-dir` driver ships in the binary.
+This gives you three replicas (slot mode is the default) with three independent
+data directories. Each directory is reattached to its own replica across
+restarts, redeploys, and reschedules. There is nothing to install or configure,
+because the default `local-dir` driver ships in the binary.
 
 ## Concepts
 
 ### Volume vs storage handle
 
 An **instance** owns an opaque `storage_handle` that looks like
-`local-dir/9f2c…`. That is `{driver}/{volume_id}`: which driver owns the
-storage, and which volume it is. The **volume** is the row behind that handle —
-where it lives, what the driver recorded about it, and where it is in its
-lifecycle.
+`local-dir/9f2c…`. The format is `{driver}/{volume_id}`: which driver owns the
+storage, and which volume it is. The **volume** is the record behind that
+handle. It tracks where the storage lives, what the driver recorded about it,
+and where it is in its lifecycle.
 
 | | Allocation | Instance | Volume |
 | --- | --- | --- | --- |
@@ -47,26 +45,27 @@ lifecycle.
 | Dies when | rescheduled | destroyed / scaled in | reclaimed |
 | Identified by | churning integer | stable string id | `{driver}/{volume_id}` |
 
-Volumes deliberately **outlive** their instances: when an instance is destroyed
-its bytes still need reclaiming, so the volume row sticks around until a driver
-confirms the storage is gone.
+Volumes outlive their instances. When an instance is destroyed, its bytes still
+need reclaiming, so the volume record stays until a driver confirms the storage
+is gone.
 
 ### Instance storage vs volume claims
 
-Two declaration sites, because they are two different lifecycles:
+There are two places to declare storage, because they have two different
+lifecycles:
 
 | | `stateful.storage` | `volumes = [...]` |
 | --- | --- | --- |
 | One per | instance (replica) | task |
-| Provisioned | on first placement | never — it already exists |
+| Provisioned | on first placement | never (it already exists) |
 | Reclaimed | with the instance | only by `legion volume delete` |
 | Shared | no, single writer | yes, every allocation of the task |
 | Valid on stateless tasks | no | **yes** |
 
-`stateful.storage` is the K8s `volumeClaimTemplates` analog: one volume per
-replica, provisioned automatically. `volumes[]` is a claim on storage that
-already exists — a models directory, an NFS export, a scratch tmpfs — and works
-on any task, stateful or not.
+`stateful.storage` is the Kubernetes `volumeClaimTemplates` analog: one volume
+per replica, provisioned automatically. `volumes[]` is a claim on storage that
+already exists, such as a models directory, an NFS export, or a scratch tmpfs.
+It works on any task, stateful or not.
 
 ```nickel
 tasks = [{
@@ -86,15 +85,16 @@ tasks = [{
 
 Every driver declares whether its volumes are **node-local**:
 
-- **node-local** (`local-dir`, `host`, `tmpfs`) — the bytes exist on one
-  machine. The instance holding one is **pinned** to that node: replacements can
-  only be placed there. If the node is gone, the instance waits.
-- **network** (`nfs`) — any node can reach the storage. The instance
+- **Node-local** (`local-dir`, `host`, `tmpfs`): the bytes exist on one
+  machine. The instance holding the volume is **pinned** to that node, and
+  replacements can only be placed there. If the node is gone, the instance
+  waits.
+- **Network** (`nfs`): any node can reach the storage. The instance
   reschedules freely, and the volume follows.
 
-This is the single most important property of a driver, because it decides
-whether "my database comes back on the same machine" or "my database comes
-back". `legion volume list` marks a pin with `*`:
+This is the most important property of a driver. It decides whether your
+database comes back on the same machine, or comes back anywhere.
+`legion volume list` marks a pin with `*`:
 
 ```console
 $ legion volume list
@@ -107,16 +107,16 @@ $ legion volume list
 
 ### Filesystem mode vs block mode
 
-Every volume is handed over one of two ways, declared with `mode`:
+A volume is handed to the task in one of two ways, set with `mode`:
 
-- **`filesystem`** (the default) — a host directory the task reads and writes.
-  What `exec` and `container` tasks want.
-- **`block`** — a raw block device or disk image the task *attaches*. A guest
+- **`filesystem`** (the default): a host directory the task reads and writes.
+  This is what `exec` and `container` tasks want.
+- **`block`**: a raw block device or disk image the task attaches. A guest
   kernel consumes a virtio-blk device, not a host directory, so a
   [`sandbox`](task-runtime-sandbox.md) microVM cannot use a filesystem volume
   at all.
 
-This is the same split Kubernetes makes with `volumeMode`, for the same reason.
+Kubernetes makes the same split with `volumeMode`, for the same reason.
 
 ```nickel
 stateful = {
@@ -132,11 +132,11 @@ stateful = {
 
 Three things have to agree, and admission checks all three at submit:
 
-1. the **task runtime's** supported modes (`exec`/`container` → filesystem;
-   `sandbox` → both, split by backend — block on microVMs, filesystem in its
-   dev modes);
-2. the **driver's** supported modes (`legion volume drivers` shows them);
-3. the mode the **job** asked for.
+1. The **task runtime's** supported modes. `exec` and `container` support
+   filesystem. `sandbox` supports both, split by backend: block on microVMs,
+   filesystem in its dev modes.
+2. The **driver's** supported modes (`legion volume drivers` shows them).
+3. The mode the **job** asked for.
 
 ```
 task db stateful.storage: task runtime `exec` cannot consume a `block` volume (it
@@ -144,35 +144,35 @@ supports: filesystem). Filesystem volumes are directories a process reads; block
 volumes are devices a guest attaches
 ```
 
-**The driver formats, never the guest.** A block volume is created and
-formatted with `params.fs` (default `ext4`) on its first mount, so `mkfs` never
-runs inside an untrusted guest and "is this volume fresh?" is a driver-side
-fact rather than a guess. `mount` returns `fresh = true` exactly once — on the
-call that created the storage — which is the signal to run first-boot
-initialization. **A remount never reformats**; the conformance suite has a
-dedicated check for that, because getting it wrong silently destroys the volume
-you asked to reattach.
+The driver formats block volumes, never the guest. A block volume is created
+and formatted with `params.fs` (default `ext4`) on its first mount. That way
+`mkfs` never runs inside an untrusted guest, and the driver knows for certain
+whether a volume is fresh. `mount` returns `fresh = true` only once, on the call
+that created the storage. Use that signal to run first-boot initialization.
 
-A driver is also allowed to return a device that is **not yet fully populated**
-— an NBD/FUSE device over a content-addressed base, a qcow2 backing chain,
-dm-thin over a sparse file — so a consumer can start before the data finishes
-syncing. Nothing in the contract requires `mount` to block until every byte is
-local.
+A remount never reformats. The conformance suite checks this, because getting
+it wrong silently destroys the volume you asked to reattach.
+
+A driver may also return a device that is not yet fully populated, so a
+consumer can start before the data finishes syncing. Examples include an
+NBD/FUSE device over a content-addressed base, a qcow2 backing chain, or
+dm-thin over a sparse file. The contract does not require `mount` to block
+until every byte is local.
 
 ## How `path` works per task runtime
 
-`path` is where the *task* sees the volume, and different task runtimes see
-different filesystems. Legion does not pretend otherwise:
+`path` is where the task sees the volume. Different task runtimes see different
+filesystems, so `path` behaves differently in each:
 
 | Runtime | What `path` does | What the task should read |
 | --- | --- | --- |
-| `container` | A real bind mount at that destination inside the container. **Required.** | `path` — or `$LEGION_VOLUME_<NAME>`, which carries the same value |
-| `exec` | Nothing. An exec task runs in the **host** mount namespace: there is no filesystem view to mount into, and creating a mount at `/var/lib/db` on the operator's machine is not something a jobspec should be able to do. `path` is recorded and shown in the UI/CLI as intent. | `$LEGION_VOLUME_<NAME>` (or `$LEGION_STORAGE_DIR`), which carries the real host path |
-| `sandbox` | Block mode: the guest init mounts the attached virtio-blk device there. Dev modes: a bind mount, like `container`. Omitted on a block volume = attach-only (the guest gets the raw device). | `path` — or `$LEGION_VOLUME_<NAME>`, which carries the guest path |
+| `container` | A real bind mount at that destination inside the container. **Required.** | `path`, or `$LEGION_VOLUME_<NAME>`, which carries the same value |
+| `exec` | Nothing. An exec task runs in the **host** mount namespace, so there is no filesystem view to mount into. A jobspec should not be able to create a mount at `/var/lib/db` on the operator's machine. `path` is recorded and shown in the UI and CLI as intent. | `$LEGION_VOLUME_<NAME>` (or `$LEGION_STORAGE_DIR`), which carries the actual host path |
+| `sandbox` | Block mode: the guest init mounts the attached virtio-blk device there. Dev modes: a bind mount, like `container`. If you omit `path` on a block volume, the volume is attach-only (the guest gets the raw device). | `path`, or `$LEGION_VOLUME_<NAME>`, which carries the guest path |
 
 Every volume is exported as `LEGION_VOLUME_<NAME>` (name upper-cased,
 non-alphanumerics folded to `_`). The instance volume from `stateful.storage` is
-additionally exported as **`LEGION_STORAGE_DIR`**, which is what the guides use:
+also exported as **`LEGION_STORAGE_DIR`**, which is what the guides use:
 
 ```nickel
 # exec — read the env var
@@ -185,38 +185,38 @@ config = { image = "postgres:16", env = { PGDATA = "/var/lib/postgresql/data" } 
 
 ## Built-in drivers
 
-Four drivers ship in the binary. `legion volume drivers` shows what a given
-cluster actually has, including anything installed out of tree.
+Four drivers ship in the binary. Run `legion volume drivers` to see what a
+given cluster has, including anything installed out of tree.
 
 ### `local-dir` (the default)
 
-A directory under the worker's state dir, created on first mount, removed on
-destroy. Node-local. Zero configuration — this is what a bare
-`storage = { path = … }` uses.
+A directory under the worker's state dir, created on first mount and removed on
+destroy. It is node-local and needs no configuration. A bare
+`storage = { path = … }` uses this driver.
 
 ```nickel
 storage = { path = "/var/lib/db", params = { size = "10G", mode = "0700" } }
 ```
 
-`size` is **not a quota** in filesystem mode — a directory has no enforcement,
-and pretending otherwise would be worse than being honest. It *is* used for
-placement: the scheduler checks a node's free disk can hold a task's node-local
-volumes before placing there (network drivers like `nfs` are exempt — their
-bytes live on the storage server). `mode` sets the directory permissions.
+In filesystem mode, `size` is not a quota, because a directory has no
+enforcement. The scheduler does use it for placement: it checks that a node's
+free disk can hold a task's node-local volumes before placing there. Network
+drivers like `nfs` are exempt, since their bytes live on the storage server.
+`mode` sets the directory permissions.
 
-In **block mode** it serves a sparse disk image at
+In **block mode**, the driver serves a sparse disk image at
 `<volume dir>/<volume_id>/disk.img`, formatted with `params.fs` (default
-`ext4`) at `params.size` (default 1GiB). Here `size` *is* real — it is the
-image's size — and the image is a plain file, so producing one needs no
+`ext4`) at `params.size` (default 1GiB). Here `size` is enforced, because it is
+the image's size. The image is a plain file, so creating one needs no
 privileges and no loop device. Block mode is advertised only on nodes with the
-matching `mkfs` on `PATH`; elsewhere the driver reports filesystem mode only
+matching `mkfs` on `PATH`. Elsewhere the driver reports filesystem mode only
 and says why.
 
 ### `host`
 
-Claims a path the operator declared in the worker config. No provisioning, and
-`destroy` is deliberately a **no-op**: the data belongs to the operator, so a
-scaled-in job must never delete `/mnt/models`.
+Claims a path the operator declared in the worker config. It does no
+provisioning, and `destroy` is a **no-op**. The data belongs to the operator,
+so a scaled-in job must never delete `/mnt/models`.
 
 ```nickel
 # worker config (configs/workers/<type>.ncl)
@@ -235,8 +235,8 @@ volumes = [{ name = "models", driver = "host", params = { name = "models" },
             path = "/models", readOnly = true }],
 ```
 
-For block mode, declare a `device` instead of a `path` — the bare-metal escape
-hatch for handing a dedicated disk to a guest:
+For block mode, declare a `device` instead of a `path`. Use this to hand a
+dedicated disk to a guest on bare metal:
 
 ```nickel
 hostVolumes = {
@@ -244,22 +244,22 @@ hostVolumes = {
 }
 ```
 
-`host` never formats a declared device: whatever is on the operator's disk is
-what the consumer gets.
+`host` never formats a declared device. The consumer gets whatever is on the
+operator's disk.
 
-`readOnly` on the declaration is a hard boundary: a read-write claim is an
-error, not a silent downgrade. `create` (default false) makes the worker create
-a missing directory — off by default so a typo in a path cannot silently produce
-an empty volume where real data was meant to be.
+`readOnly` on the declaration is a hard boundary. A read-write claim against it
+is an error, not a silent downgrade. `create` (default false) makes the worker
+create a missing directory. It is off by default so a typo in a path cannot
+silently produce an empty volume where your data was supposed to be.
 
-This is the escape hatch for "the bytes are already on the machine" and the way
-to put a database on a specific NVMe.
+Use `host` when the bytes are already on the machine, or to put a database on
+a specific NVMe drive.
 
 ### `nfs`
 
-Mounts an NFS export and hands out a per-volume subdirectory inside it. The one
-built-in that is **not** node-local, so instances holding an `nfs` volume
-reschedule anywhere that can reach the server.
+Mounts an NFS export and hands out a per-volume subdirectory inside it. This is
+the only built-in driver that is **not** node-local, so instances holding an
+`nfs` volume can reschedule to any node that can reach the server.
 
 ```nickel
 storage = {
@@ -276,28 +276,28 @@ storage = {
 | `subdir` | optional | Subdirectory within the export (default: the volume id) |
 | `options` | optional | `mount -o` string (default `vers=4`, or `resvport` on macOS) |
 
-Mounting needs privileges: run the worker as root, or the driver reports itself
-unavailable and jobs claiming it are rejected at admission with the reason.
+Mounting needs privileges. Run the worker as root. Otherwise the driver reports
+itself unavailable, and admission rejects jobs that claim it, with the reason.
 
 ### `tmpfs`
 
-RAM-backed scratch, sized by `size`, wiped on unmount. **Linux only** — macOS
-has no tmpfs, and quietly substituting a disk-backed directory would turn "this
-is in RAM and capped at 512M" into a lie.
+RAM-backed scratch space, sized by `size` (default `64M`) and wiped on unmount. It is **Linux
+only**. macOS has no tmpfs, and substituting a disk-backed directory would
+break the promise that the data is in RAM and capped at the size you set.
 
 ```nickel
 volumes = [{ name = "scratch", driver = "tmpfs", params = { size = "2G" },
             path = "/scratch" }],
 ```
 
-`tmpfs` advertises itself as **ephemeral**, and admission rejects it for
-`stateful.storage`: the instance contract promises data survives a reschedule
+`tmpfs` advertises itself as **ephemeral**, so admission rejects it for
+`stateful.storage`. Instance storage promises that data survives a reschedule,
 and a tmpfs cannot keep that promise. Declare it under `volumes` instead.
 
 > A `tmpfs` claim is shared per `(job, group, task, name)` like any other claim,
-> so two allocations of the same task on one node share it. For genuinely
-> per-allocation scratch, use `$LEGION_TASK_DIR`, which is already private and
-> cleaned up on stop.
+> so two allocations of the same task on one node share it. For per-allocation
+> scratch, use `$LEGION_TASK_DIR`, which is already private and cleaned up on
+> stop.
 
 ## Lifecycle
 
@@ -312,20 +312,20 @@ instance ──────────────────────> pen
                                           (driver confirmed)
 ```
 
-- **Provisioning is lazy.** There is no separate create step: the first `mount`
-  creates the storage. A volume that never mounted is a row and a name — nothing
-  external leaks.
+- **Provisioning is lazy.** There is no separate create step. The first `mount`
+  creates the storage. A volume that never mounted is only a record and a name,
+  so nothing external leaks.
 - **Reclaim is reconciled, not triggered.** A background loop marks any volume
   that no instance references as `destroying`. One rule covers every way a
-  handle can be dropped (keyed destroy, scale-in without `retainOnScaleIn`,
-  `retainOnStop = false` on job stop, a job destroy that cascades instance rows
-  away), so no code path can forget to free storage.
-- **Destroy is two-phase.** The manager marks `destroying` and re-sends the
-  request to the owning worker on every heartbeat until a driver confirms. A
-  worker that dies mid-destroy simply retries; nothing leaks and nothing is
-  double-deleted.
+  handle can be dropped: keyed destroy, scale-in without `retainOnScaleIn`,
+  `retainOnStop = false` on job stop, and a job destroy that removes instance
+  records. No code path can forget to free storage.
+- **Destroy is two-phase.** The manager marks the volume `destroying` and
+  re-sends the request to the owning worker on every heartbeat until a driver
+  confirms. A worker that dies mid-destroy retries. Nothing leaks and nothing
+  is deleted twice.
 
-Retention is governed by the same knobs stateful workloads already had —
+Retention uses the same settings as other stateful workloads:
 `retainOnScaleIn` and `retainOnStop`, both defaulting to Retain. See
 [Scale-In / Scale-Out Retention](stateful-workloads.md#scale-in--scale-out-retention).
 
@@ -359,8 +359,8 @@ operations are exposed over MCP as `legion_volume_list`, `legion_volume_get`,
 
 ### When a replica will not place
 
-A node-local volume pins its instance. If that node is gone, the eval fails with
-the reason rather than silently placing the replica on an empty disk elsewhere:
+A node-local volume pins its instance. If that node is gone, the eval fails
+with a reason. Legion does not place the replica on an empty disk elsewhere:
 
 ```
 Failed to place task postgres: instance db-default-1 holds node-local storage on
@@ -368,29 +368,29 @@ node node-a1, which is unavailable. Waiting for that node to return; use
 `legion volume delete --force <id>` to abandon the data if it never will
 ```
 
-`legion instance get <id>` says the same thing from the instance's side:
+`legion instance get <id>` reports the same thing from the instance's side:
 
 ```
 detail: volume-pinned: volume 9f2c8a1b… (local-dir) is node-local and lives on
 node node-a1 (status: lost), so this instance can only be placed there. …
 ```
 
-Two ways out:
+You have two options:
 
-1. **Bring the node back.** The replacement places itself the moment it returns,
-   with its data intact. This is usually what you want.
-2. **Abandon the data**: `legion volume delete --force <id>` detaches the volume
-   and tombstones it without driver confirmation. The instance mints a fresh,
-   empty volume and places anywhere. Whatever bytes exist on the dead node stay
-   there — which is why this is not the default.
+1. **Bring the node back.** The replacement places as soon as the node
+   returns, with its data intact. This is usually what you want.
+2. **Abandon the data.** `legion volume delete --force <id>` detaches the
+   volume and tombstones it without driver confirmation. The instance mints a
+   fresh, empty volume and places anywhere. Any bytes on the dead node stay
+   there, which is why this is not the default.
 
-Avoiding the choice entirely means not using node-local storage: an `nfs` volume
+To avoid this choice, don't use node-local storage. An `nfs` volume
 reschedules freely.
 
 ### Why is my job rejected?
 
-Admission validates volume declarations against what the cluster actually
-advertises, so storage problems surface at submit rather than at task start:
+Admission validates volume declarations against what the cluster advertises,
+so storage problems show up at submit time instead of at task start:
 
 ```
 task postgres stateful.storage: no node in the cluster provides volume driver
@@ -403,15 +403,14 @@ unusable everywhere: tmpfs mounts are Linux-only
 task db stateful.storage: volume driver `nfs` requires params: export
 ```
 
-`legion volume drivers` shows a `NODES` column as *usable/installed* — a gap
-between the two is exactly the thing to investigate.
+`legion volume drivers` shows a `NODES` column as *usable/installed*. If the two
+numbers differ, start investigating there.
 
 ## Common workflows
 
-The scenarios below are the design's test suite in prose: each is a real
-storage topology, and each should be achievable in a few lines of spec plus at
-most one CLI command. Where a workflow needs an honest caveat, it is written
-next to the workflow rather than hidden in a limitations section.
+Each scenario below is a common storage setup. Each takes a few lines of spec
+and at most one CLI command. Caveats are listed next to the workflow they apply
+to.
 
 ### A database with zero storage decisions
 
@@ -420,10 +419,10 @@ stateful = { storage = { path = "/var/lib/postgresql/data" } },
 ```
 
 Every field has a default: `mode = "slot"`, `driver = "local-dir"`,
-`volume_mode = "filesystem"`, retention on. One replica, one volume, data
-survives restarts and reschedules to the same node. This is the dev-cluster
-and single-node-production shape; the [Postgres guide](guides/postgres.md)
-builds on it.
+`storage.mode = "filesystem"`, and retention on. You get one replica and one
+volume, and the data survives restarts and reschedules to the same node. This
+fits dev clusters and single-node production. The
+[Postgres guide](guides/postgres.md) builds on it.
 
 ### Remote volume: lose the node, replace the instance, reattach
 
@@ -435,26 +434,31 @@ stateful = {
 },
 ```
 
-The node dies → the partitioned worker self-fences at 90s → the manager frees
-the allocation at 3m → the scheduler places a replacement on **any** node
-advertising `nfs` (no pin — the volume is not node-local) → `mount` reattaches
-the same export subdirectory, because the volume row carries the params and the
-subdir defaults to the volume id. No operator action; total downtime ≈
-`replaceAfter` + application recovery. Step-by-step narration:
+When the node dies:
+
+1. The partitioned worker self-fences at 90s.
+2. The manager frees the allocation at 3m.
+3. The scheduler places a replacement on **any** node advertising `nfs`. There
+   is no pin, because the volume is not node-local.
+4. `mount` reattaches the same export subdirectory. The volume record carries
+   the params, and the subdirectory defaults to the volume id.
+
+No operator action is needed. Total downtime is about `replaceAfter` plus
+application recovery. For a step-by-step walkthrough, see
 [the Postgres guide](guides/postgres.md#what-node-loss-looks-like-on-nfs-step-by-step).
 
-Prefer a human in the loop? `replaceAfter = "never"` parks the instance until
-someone runs `legion instance replace <id>`. Same reattach, manual trigger.
+To keep a human in the loop, set `replaceAfter = "never"`. The instance then
+waits until someone runs `legion instance replace <id>`, and reattaches the
+same way.
 
 ### Node-local volume: lose the node, wait for it
 
-With `local-dir` the bytes are on the node, so the same failure pins the
-replacement instead of moving it — see
-[When a replica will not place](#when-a-replica-will-not-place). This is a
-feature: silently starting a database on an empty disk *looks* like recovery
-and is actually data loss. You choose per job, at submit time, which failure
-mode you want: `nfs` moves freely, `local-dir` waits or is explicitly
-abandoned.
+With `local-dir`, the bytes are on the node, so the same failure pins the
+replacement instead of moving it. See
+[When a replica will not place](#when-a-replica-will-not-place). Starting a
+database on an empty disk looks like recovery but is data loss, so Legion
+waits. You choose the failure mode per job at submit time: `nfs` moves freely,
+and `local-dir` waits until the node returns or you abandon the data.
 
 ### Abandon a dead node and restore from backup
 
@@ -464,39 +468,39 @@ legion volume delete <id> --force   # tombstone the stranded volume
 legion action run postgres sql -p query="$(cat backup.sql)"   # or psql < backup.sql
 ```
 
-`--force` is the "the node is never coming back" affirmation: it abandons the
-volume record without waiting for a driver that can no longer answer. One
-guard rail survives even `--force` — a worker never destroys storage under a
-live mount — so a mistyped id cannot reclaim a running database's disk.
+`--force` confirms that the node is never coming back. It abandons the volume
+record without waiting for a driver that can no longer answer. One guard rail
+still applies with `--force`: a worker never destroys storage under a live
+mount. A mistyped id cannot reclaim a running database's disk.
 
 ### Fast local disk (NVMe) the operator provisioned
 
-Worker config names the disks; the job claims one by name:
+The worker config names the disks, and the job claims one by name:
 
 ```nickel
 # worker config
-"hostVolumes" = { "nvme0" = { "path" = "/mnt/nvme0" } }
+hostVolumes = { nvme0 = { path = "/mnt/nvme0" } }
 ```
 
 ```nickel
 stateful = { storage = { path = "/data", driver = "host", params = { name = "nvme0" } } },
 ```
 
-`host` is node-local, so this pins like `local-dir` — the right behavior for
-hardware you chose deliberately. A `device` entry instead of `path` serves the
-same disk as a raw block device.
+`host` is node-local, so this pins like `local-dir`. That is the right
+behavior for hardware you chose on purpose. A `device` entry instead of `path`
+serves the same disk as a raw block device.
 
 ### Shared read-only model / artifact cache
 
 ```nickel
-volumes = [{ name = "models", driver = "nfs", path = "/models", read_only = true,
+volumes = [{ name = "models", driver = "nfs", path = "/models", readOnly = true,
             params = { server = "10.0.0.5", export = "/exports/models" } }],
 ```
 
-A `volumes` claim (not `stateful.storage`) is shared per task: every replica on
-every node mounts the same export, read-only, with no instance identity and no
-pin. Scale the fleet freely; the cache is just there. With `driver = "host"`
-this becomes "every node has the dataset pre-synced at a named path."
+A `volumes` claim (as opposed to `stateful.storage`) is shared per task. Every
+replica on every node mounts the same export, read-only, with no instance
+identity and no pin. You can scale the fleet freely. With `driver = "host"`,
+this instead means every node has the dataset pre-synced at a named path.
 
 ### Scratch space
 
@@ -505,10 +509,10 @@ volumes = [{ name = "scratch", driver = "tmpfs", path = "/scratch",
             params = { size = "1G" } }],
 ```
 
-`tmpfs` is RAM-backed, wiped on unmount, Linux-only, and refuses to back
-`stateful.storage` (it advertises itself as ephemeral; admission enforces it).
-For private per-allocation scratch, `$LEGION_TASK_DIR` needs no declaration at
-all.
+`tmpfs` is RAM-backed, wiped on unmount, and Linux-only. It cannot back
+`stateful.storage`, because it advertises itself as ephemeral and admission
+enforces that. For private per-allocation scratch, `$LEGION_TASK_DIR` needs no
+declaration at all.
 
 ### A sandbox (or tenant) per key, with pause and resume
 
@@ -523,10 +527,10 @@ legion instance start sandbox-user-42           # resume: same key, same volume,
 legion instance destroy sandbox-user-42         # tombstone the key; reaper reclaims the volume
 ```
 
-Stop/start is suspend/resume for stateful sandboxes: the storage handle stays
-with the id while nothing runs. Destroy drops the handle, and reclaim is
-reconciled — the reaper marks the orphaned volume `destroying` and the owning
-worker's driver confirms.
+Stop and start act as suspend and resume for stateful sandboxes. The storage
+handle stays with the id while nothing runs. Destroy drops the handle. The
+reaper then marks the orphaned volume `destroying`, and the owning worker's
+driver confirms the reclaim.
 
 ### Ordered rollout of a quorum system
 
@@ -534,12 +538,12 @@ worker's driver confirms.
 rollout = { slots = { order = "sequential" } },
 ```
 
-Updates replace **allocations**, never instances, so slot N's replacement
-re-mounts slot N's existing volume — a rollout cannot touch data. `sequential`
-updates one slot at a time, highest ordinal first, each step health-gated
-(the StatefulSet `OrderedReady` analog). For a staged canary, add
-`updateFrom = 2`: slots ≥ 2 get the new config, slots 0–1 keep running the old
-one until you lower the floor.
+Updates replace **allocations**, never instances. Slot N's replacement
+re-mounts slot N's existing volume, so a rollout cannot touch data.
+`sequential` updates one slot at a time, highest ordinal first, and each step
+is health-gated (the StatefulSet `OrderedReady` analog). For a staged canary,
+add `updateFrom = 2`. Slots 2 and up get the new config, and slots 0 and 1 keep
+running the old one until you lower the floor.
 
 ### Scale in without losing data, scale back out and reattach
 
@@ -549,18 +553,18 @@ one until you lower the floor.
 legion volume list --job db   # the retained rows are visible the whole time
 ```
 
-Set `retainOnScaleIn = false` to trade reattach-on-scale-out for automatic
-reclaim. Either way the behavior is declared in the spec, not decided in an
-incident.
+Set `retainOnScaleIn = false` to get automatic reclaim instead of reattaching
+on scale-out. Either way, the spec declares the behavior ahead of time.
 
 ### Changing the driver of a live job
 
-Resubmitting with a different `driver` affects only volumes minted **after**
-the change (scale-out, new keys, post-`--force` re-mints). Existing instances
-keep their existing volume — driver, params, and data — because the storage
-handle records the driver it was created with. Nothing migrates bytes behind
-your back. To actually move data: back up, `legion volume delete` the old
-volume (workload stopped), let the instance mint under the new driver, restore.
+If you resubmit with a different `driver`, only volumes created **after** the
+change use it. That covers scale-out, new keys, and re-mints after `--force`.
+Existing instances keep their existing volume, including its driver, params,
+and data, because the storage handle records the driver it was created with.
+Legion never migrates bytes on its own. To move data, back up, stop the
+workload, `legion volume delete` the old volume, let the instance mint a new
+one under the new driver, and restore.
 
 ### A block device for a VM or sandbox runtime
 
@@ -570,22 +574,20 @@ stateful = { storage = { path = "/workspace", driver = "local-dir", mode = "bloc
 ```
 
 The driver creates and formats a disk image and hands the task a device path
-instead of a mount path — the shape microVM runtimes want to attach as a
-virtio disk. This is exactly how the [`sandbox` runtime](task-runtime-sandbox.md)
-persists a workspace: the device becomes `/dev/vdb` in the guest and the
-generated init mounts it at `path`. Filesystem tasks and block volumes are
-cross-checked at admission (a plain container asking for `mode = "block"` is
-rejected with the reason).
+instead of a mount path. MicroVM runtimes attach this as a virtio disk. The
+[`sandbox` runtime](task-runtime-sandbox.md) persists a workspace this way: the
+device becomes `/dev/vdb` in the guest, and the generated init mounts it at
+`path`. Admission cross-checks filesystem tasks against block volumes, so a
+plain container asking for `mode = "block"` is rejected with the reason.
 
 ## Writing a volume driver
 
 A volume driver is any executable that reads a JSON request on stdin and writes
 a JSON response on stdout, installed under `plugins/volumes/`. Legion runs it
-with the operation as `argv[1]`. This
-is CNI's model, chosen for the same reasons: language-agnostic, crash-isolated
-from the worker, and testable from a shell.
+with the operation as `argv[1]`. This is the CNI model. It is
+language-agnostic, isolated from worker crashes, and testable from a shell.
 
-Install one at `plugins/volumes/<name>/<name>` beside a manifest:
+Install a driver at `plugins/volumes/<name>/<name>` beside a manifest:
 
 ```json
 { "kind": "volumes", "name": "zfs", "legionVolumeApiVersion": 1 }
@@ -593,8 +595,8 @@ Install one at `plugins/volumes/<name>/<name>` beside a manifest:
 
 ### The contract
 
-Four operations. **Every one must be idempotent** — Legion retries on worker
-restarts and partial failures, so "already done" is a success, not an error.
+There are four operations, and **every one must be idempotent**. Legion retries
+on worker restarts and partial failures, so "already done" counts as success.
 
 | Op | Purpose |
 | --- | --- |
@@ -604,14 +606,14 @@ restarts and partial failures, so "already done" is a success, not an error.
 | `destroy` | Delete the volume and its data |
 
 `create`, `attach`, `detach`, `snapshot`, `restore`, `clone`, and `expand` are
-**reserved names**: a driver may advertise them in `capabilities.ops`, and
+**reserved names**. A driver may advertise them in `capabilities.ops`, and
 Legion will dispatch them when those features land, without an ABI break.
 
-`clone` — "make a new volume that starts as a copy-on-write copy of this one" —
-is reserved deliberately rather than left for later: forking a workload needs
-it, and the backends that can do it instantly (reflink/`FICLONE`, `zfs clone`,
-dm-thin, EBS-from-snapshot) are the same ones that make forking viable at all.
-Settling its name now is what keeps that work from forcing an ABI break.
+`clone` makes a new volume that starts as a copy-on-write copy of an existing
+one. Forking a workload needs it. The backends that can clone instantly
+(reflink/`FICLONE`, `zfs clone`, dm-thin, EBS-from-snapshot) are the ones that
+make forking practical, so the name is reserved now to avoid an ABI break
+later.
 
 ### The request
 
@@ -642,8 +644,9 @@ Settling its name now is what keeps that work from forcing an ABI break.
   "attrs" = { "dataset" = "tank/legion/vol-9f2c" } }
 ```
 
-`attrs` is yours: whatever you return is persisted on the volume row and handed
-back on every later operation, so drivers stay stateless between calls.
+`attrs` belongs to your driver. Whatever you return is stored on the volume
+record and passed back on every later operation, so drivers can stay stateless
+between calls.
 
 Report failure by exiting non-zero. Legion prefers a structured error on stdout
 over stderr text:
@@ -654,8 +657,8 @@ over stderr text:
 
 ### Test it
 
-`plugins/volumes/example/` is a working reference in ~60 lines of shell. Copy it,
-then run the conformance suite — the same one Legion's own tests use:
+`plugins/volumes/example/` is a working reference in about 60 lines of shell.
+Copy it, then run the conformance suite. Legion's own tests use the same suite:
 
 ```bash
 legion volume driver test example
@@ -679,40 +682,41 @@ Volume driver conformance: example (filesystem mode)
 PASS — example honors the volume contract.
 ```
 
-It needs no manager and exits non-zero on failure, so it drops straight into CI.
-Pass driver params with `-p key=value` (`legion volume driver test nfs -p
+The suite needs no manager and exits non-zero on failure, so you can run it in
+CI. Pass driver params with `-p key=value` (`legion volume driver test nfs -p
 server=10.0.0.5 -p export=/exports/legion`).
 
 ### CSI
 
-Legion core does not speak CSI, and won't. The mapping onto this contract is
-small enough to live in one driver: `mount` → `NodeStageVolume` +
-`NodePublishVolume`, `unmount` → the unpublish/unstage pair, `destroy` →
-`DeleteVolume`. A `csi-bridge` exec driver is the intended path to the existing
-driver ecosystem; nothing in the contract needs to change for it.
+Legion core does not speak CSI, and there are no plans for it to. The mapping
+onto this contract is small enough to live in one driver: `mount` maps to
+`NodeStageVolume` + `NodePublishVolume`, `unmount` to the unpublish/unstage
+pair, and `destroy` to `DeleteVolume`. A `csi-bridge` exec driver is the
+intended path to the existing CSI driver ecosystem, and it needs no changes to
+the contract.
 
 ## Where volumes run
 
-Workers own the drivers. The manager owns the state machine — which volumes
-exist, their pins, their reclaim status — and never loads a driver or touches
-storage. It learns what drivers exist entirely from the capabilities workers
-publish in their fingerprints, which is also what `legion volume drivers` and
-job admission read.
+Workers own the drivers. The manager owns the state machine: which volumes
+exist, their pins, and their reclaim status. It never loads a driver or touches
+storage. It learns which drivers exist from the capabilities workers publish in
+their fingerprints. `legion volume drivers` and job admission read the same
+data.
 
-The practical consequence: the control plane needs no storage credentials and no
-`mount` privileges, and adding a driver is a worker-side operation that needs no
-manager restart.
+As a result, the control plane needs no storage credentials and no `mount`
+privileges. Adding a driver is a worker-side change that needs no manager
+restart.
 
 ## What v1 does not do
 
-- **Snapshots, clones, expansion.** Reserved in the contract, unimplemented.
-- **Multi-writer volumes.** `accessModes` is reported and recorded; anything
-  other than single-writer is rejected for instance storage. Several tasks *can*
-  share a `host` volume read-only, since it has no per-instance lifecycle.
-- **Multiple volumes per instance.** `stateful.storage` is one volume. The
-  schema is keyed by `(instance, name)`, so `stateful.volumes = [...]` is a purely
-  additive change when it is needed.
 - **Snapshots, clones, expansion.** Named in the contract and reserved in
-  `capabilities.ops`, but no built-in implements them yet.
-- **Moving data between nodes.** A node-local volume pins its instance; moving
-  the bytes is the operator's job.
+  `capabilities.ops`, but no built-in driver implements them yet.
+- **Multi-writer volumes.** `accessModes` is reported and recorded, but
+  anything other than single-writer is rejected for instance storage. Several
+  tasks *can* share a `host` volume read-only, since it has no per-instance
+  lifecycle.
+- **Multiple volumes per instance.** `stateful.storage` is one volume. The
+  schema is keyed by `(instance, name)`, so adding `stateful.volumes = [...]`
+  later would be a purely additive change.
+- **Moving data between nodes.** A node-local volume pins its instance. Moving
+  the bytes is up to the operator.

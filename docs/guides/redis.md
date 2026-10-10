@@ -1,11 +1,11 @@
 # Running Redis on Legion
 
-Redis is two different workloads wearing one binary. As a **cache** it should be
-cheap to lose: a replica dies, you take a cold start, nobody pages. As a
-**store** — sessions, queues, rate limiter state — losing it is an outage.
+Redis is often used for two different workloads. As a cache, it should be
+cheap to lose: a replica dies, you take a cold start, and nobody gets paged. As
+a store for sessions, queues, or rate limiter state, losing it is an outage.
 
-Those want opposite things from a scheduler, so this guide runs both and makes
-the difference explicit in the spec.
+These two uses need different things from a scheduler. This guide runs both and
+shows the difference in the spec.
 
 Runnable spec: [`configs/jobs/redis.ncl`](../../configs/jobs/redis.ncl).
 
@@ -21,7 +21,7 @@ legion volume list --job redis
  4471be…   local-dir  redis  redis-store-0  created  node-a1*
 ```
 
-One volume, for the durable task. The cache tasks have none — that is the point.
+There is one volume, for the durable task. The cache tasks have none.
 
 ```bash
 legion service resolve redis        # the durable one
@@ -54,25 +54,24 @@ legion service resolve redis-cache  # the pool
 }
 ```
 
-**`$LEGION_STORAGE_DIR`, not `path`.** This is an `exec` task: it runs in the
-host mount namespace, so there is nothing to mount `/var/lib/redis` into.
-Legion exports the real host path as `LEGION_STORAGE_DIR` (and
-`LEGION_VOLUME_DATA`) and the `path` field is recorded as intent. A `container`
-task would use the path directly. See
+**Use `$LEGION_STORAGE_DIR` instead of `path`.** This is an `exec` task. It
+runs in the host mount namespace, so there is nothing to mount
+`/var/lib/redis` into. Legion exports the host path as `LEGION_STORAGE_DIR`
+(and `LEGION_VOLUME_DATA`), and records the `path` field as intent. A
+`container` task would use the path directly. See
 [docs/volumes.md](../volumes.md#how-path-works-per-task-runtime).
 
-**`--appendonly yes` is not optional here.** Without it Redis persists only via
-periodic RDB snapshots, so a restart silently drops everything written since the
-last save — and the volume becomes decorative. `everysec` fsyncs once a second:
-you can lose up to a second of writes on a hard kill, in exchange for not
-fsyncing on every command. `--appendfsync always` is the durable-but-slow
-setting if that second matters.
+**Set `--appendonly yes`.** Without it, Redis persists only through periodic
+RDB snapshots. A restart then silently drops everything written since the last
+save, and the volume does little good. `everysec` fsyncs once a second. You can
+lose up to a second of writes on a hard kill, but Redis avoids an fsync on every
+command. If that second matters, use `--appendfsync always`, which is durable
+but slower.
 
-**`count = 1`.** Two Redis processes on one AOF directory corrupt it. Slot mode
-guarantees at most one live allocation per instance even across a network
+**Set `count = 1`.** Two Redis processes on one AOF directory corrupt it. Slot
+mode guarantees at most one live allocation per instance, even across a network
 partition (see
-[Node loss and fencing](../stateful-workloads.md#node-loss-and-fencing-at-most-one)),
-which is exactly the guarantee this needs.
+[Node loss and fencing](../stateful-workloads.md#node-loss-and-fencing-at-most-one)).
 
 ### Verify it persists
 
@@ -105,11 +104,11 @@ redis-cli -h <addr> -p <port> GET greeting   # "hello"
 }
 ```
 
-**No `stateful` block** is the design, not an omission. A cache has nothing
-worth a stable identity: it gains no volume, no node pin, and no fencing window,
-so a lost replica is replaced in seconds instead of waiting out
-`onLost.replaceAfter`. Stateless failover is *faster* precisely because nothing
-has to be proven dead first.
+**Leave out the `stateful` block.** A cache does not need a stable identity.
+Without the block it gets no volume, no node pin, and no fencing window, so
+Legion replaces a lost replica in seconds instead of waiting out
+`onLost.replaceAfter`. Stateless failover is faster because nothing has to be
+proven dead first.
 
 Scale it freely:
 
@@ -120,18 +119,18 @@ legion job run configs/jobs/redis.ncl
 
 ### If the cache needs scratch space
 
-Some workloads want a big scratch area without wanting durability. Claim one
-under `volumes` rather than `stateful.storage`:
+Some workloads need a big scratch area but not durability. Claim one under
+`volumes` instead of `stateful.storage`:
 
 ```nickel
 volumes = [{ name = "scratch", driver = "tmpfs", params = { size = "1G" },
             path = "/scratch" }],
 ```
 
-`tmpfs` is RAM-backed, wiped on unmount, and **Linux only**. It advertises
-itself as *ephemeral*, which is why admission rejects it under
-`stateful.storage`: that field promises data survives a reschedule, and a tmpfs
-cannot. Trying it produces:
+`tmpfs` is RAM-backed, wiped on unmount, and Linux only. It advertises itself as
+ephemeral, so admission rejects it under `stateful.storage`. That field promises
+data survives a reschedule, and a tmpfs cannot keep that promise. Trying it
+produces:
 
 ```
 task cache stateful.storage: volume driver `tmpfs` is ephemeral (its contents do
@@ -141,14 +140,14 @@ want scratch space
 ```
 
 A `tmpfs` claim is shared per task, so two allocations on one node share it. For
-private per-allocation scratch, `$LEGION_TASK_DIR` already exists and is cleaned
-up on stop.
+private per-allocation scratch, use `$LEGION_TASK_DIR`. It already exists and
+Legion cleans it up on stop.
 
 ## Day-2 operations
 
 The store task declares [actions](../exec-and-actions.md). Exec-runtime actions
 run as sibling host processes with the task's env, so `$LEGION_PORT_REDIS`
-resolves without you looking the port up:
+resolves without you having to look up the port:
 
 ```bash
 legion action run redis cli --tty                    # interactive redis-cli
@@ -156,8 +155,8 @@ legion action run redis command -p cmd='INFO keyspace'
 legion action run redis save                         # BGREWRITEAOF now
 ```
 
-The `command` action constrains its param to redis-safe characters, since it
-lands inside a shell.
+The `command` action limits its param to Redis-safe characters, because the
+param ends up inside a shell.
 
 ## Choosing between them
 
@@ -166,18 +165,18 @@ lands inside a shell.
 | `stateful` block | none | `mode = "slot"` |
 | Volume | none (or a `tmpfs` claim) | `local-dir` / `nfs` |
 | Persistence | `--save ''`, `--appendonly no` | `--appendonly yes` |
-| Eviction | `maxmemory` + `allkeys-lru` | none — evicting real data is data loss |
+| Eviction | `maxmemory` + `allkeys-lru` | none (evicting stored data is data loss) |
 | Failover | seconds | waits out the fencing window |
 | `count` | as many as you want | 1 per data directory |
 
-If you are unsure which you have, ask what happens when the process is killed
-and comes back empty. If the answer is "some extra database load", it is a
+If you are unsure which one you have, consider what happens when the process is
+killed and comes back empty. If the answer is "some extra database load", it is a
 cache. If it is "users are logged out" or "we lost the queue", it is a store.
 
 ## Surviving a node loss
 
-`local-dir` pins the store to its node: if that node dies the instance waits
-rather than starting empty somewhere else. To let it move, put the data on
+`local-dir` pins the store to its node. If that node dies, the instance waits
+instead of starting empty somewhere else. To let it move, put the data on
 network storage:
 
 ```nickel
@@ -188,10 +187,10 @@ storage = {
 }
 ```
 
-Redis on NFS is workable because its write pattern is append-then-rewrite rather
-than random O_DIRECT I/O, but measure it: `appendfsync everysec` over a slow
-export will show up as latency. If a node loss must be survivable *and* fast,
-Redis replication is the better answer — see below.
+Redis on NFS is workable because its write pattern is append-then-rewrite, not
+random O_DIRECT I/O. Measure it, though: `appendfsync everysec` over a slow
+export shows up as latency. If you need to survive a node loss and recover
+quickly, use Redis replication instead (see below).
 
 ## Replication and Sentinel
 
@@ -209,28 +208,27 @@ Each replica is its own slot instance with its own volume, so a restarted
 replica resyncs from local data instead of a full transfer.
 
 Automatic promotion needs Sentinel (or a client library that handles it).
-Sentinel itself is a stateless task with `count = 3` — it needs no volume, only
+Sentinel itself is a stateless task with `count = 3`. It needs no volume, only
 quorum. Legion's [KV store](../kv-store.md) can hold the current primary
 address for clients that would rather resolve than gossip.
 
 ## Troubleshooting
 
-**Data disappeared after a restart.** Check `--appendonly yes` is actually set —
-this is the single most common cause. `redis-cli CONFIG GET appendonly`
-confirms.
+**Data disappeared after a restart.** Check that `--appendonly yes` is set. This
+is the most common cause. Run `redis-cli CONFIG GET appendonly` to confirm.
 
 **`redis-server` fails with a permissions error on the dir.** The worker's user
 owns the volume directory. Either run the task as that user, or set
-`params = { mode = "0777" }` on the volume (blunt, but honest for a dev cluster).
+`params = { mode = "0777" }` on the volume (blunt, but fine for a dev cluster).
 
-**The store instance will not place.** The node-local pin — see
+**The store instance will not place.** This is usually the node-local pin. See
 [docs/volumes.md](../volumes.md#when-a-replica-will-not-place).
 
-**The cache pool has fewer replicas than `count`.** Nothing to do with volumes:
-check `legion job list` and the eval output for capacity or constraints.
+**The cache pool has fewer replicas than `count`.** This is not a volume issue.
+Check `legion job list` and the eval output for capacity or constraints.
 
 ## See also
 
-- [docs/volumes.md](../volumes.md) — plugins, the contract, operating volumes
-- [docs/stateful-workloads.md](../stateful-workloads.md) — instances, fencing, retention
-- [Running Postgres](postgres.md) — the same machinery when durability is mandatory
+- [docs/volumes.md](../volumes.md): plugins, the contract, operating volumes
+- [docs/stateful-workloads.md](../stateful-workloads.md): instances, fencing, retention
+- [Running Postgres](postgres.md): the same machinery when durability is mandatory

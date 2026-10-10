@@ -1,17 +1,16 @@
 # Worker Simulation
 
-`legion start worker --simulate N` runs N *simulated* nodes in one
-process instead of one real worker. It exists for benchmarking and load
-testing the manager and scheduler: each simulated node registers,
-heartbeats, and reports health over the unmodified worker-plane wire
-protocol at real-worker cadences, so N simulated nodes put the same
-control-plane load on a manager as N idle real workers — at a tiny
-fraction of the process cost. It is the Legion analog of Nomad's
-nodesim and Kubernetes' KWOK.
+`legion start worker --simulate N` runs N simulated nodes in one process
+instead of one real worker. Use it to benchmark and load test the manager
+and scheduler. Each simulated node registers, heartbeats, and reports
+health over the normal worker-plane wire protocol at the same cadence as
+a real worker. So N simulated nodes put the same control-plane load on a
+manager as N idle real workers, at a small fraction of the process cost.
+It is Legion's counterpart to Nomad's nodesim and Kubernetes' KWOK.
 
 Simulated nodes never execute tasks. Allocations placed on them are
-accepted, acknowledged, and dropped when the manager no longer desires
-them — nothing runs.
+accepted, acknowledged, and dropped when the manager no longer wants
+them. Nothing runs.
 
 ## Usage
 
@@ -29,8 +28,8 @@ flags except `--simulate` are optional:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--simulate <N>` | — | Run N simulated nodes (enables the mode). |
-| `--profiles <FILE>` | one uniform profile (4 CPUs, 32 GiB, no attrs) | JSON file with a `node_profiles` array (the benchmark scenario schema — a scenario file works as-is). |
+| `--simulate <N>` | none | Run N simulated nodes (enables the mode). |
+| `--profiles <FILE>` | one uniform profile (4 CPUs, 32 GiB, no attrs) | JSON file with a `node_profiles` array. This is the benchmark scenario schema, so a scenario file works as-is. |
 | `--name-prefix <P>` | `sim` | Node ids are `<prefix>-<profile>-<idx>`. |
 | `--ready-after <DUR>` | `0s` | Delay before a dispatched allocation is reported running (models task-start latency). |
 | `--register-rate <N/s>` | `100` | Registration ramp, so a large fleet doesn't stampede a fresh manager. |
@@ -39,7 +38,7 @@ flags except `--simulate` are optional:
 ### Profiles
 
 `--profiles` reuses the benchmark `node_profiles` schema
-(`benchmarks/scheduler/scenarios/*.json`), so one file describes a fleet
+(`benchmarks/scheduler/scenarios/*.json`). One file describes a fleet
 shape for both the local scheduler benchmarks and a simulated cluster:
 
 ```json
@@ -53,16 +52,16 @@ shape for both the local scheduler benchmarks and a simulated cluster:
 }
 ```
 
-The `count` fields are **weights**, not literal counts: `--simulate N`
-is distributed across profiles proportionally (largest-remainder
-rounding), so the same file drives every scale step. To reproduce a
-file's counts literally, pass N equal to their sum. A profile may also
-set `max_allocations` to cap the node's allocation capacity.
+The `count` fields are weights. `--simulate N` is split across profiles
+in proportion to them (largest-remainder rounding), so the same file
+works at every scale step. To reproduce a file's counts literally, pass
+N equal to their sum. A profile may also set `max_allocations` to cap
+the node's allocation capacity.
 
 `memory_gb` and `cpus` become the node's fingerprinted capacity (each
-CPU is fingerprinted at 3 GHz); `attrs` land in the node's attributes
-and are matched by job `constraints`/`affinities` exactly like real
-node attributes.
+CPU is fingerprinted at 3 GHz). `attrs` land in the node's attributes,
+and job `constraints` and `affinities` match them the same way they
+match real node attributes.
 
 ### Telling fleets apart
 
@@ -72,44 +71,46 @@ Every simulated node carries `"simulated": true` in its attributes:
 legion node list -j | jq '[.data[] | select(.config_attrs.simulated)] | length'
 ```
 
-Simulated nodes are **not capacity**. Keep simulated fleets out of
-production clusters, or at minimum keep real workloads off them with a
+Simulated nodes add no usable capacity. Keep simulated fleets out of
+production clusters. If you can't, keep real workloads off them with a
 constraint (for example `constraints = { simulated = { operator = "is_not_set" } }`).
 
 ## Behavior and fidelity
 
-- **Same wire, same cadence.** Registration, heartbeats at the
-  worker-type's cadence (`heartbeatSeconds`, default 2s, clamped and
-  ±10%-jittered by the same code as a real worker — see
-  [architecture-managers-workers.md](architecture-managers-workers.md)),
-  30s health-check reports, exponential retry with re-registration on
-  `Unauthenticated`. A sim node reports its resolved cadence at
-  registration and honors a manager-served interval (with the same one-shot
-  re-phase) exactly as a real worker does, so a scale run measures the real
-  controller. The manager's lost-node detection applies unchanged — the
-  window is `missedBeatsBeforeLost x that node's interval`, 10s at the
-  defaults ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
-- **Shared channels.** Nodes multiplex over a small pool of gRPC
-  channels (one per 256 nodes, max 16), so one process holds a
-  handful of connections regardless of fleet size.
+- **Same wire, same cadence.** Simulated nodes use the same
+  registration and heartbeat code as a real worker. Heartbeats follow
+  the worker type's `heartbeatSeconds` (default 2s), clamped and jittered
+  by ±10% (see
+  [architecture-managers-workers.md](architecture-managers-workers.md)).
+  Health-check reports go out every 30s, and retries back off
+  exponentially with re-registration on `Unauthenticated`. A simulated
+  node reports its resolved cadence at registration and honors an
+  interval served by the manager (with the same one-shot re-phase) just
+  as a real worker does. That means a scale run measures the actual
+  controller. The manager's lost-node detection applies unchanged. The
+  window is `missedBeatsBeforeLost x that node's interval`, which is 10s
+  at the defaults ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
+- **Shared channels.** Nodes share a small pool of gRPC channels (one
+  per 256 nodes, max 16). One process holds a handful of connections
+  regardless of fleet size.
 - **Dispatch works, execution doesn't.** The process serves one stub
-  worker endpoint, advertised as every node's `workerAddress`, so the
-  manager's push dispatch (`PostWork`) is exercised; dispatched
+  worker endpoint and advertises it as every node's `workerAddress`, so
+  the manager's push dispatch (`PostWork`) gets exercised. Dispatched
   allocations are acknowledged after `--ready-after` and echoed in
-  heartbeats. No process is spawned, no runtime plugin loads.
-- **Restart-safe by naming.** There is no state directory; node ids
-  are deterministic, and a restarted process re-registers the same
-  nodes (registration is an upsert). The manager sees a restart as a
-  brief fleet blip, exactly like a rebooted worker host.
+  heartbeats. No process is spawned and no runtime plugin loads.
+- **Restart-safe by naming.** There is no state directory. Node ids are
+  deterministic, so a restarted process re-registers the same nodes
+  (registration is an upsert). The manager sees a restart as a brief
+  fleet blip, the same as a rebooted worker host.
 - **Status line.** Every 30s the process logs `Simulated fleet
-  status` with nodes registered, achieved vs expected heartbeat rate,
-  cumulative failures, and acked allocations — scripts can watch this
-  to confirm a fleet is healthy.
+  status` with nodes registered, achieved vs. expected heartbeat rate,
+  cumulative failures, and acked allocations. Scripts can watch this to
+  confirm a fleet is healthy.
 
 ## Metrics
 
-A sim host exports the ordinary worker registry, from the ordinary
-opt-in listener — set `LEGION_WORKER_TELEMETRY_PORT` and scrape
+A simulated host exports the ordinary worker metrics from the ordinary
+opt-in listener. Set `LEGION_WORKER_TELEMETRY_PORT` and scrape
 `/metrics` as you would on any worker
 ([metrics.md § Worker](metrics.md#worker)). The listener starts before
 the registration ramp, so a scrape during ramp-up shows the climb.
@@ -119,46 +120,47 @@ LEGION_WORKER_TELEMETRY_PORT=9101 legion start worker "$TOKEN" --simulate 1250
 curl -s localhost:9101/metrics | grep legion_worker_
 ```
 
-The familiar families (`legion_worker_heartbeats_total`,
+The usual families (`legion_worker_heartbeats_total`,
 `legion_worker_heartbeat_duration_seconds`,
-`legion_worker_allocations_running`) aggregate over the whole fleet —
-this is a worker process carrying N nodes, so its metrics are
-per-process, not per-node. Three more describe the fleet:
+`legion_worker_allocations_running`) aggregate over the whole fleet.
+This is one worker process carrying N nodes, so its metrics are per
+process. Three more metrics describe the fleet:
 `legion_worker_simulated_nodes`, `..._nodes_target`, and
-`legion_worker_simulated_registrations_total{outcome}`. Registered
-nodes short of target with a flat `error` counter means the ramp is
-still climbing; short of target with a rising one means it is stuck.
+`legion_worker_simulated_registrations_total{outcome}`. If registered
+nodes are short of target and the `error` counter is flat, the ramp is
+still climbing. If they are short of target and the counter is rising,
+the ramp is stuck.
 
-Per-node series are deliberately not exported (cardinality, and the
-manager already has that view), and OTLP push works here exactly as it
-does for a real worker.
+Per-node series are not exported, to keep cardinality down and because
+the manager already has that view. OTLP push works the same as it does
+for a real worker.
 
 ## Limitations
 
 - `legion exec`, log streaming (`legion job logs`), and worker restart
   return `Unimplemented` against simulated nodes.
-- Volume drivers are fingerprinted as absent, so volume-requiring jobs
+- Volume drivers are fingerprinted as absent, so jobs that need volumes
   will not place on simulated nodes.
-- No allocation-health reporting: tasks with health checks never
-  report healthy from a simulated node, so health-gated rollouts will
-  not converge there. Use plain (checkless) noop tasks for load.
+- There is no allocation-health reporting. Tasks with health checks
+  never report healthy from a simulated node, so health-gated rollouts
+  will not converge there. Use plain noop tasks without checks for load.
 - Failure reports, workload identity, service-discovery upstreams, and
   artifact staging are not simulated.
-- The fleet-wide allocation gauge is maintained incrementally and
-  repaired from authoritative state every 30s, so under heavy churn a
-  scrape can disagree with the manager by a few allocations; aborting a
-  fleet leaves the gauges at their teardown values rather than zero.
-  Counters and the heartbeat histogram are exact.
-- All nodes in one process share one advertised dispatch address; the
-  manager's per-node connection cost is therefore understated at very
-  large N (real fleets dial N addresses). Recorded in the benchmark
-  fairness notes.
+- The fleet-wide allocation gauge is updated incrementally and repaired
+  from authoritative state every 30s. Under heavy churn, a scrape can
+  disagree with the manager by a few allocations. Aborting a fleet
+  leaves the gauges at their teardown values rather than zero. Counters
+  and the heartbeat histogram are exact.
+- All nodes in one process share one advertised dispatch address. This
+  understates the manager's per-node connection cost at very large N,
+  since a real fleet dials N addresses. The benchmark fairness notes
+  record this.
 
 ## Scale guidance
 
 A simulated node costs two lightweight async tasks and a few KB of
-state. Thousands of nodes per process are comfortable on a small
-instance; the AWS benchmark rig (`benchmarks/aws/`) runs 1,250 nodes
-per `c7i.2xlarge` with wide headroom. For very large fleets prefer
-several processes (one per instance) over one giant process — the
-storm/churn scenarios also want process-granular kill targets.
+state. Thousands of nodes per process run comfortably on a small
+instance. The AWS benchmark rig (`benchmarks/aws/`) runs 1,250 nodes per
+`c7i.2xlarge` with plenty of headroom. For very large fleets, run
+several processes (one per instance) instead of one giant process. The
+storm and churn scenarios also need one process per kill target.

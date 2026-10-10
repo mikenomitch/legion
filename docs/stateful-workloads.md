@@ -1,14 +1,13 @@
 # Stateful Workloads & Instance Identity
 
-Legion's scheduling unit is the **allocation** — an ephemeral placement of a
-task on a node. When a task is rescheduled (node loss, drain, config update)
-it gets a *new* allocation with a *new* id. Stateful workloads need a handle
-that survives that churn: replica N must always come back as replica N, with
-replica N's data.
+Legion schedules work as **allocations**. An allocation is a short-lived
+placement of a task on a node. When a task is rescheduled (node loss, drain,
+config update), it gets a new allocation with a new id. Stateful workloads
+need a handle that survives that churn: replica N must always come back as
+replica N, with replica N's data.
 
-The `stateful` task block introduces that handle: the **instance**.
+The `stateful` task block adds that handle, called the **instance**.
 
-> Design plan: [stateful-workloads-and-instance-identity-plan.md](../internal_docs/plans/stateful-workloads-and-instance-identity-plan.md).
 > Related: [volumes.md](volumes.md) (the storage an instance's handle points
 > at), [workload-identity.md](workload-identity.md) (the instance id feeds the
 > reschedule-stable token subject).
@@ -20,44 +19,44 @@ The `stateful` task block introduces that handle: the **instance**.
 
 | | Allocation | Instance |
 | --- | --- | --- |
-| Lifetime | One placement; replaced on every reschedule | The workload's whole logical life |
+| Lifetime | One placement, replaced on every reschedule | The workload's whole logical life |
 | Id | Churning integer (`LEGION_ALLOC_ID`) | Stable string (`LEGION_INSTANCE_ID`) |
 | Binds | A node + resources | Persistent state (`storage_handle`) + identity |
 
-An instance has **at most one live allocation** at a time and many over its
-life. Allocations carry an `instance_id` reference; the instance row lives in
+An instance has **at most one live allocation** at a time, and many over its
+life. Allocations carry an `instance_id` reference. The instance row lives in
 the manager's state store (`instance` table) and outlives any allocation.
 
 ### Slot mode vs keyed mode
 
-- **`slot`** (StatefulSet / Nomad `per_alloc` style) — implemented. A fixed
-  pool of ordinal slots `0..count.num-1`. Each slot has a deterministic,
-  human-legible instance id:
+- **`slot`** (StatefulSet or Nomad `per_alloc` style). A fixed pool of
+  ordinal slots `0..count.num-1`. Each slot has a predictable, readable
+  instance id:
 
   ```
   {job_id}-{group}-{slot}      e.g. stateful-demo-default-2
   ```
 
-  Slot ids are **reused within the pool**: a replacement allocation for slot 2
-  gets slot 2's instance id and storage handle. That reuse is the *correct*
-  behavior for replica sets — replica 2's disk is replica 2's disk.
+  Slot ids are **reused within the pool**. A replacement allocation for slot 2
+  gets slot 2's instance id and storage handle. This is what you want for
+  replica sets, since replica 2's disk belongs to replica 2.
 
-- **`keyed`** (sandbox / dispatch style) — implemented. Instances are created
-  on demand via the management API (`legion instance create` /
-  `CreateInstance`), each with a unique id that is **never recycled for the
-  lifetime of the job**, so a new sandbox can never inherit a dead one's
-  identity or persisted state while the job lives (destroying the job clears
-  its instance history; see the [Id rules](#id-rules)).
-  keyed tasks define no `count` (a parse-time error): the set of live instances
-  (zero instances = zero allocations). See
+- **`keyed`** (sandbox or dispatch style). You create instances on demand
+  through the management API (`legion instance create` or
+  `CreateInstance`). Each one gets a unique id that is **never recycled for
+  the lifetime of the job**. A new sandbox can't inherit a dead one's identity
+  or saved state while the job exists. (Destroying the job clears its
+  instance history. See the [Id rules](#id-rules).) Keyed tasks define no
+  `count`, and defining one is a parse-time error. The set of live instances
+  sets the cardinality (zero instances means zero allocations). See
   [Keyed Mode: the Management API](#keyed-mode-the-management-api).
 
-An instance has **at most one live allocation at a time, by construction**:
-every placement binds inside the allocation-insert transaction, and the one
-rollout strategy that would run two live allocations concurrently —
-`createFirst` (replace-before-stop) — is rejected at job admission for stateful
-tasks (see [Rollouts and the single-live-allocation
-invariant](#rollouts-and-the-single-live-allocation-invariant)).
+Legion guarantees at most one live allocation per instance. Every placement
+binds inside the transaction that inserts the allocation. The one rollout
+strategy that would run two live allocations at once, `createFirst`
+(replace-before-stop), is rejected at job admission for stateful tasks. See
+[Rollouts and the single-live-allocation
+invariant](#rollouts-and-the-single-live-allocation-invariant).
 
 ### Instance lifecycle
 
@@ -67,23 +66,23 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
                           └────── start (keyed) ─────────┘  (stopped only)
 ```
 
-- `pending` — row exists, never placed.
-- `active` — a live allocation fulfills it (`current_alloc_id` points at it).
-  An instance whose allocation sits on a **lost** node stays `active` and
-  bound while the manager waits out the loss-confirmation window — `legion
-  instance get/list` then carries a `pending-loss-confirmation` detail
-  explaining the wait (see [Node loss and fencing
-  (at-most-one)](#node-loss-and-fencing-at-most-one)).
-- `rescheduling` — its allocation died; the replacement will reuse the same
+- `pending`: the row exists but has never been placed.
+- `active`: a live allocation fulfills it (`current_alloc_id` points at it).
+  If the allocation sits on a **lost** node, the instance stays `active` and
+  bound while the manager waits out the loss-confirmation window. During
+  that wait, `legion instance get/list` shows a `pending-loss-confirmation`
+  detail that explains it. See [Node loss and fencing
+  (at-most-one)](#node-loss-and-fencing-at-most-one).
+- `rescheduling`: its allocation died. The replacement will reuse the same
   instance id and storage handle.
-- `stopped` — paused (keyed only): the allocation was stopped but the row AND
-  storage handle are retained, so `legion instance start <id>` revives the
-  same identity with its data. A job stop puts keyed instances here. Not part
-  of the scheduler's desired set until explicitly started.
-- `terminated` — no longer desired (slot scale-in, keyed destroy, or job
-  stop for slot rows). **Rows are retained**: slot rows so a later scale-out
-  re-materializes the same id, keyed tombstones so a destroyed id is never
-  recycled for the lifetime of the job.
+- `stopped`: paused (keyed only). The allocation was stopped, but the row and
+  storage handle are kept, so `legion instance start <id>` brings back the
+  same identity with its data. A job stop puts keyed instances here. Stopped
+  instances aren't scheduled until you start them.
+- `terminated`: no longer desired (slot scale-in, keyed destroy, or job stop
+  for slot rows). **Rows are kept.** Slot rows are kept so a later scale-out
+  brings back the same id. Keyed tombstones are kept so a destroyed id is
+  never recycled for the lifetime of the job.
 
 ## Job Spec Reference
 
@@ -123,204 +122,201 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
 }
 ```
 
-Validation rules (enforced at `job validate` / submit time):
+Validation rules (enforced at `job validate` and submit time):
 
-- `mode` defaults to `'slot'`; declare `'keyed'` explicitly to switch to the
+- `mode` defaults to `'slot'`. Set `'keyed'` explicitly to use the
   instance-management model.
 - `idSource` is only valid in keyed mode (`'caller'` or `'uuid'`).
-- Slot mode requires `count.num >= 1` and cannot be combined with `count.per`
+- Slot mode requires `count.num >= 1` and can't be combined with `count.per`
   (per-attribute pools would collide on slot ids).
-- Keyed mode **cannot define `count` at all** — the spec is rejected at parse
+- Keyed mode **can't define `count` at all**. The spec is rejected at parse
   time with `task <name> is stateful keyed mode and cannot define count: keyed
   instance cardinality is driven by the instance management API (legion
-  instance create/destroy), not the job spec`. There is no fixed pool to size:
-  the set of live instances *is* the cardinality.
-- `initialInstances` is valid only in keyed mode; each id must match
-  `[A-Za-z0-9._-]{1,128}` and the list must contain no duplicates.
+  instance create/destroy), not the job spec`. There is no fixed pool to size,
+  because the set of live instances is the cardinality.
+- `initialInstances` is valid only in keyed mode. Each id must match
+  `[A-Za-z0-9._-]{1,128}`, and the list can't contain duplicates.
 - `storage.path` must be a non-empty absolute path.
-- `storage.retainOnStop` is only valid in slot mode: keyed stop/destroy
-  semantics are fixed per instance (instance stop / job stop always retains
-  the handle, instance destroy always drops it), so the knob is rejected on
-  keyed tasks with a validation error.
+- `storage.retainOnStop` is only valid in slot mode. Keyed stop and destroy
+  behavior is fixed per instance: instance stop and job stop always keep the
+  handle, and instance destroy always drops it. Setting the field on a keyed
+  task is a validation error.
 - At most one slot-mode stateful task per group (slot ids are derived from
-  `(job, group, slot)`). Multiple keyed tasks per group are fine — their ids
-  are explicit keys, not ordinals.
-- `onLost` durations must parse (humantime strings like `'90s'`, `'3m'`);
-  `selfTerminateAfter` must be greater than zero; `replaceAfter` must be
-  **greater than** `selfTerminateAfter` (or the special value `'never'`) —
-  otherwise a replacement could start before the worker has provably
-  self-fenced. `onLost` belongs *inside* the `stateful` block; declaring it
-  at the task level — including on a stateless task, which has nothing to
-  fence — is rejected at parse time with a pointer to the right nesting.
-- **The lost window must stay clear of the self-fence.** A node's window is
+  `(job, group, slot)`). Multiple keyed tasks per group are fine, because
+  their ids are explicit keys rather than ordinals.
+- `onLost` durations must parse (humantime strings like `'90s'`, `'3m'`).
+  `selfTerminateAfter` must be greater than zero. `replaceAfter` must be
+  **greater than** `selfTerminateAfter` (or the special value `'never'`).
+  Otherwise a replacement could start before the worker is known to have
+  stopped its copy. `onLost` belongs inside the `stateful` block. Declaring
+  it at the task level, including on a stateless task, is rejected at parse
+  time with a pointer to the right nesting.
+- **The lost window must stay below the self-fence.** A node's lost window is
   `missedBeatsBeforeLost x its heartbeat interval`
   ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). If that
-  reaches `selfTerminateAfter`, a perfectly HEALTHY worker kills its own
-  stateful tasks between beats. The manager refuses to start on a worker
-  config that would produce it, naming both numbers — so this is caught at
-  config load rather than discovered as spontaneous stateful task death. At
-  the defaults (`5 x 2s = 10s` against a 90s fence) there is nine times the
-  margin; a 60-second batch cadence would need `selfTerminateAfter` raised
-  well past its 300-second window.
+  reaches `selfTerminateAfter`, a healthy worker would kill its own stateful
+  tasks between heartbeats. The manager refuses to start with a worker config
+  that would cause this, and the error names both numbers. At the defaults
+  (`5 x 2s = 10s` against a 90s fence) there is nine times the margin. A
+  60-second batch cadence would need `selfTerminateAfter` raised well past its
+  300-second window.
 
 ### Seed list (`initialInstances`) semantics
 
-`stateful.initialInstances` (keyed mode only) is a **seed list, not a
-reconciled desired set**. On every submit, after the config is persisted and
-before placement is evaluated, the manager ensures each listed id exists:
+`stateful.initialInstances` (keyed mode only) is a **seed list**. It is not a
+reconciled desired set. On every submit, after the config is saved and before
+placement is evaluated, the manager makes sure each listed id exists:
 
-- Ids that have **never existed** are created (`pending`) and flow into the
+- Ids that have **never existed** are created (`pending`) and go through the
   submit's normal placement eval.
-- Ids that already exist in **any** state — live, `stopped`, or a `terminated`
-  tombstone (even under another job) — are skipped silently. Resubmits are
-  therefore idempotent, and a deliberately **destroyed id is never
-  resurrected** by appearing in the seed list.
+- Ids that already exist in **any** state (live, `stopped`, or a
+  `terminated` tombstone, even under another job) are skipped silently. This
+  makes resubmits idempotent, and a **destroyed id is never brought back** by
+  appearing in the seed list.
 
-Because it is a seed and not a desired set, **removing** an id from the list on
-a resubmit does *not* stop or destroy that instance — only `legion instance
-stop`/`destroy` (or a job stop/destroy) changes a live instance's lifecycle.
-Think of it as "create these on first run if they don't already exist", not
-"the set of instances that should exist".
+**Removing** an id from the list on a resubmit doesn't stop or destroy that
+instance. Only `legion instance stop`/`destroy` (or a job stop/destroy)
+changes a live instance's lifecycle. Read the list as "create these on first
+run if they don't already exist."
 
 ## Environment Variables
 
-Injected by the manager into the task's runtime config `env` map at dispatch
-time, so they are present at process start for `exec` and `container` tasks:
+The manager injects these into the task's runtime config `env` map at
+dispatch time, so they are present at process start for `exec` and
+`container` tasks:
 
 | Variable | When | Meaning |
 | --- | --- | --- |
-| `LEGION_ALLOC_ID` | **all** tasks (stateless too) | Current allocation id; churns each placement. |
-| `LEGION_INSTANCE_ID` | stateful tasks | Stable instance id; survives reschedules. |
+| `LEGION_ALLOC_ID` | **all** tasks (stateless too) | Current allocation id. Changes with each placement. |
+| `LEGION_INSTANCE_ID` | stateful tasks | Stable instance id. Survives reschedules. |
 | `LEGION_INSTANCE_MODE` | stateful tasks | `slot` or `keyed`. |
 | `LEGION_INSTANCE_SLOT` | slot mode only | Ordinal slot index `0..count-1`. |
 | `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-runtime) for why exec and container tasks get different values. |
 | `LEGION_VOLUME_<NAME>` | per declared volume | Same, for every volume including `volumes[]` claims. |
-| `LEGION_CLAIM_ID` | provisional starts only | The claim a workload was started under, before its placement was durable ([edge-boot.md](edge-boot.md)). Such a task sees **no** `LEGION_ALLOC_ID` — it does not have one yet, and a placeholder would be a lie. `LEGION_INSTANCE_ID` is correct from the first millisecond. |
+| `LEGION_CLAIM_ID` | provisional starts only | The claim a workload was started under, before its placement was durable ([edge-boot.md](edge-boot.md)). Such a task has **no** `LEGION_ALLOC_ID` yet, and Legion doesn't set a placeholder. `LEGION_INSTANCE_ID` is correct from the start. |
 
-Apps key their durable state and "who am I" decisions on
-`LEGION_INSTANCE_ID`; `LEGION_ALLOC_ID` is the ephemeral placement id.
+Key your app's durable state and "who am I" decisions on
+`LEGION_INSTANCE_ID`. `LEGION_ALLOC_ID` is the short-lived placement id.
 
-**Precedence:** Legion-injected variables win over user-declared env keys of
-the same name. They are authoritative runtime facts — letting a jobspec shadow
-them would let a workload misreport its own identity (this mirrors Nomad,
-whose runtime variables always take precedence).
+**Precedence:** Legion-injected variables override user-declared env keys of
+the same name. If a jobspec could shadow them, a workload could misreport its
+own identity. Nomad works the same way: its runtime variables always take
+precedence.
 
 ## Reschedule Semantics
 
 When a slot's allocation dies (process failure, node loss, drain):
 
-1. The instance transitions `active -> rescheduling`; its `instance_id` and
-   `storage_handle` are untouched.
+1. The instance moves from `active` to `rescheduling`. Its `instance_id` and
+   `storage_handle` don't change.
 2. The scheduler plans a replacement allocation as usual (constraints,
-   resources, scoring — slot identity does not influence node choice in v1).
-3. The replacement is bound to the lowest free slot — i.e. the one that just
-   lost its allocation — so it reuses the same instance id and storage handle,
-   and the instance transitions back to `active`.
+   resources, scoring). Slot identity doesn't influence node choice in v1.
+3. The replacement is bound to the lowest free slot, which is the one that
+   just lost its allocation. It reuses the same instance id and storage
+   handle, and the instance moves back to `active`.
 
-Config updates behave the same way: instances are keyed by *job* (not job
-config version), so replica N keeps its identity and storage across deploys.
+Config updates work the same way. Instances are keyed by job, not by job
+config version, so replica N keeps its identity and storage across deploys.
 
-**Node loss is the exception**: a dead *process* is reported by a live
-worker and replaced immediately, but a dead *heartbeat* only proves the
-manager can't reach the node — the workload may still be running. Stateful
-allocations on lost nodes are therefore gated behind a loss-confirmation
-window before step 1 happens at all; see the next section.
+**Node loss is the exception.** A live worker reports a dead process, and
+Legion replaces it right away. A missing heartbeat only proves the manager
+can't reach the node, and the workload may still be running. So stateful
+allocations on lost nodes wait out a loss-confirmation window before step 1
+happens. See the next section.
 
 ### Preemption
 
 A stateful allocation on **cluster-reachable** storage (`nfs`, and future
-network drivers) is preemptible. Preemption stops it exactly the way a rollout
-replacement does — a clean, manager-driven stop with the task's `stop` ladder —
-and its replacement reattaches the same storage handle wherever it lands, by
-the same reschedule path above.
+network drivers) can be preempted. Preemption stops it the same way a rollout
+replacement does: a clean, manager-driven stop using the task's `stop`
+ladder. Its replacement reattaches the same storage handle wherever it lands,
+through the reschedule path above.
 
-A stateful allocation on **node-local** storage (`local-dir`) is **never** a
-preemption victim, categorically. Evicting one either frees nothing (the
-instance can only be recreated on the node its data is on) or abandons the
-data. The rule follows the same principle as drain's held-stateful behavior:
-the platform never force-moves protected state. The consequence to plan around
-is that a node filled with low-band, node-pinned stateful work is
-un-preemptible; the placement error says so. See
-[preemption-and-eviction.md](preemption-and-eviction.md).
+A stateful allocation on **node-local** storage (`local-dir`) is **never**
+preempted. Evicting one either frees nothing (the instance can only be
+recreated on the node that holds its data) or abandons the data. This follows
+the same rule as drain's handling of stateful work: Legion never force-moves
+protected state. Plan around one consequence: a node filled with low-band,
+node-pinned stateful work can't be preempted, and the placement error says
+so. See [preemption-and-eviction.md](preemption-and-eviction.md).
 
 ## Node loss and fencing (at-most-one)
 
-Single-writer systems need certainty that slot N's old allocation is dead
-before a replacement binds slot N's identity, storage handle, and
-workload-identity `sub`. A missed heartbeat alone cannot give that
-certainty: a network partition looks exactly like a dead node, and eagerly
-replacing a partitioned node's allocation would run the same instance twice
-(split-brain). Legion closes this with **lease-based fencing**: two
-cooperating timers, one on each side of the partition.
+Single-writer systems need to know that slot N's old allocation is dead
+before a replacement takes slot N's identity, storage handle, and
+workload-identity `sub`. A missed heartbeat can't tell you that. A network
+partition looks the same as a dead node, and replacing a partitioned node's
+allocation right away would run the same instance twice (split-brain).
+Legion handles this with **lease-based fencing**: two timers that work
+together, one on each side of the partition.
 
-1. **Worker self-fence** (`onLost.selfTerminateAfter`, default `90s`): if a
-   worker cannot complete a heartbeat against the manager for longer than
-   this window, it kills its stateful allocations locally (the heartbeat
-   loop itself never exits on failure — it retries with backoff forever
-   while an independent watchdog tracks the time since the last *successful*
-   heartbeat). The fenced allocation is recorded as failed, so the first
-   post-reconnect heartbeat reports it failed/stopped rather than running.
+1. **Worker self-fence** (`onLost.selfTerminateAfter`, default `90s`). If a
+   worker can't complete a heartbeat to the manager for longer than this, it
+   kills its stateful allocations locally. The heartbeat loop never exits on
+   failure. It retries with backoff forever, while a separate watchdog tracks
+   the time since the last successful heartbeat. The fenced allocation is
+   recorded as failed, so the first heartbeat after reconnecting reports it
+   as failed or stopped rather than running.
 2. **Manager confirmation gate** (`onLost.replaceAfter`, default
-   `2 x selfTerminateAfter`): a stateful allocation on a lost node is **not**
+   `2 x selfTerminateAfter`). A stateful allocation on a lost node is **not**
    freed for replacement until the node has been lost longer than this. The
-   node row records `lost_at` when it is marked lost (cleared when it
-   heartbeats again or re-registers), and the same monitor loop that marks
-   nodes lost re-checks gated allocations every tick, so replacement
-   proceeds automatically — no operator action — once the window elapses.
+   node row records `lost_at` when the node is marked lost. It's cleared when
+   the node heartbeats again or re-registers. The monitor loop that marks
+   nodes lost also re-checks gated allocations every tick, so replacement
+   happens automatically once the window passes, with no operator action.
 
-**Why this confirms the loss**: validation enforces
+**Why this confirms the loss:** validation requires
 `replaceAfter > selfTerminateAfter`. By the time the manager frees the
-allocation, one of two things is true on the unreachable node: the worker is
-alive-but-partitioned and has already self-fenced (its window expired
-strictly earlier, by the manager's own clock plus the safety margin), or the
-worker is truly dead and so is the workload. Either way the replacement that
-re-binds the instance can never run concurrently with the original — at most
-one live allocation per instance, even across partitions.
+allocation, one of two things is true on the unreachable node. Either the
+worker is alive but partitioned and has already self-fenced (its window
+expired earlier, by the manager's own clock plus the safety margin), or the
+worker is dead and so is the workload. In both cases the replacement can't
+run at the same time as the original. You get at most one live allocation
+per instance, even across partitions.
 
-While gated, nothing visibly changes: the allocation row stays put, the
-instance stays `active` and bound, and `legion instance get/list` shows a
-`pending-loss-confirmation` detail naming the lost node and what would
-unblock it. Stateless tasks are untouched by all of this — they carry no
-fencing window and are replaced eagerly the moment their node is marked
-lost, exactly like today.
+While an allocation is gated, nothing visible changes. The allocation row
+stays, the instance stays `active` and bound, and `legion instance get/list`
+shows a `pending-loss-confirmation` detail naming the lost node and what
+would unblock it. Stateless tasks aren't affected by any of this. They have
+no fencing window and are replaced as soon as their node is marked lost.
 
-One bound to be aware of: a **config update** deliberately replaces every
-allocation, including ones on an unreachable node that cannot be told to
-stop. If you deploy while a node is partitioned, the outgoing allocation
-there may overlap its replacement for up to `selfTerminateAfter` (the
-worker's self-fence still bounds it — that lease is exactly why the window
-exists). Prefer not deploying stateful jobs while nodes are lost, or size
-`selfTerminateAfter` to an overlap your workload tolerates.
+Watch out for one case. A **config update** replaces every allocation,
+including ones on an unreachable node that can't be told to stop. If you
+deploy while a node is partitioned, the old allocation there may overlap its
+replacement for up to `selfTerminateAfter`. The worker's self-fence still
+caps the overlap, which is why the window exists. Avoid deploying stateful
+jobs while nodes are lost, or set `selfTerminateAfter` to an overlap your
+workload can tolerate.
 
 ### Defaults, tuning, and `'never'`
 
-Every stateful task gets the policy — an absent `onLost` block means
-`selfTerminateAfter = "90s"`, `replaceAfter = "180s"`. **Safe by default
-means stateful failover is deliberately slower than stateless failover**: a
-replica on a lost node waits out the confirmation window (~3 minutes by
-default) where a stateless task moves in seconds. For workloads where fast
-failover matters more than a long partition grace (and whose checks/restarts
-tolerate it), tune the *worker* side down — e.g. `selfTerminateAfter = "15s"`
-lets `replaceAfter` default to 30s. The worker pays for that with less
-tolerance of manager downtime: any manager outage longer than the window
-kills the task locally (it is rescheduled when the manager returns).
+Every stateful task gets this policy. Without an `onLost` block, the values
+are `selfTerminateAfter = "90s"` and `replaceAfter = "180s"`. **Because the
+defaults favor safety, stateful failover is slower than stateless
+failover.** A replica on a lost node waits out the confirmation window (about
+3 minutes by default), while a stateless task moves in seconds. If fast
+failover matters more than a long partition grace period (and your checks
+and restarts can handle it), lower the worker side. For example,
+`selfTerminateAfter = "15s"` makes `replaceAfter` default to 30s. The cost is
+less tolerance for manager downtime: any manager outage longer than the
+window kills the task locally. It's rescheduled when the manager returns.
 
-`replaceAfter = "never"` is the K8s StatefulSet behavior: the manager never
-auto-replaces the allocation. Recovery requires the node coming back (the
-allocation simply keeps running; `lost_at` clears) or an operator override.
+`replaceAfter = "never"` matches K8s StatefulSet behavior: the manager never
+replaces the allocation on its own. Recovery requires the node to come back
+(the allocation keeps running and `lost_at` clears) or an operator override.
 
 ### Operator override
 
 `legion instance replace <id>` (RPC `ReplaceInstance`, MCP
-`legion_instance_replace`; supports `--idempotency-key`) is the analog of
-force-deleting a pod stuck on a lost K8s node: it frees the gated allocation
-immediately — skipping the rest of the window, and despite `'never'` — and
-enqueues a reschedule that excludes the lost node, so the replacement
-re-binds the same instance id and storage handle elsewhere. It refuses to
-act unless the instance's allocation actually sits on a `lost` node. Use it
-only when the node is confirmed dead or isolated: forcing while the node is
-merely partitioned and the worker has not yet self-fenced is exactly the
-split-brain the gate exists to prevent.
+`legion_instance_replace`, supports `--idempotency-key`) is like
+force-deleting a pod stuck on a lost K8s node. It frees the gated allocation
+immediately, skipping the rest of the window and overriding `'never'`. It
+then enqueues a reschedule that excludes the lost node, so the replacement
+re-binds the same instance id and storage handle somewhere else. It refuses
+to act unless the instance's allocation is on a `lost` node. Use it only when
+you've confirmed the node is dead or isolated. Forcing it while the node is
+only partitioned, and the worker hasn't self-fenced yet, causes the
+split-brain the gate is there to prevent.
 
 ### State walkthrough
 
@@ -329,57 +325,53 @@ split-brain the gate exists to prevent.
 
 | t | manager view | worker view (partitioned) |
 | --- | --- | --- |
-| 0s | heartbeats from `node-w3` stop arriving | heartbeats to the manager start failing; retry with backoff |
-| ~10s | monitor marks `node-w3` lost, sets `lost_at`; stateless allocations replaced now; `db-default-2` gated (`pending-loss-confirmation` in `instance get`) | task still running; self-fence clock at ~10s |
+| 0s | heartbeats from `node-w3` stop arriving | heartbeats to the manager start failing and retry with backoff |
+| ~10s | monitor marks `node-w3` lost and sets `lost_at`. Stateless allocations are replaced now. `db-default-2` is gated (`pending-loss-confirmation` in `instance get`) | task still running, self-fence clock at ~10s |
 | 90s | still gated (90 < 180) | watchdog kills the allocation: `self-fencing allocation …: lost manager contact for 90s` |
 | 180s+ | monitor tick confirms the loss: allocation freed, instance `rescheduling`, replacement planned on a live node, instance `active` again with the **same id and storage handle** | nothing running |
-| later | if `node-w3` reconnects, its heartbeat reports the fenced allocation as failed and clears `lost_at`; the manager treats it as a normal dead allocation (it may already have been replaced) | worker rejoins cleanly |
+| later | if `node-w3` reconnects, its heartbeat reports the fenced allocation as failed and clears `lost_at`. The manager treats it as a normal dead allocation (it may already have been replaced) | worker rejoins cleanly |
 
-Had the node returned before 180s, the gate would simply release: the
-allocation (already self-fenced at 90s, or still running if the outage was
-shorter than 90s) is reported by the returning worker and normal
-reconciliation takes over — an allocation that never stopped keeps running
-with its binding intact, and no replacement is ever planned.
+If the node had returned before 180s, the gate would release. The returning
+worker reports the allocation (already self-fenced at 90s, or still running
+if the outage was shorter than 90s), and normal reconciliation takes over. An
+allocation that never stopped keeps running with its binding intact, and no
+replacement is planned.
 
 ## Rollouts and the single-live-allocation invariant
 
-The "at most one live allocation per instance" invariant must hold even during
-a rollout. The only rollout strategy that would break it is `createFirst`
-(replace-before-stop), which starts the incoming allocation *before* stopping
-the outgoing one — for a stateful task that means two live allocations sharing
-one instance id, storage handle, and workload-identity subject at the same
-time. The node-loss fencing described in [Node loss and fencing
-(at-most-one)](#node-loss-and-fencing-at-most-one) cannot help here — a
-createFirst overlap is deliberate and on healthy nodes, not a partition
-artifact (see [stateful-vs-nomad-k8s.md](../internal_docs/stateful-vs-nomad-k8s.md)).
+The rule of at most one live allocation per instance must hold during
+rollouts too. The only rollout strategy that would break it is `createFirst`
+(replace-before-stop). It starts the new allocation before stopping the old
+one. For a stateful task, that means two live allocations sharing one
+instance id, storage handle, and workload-identity subject at the same time.
+The node-loss fencing in [Node loss and fencing
+(at-most-one)](#node-loss-and-fencing-at-most-one) doesn't help here,
+because a `createFirst` overlap is intentional and happens on healthy nodes.
 
-Therefore **a stateful task may not use a `createFirst` rollout**: the combo is
-rejected at job admission with an actionable error pointing at this invariant.
+So **a stateful task can't use a `createFirst` rollout.** Legion rejects the
+combination at job admission with an error that points to this rule.
 Stateful groups must use the default stop-then-start (`destroyFirst`)
-replacement, which guarantees the single-live-allocation invariant by
-construction. (This is a temporary restriction until instance fencing exists.)
+replacement, which guarantees a single live allocation.
 
 ### Edge boot does not weaken the invariant
 
-[Edge boot](edge-boot.md) lets a node start a keyed sandbox *before* its
-placement is durable, which sounds like it should threaten the same invariant.
-It does not, because an unratified start binds nothing: no instance id, no
-storage handle, no workload identity. Binding still happens in exactly one
-place — `assign_stateful_instance_tx`, inside the plan apply — and a
-ratification is an ordinary plan submission that names the instance it is
-racing for.
+[Edge boot](edge-boot.md) lets a node start a keyed sandbox before its
+placement is durable. That might seem to threaten the same rule, but it
+doesn't. A start that hasn't been ratified binds nothing: no instance id, no
+storage handle, no workload identity. Binding still happens in one place,
+inside the plan apply. A ratification is an ordinary plan submission that
+names the instance it's competing for.
 
-Two nodes that both boot `user-42` therefore resolve the same way two
-concurrent plans resolve today: the store serializes them, the first binds, and
-the second is refused with `instance_claimed` and kills its work. The existing
-suites in this section run unchanged with `speculativeStart` on and off.
+If two nodes both boot `user-42`, they resolve the same way two concurrent
+plans do. The store serializes them, the first one binds, and the second is
+refused with `instance_claimed` and kills its work.
 
 ## Ordered rollouts for slot pools
 
-Slot pools are ordinal by nature, and quorum systems care about the order in
-which replicas restart. Two rollout options make config updates
-ordinal-aware (`rollout.slots`, also scopeable per group via
-`rolloutByGroup.<group>.slots` like every other rollout option):
+Slot pools are ordinal, and quorum systems care about the order in which
+replicas restart. Two rollout options make config updates follow slot order.
+Set them under `rollout.slots`, or per group under
+`rolloutByGroup.<group>.slots` like every other rollout option:
 
 ```nickel
 rollout = {
@@ -393,49 +385,48 @@ rollout = {
 ### `order = "sequential"` — one slot at a time, highest first
 
 A sequential rollout replaces allocations **one slot per step, highest
-ordinal first** (`count-1 → 0`), and each step is gated on the previous
-slot's replacement passing the rollout's existing health criteria
-(allocation health snapshots plus `minHealthyTime`, exactly like any other
-rollout step). This is the update-order analog of a K8s StatefulSet's
-`OrderedReady` pod management: followers (high ordinals) restart before the
-conventional leader at slot 0.
+ordinal first** (`count-1 → 0`). Each step waits for the previous slot's
+replacement to pass the rollout's existing health criteria (allocation
+health snapshots plus `minHealthyTime`, like any other rollout step). This
+matches the update order of a K8s StatefulSet's `OrderedReady` pod
+management: followers (high ordinals) restart before the usual leader at
+slot 0.
 
-- **Replacement is stop-then-start per slot**: the slot's old allocation is
-  retired, its replacement is placed, **re-binds the same instance id and
+- **Each slot is stopped, then started.** The slot's old allocation is
+  retired, and its replacement is placed, **re-binds the same instance id and
   storage handle**, and must become healthy before the next (lower) slot is
-  touched. (`createFirst` remains rejected for stateful groups, so the
-  at-most-one invariant holds at every step.)
-- **Halt on unhealthy**: if a replacement never passes the health gate, the
-  rollout stops at that slot — lower slots keep running the old config.
-  This inherits the standard rollout failure semantics: without a
-  `healthyDeadline` the rollout waits (status `running`, with a
-  `waiting for slot N replacement to become healthy` event); with one, the
-  configured `onHealthDeadline` action (`rollback` by default) fires.
-- **Legibility**: rollout events name each step's slot (`retired old
+  touched. (`createFirst` is still rejected for stateful groups, so the
+  one-live-allocation rule holds at every step.)
+- **Halt on unhealthy.** If a replacement never passes the health gate, the
+  rollout stops at that slot, and lower slots keep running the old config.
+  Standard rollout failure behavior applies. Without a `healthyDeadline`, the
+  rollout waits (status `running`, with a `waiting for slot N replacement to
+  become healthy` event). With one, the configured `onHealthDeadline` action
+  (`rollback` by default) fires.
+- **Visibility.** Rollout events name each step's slot (`retired old
   allocation for slot 2`, `slot 2 updated and healthy`), and
-  `GetRolloutStatus` reports `step_index`/`total_steps` where total steps =
+  `GetRolloutStatus` reports `step_index`/`total_steps`, where total steps is
   the number of slots being updated.
-- Sequential defines its own one-slot-per-step progression, so it cannot be
-  combined with the step modes (`percentEachStep`, `countEachStep`,
+- Sequential has its own one-slot-per-step progression, so you can't combine
+  it with the step modes (`percentEachStep`, `countEachStep`,
   `percentSteps`, `countSteps`) in the same scope. A per-group `slots`
-  override replaces a global step mode (and vice versa), mirroring how step
-  mode overrides already work. `progression = "manual"` composes fine: each
+  override replaces a global step mode (and the reverse), the same way step
+  mode overrides already work. `progression = "manual"` works with it: each
   manual advance releases one slot.
 
-**Initial bring-up is not yet gated.** A fresh job's slots place in
-ascending order (0 → N-1) by construction, but in a single eval without
-per-slot health gating — the K8s `OrderedReady` *bring-up* analog is a
-follow-up. `order = "sequential"` governs config updates (and staged
-promotions) today.
+**Initial bring-up is not gated yet.** A new job's slots are placed in
+ascending order (0 → N-1), but in a single eval without per-slot health
+gating. There is no equivalent of K8s `OrderedReady` bring-up yet. Today
+`order = "sequential"` applies to config updates (and staged promotions).
 
 ### `updateFrom` — staged ("partitioned") rollouts
 
-`updateFrom = N` stages the rollout: **only slots `>= N` are updated to the
-new config; slots `0..N` keep running their current allocations untouched**
-— including across later reschedules (the scheduler knows staged slots are
-deliberately occupied by the older config and will not double-place them).
-This is the K8s StatefulSet `rollingUpdate.partition` analog and enables the
-canary-promote workflow:
+`updateFrom = N` stages the rollout. **Only slots `>= N` are updated to the
+new config. Slots `0` through `N-1` keep running their current allocations untouched**,
+including across later reschedules. (The scheduler knows staged slots are
+intentionally held by the older config and won't double-place them.) This is
+the equivalent of K8s StatefulSet `rollingUpdate.partition`, and it supports
+a canary-then-promote workflow:
 
 ```text
 count: 4, v2 submitted with updateFrom: 2
@@ -450,20 +441,20 @@ operator validates v2 on slots 3 and 2, then resubmits with updateFrom: 0
   takes — the promote needs no other spec change.
 ```
 
-Validation rules (all at `job validate`/submit time, with actionable
+Validation rules (all at `job validate` and submit time, with actionable
 errors):
 
 - `rollout.slots` (both `order` and `updateFrom`) is only valid for groups
-  whose stateful task is **slot mode** — stateless and keyed groups are
-  rejected, with a pointer at `rolloutByGroup` scoping for mixed jobs.
+  whose stateful task uses **slot mode**. Stateless and keyed groups are
+  rejected, with a pointer to `rolloutByGroup` scoping for mixed jobs.
 - `updateFrom` requires `order = "sequential"`. (K8s `partition` exists only
-  inside ordered rolling updates; "update slots >= N" has no coherent
-  meaning unless slots are replaced by ordinal.)
-- `updateFrom` must be `< count.num`. K8s permits `partition >= replicas`
-  to mean "update nothing", but a rollout that completes instantly while
-  silently pinning every slot to the old config is almost always a typo in
-  Legion — omit the field to update everything, or lower it to stage.
-- `updateFrom = 0` is valid and identical to omitting the field.
+  inside ordered rolling updates. "Update slots >= N" doesn't make sense
+  unless slots are replaced by ordinal.)
+- `updateFrom` must be `< count.num`. K8s allows `partition >= replicas` to
+  mean "update nothing." In Legion, a rollout that finishes instantly while
+  pinning every slot to the old config is almost always a typo. Omit the
+  field to update everything, or lower it to stage.
+- `updateFrom = 0` is valid and the same as omitting the field.
 - Negative or non-numeric values and unknown `order` values are rejected at
   parse time.
 
@@ -478,9 +469,10 @@ errors):
 
 ## Keyed Mode: the Management API
 
-Keyed mode is the sandbox/dispatch primitive: 0..thousands of long-lived
-logical instances per (job, group, task), created and destroyed on demand,
-each with a unique id that is **never recycled for the lifetime of the job**.
+Keyed mode is the building block for sandboxes and dispatch work. A job can
+have anywhere from zero to thousands of long-lived logical instances per
+(job, group, task), created and destroyed on demand. Each has a unique id
+that is **never recycled for the lifetime of the job**.
 
 ### Lifecycle
 
@@ -496,35 +488,38 @@ CreateInstance ──> pending ──placed──> active ──alloc dies──
 ```
 
 - **Create** registers the instance (state `pending`) and enqueues placement.
-  The scheduler derives a keyed task's desired allocation count from its live
-  (pending/active/rescheduling) instances — keyed tasks define no `count`, and a
-  keyed task with zero instances runs zero allocations. Stopped instances are
-  NOT in the desired set.
-- **Placement** binds the new allocation to an unbound live instance inside
-  the same transaction that inserts the allocation (the same choke point slot
-  mode uses), and mints the storage handle on first placement if the task
-  declares `stateful.storage`.
-- **Failure** of the allocation moves the instance to `rescheduling`; the
-  replacement allocation re-binds the *same* instance id and storage handle.
+  The scheduler sets a keyed task's desired allocation count from its live
+  (pending, active, or rescheduling) instances. Keyed tasks define no
+  `count`, and a keyed task with zero instances runs zero allocations.
+  Stopped instances are **not** in the desired set.
+- **Placement** binds the new allocation to an unbound live instance, inside
+  the same transaction that inserts the allocation (the same path slot mode
+  uses). If the task declares `stateful.storage`, the storage handle is
+  created on first placement.
+- **Failure** of the allocation moves the instance to `rescheduling`. The
+  replacement allocation re-binds the same instance id and storage handle.
   Allocation churn never terminates or stops a keyed instance.
-- **Stop** (`StopInstance` / `legion instance stop`) pauses the instance:
-  stops its allocation through the normal allocation-stop path and transitions
-  the row to `stopped`, **retaining the row and its storage handle**. The id
-  stays owned (creates still collide) and the instance is not scheduled until
-  started. See [Stopping and starting](#stopping-and-starting).
-- **Start** (`StartInstance` / `legion instance start`) reverses a stop:
-  `stopped -> pending`, re-placed against the same id and retained handle.
+- **Stop** (`StopInstance` or `legion instance stop`) pauses the instance. It
+  stops the allocation through the normal allocation-stop path and moves the
+  row to `stopped`, **keeping the row and its storage handle**. The id stays
+  owned (creates with that id still collide), and the instance isn't
+  scheduled until it's started. See [Stopping and
+  starting](#stopping-and-starting).
+- **Start** (`StartInstance` or `legion instance start`) reverses a stop. The
+  instance moves from `stopped` to `pending` and is placed again with the
+  same id and kept handle.
 - **Destroy** stops the instance's allocation through the normal
-  allocation-stop path, **drops the storage handle**, and retains the row as a
-  `terminated` tombstone for the lifetime of the job (destroying the job clears
-  it).
+  allocation-stop path, **drops the storage handle**, and keeps the row as a
+  `terminated` tombstone for the lifetime of the job. Destroying the job
+  clears it.
 
 ### API / CLI
 
-Four manager RPCs (`CreateInstance`, `DestroyInstance`, `ListInstances`,
-`GetInstance` — see `proto/legion.proto` for the authoritative contract),
-surfaced as `legion instance ...` and as MCP tools
-(`legion_instance_create/destroy/stop/start/list/get`):
+Eight manager RPCs back this: `CreateInstance`, `CreateInstances` (batch),
+`StopInstance`, `StartInstance`, `DestroyInstance`, `ReplaceInstance`,
+`ListInstances`, and `GetInstance`. See `proto/legion.proto` for the full
+contract. They're available as `legion instance ...` commands and as MCP
+tools (`legion_instance_create/stop/start/destroy/replace/list/get`):
 
 ```bash
 # create with an explicit key (idSource 'caller' requires one; with 'uuid'
@@ -557,36 +552,38 @@ legion instance destroy user-42 -j     # forever (tombstone, handle dropped)
 
 `create`, `destroy`, `stop`, and `start` accept `--idempotency-key` and report
 `deduplicated`, like the other mutating RPCs. Destroying an already-terminated
-instance, stopping an already-stopped one, and starting an already-live one all
-succeed as no-ops. `--group`/`--task` are only needed when the job declares
-more than one keyed task; ambiguity is rejected, never guessed.
+instance, stopping an already-stopped one, and starting an already-live one
+all succeed and do nothing. You only need `--group`/`--task` when the job
+declares more than one keyed task. If the target is ambiguous, the command
+fails instead of guessing.
 
 ### Stopping and starting
 
-`stop` and `start` (keyed mode only — slot lifecycles are owned by the
-scheduler via `count.num`) make a keyed instance a *reversible pause*, distinct
-from the irreversible `destroy`:
+`stop` and `start` work in keyed mode only. (In slot mode, the scheduler
+manages the lifecycle through `count.num`.) They let you pause a keyed
+instance and resume it later, unlike `destroy`, which is permanent:
 
 | | `stop` | `destroy` |
 | --- | --- | --- |
 | Row | retained (`stopped`) | retained (`terminated` tombstone) |
 | Storage handle | **retained** | **dropped** |
 | Id | stays owned (creates collide) | stays owned for the job's lifetime |
-| Reversible | yes, via `start` | no — create a new id instead |
+| Reversible | yes, via `start` | no (create a new id instead) |
 | In desired set | no (not scheduled until started) | no, ever |
 
-- **Stop** removes the instance's allocation in the same transaction that flips
-  the row to `stopped`, so the release hook can never race it back to
-  `rescheduling`. While stopped the instance is not part of the keyed task's
-  desired count: resubmits, config updates, and reschedules will not resurrect
-  it. Only `start` does.
-- **Start** transitions `stopped -> pending` and enqueues placement; the new
-  allocation re-binds the same instance id and its retained storage handle, so
-  the revived sandbox is *the same* logical instance with its data.
-- **Terminated** (destroyed) instances cannot be stopped or started — the id is
-  tombstoned for the job's lifetime; create a new id instead.
+- **Stop** removes the instance's allocation in the same transaction that
+  sets the row to `stopped`, so the release hook can't race it back to
+  `rescheduling`. While stopped, the instance doesn't count toward the keyed
+  task's desired count. Resubmits, config updates, and reschedules won't
+  bring it back. Only `start` does.
+- **Start** moves the instance from `stopped` to `pending` and enqueues
+  placement. The new allocation re-binds the same instance id and its kept
+  storage handle, so the revived sandbox is the same logical instance with
+  its data.
+- **Terminated** (destroyed) instances can't be stopped or started. The id is
+  tombstoned for the job's lifetime, so create a new id instead.
 
-Revival walkthrough (stop, then bring it back):
+To stop an instance and bring it back:
 
 ```bash
 legion instance create sandbox-demo --id user-42   # active
@@ -602,133 +599,132 @@ legion instance list sandbox-demo -j                 # ...but instances still "s
 legion instance start user-42                        # each one revived explicitly
 ```
 
-Note that resubmitting a stopped job (`job run`) clears the *job's* stopped
-status but **does not** auto-start its stopped keyed instances — each needs an
-explicit `instance start`. This keeps revival intentional (you choose which
-sandboxes come back).
+Resubmitting a stopped job (`job run`) clears the job's stopped status, but it
+**doesn't** start its stopped keyed instances. Each one needs an explicit
+`instance start`, so you choose which sandboxes come back.
 
 ### Id rules
 
-- Charset `[A-Za-z0-9._-]`, length 1–128 (ids flow into env vars, workload
-  identity subjects, and CLI args).
-- `stateful.idSource` declares the *default* source: `'caller'` makes the id
-  required on create; `'uuid'` (or unset) lets the server mint one. A valid
-  caller-supplied id is always honored regardless of `idSource`.
-- Ids are unique within the job and **never recycled for the lifetime of the
-  job**: creating an id that collides with any existing row of the job —
-  including a `stopped` instance or a `terminated` tombstone — is rejected
-  (`AlreadyExists`). So a dead sandbox's identity (and its WI `sub`) can never
-  be handed to a new one while the job lives. Destroying the whole job
-  (`job destroy`) cascades and clears its instance history (rows are deleted
-  with the job, see [Scale-In / Scale-Out Retention](#scale-in--scale-out-retention)),
-  after which an id from that job is free again — the never-recycle guarantee
-  is scoped to the job's lifetime, not eternal.
-- Keyed ids may not collide with the reserved slot-id pattern
-  `{job}-{group}-{slot}` of a slot-mode stateful task **in the same job**: the
-  slot and keyed id spaces are kept disjoint so a keyed id can never adopt, or
-  be adopted by, a slot placement (a create supplying such an id is rejected,
-  and a slot binding never adopts a foreign row).
+- Allowed characters are `[A-Za-z0-9._-]`, and length is 1–128 (ids end up in
+  env vars, workload identity subjects, and CLI args).
+- `stateful.idSource` sets the default source. `'caller'` makes the id
+  required on create. `'uuid'` (or unset) lets the server create one. A valid
+  caller-supplied id is always used regardless of `idSource`.
+- Ids are unique across the whole cluster and **never recycled for the
+  lifetime of the job that owns them**. Creating an id that matches any
+  existing instance row, in this job or another one, is rejected
+  (`AlreadyExists`). That includes a `stopped` instance or a `terminated`
+  tombstone. So a dead sandbox's identity (and its WI `sub`) can never
+  be given to a new one while the job exists. Destroying the whole job (`job
+  destroy`) clears its instance history, since rows are deleted with the job
+  (see [Scale-In / Scale-Out Retention](#scale-in--scale-out-retention)).
+  After that, ids from that job are free again. The never-recycle guarantee
+  lasts for the job's lifetime only.
+- Keyed ids can't match the reserved slot-id pattern `{job}-{group}-{slot}`
+  of a slot-mode stateful task **in the same job**. Slot and keyed ids are
+  kept separate so a keyed id can never take over, or be taken over by, a
+  slot placement. A create with such an id is rejected, and a slot binding
+  never adopts a row it doesn't own.
 
 ### Storage on destroy
 
-Destroy always drops the storage handle. This is deliberately the opposite of
-slot scale-in (which retains storage by default for a later scale-out): a
-slot id will run again and must reattach its data; a destroyed keyed id can
-never run again, so letting its state remain attachable would be a leak.
+Destroy always drops the storage handle. Slot scale-in does the opposite and
+keeps storage by default for a later scale-out. The difference is that a slot
+id will run again and must reattach its data. A destroyed keyed id can never
+run again, so keeping its state attachable would leak storage.
 
-Stopping the whole job (`job stop`) is **not** a destroy: keyed instances are
-moved to `stopped` (not `terminated`) with their storage handles **retained**,
-so `job run` + `instance start` revives them with their data. Slot instances
-become `terminated` with handles retained too (unless the task sets
+Stopping the whole job (`job stop`) is **not** a destroy. Keyed instances move
+to `stopped` (not `terminated`) and **keep** their storage handles, so `job
+run` plus `instance start` brings them back with their data. Slot instances
+become `terminated` and also keep their handles (unless the task sets
 `retainOnStop = false`, see [Scale-In / Scale-Out
-Retention](#scale-in--scale-out-retention)), so a later `job run`
-re-materializes the same ordinal identities. Only `instance destroy` / `job
-destroy` drops keyed handles.
+Retention](#scale-in--scale-out-retention)), so a later `job run` brings back
+the same ordinal identities. Only `instance destroy` or `job destroy` drops
+keyed handles.
 
 ### Count interaction
 
-Keyed tasks have no `count` — defining one is a parse-time error (see the
-validation rules above), because cardinality is owned entirely by the
-instance management API. Submitting the job places nothing until instances
-are created, and config updates/rollouts converge each keyed task to its
-live-instance count, replacing every live instance's allocation on the new
-config.
+Keyed tasks have no `count`. Defining one is a parse-time error (see the
+validation rules above), because the instance management API owns
+cardinality. Submitting the job places nothing until you create instances.
+Config updates and rollouts bring each keyed task to its live-instance count
+and replace every live instance's allocation with one on the new config.
 
 ## Scale-In / Scale-Out Retention
 
-- **Scale-in** (`count` 3 → 2): slot 2's instance is marked `terminated` but
-  the **row is retained**, and its storage handle is kept by default
-  (`retainOnScaleIn = true`). With `retainOnScaleIn = false` the handle is
-  dropped on scale-in (reclamation itself is a driver concern, see below).
-- **Scale-out** (2 → 3): slot 2 is re-materialized with the **same instance
-  id**, and a retained storage handle is reattached. If no handle was retained
-  a fresh one is minted.
-- **Job stop**: rows are retained for all instances. Slot instances become
-  `terminated`, so a later `job run` re-materializes the same identities;
-  their handles are retained by default (`retainOnStop = true`) so the re-run
-  reattaches the same data, while `retainOnStop = false` drops the handles on
-  stop and the revived slots mint fresh ones — identity comes back, the data
-  binding doesn't. Keyed instances become `stopped` (handles retained,
-  always), so `job run` + `legion instance start <id>` revives each one with
-  its data (see [Stopping and starting](#stopping-and-starting)). A stop is a
-  pause, not a destroy.
+- **Scale-in** (`count` 3 → 2): slot 2's instance is marked `terminated`, but
+  the **row is kept**, and its storage handle is kept by default
+  (`retainOnScaleIn = true`). With `retainOnScaleIn = false`, the handle is
+  dropped on scale-in. (Reclaiming the storage is up to the driver, see
+  below.)
+- **Scale-out** (2 → 3): slot 2 comes back with the **same instance id**, and
+  a kept storage handle is reattached. If no handle was kept, a new one is
+  created.
+- **Job stop**: rows are kept for all instances. Slot instances become
+  `terminated`, so a later `job run` brings back the same identities. Their
+  handles are kept by default (`retainOnStop = true`), so the re-run
+  reattaches the same data. With `retainOnStop = false`, handles are dropped
+  on stop and the revived slots get new ones: the identity comes back, but
+  the data doesn't. Keyed instances become `stopped` (handles always kept),
+  so `job run` plus `legion instance start <id>` brings each one back with its
+  data (see [Stopping and starting](#stopping-and-starting)). A stop is a
+  pause.
 - **Job destroy**: instance rows are deleted with the job (FK cascade),
-  storage handles included, regardless of `retainOnStop` — that knob governs
-  `job stop` only. This is the only thing that clears a job's keyed-id
-  history — the never-recycle guarantee holds for the lifetime of the job,
-  not beyond it.
+  storage handles included, regardless of `retainOnStop`. That setting only
+  affects `job stop`. Job destroy is the only thing that clears a job's
+  keyed-id history, so the never-recycle guarantee holds for the lifetime of
+  the job and no longer.
 
 ### K8s mapping
 
-The two knobs are the slot-mode analog of a StatefulSet's
-`persistentVolumeClaimRetentionPolicy` (both default Retain):
+The two settings are the slot-mode equivalent of a StatefulSet's
+`persistentVolumeClaimRetentionPolicy` (both default to Retain):
 
 | K8s | Legion |
 | --- | --- |
 | `whenScaled: Retain/Delete` | `retainOnScaleIn = true/false` |
-| `whenDeleted: Retain/Delete` | `retainOnStop = true/false` (`job stop`; `job destroy` always deletes) |
+| `whenDeleted: Retain/Delete` | `retainOnStop = true/false` (applies to `job stop`, while `job destroy` always deletes) |
 
-`whenDeleted` maps to `job stop` — not `job destroy` — because stopping is
-Legion's analog of deleting a StatefulSet (the spec lingers, identities can
-come back), whereas `job destroy` purges the job's entire record history
-unconditionally.
+`whenDeleted` maps to `job stop` rather than `job destroy`. Stopping a job is
+Legion's equivalent of deleting a StatefulSet: the spec stays, and identities
+can come back. `job destroy` always purges the job's entire record history.
 
 ## Storage Handle Contract
 
-Each instance optionally owns a `storage_handle`, minted on first placement
-when the task declares `stateful.storage`. It is a `{plugin}/{volume_id}` pair
-(`local-dir/9f2c…`): which driver owns the storage, and which volume. The
-contract is:
+Each instance can own a `storage_handle`, created on first placement when the
+task declares `stateful.storage`. It is a `{plugin}/{volume_id}` pair
+(`local-dir/9f2c…`) that names the driver that owns the storage and the
+volume. The contract:
 
-- the handle binds to the **instance**, never the allocation;
-- every allocation for the instance sees the same handle;
-- handles survive reschedules, config updates, and (by default) scale cycles.
+- the handle binds to the **instance**, never the allocation
+- every allocation for the instance sees the same handle
+- handles survive reschedules, config updates, and (by default) scale cycles
 
-Behind the handle is a real volume, materialized by a plugin on whatever node
-the instance lands on: mounted before the task starts, unmounted on stop, and
-reclaimed when the handle is dropped. Node-local volumes additionally **pin**
-their instance to the node holding the data, so a replacement can never start on
-an empty disk. See **[docs/volumes.md](volumes.md)** for plugins, the driver
-contract, and `legion volume`.
+Behind the handle is a volume, set up by a plugin on whatever node the
+instance lands on. It's mounted before the task starts, unmounted on stop,
+and reclaimed when the handle is dropped. Node-local volumes also **pin**
+their instance to the node holding the data, so a replacement can never start
+on an empty disk. See **[docs/volumes.md](volumes.md)** for plugins, the
+driver contract, and `legion volume`.
 
-Every task runtime consumes the same machinery — there is no runtime-private
-storage. What differs is the *shape* a runtime takes
-([`volume_mode`](volumes.md#filesystem-mode-vs-block-mode)): `exec` and
-`container` consume a host directory, while the
-[`sandbox` runtime](task-runtime-sandbox.md) declares `mode = "block"` and is handed
-a formatted disk image its microVM attaches as a virtio-blk device. Either
-way, single-writer safety is the invariant above: a filesystem (or a
-filesystem image) tolerates exactly one writer, and "at most one live
-allocation per instance" is precisely that guarantee.
+Every task runtime uses the same storage machinery. No runtime has its own
+private storage. What differs is the shape a runtime expects
+([`volume_mode`](volumes.md#filesystem-mode-vs-block-mode)). `exec` and
+`container` use a host directory. The [`sandbox`
+runtime](task-runtime-sandbox.md) declares `mode = "block"` and gets a
+formatted disk image that its microVM attaches as a virtio-blk device. In
+both cases, single-writer safety comes from the rule above. A filesystem (or
+a filesystem image) supports only one writer, and at most one live
+allocation per instance guarantees that.
 
 ## Workload Identity Integration
 
-The instance id is the stable key the OIDC workload identity consumes (see
-[workload-identity.md](workload-identity.md)): stateful claims carry
+The instance id is the stable key that OIDC workload identity uses (see
+[workload-identity.md](workload-identity.md)). Stateful claims carry
 `legion.io/instance` (and `legion.io/slot` in slot mode), and `sub` templates
-on stateful tasks may use the `{instance}` / `{slot}` placeholders. Because
-the instance id survives reschedules, the token's identity is stable even
-though each allocation mints fresh short-lived tokens.
+on stateful tasks can use the `{instance}` and `{slot}` placeholders. Since
+the instance id survives reschedules, the token's identity stays stable even
+though each allocation gets fresh short-lived tokens.
 
 ## Trying It Locally
 
@@ -746,7 +742,7 @@ cargo run -- job run configs/jobs/stateful-demo.ncl
 cargo run -- job list -j
 ```
 
-Each replica logs its identity at start, e.g.:
+Each replica logs its identity at start, for example:
 
 ```
 instance=stateful-demo-default-1 slot=1 alloc=12
@@ -761,9 +757,9 @@ LEGION_INSTANCE_MODE=slot
 LEGION_ALLOC_ID=12
 ```
 
-Kill the worker process hosting slot 1 (or stop its allocation) and watch the
-replacement come up with the **same** `LEGION_INSTANCE_ID` and slot but a new
-`LEGION_ALLOC_ID`. Instance rows are visible via the state store:
+Kill the worker process hosting slot 1 (or stop its allocation). The
+replacement comes up with the **same** `LEGION_INSTANCE_ID` and slot but a
+new `LEGION_ALLOC_ID`. You can see instance rows in the state store:
 
 ```bash
 cargo run -- state query 'SELECT instance_id, state, slot_index, current_alloc_id, storage_handle FROM instance' -j
@@ -771,7 +767,7 @@ cargo run -- state query 'SELECT instance_id, state, slot_index, current_alloc_i
 
 ### Keyed mode walkthrough
 
-With the same manager + worker running:
+With the same manager and worker running:
 
 ```bash
 # Submitting the keyed demo places ZERO allocations (count is not in charge)
@@ -797,11 +793,7 @@ cargo run -- instance create sandbox-demo --id user-42
 
 ## Stateless Jobs Are Unaffected
 
-Tasks without a `stateful` block behave exactly as before: no instance rows
-are created, allocations carry no `instance_id`, and no `LEGION_INSTANCE_*`
-variables are injected. The only addition for stateless tasks is
-`LEGION_ALLOC_ID`, which is universally useful and harmless. This regression
-guarantee is covered by tests
-(`stateless_job_plans_carry_no_instance_metadata`,
-`stateless_jobs_create_no_instance_rows`,
-`injects_alloc_id_for_stateless_tasks_without_instance_vars`).
+Tasks without a `stateful` block behave as before. No instance rows are
+created, allocations carry no `instance_id`, and no `LEGION_INSTANCE_*`
+variables are injected. The only change for stateless tasks is the
+`LEGION_ALLOC_ID` variable.

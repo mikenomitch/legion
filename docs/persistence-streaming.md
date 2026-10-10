@@ -5,7 +5,7 @@ Legion supports a streaming persistence mode for manager state using:
 - SQLite as the local primary store.
 - [rustyriver](https://crates.io/crates/rustyriver) for WAL shipping to object
   storage. rustyriver is an embeddable Rust reimplementation of Litestream v0.5,
-  so replication runs **in-process** — there is no `litestream` sidecar binary to
+  so replication runs in-process. There is no `litestream` sidecar binary to
   install or supervise.
 - An optional object-storage lease for single-primary failover fencing, provided
   by rustyriver's `S3Leaser`.
@@ -21,8 +21,8 @@ Legion supports a streaming persistence mode for manager state using:
 
 ## Configuration
 
-Nickel deliberately has no access to the process environment, so secrets are
-kept in a separate, uncommitted file and imported:
+Nickel has no access to the process environment. Keep secrets in a separate,
+uncommitted file and import them:
 
 ```nickel
 # secrets.ncl (gitignored)
@@ -57,30 +57,30 @@ let secrets = import "secrets.ncl" in
 
 ### `replicaUrl`
 
-- `s3://<bucket>/<prefix>` — replicate to S3/R2/MinIO via rustyriver's
+- `s3://<bucket>/<prefix>`: replicate to S3/R2/MinIO via rustyriver's
   `ObjectStoreClient`. Credentials for this destination are read from the ambient
   environment (`AWS_*`, falling back to `LITESTREAM_*`), matching Litestream's URL
   semantics.
-- `file://<path>` or a bare local path — replicate to a local directory via
+- `file://<path>` or a bare local path: replicate to a local directory via
   rustyriver's `FileReplicaClient` (useful for tests and single-host backups).
-- empty string — replication is disabled (local SQLite only).
+- Empty string: replication is disabled (local SQLite only).
 
 KV values inside the shipped WAL frames are ciphertext
-([KV Encryption at Rest](kv-encryption.md)), and the root key that decrypts
-them is never part of the replica. Segments written *before* encryption was
-enabled keep whatever plaintext they held until the replica's retention
-removes them — rotate retention after enabling if that history matters.
+([KV Encryption at Rest](kv-encryption.md)). The root key that decrypts them
+is never part of the replica. Segments written before you enabled encryption
+keep whatever plaintext they held until the replica's retention removes them.
+If that history matters, rotate retention after enabling encryption.
 
 ## Runtime Behavior
 
 On manager startup in `streaming` mode:
 
-1. Legion opens the SQLite store as a rustyriver-managed `Db` (WAL mode,
-   auto-checkpoint disabled, long-running read lock held to take over
-   checkpointing), then runs the capture/upload loop every `syncInterval`:
-   `Db::sync()` captures new WAL frames into a local LTX file and
-   `Replica::sync()` uploads new LTX files to `replicaUrl`. This is skipped when
-   `replicaUrl` is empty.
+1. Legion opens the SQLite store as a rustyriver-managed `Db`. It uses WAL
+   mode, disables auto-checkpoint, and holds a long-running read lock so it can
+   take over checkpointing. It then runs the capture/upload loop every
+   `syncInterval`. `Db::sync()` captures new WAL frames into a local LTX file,
+   and `Replica::sync()` uploads new LTX files to `replicaUrl`. Legion skips
+   this step when `replicaUrl` is empty.
 2. If `lease.provider = "none"`, the node is primary immediately.
 3. If `lease.provider = "object_storage"`, the node participates in an
    `S3Leaser` loop:
@@ -93,14 +93,12 @@ The manager exposes persistence status through existing manager status APIs
 
 ## Operational Notes
 
-- **No external binary is required** — replication is embedded via the
-  `rustyriver` crate. (The former `litestreamBinary` config field has been
-  removed; it is ignored if still present in old configs.)
-- For Cloudflare R2, use the S3-compatible endpoint + credentials.
+- No external binary is required. Replication is embedded via the
+  `rustyriver` crate. The former `litestreamBinary` config field has been
+  removed, and Legion ignores it if it is still present in old configs.
+- For Cloudflare R2, use the S3-compatible endpoint and credentials.
 - Keep `ttlSeconds` comfortably above `renewIntervalSeconds` (default 15s / 5s).
-- For manual failover (`none`), operators must ensure only one writer is active.
-- The lease lock object is written at `<dir(key)>/lock.json` — see
-  [`rustyriver-migration.md`](../internal_docs/rustyriver-migration.md) for the lock-key naming
-  detail and the one optional upstream enhancement.
+- For manual failover (`none`), you must make sure only one writer is active.
+- The lease lock object is written at `<dir(key)>/lock.json`.
 - Disaster recovery (point-in-time restore from the replica) uses
   `rustyriver::restore`.

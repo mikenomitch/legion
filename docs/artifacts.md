@@ -1,35 +1,33 @@
 # Artifacts
 
-Tasks need *stuff* before they can run: release tarballs, builds from
-S3-compatible storage, git repos, container images, ORAS artifacts (model
-weights, WASM modules). The artifact system is one declaration and one
-fetch/verify/unpack/stage pipeline shared by every task runtime: tasks declare
-`artifacts`, the worker stages them into a private task directory before the
-task starts, and the task references them by name — no hardcoded paths, no
-credentials in the job spec.
+Tasks often need files before they can run: release tarballs, builds from
+S3-compatible storage, git repos, container images, or ORAS artifacts (model
+weights, WASM modules). Artifacts give every task runtime one way to declare
+these and one pipeline to fetch, verify, unpack, and stage them. A task
+declares `artifacts`, the worker stages them into a private task directory
+before the task starts, and the task refers to them by name. You don't need
+hardcoded paths or credentials in the job spec.
 
-This document is the user-facing reference. The design rationale lives in
-[internal_docs/plans/artifact-system-plan.md](../internal_docs/plans/artifact-system-plan.md); the
-caching/pre-warming layer is a separate, not-yet-implemented plan
-([internal_docs/plans/artifact-cache-and-prewarm-plan.md](../internal_docs/plans/artifact-cache-and-prewarm-plan.md)).
+This page is the user-facing reference.
 
-> **Implementation status.** The system is implemented end-to-end: spec +
+> **Implementation status.** The following are implemented: spec and
 > admission validation, task directories, the staging pipeline with five
 > built-in fetchers (`https`/`http`, `file`, `git`, `s3`, `oci`), KV-backed
-> auth with cluster matchers, digest pinning at submit, per-artifact status
-> through to the CLI and UI, container image desugaring (behind a cluster
-> flag), and dynamic fetcher plugins. Two pieces are declared-but-pending:
-> **identity/nodeIdentity auth** is validated at admission but fails at fetch
-> time until workload-identity token issuance lands (see
-> [Auth](#workload-identity-auth-pending)), and there is **no artifact cache
-> yet** — every staging fetches from origin (see
+> auth with cluster matchers, digest pinning at submit, per-artifact status in
+> the CLI and UI, container image desugaring (behind a cluster flag),
+> dynamic fetcher plugins, and `nodeIdentity` auth. Two pieces are not
+> finished. **Task `identity` auth** (and `assumeRole`) is validated at
+> admission but fails at fetch time (see
+> [Auth](#workload-identity-auth-pending)). There is also **no artifact cache
+> yet**, so staging fetches from origin unless the same allocation is
+> restaging unchanged artifacts on the same node (see
 > [Limitations](#limitations)).
 
 ## Declaring artifacts
 
-`artifacts` is a first-class task field, beside `env`, `kv`, and
-`identities` — not inside the runtime-specific `config`. A bare source string is
-a complete artifact spec:
+`artifacts` is a top-level task field, next to `env`, `kv`, and
+`identities`. It does not go inside the runtime-specific `config`. A bare
+source string is a complete artifact spec:
 
 ```nickel
 {
@@ -109,90 +107,91 @@ artifacts = [
 A runnable example exercising every field is the `batch` task in
 [configs/jobs/maximal.ncl](../configs/jobs/maximal.ncl).
 
-Two read-only annotations appear on stored/normalized specs (the manager
-writes them at admission; user specs never set them): `pinnedFrom` (the
-original mutable reference when `resolve = "pin"` rewrote `source` to a digest)
-and `authOrigin` (`"task"` or `"cluster"` — where the effective auth came
-from).
+Two read-only annotations appear on stored, normalized specs. The manager
+writes them at admission, and user specs never set them:
+
+- `pinnedFrom`: the original mutable reference, when `resolve = "pin"`
+  rewrote `source` to a digest.
+- `authOrigin`: `"task"` or `"cluster"`, depending on where the effective
+  auth came from.
 
 ### Validation rules
 
-Enforced at admission (`job run` / `job plan`) **and** by offline
+These rules are enforced at admission (`job run` / `job plan`) and by offline
 `legion job validate`:
 
-- `source` must parse; `oci://` sources must include a registry host.
+- `source` must parse. `oci://` sources must include a registry host.
 - `name` matches `[a-z0-9_-]+` and is unique within the task.
 - Every `${artifact.<name>}` reference anywhere in the task's `config` must
-  name a declared artifact (typos fail at submit, not on a node twenty
-  minutes later).
+  name a declared artifact. Typos fail at submit, not on a node twenty
+  minutes later.
 - `checksum` must be `sha256:` + 64 hex digits.
 - `dest` must be relative and may not escape the task directory (`..` is
   rejected after normalization).
-- `auth` must set exactly one of `kv` / `identity` / `nodeIdentity`;
-  `assumeRole` may only accompany `identity`; `identity` must name an entry
+- `auth` must set exactly one of `kv` / `identity` / `nodeIdentity`.
+  `assumeRole` is only allowed with `identity`. `identity` must name an entry
   in the task's `identities` list.
 - `mediaType` is only valid for `oci://` sources.
 - `mode` must be an octal file mode.
-- The task runtime must support artifacts (`supports_artifacts` capability
-  gate). `exec`, `container`, and `sandbox` do; **`noop` rejects
-  artifact-bearing specs**.
+- The task runtime must support artifacts (the `supports_artifacts`
+  capability). `exec`, `container`, and `sandbox` do. **`noop` rejects specs
+  with artifacts**.
 - Unknown fields in the object form are rejected.
 
-Two checks need cluster config and therefore run only at admission, not in
-offline `job validate`: the scheme must be in the cluster's
+Two checks need cluster config, so they run only at admission, not in offline
+`job validate`. The scheme must be in the cluster's
 `artifacts.allowedSchemes`, and `auth.nodeIdentity` must name an entry in
-`workloadIdentity.nodeIdentities`. `job validate` also performs no pin
-resolution (it is fully static); `job plan` and `job run` do.
+`workloadIdentity.nodeIdentities`. `job validate` also does no pin resolution,
+because it is fully static. `job plan` and `job run` do resolve pins.
 
 ## The task directory
 
-Every allocation gets a private, cleaned-up working directory per task —
-artifact-bearing or not:
+Every allocation gets a private working directory for each task, whether or
+not the task has artifacts. Legion cleans it up afterward:
 
 ```
 <worker state dir>/allocs/<alloc_id>/<task_name>/
 ```
 
-(beside the worker's `worker_state.json`, i.e.
-`.legion/workers/<id>/allocs/…`).
+This sits next to the worker's `worker_state.json`, for example
+`.legion/workers/<id>/allocs/…`.
 
-- Created owner-only (`0700` on Unix). The allocation directory is the
-  on-disk isolation boundary between workloads sharing a node: no other
-  task or local user can reach this allocation's staged artifacts, injected
-  secrets, or files. When an `exec` task sets `user`, the allocation tree is
-  chowned to that user at start (symlinks are not followed), so the
-  dropped-privilege process keeps access to its own directory — and only
-  its own.
-- Exposed to the task as `LEGION_ALLOC_DIR` and `LEGION_TASK_DIR` env vars
-  (for runtimes that apply worker-injected env — see the
+- It is created owner-only (`0700` on Unix). The allocation directory
+  isolates workloads that share a node on disk. No other task or local user
+  can reach this allocation's staged artifacts, injected secrets, or files.
+  When an `exec` task sets `user`, the allocation tree is chowned to that
+  user at start (symlinks are not followed). The process keeps access to its
+  own directory after dropping privileges, and to no one else's.
+- It is exposed to the task as the `LEGION_ALLOC_DIR` and `LEGION_TASK_DIR`
+  env vars, for runtimes that apply worker-injected env (see the
   [capability matrix](#task-runtime-support)).
-- The `exec` runtime's `cwd` defaults to the task directory when the spec sets
-  none.
-- `exec` tasks using landlock get the task directory appended to
-  `read_write_paths` automatically — otherwise artifacts would stage
+- The `exec` runtime's `cwd` defaults to the task directory when the spec
+  sets none.
+- `exec` tasks using landlock get the task directory added to
+  `read_write_paths` automatically. Otherwise artifacts would stage
   somewhere the sandboxed task cannot read.
-- Artifacts stage into `dest` relative to this directory. Paths handed to
+- Artifacts stage into `dest` relative to this directory. Paths given to
   tasks (env vars, interpolation) are absolute.
 - The directory is removed when the allocation is stopped, destroyed, or
-  fails (best-effort, logged), and cleared before fresh staging begins — a
-  worker that died mid-staging leaves no stale content to collide with.
+  fails (best-effort, logged). It is also cleared before fresh staging
+  begins, so a worker that died mid-staging leaves no stale content behind.
 
 ## Referencing staged artifacts
 
-Named artifacts are addressable two ways, so tasks never hardcode staging
+You can refer to named artifacts in two ways, so tasks never hardcode staging
 paths:
 
-1. **`${artifact.<name>}` interpolation.** The worker substitutes the token
-   in every string field of the runtime config just before start. It is dumb
-   string substitution — no expression language — and unknown references were
+1. **`${artifact.<name>}` interpolation.** The worker replaces the token in
+   every string field of the runtime config just before start. This is plain
+   string substitution with no expression language. Unknown references were
    already rejected at admission.
-2. **`LEGION_ARTIFACT_<NAME>` env vars** (name uppercased, `-` → `_`),
-   holding the absolute staged path. Applied by runtimes that inject
-   worker-provided env (`exec`).
+2. **`LEGION_ARTIFACT_<NAME>` env vars** (name uppercased, `-` → `_`), which
+   hold the absolute staged path. Runtimes that inject worker-provided env
+   (`exec`) set these.
 
-Both expand to the staged *file path* for single files and the *destination
-directory* for everything else (unpacked archives, git trees, ORAS layer
-directories, OCI layouts).
+Both expand to the staged file path for single files. For everything else
+(unpacked archives, git trees, ORAS layer directories, OCI layouts), they
+expand to the destination directory.
 
 ```nickel
 {
@@ -214,29 +213,29 @@ directories, OCI layouts).
 | Scheme | Fetcher notes |
 | --- | --- |
 | `https://` / `http://` | Streaming download (no whole-body buffering), basic/bearer/headers credentials, redirect limit (5), Content-Length checked against the size cap before streaming. Plain `http` is **not** in the default scheme allowlist. |
-| `file://` | Copies a local file or directory tree. Dev workflows and node-local pre-provisioned artifacts. |
-| `git` | `git::https://github.com/acme/repo?ref=v1.2.0` (go-getter style) or `git://…`. Shallow clone (depth 1); `ref=` takes a branch, tag, or full 40-hex commit SHA (full SHAs are fetched as exact objects). The `.git` directory is stripped — tasks get a clean worktree. Credentials are injected via `GIT_CONFIG_*` environment variables (an `http.extraHeader` Authorization header), never argv. `resolve()` uses `git ls-remote` to pin refs to commit SHAs. |
-| `s3://` | `object_store`-backed; speaks any S3-compatible endpoint (AWS, MinIO, R2, GCS interop). Region/endpoint come from the credential object or query params (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`) — query params win. Anonymous fetches skip request signing (public buckets). |
-| `oci://` | Built on the `oci-client` crate. Anonymous/basic/bearer registry auth; tags resolve to manifest digests for pinning. Without `mediaType`, the image is materialized as an on-disk **OCI layout** (what image-consuming runtimes hand to their OCI runtime; staged under `.oci/<name>/` unless `dest` is set). With `mediaType`, only matching ORAS layers are pulled, named by their `org.opencontainers.image.title` annotation (sanitized to a basename; digest hex as fallback). Blob sizes are checked against the size cap before any blob downloads. `?protocol=http` opts into plain-HTTP registries for dev/test. |
+| `file://` | Copies a local file or directory tree. For dev workflows and artifacts pre-provisioned on the node. |
+| `git` | `git::https://github.com/acme/repo?ref=v1.2.0` (go-getter style) or `git://…`. Shallow clone (depth 1). `ref=` takes a branch, tag, or full 40-hex commit SHA (full SHAs are fetched as exact objects). The `.git` directory is stripped, so tasks get a clean worktree. Credentials are injected through `GIT_CONFIG_*` environment variables (an `http.extraHeader` Authorization header), never argv. `resolve()` uses `git ls-remote` to pin refs to commit SHAs. |
+| `s3://` | Backed by `object_store`. Works with any S3-compatible endpoint (AWS, MinIO, R2, GCS interop). Region and endpoint come from the credential object or from query params (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`). Query params win. Anonymous fetches skip request signing (public buckets). |
+| `oci://` | Built on the `oci-client` crate. Anonymous, basic, or bearer registry auth. Tags resolve to manifest digests for pinning. Without `mediaType`, the image is written to disk as an **OCI layout**, which is what image-consuming runtimes pass to their OCI runtime. It is staged under `.oci/<name>/` unless `dest` is set. With `mediaType`, only matching ORAS layers are pulled. Each is named by its `org.opencontainers.image.title` annotation (sanitized to a basename, with the digest hex as fallback). Blob sizes are checked against the size cap before any blob downloads. `?protocol=http` enables plain-HTTP registries for dev and test. |
 
 Additional schemes can be served by [fetcher plugins](#fetcher-plugins).
 
-The CLI's own jobspec fetching (`legion job run https://…`) goes through the
-same fetcher registry — one fetch stack in the tree.
+The CLI's own jobspec fetching (`legion job run https://…`) uses the same
+fetcher registry.
 
 ## Auth
 
-Three doors, one resolution path. Per artifact:
+There are three kinds of auth, resolved the same way. Per artifact:
 
 ```nickel
 auth = { kv = "secrets/ghcr-pull" }              # secret-based (works today)
-auth = { identity = "aws" }                      # task workload identity (pending)
+auth = { identity = "aws" }                      # task workload identity (not implemented)
 auth = { identity = "aws", assumeRole = "arn:aws:iam::123:role/artifact-pull" }
-auth = { nodeIdentity = "artifact-pull" }        # node workload identity (pending)
+auth = { nodeIdentity = "artifact-pull" }        # node workload identity (bearer token)
 ```
 
-Most specs should carry no `auth` at all — cluster defaults route sources to
-credentials centrally:
+Most specs should have no `auth` at all. Cluster defaults map sources to
+credentials in one place:
 
 ```nickel
 # manager.ncl
@@ -257,15 +256,15 @@ credentials centrally:
 Resolution order: **task artifact `auth` → first matching cluster
 `artifacts.auth` entry → anonymous.**
 
-Cluster matchers may use `kv` or `nodeIdentity` — both cluster-scoped
-concepts — but never a *task* identity: task identities are a per-task
-security boundary, and silently attaching one cluster-wide would blur it.
+Cluster matchers may use `kv` or `nodeIdentity`, which are both
+cluster-scoped. They can never use a task identity. Task identities are a
+per-task security boundary, and attaching one cluster-wide would weaken it.
 
-> **Matchers are baked at admission.** The manager evaluates `artifacts.auth`
-> when a job is submitted and persists the *effective* auth on the normalized
-> artifact list (annotated `authOrigin = "cluster"`). Changing the matchers
-> therefore affects the **next submit**, not jobs already in flight.
-> Credential *values* are still resolved late, on the worker, at fetch time —
+> **Matchers are applied at admission.** The manager evaluates
+> `artifacts.auth` when a job is submitted and stores the effective auth on
+> the normalized artifact list (annotated `authOrigin = "cluster"`). So
+> changing the matchers affects the **next submit**, not jobs already
+> running. Credential values are still resolved on the worker at fetch time,
 > so rotating a KV credential needs no re-submit (below).
 
 ### Secret-based auth (`kv`)
@@ -282,147 +281,131 @@ discriminator:
 { "type": "headers", "headers": { "X-Api-Key": "…" } }                   // http(s) escape hatch
 ```
 
-The worker reads the value over its authenticated manager channel via the
-`GetArtifactCredential` RPC **immediately before fetching**. The value is
-used once and never persisted on allocation rows, logged, or traced; the
-manager validates the credential shape server-side so a malformed KV value
-fails with an error naming the path, not a mid-staging parse error.
+The worker reads the value over its authenticated manager channel with the
+`GetArtifactCredential` RPC, immediately before fetching. The value is used
+once. It is never stored on allocation rows, logged, or traced. The manager
+validates the credential shape on the server, so a malformed KV value fails
+with an error naming the path instead of a parse error mid-staging.
 
-**Rotation story:** because the read happens at fetch time, rotating a
-credential is a single `legion kv put` — the next fetch (including restarts
-and reschedules of existing jobs) picks up the new value. No job edit, no
-re-submit.
+**Rotation:** the read happens at fetch time, so rotating a credential is a
+single `legion kv put`. The next fetch picks up the new value, including
+restarts and reschedules of existing jobs. You don't need to edit or
+re-submit the job.
 
-> **⚠️ KV ACL caveat — read this.** There are **no KV ACLs yet**: any job may
-> point `auth.kv` (or benefit from a cluster matcher pointing) at **any** KV
-> path. Possession of job-submit access therefore implies read access to
-> every credential stored in KV. This matches the existing trust model for
-> `$path/key` jobspec references and is accepted for now, but treat your KV
-> namespace accordingly: anyone who can submit jobs can read any KV value by
-> staging an artifact with it. When the ACL system lands, the
-> `GetArtifactCredential` handler is the enforcement point (tracked in
-> [internal_docs/TODO.md](../internal_docs/TODO.md) under *Auth, TLS & security*; the SECURITY BOUNDARY
-> comment sits at the handler in `src/manager/server.rs` and on the RPC in
-> `proto/legion.proto`).
+> **⚠️ KV ACL caveat.** KV ACLs (`kv` rules scoped by `paths`, see
+> [auth-and-acls.md](auth-and-acls.md)) govern the KV RPCs, but they do not
+> apply to artifact credentials. Admission does not check the submitter's
+> `kv` read rights for `auth.kv`, and `GetArtifactCredential` is a
+> worker-plane RPC that serves any path to an authenticated worker. So any
+> job may point `auth.kv` at **any** KV path, or use a cluster matcher that
+> does. Anyone with job-submit access can read every credential stored in
+> KV by staging an artifact with it. This matches the trust model for
+> `$path/key` jobspec references. Plan your KV namespace and job-write
+> grants with this in mind.
 
 ### Workload-identity auth (pending)
 
 `auth.identity` names an entry in the task's `identities` list
-([docs/workload-identity.md](workload-identity.md)); `auth.nodeIdentity`
-names a cluster-level **node identity** (`workloadIdentity.nodeIdentities` —
-see the node-identities section of that doc). The intent: present the JWT as
-a bearer token to stores that trust Legion's issuer ("it is Legion task
-`prod:api:web:server` fetching" / "it is a Legion worker node in pool
-`default`"), with `assumeRole` exchanging it for AWS STS credentials for
-`s3://` sources.
+([docs/workload-identity.md](workload-identity.md)). `auth.nodeIdentity`
+names a cluster-level **node identity** (`workloadIdentity.nodeIdentities`,
+see the node-identities section of that doc). The JWT is sent as a bearer
+token to stores that trust Legion's issuer. It says either "Legion task
+`prod:api:web:server` is fetching" or "a Legion worker node in pool
+`default` is fetching".
 
-> **Status:** the spec surface and all admission validation are implemented,
-> but token issuance is not — it depends on the workload-identity plan's
-> phases 2 and 4 (`IssueWorkloadIdentityToken` RPC + worker-side delivery).
-> Until those land, a fetch using `identity`/`nodeIdentity` fails with an
-> actionable error suggesting `auth.kv` or anonymous access, and a
-> `resolve = "pin"` submit on an identity-authed mutable source fails
-> suggesting `resolve = "always"`. Everything else in this document works
-> without it.
+> **Status:**
+>
+> - **`nodeIdentity` works.** At fetch time the worker requests a fresh token
+>   with the `IssueNodeIdentityToken` RPC and sends it as a bearer
+>   credential. This works for sources that accept bearer auth (`https`,
+>   `oci`, `git`). `s3://` sources reject it, because the S3 fetcher needs an
+>   AWS credential and Legion does not exchange tokens for STS credentials.
+> - **Task `identity` does not work yet.** The spec field and admission
+>   validation exist, but the worker does not request task tokens for
+>   artifact fetches. A fetch using `identity` fails with an error
+>   suggesting `auth.kv` or anonymous access. `assumeRole` is accepted with
+>   `identity` but is never used.
+> - **Pinning needs KV or anonymous auth.** The manager resolves pins only
+>   with `kv` or no auth. A `resolve = "pin"` submit on a mutable source that
+>   uses `identity` or `nodeIdentity` fails and suggests `resolve = "always"`.
 
 ### Security properties
 
 - Credential values never appear in logs, traces, allocation rows, or error
-  strings. Errors and status rows name the auth *source* (`kv:
+  strings. Errors and status rows name the auth source (`kv:
   secrets/ghcr-pull`, `identity: aws`, `nodeIdentity: artifact-pull`,
-  `anonymous`) — never values. The `Credential` type's `Debug` impl is
+  `anonymous`), never the values. The `Credential` type's `Debug` impl is
   redacted.
-- Sources are redacted on every status/error surface: userinfo and the whole
-  query string are stripped (presigned URLs carry secrets in query values).
-  HTTP client errors are stripped of their URLs for the same reason.
-- Git credentials travel via environment-scoped git config, never argv.
+- Sources are redacted everywhere they appear in status and errors. Userinfo
+  and the whole query string are stripped, because presigned URLs carry
+  secrets in query values. HTTP client errors have their URLs stripped for
+  the same reason.
+- Git credentials are passed through environment-scoped git config, never
+  argv.
 - `allowedSchemes` is enforced at admission **and** on the worker
-  (`artifacts.fetch.allowedSchemes`) — defense in depth.
+  (`artifacts.fetch.allowedSchemes`).
 
 ## Pinning: `resolve = "pin"` vs `'always'`
 
-Mutable references — OCI **tags** and git **branches/tags** — default to
+Mutable references (OCI tags and git branches or tags) default to
 `resolve = "pin"`:
 
 - At submit, the manager calls the fetcher's `resolve()` (manifest-digest
-  lookup for OCI, `git ls-remote` for git) and persists the **pinned** source
+  lookup for OCI, `git ls-remote` for git). It stores the **pinned** source
   (`oci://…@sha256:…`, `git::…?ref=<sha>`) plus a `pinnedFrom` annotation
-  recording the original reference. Every allocation of that job config —
-  including reschedules days later — fetches identical bytes.
+  with the original reference. Every allocation of that job config fetches
+  the same bytes, including reschedules days later.
 - `job plan` reports what would be pinned
   (`task api: pinned oci://ghcr.io/acme/api:v42 -> sha256:def…`) and diffs
-  against the stored config
+  it against the stored config
   (`task api: artifact oci://ghcr.io/acme/api:v42 moved: sha256:abc… ->
-  sha256:def…`) so a moved tag is visible *before* you submit. The UI's
+  sha256:def…`), so you can see a moved tag before you submit. The UI's
   declared-artifacts table shows each pinned digest with the tag it resolved
   from.
-- **Re-submitting re-resolves.** That is the deliberate "roll forward"
-  moment: push a new image to the tag, re-run `job run`, and the rollout
-  ships the new digest.
-- Resolution uses the same auth chain a worker would; the manager reads KV
+- **Re-submitting resolves again.** This is how you roll forward: push a new
+  image to the tag, re-run `job run`, and the rollout ships the new digest.
+- Resolution uses the same auth chain a worker would. The manager reads KV
   credentials directly from its own store. If resolution fails (bad
   reference, unreachable registry, identity-authed source), the submit fails
-  with the fetch error and the suggestion to set `resolve = "always"`.
+  with the fetch error and suggests setting `resolve = "always"`.
 
-`resolve = "always"` passes the reference through unchanged; each staging
-fetches whatever the tag/branch points at *then*. This is the explicit
-"track the tag" option, with the documented cost that allocations of one job
-config may run different bytes if the reference moves mid-rollout.
+`resolve = "always"` passes the reference through unchanged. Each staging
+fetches whatever the tag or branch points at at that moment. Use it to track
+a tag. The cost is that allocations of one job config may run different bytes
+if the reference moves mid-rollout.
 
-Already-immutable sources — anything with a `checksum`, OCI `@sha256:…`
-digests, git full-SHA refs — need no resolution; `resolve` is ignored.
+Sources that are already immutable need no resolution, and `resolve` is
+ignored for them. These include anything with a `checksum`, OCI `@sha256:…`
+digests, and git full-SHA refs.
 
 ## Staging mechanics
 
 Staging happens on the worker, between receiving the allocation and the
 plugin's `prepare()`/`start()`:
 
-1. Tasks without artifacts start exactly as before — no staging step, no new
-   RPC traffic.
-2. Artifact-bearing tasks are registered with health
+1. Tasks without artifacts skip staging entirely. There is no extra step and
+   no extra RPC traffic.
+2. Tasks with artifacts are registered with health
    `healthy: false, status: "staging artifacts"` and handed to a **dedicated
-   staging thread** — fetches can take minutes, and worker heartbeats keep
+   staging thread**. Fetches can take minutes, and worker heartbeats keep
    flowing the whole time.
 3. Each artifact is fetched into a `.staging/` temp area inside the task
-   directory, hashing while streaming. Checksum mismatches discard the bytes
-   and fail the attempt — corrupt bytes never reach the task directory.
-4. Archives unpack with path-traversal protection (absolute entry paths,
-   `..` escapes, and symlink/hardlink targets escaping the extraction root
-   are all rejected) and a decompressed-size budget. Recognized formats:
-   `.tar.gz`, `.tgz`, `.tar`, and bare `.gz`.
-5. Content moves into `dest`. Collisions with existing files **error** rather
-   than overwrite, and the temp area is always cleaned up.
+   directory and hashed while it streams. A checksum mismatch discards the
+   bytes and fails the attempt, so corrupt bytes never reach the task
+   directory.
+4. Archives unpack with path-traversal protection and a decompressed-size
+   budget. Absolute entry paths, `..` escapes, and symlink or hardlink
+   targets that escape the extraction root are all rejected. Recognized
+   formats: `.tar.gz`, `.tgz`, `.tar`, and bare `.gz`.
+5. Content moves into `dest`. A collision with an existing file is an error,
+   not an overwrite. The temp area is always cleaned up.
 6. The task starts with `${artifact.<name>}` interpolated and
    `LEGION_ARTIFACT_<NAME>` set.
 
-Staging is **all-or-nothing per task**: the first artifact that fails (after
-its per-artifact retries) fails the whole allocation. Per-artifact fetches
-retry with backoff and honor an overall per-artifact deadline and size cap,
-all configurable per worker type:
-
-### Restart reuse — no refetch when nothing changed
-
-A fully successful staging run writes a manifest (`.staged.json`) into the
-task directory recording the artifact list's fingerprint and every staged
-payload. When the **same allocation** stages again with an **unchanged
-artifact list** — a worker restart re-dispatching the allocation, or an
-in-place config update that didn't touch `artifacts` — the worker reuses the
-already-staged content instead of refetching from origin. Reuse is
-all-or-nothing and falls back to a full fresh fetch when:
-
-- the artifact list changed in any way (the fingerprint covers the
-  normalized, pinned specs — so a moved pinned digest refetches),
-- any recorded payload path is missing from the task directory,
-- any artifact sets `resolve = "always"` (the explicit "re-resolve at every
-  staging" contract disables reuse for the whole task), or
-- the previous run never finished (no manifest is written until every
-  artifact staged successfully; partial content is cleared before the fresh
-  fetch).
-
-Reuse applies only on the same node, per allocation — allocations *moved* to
-another node always fetch fresh, and explicit stops/removals delete the task
-directory. Cross-allocation and cross-node caching remain the
-[cache plan's](../internal_docs/plans/artifact-cache-and-prewarm-plan.md) territory.
+Staging is **all-or-nothing per task**. The first artifact that fails (after
+its retries) fails the whole allocation. Each fetch retries with backoff and
+has an overall deadline and size cap. You can configure these per worker
+type:
 
 ```nickel
 # configs/workers/default.ncl — values shown are the defaults
@@ -444,24 +427,47 @@ directory. Cross-allocation and cross-node caching remain the
 Workers without an `artifacts` block get these defaults. The settings are
 delivered through the existing worker pre-registration config flow.
 
-> **Failure semantics — fetch failures spend your `on_unhealthy` budgets.**
+> **Failure semantics: fetch failures use up your `on_unhealthy` budgets.**
 > A staging failure (404 after retries, checksum mismatch, timeout, oversize,
-> missing credential) is an **allocation failure**, reported through the same
-> heartbeat path as a crashed task and handled by the manager's existing
-> `on_unhealthy` restart/move logic. That means registry or object-store
-> flakiness consumes the task's restart/move budget exactly like task
-> unhealthiness — size `on_unhealthy.restart_count`/`move_count` with that in
-> mind for jobs that pull from less-reliable origins. A dedicated
-> `onFetchFailure` policy (treating a registry outage differently from an
-> unhealthy task) is a noted follow-up, not yet implemented.
+> missing credential) is an **allocation failure**. It is reported through
+> the same heartbeat path as a crashed task, and the manager handles it with
+> the existing `on_unhealthy` restart/move logic. So a flaky registry or
+> object store uses up the task's restart and move budget, the same way an
+> unhealthy task does. For jobs that pull from less reliable origins, size
+> `on_unhealthy.restart_count`/`move_count` with that in mind. There is no
+> separate `onFetchFailure` policy yet to treat a registry outage
+> differently from an unhealthy task.
+
+### Restart reuse — no refetch when nothing changed
+
+A fully successful staging run writes a manifest (`.staged.json`) into the
+task directory. It records the artifact list's fingerprint and every staged
+payload. When the same allocation stages again with an unchanged artifact
+list, the worker reuses the staged content instead of fetching from origin.
+This happens when a worker restart re-dispatches the allocation, or when an
+in-place config update didn't touch `artifacts`. Reuse is all-or-nothing. The
+worker does a full fresh fetch when:
+
+- The artifact list changed in any way. The fingerprint covers the
+  normalized, pinned specs, so a moved pinned digest triggers a refetch.
+- Any recorded payload path is missing from the task directory.
+- Any artifact sets `resolve = "always"`. That setting asks for a fresh
+  resolve at every staging, so it disables reuse for the whole task.
+- The previous run never finished. No manifest is written until every
+  artifact has staged, and partial content is cleared before the fresh
+  fetch.
+
+Reuse applies only on the same node, per allocation. Allocations moved to
+another node always fetch fresh, and explicit stops and removals delete the
+task directory. There is no caching across allocations or nodes.
 
 ## Status surfaces
 
-Each artifact progresses `pending` → `fetching` → `verifying` → `staged`, or
-ends `failed`. Workers report per-artifact rows inside the existing
-heartbeat (`AllocationHealth.artifact_states`, a JSON array); the manager
-persists them on allocation health and serves them everywhere allocation
-health already flows:
+Each artifact moves through `pending` → `fetching` → `verifying` → `staged`,
+or ends in `failed`. Workers report per-artifact rows inside the existing
+heartbeat (`AllocationHealth.artifact_states`, a JSON array). The manager
+stores them on allocation health and serves them everywhere allocation health
+already appears:
 
 ```nickel
 [
@@ -474,69 +480,76 @@ health already flows:
 ]
 ```
 
-Sources are redacted; errors name auth sources, never values.
+Sources are redacted. Errors name auth sources, never values.
 
 - **CLI:** `legion job rollout status --id <ID> --json` includes
-  `artifact_states` on every allocation, and the ledger (`GetLedger`) carries
-  the same field per allocation — agents and humans get identical visibility.
+  `artifact_states` on every allocation. The ledger (`GetLedger`) has the
+  same field per allocation, so agents and humans see the same data.
 - **UI:** the Jobs page task view shows a declared-artifacts table (name,
-  source, checksum or pinned digest with its `pinned from` provenance,
-  resolve mode, auth source, dest). Allocation cards on the task, rollout,
-  and node views show live staging rows — state badge, progress percentage,
-  failure reason — and rollout cards summarize `staging artifacts: 1/3
-  staged` while a deploy is mid-fetch.
-- **Event stream:** artifact lifecycle transitions join the
+  source, checksum or pinned digest with its `pinned from` origin, resolve
+  mode, auth source, dest). Allocation cards on the task, rollout, and node
+  views show live staging rows with a state badge, progress percentage, and
+  failure reason. Rollout cards show a summary such as `staging artifacts:
+  1/3 staged` while a deploy is mid-fetch.
+- **Event stream:** artifact lifecycle changes appear in the
   [scheduler event stream](event-stream.md) (`legion events list --kind
-  artifact`, `legion events tail`, the UI Events page). `artifact.staging`
-  fires when an allocation enters staging, `artifact.staged` once when every
-  artifact landed (digests/bytes/durations in metadata), `artifact.failed`
-  per failed artifact with the redacted source, error, and attempt count
-  (riding the failure report, so it survives the allocation's removal), and
-  `artifact.pinned` records submit-time digest pinning. The staging/staged
-  events are derived manager-side from heartbeat snapshot *transitions*, so
-  steady-state heartbeats add nothing to the journal.
+  artifact`, `legion events tail`, the UI Events page):
+  - `artifact.staging` fires when an allocation enters staging.
+  - `artifact.staged` fires once, when every artifact has landed (digests,
+    bytes, and durations in metadata).
+  - `artifact.failed` fires per failed artifact, with the redacted source,
+    error, and attempt count. It is sent with the failure report, so it
+    survives the allocation's removal.
+  - `artifact.pinned` records submit-time digest pinning.
+
+  The manager derives the staging and staged events from changes between
+  heartbeat snapshots, so steady-state heartbeats add nothing to the
+  journal.
 
 ## Task-runtime support
 
-| Kind | artifacts | consumption |
+| Runtime | artifacts | consumption |
 | --- | --- | --- |
-| `exec` | ✅ | File/Tree payloads staged into the task dir; `${artifact.*}` interpolation; `LEGION_ARTIFACT_*` / `LEGION_TASK_DIR` env; `cwd` defaults to the task dir; landlock auto-grants it. |
-| `container` | ✅ (image behind a flag; file/tree always) | The implicit `image` artifact is consumed as an OCI layout (below). File and tree artifacts stage into the host task dir, which is bind-mounted at `/legion/task`, so the container reads them there — `LEGION_ARTIFACT_<NAME>` and `${artifact.<name>}` both carry the in-container path. |
-| `sandbox` | ✅ | The implicit `image` artifact becomes the microVM's root filesystem. File/tree/layer artifacts are copied **into the guest** at `/legion/artifacts/<name>` while the root disk is built, with `LEGION_ARTIFACT_*` and already-interpolated `${artifact.*}` paths rewritten from host staging paths to their in-guest locations (see [task-runtime-sandbox.md](task-runtime-sandbox.md)). |
-| `noop` | ❌ | Artifact-bearing specs rejected at validation/admission. |
+| `exec` | ✅ | File/Tree payloads staged into the task dir. `${artifact.*}` interpolation. `LEGION_ARTIFACT_*` / `LEGION_TASK_DIR` env. `cwd` defaults to the task dir. Landlock grants access to it automatically. |
+| `container` | ✅ (image behind a flag, file/tree always) | The implicit `image` artifact is consumed as an OCI layout (below). File and tree artifacts stage into the host task dir, which is bind-mounted at `/legion/task`, so the container reads them there. `LEGION_ARTIFACT_<NAME>` and `${artifact.<name>}` both hold the in-container path. |
+| `sandbox` | ✅ | The implicit `image` artifact becomes the microVM's root filesystem. File/tree/layer artifacts are copied **into the guest** at `/legion/artifacts/<name>` while the root disk is built. `LEGION_ARTIFACT_*` and already-interpolated `${artifact.*}` paths are rewritten from host staging paths to their in-guest locations (see [task-runtime-sandbox.md](task-runtime-sandbox.md)). |
+| `noop` | ❌ | Specs with artifacts are rejected at validation and admission. |
 
-New runtimes adopt artifacts through three optional `TaskPlugin` hooks —
-`supports_artifacts()` (the capability gate), `implicit_artifacts()`
-(desugar runtime config into artifacts at admission), and `consume_artifact()`
-(handle non-file payloads such as OCI images or ORAS layers). Kinds that
-just need files in the task directory only implement the first.
+New runtimes add artifact support through three optional `TaskPlugin` hooks:
+
+- `supports_artifacts()`: the capability check.
+- `implicit_artifacts()`: turn runtime config into artifacts at admission.
+- `consume_artifact()`: handle non-file payloads such as OCI images or ORAS
+  layers.
+
+Runtimes that only need files in the task directory implement just the
+first.
 
 ### Container image desugaring (`artifacts.containerImageDesugar`)
 
-With the cluster flag on, the manager desugars a container task's `image`
-field at admission into an implicit `oci://` artifact named `image` (Docker
-Hub shorthand expands: `alpine:latest` →
-`oci://docker.io/library/alpine:latest`), and the worker pulls it through
-the shared pipeline — same auth matchers, same pinning, same status rows as
-every other artifact. The plugin then loads the staged OCI layout into the
-local runtime:
+With the cluster flag on, the manager turns a container task's `image` field
+into an implicit `oci://` artifact named `image` at admission. Docker Hub
+shorthand expands: `alpine:latest` → `oci://docker.io/library/alpine:latest`.
+The worker pulls it through the shared pipeline, with the same auth matchers,
+pinning, and status rows as every other artifact. The plugin then loads the
+staged OCI layout into the local runtime:
 
 - **macOS (Apple `container`):** the layout is tarred and imported with
   `container image load`, so the subsequent run needs no registry pull.
 - **Linux (youki / any OCI runtime):** the layout is converted to an OCI
-  runtime bundle (rootfs extraction + generated `config.json`) and run with
-  `<runtime> run --bundle` — see
+  runtime bundle (rootfs extraction plus a generated `config.json`) and run
+  with `<runtime> run --bundle`. See
   [task-runtime-container.md](task-runtime-container.md#linux-image--bundle).
 
-The flag defaults to **off** until the artifact cache lands: without a
-cache, Legion-managed pulls re-download the image for every allocation,
-which would regress runtimes that cache images themselves. With the flag
-off, container behavior is byte-identical to before the artifact system.
+The flag defaults to **off** until the artifact cache ships. Without a cache,
+Legion-managed pulls download the image again for every allocation. That
+would be a step backward for runtimes that cache images themselves. With the
+flag off, container behavior is unchanged.
 
 ## Fetcher plugins
 
-Schemes beyond the built-ins are served by dynamic fetcher plugins, using
-the same dylib pattern as task-runtime plugins (see
+Dynamic fetcher plugins add schemes beyond the built-ins. They use the same
+dylib pattern as task-runtime plugins (see
 [docs/plugin-system.md](plugin-system.md)):
 
 ```
@@ -571,59 +584,59 @@ pub extern "C" fn get() -> Box<dyn ArtifactFetcher> {
 }
 ```
 
-Resolution order is **built-ins first, then plugins**: when no built-in
+Resolution order is **built-ins first, then plugins**. When no built-in
 serves a scheme, the registry looks for
-`plugins/artifacts/<scheme>/target/release/lib<scheme>.<ext>`, validates the
-manifest, loads the dylib, and verifies the fetcher actually reports the
-requested scheme. Everything downstream — auth resolution, checksums,
-unpack, retries, status reporting — is shared pipeline code; the plugin only
-moves bytes. Fetchers are deliberately *blocking* (they run on staging
-threads, never the async runtime), which keeps the dylib boundary free of
-async-trait hazards. Optionally implement `resolve()` to support
-`resolve = "pin"` for mutable references.
+`plugins/artifacts/<scheme>/target/release/lib<scheme>.<ext>`. It validates
+the manifest, loads the dylib, and checks that the fetcher reports the
+requested scheme. Everything after the fetch (auth resolution, checksums,
+unpack, retries, status reporting) is shared pipeline code. The plugin only
+moves bytes. Fetchers are blocking. They run on staging threads, never the
+async runtime, which keeps async-trait problems away from the dylib
+boundary. Optionally implement `resolve()` to support `resolve = "pin"` for
+mutable references.
 
-A complete worked example ships at
-[plugins/artifacts/demo](../plugins/artifacts/demo/): a `demo://` fetcher
-that materializes the URL's `content` query parameter as a staged file —
-`artifacts = ["demo://example/hello.txt?content=hi"]`.
+A complete example ships at [plugins/artifacts/demo](../plugins/artifacts/demo/).
+It is a `demo://` fetcher that writes the URL's `content` query parameter as
+a staged file: `artifacts = ["demo://example/hello.txt?content=hi"]`.
 
-Remember the allowlists: a custom scheme must be added to the cluster's
-`artifacts.allowedSchemes` *and* (if customized) the worker's
-`artifacts.fetch.allowedSchemes`.
+Remember the allowlists. Add a custom scheme to the cluster's
+`artifacts.allowedSchemes`, and also to the worker's
+`artifacts.fetch.allowedSchemes` if you have customized it.
 
 ## Limitations
 
-- **No cache, no pre-warming.** Every staging — including restarts and
-  reschedules onto the same node — fetches from origin. The
-  content-addressed cache, disk budgets, pre-pull, and scheduler locality
-  scoring are the companion plan
-  ([artifact-cache-and-prewarm-plan.md](../internal_docs/plans/artifact-cache-and-prewarm-plan.md));
-  the `ArtifactSink` write seam exists so it slots in without changing
-  specs, fetchers, or plugins.
+- **No cache, no pre-warming.** Staging fetches from origin, except when the
+  same allocation restages an unchanged artifact list on the same node (see
+  [Restart reuse](#restart-reuse--no-refetch-when-nothing-changed)). A new
+  allocation fetches fresh, even on a node that already staged the same
+  artifact. There is no content-addressed cache, disk budget, pre-pull, or
+  scheduler locality scoring yet. The
+  `ArtifactSink` write interface exists so a cache can be added without
+  changing specs, fetchers, or plugins.
 - **Checksums verify single-file payloads** (and, for OCI, the manifest
-  digest). Declaring a `checksum` on a tree-producing source (git, `file://`
-  directories) is a staging error rather than a silent skip.
-- **`identity` / `nodeIdentity` auth fails at fetch time** until
-  workload-identity token issuance and delivery land (WI plan phases 2/4).
-- **Cluster auth matcher changes apply at the next submit**, not to
-  in-flight jobs (the effective auth is baked into the normalized spec at
-  admission). KV credential *value* rotation applies immediately.
-- **The `sandbox` runtime consumes every payload**: the `Image` becomes the
+  digest). Declaring a `checksum` on a source that produces a tree (git,
+  `file://` directories) is a staging error, not a silent skip.
+- **Task `identity` auth fails at fetch time**, and `assumeRole` is never
+  used. `nodeIdentity` works for bearer-auth sources but not `s3://`.
+  Neither can be used with `resolve = "pin"`.
+- **Cluster auth matcher changes apply at the next submit**, not to running
+  jobs, because the effective auth is stored in the normalized spec at
+  admission. Rotating a KV credential value applies immediately.
+- **The `sandbox` runtime consumes every payload.** The `Image` becomes the
   guest root filesystem, and File/Tree/Layers are copied into the guest root
-  disk — it builds its own filesystem, so it has somewhere to put them.
-- **Container runtimes consume only the `Image` payload** (macOS imports it into
-  Apple `container`; Linux converts it to an OCI runtime bundle), and image
-  desugaring is off by default. File and tree artifacts need no consumption:
-  they stage into the task directory, which the runtime mounts at
+  disk. It builds its own filesystem, so it has somewhere to put them.
+- **Container runtimes consume only the `Image` payload** (macOS imports it
+  into Apple `container`, Linux converts it to an OCI runtime bundle), and
+  image desugaring is off by default. File and tree artifacts need no extra
+  handling. They stage into the task directory, which the runtime mounts at
   `/legion/task` (see
   [task-runtime-container.md](task-runtime-container.md#the-task-directory-legiontask)).
-  An artifact staged *outside* the task directory would not be visible inside,
-  so its `LEGION_ARTIFACT_*` var is omitted rather than pointing at a dead
-  host path.
-- **Archive formats** are `.tar.gz`/`.tgz`/`.tar`/`.gz`; `zip`/`zstd` are
-  not yet recognized (use `unpack = "file"` to stage such files as-is).
-- **Fetch failures consume `on_unhealthy` budgets** (see
-  [Failure semantics](#staging-mechanics)); there is no dedicated
+  An artifact staged outside the task directory would not be visible inside
+  the container, so its `LEGION_ARTIFACT_*` var is left out instead of
+  pointing at a host path the container can't see.
+- **Archive formats** are `.tar.gz`/`.tgz`/`.tar`/`.gz`. `zip` and `zstd`
+  are not recognized yet. Use `unpack = "file"` to stage such files as-is.
+- **Fetch failures use up `on_unhealthy` budgets** (see
+  [Failure semantics](#staging-mechanics)). There is no dedicated
   `onFetchFailure` policy yet.
-- **Windows staging** has not had a dedicated pass (tracked in
-  [internal_docs/TODO.md](../internal_docs/TODO.md)).
+- **Windows staging** has not been specifically tested.

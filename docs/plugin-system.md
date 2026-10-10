@@ -1,45 +1,45 @@
 # Plugin System
 
-This document describes Legion's plugin architecture, loading behavior, and trade-offs.
+This page describes Legion's plugin architecture, how plugins load, and the trade-offs.
 
 ## Why Legion Uses In-Process `cdylib` Plugins
 
-Legion currently uses Rust `cdylib` plugins loaded in-process via `libloading`.
+Legion uses Rust `cdylib` plugins loaded in-process with `libloading`.
 
-This approach was chosen because it is:
+We chose this approach because it is:
 
-- **Fast**: no RPC boundary between core scheduler/worker and plugin code.
-- **Simple to deploy**: plugins are shared libraries on disk under a predictable directory.
-- **Ergonomic for Rust extension authors**: plugin authors implement traits and export a `get` constructor.
-- **Flexible**: task runtimes, scheduling policies, node checks, rollout strategies, and artifact fetchers can each be extended.
+- **Fast**: there is no RPC boundary between the core scheduler or worker and plugin code.
+- **Simple to deploy**: plugins are shared libraries on disk in a predictable directory.
+- **Easy for Rust authors**: you implement traits and export a `get` constructor.
+- **Flexible**: you can extend task runtimes, scheduling policies, node checks, rollout strategies, and artifact fetchers.
 
 ## Downsides and Risks to Watch
 
-The primary trade-off of in-process plugins is reliability/isolation:
+The main trade-off of in-process plugins is weaker reliability and isolation:
 
 - **Plugin panics can terminate the host process** (manager/worker) if not contained.
-- **Memory safety/ABI mistakes are dangerous** because dynamic loading requires unsafe FFI boundaries.
+- **Memory safety and ABI mistakes are dangerous** because dynamic loading requires unsafe FFI boundaries.
 - **Version drift can break loading** if plugin and host disagree on API expectations.
 
-To reduce this risk, Legion validates plugin manifests (kind/name/API version) before loading.
+To reduce this risk, Legion validates plugin manifests (kind, name, API version) before loading.
 
 ## How Plugin Loading Works
 
-Legion resolves plugin roots from `LEGION_PLUGIN_DIR` (default: `plugins/` under repo root).
+Legion finds plugin roots in `LEGION_PLUGIN_DIR` (default: `plugins/` under the repo root).
 
-Dynamic plugin loading pattern:
+Dynamic plugins follow this pattern:
 
 - Plugins are Rust `cdylib` libraries.
-- Exported symbol must be `get`.
-- Legion loads plugin `.so/.dylib/.dll` with `libloading`.
+- The exported symbol must be `get`.
+- Legion loads the plugin's `.so/.dylib/.dll` with `libloading`.
 
-Common directory pattern:
+The usual directory layout is:
 
 - `plugins/<kind>/<name>/target/release/lib<name>.<ext>`
 
 ### Plugin Manifest (Required for Dynamic Plugins)
 
-Each dynamic plugin root now includes a `plugin.json` manifest.
+Each dynamic plugin root includes a `plugin.json` manifest.
 
 Example:
 
@@ -64,24 +64,24 @@ Before loading the dynamic library, Legion validates:
 3. `name` matches the requested plugin name.
 4. `legionApiVersion` equals the host-supported version.
 
-If any check fails, plugin loading fails with contextual errors.
+If any check fails, loading fails with an error that explains which check failed.
 
 ### Version history
 
-The version is shared by every plugin category, because all plugins link the
-`legion` crate and pass Rust types across the boundary — a layout change in one
-shared struct invalidates any prebuilt library, whatever the category.
+Every plugin category shares one version. All plugins link the `legion` crate
+and pass Rust types across the boundary, so a layout change in one shared
+struct breaks every prebuilt library, whatever the category.
 
 | Version | Change |
 | --- | --- |
-| 2 | `TaskRuntime` renamed to `TaskInstance` and `RuntimeVolume` to `MountedVolume`; `TaskInstance` gained `volumes`. |
+| 2 | `TaskRuntime` renamed to `TaskInstance` and `RuntimeVolume` to `MountedVolume`. `TaskInstance` gained `volumes`. |
 | 1 | Initial. |
 
-**Rebuild your plugins when this number changes.** A library built against an
-older version whose manifest still claims the current one is not caught by the
-manifest check, and a struct-layout mismatch across the `dylib` boundary is
-undefined behavior — in practice a `SIGBUS` at first use, not a clean error.
-This is why the version is bumped for layout changes and not only for signature
+**Rebuild your plugins when this number changes.** The manifest check does not
+catch a library built against an older version whose manifest claims the
+current one. A struct-layout mismatch across the `dylib` boundary is undefined
+behavior. In practice you get a `SIGBUS` at first use instead of a clean error.
+For this reason the version changes for layout changes as well as signature
 changes.
 
 ## Plugin Types Implemented Today
@@ -100,7 +100,7 @@ Entry trait: `TaskPlugin` in `src/task_plugins/mod.rs`.
 
 ## 2) Scheduling Policy Plugins
 
-Purpose: select node placement strategy.
+Purpose: choose the node placement strategy.
 
 - Built-in policies:
   - `bin_pack`
@@ -112,7 +112,7 @@ Entry trait: `SchedulingPolicy` in `src/manager/scheduler/policy.rs`.
 
 ## 3) Node Check Plugins
 
-Purpose: augment worker fingerprint and node health checks.
+Purpose: extend worker fingerprinting and node health checks.
 
 - Built-in checkers/fingerprinters:
   - arch
@@ -126,7 +126,7 @@ Entry trait: `NodeChecker` in `src/worker/node_check.rs`.
 
 ## 4) Rollout Strategy Plugins
 
-Purpose: transform/resolve rollout config before rollout execution.
+Purpose: transform or resolve rollout config before the rollout runs.
 
 - Built-in strategy:
   - `default`
@@ -144,96 +144,93 @@ Purpose: serve artifact source schemes beyond the built-ins
 - Built-in fetchers register in `FetcherRegistry::with_builtins()`
   (`src/artifacts/fetcher.rs`, implementations in `src/artifacts/fetchers/`).
 - Dynamic example plugin:
-  - `demo` (`plugins/artifacts/demo/`) — serves `demo://`, materializing the
-    URL's `content` query parameter as a staged file.
+  - `demo` (`plugins/artifacts/demo/`) serves `demo://` and writes the
+    URL's `content` query parameter out as a staged file.
 
 Entry trait: `ArtifactFetcher` in `src/artifacts/fetcher.rs`.
 
-Contract specifics (the rest follows the common pattern above):
+Contract details (everything else follows the common pattern above):
 
 - Directory layout: `plugins/artifacts/<scheme>/` with a `plugin.json` of
   `{"kind": "artifacts", "name": "<scheme>", "legionApiVersion": 2}` and the
   dylib at `plugins/artifacts/<scheme>/target/release/lib<scheme>.<ext>`.
 - Exported symbol: `get() -> Box<dyn ArtifactFetcher>` (the usual `get`
   constructor, returning the fetcher trait object).
-- The trait is deliberately **blocking** (`fetch` streams bytes into an
-  `ArtifactSink`, which hashes, counts, and enforces size limits): fetchers
-  run on worker staging threads, never the async runtime, and a blocking
-  trait keeps the dylib ABI free of async-trait hazards. `resolve()` is an
-  optional second method that pins mutable references to digests for
-  `resolve = "pin"`.
-- **Registry resolution order: built-ins first, then dynamic plugins.** A
-  plugin is only consulted (lazily loaded, manifest validated) when no
-  built-in serves the requested scheme, and loading fails if the plugin's
-  `schemes()` does not include the scheme it was loaded for.
+- The trait is **blocking**. `fetch` streams bytes into an `ArtifactSink`,
+  which hashes, counts, and enforces size limits. Fetchers run on worker
+  staging threads, never the async runtime, and a blocking trait keeps the
+  dylib ABI free of async-trait hazards. `resolve()` is an optional second
+  method that pins mutable references to digests for `resolve = "pin"`.
+- **The registry checks built-ins first, then dynamic plugins.** Legion only
+  loads a plugin (lazily, after validating its manifest) when no built-in
+  serves the requested scheme. Loading fails if the plugin's `schemes()`
+  does not include the scheme it was loaded for.
 - Auth resolution, checksum verification, unpacking, retries, and status
-  reporting are all shared pipeline code in the worker core — a fetcher
-  plugin only moves bytes. Custom schemes must also be added to the
-  cluster's `artifacts.allowedSchemes` (and the worker-side allowlist if
-  customized).
+  reporting are shared pipeline code in the worker core. A fetcher plugin
+  only moves bytes. Add custom schemes to the cluster's
+  `artifacts.allowedSchemes` too (and to the worker-side allowlist if you
+  customized it).
 
 ## 6) Volume Plugins
 
 Purpose: materialize persistent storage for stateful tasks (and volume claims
-on any task). See [docs/volumes.md](volumes.md) for the user-facing doc and
-[plans/volume-plugin-system-plan.md](../internal_docs/plans/volume-plugin-system-plan.md) for the
-design.
+on any task). See [docs/volumes.md](volumes.md) for the user-facing doc.
 
 - Built-in drivers (in-process, ship in the binary):
-  `local-dir` (the default), `host`, `nfs`, `tmpfs` — `src/volumes/builtins.rs`.
+  `local-dir` (the default), `host`, `nfs`, `tmpfs` (`src/volumes/builtins.rs`).
 - Reference exec plugin: `plugins/volumes/example/` (a ~60-line shell script).
 
-Entry trait: `VolumeDriver` in `src/volumes/mod.rs`. In the jobspec and API the
-selectable thing is called a **driver** (`storage = { driver = "nfs" }`); "plugin"
-refers to the packaging that delivers one (`plugins/volumes/<name>/` with a
-`plugin.json`).
+Entry trait: `VolumeDriver` in `src/volumes/mod.rs`. In the jobspec and API you
+select a **driver** (`storage = { driver = "nfs" }`). "Plugin" refers to the
+packaging that delivers one (`plugins/volumes/<name>/` with a `plugin.json`).
 
-Contract specifics — this category deliberately differs from the others:
+This category's contract differs from the others:
 
-- **The ABI is exec, not `cdylib`** (CNI-style): a plugin is any executable at
-  `plugins/volumes/<name>/<name>` that reads a JSON request on stdin and writes
-  a JSON response on stdout, with the operation as `argv[1]`. Volume operations
-  are low-frequency (task start/stop), usually shell out to system tools
-  (`mount`, `zfs`, a cloud CLI), and must not be able to take a worker down when
-  they crash. Process isolation buys all three and the per-call fork cost is
-  irrelevant at this rate.
-- Manifest: `{"kind": "volumes", "name": "<name>", "legionVolumeApiVersion": 1}`
-  — note the distinct version key, since the volume contract versions
-  independently of the dylib plugin API.
-- Four operations, all **required to be idempotent**: `capabilities`, `mount`,
-  `unmount`, `destroy`. `create`, `attach`, `detach`, `snapshot`, `restore`, and
-  `expand` are reserved names a plugin may advertise for forward compatibility.
-- **Drivers run on workers only.** The manager owns the volume state machine but
-  loads no drivers: it learns what exists from the capabilities workers publish
-  in their fingerprints. The control plane therefore needs no storage
+- **The ABI is exec, CNI-style, instead of `cdylib`.** A plugin is any
+  executable at `plugins/volumes/<name>/<name>` that reads a JSON request on
+  stdin and writes a JSON response on stdout, with the operation as
+  `argv[1]`. Volume operations are infrequent (task start and stop), usually
+  shell out to system tools (`mount`, `zfs`, a cloud CLI), and must not take a
+  worker down when they crash. Process isolation covers all three, and the
+  per-call fork cost does not matter at this rate.
+- Manifest: `{"kind": "volumes", "name": "<name>", "legionVolumeApiVersion": 1}`.
+  The version key is different because the volume contract is versioned
+  separately from the dylib plugin API.
+- There are four operations, and all **must be idempotent**: `capabilities`,
+  `mount`, `unmount`, `destroy`. `create`, `attach`, `detach`, `snapshot`,
+  `restore`, and `expand` are reserved names a plugin may advertise for
+  forward compatibility.
+- **Drivers run on workers only.** The manager owns the volume state machine
+  but loads no drivers. It learns what exists from the capabilities workers
+  publish in their fingerprints, so the control plane needs no storage
   credentials and no mount privileges.
-- Built-ins win over exec plugins on a name collision, so an installed plugin
+- Built-ins win over exec plugins when names collide, so an installed plugin
   cannot silently redefine what `local-dir` means on a running cluster.
-- `legion volume driver test <name>` runs the contract conformance suite against
-  a driver — the same suite Legion's own tests use, no manager required.
+- `legion volume driver test <name>` runs the contract conformance suite
+  against a driver. It is the same suite Legion's own tests use, and it needs
+  no manager.
 
 ### Coexistence with CNI (the networking kind)
 
-"CNI-style" above describes the *architecture* (exec binaries, JSON over
-stdio, versioned manifest), not wire compatibility — and the two systems
-cannot collide on a host that runs both:
+"CNI-style" above describes the architecture (exec binaries, JSON over
+stdio, versioned manifest). The two are not wire-compatible, and they cannot
+collide on a host that runs both:
 
 - **Separate trees.** Legion discovers volume plugins only under its own
   `plugins/volumes/<name>/` directories (each gated by a `plugin.json`).
-  CNI binaries live in `/opt/cni/bin` with configs in `/etc/cni/net.d`;
+  CNI binaries live in `/opt/cni/bin` with configs in `/etc/cni/net.d`.
   Legion never reads either, and CNI runtimes never read Legion's tree.
-- **Different ABI on purpose.** CNI passes the verb via the `CNI_COMMAND`
-  environment variable and network config on stdin; Legion passes the op as
-  `argv[1]` and a self-describing request on stdin. A binary cannot be
-  mistaken for the other kind by accident, and a CNI plugin dropped into
-  `plugins/volumes/` fails loudly at `capabilities` rather than half-working.
-- **Different version keys.** `legionVolumeApiVersion` in the manifest vs
-  CNI's `cniVersion` in network config — each contract evolves independently.
-- **Networking stays CNI's job.** When Legion grows a first-class `datapath`
-  plugin kind (planned; see the note under
-  [Planned Plugin Categories](#planned-plugin-categories-not-implemented-yet)),
-  the design is a *shim that drives real CNI plugins* with their own protocol —
-  reusing the ecosystem, not re-inventing it under the volume ABI.
+- **Different ABI.** CNI passes the verb in the `CNI_COMMAND` environment
+  variable and network config on stdin. Legion passes the operation as
+  `argv[1]` and a self-describing request on stdin. One kind of binary cannot
+  be mistaken for the other by accident. A CNI plugin dropped into
+  `plugins/volumes/` fails with a clear error at `capabilities` instead of
+  half-working.
+- **Different version keys.** The manifest uses `legionVolumeApiVersion` and
+  CNI network config uses `cniVersion`, so each contract evolves on its own.
+- **Networking stays CNI's job.** Legion has no `datapath` plugin kind and
+  does not load CNI plugins. The `network.mode` values `bridge` and
+  `cni/<name>` are reserved and rejected at submit.
 
 ## Build Behavior
 
@@ -242,49 +239,38 @@ cannot collide on a host that runs both:
 - Protobuf always compiles.
 - Plugins build only when `LEGION_BUILD_PLUGINS=1`.
 - Plugin builds are skipped if `LEGION_SKIP_PLUGIN_BUILD` is set.
-- When `build.rs` builds plugins, it uses an isolated `CARGO_TARGET_DIR`
-  under `target/plugin-build/...` for compile isolation.
-- Runtime dynamic loading still resolves from plugin crate-local paths such as
+- When `build.rs` builds plugins, it uses a separate `CARGO_TARGET_DIR`
+  under `target/plugin-build/...`.
+- At runtime, dynamic loading still looks in plugin crate-local paths such as
   `plugins/<kind>/<name>/target/release/lib<name>.<ext>`.
 
-This allows normal core builds without paying plugin build cost.
+This lets normal core builds skip the cost of building plugins.
 
 ## Plugin-Shaped (Trait Exists, No Dynamic Loading)
 
 ### Auth Methods
 
-Identity sources for the ACL system (username/password, JWT, OIDC) implement
-the `AuthMethod` trait in `src/manager/auth_method.rs` — the same
-trait-plus-built-ins shape as the categories above. Custom methods can be
-registered programmatically when embedding Legion as a library
+Identity sources for the ACL system (username/password, JWT, OIDC, webhook) implement
+the `AuthMethod` trait in `src/manager/auth_method.rs`, the same
+trait-plus-built-ins shape as the categories above. You can register custom
+methods in code when you embed Legion as a library
 (`Authenticator::register_method`).
 
-Dynamic `cdylib` loading is deliberately **not** wired for this category.
-Auth methods run inside the manager and decide cluster admission, so a buggy
-or malicious plugin is a full cluster compromise — a much worse failure
-domain than a task or scheduling plugin. If external extensibility is needed,
-the plan is:
+Dynamic `cdylib` loading is **not** supported for this category. Auth methods
+run inside the manager and decide who is admitted to the cluster, so a buggy
+or malicious plugin would compromise the whole cluster. That is a much worse
+failure than a bad task or scheduling plugin.
 
-1. First, an in-tree `webhook` method type that calls an operator-supplied
-   endpoint (`{credential} -> {principal, policies}`), keeping custom auth
-   code behind a process/network trust boundary.
-2. Only if real demand emerges, a `plugins/auth/<name>/` category exporting
-   `get() -> Box<dyn AuthMethod>` like the other kinds. Token minting,
-   secret hashing, and policy evaluation stay in core regardless; methods
-   can only ever yield policy names, never management access.
-
-See internal_docs/plans/auth-acl-plan.md for the full reasoning.
+To plug in a custom identity system (LDAP, a SAML bridge, in-house SSO) in
+any language, use the built-in `webhook` auth method. It sends the
+credential to an HTTP endpoint you run, which returns the principal and
+policy names. This keeps custom auth code behind a process or network trust
+boundary. Webhooks are only called at login. See
+[Auth & ACLs](auth-and-acls.md).
 
 ## Planned Plugin Categories (Not Implemented Yet)
 
-These categories are intended but are not first-class plugin frameworks today:
-
-- Networking/CNI plugins (a declarative `datapath` plugin kind + CNI compatibility shim is designed in [plans/service-discovery-plan.md](../internal_docs/plans/service-discovery-plan.md)).
-- Command/API endpoint extension plugins.
-- Logging/observability pipeline plugins.
-- Eval hooks / scheduler reaction hooks.
-- UI extension plugins.
-- Job submit hook plugins.
-- Auth method plugins (webhook-first; see above).
-
-Some similarly named functionality exists in non-plugin form today (for example, resource defaults/validation in `ResourcePolicy`).
+Legion has no plugin kind for networking (CNI), API extensions, logging
+pipelines, eval or submit hooks, or the UI. Some of this exists in
+non-plugin form, such as resource defaults and validation in
+`ResourcePolicy`.

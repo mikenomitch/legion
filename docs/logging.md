@@ -1,10 +1,10 @@
 # Logging
 
-Legion captures each task's stdout and stderr, makes it available through the
-CLI, the MCP tools, and the web UI (with live tailing), rotates it so a noisy
-task cannot fill a worker's disk, and is ready to ship to any external log
-system. Legion's *own* control-plane traces can additionally be exported over
-OpenTelemetry (OTLP).
+Legion captures each task's stdout and stderr. You can read the output through
+the CLI, the MCP tools, and the web UI (with live tailing). Legion rotates the
+files so a noisy task can't fill a worker's disk, and any standard log
+collector can ship them to an external system. Legion can also export its own
+control-plane traces over OpenTelemetry (OTLP).
 
 This document covers:
 
@@ -35,31 +35,31 @@ two append-mode files in a per-allocation directory:
 The state dir defaults to `.legion/workers/<worker-id>/` (override the worker
 state path with `LEGION_WORKER_STATE_PATH`).
 
-The per-allocation log directory is created owner-only (`0700` on Unix):
-captured output can carry secrets, so other tasks and local users on the node
-cannot read it. Tasks never need to enter the directory themselves — the
+The per-allocation log directory is owner-only (`0700` on Unix). Captured
+output can contain secrets, so other tasks and local users on the node can't
+read it. Tasks never need to enter the directory themselves, because the
 worker opens the capture file descriptors before spawning the task.
 
-Capture is wired through the task plugin runtime: the worker sets a log
-directory on `TaskInstance`, and the built-in `exec` and `container` task runtimes
+Capture runs through the task plugin runtime. The worker sets a log directory
+on `TaskInstance`, and the built-in `exec` and `container` task runtimes
 redirect their child process to those files
-([`configure_task_log_capture`](../src/task_plugins/mod.rs)). Because the task
-writes to a **real file descriptor** (not a pipe to the worker), logging keeps
-working — and tasks keep running — across worker restarts.
+([`configure_task_log_capture`](../src/task_plugins/mod.rs)). The task writes
+to a file descriptor instead of a pipe to the worker. So logging keeps working,
+and tasks keep running, across worker restarts.
 
-> **Note on custom task plugins:** a plugin captures logs automatically as long
-> as it spawns its work via `spawn_task_process` after calling
+> **Note on custom task plugins:** a plugin captures logs automatically if it
+> spawns its work with `spawn_task_process` after calling
 > `configure_task_log_capture(&mut cmd, runtime)` (as `exec`/`container` do). A
-> plugin that manages its own process output (e.g. a runtime that writes
-> elsewhere) is responsible for its own capture.
+> plugin that manages its own process output (for example, a runtime that
+> writes elsewhere) has to handle its own capture.
 
 ---
 
 ## The log "plugins" (sinks)
 
-Legion does **not** run a separate per-task logging process (Nomad's `logmon`
-model). Instead, log handling is expressed as an in-process, pluggable
-**`LogSink`** ([`src/worker/log_sink.rs`](../src/worker/log_sink.rs)):
+Legion doesn't run a separate logging process per task (Nomad's `logmon`
+model). Log handling is an in-process, pluggable **`LogSink`**
+([`src/worker/log_sink.rs`](../src/worker/log_sink.rs)):
 
 ```rust
 pub trait LogSink: Send + Sync {
@@ -69,21 +69,22 @@ pub trait LogSink: Send + Sync {
 }
 ```
 
-The always-on default is **`FileLogSink`**, which:
+The default sink is always on. It's called **`FileLogSink`**, and it:
 
-- writes the `meta.json` **resource manifest** when a task starts, and
-- rotates/prunes the stream files on a periodic worker sweep.
+- Writes the `meta.json` resource manifest when a task starts.
+- Rotates and prunes the stream files on a periodic worker sweep.
 
-This is the extension seam for the future (e.g. a native OTLP-logs pusher). For
-today, **external shipping is done by a log collector tailing the files** — the
-same division of labour Nomad, Docker (`json-file`), and Kubernetes use, and the
-reason the `meta.json` manifest exists (see
+The trait leaves room for future sinks, such as a native OTLP-logs pusher.
+Today, you ship logs externally by running a log collector that tails the
+files. Nomad, Docker (`json-file`), and Kubernetes split the work the same way.
+The `meta.json` manifest exists to support this (see
 [shipping](#shipping-logs-externally)).
 
 ### The resource manifest (`meta.json`)
 
-Each allocation's log directory contains a manifest a collector can read to
-attach correct OpenTelemetry **resource** attributes without re-deriving them:
+Each allocation's log directory contains a manifest. A collector can read it
+to attach the right OpenTelemetry resource attributes without working them out
+itself:
 
 ```json
 {
@@ -101,28 +102,29 @@ attach correct OpenTelemetry **resource** attributes without re-deriving them:
 }
 ```
 
-`service.name` follows OpenTelemetry semantic conventions; the `legion.*` keys
-carry orchestrator identity a collector can promote to labels.
+`service.name` follows OpenTelemetry semantic conventions. The `legion.*` keys
+identify the job, allocation, node, and task, and a collector can promote them
+to labels.
 
 ---
 
 ## Rotation & retention
 
-Rotation works out of the box with **zero configuration**. A periodic worker
-sweep checks each active stream and, when the active file exceeds the size cap,
-performs a **copy-truncate** rotation: the active file is copied aside to
-`stdout.log.1` (existing generations shift up to `.N`) and then truncated in
-place. Because tasks write with `O_APPEND`, the task's next write lands at the
-new end of the (now empty) active file — no sparse hole, no lost offset, and no
-need to signal the task.
+Rotation works out of the box with no configuration. A periodic worker sweep
+checks each active stream. When the active file exceeds the size cap, the
+sweep does a copy-truncate rotation. It copies the active file to
+`stdout.log.1` (existing generations shift up to `.N`), then truncates the
+active file in place. Tasks write with `O_APPEND`, so the task's next write
+lands at the start of the now-empty active file. There's no sparse hole, no
+lost offset, and no need to signal the task.
 
 Rotated generations beyond `maxFiles`, or older than `retentionDays`, are
 deleted.
 
 ### Configuration
 
-Tuned via environment variables on the **worker** (consistent with
-`LEGION_WORKER_STATE_PATH`); all are optional:
+Tune rotation with environment variables on the worker (like
+`LEGION_WORKER_STATE_PATH`). All are optional:
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
@@ -130,7 +132,7 @@ Tuned via environment variables on the **worker** (consistent with
 | `LEGION_LOG_MAX_FILES` | `5` | Rotated generations to keep per stream. |
 | `LEGION_LOG_RETENTION_DAYS` | `7` | Delete rotated files older than this. |
 
-Example — a worker that keeps less on disk:
+For example, a worker that keeps less on disk:
 
 ```bash
 LEGION_LOG_MAX_FILE_BYTES=2097152 \
@@ -140,7 +142,7 @@ legion start worker
 ```
 
 Defaults live in [`src/constants.rs`](../src/constants.rs)
-(`DEF_TASK_LOG_*`); the engine is in
+(`DEF_TASK_LOG_*`). The rotation code is in
 [`src/worker/logs.rs`](../src/worker/logs.rs).
 
 ---
@@ -167,9 +169,9 @@ Flags: `--allocation <ID>`, `--stream stdout|stderr|all` (default `all`),
 `--max-bytes <N>` (`0` = the worker's 256 KiB default window), `--tail` (trailing
 bytes), `--follow`/`-f` (stream until interrupted).
 
-`--follow` polls and prints only newly-written bytes, tracked per
-(allocation, stream) byte offset, so it stays efficient on chatty tasks and
-recovers cleanly when a stream rotates.
+`--follow` polls and prints only newly written bytes. It tracks a byte offset
+per (allocation, stream), so it stays efficient on chatty tasks and recovers
+cleanly when a stream rotates.
 
 ### MCP
 
@@ -181,19 +183,19 @@ The `legion_job_logs` tool exposes the same capability to agents (read-only):
 
 ### Web UI
 
-Open a job and select the **Logs** tab, or a task's detail page (logs are scoped
-to that task's allocations). The viewer is a live terminal pane that follows
-best practices for tailing:
+Open a job and select the **Logs** tab, or open a task's detail page (logs
+there are scoped to that task's allocations). The viewer is a live terminal
+pane:
 
-- **Follow** auto-scrolls to the newest line and **auto-pauses when you scroll
-  up**, resuming when you return to the bottom.
-- stdout and stderr are visually distinguished (and filterable).
+- **Follow** auto-scrolls to the newest line. It pauses when you scroll up and
+  resumes when you return to the bottom.
+- stdout and stderr are styled differently, and you can filter by stream.
 - **Wrap**, **Clear**, **Download**, **Pause**, and a per-allocation filter.
-- The buffer is bounded (5,000 lines) to keep the page responsive, and a banner
-  appears when older lines have rotated out of the visible window.
+- The buffer holds up to 5,000 lines to keep the page responsive. A banner
+  appears when older lines have scrolled out of the buffer.
 
-Under the hood the UI polls `GetAllocationLogs` and appends only new bytes using
-the per-stream `nextOffset`, the same incremental-tail mechanism as the CLI.
+The UI polls `GetAllocationLogs` and appends only new bytes using the
+per-stream `nextOffset`. This is the same incremental tail the CLI uses.
 
 ### How it is wired
 
@@ -207,10 +209,10 @@ the per-stream `nextOffset`, the same incremental-tail mechanism as the CLI.
 
 ## Shipping logs externally
 
-There is **nothing to enable in Legion**. Workers already write plain,
-stably-named files; "shipping" just means running a standard file-tailing agent
-(the OpenTelemetry Collector or Vector) next to each worker and pointing it at
-those files. Here is the whole process, end to end.
+There is nothing to enable in Legion. Workers already write plain files with
+stable names. To ship logs, run a standard file-tailing agent (the
+OpenTelemetry Collector or Vector) next to each worker and point it at those
+files. Here is the whole process.
 
 ### Step 1 — Find the log files on the worker host
 
@@ -233,13 +235,13 @@ Each worker writes (relative to the **worker process's working directory**):
 >
 > (`LEGION_WORKER_STATE_PATH` overrides the base directory.)
 
-The collector runs **on the same host as the worker** so it can read those local
-files. One collector per worker host.
+Run the collector on the same host as the worker so it can read those local
+files. You need one collector per worker host.
 
 ### Step 2 — Install a collector that can tail files
 
-Use the OpenTelemetry Collector **contrib** distribution — the `filelog`
-receiver is *not* in the core `otelcol` build:
+Use the OpenTelemetry Collector **contrib** distribution. The `filelog`
+receiver is not in the core `otelcol` build:
 
 ```bash
 # Binary: download "otelcol-contrib" from
@@ -254,24 +256,24 @@ docker pull otel/opentelemetry-collector-contrib:latest
 
 The repo ships a working config at
 [`configs/observability/otel-collector.yaml`](../configs/observability/otel-collector.yaml).
-Out of the box it tails the files, parses the allocation id and stream from the
-path, and prints to the collector's own stdout via the `debug` exporter — so you
-can verify the pipeline **before** wiring up a real backend:
+It tails the files, parses the allocation id and stream from the path, and
+prints to the collector's own stdout with the `debug` exporter. This lets you
+check the pipeline before you connect a backend:
 
 ```bash
 # from the worker's working directory (so the relative glob matches):
 otelcol-contrib --config /path/to/configs/observability/otel-collector.yaml
 ```
 
-Run a job that prints something, then watch the collector's console — you should
-see your task's lines, tagged with `legion.allocation.id` and `legion.stream`.
-If you see them, shipping works; everything after this is just choosing a
+Run a job that prints something, then watch the collector's console. You
+should see your task's lines, tagged with `legion.allocation.id` and
+`legion.stream`. If you see them, shipping works. The rest is choosing a
 destination.
 
 ### Step 4 — Point it at your real backend
 
 Edit the `exporters:` block in the config and swap `debug` for your backend.
-Concrete examples:
+For example:
 
 ```yaml
 exporters:
@@ -300,9 +302,9 @@ service:
       exporters: [otlphttp/loki]   # whichever you configured
 ```
 
-That's it — there is no Legion-side step. The same shape applies to Vector
+There is no Legion-side step. Vector works the same way
 ([`configs/observability/vector.toml`](../configs/observability/vector.toml)):
-swap its `[sinks.out]` for `loki`, `elasticsearch`, `http`, etc.
+swap its `[sinks.out]` for `loki`, `elasticsearch`, `http`, and so on.
 
 ### Try the whole thing locally (Docker Compose)
 
@@ -322,18 +324,18 @@ view them in Grafana at <http://localhost:3000> (Explore → Loki).
 
 ### A note on rotation + at-least-once delivery
 
-Legion rotates with **copy-truncate** (see [above](#rotation--retention)). As
-with `logrotate`'s `copytruncate` + any file tailer, a small number of bytes
-written in the instant between the collector's last read and the truncate can be
-missed. For most workloads this is negligible. If you need stricter delivery,
-raise `LEGION_LOG_MAX_FILE_BYTES` (rotate less often) and/or lower the
-collector's `poll_interval`, or ship from the application itself.
+Legion rotates with copy-truncate (see [above](#rotation--retention)). As with
+`logrotate`'s `copytruncate` and any file tailer, the collector can miss a few
+bytes written between its last read and the truncate. For most workloads this
+doesn't matter. If you need stricter delivery, raise
+`LEGION_LOG_MAX_FILE_BYTES` (to rotate less often), lower the collector's
+`poll_interval`, or ship from the application itself.
 
 ### Run the shipper as a per-node Legion job (daemonset)
 
-You don't have to manage the collector out-of-band — you can run it **as a
-Legion job, one per node**, so the cluster schedules and supervises it for you.
-Two ready jobspecs ship in [`configs/jobs/`](../configs/jobs/):
+You don't have to manage the collector separately. You can run it as a Legion
+job, one per node, so the cluster schedules and supervises it for you. Two
+ready-made jobspecs ship in [`configs/jobs/`](../configs/jobs/):
 
 ```bash
 legion job run configs/jobs/otel-log-shipper.ncl     # OpenTelemetry Collector
@@ -343,57 +345,59 @@ legion job run configs/jobs/vector-log-shipper.ncl   # Vector
 
 How they work:
 
-- **One per node** via `count = { num = 1, per = "id" }`. Legion's scheduler groups
-  eligible nodes by their unique node **id**, so `per = "id"` places exactly one
-  allocation on every node — the daemonset/system-job pattern. New nodes get a
-  shipper automatically.
-- **Reads every allocation's logs** because the shipper runs as an `exec` task: it
-  is a child of the worker and inherits the worker's working directory (the one
-  containing `.legion/`), so the relative `filelog`/`file` glob
-  `.legion/workers/*/logs/*/*.log` matches all of that node's task logs.
-- The collector config/Vector config is materialized on the node via the exec
-  task's `files` field — no external config distribution needed.
+- **One per node** via `count = { num = 1, per = "id" }`. Legion's scheduler
+  groups eligible nodes by their unique node id, so `per = "id"` places one
+  allocation on every node (the daemonset or system-job pattern). New nodes
+  get a shipper automatically.
+- **Reads every allocation's logs** because the shipper runs as an `exec`
+  task. It is a child of the worker and inherits the worker's working
+  directory (the one containing `.legion/`). So the relative `filelog`/`file`
+  glob `.legion/workers/*/logs/*/*.log` matches all of that node's task logs.
+- The exec task's `files` field writes the collector or Vector config onto the
+  node, so you don't need a separate way to distribute config.
 
 Edit the endpoint at the top of the jobspec (`otlpEndpoint` / `lokiEndpoint`)
 before running.
 
 **Requirements and limits (important):**
 
-- The `otelcol-contrib` (or `vector`) **binary must already be installed on every
-  node** and on `PATH`. The `exec` task runs a host binary; Legion does not
-  download it. (The OTel Collector **contrib** distro is required — core lacks
-  `filelog`.)
-- **Don't use the `debug`/`console` exporter in the job form.** The shipper's own
-  stdout is itself captured by Legion, so a console exporter would feed the
-  shipper its own output. The jobspecs use a real backend exporter and set the
-  shipper's self-logging to `warn`, which keeps self-ingestion negligible (a real
-  exporter doesn't echo to stdout, so there's no amplification loop).
-- If workers use an absolute `LEGION_WORKER_STATE_PATH`, set the task's `cwd` (or
-  make the glob absolute) so the relative path still resolves.
-- **The `container` task runtime cannot do this.** Legion's container runtime has no
-  host volume mounts (only image/command/env), so a containerized collector can't
-  read the node's log files. Use `exec` with a host-installed binary, as the
-  jobspecs do. (If host volume mounts are added to the container runtime later, a
-  fully self-contained image-based shipper becomes possible.)
+- The `otelcol-contrib` (or `vector`) **binary must already be installed on
+  every node** and on `PATH`. The `exec` task runs a host binary, and Legion
+  doesn't download it. (You need the OTel Collector contrib distro, because
+  core lacks `filelog`.)
+- **Don't use the `debug`/`console` exporter in the job form.** Legion
+  captures the shipper's own stdout, so a console exporter would feed the
+  shipper its own output. The jobspecs use a backend exporter and set the
+  shipper's own logging to `warn`, so very little of its output gets shipped.
+  A backend exporter doesn't echo to stdout, so there's no feedback loop.
+- If workers use an absolute `LEGION_WORKER_STATE_PATH`, set the task's `cwd`
+  (or make the glob absolute) so the relative path still resolves.
+- **The shipped jobspecs use `exec`.** A `container` task can't see the
+  worker's working directory, so a containerized collector needs the log
+  directory mounted in. Declare it as a read-only `hostVolumes` entry in the
+  worker config and claim it with a `host` volume (see
+  [docs/volumes.md](volumes.md)). The container's user must also be able to
+  read the owner-only (`0700`) per-allocation log directories.
 
 ### Why a collector instead of built-in forwarding?
 
-Shipping is intentionally **not** in Legion's hot path: a task writes to a file
-descriptor that survives worker restarts, and a collector tails the files. This
-keeps the worker simple and lets operators use the mature, backpressure-aware
-shippers they already run. The `LogSink` trait remains the seam if a native
-in-process exporter is ever warranted.
+Shipping stays out of Legion's hot path on purpose. A task writes to a file
+descriptor that survives worker restarts, and a collector tails the files.
+This keeps the worker simple and lets operators use the mature,
+backpressure-aware shippers they already run. If a native in-process exporter
+is ever needed, it can be added as a `LogSink`.
 
 ---
 
 ## OpenTelemetry traces for Legion itself
 
-Separately from task logs, Legion's **own** control-plane spans (the `tracing`
-instrumentation across the manager and worker) can be exported over **OTLP/HTTP**
-to any OpenTelemetry backend (Tempo, Jaeger, Honeycomb, an OTel Collector, …).
+Separate from task logs, Legion can export its own control-plane spans (the
+`tracing` instrumentation across the manager and worker) over OTLP/HTTP. Any
+OpenTelemetry backend works (Tempo, Jaeger, Honeycomb, an OTel Collector, and
+so on).
 
-It is opt-in and configured with the standard OpenTelemetry environment
-variables — the baseline is "set one env var":
+Export is opt-in, and you configure it with the standard OpenTelemetry
+environment variables. In the simplest case, you set one variable:
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
@@ -405,20 +409,20 @@ Recognized configuration (all optional):
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Base collector URL; `/v1/traces` is appended. Setting it enables export. |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | — | Exact traces endpoint (used verbatim). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | (none) | Base collector URL. `/v1/traces` is appended. Setting it enables export. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | (none) | Exact traces endpoint (used as is). |
 | `OTEL_SERVICE_NAME` | `legion` | `service.name` resource attribute. |
 | `LEGION_OTLP` | `0` | Force-enable at the default endpoint without setting an endpoint var. |
 
 Notes:
 
-- Export is limited to long-running servers (`start manager` / `start worker`);
-  short CLI invocations never spin up an exporter.
-- The exporter is OTLP/**HTTP** (protobuf, port 4318 by convention) so it adds no
-  second gRPC stack to the build.
+- Only long-running servers (`start manager` / `start worker`) export. Short
+  CLI invocations never start an exporter.
+- The exporter uses OTLP over HTTP (protobuf, port 4318 by convention), so it
+  doesn't add a second gRPC stack to the build.
 - Spans carry `service.name` and `service.version` resource attributes.
-- The pre-existing local trace files (`legion start … --o11y` → `./traces`) are
-  unchanged; OTLP export is additive.
+- Local trace files (`legion start … --o11y` → `./traces`) still work as
+  before. OTLP export runs alongside them.
 
 Implementation: [`src/otel.rs`](../src/otel.rs), wired in
 [`src/tracing_util.rs`](../src/tracing_util.rs).
