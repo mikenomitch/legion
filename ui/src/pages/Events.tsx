@@ -1,6 +1,7 @@
 import { A } from '@solidjs/router'
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import { AccessGate } from '../components/AccessGate'
+import { PressureExplanation, SnapshotEventSummary } from '../components/PressureHistory'
 import type { SchedulerEvent } from '../gen/legion_pb'
 import { managerClient } from '../grpcClient'
 import { Badge, Button, Dot, EmptyState, Icon, RelativeTime, SectionCard, cx, inputClass, selectClass } from '../components/ui'
@@ -11,7 +12,7 @@ const RECONNECT_DELAY_MS = 2000
 
 type ConnectionState = 'connecting' | 'live' | 'reconnecting'
 
-const KIND_CATEGORIES = ['scheduler', 'eval', 'allocation', 'artifact', 'node', 'job', 'rollout'] as const
+const KIND_CATEGORIES = ['scheduler', 'eval', 'allocation', 'artifact', 'node', 'job', 'rollout', 'snapshot'] as const
 
 const levelTone = (level: string): Tone => statusTone(level) === 'info' ? 'neutral' : statusTone(level)
 
@@ -240,6 +241,14 @@ function EventsContent() {
                         </Show>
                         <span><span class="font-semibold text-faint">at</span> {event.createdAt}</span>
                       </p>
+                      {/* Kinds whose metadata answers a question on its own
+                          get it spelled out above the raw JSON. */}
+                      <Show when={event.kind === 'node.pressure'}>
+                        <PressureExplanation event={event} />
+                      </Show>
+                      <Show when={eventCategory(event.kind) === 'snapshot'}>
+                        <SnapshotEventSummary event={event} />
+                      </Show>
                       <pre class="overflow-auto rounded-md border border-line bg-surface p-2 font-mono text-2xs leading-relaxed text-muted">
                         {formatMetadata(event.metadataJson)}
                       </pre>

@@ -3,12 +3,14 @@ import { AccessGate } from '../components/AccessGate'
 import { Show, createEffect, createMemo, createResource, createSignal } from 'solid-js'
 import SharedIndex from '../components/SharedIndex'
 import { CreateJoinTokenForm } from '../components/acl/AdminPanels'
+import { CompactNodeUsage } from '../components/NodeUsagePanel'
 import { Badge, Button, SectionCard, StatusBadge, linkClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
 import { debounced } from '../utils/debounce'
 import { heartbeatFreshnessHint } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
+import { fetchNodeUsage } from '../utils/usage'
 
 function NodesContent() {
   const [search, setSearch] = createSignal('')
@@ -57,6 +59,19 @@ function NodesContent() {
     ),
   )
 
+  // Memory used and reserved for the workers on this page, one GetNodeUsage
+  // per row at the index cadence. There is no batch RPC yet (see the suspend
+  // UI plan, §7.3), and the manager answers each from memory. A node that
+  // fails to answer shows a blank cell.
+  const [usageByNode] = createResource(
+    () => [(data()?.nodes ?? []).map((node) => node.id).join(','), tick()] as const,
+    async ([ids]) => {
+      const nodeIds = ids ? ids.split(',') : []
+      const replies = await Promise.all(nodeIds.map((id) => fetchNodeUsage(id).catch(() => null)))
+      return new Map(nodeIds.map((id, index) => [id, replies[index]]))
+    },
+  )
+
   return (
     <div class="space-y-3">
       {/* Adding a worker starts here — a join token is the one command a new
@@ -96,6 +111,7 @@ function NodesContent() {
           { key: 'health', header: 'Health' },
           { key: 'pool', header: 'Pool' },
           { key: 'availability', header: 'Availability' },
+          { key: 'memory', header: 'Memory used / reserved' },
           { key: 'allocations', header: 'Allocations', class: 'text-right' },
         ]}
         updatedLabel="Heartbeat"
@@ -123,6 +139,7 @@ function NodesContent() {
                 ) : (
                   node.availability || '—'
                 ),
+              memory: <CompactNodeUsage usage={usageByNode()?.get(node.id)} />,
               allocations: <span class="tabular-nums">{allocationCounts().get(node.id) ?? 0}</span>,
             },
           }

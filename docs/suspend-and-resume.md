@@ -796,6 +796,18 @@ snapshots.
 
 Destroying an instance keeps its snapshots until they are deleted or expire.
 
+### In the UI
+
+The job page has a Snapshots card for jobs with stateful tasks. It lists
+each snapshot's kind, state, node, size, and expiry, expands a row to show
+its manifest, and offers Take snapshot, Restore, and Delete. Restore and
+Delete ask for a second click, and so does a memory snapshot, because it
+pauses the guest. The card follows the same permissions as the CLI: it is
+hidden without `snapshot:read`, and its buttons are disabled with the reason
+when your token lacks `snapshot:write` (create, delete) or `job:write`
+(restore). The Events page has a `snapshot` category. See
+[ui-architecture.md](ui-architecture.md#usage-pressure-and-snapshots).
+
 ## Fork
 
 An agent wants to try three approaches to a problem from the same starting

@@ -18,6 +18,7 @@ import {
   shortenArtifactDigest,
   type ArtifactStateRow,
   type JobTaskArtifact,
+  type JobTaskResources,
 } from '../../utils/jobspec'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../../utils/volumes'
 
@@ -39,6 +40,17 @@ const artifactProgressLabel = (row: ArtifactStateRow): string | undefined => {
   const prefix = percent === undefined ? '' : `${percent}% · `
   return `${prefix}${formatMb(row.bytesFetched)} / ${formatMb(row.bytesTotal)}`
 }
+
+// `0.5 cpus · 400 MiB reserved · 2048 MiB max`, omitting what the spec
+// leaves to defaults.
+const resourcesLabel = (resources: JobTaskResources): string =>
+  [
+    resources.cpus !== undefined ? `${resources.cpus} cpus` : undefined,
+    resources.memory !== undefined ? `${resources.memory} MiB reserved` : undefined,
+    resources.memoryMax !== undefined ? `${resources.memoryMax} MiB max` : undefined,
+  ]
+    .filter(Boolean)
+    .join(' · ')
 
 const formatDurationMs = (ms: number): string => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`)
 
@@ -183,6 +195,14 @@ function TaskDetailContent() {
                         </Show>
                       </span>,
                     ],
+                    ...(data()!.taskSpec!.resources
+                      ? ([[
+                          'Resources',
+                          <span class="font-mono text-xs" title="memory is the reservation the scheduler packs on; memoryMax is the burst ceiling (docs/resource-enforcement.md)">
+                            {resourcesLabel(data()!.taskSpec!.resources!)}
+                          </span>,
+                        ]] as Array<[string, any]>)
+                      : []),
                     ...(data()!.taskSpec!.stateful
                       ? ([[
                           'Stateful',

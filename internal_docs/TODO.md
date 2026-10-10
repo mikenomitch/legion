@@ -2787,6 +2787,43 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
       the reserved-key list, not measured
       ([calls entry 1](calls/ui-jump-hints-plan_calls.md))
 
+- [ ] **Suspend, resume, and oversubscription in the UI**
+      ([plan](plans/suspend-resume-ui-plan.md),
+      [calls](calls/suspend-resume-ui-plan_calls.md),
+      [docs](../docs/ui-architecture.md#usage-pressure-and-snapshots)).
+  - [x] UI-1: worker Usage card from `GetNodeUsage` (capacity with ratio,
+        reserved and used bars, pressure status, per-allocation table,
+        pressure order with step chips), workers-index memory column, usage
+        and `memoryMax` on the job's instance and allocation tables and the
+        task page, Memory pressure cards on job and worker pages, structured
+        `node.pressure` and `snapshot.*` summaries on Events, fixtures at
+        `/testing`
+  - [x] UI-2: job Snapshots card with take (disk or memory), restore, and
+        delete, ACL-gated and two-step, row expansion with the manifest, a
+        "restoring from" badge on instances
+  - [ ] UI-3: `suspended` badge and filter, checkpoint column, Suspend,
+        Resume, Resume cold, `instance` events category. Unblocked: server
+        Phase 4 shipped (`InstanceInfo.checkpoint_*`, `suspended_at`,
+        `suspend_reason`, `SuspendInstance`, `StartInstanceRequest.cold`)
+        ([plan §7.2](plans/suspend-resume-ui-plan.md#72-what-pass-2-waits-on-parent-plan-7)).
+        Keep `InstancesTable` row objects stable across polls before adding
+        two-step buttons there
+        ([call 7](calls/suspend-resume-ui-plan_calls.md#7-snapshot-rows-keep-their-objects-across-polls))
+  - [ ] UI-4: idle countdown and a live `suspend` step chip. Unblocked: server
+        Phase 5 shipped (`InstanceInfo.idle_since`, the `suspend` pressure step)
+  - [ ] UI-5: Fork with a count. Unblocked: `ForkInstance` (Phase 6) shipped
+  - [ ] UI-6: durability column, Warm action, content store card. Phase 7b
+        shipped. Still waits on a content read RPC
+  - [ ] Server changes the UI needs
+        ([plan §7.3](plans/suspend-resume-ui-plan.md#73-server-changes-the-ui-needs)):
+        a batch node-usage RPC for the workers index (it fans out one
+        `GetNodeUsage` per row today), `InstanceInfo.last_stop` plus
+        `instance_id` in `node.pressure` metadata, a `GetNodeContent` read
+        RPC, and a memory-checkpoint eligibility field
+  - [ ] Linux visual check: `/nodes/<id>` against `legion node usage <id>`
+        on a worker with enforcement on. macOS only exercises the
+        not-reported shape
+
 Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 
 - [ ] Restart worker from the worker page. `RestartWorker` exists and the CLI

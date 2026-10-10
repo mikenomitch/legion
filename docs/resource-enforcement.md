@@ -378,6 +378,12 @@ measured memory, CPU, and idle time in `mem MiB`, `cpu`, and `idle` columns,
 and `InstanceInfo.usage` carries the full sample. Prometheus gets per-node
 gauges, listed in [metrics.md](metrics.md#node-usage).
 
+In the UI, the worker page's Usage card shows the same reply: capacity with
+the ratio, reserved and used bars, the pressure status, the per-allocation
+table, and the pressure order. The workers index has a memory column, and
+the job page's instance and allocation tables show used memory against
+`res/max`. See [ui-architecture.md](ui-architecture.md#usage-pressure-and-snapshots).
+
 ### What usage does not do
 
 Usage is not a scheduling input. Placement still packs on reservations
@@ -563,6 +569,11 @@ task's stop notice, `allocation.stopping`, and the replacement eval all say
 why. An OOM kill at the task's own `memoryMax` keeps its own annotation
 ("task exceeded its N MiB memory limit and was OOM-killed"), so "my own limit
 or the machine?" always has an answer.
+
+In the UI, the job page shows a "Memory pressure" card with each action
+on that job's allocations, its detail sentence, and its hint, and the worker
+page shows the same card for the node. Both read these events, so they need
+`operator:read`.
 
 The worker stops the task first and reports afterwards, because a node
 running out of memory can't wait on the manager. The stop is the ordinary

@@ -4,6 +4,9 @@ import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
 import ScalePanel from '../../components/ScalePanel'
+import InstancesTable from '../../components/InstancesTable'
+import { PressureHistoryCard } from '../../components/PressureHistory'
+import SnapshotsPanel from '../../components/SnapshotsPanel'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
 import { GetLedgerReply, InstanceInfo } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
@@ -13,10 +16,7 @@ import { allocationHealthLabel, fetchAllocationRuntime, fetchTaskStatusByName, p
 import { formatDate, pluralize } from '../../utils/format'
 import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
-
-// A storage handle is `{plugin}/{volume_id}`; plugin names never contain a
-// slash, so the split is unambiguous.
-const volumeIdFromHandle = (handle: string) => handle.slice(handle.indexOf('/') + 1)
+import { bytesToMiB, fetchAllocationUsageByNode, formatIdle, formatMiB, reservationLabel } from '../../utils/usage'
 
 function JobDetailContent() {
   const params = useParams()
@@ -34,7 +34,7 @@ function JobDetailContent() {
   const [jobData, { refetch: refetchJob }] = createResource(
     () => [jobName(), pageTick()] as const,
     retainOnError(async ([name]: readonly [string, number]) => {
-    const [jobInfo, ledger, rollouts, spec, specHistory, services, preemptions] = await Promise.all([
+    const [jobInfo, ledger, rollouts, spec, specHistory, services, preemptions, pressureEvents] = await Promise.all([
       managerClient.getJobInfo({ name: name }),
       // node:read garnish (allocation placement); job-scoped tokens
       // still get the rest of the page.
@@ -49,6 +49,13 @@ function JobDetailContent() {
       // preemptions have aged out simply shows none.
       managerClient
         .listEvents({ kind: 'allocation.preempted', jobId: name, limit: 20 })
+        .then((reply) => reply.events)
+        .catch(() => []),
+      // Memory pressure history: what a node's pressure response did to this
+      // job's allocations (docs/resource-enforcement.md, "Memory pressure").
+      // Same best-effort journal, same operator:read requirement.
+      managerClient
+        .listEvents({ kind: 'node.pressure', jobId: name, limit: 20 })
         .then((reply) => reply.events)
         .catch(() => []),
     ])
@@ -90,6 +97,7 @@ function JobDetailContent() {
       services: jobServices,
       endpoints,
       preemptions,
+      pressureEvents,
     }
   }, ([name]) => name),
   )
@@ -137,7 +145,7 @@ function JobDetailContent() {
   const instanceTick = usePoll()
 
   let lastInstances: InstanceInfo[] = []
-  const [instances] = createResource(
+  const [instances, { refetch: refetchInstances }] = createResource(
     () => [jobName(), instanceTick()] as const,
     async ([name]) => {
       try {
@@ -154,6 +162,24 @@ function JobDetailContent() {
       }
     },
   )
+
+  // Measured usage per allocation, from GetNodeUsage on each node this job
+  // runs on. Needs node:read; without it (or on an older manager) the map is
+  // empty and the usage columns fall back to the instances' own `usage`.
+  const [allocationUsage] = createResource(
+    () => [jobName(), (jobData()?.allocations ?? []).map((allocation) => allocation.nodeId).join(','), pageTick()] as const,
+    ([, nodeIds]) => fetchAllocationUsageByNode(nodeIds ? nodeIds.split(',') : []),
+  )
+
+  const instanceRows = createMemo(() => {
+    const tasks = new Map((jobData()?.taskSpec?.tasks ?? []).map((task) => [task.name, task]))
+    const usage = allocationUsage()
+    return (instances() ?? []).map((instance) => ({
+      instance,
+      task: tasks.get(instance.task),
+      allocation: instance.currentAllocId !== undefined ? usage?.get(Number(instance.currentAllocId)) : undefined,
+    }))
+  })
 
   // The instances panel appears for jobs that declare stateful tasks, or that
   // have instance rows anyway (e.g. the spec failed to parse but the manager
@@ -440,48 +466,7 @@ function JobDetailContent() {
                       </p>
                     }
                   >
-                    <TableShell>
-                      <table class={tableClass}>
-                        <thead class={theadClass}>
-                          <tr>
-                            <th class={thClass}>Instance</th>
-                            <th class={thClass}>Mode</th>
-                            <th class={thClass}>State</th>
-                            <th class={thClass}>Slot</th>
-                            <th class={thClass}>Allocation</th>
-                            <th class={thClass}>Storage</th>
-                            <th class={thClass + ' text-right'}>Created</th>
-                          </tr>
-                        </thead>
-                        <tbody class="divide-y divide-line">
-                          <For each={instances() ?? []}>
-                            {(instance) => (
-                              <tr class={trHoverClass}>
-                                <td class={tdClass + ' font-mono text-xs'}>{instance.instanceId}</td>
-                                <td class={tdClass + ' text-muted'}>{instance.mode}</td>
-                                <td class={tdClass}><StatusBadge status={instance.state} /></td>
-                                <td class={tdClass + ' tabular-nums text-muted'}>{instance.slotIndex !== undefined ? String(instance.slotIndex) : '—'}</td>
-                                <td class={tdClass + ' font-mono text-xs text-muted'}>{instance.currentAllocId !== undefined ? `#${String(instance.currentAllocId)}` : '—'}</td>
-                                <td class={tdClass}>
-                                  <Show when={instance.storageHandle} fallback={<span class="text-faint">—</span>}>
-                                    {/* The handle is `{plugin}/{volume_id}` — link the volume id
-                                        straight to the volume that holds this instance's data. */}
-                                    <A
-                                      href={`/volumes/${encodeURIComponent(volumeIdFromHandle(instance.storageHandle!))}`}
-                                      class="inline-block max-w-[12rem] truncate align-bottom font-mono text-xs text-muted hover:text-brass-strong"
-                                      title={instance.storageHandle}
-                                    >
-                                      {instance.storageHandle}
-                                    </A>
-                                  </Show>
-                                </td>
-                                <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>{formatDate(instance.createdAt)}</td>
-                              </tr>
-                            )}
-                          </For>
-                        </tbody>
-                      </table>
-                    </TableShell>
+                    <InstancesTable rows={instanceRows()} />
                     <Show when={hasKeyedTasks()}>
                       <p class="border-t border-line px-4 py-2.5 text-xs text-faint">
                         Keyed instances are managed from the CLI via <code class="rounded bg-surface2 px-1 font-mono">legion instance create/destroy</code> — read-only here.
@@ -489,6 +474,12 @@ function JobDetailContent() {
                     </Show>
                   </Show>
                 </SectionCard>
+                <SnapshotsPanel
+                  jobName={jobName()}
+                  instances={instances() ?? []}
+                  tasks={jobData()!.taskSpec?.tasks ?? []}
+                  onChanged={() => void refetchInstances()}
+                />
               </Show>
 
               <SectionCard title="Allocations" flush>
@@ -505,6 +496,8 @@ function JobDetailContent() {
                           <th class={thClass}>Status</th>
                           <th class={thClass}>Health</th>
                           <th class={thClass}>Ports</th>
+                          <th class={thClass} title="Measured use, with the reservation and burst ceiling (MiB)">Memory</th>
+                          <th class={thClass} title="Time since the allocation last used 1% of a core or moved traffic">Idle</th>
                           <th class={thClass}>Worker</th>
                           <th class={thClass}>Job config</th>
                         </tr>
@@ -513,6 +506,7 @@ function JobDetailContent() {
                         <For each={jobData()!.allocations}>
                           {(allocation) => {
                             const health = () => allocationHealth()?.get(Number(allocation.id))
+                            const usage = () => allocationUsage()?.get(Number(allocation.id))
                             return (
                             <tr class={trHoverClass}>
                               <td class={tdClass + ' font-mono text-xs'}>#{String(allocation.id)}</td>
@@ -527,6 +521,21 @@ function JobDetailContent() {
                               </td>
                               <td class={tdClass}>
                                 <AllocationPorts network={parseAllocNetwork(allocation.network)} />
+                              </td>
+                              <td class={tdClass + ' font-mono text-xs tabular-nums'}>
+                                <Show when={usage()} fallback={<span class="text-faint">-</span>}>
+                                  {(entry) => (
+                                    <>
+                                      <span class={entry().usage ? 'text-ink' : 'text-faint'}>
+                                        {entry().usage ? `${formatMiB(bytesToMiB(entry().usage!.memoryCurrentBytes))} MiB` : 'not measured'}
+                                      </span>
+                                      <div class="text-2xs text-faint">res/max {reservationLabel(entry().reservedMemoryMib, entry().memoryMaxMib)}</div>
+                                    </>
+                                  )}
+                                </Show>
+                              </td>
+                              <td class={tdClass + ' font-mono text-xs tabular-nums text-muted'}>
+                                {usage()?.usage ? formatIdle(usage()!.idleSeconds) : '-'}
                               </td>
                               <td class={tdClass}>
                                 <A class="text-muted hover:text-brass-strong" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A>
@@ -585,6 +594,12 @@ function JobDetailContent() {
                   </TableShell>
                 </Show>
               </SectionCard>
+
+              {/* Memory pressure: why an allocation of this job was reclaimed
+                  or evicted by its node, with the hint for the job author. */}
+              <Show when={jobData()!.pressureEvents.length}>
+                <PressureHistoryCard events={jobData()!.pressureEvents} scope="job" />
+              </Show>
 
               {/* Preemption history. Only rendered when there is any: a job
                   that has never been displaced should not carry an empty

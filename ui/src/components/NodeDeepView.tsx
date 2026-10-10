@@ -2,6 +2,8 @@ import { A } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal, type JSX, type Resource } from 'solid-js'
 import { Badge, CodeBlock, Icon, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 import NodeAvailabilityControls, { type AvailabilityOutcome } from './NodeAvailabilityControls'
+import { NodeUsageCard } from './NodeUsagePanel'
+import { PressureHistoryCard } from './PressureHistory'
 import { AllocationPorts } from './ServiceEndpoints'
 import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
 import { parseAllocNetwork } from '../utils/allocations'
@@ -9,7 +11,8 @@ import { formatBytes, heartbeatFreshnessHint, pluralize } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { parseArtifactStates } from '../utils/jobspec'
 import { managerClient } from '../grpcClient'
-import { retainOnError, usePoll } from '../utils/polling'
+import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
+import { fetchNodeUsage } from '../utils/usage'
 import type { Tone } from '../utils/status'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../utils/volumes'
 
@@ -524,6 +527,29 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
       ([nodeId]) => nodeId ?? '',
     ),
   )
+  // Measured usage and the memory pressure response (GetNodeUsage). `null`
+  // means the manager has no such RPC or the caller cannot read the node, and
+  // the page falls back to the reservation-only card below.
+  const [nodeUsage] = createResource(
+    () => [props.nodes.latest?.[0]?.id, volumeTick()] as const,
+    retainOnError(
+      async ([nodeId]: readonly [string | undefined, number]) => (nodeId ? fetchNodeUsage(nodeId) : null),
+      ([nodeId]) => nodeId ?? '',
+    ),
+  )
+  // What this node's pressure response did lately. Needs operator:read, so a
+  // denial just means no card.
+  const eventTick = usePoll(INDEX_POLL_INTERVAL_MS)
+  const [pressureEvents] = createResource(
+    () => [props.nodes.latest?.[0]?.id, eventTick()] as const,
+    async ([nodeId]) =>
+      nodeId
+        ? managerClient
+            .listEvents({ kind: 'node.pressure', nodeId, limit: 20 })
+            .then((reply) => reply.events)
+            .catch(() => [])
+        : [],
+  )
   const allocationsByNode = createMemo(() => {
     const map = new Map<string, readonly LedgerAllocation[]>()
     ;(props.ledger() ?? []).forEach((entry) => {
@@ -573,7 +599,11 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
   const resourceUsage = createMemo(() => {
     const data = parsedNodeData()
     if (!data) return [] as ResourceUsageEntry[]
-    return buildResourceUsage(data.configData, data.fingerprintData, allocations())
+    const entries = buildResourceUsage(data.configData, data.fingerprintData, allocations())
+    // With GetNodeUsage answering, memory and CPU live in the Usage card
+    // (reservations against the scheduler's real capacity, plus measured
+    // use). Only custom resources, which usage does not measure, stay here.
+    return nodeUsage() ? entries.filter((entry) => !BUILTIN_RESOURCES.has(entry.name)) : entries
   })
 
   const healthEntries = createMemo(() => {
@@ -721,30 +751,41 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                     </Show>
                   </SectionCard>
 
-                  <SectionCard title="Resource usage">
-                    <Show when={resourceUsage().length > 0} fallback={<p class="text-sm text-muted">No resource data available.</p>}>
-                      <div class="grid gap-x-8 gap-y-4 md:grid-cols-2 xl:grid-cols-3">
-                        <For each={resourceUsage()}>
-                          {(entry) => (
-                            <div>
-                              <div class="flex items-baseline justify-between text-sm">
-                                <p class="font-medium text-ink">{entry.label}</p>
-                                <span class="font-mono text-xs tabular-nums text-muted">
-                                  {formatUsage(entry)} · {resourcePercent(entry)}%
-                                </span>
+                  <Show when={nodeUsage()}>{(usage) => <NodeUsageCard usage={usage()} />}</Show>
+
+                  <Show when={(pressureEvents() ?? []).length > 0}>
+                    <PressureHistoryCard events={pressureEvents() ?? []} scope="node" />
+                  </Show>
+
+                  <Show when={!nodeUsage() || resourceUsage().length > 0}>
+                    <SectionCard
+                      title={nodeUsage() ? 'Other resources' : 'Resource usage'}
+                      description={nodeUsage() ? 'Custom resources declared by the worker, against what allocations reserve.' : 'Reservations against fingerprinted capacity. This manager does not report measured usage.'}
+                    >
+                      <Show when={resourceUsage().length > 0} fallback={<p class="text-sm text-muted">No resource data available.</p>}>
+                        <div class="grid gap-x-8 gap-y-4 md:grid-cols-2 xl:grid-cols-3">
+                          <For each={resourceUsage()}>
+                            {(entry) => (
+                              <div>
+                                <div class="flex items-baseline justify-between text-sm">
+                                  <p class="font-medium text-ink">{entry.label}</p>
+                                  <span class="font-mono text-xs tabular-nums text-muted">
+                                    {formatUsage(entry)} · {resourcePercent(entry)}%
+                                  </span>
+                                </div>
+                                <div class="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-line/70">
+                                  <div
+                                    class={cx('h-full rounded-full transition-all', resourceBarClass(resourcePercent(entry)), entry.used > 0 && 'min-w-[3px]')}
+                                    style={{ width: `${resourcePercent(entry)}%` }}
+                                  />
+                                </div>
                               </div>
-                              <div class="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-line/70">
-                                <div
-                                  class={cx('h-full rounded-full transition-all', resourceBarClass(resourcePercent(entry)), entry.used > 0 && 'min-w-[3px]')}
-                                  style={{ width: `${resourcePercent(entry)}%` }}
-                                />
-                              </div>
-                            </div>
-                          )}
-                        </For>
-                      </div>
-                    </Show>
-                  </SectionCard>
+                            )}
+                          </For>
+                        </div>
+                      </Show>
+                    </SectionCard>
+                  </Show>
 
                   <SectionCard title="Health checks" flush>
                     <div class="p-3.5">
