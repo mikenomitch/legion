@@ -452,18 +452,7 @@ impl WorkerTaskManager {
     }
 
     pub fn load_builtin_plugins(&mut self) {
-        if let Err(err) = self.registry.load_plugin("exec", true) {
-            error!(?err, "Failed to load exec task plugin");
-        }
-        if let Err(err) = self.registry.load_plugin("container", true) {
-            error!(?err, "Failed to load container task plugin");
-        }
-        if let Err(err) = self.registry.load_plugin("sandbox", true) {
-            error!(?err, "Failed to load sandbox task plugin");
-        }
-        if let Err(err) = self.registry.load_plugin("noop", true) {
-            debug!(?err, "Noop task plugin not available");
-        }
+        load_builtin_plugins_into(&mut self.registry);
     }
 
     pub fn readiness_checks(&self) -> Map<String, Value> {
@@ -832,6 +821,11 @@ impl WorkerTaskManager {
     }
 
     /// Root of per-allocation directories (`<state>/allocs/`).
+    /// Where this worker persists its allocations and contact record.
+    pub fn state_store(&self) -> &WorkerStateStore {
+        &self.state_store
+    }
+
     pub fn alloc_root(&self) -> &std::path::Path {
         &self.alloc_root
     }
@@ -2301,31 +2295,27 @@ impl WorkerTaskManager {
                 );
                 continue;
             };
-            let Some(started) = process_start_time(pid) else {
-                warn!(
-                    allocation_id = record.allocation.id,
-                    task_name = %record.task.name,
-                    pid,
-                    "Skipping persisted allocation with dead pid"
-                );
-                continue;
+            let started = match persisted_process_identity(&record, pid) {
+                PersistedProcess::Live { started } => started,
+                PersistedProcess::Dead => {
+                    warn!(
+                        allocation_id = record.allocation.id,
+                        task_name = %record.task.name,
+                        pid,
+                        "Skipping persisted allocation with dead pid"
+                    );
+                    continue;
+                }
+                PersistedProcess::Recycled => {
+                    warn!(
+                        allocation_id = record.allocation.id,
+                        task_name = %record.task.name,
+                        pid,
+                        "Skipping persisted allocation whose pid now belongs to another process"
+                    );
+                    continue;
+                }
             };
-            // A live pid is not proof it is still our task: after a host
-            // reboot (or enough process churn) the number belongs to some
-            // unrelated process, which we would report as running and later
-            // kill on stop. The start time pins the identity.
-            if record
-                .pid_start_time
-                .is_some_and(|recorded| recorded != started)
-            {
-                warn!(
-                    allocation_id = record.allocation.id,
-                    task_name = %record.task.name,
-                    pid,
-                    "Skipping persisted allocation whose pid now belongs to another process"
-                );
-                continue;
-            }
             // Backfills records written before start times were persisted.
             record.pid_start_time = Some(started);
 
@@ -2493,6 +2483,122 @@ impl WorkerTaskManager {
             warn!(error = ?err, "Failed to persist worker allocation state");
         }
     }
+}
+
+fn load_builtin_plugins_into(registry: &mut TaskPluginRegistry) {
+    if let Err(err) = registry.load_plugin("exec", true) {
+        error!(?err, "Failed to load exec task plugin");
+    }
+    if let Err(err) = registry.load_plugin("container", true) {
+        error!(?err, "Failed to load container task plugin");
+    }
+    if let Err(err) = registry.load_plugin("sandbox", true) {
+        error!(?err, "Failed to load sandbox task plugin");
+    }
+    if let Err(err) = registry.load_plugin("noop", true) {
+        debug!(?err, "Noop task plugin not available");
+    }
+}
+
+/// What a persisted pid names today.
+enum PersistedProcess {
+    /// The task's own process, still running; `started` is its start time.
+    Live { started: u64 },
+    /// No process with that pid is running.
+    Dead,
+    /// The pid is live but started at a different time than the record
+    /// says: it was recycled and belongs to something else now.
+    Recycled,
+}
+
+fn persisted_process_identity(record: &PersistedAllocation, pid: u32) -> PersistedProcess {
+    let Some(started) = process_start_time(pid) else {
+        return PersistedProcess::Dead;
+    };
+    // A live pid is not proof it is still our task: after a host reboot (or
+    // enough process churn) the number belongs to some unrelated process,
+    // which we would report as running and later kill on stop. The start
+    // time pins the identity. Records without one predate it and are taken
+    // on liveness alone.
+    if record
+        .pid_start_time
+        .is_some_and(|recorded| recorded != started)
+    {
+        return PersistedProcess::Recycled;
+    }
+    PersistedProcess::Live { started }
+}
+
+/// Self-fence persisted stateful allocations whose `selfTerminateAfter`
+/// window has run out, for a worker process that has not reached its manager
+/// yet. Returns the fenced allocation ids.
+///
+/// Tasks outlive the worker (`setsid`), but the in-process watchdog only
+/// starts after registration. A worker restarted during a partition would
+/// otherwise wait in its connect loop, or crash-loop on a failed
+/// pre-registration, while its restored stateful tasks ran unfenced
+/// indefinitely and the manager's `replaceAfter` kept counting.
+/// `since_last_contact` comes from the persisted wall-clock contact record
+/// ([`WorkerStateStore::since_last_manager_contact`]).
+///
+/// The kill uses the runtime's own `destroy`, exactly as the watchdog would
+/// for a restored allocation. The persisted record is left alone: its pid is
+/// dead now, so the restore that follows registration skips it, and the
+/// manager's desired set decides whether it runs again.
+pub fn fence_persisted_allocations(
+    state_store: &WorkerStateStore,
+    since_last_contact: std::time::Duration,
+) -> R<Vec<i64>> {
+    let expired = state_store
+        .load()?
+        .into_iter()
+        .filter(|record| {
+            record
+                .self_terminate_after_secs
+                .is_some_and(|window| since_last_contact > std::time::Duration::from_secs(window))
+        })
+        .filter_map(|record| {
+            let pid = record.pid?;
+            matches!(
+                persisted_process_identity(&record, pid),
+                PersistedProcess::Live { .. }
+            )
+            .then_some((record, pid))
+        })
+        .collect::<Vec<_>>();
+    if expired.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut registry = TaskPluginRegistry::new();
+    load_builtin_plugins_into(&mut registry);
+    let mut fenced = Vec::with_capacity(expired.len());
+    for (record, pid) in expired {
+        warn!(
+            allocation_id = record.allocation.id,
+            task_name = %record.task.name,
+            lost_contact_secs = since_last_contact.as_secs(),
+            "Self-fencing a restored allocation before reaching the manager"
+        );
+        let mut instance = TaskInstance {
+            pid: Some(pid),
+            ..TaskInstance::default()
+        };
+        let destroyed = match registry.plugin(&record.task.runtime) {
+            Some(plugin) => plugin.destroy(&record.allocation, &record.task, &mut instance),
+            None => Err(anyhow!("task plugin {} not loaded", record.task.runtime)),
+        };
+        if let Err(err) = destroyed {
+            warn!(
+                allocation_id = record.allocation.id,
+                error = ?err,
+                "Failed to self-fence a restored allocation"
+            );
+            continue;
+        }
+        fenced.push(record.allocation.id);
+    }
+    Ok(fenced)
 }
 
 /// Split a finished child's status into `(exit_code, signal)`. Unix reports a
@@ -4424,6 +4530,54 @@ mod tests {
             .load()?
             .iter()
             .all(|record| record.pid_start_time == Some(started)));
+        Ok(())
+    }
+
+    /// Regression (audit W6): before a restarted worker reaches its manager,
+    /// only allocations whose window the persisted silence exceeds are
+    /// fenced; a long window keeps running.
+    #[test]
+    fn fence_persisted_allocations_kills_only_expired_windows() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_path = temp_dir.path().join("worker_state.json");
+        let mut manager =
+            WorkerTaskManager::with_state_store(WorkerStateStore::new(state_path.clone()));
+        manager.load_builtin_plugins();
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        manager.run_allocation(&Allocation { id: 1, ..alloc() }, &task)?;
+        manager.set_self_fence_window(1, Duration::from_secs(5));
+        manager.run_allocation(&Allocation { id: 2, ..alloc() }, &task)?;
+        manager.set_self_fence_window(2, Duration::from_secs(3600));
+        // Stateless: never fenced, however long the silence.
+        manager.run_allocation(&Allocation { id: 3, ..alloc() }, &task)?;
+        let pids = [1, 2, 3].map(|id| manager.allocation_pid(id).expect("pid"));
+
+        let fenced = fence_persisted_allocations(
+            &WorkerStateStore::new(state_path.clone()),
+            Duration::from_secs(60),
+        )?;
+        assert_eq!(fenced, vec![1]);
+        // The fenced pid is the old process's child no longer; `manager`
+        // still owns its `Child`, so reap it here to drop the zombie.
+        manager.poll_task_exits();
+        assert!(!pid_is_running(pids[0]), "expired stateful task is killed");
+        assert!(pid_is_running(pids[1]), "long window keeps running");
+        assert!(pid_is_running(pids[2]), "stateless task keeps running");
+
+        // Idempotent: the dead pid is skipped on the next tick.
+        assert!(fence_persisted_allocations(
+            &WorkerStateStore::new(state_path),
+            Duration::from_secs(60)
+        )?
+        .is_empty());
+        manager.reconcile_allocations(&[]);
+        while manager.has_terminating() {
+            manager.reap_terminating();
+            thread::sleep(Duration::from_millis(20));
+        }
         Ok(())
     }
 

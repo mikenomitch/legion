@@ -139,10 +139,24 @@ async fn run_worker_with_manager(
 
     info!(%manager_addr, %worker_type, "Worker connecting to manager");
 
+    // Tasks outlive the worker, but the self-fence watchdog below starts only
+    // once the manager answers. Until then, fence restored stateful tasks
+    // against the contact time a previous process persisted, so a worker
+    // restarted (or crash-looping) during a partition cannot keep them
+    // running past their window.
+    let boot_fence =
+        boot_state_store(name_override).map(|store| tokio::spawn(run_boot_fence(store)));
+
     let client: ManagerClient<Channel> = connect_manager_with_retry(&manager_addr).await?;
     let credentials = Arc::new(WorkerCredentials::with_join_secret(join_secret));
 
     let pre_register_res = pre_register_self(client.clone(), worker_type, &credentials).await?;
+    // The manager answered, so restore (below) and then the in-process
+    // watchdog take over. Stopped before the restore so the two never act on
+    // the same process at once.
+    if let Some(boot_fence) = boot_fence {
+        boot_fence.abort();
+    }
     let config = pre_register_res
         .into_inner()
         .config
@@ -322,6 +336,7 @@ async fn run_worker_with_manager(
     };
     register_self(client.clone(), &registration, &credentials).await?;
     info!(worker_name = %name, "Worker registered with manager");
+    record_manager_contact(task_manager.lock().expect("task manager").state_store());
     crate::worker::balance::set_local_node(&name);
 
     start_worker_telemetry();
@@ -724,6 +739,11 @@ async fn start_heartbeats(
     spec_cache: Option<crate::worker::edge::SpecCache>,
 ) -> R<()> {
     let mut backoff = HEARTBEAT_RETRY_MIN;
+    let contact_store = task_manager
+        .lock()
+        .expect("task manager")
+        .state_store()
+        .clone();
     let configured_interval = heartbeat_interval;
 
     loop {
@@ -765,6 +785,7 @@ async fn start_heartbeats(
                 *last_successful_heartbeat
                     .lock()
                     .expect("heartbeat clock lock") = std::time::Instant::now();
+                record_manager_contact(&contact_store);
                 backoff = HEARTBEAT_RETRY_MIN;
                 // Adopt a manager-served interval, once, with a full-width
                 // re-phase so a fleet that all learns the new value within one
@@ -2047,6 +2068,69 @@ async fn start_self_fence_watchdog(
     }
 }
 
+/// Persist "the manager acknowledged us just now", so the next worker process
+/// can fence from it before it reaches the manager (see [`run_boot_fence`]).
+/// Best-effort: a failed write leaves an older record, which fences earlier.
+fn record_manager_contact(store: &WorkerStateStore) {
+    if let Err(err) = store.record_manager_contact(std::time::SystemTime::now()) {
+        debug!(error = ?err, "Failed to persist last manager contact");
+    }
+}
+
+/// The state store a previous worker process on this host left behind, when
+/// it can be found without asking the manager: an explicit state path, an
+/// explicit `--name`, or the single worker directory on disk. `None` means a
+/// fresh node (or an ambiguous one, which registration rejects anyway), so
+/// there is nothing to fence.
+fn boot_state_store(name_override: Option<&str>) -> Option<WorkerStateStore> {
+    if std::env::var_os("LEGION_WORKER_STATE_PATH").is_some() {
+        return Some(WorkerStateStore::new(WorkerStateStore::default_path()));
+    }
+    let name = match name_override {
+        Some(name) => name.to_string(),
+        None => find_existing_worker_id(&worker_state_dir())
+            .ok()
+            .flatten()?,
+    };
+    Some(WorkerStateStore::new(WorkerStateStore::path_for_worker(
+        &name,
+    )))
+}
+
+/// The self-fence for the stretch of boot before this process has reached
+/// its manager: once a second, kill restored stateful allocations whose
+/// window the persisted silence exceeds. Exits at once when no contact was
+/// ever recorded (nothing to measure from); otherwise runs until the caller
+/// aborts it.
+async fn run_boot_fence(store: WorkerStateStore) {
+    loop {
+        let Some(since_last_contact) =
+            store.since_last_manager_contact(std::time::SystemTime::now())
+        else {
+            return;
+        };
+        let tick_store = store.clone();
+        let fenced = tokio::task::spawn_blocking(move || {
+            crate::worker::task_manager::fence_persisted_allocations(
+                &tick_store,
+                since_last_contact,
+            )
+        })
+        .await;
+        match fenced {
+            Ok(Ok(fenced)) if !fenced.is_empty() => warn!(
+                fenced_allocations = ?fenced,
+                lost_contact_secs = since_last_contact.as_secs(),
+                "Boot self-fence killed restored allocations after prolonged manager silence"
+            ),
+            Ok(Err(err)) => warn!(error = ?err, "Boot self-fence could not read worker state"),
+            Err(err) => warn!(error = ?err, "Boot self-fence task failed"),
+            Ok(Ok(_)) => {}
+        }
+        tokio::time::sleep(SELF_FENCE_CHECK_INTERVAL).await;
+    }
+}
+
 /// Periodically rotate/prune captured task logs across all active allocations
 /// so a chatty task cannot fill the worker's disk. Runs for the lifetime of the
 /// worker; never returns on the happy path.
@@ -2449,6 +2533,64 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         server.abort();
+        Ok(())
+    }
+
+    /// Regression (audit W6): a worker that cannot reach its manager at boot
+    /// still fences restored stateful tasks, measured from the contact time
+    /// the previous process persisted rather than from "now".
+    #[tokio::test]
+    async fn boot_fence_kills_restored_tasks_past_their_window() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut previous = WorkerTaskManager::with_state_store(store.clone());
+        previous.load_builtin_plugins();
+        let allocation = crate::structs::Allocation {
+            id: 61,
+            status: "running".into(),
+            resources: json!({}),
+            node_id: "node-1".into(),
+            job_config_id: "job-1".into(),
+            task_config_id: 1,
+            job_id: "db".into(),
+            instance_id: None,
+            network: None,
+        };
+        let task = crate::structs::TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            ..crate::structs::TaskConfig::new("db", "exec")
+        };
+        previous.run_allocation(&allocation, &task)?;
+        previous.set_self_fence_window(61, Duration::from_secs(60));
+        let pid = previous.allocation_pid(61).expect("pid");
+        // The previous process last heard from its manager two minutes ago.
+        store.record_manager_contact(std::time::SystemTime::now() - Duration::from_secs(120))?;
+
+        let fence = tokio::spawn(run_boot_fence(store));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // Reap the zombie: this test process is still the task's parent.
+            previous.poll_task_exits();
+            if !crate::worker::state::pid_is_running(pid) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "boot fence never killed the expired task"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        fence.abort();
+        Ok(())
+    }
+
+    /// With no persisted contact there is nothing to measure silence from,
+    /// so the boot fence leaves everything alone and exits.
+    #[tokio::test]
+    async fn boot_fence_without_a_contact_record_does_nothing() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        tokio::time::timeout(Duration::from_secs(1), run_boot_fence(store)).await?;
         Ok(())
     }
 

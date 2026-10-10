@@ -126,15 +126,64 @@ impl WorkerStateStore {
             }
         }
         let contents = serde_json::to_string_pretty(allocations)?;
-        write_owner_only(&self.path, contents.as_bytes())?;
+        write_owner_only(&self.path, contents.as_bytes(), true)?;
         Ok(())
+    }
+
+    /// File holding the wall-clock time of this worker's last successful
+    /// manager contact (registration or heartbeat), beside the state file.
+    pub fn last_contact_path(&self) -> PathBuf {
+        self.path.with_file_name("last_manager_contact")
+    }
+
+    /// Record a successful manager contact at `at`.
+    ///
+    /// Written on every successful heartbeat, so it skips the fsync: losing
+    /// the last few writes to a host crash only makes the recorded contact
+    /// older, which fences earlier, never later.
+    pub fn record_manager_contact(&self, at: std::time::SystemTime) -> R<()> {
+        let secs = at
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_secs();
+        write_owner_only(
+            &self.last_contact_path(),
+            secs.to_string().as_bytes(),
+            false,
+        )
+    }
+
+    /// The last successful manager contact a previous worker process
+    /// recorded, or `None` when none was (a fresh node, or state written by
+    /// a worker that predates the record).
+    pub fn last_manager_contact(&self) -> Option<std::time::SystemTime> {
+        let raw = fs::read_to_string(self.last_contact_path()).ok()?;
+        let secs = raw.trim().parse::<u64>().ok()?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    }
+
+    /// How long ago, as of `now`, the recorded last contact was.
+    ///
+    /// A wall clock is the only clock that survives a restart, so this is
+    /// exposed to clock jumps. A clock stepped backwards past the record
+    /// reads as zero (no time lost: the fence waits longer, as if the worker
+    /// had just heard from its manager); a clock stepped forwards reads as
+    /// more silence than really passed and fences early. Early is the safe
+    /// side of the at-most-one guarantee.
+    pub fn since_last_manager_contact(
+        &self,
+        now: std::time::SystemTime,
+    ) -> Option<std::time::Duration> {
+        let last = self.last_manager_contact()?;
+        Some(now.duration_since(last).unwrap_or_default())
     }
 }
 
 /// Atomically write `contents` to `path` with mode 0600 (temp file created at
 /// that mode from the start, then renamed), so token bytes in the worker state
 /// are never observable at the process umask. Off Unix this is a plain write.
-fn write_owner_only(path: &Path, contents: &[u8]) -> R<()> {
+/// `sync` fsyncs the bytes before the rename.
+fn write_owner_only(path: &Path, contents: &[u8], sync: bool) -> R<()> {
     use std::io::Write;
 
     let tmp = path.with_file_name(format!(
@@ -159,8 +208,10 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> R<()> {
             .with_context(|| format!("failed to create worker state temp file {tmp:?}"))?;
         file.write_all(contents)
             .with_context(|| format!("failed to write worker state {tmp:?}"))?;
-        file.sync_all()
-            .with_context(|| format!("failed to fsync worker state {tmp:?}"))?;
+        if sync {
+            file.sync_all()
+                .with_context(|| format!("failed to fsync worker state {tmp:?}"))?;
+        }
         Ok(())
     })();
     if let Err(err) = write_result {
@@ -222,6 +273,28 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn last_manager_contact_round_trips_and_ignores_backward_clocks() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let now = std::time::SystemTime::now();
+        assert!(
+            store.since_last_manager_contact(now).is_none(),
+            "no record, nothing to measure from"
+        );
+
+        store.record_manager_contact(now - Duration::from_secs(90))?;
+        let since = store.since_last_manager_contact(now).expect("recorded");
+        assert!((89..=91).contains(&since.as_secs()), "{since:?}");
+
+        // A clock stepped back past the record reads as no silence at all.
+        assert_eq!(
+            store.since_last_manager_contact(now - Duration::from_secs(600)),
+            Some(Duration::ZERO)
+        );
+        Ok(())
+    }
 
     #[test]
     fn child_survives_parent_kill() -> R<()> {
