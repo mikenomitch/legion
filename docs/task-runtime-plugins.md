@@ -126,6 +126,11 @@ legion::declare_task_plugin_abi!();
 pub extern "C" fn get() -> Box<dyn TaskPlugin> { Box::new(MyPlugin) }
 ```
 
+The macro also exports the plugin's build fingerprint (the `rustc` version,
+the `legion` version, and shared type layouts), and the worker refuses a
+plugin built differently from itself. See
+[plugin-system.md](plugin-system.md#build-fingerprint-required-for-dynamic-plugins).
+
 The worker refuses to load a plugin that declares nothing or declares a
 mismatched generation. The error message tells you to rebuild. The current
 generation is `2` (graceful stop: `stop_with` returns `R<bool>` and

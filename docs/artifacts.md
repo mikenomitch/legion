@@ -578,6 +578,9 @@ impl ArtifactFetcher for MyFetcher {
     }
 }
 
+// Required: lets the host refuse a mismatched build (docs/plugin-system.md).
+legion::declare_plugin_abi!();
+
 #[no_mangle]
 pub extern "C" fn get() -> Box<dyn ArtifactFetcher> {
     Box::new(MyFetcher)

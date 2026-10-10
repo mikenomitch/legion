@@ -33,6 +33,10 @@ impl RolloutStrategyPlugin for SlowStartStrategy {
     }
 }
 
+// Lets the host refuse this dylib if it was built with a different rustc or
+// legion version (Rust has no stable ABI).
+legion::declare_plugin_abi!();
+
 #[no_mangle]
 pub extern "C" fn get() -> Box<dyn RolloutStrategyPlugin> {
     Box::new(SlowStartStrategy)

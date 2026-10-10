@@ -74,6 +74,8 @@ macro_rules! declare_task_plugin_abi {
         pub extern "C" fn legion_task_plugin_abi_version() -> u32 {
             $crate::task_plugins::TASK_PLUGIN_ABI_VERSION
         }
+
+        $crate::declare_plugin_abi!();
     };
 }
 
@@ -1342,9 +1344,8 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
             let paths = plugin_paths("tasks", other, &plugin_root);
             validate_manifest("tasks", other, &paths.root)
                 .with_context(|| format!("invalid task plugin manifest for {}", other))?;
-            let path = paths.dylib.to_string_lossy().into_owned();
             unsafe {
-                let lib = Library::new(&path)?;
+                let lib = crate::plugin_runtime::open_plugin_library("tasks", other, &paths.dylib)?;
                 check_task_plugin_abi(&lib, other)?;
                 let plugin = {
                     let func: Symbol<unsafe extern "C" fn() -> Box<dyn TaskPlugin>> =

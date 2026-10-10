@@ -161,6 +161,15 @@ declaration) is refused at load with a message that tells you to rebuild.
 See [task-runtime-plugins.md](task-runtime-plugins.md). Rebuild out-of-tree
 task plugins as part of any worker upgrade.
 
+Every dylib plugin kind (tasks, scheduling, rollouts, node checks, artifact
+fetchers) also carries a build fingerprint: the `rustc` version, the `legion`
+version, and the layout of the types it shares with the host. Any upgrade that
+changes the `legion` version or the toolchain changes the fingerprint, so
+rebuild every dylib plugin with the new binary, managers included (rollout
+and scheduling plugins load there). A stale plugin is refused at load instead
+of crashing the process. See
+[plugin-system.md](plugin-system.md#build-fingerprint-required-for-dynamic-plugins).
+
 ## Build-version skew expectations
 
 `build_version` is informational and never causes rejection. Only
