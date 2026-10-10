@@ -1797,6 +1797,13 @@ The Pack/Helm equivalent. Job templates are in flight on
 - [ ] Automatic build & push step for container images — `legion build` /
       `legion prep`, plus a context file
 - [ ] Buildpack runner
+- [ ] Publish `legion-rs` to crates.io. The crate is renamed and packages
+      cleanly (`cargo package`), but nothing is published yet, so the
+      README's `cargo install legion-rs` fails until the first publish.
+- [ ] Bump the yanked `validit` 0.2.5 and `wide` 1.6.0 pins in `Cargo.lock`.
+      `cargo package` warns about both.
+- [ ] Prebuilt release binaries and a Homebrew formula, so installing does
+      not need Rust or `protoc`
 
 ## Ecosystem apps (the omakase experience)
 
