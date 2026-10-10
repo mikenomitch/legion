@@ -526,17 +526,15 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
 
     // Run the same deep validation the manager applies on submit.
     if let Err(err) = validate_job_config(&config) {
+        // `{err:#}` so the whole context chain survives. Plain `{err}`
+        // prints only the outermost frame — "task web config invalid" —
+        // and drops the runtime's actual reason, which is the only part
+        // that tells the user what to change.
+        let text = format!("jobspec failed validation: {err:#}");
+        let (message, hint) = crate::cmd::helpers::split_hint(&text);
         return Err(output::fail_local(
             format,
-            CliError::local(
-                "InvalidArgument",
-                // `{err:#}` so the whole context chain survives. Plain `{err}`
-                // prints only the outermost frame — "task web config invalid" —
-                // and drops the runtime's actual reason, which is the only part
-                // that tells the user what to change.
-                format!("jobspec failed validation: {err:#}"),
-                None,
-            ),
+            CliError::local("InvalidArgument", message, hint),
         ));
     }
 

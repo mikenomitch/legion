@@ -34,8 +34,13 @@
 
 use crate::artifacts::{StagedArtifact, StagedPayload};
 use crate::prelude::*;
+use crate::structs::checkpoint::{MemoryParts, ResumeIdentity, SnapshotKind, SnapshotManifest};
 use crate::structs::{Allocation, TaskConfig};
+use crate::task_plugins::checkpoint::{
+    AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport,
+};
 use crate::task_plugins::microvm::{self, Backend, GuestDiskMount, GuestPayload, TapNet, VmSpec};
+use crate::task_plugins::sandbox_checkpoint;
 use crate::task_plugins::{
     configure_task_log_capture, derived_schema, oci_bundle, oci_image, reap_task_process,
     spawn_pipe, spawn_pty, spawn_task_process, validate_schema, ExecOptions, ExecSession,
@@ -54,6 +59,21 @@ const DEFAULT_MEMORY_MIB: u32 = 512;
 const DEFAULT_ROOTFS_HEADROOM_MIB: u32 = 256;
 /// Guest RAM below this cannot boot a Linux kernel with any userspace.
 const MIN_MEMORY_MIB: u32 = 64;
+
+/// The worker's `sandbox.vmmOverheadMiB`, exported by the daemon, falling
+/// back to the default when unset or unparseable.
+fn vmm_overhead_mib() -> u64 {
+    std::env::var(crate::constants::ENV_SANDBOX_VMM_OVERHEAD_MIB)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|mib| *mib > 0)
+        .unwrap_or(crate::constants::DEF_SANDBOX_VMM_OVERHEAD_MIB)
+}
+
+/// `memory.max` for a microVM's cgroup: guest RAM plus VMM overhead.
+fn vmm_cgroup_memory_bytes(guest_mib: u32, overhead_mib: u64) -> u64 {
+    (u64::from(guest_mib) + overhead_mib) * 1024 * 1024
+}
 
 fn default_sandbox_env() -> HashMap<String, String> {
     HashMap::new()
@@ -131,6 +151,100 @@ struct SandboxNetworkConfig {
     /// MAC address handed to the guest interface.
     #[serde(default)]
     mac: Option<String>,
+}
+
+/// Beside the VMM socket: the balloon's bounds, written at boot for a
+/// ballooned guest.
+const BALLOON_RECORD: &str = "balloon.json";
+
+/// What `reclaim` needs to drive a guest's balloon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BalloonRecord {
+    guest_mib: u64,
+    reserved_mib: u64,
+}
+
+fn write_balloon_record(scratch: &Path, record: &BalloonRecord) -> R<()> {
+    let path = scratch.join(BALLOON_RECORD);
+    std::fs::write(&path, serde_json::to_vec(record)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+fn read_balloon_record(scratch: &Path) -> Option<BalloonRecord> {
+    serde_json::from_slice(&std::fs::read(scratch.join(BALLOON_RECORD)).ok()?).ok()
+}
+
+/// The task's `resources.memory` reservation in MiB, when declared.
+fn memory_reservation_mib(resources: &Value) -> Option<u32> {
+    resources
+        .get("memory")
+        .and_then(Value::as_f64)
+        .filter(|mib| mib.is_finite() && *mib > 0.0)
+        .map(|mib| mib.ceil().min(f64::from(u32::MAX)) as u32)
+}
+
+/// Inflate a ballooned guest by up to `bytes`, never below its reservation.
+/// Returns the bytes the balloon grew by.
+fn inflate_balloon(backend: &Backend, scratch: &Path, bytes: u64) -> R<Option<u64>> {
+    let Some(record) = read_balloon_record(scratch) else {
+        return Ok(None);
+    };
+    const MIB: u64 = 1024 * 1024;
+    let socket = scratch.join("vmm.sock");
+    let (current, set): (u64, Box<dyn Fn(u64) -> R<()>>) = match backend {
+        Backend::Firecracker { .. } => {
+            let api = crate::task_plugins::vmm_api::FirecrackerApi::new(&socket);
+            (
+                api.balloon_mib()?,
+                Box::new(move |mib| api.set_balloon_mib(mib)),
+            )
+        }
+        Backend::CloudHypervisor { .. } => {
+            let api = crate::task_plugins::vmm_api::CloudHypervisorApi::new(&socket);
+            (
+                api.balloon_bytes()? / MIB,
+                Box::new(move |mib| api.set_balloon_bytes(mib * MIB)),
+            )
+        }
+        _ => return Ok(None),
+    };
+    let target = microvm::balloon_target_mib(current, bytes, record.guest_mib, record.reserved_mib);
+    if target > current {
+        set(target)?;
+    }
+    Ok(Some((target - current) * MIB))
+}
+
+/// Deflate a ballooned guest's balloon.
+fn deflate_balloon(backend: &Backend, scratch: &Path) -> R<()> {
+    if read_balloon_record(scratch).is_none() {
+        return Ok(());
+    }
+    let socket = scratch.join("vmm.sock");
+    match backend {
+        Backend::Firecracker { .. } => {
+            crate::task_plugins::vmm_api::FirecrackerApi::new(&socket).set_balloon_mib(0)
+        }
+        Backend::CloudHypervisor { .. } => {
+            crate::task_plugins::vmm_api::CloudHypervisorApi::new(&socket).set_balloon_bytes(0)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The guest size, in MiB, a task's `resources` imply: `memoryMax` when
+/// set, else `memory` (docs/task-runtime-sandbox.md, "Guest size"). `None`
+/// when neither is declared. Applied once, at submit, by
+/// [`SandboxTaskPlugin::normalize_task`].
+fn resources_guest_mib(resources: &Value) -> Option<u32> {
+    let declared = |key: &str| {
+        resources
+            .get(key)
+            .and_then(Value::as_f64)
+            .filter(|mib| mib.is_finite() && *mib > 0.0)
+    };
+    let mib = declared(crate::resources::MEMORY_MAX_KEY).or_else(|| declared("memory"))?;
+    Some(mib.ceil().min(f64::from(u32::MAX)) as u32)
 }
 
 impl SandboxTaskConfig {
@@ -493,6 +607,9 @@ fn build_stamp(layout: &Path, payload: &GuestPayload, artifacts: &[StagedArtifac
         hasher.update(b"=");
         hasher.update(value.as_bytes());
     }
+    if payload.resume_watch {
+        hasher.update(b"\0resume-watch\0");
+    }
     hasher.update(b"\0cwd\0");
     hasher.update(payload.cwd.as_deref().unwrap_or("").as_bytes());
     for mount in &payload.disk_mounts {
@@ -594,6 +711,17 @@ impl SandboxTaskPlugin {
     ) -> R<Command> {
         let scratch = work_root(allocation, instance);
         let name = sandbox_name(allocation);
+        // A fixed `network.tap` serves one guest per node. Booting on a TAP
+        // another VMM holds fails by name here, rather than as an opaque VMM
+        // error: a disk fork, or a fork that fell back to a cold boot, of a
+        // TAP-wired task lands on the node where its origin holds the TAP.
+        if let Some(tap) = config.tap() {
+            sandbox_checkpoint::ensure_boot_tap_free(
+                &sandbox_checkpoint::HostTaps,
+                &tap.device,
+                &task.name,
+            )?;
+        }
         let kernel = microvm::resolve_kernel(config.kernel.as_deref())?;
         let layout = oci_image::resolve_layout(&config.image, instance, &scratch)?;
 
@@ -640,6 +768,8 @@ impl SandboxTaskPlugin {
             cwd: payload_cwd,
             disk_mounts: volumes.mounts,
             guest_agent: gated,
+            // Gated sandboxes are never launched for checkpoints (see below).
+            resume_watch: instance.checkpoint_launch && !gated,
         };
 
         let staged = instance.staged_artifacts.clone();
@@ -696,7 +826,7 @@ impl SandboxTaskPlugin {
             let _ = std::fs::remove_dir_all(&rootfs_dir);
         }
 
-        let spec = VmSpec {
+        let mut spec = VmSpec {
             name: name.clone(),
             kernel,
             extra_cmdline: config.kernel_args.clone(),
@@ -710,18 +840,55 @@ impl SandboxTaskPlugin {
                 cid: microvm::vsock_cid(allocation.id),
                 socket: vsock_socket_base(&scratch),
             }),
+            identity_disk: None,
+            balloon: None,
         };
+        // A sandbox the job may suspend or snapshot boots behind stable
+        // device links with an identity disk, so a memory checkpoint of it
+        // can be restored into a later allocation (see sandbox_checkpoint).
+        let checkpointable = if !instance.checkpoint_launch {
+            false
+        } else if gated {
+            warn!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                "Gated sandboxes cannot be memory-checkpointed yet; launching without checkpoint support"
+            );
+            false
+        } else {
+            sandbox_checkpoint::prepare_checkpoint_launch(
+                hypervisor, allocation, &task.name, instance, &scratch, &mut spec,
+            )?;
+            true
+        };
+        // A balloon for the guests that run above a reservation: the
+        // `reclaim` pressure step's lever for guest RAM. Recorded beside the
+        // socket so reclaim knows the bounds without re-reading the task.
+        let _ = std::fs::remove_file(scratch.join(BALLOON_RECORD));
+        let reserved_mib = memory_reservation_mib(&task.resources);
+        if checkpointable || reserved_mib.is_some_and(|reserved| reserved < spec.memory_mib) {
+            spec.balloon = Some(microvm::BalloonSpec {
+                free_page_reporting: matches!(hypervisor, Backend::CloudHypervisor { .. }),
+            });
+            write_balloon_record(
+                &scratch,
+                &BalloonRecord {
+                    guest_mib: u64::from(spec.memory_mib),
+                    reserved_mib: u64::from(reserved_mib.unwrap_or(spec.memory_mib)),
+                },
+            )?;
+        }
         // A stale socket from a previous boot makes the VMM refuse to start.
         let _ = std::fs::remove_file(&spec.api_socket);
         if let Some(vsock) = spec.vsock.as_ref() {
             let _ = std::fs::remove_file(&vsock.socket);
         }
 
-        match hypervisor {
+        let mut cmd = match hypervisor {
             Backend::CloudHypervisor { binary } => {
                 let mut cmd = Command::new(binary);
                 cmd.args(microvm::cloud_hypervisor_args(&spec));
-                Ok(cmd)
+                cmd
             }
             Backend::Firecracker { binary } => {
                 let config_path = scratch.join("firecracker.json");
@@ -731,17 +898,34 @@ impl SandboxTaskPlugin {
                 )
                 .with_context(|| format!("write {}", config_path.display()))?;
                 let mut cmd = Command::new(binary);
-                // `--id` labels the VM in Firecracker's own logs/metrics;
-                // `--no-api` boots straight from the config with no API dance.
-                cmd.arg("--id")
-                    .arg(&spec.name)
-                    .arg("--no-api")
-                    .arg("--config-file")
-                    .arg(&config_path);
-                Ok(cmd)
+                // `--id` labels the VM in Firecracker's own logs/metrics. The
+                // VM always boots straight from the config file. A sandbox
+                // that may be memory-checkpointed also gets an API socket
+                // (the checkpoint's control channel); every other one runs
+                // `--no-api`, with no control channel at all.
+                cmd.arg("--id").arg(&spec.name);
+                // A ballooned guest needs the socket too: the balloon is
+                // driven over the API.
+                if sandbox_checkpoint::firecracker_needs_api_socket(
+                    CheckpointSupport::Memory,
+                    checkpointable,
+                ) || spec.balloon.is_some()
+                {
+                    cmd.arg("--api-sock").arg(&spec.api_socket);
+                } else {
+                    cmd.arg("--no-api");
+                }
+                cmd.arg("--config-file").arg(&config_path);
+                cmd
             }
             other => bail!("{} is not a microVM monitor", other.label()),
-        }
+        };
+        // The VMM process *is* the guest, as far as the host kernel is
+        // concerned: joining it to the allocation's cgroup before it execs
+        // is what puts guest RAM under `memory.max` and makes it measurable.
+        // A no-op when the worker governs nothing.
+        crate::task_plugins::join_assignment_cgroup(&mut cmd, instance)?;
+        Ok(cmd)
     }
 
     /// macOS dev mode: Apple `container` (still VM-isolated, but Apple owns
@@ -799,12 +983,11 @@ impl SandboxTaskPlugin {
                 // must behave the same way so a jobspec does not change
                 // meaning per backend.
                 task_dir: None,
-                // The sandbox runtime has not adopted the enforcement
-                // interface (`ResourceEnforcement::Unsupported`), so worker
-                // core computes no assignment for it and its dev-mode bundle
-                // carries no limits. It is the designed-for next adopter —
-                // see docs/resource-enforcement.md.
-                assignment: None,
+                // Worker core already created this allocation's cgroup; the
+                // OCI runtime places the container in it and re-applies the
+                // same limits from the spec. The launcher itself stays
+                // outside, so only the workload is charged.
+                assignment: instance.resource_assignment.as_ref(),
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
@@ -825,6 +1008,89 @@ impl TaskPlugin for SandboxTaskPlugin {
     /// its exit is the guest's exit.
     fn supervises_process(&self) -> bool {
         true
+    }
+
+    /// The VMM process runs in the allocation's worker-owned cgroup, so
+    /// guest memory is charged, limited, and measured there like any host
+    /// process. Dev-mode backends hand the same cgroup to their OCI runtime.
+    fn resource_enforcement(&self) -> crate::task_plugins::ResourceEnforcement {
+        crate::task_plugins::ResourceEnforcement::WorkerCgroup
+    }
+
+    /// A microVM's cgroup holds the whole VMM: guest RAM plus the monitor's
+    /// own memory. Its ceiling is the guest size plus the worker's
+    /// `sandbox.vmmOverheadMiB`, so a guest using all of its memory is not
+    /// OOM-killed for the VMM's share. Dev-mode backends run the workload
+    /// directly and keep the declared `resources.memory`.
+    fn enforced_memory_limit_bytes(&self, task: &TaskConfig) -> Option<u64> {
+        let config = SandboxTaskConfig::from_value(&task.config).ok()?;
+        let backend = Backend::detect(config.hypervisor.as_deref()).ok()?;
+        backend
+            .is_microvm()
+            .then(|| vmm_cgroup_memory_bytes(config.memory_mib(), vmm_overhead_mib()))
+    }
+
+    /// Fix the guest size at submit, so it can never change under a stored
+    /// job (docs/task-runtime-sandbox.md, "Guest size").
+    ///
+    /// - An undeclared `resources.memory` becomes this runtime's own 512 MiB
+    ///   default, ahead of the manager's `taskResourceDefaults`. That is the
+    ///   size a sandbox always booted with, so the scheduler now reserves
+    ///   what the guest gets, and a cluster default tuned for small host
+    ///   processes cannot silently shrink every guest.
+    /// - An unset `config.memory_mib` is pinned to the derived guest size
+    ///   (`memoryMax`, else `memory`). The worker reads only `memory_mib`, so
+    ///   a job stored before this rule (no `memory_mib`) keeps booting at
+    ///   512 MiB exactly as it did, rather than shrinking to a defaulted
+    ///   reservation it never asked for.
+    fn normalize_task(&self, task: &mut TaskConfig) {
+        if !task.resources.is_object() {
+            task.resources = Value::Object(Default::default());
+        }
+        if let Some(resources) = task.resources.as_object_mut() {
+            resources
+                .entry("memory")
+                .or_insert_with(|| Value::from(DEFAULT_MEMORY_MIB));
+        }
+        let Some(config) = task.config.as_object_mut() else {
+            return;
+        };
+        if config.get("memory_mib").is_none_or(Value::is_null) {
+            if let Some(guest) = resources_guest_mib(&task.resources) {
+                config.insert("memory_mib".into(), Value::from(guest));
+            }
+        }
+    }
+
+    /// A guest too small to boot is an error, and an explicit `memory_mib`
+    /// that disagrees with the size `resources` imply is a warning this
+    /// release (a future release rejects it).
+    fn check_resources(&self, task: &TaskConfig) -> R<Vec<String>> {
+        let Ok(config) = SandboxTaskConfig::from_value(&task.config) else {
+            // `validate_config` reports the parse error with its own message.
+            return Ok(Vec::new());
+        };
+        // An undeclared `memory` becomes this runtime's 512 MiB at submit.
+        let derived = resources_guest_mib(&task.resources).or(Some(DEFAULT_MEMORY_MIB));
+        let mut warnings = Vec::new();
+        match (config.memory_mib, derived) {
+            (None, Some(guest)) if guest < MIN_MEMORY_MIB => bail!(
+                "task {} would boot a {guest} MiB sandbox guest (its resources.memoryMax, else \
+                 resources.memory), below the {MIN_MEMORY_MIB} MiB a Linux guest needs. Raise \
+                 resources.memory or resources.memoryMax",
+                task.name
+            ),
+            (Some(explicit), Some(guest)) if explicit != guest => warnings.push(format!(
+                "task {} sets config.memory_mib = {explicit}, but its resources size the guest at \
+                 {guest} MiB (resources.memoryMax, else resources.memory). This release still \
+                 boots {explicit} MiB, and a future release rejects the mismatch. Drop memory_mib and \
+                 set resources.memoryMax = {explicit} to burst to it, or resources.memory = \
+                 {explicit} to reserve it. See docs/task-runtime-sandbox.md",
+                task.name
+            )),
+            _ => {}
+        }
+        Ok(warnings)
     }
 
     fn schema(&self) -> Value {
@@ -1174,7 +1440,130 @@ impl TaskPlugin for SandboxTaskPlugin {
         }
 
         reap_task_process(allocation.id, &task.name, instance, "sandbox");
+        // Whatever the VMM left behind (a helper it forked, a dev-mode
+        // container init) is still in the allocation's cgroup.
+        if let Some(assignment) = instance.resource_assignment.as_ref() {
+            crate::worker::resources::kill_cgroup(assignment);
+        }
         Ok(())
+    }
+
+    fn checkpoint_support(&self, query: &CheckpointQuery<'_>) -> CheckpointSupport {
+        sandbox_checkpoint::sandbox_checkpoint_support(query)
+    }
+
+    /// A real VMM captures memory (see `sandbox_checkpoint`). The dev
+    /// backends capture only the volume half, which worker core owns, so
+    /// they behave like the trait default: stop when asked, no parts.
+    fn checkpoint(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        out: &CheckpointDir,
+        then: AfterCheckpoint,
+    ) -> R<MemoryParts> {
+        let backend = Backend::detect(configured_backend(task).as_deref())?;
+        if !backend.is_microvm() {
+            if then == AfterCheckpoint::Stop {
+                self.stop(allocation, task, instance)?;
+            }
+            return Ok(MemoryParts::default());
+        }
+        let scratch = work_root(allocation, instance);
+        sandbox_checkpoint::checkpoint_microvm(
+            &backend, allocation, &task.name, instance, &scratch, out, then,
+        )
+    }
+
+    fn resume_after_checkpoint(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+    ) -> R<()> {
+        let backend = Backend::detect(configured_backend(task).as_deref())?;
+        if !backend.is_microvm() {
+            return Ok(());
+        }
+        sandbox_checkpoint::resume_microvm(&backend, &work_root(allocation, instance))
+    }
+
+    /// The balloon, on a guest booted with one. A dev backend, or a guest
+    /// booted without a balloon, has no lever (`None`).
+    fn reclaim_guest_memory(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &TaskInstance,
+        bytes: u64,
+    ) -> R<Option<u64>> {
+        let backend = Backend::detect(configured_backend(task).as_deref())?;
+        if !backend.is_microvm() {
+            return Ok(None);
+        }
+        inflate_balloon(&backend, &work_root(allocation, instance), bytes)
+    }
+
+    fn release_guest_memory(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &TaskInstance,
+    ) -> R<()> {
+        let backend = Backend::detect(configured_backend(task).as_deref())?;
+        if !backend.is_microvm() {
+            return Ok(());
+        }
+        deflate_balloon(&backend, &work_root(allocation, instance))
+    }
+
+    fn restore(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        manifest: &SnapshotManifest,
+        source: &CheckpointDir,
+        identity: &ResumeIdentity,
+    ) -> R<()> {
+        if manifest.kind == SnapshotKind::Disk {
+            // The volumes already hold the captured state: boot on them.
+            return self.start(allocation, task, instance);
+        }
+        let config = SandboxTaskConfig::from_value(&task.config)?;
+        let backend = Backend::detect(config.hypervisor.as_deref())?;
+        let target = sandbox_checkpoint::RestoreTarget {
+            backend: &backend,
+            allocation,
+            task_name: &task.name,
+            hostname: sandbox_name(allocation),
+            vcpus: config.vcpus(),
+            memory_mib: config.memory_mib(),
+            scratch: work_root(allocation, instance),
+            tap: config.tap().map(|tap| tap.device),
+        };
+        let scratch = target.scratch.clone();
+        let guest_mib = u64::from(target.memory_mib);
+        sandbox_checkpoint::restore_microvm(
+            &target,
+            instance,
+            manifest,
+            source,
+            identity,
+            &sandbox_checkpoint::HostTaps,
+        )?;
+        // Every memory-checkpointable guest boots with a balloon, and the
+        // device rides the snapshot, so the restored guest has one too.
+        write_balloon_record(
+            &scratch,
+            &BalloonRecord {
+                guest_mib,
+                reserved_mib: memory_reservation_mib(&task.resources)
+                    .map(u64::from)
+                    .unwrap_or(guest_mib),
+            },
+        )
     }
 
     fn destroy(
@@ -1189,6 +1578,11 @@ impl TaskPlugin for SandboxTaskPlugin {
             "Destroying sandbox task"
         );
         self.stop(allocation, task, instance)?;
+        sandbox_checkpoint::release_links(instance, &work_root(allocation, instance));
+        sandbox_checkpoint::release_restore_tap(
+            &sandbox_checkpoint::HostTaps,
+            &work_root(allocation, instance),
+        );
         // Drop the allocation's scratch (image layout, root disk, bundle).
         // Volume-backed data is never under this tree: volumes live in the
         // volume system's own root, are unmounted by the worker on stop, and
@@ -1212,6 +1606,73 @@ impl TaskPlugin for SandboxTaskPlugin {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `reclaim` on a ballooned Firecracker guest inflates the balloon by
+    /// the request, capped at the guest's room above its reservation, and
+    /// the episode's end deflates it. A guest booted without a balloon has
+    /// no lever, so the worker falls back to `memory.reclaim`.
+    #[test]
+    fn reclaim_drives_the_balloon_within_the_reservation() -> R<()> {
+        use crate::task_plugins::vmm_api::fake::FakeVmm;
+        let scratch = tempfile::tempdir()?;
+        let backend = Backend::Firecracker {
+            binary: "firecracker".into(),
+        };
+        assert_eq!(inflate_balloon(&backend, scratch.path(), 1 << 30)?, None);
+
+        write_balloon_record(
+            scratch.path(),
+            &BalloonRecord {
+                guest_mib: 4096,
+                reserved_mib: 512,
+            },
+        )?;
+        let vmm = FakeVmm::start_at(scratch.path().join("vmm.sock"), false, |seen| {
+            match (seen.method.as_str(), seen.path.as_str()) {
+                ("GET", "/balloon") => (200, r#"{"amount_mib":3000,"deflate_on_oom":true}"#.into()),
+                _ => (204, String::new()),
+            }
+        });
+        // 1 GiB asked, 584 MiB of room left above the 512 MiB reservation.
+        let freed = inflate_balloon(&backend, scratch.path(), 1 << 30)?;
+        assert_eq!(freed, Some(584 * 1024 * 1024));
+        deflate_balloon(&backend, scratch.path())?;
+        let seen = vmm.drain();
+        assert_eq!(seen[1].body, Some(json!({ "amount_mib": 3584 })));
+        assert_eq!(seen[2].body, Some(json!({ "amount_mib": 0 })));
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_drives_a_cloud_hypervisor_balloon_in_bytes() -> R<()> {
+        use crate::task_plugins::vmm_api::fake::FakeVmm;
+        let scratch = tempfile::tempdir()?;
+        let backend = Backend::CloudHypervisor {
+            binary: "cloud-hypervisor".into(),
+        };
+        write_balloon_record(
+            scratch.path(),
+            &BalloonRecord {
+                guest_mib: 2048,
+                reserved_mib: 512,
+            },
+        )?;
+        let vmm = FakeVmm::start_at(scratch.path().join("vmm.sock"), false, |seen| {
+            match seen.path.as_str() {
+                "/api/v1/vm.info" => (200, r#"{"config":{"balloon":{"size":0}}}"#.into()),
+                _ => (204, String::new()),
+            }
+        });
+        let freed = inflate_balloon(&backend, scratch.path(), 256 * 1024 * 1024)?;
+        assert_eq!(freed, Some(256 * 1024 * 1024));
+        let seen = vmm.drain();
+        assert_eq!(seen[1].path, "/api/v1/vm.resize");
+        assert_eq!(
+            seen[1].body,
+            Some(json!({ "desired_balloon": 256u64 * 1024 * 1024 }))
+        );
+        Ok(())
+    }
 
     fn alloc() -> Allocation {
         Allocation {
@@ -1256,6 +1717,99 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    fn normalized(config: Value, resources: Value) -> TaskConfig {
+        let mut task = task_with(config);
+        task.resources = resources;
+        SandboxTaskPlugin.normalize_task(&mut task);
+        task
+    }
+
+    fn guest(task: &TaskConfig) -> R<u32> {
+        Ok(SandboxTaskConfig::from_value(&task.config)?.memory_mib())
+    }
+
+    /// Guest size follows `resources` (`memoryMax`, else `memory`), fixed at
+    /// submit. An undeclared `memory` is the runtime's 512 MiB, never the
+    /// cluster default. An explicit `memory_mib` still wins this release,
+    /// with a warning when it disagrees.
+    #[test]
+    fn guest_size_follows_resources_and_is_fixed_at_submit() -> R<()> {
+        let config = json!({"image": "a", "command": ["x"]});
+        let task = normalized(config.clone(), json!({ "memory": 512, "memoryMax": 4096 }));
+        assert_eq!(guest(&task)?, 4096);
+        assert!(SandboxTaskPlugin.check_resources(&task)?.is_empty());
+
+        assert_eq!(
+            guest(&normalized(config.clone(), json!({ "memory": 768 })))?,
+            768
+        );
+
+        // Nothing declared: reserve and boot the runtime's own 512 MiB.
+        let task = normalized(config.clone(), json!({}));
+        assert_eq!(task.resources["memory"], json!(512));
+        assert_eq!(guest(&task)?, 512);
+        let task = normalized(config.clone(), Value::Null);
+        assert_eq!(task.resources["memory"], json!(512));
+
+        // A job stored before the rule (no memory_mib, a defaulted 256 MiB
+        // reservation) keeps booting at 512 MiB on the worker.
+        let mut legacy = task_with(config.clone());
+        legacy.resources = json!({ "memory": 256 });
+        assert_eq!(guest(&legacy)?, DEFAULT_MEMORY_MIB);
+
+        // Explicit memory_mib wins, and a mismatch warns.
+        let explicit = json!({"image": "a", "command": ["x"], "memory_mib": 1024});
+        let mut declared = task_with(explicit.clone());
+        declared.resources = json!({ "memory": 512 });
+        let warnings = SandboxTaskPlugin.check_resources(&declared)?;
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("memory_mib = 1024"), "{}", warnings[0]);
+        assert!(warnings[0].contains("resources.memoryMax = 1024"));
+        assert_eq!(
+            guest(&normalized(explicit.clone(), json!({ "memory": 512 })))?,
+            1024
+        );
+        // With no memory declared, the implied size is the runtime default.
+        let mut bare = task_with(explicit);
+        bare.resources = json!({});
+        assert_eq!(SandboxTaskPlugin.check_resources(&bare)?.len(), 1);
+
+        // Agreeing is fine.
+        let mut agreeing = task_with(json!({"image": "a", "command": ["x"], "memory_mib": 1024}));
+        agreeing.resources = json!({ "memory": 256, "memoryMax": 1024 });
+        assert!(SandboxTaskPlugin.check_resources(&agreeing)?.is_empty());
+
+        // Too small to boot is an error, not a warning.
+        let mut tiny = task_with(config);
+        tiny.resources = json!({ "memory": 32 });
+        assert!(SandboxTaskPlugin.check_resources(&tiny).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn vmm_cgroup_ceiling_is_guest_plus_overhead() {
+        assert_eq!(
+            vmm_cgroup_memory_bytes(512, 64),
+            576 * 1024 * 1024,
+            "the default guest with the default overhead"
+        );
+        assert_eq!(vmm_cgroup_memory_bytes(4096, 128), 4224 * 1024 * 1024);
+    }
+
+    #[test]
+    fn sandbox_is_governed_through_the_worker_cgroup() {
+        assert_eq!(
+            SandboxTaskPlugin.resource_enforcement(),
+            crate::task_plugins::ResourceEnforcement::WorkerCgroup
+        );
+        // A config that does not parse never overrides the ceiling; the task
+        // fails at start with the parse error instead.
+        assert_eq!(
+            SandboxTaskPlugin.enforced_memory_limit_bytes(&task_with(json!({}))),
+            None
+        );
     }
 
     #[test]
@@ -2002,5 +2556,275 @@ mod tests {
             "init must report the payload's exit status: {console}"
         );
         Ok(())
+    }
+
+    /// The highest `counter=N` a guest has printed to its console so far.
+    fn last_counter(log: &Path) -> Option<u64> {
+        std::fs::read_to_string(log)
+            .ok()?
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("counter="))
+            .filter_map(|n| n.trim().parse().ok())
+            .max()
+    }
+
+    fn first_counter(log: &Path) -> Option<u64> {
+        std::fs::read_to_string(log)
+            .ok()?
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("counter=")?.trim().parse().ok())
+    }
+
+    fn wait_for(what: &str, mut check: impl FnMut() -> bool) -> R<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !check() {
+            if std::time::Instant::now() > deadline {
+                bail!("timed out waiting for {what}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(())
+    }
+
+    /// A guest keeps a counter in a shell variable (RAM only, nothing on
+    /// disk). Checkpoint it with `Stop`, restore into a new allocation, and
+    /// the counter continues from where it was instead of starting over.
+    fn memory_checkpoint_round_trip(hypervisor: &str) -> R<()> {
+        let plugin = SandboxTaskPlugin;
+        let image = std::env::var("LEGION_SANDBOX_TEST_IMAGE")
+            .unwrap_or_else(|_| "alpine:latest".to_string());
+        let task = task_with(json!({
+            "image": image,
+            "hypervisor": hypervisor,
+            "command": ["/bin/sh", "-c",
+                        "i=0; while true; do i=$((i+1)); echo counter=$i; sleep 0.2; done"],
+        }));
+        let tmp = tempfile::tempdir()?;
+        let origin_alloc = alloc();
+        let mut origin = TaskInstance {
+            alloc_dir: Some(tmp.path().join("allocs/7")),
+            log_dir: Some(tmp.path().join("logs7")),
+            checkpoint_launch: true,
+            ..TaskInstance::default()
+        };
+        let origin_log = tmp.path().join("logs7/stdout.log");
+        plugin.prepare(&origin_alloc, &task, &mut origin)?;
+        plugin.start(&origin_alloc, &task, &mut origin)?;
+        wait_for("the guest to count to 10", || {
+            last_counter(&origin_log).is_some_and(|n| n >= 10)
+        })?;
+
+        let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
+        let parts = plugin.checkpoint(
+            &origin_alloc,
+            &task,
+            &mut origin,
+            &out,
+            AfterCheckpoint::Stop,
+        )?;
+        let before = last_counter(&origin_log).expect("counter before checkpoint");
+        assert!(origin.child.is_none(), "Stop killed the VMM");
+
+        let manifest = SnapshotManifest {
+            api_version: crate::structs::checkpoint::MANIFEST_API_VERSION,
+            id: "snap-kvm".into(),
+            job_id: "job".into(),
+            task: task.name.clone(),
+            origin_instance: None,
+            origin_alloc_id: origin_alloc.id,
+            runtime: "sandbox".into(),
+            kind: SnapshotKind::Memory,
+            created_at: "2026-10-10T00:00:00Z".into(),
+            volumes: Vec::new(),
+            memory: parts.parts.clone(),
+            compat: parts.compat.clone(),
+            runtime_state: parts.runtime.clone(),
+        };
+        let restored_alloc = Allocation { id: 8, ..alloc() };
+        let mut restored = TaskInstance {
+            alloc_dir: Some(tmp.path().join("allocs/8")),
+            log_dir: Some(tmp.path().join("logs8")),
+            ..TaskInstance::default()
+        };
+        let restored_log = tmp.path().join("logs8/stdout.log");
+        let identity = ResumeIdentity {
+            alloc_id: 8,
+            job_id: "job".into(),
+            task_name: task.name.clone(),
+            hostname: sandbox_name(&restored_alloc),
+            ..ResumeIdentity::default()
+        };
+        plugin.prepare(&restored_alloc, &task, &mut restored)?;
+        let started = std::time::Instant::now();
+        plugin.restore(
+            &restored_alloc,
+            &task,
+            &mut restored,
+            &manifest,
+            &out,
+            &identity,
+        )?;
+        eprintln!("{hypervisor}: restore returned in {:?}", started.elapsed());
+        wait_for("the restored guest to keep counting", || {
+            last_counter(&restored_log).is_some_and(|n| n > before)
+        })?;
+        let resumed_at = first_counter(&restored_log).expect("counter after restore");
+        assert!(
+            resumed_at > before.saturating_sub(1) && resumed_at > 1,
+            "the counter continued from RAM ({before} before, {resumed_at} first after) instead \
+             of restarting"
+        );
+
+        plugin.destroy(&restored_alloc, &task, &mut restored)?;
+        plugin.destroy(&origin_alloc, &task, &mut origin)?;
+        Ok(())
+    }
+
+    /// `LEGION_SANDBOX_KERNEL=/path/to/vmlinux cargo test --lib \
+    ///   sandbox_memory_checkpoint_round_trip -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires KVM + firecracker + a guest kernel"]
+    fn sandbox_memory_checkpoint_round_trip_firecracker() -> R<()> {
+        memory_checkpoint_round_trip("firecracker")
+    }
+
+    #[test]
+    #[ignore = "requires KVM + cloud-hypervisor + a guest kernel"]
+    fn sandbox_memory_checkpoint_round_trip_cloud_hypervisor() -> R<()> {
+        memory_checkpoint_round_trip("cloud-hypervisor")
+    }
+    /// The last `<key>=<value>` a guest printed.
+    fn last_value(log: &Path, key: &str) -> Option<String> {
+        std::fs::read_to_string(log)
+            .ok()?
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix(&format!("{key}="))
+                    .map(str::to_string)
+            })
+            .next_back()
+    }
+
+    /// Phase 6 (plan §13): fork a running guest live into three new
+    /// allocations. The origin keeps running, and the forks differ in
+    /// hostname and in what they read from `/dev/urandom` (the resume
+    /// handler reseeds from per-fork entropy; VMGenID helps where the VMM
+    /// exposes it). Needs a rootfs whose init runs `legion guest-resume`.
+    fn fork_divergence(hypervisor: &str) -> R<()> {
+        let plugin = SandboxTaskPlugin;
+        let image = std::env::var("LEGION_SANDBOX_TEST_IMAGE")
+            .unwrap_or_else(|_| "alpine:latest".to_string());
+        let task = task_with(json!({
+            "image": image,
+            "hypervisor": hypervisor,
+            "command": ["/bin/sh", "-c",
+                        "while true; do echo rand=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \\n'); \
+                         echo host=$(hostname); sleep 0.3; done"],
+        }));
+        let tmp = tempfile::tempdir()?;
+        let origin_alloc = alloc();
+        let mut origin = TaskInstance {
+            alloc_dir: Some(tmp.path().join("allocs/7")),
+            log_dir: Some(tmp.path().join("logs7")),
+            checkpoint_launch: true,
+            ..TaskInstance::default()
+        };
+        let origin_log = tmp.path().join("logs7/stdout.log");
+        plugin.prepare(&origin_alloc, &task, &mut origin)?;
+        plugin.start(&origin_alloc, &task, &mut origin)?;
+        wait_for("the origin to print", || {
+            last_value(&origin_log, "rand").is_some()
+        })?;
+
+        let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
+        let parts = plugin.checkpoint(
+            &origin_alloc,
+            &task,
+            &mut origin,
+            &out,
+            AfterCheckpoint::Resume,
+        )?;
+        let manifest = SnapshotManifest {
+            api_version: crate::structs::checkpoint::MANIFEST_API_VERSION,
+            id: "snap-fork-kvm".into(),
+            job_id: "job".into(),
+            task: task.name.clone(),
+            origin_instance: Some("run-17".into()),
+            origin_alloc_id: origin_alloc.id,
+            runtime: "sandbox".into(),
+            kind: SnapshotKind::Memory,
+            created_at: "2026-10-10T00:00:00Z".into(),
+            volumes: Vec::new(),
+            memory: parts.parts.clone(),
+            compat: parts.compat.clone(),
+            runtime_state: parts.runtime.clone(),
+        };
+
+        let mut forks = Vec::new();
+        for (n, id) in [(1, 9), (2, 10), (3, 11)] {
+            let fork_alloc = Allocation { id, ..alloc() };
+            let mut fork = TaskInstance {
+                alloc_dir: Some(tmp.path().join(format!("allocs/{id}"))),
+                log_dir: Some(tmp.path().join(format!("logs{id}"))),
+                ..TaskInstance::default()
+            };
+            let identity = ResumeIdentity {
+                alloc_id: id,
+                instance_id: Some(format!("run-17-f{n}")),
+                job_id: "job".into(),
+                task_name: task.name.clone(),
+                hostname: sandbox_name(&fork_alloc),
+                mac: Some(crate::structs::fork::fork_mac(id)),
+                entropy: crate::task_plugins::checkpoint::fresh_entropy(),
+                host_time_unix_ms: chrono::Utc::now().timestamp_millis(),
+                fork: true,
+                ..ResumeIdentity::default()
+            };
+            plugin.prepare(&fork_alloc, &task, &mut fork)?;
+            plugin.restore(&fork_alloc, &task, &mut fork, &manifest, &out, &identity)?;
+            forks.push((
+                fork_alloc,
+                fork,
+                tmp.path().join(format!("logs{id}/stdout.log")),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (fork_alloc, _, log) in &forks {
+            let want = sandbox_name(fork_alloc);
+            wait_for("the fork to take its own hostname", || {
+                last_value(log, "host").as_deref() == Some(want.as_str())
+            })?;
+            let rand = last_value(log, "rand").expect("fork printed");
+            assert!(
+                seen.insert(rand.clone()),
+                "two forks read the same RNG output {rand}"
+            );
+        }
+        let before = std::fs::metadata(&origin_log)?.len();
+        wait_for("the origin to keep running", || {
+            std::fs::metadata(&origin_log)
+                .map(|m| m.len() > before)
+                .unwrap_or(false)
+        })?;
+        for (fork_alloc, mut fork, _) in forks {
+            plugin.destroy(&fork_alloc, &task, &mut fork)?;
+        }
+        plugin.destroy(&origin_alloc, &task, &mut origin)?;
+        Ok(())
+    }
+
+    /// `LEGION_SANDBOX_KERNEL=/path/to/vmlinux cargo test --lib \
+    ///   sandbox_fork_divergence -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires KVM + firecracker + a guest kernel"]
+    fn sandbox_fork_divergence_firecracker() -> R<()> {
+        fork_divergence("firecracker")
+    }
+
+    #[test]
+    #[ignore = "requires KVM + cloud-hypervisor + a guest kernel"]
+    fn sandbox_fork_divergence_cloud_hypervisor() -> R<()> {
+        fork_divergence("cloud-hypervisor")
     }
 }

@@ -210,6 +210,20 @@ fn maximal_job_spec_parse() {
         .expect("microvm task declares stateful.storage");
     assert_eq!(storage.path, "/workspace");
     assert_eq!(storage.volume_mode(), legion::volumes::VolumeMode::Block);
+    // The snapshots block parses and resolves, and the gated
+    // sandbox in the shipped spec asks for disk snapshots only.
+    let snapshots = microvm
+        .snapshots
+        .as_ref()
+        .expect("microvm declares a snapshots block")
+        .resolve()
+        .expect("snapshots block resolves");
+    assert_eq!(snapshots.keep, 5);
+    assert_eq!(
+        snapshots.ttl,
+        Some(std::time::Duration::from_secs(7 * 86_400))
+    );
+    assert!(!snapshots.memory);
 
     // No stateful task may sit under a createFirst (replace-before-stop)
     // rollout: that would double-bind one instance id + storage handle (see

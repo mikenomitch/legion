@@ -9,6 +9,8 @@ pub mod cmd;
 pub mod config_lang;
 pub mod constants;
 pub mod constraints;
+pub mod content_publish;
+pub mod content_store;
 pub mod manager;
 pub mod otel;
 pub mod plugin_runtime;

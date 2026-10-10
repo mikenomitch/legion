@@ -1,4 +1,5 @@
 use crate::artifacts::{ArtifactStager, ArtifactStatusBoard, CredentialSource, StagedArtifact};
+use crate::content_store::ContentStore;
 use crate::prelude::*;
 use crate::structs::edge_boot::{ClaimStage, Gate, OnRefused};
 use crate::structs::{
@@ -134,6 +135,46 @@ pub struct StagingJob {
     pub gate: Gate,
     stager: Arc<ArtifactStager>,
     board: ArtifactStatusBoard,
+    /// A published snapshot this allocation restores from, whose memory
+    /// parts are not all in the node content store yet: fetched first
+    /// (Phase 7b cross-node restore).
+    restore_fetch: Option<crate::structs::checkpoint::SnapshotManifest>,
+}
+
+impl StagingJob {
+    /// The blocking half of a staged start, run off the task-manager lock:
+    /// fetch a published restore's missing parts into the node content
+    /// store (pinned to this allocation until it starts), then stage the
+    /// task's artifacts.
+    fn stage(&self) -> R<Vec<StagedArtifact>> {
+        if let Some(manifest) = self.restore_fetch.as_ref() {
+            let started = std::time::Instant::now();
+            let fetched = crate::worker::checkpoints::fetch_published_parts(
+                &self.stager,
+                manifest,
+                Some(&crate::content_store::PinOwner::allocation(
+                    self.allocation.id,
+                )),
+            )
+            .with_context(|| format!("restoring from snapshot {}", manifest.id))?;
+            info!(
+                allocation_id = self.allocation.id,
+                snapshot_id = %manifest.id,
+                fetched_bytes = fetched,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "Fetched published snapshot parts for restore"
+            );
+        }
+        if self.task.artifacts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.stager.stage_task_artifacts(
+            self.allocation.id,
+            &self.task_dir,
+            &self.task.artifacts,
+            &self.board,
+        )
+    }
 }
 
 /// The outcome of ratifying a claim.
@@ -284,6 +325,16 @@ pub struct WorkerTaskManager {
     /// each heartbeat, so this worker holds exactly what the manager
     /// currently knows and needs no expiry logic of its own.
     stop_causes: HashMap<i64, StopCause>,
+    /// Priority band per desired allocation (local key), refreshed from the
+    /// desired set on every reconcile. Read by the memory pressure response
+    /// (`src/worker/pressure.rs`), which acts on lower bands first. Not
+    /// persisted: the next heartbeat after a restart fills it again.
+    bands: HashMap<i64, crate::structs::Band>,
+    /// Allocations the memory pressure response stopped (local keys), held
+    /// until the manager drops them from the desired set. Without it, a
+    /// heartbeat that still lists an evicted allocation (the report of the
+    /// eviction has not reached the manager yet) would relaunch it.
+    pressure_evicted: std::collections::HashSet<i64>,
     /// Who displaced each preempted allocation, from the same heartbeat feed
     /// as [`Self::stop_causes`]. Written into the stop notice so a task can
     /// tell "the platform wanted my capacity for job X" from "my operator
@@ -316,6 +367,11 @@ pub struct WorkerTaskManager {
     alloc_root: PathBuf,
     artifact_status: ArtifactStatusBoard,
     stager: Arc<ArtifactStager>,
+    /// The node content store (`None` when disabled or it failed to open).
+    content_store: Option<Arc<ContentStore>>,
+    /// Publishing to the worker's `contentStore` (`None` when unconfigured
+    /// or the node has no content store).
+    content_publishing: Option<Arc<crate::content_publish::ContentPublishing>>,
     log_sinks: Vec<Box<dyn LogSink>>,
     /// Volume drivers plus the mounts held for each allocation. Mounting
     /// happens here, between `prepare_instance` and `start`, so a task can never
@@ -352,6 +408,10 @@ pub struct WorkerTaskManager {
     /// the id cannot be launched again until it has.
     cancelled_launches: std::collections::HashSet<i64>,
     next_launch_generation: u64,
+    /// The checkpoint channel's worker state: snapshot work in flight and
+    /// done, reports owed to the manager, and allocations starting from a
+    /// snapshot (see `crate::worker::checkpoints`).
+    checkpoints: crate::worker::checkpoints::CheckpointState,
 }
 
 impl Default for WorkerTaskManager {
@@ -387,6 +447,8 @@ impl WorkerTaskManager {
             restart_history: HashMap::new(),
             self_fence_windows: HashMap::new(),
             stop_causes: HashMap::new(),
+            bands: HashMap::new(),
+            pressure_evicted: std::collections::HashSet::new(),
             preemptors: HashMap::new(),
             terminating: HashMap::new(),
             draining: HashMap::new(),
@@ -398,6 +460,8 @@ impl WorkerTaskManager {
                 WorkerArtifactFetchConfigFull::default(),
                 Box::new(crate::artifacts::AnonymousCredentials),
             )),
+            content_store: None,
+            content_publishing: None,
             log_sinks: default_sinks(),
             volumes: Arc::new(WorkerVolumeManager::new(
                 String::new(),
@@ -415,6 +479,7 @@ impl WorkerTaskManager {
             launching: HashMap::new(),
             cancelled_launches: std::collections::HashSet::new(),
             next_launch_generation: 0,
+            checkpoints: Default::default(),
         }
     }
 
@@ -535,11 +600,171 @@ impl WorkerTaskManager {
         self.volumes.requeue_reports(reports);
     }
 
+    /// Snapshot reports owed to the manager (`HeartbeatRequest.snapshot_reports`).
+    pub fn drain_snapshot_reports(&mut self) -> Vec<crate::structs::SnapshotReport> {
+        self.checkpoints.drain()
+    }
+
+    /// Put drained snapshot reports back after a failed heartbeat.
+    pub fn requeue_snapshot_reports(&mut self, reports: Vec<crate::structs::SnapshotReport>) {
+        self.checkpoints.requeue(reports);
+    }
+
+    pub fn checkpoints_mut(&mut self) -> &mut crate::worker::checkpoints::CheckpointState {
+        &mut self.checkpoints
+    }
+
+    /// The runtime's half of a capture, under this lock: check the
+    /// allocation can take a `kind` checkpoint, then (memory) have the
+    /// runtime pause and write its memory parts. For a live memory
+    /// checkpoint the task stays paused: the caller snapshots the volumes
+    /// and then calls [`Self::checkpoint_resume`].
+    pub(crate) fn checkpoint_begin(
+        &mut self,
+        allocation_id: i64,
+        snapshot_id: &str,
+        kind: crate::structs::checkpoint::SnapshotKind,
+        then: crate::task_plugins::AfterCheckpoint,
+    ) -> R<crate::worker::checkpoints::CaptureContext> {
+        use crate::structs::checkpoint::SnapshotKind;
+        use crate::task_plugins::{
+            AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport,
+        };
+        let allocation = self
+            .allocations
+            .get(&allocation_id)
+            .cloned()
+            .with_context(|| format!("allocation {allocation_id} is not running on this node"))?;
+        if self.terminated.contains_key(&allocation_id) {
+            bail!("allocation {allocation_id} has exited; there is nothing running to capture");
+        }
+        let task = self
+            .task_configs
+            .get(&allocation_id)
+            .cloned()
+            .context("task config missing")?;
+        let plugin = self
+            .registry
+            .plugin(&task.runtime)
+            .context("task plugin not loaded")?;
+        let content = self.content_store.clone();
+        let mut memory = crate::structs::checkpoint::MemoryParts::default();
+        let mut dir = None;
+        let mut paused = false;
+        match kind {
+            SnapshotKind::Memory => {
+                let support = plugin.checkpoint_support(&CheckpointQuery::new(&task.config));
+                if support != CheckpointSupport::Memory {
+                    bail!(
+                        "task runtime `{}` cannot take memory checkpoints here (it supports {})",
+                        task.runtime,
+                        support.as_str()
+                    );
+                }
+                let store = content.as_ref().context(
+                    "memory snapshots need the node content store, which is disabled on this \
+                     worker (content.enabled = false)",
+                )?;
+                // In the store's staging area, so ingesting each part is a
+                // rename on the same filesystem.
+                let out =
+                    CheckpointDir::create(store.staging_path(&format!("ckpt-{snapshot_id}"))?)?;
+                let then = match then {
+                    AfterCheckpoint::Resume => AfterCheckpoint::Pause,
+                    other => other,
+                };
+                let instance = self
+                    .instances
+                    .get_mut(&allocation_id)
+                    .context("task instance missing")?;
+                match plugin.checkpoint(&allocation, &task, instance, &out, then) {
+                    Ok(parts) => memory = parts,
+                    Err(err) => {
+                        let _ = std::fs::remove_dir_all(out.path());
+                        return Err(err);
+                    }
+                }
+                paused = then == AfterCheckpoint::Pause;
+                dir = Some(out);
+            }
+            SnapshotKind::Disk => {
+                if then == AfterCheckpoint::Stop {
+                    let instance = self
+                        .instances
+                        .get_mut(&allocation_id)
+                        .context("task instance missing")?;
+                    plugin.stop(&allocation, &task, instance)?;
+                }
+            }
+        }
+        Ok(crate::worker::checkpoints::CaptureContext {
+            runtime: task.runtime.clone(),
+            allocation,
+            task,
+            memory,
+            dir,
+            paused,
+            volumes: self.volumes.clone(),
+            content,
+        })
+    }
+
+    /// Finish a suspend once its checkpoint is safely stored: kill a paused
+    /// guest outright (it must not run past the captured instant), then tear
+    /// the allocation down with cause `suspended`, which keeps its instance
+    /// volume in place. A disk suspend (`paused` false) stops gracefully.
+    /// Runs under the task-manager lock, so the exit poller never sees the
+    /// stop as a crash.
+    pub(crate) fn checkpoint_finish_suspend(&mut self, allocation_id: i64, paused: bool) -> R<()> {
+        if paused {
+            if let (Some(task), Some(instance)) = (
+                self.task_configs.get(&allocation_id),
+                self.instances.get_mut(&allocation_id),
+            ) {
+                crate::task_plugins::reap_task_process(
+                    allocation_id,
+                    &task.name,
+                    instance,
+                    &task.runtime,
+                );
+            }
+        }
+        self.stop_causes.insert(allocation_id, StopCause::Suspended);
+        self.stop_allocation(allocation_id)
+    }
+
+    /// Resume a task [`Self::checkpoint_begin`] left paused.
+    pub(crate) fn checkpoint_resume(&mut self, allocation_id: i64) -> R<()> {
+        let allocation = self
+            .allocations
+            .get(&allocation_id)
+            .context("allocation missing")?;
+        let task = self
+            .task_configs
+            .get(&allocation_id)
+            .context("task config missing")?;
+        let plugin = self
+            .registry
+            .plugin(&task.runtime)
+            .context("task plugin not loaded")?;
+        let instance = self
+            .instances
+            .get_mut(&allocation_id)
+            .context("task instance missing")?;
+        plugin.resume_after_checkpoint(allocation, task, instance)
+    }
+
     /// A handle to the volume manager for work that must NOT run under the
     /// task-manager lock — reclaim dispatch, whose driver calls can stall on a
     /// dead storage backend. Cheap to clone; see the field docs.
     pub fn volumes_handle(&self) -> Arc<WorkerVolumeManager> {
         self.volumes.clone()
+    }
+
+    /// The artifact stager, for work that fetches outside an allocation
+    /// (warming a published snapshot).
+    pub fn stager_handle(&self) -> Arc<ArtifactStager> {
+        self.stager.clone()
     }
 
     /// Applies the worker's artifact fetch settings and credential source
@@ -549,7 +774,35 @@ impl WorkerTaskManager {
         config: WorkerArtifactFetchConfigFull,
         credentials: Box<dyn CredentialSource>,
     ) {
-        self.stager = Arc::new(ArtifactStager::new(config, credentials));
+        self.stager = Arc::new(
+            ArtifactStager::new(config, credentials).with_content_store(self.content_store.clone()),
+        );
+    }
+
+    /// Sets the node content store. Call before [`Self::configure_artifacts`],
+    /// which hands it to the artifact stager.
+    pub fn configure_content_store(&mut self, store: Option<Arc<ContentStore>>) {
+        self.content_store = store;
+    }
+
+    /// The node content store, when this worker has one. Checkpoint code puts
+    /// and pins snapshot parts here (see [`crate::content_store`]).
+    pub fn content_store(&self) -> Option<Arc<ContentStore>> {
+        self.content_store.clone()
+    }
+
+    /// Sets the publisher for the worker's `contentStore`.
+    pub fn configure_content_publishing(
+        &mut self,
+        publishing: Option<Arc<crate::content_publish::ContentPublishing>>,
+    ) {
+        self.content_publishing = publishing;
+    }
+
+    /// Publishing to the shared content store, when this worker has one.
+    /// Phase 7b publishes snapshot parts through this (`durability = "store"`).
+    pub fn content_publishing(&self) -> Option<Arc<crate::content_publish::ContentPublishing>> {
+        self.content_publishing.clone()
     }
 
     pub fn load_builtin_plugins(&mut self) {
@@ -575,6 +828,181 @@ impl WorkerTaskManager {
             .collect::<Vec<_>>();
         allocations.sort_unstable();
         allocations
+    }
+
+    /// Every allocation running in a worker-owned cgroup, addressed by the
+    /// id the manager knows: what the usage sampler measures
+    /// (`src/worker/usage.rs`). Ungoverned runtimes have no assignment and are
+    /// absent, as is unratified provisional work.
+    pub fn usage_targets(&self) -> Vec<crate::worker::usage::UsageTarget> {
+        let mut targets: Vec<_> = self
+            .instances
+            .iter()
+            .filter_map(|(local_key, instance)| {
+                let assignment = instance.resource_assignment.as_ref()?;
+                Some(crate::worker::usage::UsageTarget {
+                    allocation_id: self.external_id(*local_key).filter(|id| *id >= 0)?,
+                    cgroup_dir: assignment.absolute_cgroup_path(),
+                    pressure: self.pressure_meta(*local_key),
+                    idle: self.task_configs.get(local_key).and_then(|task| {
+                        crate::worker::idle::IdlePolicy::for_task(
+                            task,
+                            crate::worker::idle::local_mhz_per_core(),
+                        )
+                    }),
+                })
+            })
+            .collect();
+        targets.sort_by_key(|target| target.allocation_id);
+        targets
+    }
+
+    /// What the memory pressure response needs to know about one running
+    /// allocation besides its measurements. Anything unknown falls back to
+    /// [`crate::worker::pressure::PressureMeta::default`], which is
+    /// untouchable (node-pinned).
+    fn pressure_meta(&self, local_key: i64) -> crate::worker::pressure::PressureMeta {
+        let Some(allocation) = self.allocations.get(&local_key) else {
+            return Default::default();
+        };
+        let reserved_bytes = self
+            .task_configs
+            .get(&local_key)
+            .and_then(|task| crate::worker::resources::memory_limit_bytes(&task.resources))
+            .unwrap_or(0);
+        // Preemption's rule, applied to what this node mounted: instance
+        // storage on a node-local driver can only come back here.
+        let node_pinned = self
+            .volume_specs
+            .get(&local_key)
+            .into_iter()
+            .flatten()
+            .any(|mount| mount.instance_volume && self.volumes.is_node_local(&mount.driver));
+        // `suspend.onPressure`: the `suspend` step may checkpoint it. Only a
+        // keyed instance can be suspended, and only one the manager knows
+        // (a provisional claim has no instance row to suspend).
+        let on_pressure = allocation.instance_id.is_some()
+            && local_key >= 0
+            && self
+                .task_configs
+                .get(&local_key)
+                .and_then(|task| task.suspend.as_ref())
+                .and_then(|suspend| suspend.resolve().ok())
+                .is_some_and(|suspend| suspend.on_pressure);
+        crate::worker::pressure::PressureMeta {
+            job_id: allocation.job_id.clone(),
+            band: self.bands.get(&local_key).copied().unwrap_or_default(),
+            reserved_bytes,
+            node_pinned,
+            on_pressure,
+        }
+    }
+
+    /// Stop an allocation for memory pressure, ahead of the manager.
+    ///
+    /// The stop runs the ordinary graceful path (stop notice with `cause =
+    /// node_pressure`, drain, signal, kill after `stop.killAfter`), and the
+    /// allocation is held out of relaunch until the manager drops it from
+    /// the desired set, which it does once the heartbeat reports the
+    /// eviction.
+    pub fn evict_for_pressure(&mut self, allocation_id: i64) -> R<()> {
+        let local = self.local_key(allocation_id);
+        if !self.instances.contains_key(&local) {
+            bail!("allocation {allocation_id} is not running on this node");
+        }
+        self.pressure_evicted.insert(local);
+        self.stop_causes.insert(local, StopCause::NodePressure);
+        warn!(
+            allocation_id,
+            "Stopping allocation for node memory pressure"
+        );
+        self.stop_allocation(local)
+    }
+
+    /// The checkpoint kind the `suspend` pressure step takes for an
+    /// allocation: the task's `suspend.checkpoint` when set, else memory when
+    /// the runtime can take one of this allocation, else disk. The same
+    /// default SuspendInstance uses.
+    pub fn local_suspend_kind(
+        &self,
+        allocation_id: i64,
+    ) -> R<crate::structs::checkpoint::SnapshotKind> {
+        use crate::structs::checkpoint::SnapshotKind;
+        let task = self
+            .task_configs
+            .get(&allocation_id)
+            .with_context(|| format!("allocation {allocation_id} is not running on this node"))?;
+        let declared = task
+            .suspend
+            .as_ref()
+            .and_then(|suspend| suspend.resolve().ok())
+            .and_then(|resolved| resolved.checkpoint);
+        if let Some(kind) = declared {
+            return Ok(kind);
+        }
+        let launched_for_memory = self
+            .instances
+            .get(&allocation_id)
+            .is_some_and(|instance| instance.checkpoint_launch);
+        let memory = launched_for_memory
+            && self.registry.plugin(&task.runtime).is_some_and(|plugin| {
+                plugin.checkpoint_support(&crate::task_plugins::CheckpointQuery::new(&task.config))
+                    == crate::task_plugins::CheckpointSupport::Memory
+            });
+        Ok(if memory {
+            SnapshotKind::Memory
+        } else {
+            SnapshotKind::Disk
+        })
+    }
+
+    /// Keep an allocation from being relaunched until the manager drops it
+    /// from the desired set (a local suspension the manager has not applied
+    /// yet). The same hold a pressure eviction uses.
+    pub fn hold_out_of_relaunch(&mut self, allocation_id: i64) {
+        self.pressure_evicted.insert(allocation_id);
+    }
+
+    /// Undo [`Self::hold_out_of_relaunch`] when the work it guarded failed
+    /// and the allocation keeps running.
+    pub fn release_relaunch_hold(&mut self, allocation_id: i64) {
+        self.pressure_evicted.remove(&allocation_id);
+    }
+
+    /// Give back guest memory above an allocation's reservation through its
+    /// runtime (a sandbox balloon), for the `reclaim` pressure step. `None`
+    /// when the runtime has no such lever, in which case the caller uses
+    /// `memory.reclaim` on the cgroup.
+    pub fn reclaim_guest_memory(&mut self, allocation_id: i64, bytes: u64) -> R<Option<u64>> {
+        let local = self.local_key(allocation_id);
+        let (Some(allocation), Some(task), Some(instance)) = (
+            self.allocations.get(&local),
+            self.task_configs.get(&local),
+            self.instances.get(&local),
+        ) else {
+            return Ok(None);
+        };
+        let Some(plugin) = self.registry.plugin(&task.runtime) else {
+            return Ok(None);
+        };
+        plugin.reclaim_guest_memory(allocation, task, instance, bytes)
+    }
+
+    /// Return what [`Self::reclaim_guest_memory`] took (deflate the balloon)
+    /// once the pressure episode is over.
+    pub fn release_guest_memory(&mut self, allocation_id: i64) -> R<()> {
+        let local = self.local_key(allocation_id);
+        let (Some(allocation), Some(task), Some(instance)) = (
+            self.allocations.get(&local),
+            self.task_configs.get(&local),
+            self.instances.get(&local),
+        ) else {
+            return Ok(());
+        };
+        let Some(plugin) = self.registry.plugin(&task.runtime) else {
+            return Ok(());
+        };
+        plugin.release_guest_memory(allocation, task, instance)
     }
 
     /// Whether this worker currently runs the allocation (used by identity
@@ -1086,6 +1514,18 @@ impl WorkerTaskManager {
     }
 
     pub fn record_failure(&mut self, allocation_id: i64, reason: impl Into<String>) {
+        let reason = reason.into();
+        // An allocation that dies before its restore finished reports the
+        // restore as failed, with the same reason, so the snapshot's event
+        // carries it.
+        if self.checkpoints.has_pending_restore(allocation_id) {
+            self.checkpoints.record_restore(
+                allocation_id,
+                false,
+                reason.clone(),
+                std::time::Instant::now(),
+            );
+        }
         if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
             monitor.shutdown();
         }
@@ -1140,7 +1580,7 @@ impl WorkerTaskManager {
         self.cleanup_alloc_dir(allocation_id);
         self.failed.push(FailedAllocationReport {
             allocation_id,
-            reason: reason.into(),
+            reason,
             artifact_states,
         });
         self.persist_state();
@@ -1244,6 +1684,20 @@ impl WorkerTaskManager {
             .iter()
             .map(|allocation| self.local_key(allocation.allocation_id))
             .collect::<std::collections::HashSet<_>>();
+        // Bands ride every desired allocation; keep exactly the desired set's.
+        self.bands = allocations
+            .iter()
+            .map(|allocation| {
+                (
+                    self.local_key(allocation.allocation_id),
+                    crate::structs::Band::from_stored(&allocation.priority_band),
+                )
+            })
+            .collect();
+        // An eviction is settled once the manager stops asking for the
+        // allocation; until then it must not be relaunched.
+        self.pressure_evicted
+            .retain(|local| desired_ids.contains(local));
         // Unratified claims are exempt from the stop sweep for the length of
         // their lease. The manager cannot list work it does not know about,
         // so an absence here is not a decision — it is ignorance, and reading
@@ -1256,6 +1710,31 @@ impl WorkerTaskManager {
             .unratified_local_keys()
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
+        // A restore replaces an instance's allocation in one manager
+        // transaction. Allocation ids are never reused (AUTOINCREMENT), so
+        // the replacement normally has a new id; a store migrated from a
+        // version that reused ids can still hand one out once. An id this
+        // node runs that now arrives with a restore payload it never started
+        // from is that replacement: stop the old process so the restore
+        // starts once it is gone, instead of mistaking it for the same
+        // allocation and never restoring at all.
+        let replaced: Vec<i64> = allocations
+            .iter()
+            .filter(|allocation| allocation.restore.is_some())
+            .map(|allocation| self.local_key(allocation.allocation_id))
+            .filter(|local| {
+                self.instances.contains_key(local) && !self.checkpoints.restores.contains_key(local)
+            })
+            .collect();
+        for allocation_id in replaced {
+            info!(
+                allocation_id,
+                "Allocation id reused by a snapshot restore; stopping the previous task first"
+            );
+            if let Err(err) = self.stop_allocation(allocation_id) {
+                warn!(allocation_id, error = ?err, "Failed to stop the allocation a restore replaces");
+            }
+        }
         let existing_ids = self.instances.keys().copied().collect::<Vec<_>>();
         for allocation_id in existing_ids {
             if desired_ids.contains(&allocation_id) || protected.contains(&allocation_id) {
@@ -1278,6 +1757,7 @@ impl WorkerTaskManager {
                     && !self.terminating.contains_key(&local)
                     && !self.draining.contains_key(&local)
                     && !self.cancelled_launches.contains(&local)
+                    && !self.pressure_evicted.contains(&local)
             })
             .cloned()
             .collect();
@@ -1858,6 +2338,10 @@ impl WorkerTaskManager {
         allocation: &Allocation,
         task: &TaskConfig,
     ) -> R<()> {
+        // A restore rolls the instance volume back before anything mounts
+        // it, so the task never sees the state it is being rolled back from.
+        self.restore_allocation_volumes(allocation)?;
+
         // Storage first: a task must never observe a missing or empty data
         // directory because its volume was still being mounted. A failure here
         // fails the allocation, which is the honest outcome — the manager
@@ -1867,14 +2351,19 @@ impl WorkerTaskManager {
         // Resource placement next, and before `prepare()`: a task must never
         // observe its CPU/memory limits arriving after it started. Runtimes
         // that did not opt in get `None` and are untouched.
-        let enforcement = self
+        let (enforcement, memory_override) = self
             .registry
             .plugin(&task.runtime)
-            .map(|plugin| plugin.resource_enforcement())
-            .unwrap_or(ResourceEnforcement::Unsupported);
+            .map(|plugin| {
+                (
+                    plugin.resource_enforcement(),
+                    plugin.enforced_memory_limit_bytes(task),
+                )
+            })
+            .unwrap_or((ResourceEnforcement::Unsupported, None));
         let assignment = self
             .resources
-            .assign(allocation.id, task, enforcement)
+            .assign(allocation.id, task, enforcement, memory_override)
             .with_context(|| {
                 format!(
                     "failed to place task {} within this node's resource limits",
@@ -1893,6 +2382,12 @@ impl WorkerTaskManager {
             .context("Task instance missing")?;
         instance.log_dir = Some(log_dir);
         instance.resource_assignment = assignment;
+        // Launch ready for memory checkpoints when the task asks for them
+        // and the runtime can take them here (a sandbox on a real VMM).
+        instance.checkpoint_launch = crate::structs::snapshot::memory_checkpoint_ask(task)
+            .is_some()
+            && plugin.checkpoint_support(&crate::task_plugins::CheckpointQuery::new(&task.config))
+                == crate::task_plugins::CheckpointSupport::Memory;
 
         let staged = instance.staged_artifacts.clone();
         for artifact in &staged {
@@ -1959,12 +2454,36 @@ impl WorkerTaskManager {
             plugin.set_network_gate(allocation, task, instance, false)?;
         }
 
-        info!(
-            allocation_id = allocation.id,
-            task_name = %task.name,
-            "Starting task allocation"
-        );
-        plugin.start(allocation, task, instance)?;
+        if let Some(restore) = self.checkpoints.restores.get(&allocation.id).cloned() {
+            let started = std::time::Instant::now();
+            let restored = Self::restore_from_snapshot(
+                plugin,
+                self.content_store.as_deref(),
+                allocation,
+                task,
+                instance,
+                &restore,
+            );
+            match restored {
+                Ok(()) => {
+                    self.checkpoints
+                        .record_restore(allocation.id, true, String::new(), started)
+                }
+                Err(err) => {
+                    let reason = format!("{err:#}");
+                    self.checkpoints
+                        .record_restore(allocation.id, false, reason, started);
+                    return Err(err);
+                }
+            }
+        } else {
+            info!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                "Starting task allocation"
+            );
+            plugin.start(allocation, task, instance)?;
+        }
 
         let supervised = plugin.supervises_process();
 
@@ -2241,6 +2760,14 @@ impl WorkerTaskManager {
         // mount the same list.
         self.volume_specs
             .insert(alloc.id, parse_volume_mounts(allocation)?);
+        // Start from a snapshot instead of booting (RestoreInstance). The
+        // payload stays until the manager has the outcome.
+        if let Some(restore) = allocation.restore.clone() {
+            self.checkpoints.restores.insert(alloc.id, restore);
+        }
+        // A published snapshot restored on a node that does not hold its
+        // parts fetches them first, on the staging thread.
+        let restore_fetch = self.restore_parts_to_fetch(alloc.id);
         // A re-dispatch of an id we already run is an in-place update (for
         // example a config change reusing the allocation). The previous
         // instance is normally gone already: `reconcile_allocations` holds a
@@ -2266,8 +2793,11 @@ impl WorkerTaskManager {
         // keep the locked path: their failures settle the claim (see
         // `launch_provisional_allocation`) rather than reaching the manager
         // as a failed allocation, which `record_failure` would do.
+        // A restore keeps the locked path too: it runs inside the locked
+        // start, which records its outcome on the checkpoint channel.
         let provisional = self.claims.by_local_key(alloc.id).is_some();
-        if task.artifacts.is_empty() && gate == Gate::Off && !provisional {
+        let restoring = self.checkpoints.restores.contains_key(&alloc.id);
+        if task.artifacts.is_empty() && gate == Gate::Off && !provisional && !restoring {
             self.registry
                 .load_plugin(&task.runtime, true)
                 .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
@@ -2289,7 +2819,7 @@ impl WorkerTaskManager {
             }
             return Ok(BeginOutcome::Launching(Box::new(launch)));
         }
-        if task.artifacts.is_empty() {
+        if task.artifacts.is_empty() && restore_fetch.is_none() {
             self.run_allocation_gated(&alloc, &task, gate)?;
             // Arm the self-fence watchdog for stateful allocations (0 = no
             // fencing; see the TaskAllocation proto comments). Registered
@@ -2314,6 +2844,7 @@ impl WorkerTaskManager {
             task_name = %task.name,
             task_runtime = %task.runtime,
             artifacts = task.artifacts.len(),
+            restore_fetch = restore_fetch.is_some(),
             "Received task allocation with artifacts"
         );
         self.registry
@@ -2324,7 +2855,7 @@ impl WorkerTaskManager {
             .registry
             .plugin(&task.runtime)
             .context("Task plugin not loaded")?;
-        if !plugin.supports_artifacts() {
+        if !task.artifacts.is_empty() && !plugin.supports_artifacts() {
             bail!(
                 "task runtime {} does not support artifacts on this worker",
                 task.runtime
@@ -2344,7 +2875,15 @@ impl WorkerTaskManager {
         self.allocations.insert(alloc.id, alloc.clone());
         self.task_configs.insert(alloc.id, task.clone());
         self.artifact_status.init(alloc.id, &task.artifacts);
-        self.set_allocation_health(alloc.id, false, "staging artifacts");
+        self.set_allocation_health(
+            alloc.id,
+            false,
+            if task.artifacts.is_empty() {
+                "fetching snapshot"
+            } else {
+                "staging artifacts"
+            },
+        );
         // Arm the self-fence watchdog as soon as the allocation is
         // registered: staging can take minutes and the at-most-one fencing
         // guarantee must hold from the moment the manager could plan a
@@ -2364,7 +2903,43 @@ impl WorkerTaskManager {
             gate,
             stager: self.stager.clone(),
             board: self.artifact_status.clone(),
+            restore_fetch,
         })))
+    }
+
+    /// The manifest of the snapshot `allocation_id` restores from, when it
+    /// has memory parts this node's content store lacks. `None` for every
+    /// allocation that is not restoring, and for a restore whose parts are
+    /// all here (a resume on the node that took the checkpoint). An
+    /// unreadable manifest is left for the restore itself to report.
+    fn restore_parts_to_fetch(
+        &self,
+        allocation_id: i64,
+    ) -> Option<crate::structs::checkpoint::SnapshotManifest> {
+        let restore = self.checkpoints.restores.get(&allocation_id)?;
+        let manifest =
+            crate::structs::checkpoint::SnapshotManifest::from_json(&restore.manifest_json).ok()?;
+        let store = self.content_store.as_deref();
+        let missing = manifest.memory.iter().any(|part| {
+            let Ok(digest) = crate::content_store::ContentDigest::parse(&part.digest) else {
+                return false;
+            };
+            !store.is_some_and(|store| store.contains(&digest).unwrap_or(false))
+        });
+        missing.then_some(manifest)
+    }
+
+    /// Drop the pins a cross-node restore held on its fetched parts while
+    /// the allocation started. The parts stay in the store as ordinary
+    /// cache entries (and in the location index), until LRU evicts them.
+    pub(crate) fn release_restore_fetch_pins(&self, allocation_id: i64) {
+        if let Some(store) = self.content_store.as_deref() {
+            if let Err(err) =
+                store.release_owner(&crate::content_store::PinOwner::allocation(allocation_id))
+            {
+                warn!(allocation_id, error = ?err, "Failed releasing restore fetch pins");
+            }
+        }
     }
 
     /// Completes an allocation whose artifacts finished staging: interpolates
@@ -2477,12 +3052,14 @@ impl WorkerTaskManager {
         // masks are this struct's, and it is quick (a cgroup mkdir and a few
         // small writes). A task must never observe its limits arriving after
         // it started, so it happens before `prepare`.
+        let runtime = plugin.task_plugin();
         instance.resource_assignment = self
             .resources
             .assign(
                 allocation.id,
                 task,
-                plugin.task_plugin().resource_enforcement(),
+                runtime.resource_enforcement(),
+                runtime.enforced_memory_limit_bytes(task),
             )
             .with_context(|| {
                 format!(
@@ -2491,6 +3068,13 @@ impl WorkerTaskManager {
                 )
             })?;
         instance.log_dir = Some(self.state_store.allocation_log_dir(allocation.id));
+        // Launch ready for memory checkpoints when the task asks for them
+        // and the runtime can take them here (see
+        // `prepare_registered_allocation`).
+        instance.checkpoint_launch = crate::structs::snapshot::memory_checkpoint_ask(task)
+            .is_some()
+            && runtime.checkpoint_support(&crate::task_plugins::CheckpointQuery::new(&task.config))
+                == crate::task_plugins::CheckpointSupport::Memory;
 
         self.next_launch_generation += 1;
         let generation = self.next_launch_generation;
@@ -2576,6 +3160,114 @@ impl WorkerTaskManager {
     ) {
         self.cancelled_launches.remove(&allocation_id);
         self.finish_teardown(allocation_id, true, assignment);
+    }
+
+    /// Roll the allocation's instance volumes back to the snapshot it
+    /// restores from, with the driver's `restore` op, before they mount.
+    /// A no-op for every allocation that is not restoring.
+    fn restore_allocation_volumes(&mut self, allocation: &Allocation) -> R<()> {
+        let Some(restore) = self.checkpoints.restores.get(&allocation.id).cloned() else {
+            return Ok(());
+        };
+        let manifest =
+            crate::structs::checkpoint::SnapshotManifest::from_json(&restore.manifest_json)
+                .with_context(|| {
+                    format!(
+                        "snapshot {} has an unreadable manifest",
+                        restore.snapshot_id
+                    )
+                })?;
+        let specs = self
+            .volume_specs
+            .get(&allocation.id)
+            .cloned()
+            .unwrap_or_default();
+        if restore.fork {
+            return self.clone_allocation_volumes(allocation, &restore, &manifest, &specs);
+        }
+        for snapshot in &manifest.volumes {
+            let mount = specs
+                .iter()
+                .find(|mount| mount.volume_id == snapshot.volume_id)
+                .with_context(|| {
+                    format!(
+                        "snapshot {} holds volume {}, which this allocation does not mount; the \
+                         instance's storage changed since the snapshot was taken",
+                        restore.snapshot_id, snapshot.volume_id
+                    )
+                })?;
+            self.volumes.restore_volume(allocation, mount, snapshot)?;
+        }
+        Ok(())
+    }
+
+    /// Phase 6: give an allocation restoring into a NEW instance (a fork, or
+    /// a create from a snapshot) its own copy of each snapshotted instance
+    /// volume, with the driver's `clone` op. The snapshot holds the origin's
+    /// volumes in mount order, which is also this allocation's order: the
+    /// two run the same task.
+    fn clone_allocation_volumes(
+        &self,
+        allocation: &Allocation,
+        restore: &crate::structs::SnapshotRestore,
+        manifest: &crate::structs::checkpoint::SnapshotManifest,
+        specs: &[crate::structs::VolumeMount],
+    ) -> R<()> {
+        let instance_volumes: Vec<&crate::structs::VolumeMount> =
+            specs.iter().filter(|mount| mount.instance_volume).collect();
+        if instance_volumes.len() != manifest.volumes.len() {
+            bail!(
+                "snapshot {} holds {} instance volume(s), but this allocation mounts {}; the \
+                 task's storage changed since the snapshot was taken",
+                restore.snapshot_id,
+                manifest.volumes.len(),
+                instance_volumes.len()
+            );
+        }
+        for (mount, snapshot) in instance_volumes.into_iter().zip(&manifest.volumes) {
+            self.volumes.clone_volume(allocation, mount, snapshot)?;
+        }
+        Ok(())
+    }
+
+    /// Start a prepared instance from a snapshot instead of booting it.
+    fn restore_from_snapshot(
+        plugin: &dyn crate::task_plugins::TaskPlugin,
+        content: Option<&crate::content_store::ContentStore>,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        restore: &crate::structs::SnapshotRestore,
+    ) -> R<()> {
+        let manifest =
+            crate::structs::checkpoint::SnapshotManifest::from_json(&restore.manifest_json)
+                .with_context(|| {
+                    format!(
+                        "snapshot {} has an unreadable manifest",
+                        restore.snapshot_id
+                    )
+                })?;
+        let alloc_dir = instance
+            .alloc_dir
+            .clone()
+            .context("allocation directory missing")?;
+        let source = crate::worker::checkpoints::materialize_parts(
+            content,
+            &manifest,
+            alloc_dir.join(".restore"),
+        )?;
+        let identity = crate::worker::checkpoints::resume_identity(allocation, task, restore);
+        info!(
+            allocation_id = allocation.id,
+            task_name = %task.name,
+            snapshot_id = %restore.snapshot_id,
+            kind = manifest.kind.as_str(),
+            "Restoring task allocation from snapshot"
+        );
+        let result = plugin.restore(allocation, task, instance, &manifest, &source, &identity);
+        // The runtime holds what it needs (hardlinks, open files) by now.
+        let _ = std::fs::remove_dir_all(source.path());
+        result
     }
 
     /// Mount the allocation's volumes and expose them to the task.
@@ -3333,21 +4025,19 @@ fn spawn_provisional_staging_thread(
         .name(format!("provisional-staging-{allocation_id}"))
         .spawn(move || {
             let manager = manager_for_thread;
-            let result = job.stager.stage_task_artifacts(
-                allocation_id,
-                &job.task_dir,
-                &job.task.artifacts,
-                &job.board,
-            );
+            let result = job.stage();
 
             let started = {
                 let mut guard = manager.lock().expect("task manager");
                 if !guard.is_allocation_active(allocation_id) {
                     debug!(allocation_id, "Claim removed while staging artifacts");
+                    if job.restore_fetch.is_some() {
+                        guard.release_restore_fetch_pins(allocation_id);
+                    }
                     return;
                 }
                 let claim_id = claim_for_thread.as_str();
-                match result.and_then(|staged| {
+                let started = match result.and_then(|staged| {
                     guard.start_staged_allocation(&job.allocation, &job.task, staged, gate)
                 }) {
                     Ok(()) => {
@@ -3358,7 +4048,11 @@ fn spawn_provisional_staging_thread(
                         guard.kill_claim(claim_id, &format!("provisional staging failed: {err:#}"));
                         false
                     }
+                };
+                if job.restore_fetch.is_some() {
+                    guard.release_restore_fetch_pins(allocation_id);
                 }
+                started
             };
             if started && gate != Gate::Stage {
                 spawn_health_monitor(manager, job.allocation, job.task);
@@ -3380,17 +4074,15 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
         .name(format!("artifact-staging-{allocation_id}"))
         .spawn(move || {
             let manager = manager_for_thread;
-            let result = job.stager.stage_task_artifacts(
-                allocation_id,
-                &job.task_dir,
-                &job.task.artifacts,
-                &job.board,
-            );
+            let result = job.stage();
 
             const START_FAILED: &str = "start after artifact staging failed: ";
             let launch = {
                 let mut guard = manager.lock().expect("task manager");
                 if !guard.is_allocation_active(allocation_id) {
+                    if job.restore_fetch.is_some() {
+                        guard.release_restore_fetch_pins(allocation_id);
+                    }
                     // Stopped while staging; stop_allocation already cleaned
                     // the directories and status rows.
                     debug!(allocation_id, "Allocation removed while staging artifacts");
@@ -3399,24 +4091,51 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                 let staged = match result {
                     Ok(staged) => staged,
                     Err(err) => {
+                        // A restore that could not fetch its parts reports
+                        // the failure on the checkpoint channel too, so the
+                        // resume follows `onRestoreFailure`.
+                        if job.restore_fetch.is_some()
+                            && guard.checkpoints.has_pending_restore(allocation_id)
+                        {
+                            guard.checkpoints.record_restore(
+                                allocation_id,
+                                false,
+                                format!("{err:#}"),
+                                std::time::Instant::now(),
+                            );
+                        }
                         guard.record_failure(
                             allocation_id,
                             format!("artifact staging failed: {err:#}"),
                         );
+                        if job.restore_fetch.is_some() {
+                            guard.release_restore_fetch_pins(allocation_id);
+                        }
                         return;
                     }
                 };
                 // Only the ordinary gate reaches this thread (provisional
                 // starts stage on their own), but a gated job keeps the
-                // locked path rather than silently skipping its gate.
-                if job.gate != Gate::Off {
-                    if let Err(err) =
-                        guard.start_staged_allocation(&job.allocation, &job.task, staged, job.gate)
-                    {
+                // locked path rather than silently skipping its gate. So
+                // does a restore: it runs inside the locked start, which
+                // records its outcome on the checkpoint channel.
+                let restoring = guard.checkpoints.restores.contains_key(&allocation_id);
+                if job.gate != Gate::Off || restoring {
+                    let started =
+                        guard.start_staged_allocation(&job.allocation, &job.task, staged, job.gate);
+                    // The restore (if any) ran inside the start above, so
+                    // the fetched parts no longer need their pins.
+                    if job.restore_fetch.is_some() {
+                        guard.release_restore_fetch_pins(allocation_id);
+                    }
+                    if let Err(err) = started {
                         guard.record_failure(allocation_id, format!("{START_FAILED}{err:#}"));
                         return;
                     }
                     drop(guard);
+                    // A staged-but-not-started allocation has nothing to
+                    // health check yet; the monitor starts when ratification
+                    // does.
                     if job.gate != Gate::Stage {
                         spawn_health_monitor(manager, job.allocation, job.task);
                     }
@@ -3620,7 +4339,813 @@ mod tests {
             task_resources: json!({ "memory": 256 }).to_string(),
             task_stop: String::new(),
             provisional: None,
+            priority_band: String::new(),
+            restore: None,
         }
+    }
+
+    /// An `exec` allocation with a `local-dir` instance volume, as the
+    /// manager dispatches it.
+    fn volume_payload(allocation_id: i64) -> TaskAllocation {
+        TaskAllocation {
+            allocation_id,
+            task_runtime: "exec".into(),
+            task_config: json!({ "command": ["sleep", "30"] }).to_string(),
+            task_volumes: json!([{
+                "volumeId": "vol-snap-test",
+                "name": "data",
+                "driver": "local-dir",
+                "mode": "filesystem",
+                "instanceVolume": true,
+            }])
+            .to_string(),
+            ..provisional_payload(allocation_id)
+        }
+    }
+
+    fn stop_and_reap(manager: &Arc<Mutex<WorkerTaskManager>>) {
+        let _ = manager.lock().unwrap().reconcile_allocations(&[]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while manager.lock().unwrap().has_terminating() {
+            manager.lock().unwrap().reap_terminating();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "allocation never stopped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The Phase 3 round trip on `exec`, no KVM: write a marker, take a disk
+    /// snapshot through the checkpoint channel, mutate the marker, start a
+    /// replacement allocation from the snapshot, and the marker is back.
+    #[test]
+    fn an_exec_disk_snapshot_round_trips_through_capture_and_restore() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        launch_task_allocation(&manager, &volume_payload(41))?;
+        let volume_dir = manager
+            .lock()
+            .unwrap()
+            .volumes_handle()
+            .mounts_for(41)
+            .and_then(|mounts| mounts.first().map(|mount| mount.host_path.clone()))
+            .expect("instance volume mounted");
+        std::fs::write(volume_dir.join("marker"), b"before")?;
+
+        let capture = crate::structs::CheckpointRequest {
+            snapshot_id: "snap-roundtrip".into(),
+            op: "capture".into(),
+            allocation_id: 41,
+            kind: "disk".into(),
+            then: "resume".into(),
+            purpose: "manual".into(),
+            manifest_json: String::new(),
+        };
+        let fresh = manager
+            .lock()
+            .unwrap()
+            .checkpoints_mut()
+            .accept(std::slice::from_ref(&capture));
+        assert_eq!(fresh.len(), 1);
+        crate::worker::checkpoints::run_request(&manager, &capture);
+        let reports = manager.lock().unwrap().drain_snapshot_reports();
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert!(report.ok, "capture failed: {}", report.error);
+        let manifest =
+            crate::structs::checkpoint::SnapshotManifest::from_json(&report.manifest_json)?;
+        assert_eq!(
+            manifest.kind,
+            crate::structs::checkpoint::SnapshotKind::Disk
+        );
+        assert_eq!(manifest.volumes.len(), 1);
+        assert_eq!(manifest.volumes[0].volume_id, "vol-snap-test");
+        assert!(
+            manifest.compat.is_empty(),
+            "a disk snapshot is not CPU-bound"
+        );
+        // The task kept running through the capture.
+        assert!(manager.lock().unwrap().is_allocation_active(41));
+
+        std::fs::write(volume_dir.join("marker"), b"after")?;
+        std::fs::write(volume_dir.join("new-file"), b"x")?;
+        stop_and_reap(&manager);
+
+        let restore = TaskAllocation {
+            restore: Some(crate::structs::SnapshotRestore {
+                snapshot_id: "snap-roundtrip".into(),
+                kind: "disk".into(),
+                manifest_json: report.manifest_json.clone(),
+                on_resume: Vec::new(),
+                ..Default::default()
+            }),
+            ..volume_payload(42)
+        };
+        manager.lock().unwrap().begin_task_allocation(&restore)?;
+        assert_eq!(std::fs::read(volume_dir.join("marker"))?, b"before");
+        assert!(!volume_dir.join("new-file").exists());
+        assert!(manager.lock().unwrap().is_allocation_active(42));
+
+        let reports = manager.lock().unwrap().drain_snapshot_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].op, "restore");
+        assert_eq!(reports[0].allocation_id, 42);
+        assert!(reports[0].ok, "{}", reports[0].error);
+
+        // Delete reclaims the volume snapshot.
+        let delete = crate::structs::CheckpointRequest {
+            op: "delete".into(),
+            allocation_id: 0,
+            manifest_json: report.manifest_json.clone(),
+            ..capture
+        };
+        manager
+            .lock()
+            .unwrap()
+            .checkpoints_mut()
+            .accept(std::slice::from_ref(&delete));
+        crate::worker::checkpoints::run_request(&manager, &delete);
+        let reports = manager.lock().unwrap().drain_snapshot_reports();
+        assert!(
+            reports.iter().any(|r| r.op == "delete" && r.ok),
+            "{reports:?}"
+        );
+        stop_and_reap(&manager);
+        Ok(())
+    }
+
+    /// An `exec` allocation whose instance volume is `volume_id`.
+    fn volume_payload_for(allocation_id: i64, volume_id: &str) -> TaskAllocation {
+        TaskAllocation {
+            task_volumes: json!([{
+                "volumeId": volume_id,
+                "name": "data",
+                "driver": "local-dir",
+                "mode": "filesystem",
+                "instanceVolume": true,
+            }])
+            .to_string(),
+            ..volume_payload(allocation_id)
+        }
+    }
+
+    /// Phase 6 on `exec`, for real on any OS: a disk fork captures the
+    /// origin's volume while it keeps running, and every fork restores into
+    /// its OWN volume with the driver's `clone` op. A marker written before
+    /// the fork is in every fork; a write in one fork is in no other fork and
+    /// not in the origin.
+    #[test]
+    fn an_exec_disk_fork_gives_every_fork_its_own_copy_of_the_volume() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let mount_of = |allocation_id: i64| {
+            manager
+                .lock()
+                .unwrap()
+                .volumes_handle()
+                .mounts_for(allocation_id)
+                .and_then(|mounts| mounts.first().map(|mount| mount.host_path.clone()))
+                .expect("instance volume mounted")
+        };
+        launch_task_allocation(&manager, &volume_payload_for(71, "vol-origin"))?;
+        let origin_dir = mount_of(71);
+        std::fs::write(origin_dir.join("marker"), b"before-fork")?;
+
+        let capture = crate::structs::CheckpointRequest {
+            snapshot_id: "snap-fork".into(),
+            op: "capture".into(),
+            allocation_id: 71,
+            kind: "disk".into(),
+            then: "resume".into(),
+            purpose: "fork".into(),
+            manifest_json: String::new(),
+        };
+        manager
+            .lock()
+            .unwrap()
+            .checkpoints_mut()
+            .accept(std::slice::from_ref(&capture));
+        crate::worker::checkpoints::run_request(&manager, &capture);
+        let reports = manager.lock().unwrap().drain_snapshot_reports();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].ok, "capture failed: {}", reports[0].error);
+        assert_eq!(reports[0].pause_ms, 0, "a disk capture never pauses");
+        let manifest_json = reports[0].manifest_json.clone();
+        assert!(
+            manager.lock().unwrap().is_allocation_active(71),
+            "the origin keeps running"
+        );
+
+        let forks = [
+            (72, "vol-f1", "run-17-f1"),
+            (73, "vol-f2", "run-17-f2"),
+            (74, "vol-f3", "run-17-f3"),
+        ];
+        let mut dirs = Vec::new();
+        for (allocation_id, volume_id, instance_id) in forks {
+            let payload = TaskAllocation {
+                restore: Some(crate::structs::SnapshotRestore {
+                    snapshot_id: "snap-fork".into(),
+                    kind: "disk".into(),
+                    manifest_json: manifest_json.clone(),
+                    fork: true,
+                    instance_id: instance_id.into(),
+                    ..Default::default()
+                }),
+                ..volume_payload_for(allocation_id, volume_id)
+            };
+            manager.lock().unwrap().begin_task_allocation(&payload)?;
+            assert!(manager.lock().unwrap().is_allocation_active(allocation_id));
+            let dir = mount_of(allocation_id);
+            assert_ne!(dir, origin_dir, "a fork never shares the origin's volume");
+            assert_eq!(
+                std::fs::read(dir.join("marker"))?,
+                b"before-fork",
+                "the marker written before the fork is in fork {instance_id}"
+            );
+            dirs.push(dir);
+        }
+        let restores = manager.lock().unwrap().drain_snapshot_reports();
+        assert_eq!(restores.len(), 3);
+        assert!(restores
+            .iter()
+            .all(|report| report.op == "restore" && report.ok));
+
+        // Divergence: a write in one fork is seen nowhere else.
+        std::fs::write(dirs[0].join("marker"), b"fork-1 was here")?;
+        std::fs::write(dirs[0].join("only-in-f1"), b"x")?;
+        for other in [&dirs[1], &dirs[2], &origin_dir] {
+            assert_eq!(std::fs::read(other.join("marker"))?, b"before-fork");
+            assert!(!other.join("only-in-f1").exists());
+        }
+        // And the origin's later writes reach no fork.
+        std::fs::write(origin_dir.join("origin-later"), b"y")?;
+        assert!(dirs.iter().all(|dir| !dir.join("origin-later").exists()));
+        stop_and_reap(&manager);
+        Ok(())
+    }
+
+    /// Phase 4's acceptance check on `exec`, for real on any OS: a disk
+    /// suspend stops the task without copying its volume, and the resume
+    /// (a NEW allocation carrying the suspend manifest) cold-boots on the
+    /// retained volume, which still holds everything the task wrote.
+    #[test]
+    fn an_exec_disk_suspend_cold_boots_on_its_retained_volume() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        launch_task_allocation(&manager, &volume_payload(51))?;
+        let volume_dir = manager
+            .lock()
+            .unwrap()
+            .volumes_handle()
+            .mounts_for(51)
+            .and_then(|mounts| mounts.first().map(|mount| mount.host_path.clone()))
+            .expect("instance volume mounted");
+        std::fs::write(volume_dir.join("marker"), b"written before suspend")?;
+
+        let suspend = crate::structs::CheckpointRequest {
+            snapshot_id: "snap-suspend".into(),
+            op: "capture".into(),
+            allocation_id: 51,
+            kind: "disk".into(),
+            then: "stop".into(),
+            purpose: "suspend".into(),
+            manifest_json: String::new(),
+        };
+        manager
+            .lock()
+            .unwrap()
+            .checkpoints_mut()
+            .accept(std::slice::from_ref(&suspend));
+        crate::worker::checkpoints::run_request(&manager, &suspend);
+        let reports = manager.lock().unwrap().drain_snapshot_reports();
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert!(report.ok, "suspend failed: {}", report.error);
+        let manifest =
+            crate::structs::checkpoint::SnapshotManifest::from_json(&report.manifest_json)?;
+        assert_eq!(
+            manifest.kind,
+            crate::structs::checkpoint::SnapshotKind::Disk
+        );
+        assert!(
+            manifest.volumes.is_empty(),
+            "a suspend keeps the volume in place instead of copying it"
+        );
+        assert!(manifest.memory.is_empty());
+        // The task is stopping (or stopped) with cause `suspended`; nothing
+        // is left running.
+        assert!(!manager.lock().unwrap().is_allocation_active(51));
+        stop_and_reap(&manager);
+        assert!(
+            volume_dir.join("marker").exists(),
+            "the volume is retained across the suspend"
+        );
+
+        // Resume: a new allocation id, the suspend manifest, a cold boot.
+        let resume = TaskAllocation {
+            restore: Some(crate::structs::SnapshotRestore {
+                snapshot_id: "snap-suspend".into(),
+                kind: "disk".into(),
+                manifest_json: report.manifest_json.clone(),
+                on_resume: Vec::new(),
+                ..Default::default()
+            }),
+            ..volume_payload(52)
+        };
+        manager.lock().unwrap().begin_task_allocation(&resume)?;
+        assert!(manager.lock().unwrap().is_allocation_active(52));
+        assert_eq!(
+            std::fs::read(volume_dir.join("marker"))?,
+            b"written before suspend"
+        );
+        let reports = manager.lock().unwrap().drain_snapshot_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].op, "restore");
+        assert_eq!(reports[0].allocation_id, 52);
+        assert!(reports[0].ok, "{}", reports[0].error);
+        stop_and_reap(&manager);
+        Ok(())
+    }
+
+    /// The `suspend` pressure step on a real `exec` task: the worker
+    /// captures and stops it with no request from the manager, reports a
+    /// local suspension under the id it minted, keeps the allocation out of
+    /// relaunch while the manager still lists it, and re-sends the report
+    /// until the manager drops the allocation.
+    #[test]
+    fn a_pressure_suspend_reports_a_local_suspension_and_holds_the_allocation() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let payload = volume_payload(61);
+        launch_task_allocation(&manager, &payload)?;
+        assert_eq!(
+            manager.lock().unwrap().local_suspend_kind(61)?,
+            crate::structs::checkpoint::SnapshotKind::Disk,
+            "an exec task suspends to disk"
+        );
+
+        let snapshot_id = crate::worker::checkpoints::run_local_suspension(&manager, 61)?;
+        assert!(snapshot_id.starts_with("snap-"), "{snapshot_id}");
+        let reports = manager.lock().unwrap().drain_snapshot_reports();
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert!(report.ok && report.local_suspension, "{report:?}");
+        assert_eq!(report.snapshot_id, snapshot_id);
+        assert_eq!(report.allocation_id, 61);
+        assert!(!manager.lock().unwrap().is_allocation_active(61));
+
+        // The manager has not applied it yet and still lists the allocation:
+        // it is not relaunched, and the report goes out again.
+        let pending = manager
+            .lock()
+            .unwrap()
+            .reconcile_allocations(std::slice::from_ref(&payload));
+        assert!(pending.is_empty(), "held out of relaunch: {pending:?}");
+        manager
+            .lock()
+            .unwrap()
+            .checkpoints_mut()
+            .reconcile_local_suspensions(std::slice::from_ref(&payload));
+        assert_eq!(manager.lock().unwrap().drain_snapshot_reports().len(), 1);
+
+        // Applied: the manager drops it, and the worker forgets it.
+        stop_and_reap(&manager);
+        manager
+            .lock()
+            .unwrap()
+            .checkpoints_mut()
+            .reconcile_local_suspensions(&[]);
+        assert!(manager.lock().unwrap().drain_snapshot_reports().is_empty());
+        Ok(())
+    }
+
+    /// A pressure suspend that cannot capture releases its hold and leaves
+    /// the task running.
+    #[test]
+    fn a_failed_pressure_suspend_keeps_the_task_running() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        launch_task_allocation(&manager, &volume_payload(62))?;
+        // An exec task cannot take the memory checkpoint this suspend block
+        // asks for (refused at submit; forced here to make the capture fail).
+        manager
+            .lock()
+            .unwrap()
+            .task_configs
+            .get_mut(&62)
+            .expect("task config")
+            .suspend = Some(crate::structs::suspend::SuspendConfig {
+            checkpoint: Some("memory".into()),
+            ..Default::default()
+        });
+        let err = crate::worker::checkpoints::run_local_suspension(&manager, 62).unwrap_err();
+        assert!(format!("{err:#}").contains("memory"), "{err:#}");
+        assert!(manager.lock().unwrap().is_allocation_active(62));
+        assert!(!manager.lock().unwrap().pressure_evicted.contains(&62));
+        assert!(manager.lock().unwrap().drain_snapshot_reports().is_empty());
+        stop_and_reap(&manager);
+        Ok(())
+    }
+
+    /// A suspend that cannot capture leaves the task running: an `exec`
+    /// task asked for a memory checkpoint reports the reason and keeps going.
+    #[test]
+    fn a_suspend_that_cannot_capture_leaves_the_task_running() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        launch_task_allocation(&manager, &volume_payload(53))?;
+        let suspend = crate::structs::CheckpointRequest {
+            snapshot_id: "snap-suspend-mem".into(),
+            op: "capture".into(),
+            allocation_id: 53,
+            kind: "memory".into(),
+            then: "stop".into(),
+            purpose: "suspend".into(),
+            manifest_json: String::new(),
+        };
+        let report = crate::worker::checkpoints::run_capture(&manager, &suspend);
+        assert!(!report.ok);
+        assert!(
+            report.error.contains("cannot take memory checkpoints"),
+            "{}",
+            report.error
+        );
+        assert!(manager.lock().unwrap().is_allocation_active(53));
+        stop_and_reap(&manager);
+        Ok(())
+    }
+
+    /// RestoreInstance can hand the replacement the id the old allocation
+    /// had. The worker must stop the old task and restore, not keep running
+    /// it as if nothing changed.
+    #[test]
+    fn a_restore_that_reuses_a_running_allocation_id_replaces_the_task() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        launch_task_allocation(&manager, &volume_payload(45))?;
+        let reused = TaskAllocation {
+            restore: Some(crate::structs::SnapshotRestore {
+                snapshot_id: "snap-reused".into(),
+                kind: "disk".into(),
+                manifest_json: "{}".into(),
+                on_resume: Vec::new(),
+                ..Default::default()
+            }),
+            ..volume_payload(45)
+        };
+        let pending = manager
+            .lock()
+            .unwrap()
+            .reconcile_allocations(std::slice::from_ref(&reused));
+        assert!(pending.is_empty(), "held until the old task is gone");
+        assert!(!manager.lock().unwrap().is_allocation_active(45));
+        stop_and_reap(&manager);
+        let pending = manager
+            .lock()
+            .unwrap()
+            .reconcile_allocations(std::slice::from_ref(&reused));
+        assert_eq!(pending.len(), 1, "then started again, from the snapshot");
+        Ok(())
+    }
+
+    #[test]
+    fn a_memory_snapshot_of_an_exec_task_fails_with_the_reason() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        launch_task_allocation(&manager, &volume_payload(43))?;
+        let capture = crate::structs::CheckpointRequest {
+            snapshot_id: "snap-mem".into(),
+            op: "capture".into(),
+            allocation_id: 43,
+            kind: "memory".into(),
+            then: "resume".into(),
+            purpose: "manual".into(),
+            manifest_json: String::new(),
+        };
+        let report = crate::worker::checkpoints::run_capture(&manager, &capture);
+        assert!(!report.ok);
+        assert!(
+            report.error.contains("cannot take memory checkpoints"),
+            "{}",
+            report.error
+        );
+        // A failed capture leaves the task running.
+        assert!(manager.lock().unwrap().is_allocation_active(43));
+        stop_and_reap(&manager);
+        Ok(())
+    }
+
+    /// A restore that fails reports the failure on the checkpoint channel
+    /// and fails the allocation with the same reason, never a silent cold
+    /// start.
+    #[test]
+    fn a_failed_restore_is_reported_and_fails_the_allocation() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let manifest = json!({
+            "id": "snap-gone",
+            "jobId": "agent-sandboxes",
+            "task": "workspace",
+            "originAllocId": 1,
+            "runtime": "exec",
+            "kind": "disk",
+            "createdAt": "2026-10-10T00:00:00Z",
+            "volumes": [{
+                "id": "snap-gone",
+                "volumeId": "vol-snap-test",
+                "driver": "local-dir",
+                "mode": "filesystem",
+            }],
+        });
+        let restore = TaskAllocation {
+            restore: Some(crate::structs::SnapshotRestore {
+                snapshot_id: "snap-gone".into(),
+                kind: "disk".into(),
+                manifest_json: manifest.to_string(),
+                on_resume: Vec::new(),
+                ..Default::default()
+            }),
+            ..volume_payload(44)
+        };
+        let err = launch_task_allocation(&manager, &restore).unwrap_err();
+        assert!(format!("{err:#}").contains("snap-gone"), "{err:#}");
+        let mut guard = manager.lock().unwrap();
+        let reports = guard.drain_snapshot_reports();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(!reports[0].ok);
+        assert!(
+            reports[0].error.contains("snap-gone"),
+            "{}",
+            reports[0].error
+        );
+        let failures = guard.drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert!(!guard.is_allocation_active(44));
+        Ok(())
+    }
+
+    /// A worker with its own node content store (and, given `shared`, a
+    /// `file://` contentStore to publish to), as the daemon wires it.
+    fn worker_with_store(
+        temp_dir: &TempDir,
+        shared: Option<&std::path::Path>,
+    ) -> R<Arc<Mutex<WorkerTaskManager>>> {
+        let mut manager = manager_in(temp_dir);
+        let store = Arc::new(crate::content_store::ContentStore::open(
+            temp_dir.path().join("content"),
+            crate::content_store::ContentStoreConfig {
+                min_free_disk: 0,
+                ..Default::default()
+            },
+        )?);
+        manager.configure_content_store(Some(store.clone()));
+        manager.configure_content_publishing(shared.map(|shared| {
+            Arc::new(crate::content_publish::ContentPublishing::new(
+                store.clone(),
+                Arc::new(crate::content_publish::FileContentPublisher::new(shared)),
+            ))
+        }));
+        manager.configure_artifacts(
+            crate::structs::WorkerArtifactFetchConfigFull::default(),
+            Box::new(crate::artifacts::AnonymousCredentials),
+        );
+        Ok(Arc::new(Mutex::new(manager)))
+    }
+
+    /// Wait for the next snapshot report a worker queues.
+    fn next_report(
+        manager: &Arc<Mutex<WorkerTaskManager>>,
+        what: &str,
+    ) -> crate::structs::SnapshotReport {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(report) = manager.lock().unwrap().drain_snapshot_reports().pop() {
+                return report;
+            }
+            assert!(std::time::Instant::now() < deadline, "no {what} report");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Phase 7b's cross-node transport, for real on any OS: node A publishes
+    /// a snapshot's part to a `file://` content store, and node B, which
+    /// never held it, fetches it through its artifact stager (verified by
+    /// digest) into its own content store, then restores.
+    ///
+    /// The part rides a disk-kind manifest so the `exec` runtime can take
+    /// the restore. The runtime half of a memory restore needs KVM and is in
+    /// the Linux verification plan (Phase 7b).
+    #[test]
+    fn a_published_snapshot_restores_on_a_node_that_never_held_it() -> R<()> {
+        let shared = TempDir::new()?;
+        let node_a_dir = TempDir::new()?;
+        let node_b_dir = TempDir::new()?;
+        let node_a = worker_with_store(&node_a_dir, Some(shared.path()))?;
+        let node_b = worker_with_store(&node_b_dir, None)?;
+
+        // What a capture leaves on A: the part in A's store, pinned to the
+        // snapshot.
+        let bytes = b"guest memory page ".repeat(64 * 1024);
+        let entry = node_a
+            .lock()
+            .unwrap()
+            .content_store()
+            .expect("store")
+            .put_bytes(
+                crate::content_store::ContentClass::Snapshots,
+                &bytes,
+                crate::content_store::PutOptions::default()
+                    .pin(crate::content_store::PinOwner::snapshot("snap-moving")),
+            )?;
+        let captured = json!({
+            "apiVersion": 1,
+            "id": "snap-moving",
+            "jobId": "agent-sandboxes",
+            "task": "workspace",
+            "originAllocId": 70,
+            "runtime": "exec",
+            "kind": "disk",
+            "createdAt": "2026-10-10T00:00:00Z",
+            "memory": [{
+                "role": "scratch", "file": "scratch.bin",
+                "digest": entry.digest.as_str(), "size": bytes.len(),
+            }],
+        });
+
+        // A publishes.
+        let publish = crate::structs::CheckpointRequest {
+            snapshot_id: "snap-moving".into(),
+            op: "publish".into(),
+            kind: "disk".into(),
+            purpose: "suspend".into(),
+            manifest_json: captured.to_string(),
+            ..Default::default()
+        };
+        node_a
+            .lock()
+            .unwrap()
+            .checkpoints_mut()
+            .accept(std::slice::from_ref(&publish));
+        crate::worker::checkpoints::run_request(&node_a, &publish);
+        let report = next_report(&node_a, "publish");
+        assert!(report.ok, "{}", report.error);
+        assert_eq!(report.total_bytes, bytes.len() as u64);
+        let published =
+            crate::structs::checkpoint::SnapshotManifest::from_json(&report.manifest_json)?;
+        let url = published.memory[0].url.clone().expect("part url");
+        assert!(url.starts_with("file://"), "{url}");
+        assert!(shared
+            .path()
+            .join("sha256")
+            .join(entry.digest.hex())
+            .exists());
+
+        // B restores from the published manifest.
+        let restore = TaskAllocation {
+            restore: Some(crate::structs::SnapshotRestore {
+                snapshot_id: "snap-moving".into(),
+                kind: "disk".into(),
+                manifest_json: report.manifest_json.clone(),
+                on_resume: Vec::new(),
+                ..Default::default()
+            }),
+            ..provisional_payload(71)
+        };
+        launch_task_allocation(&node_b, &restore)?;
+        let restored = next_report(&node_b, "restore");
+        assert_eq!(restored.op, "restore");
+        assert!(restored.ok, "{}", restored.error);
+        assert!(node_b.lock().unwrap().is_allocation_active(71));
+        let store_b = node_b.lock().unwrap().content_store().expect("store");
+        let fetched = store_b.verify(&entry.digest)?;
+        assert_eq!(fetched.size, bytes.len() as u64);
+        assert!(
+            store_b.pins(&entry.digest)?.is_empty(),
+            "the fetch pins are released once the allocation started"
+        );
+        stop_and_reap(&node_b);
+        Ok(())
+    }
+
+    /// A restore of a part this node lacks and that was never published
+    /// fails with a named reason, on the checkpoint channel and as the
+    /// allocation failure.
+    #[test]
+    fn an_unpublished_part_on_another_node_fails_the_restore_by_name() -> R<()> {
+        let node_dir = TempDir::new()?;
+        let node = worker_with_store(&node_dir, None)?;
+        let manifest = json!({
+            "apiVersion": 1,
+            "id": "snap-elsewhere",
+            "jobId": "agent-sandboxes",
+            "task": "workspace",
+            "originAllocId": 72,
+            "runtime": "exec",
+            "kind": "disk",
+            "createdAt": "2026-10-10T00:00:00Z",
+            "memory": [{
+                "role": "memory", "file": "memory",
+                "digest": format!("sha256:{}", "cd".repeat(32)), "size": 4096,
+            }],
+        });
+        let restore = TaskAllocation {
+            restore: Some(crate::structs::SnapshotRestore {
+                snapshot_id: "snap-elsewhere".into(),
+                kind: "disk".into(),
+                manifest_json: manifest.to_string(),
+                on_resume: Vec::new(),
+                ..Default::default()
+            }),
+            ..provisional_payload(73)
+        };
+        launch_task_allocation(&node, &restore)?;
+        let report = next_report(&node, "restore");
+        assert!(!report.ok);
+        assert!(report.error.contains("never published"), "{}", report.error);
+        assert!(!node.lock().unwrap().is_allocation_active(73));
+        Ok(())
+    }
+
+    /// `warm` lands a published snapshot's parts in the node content store,
+    /// unpinned (an ordinary cache entry), and a second warm fetches nothing.
+    #[test]
+    fn warm_fetches_published_parts_into_the_store_once() -> R<()> {
+        let shared = TempDir::new()?;
+        let publisher_dir = TempDir::new()?;
+        let warm_dir = TempDir::new()?;
+        let publisher = worker_with_store(&publisher_dir, Some(shared.path()))?;
+        let warmed = worker_with_store(&warm_dir, None)?;
+        let bytes = b"warm me ".repeat(32 * 1024);
+        let entry = publisher
+            .lock()
+            .unwrap()
+            .content_publishing()
+            .expect("publishing")
+            .store()
+            .put_bytes(
+                crate::content_store::ContentClass::Snapshots,
+                &bytes,
+                crate::content_store::PutOptions::default(),
+            )?;
+        let url = publisher
+            .lock()
+            .unwrap()
+            .content_publishing()
+            .expect("publishing")
+            .publish(&entry.digest)?
+            .url;
+        let warm = crate::structs::CheckpointRequest {
+            snapshot_id: "snap-warm".into(),
+            op: "warm".into(),
+            manifest_json: json!({
+                "id": "snap-warm", "jobId": "j", "task": "t", "originAllocId": 1,
+                "runtime": "sandbox", "kind": "memory", "createdAt": "2026-10-10T00:00:00Z",
+                "memory": [{
+                    "role": "memory", "file": "memory", "digest": entry.digest.as_str(),
+                    "size": bytes.len(), "url": url,
+                }],
+            })
+            .to_string(),
+            ..Default::default()
+        };
+        let report = crate::worker::checkpoints::run_warm(&warmed, &warm);
+        assert!(report.ok, "{}", report.error);
+        assert_eq!(report.total_bytes, bytes.len() as u64);
+        let store = warmed.lock().unwrap().content_store().expect("store");
+        assert_eq!(store.verify(&entry.digest)?.size, bytes.len() as u64);
+        assert!(
+            store.pins(&entry.digest)?.is_empty(),
+            "warmed parts are not pinned"
+        );
+        let again = crate::worker::checkpoints::run_warm(&warmed, &warm);
+        assert!(again.ok, "{}", again.error);
+        assert_eq!(again.total_bytes, 0, "already warm: nothing fetched");
+        Ok(())
+    }
+
+    /// Publishing on a worker with no contentStore fails loudly, naming the
+    /// fix.
+    #[test]
+    fn publishing_without_a_content_store_names_the_fix() -> R<()> {
+        let node_dir = TempDir::new()?;
+        let node = worker_with_store(&node_dir, None)?;
+        let publish = crate::structs::CheckpointRequest {
+            snapshot_id: "snap-nowhere".into(),
+            op: "publish".into(),
+            manifest_json: json!({
+                "id": "snap-nowhere", "jobId": "j", "task": "t", "originAllocId": 1,
+                "runtime": "sandbox", "kind": "memory", "createdAt": "2026-10-10T00:00:00Z",
+            })
+            .to_string(),
+            ..Default::default()
+        };
+        let report = crate::worker::checkpoints::run_publish(&node, &publish);
+        assert!(!report.ok);
+        assert!(report.error.contains("no contentStore"), "{}", report.error);
+        assert!(report.error.contains("Hint:"), "{}", report.error);
+        Ok(())
     }
 
     fn claim_record(claim_id: &str, instance_id: &str, gate: Gate) -> ClaimRecord {
@@ -4926,6 +6451,45 @@ mod tests {
         let failures = guard.drain_failures();
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].allocation_id, 23);
+        Ok(())
+    }
+
+    /// An allocation the memory pressure response stopped is not relaunched
+    /// while the manager still lists it (the eviction report is in flight),
+    /// and the hold is dropped once the manager stops asking for it. The
+    /// desired set also carries each allocation's band to the response.
+    #[test]
+    fn a_pressure_evicted_allocation_is_held_out_of_relaunch() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let ta = TaskAllocation {
+            allocation_id: 9,
+            job_id: "job".into(),
+            task_name: "exec-task".into(),
+            task_runtime: "exec".into(),
+            task_config: json!({"command": ["true"]}).to_string(),
+            priority_band: "low".into(),
+            ..Default::default()
+        };
+        manager.pressure_evicted.insert(9);
+        assert!(manager
+            .reconcile_allocations(std::slice::from_ref(&ta))
+            .is_empty());
+        assert_eq!(manager.bands.get(&9), Some(&crate::structs::Band::Low));
+
+        // The manager dropped it: the hold goes, and a later re-dispatch of
+        // the same id would launch.
+        manager.reconcile_allocations(&[]);
+        assert!(manager.pressure_evicted.is_empty());
+        assert_eq!(
+            manager
+                .reconcile_allocations(std::slice::from_ref(&ta))
+                .len(),
+            1
+        );
+
+        // Nothing running: nothing to evict.
+        assert!(manager.evict_for_pressure(9).is_err());
         Ok(())
     }
 

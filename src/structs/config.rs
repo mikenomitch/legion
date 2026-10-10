@@ -136,6 +136,70 @@ pub struct ManagerConfig {
     /// by a root key the manager mints at `<storePath>/keys/root.key`.
     #[serde(default)]
     pub encryption: Option<EncryptionConfig>,
+    /// Automatic suspend (docs/suspend-and-resume.md, "Idle policy").
+    /// Omitting it sweeps for idle instances every 15s.
+    #[serde(default)]
+    pub suspend: Option<SuspendManagerConfig>,
+}
+
+/// Default `suspend.idleSweep`.
+pub const DEF_IDLE_SWEEP: &str = "15s";
+
+/// The manager's `suspend` block.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SuspendManagerConfig {
+    /// How often the idle sweep looks for instances quiet past their task's
+    /// `suspend.idle.after`. Default `"15s"`. The sweep reads only the
+    /// in-memory usage reports, so a shorter interval costs little, but
+    /// workers report every 10s, so going below that buys nothing.
+    #[serde(default)]
+    pub idle_sweep: Option<String>,
+}
+
+/// Resolved [`SuspendManagerConfig`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SuspendManagerConfigFull {
+    pub idle_sweep: String,
+}
+
+impl Default for SuspendManagerConfigFull {
+    fn default() -> Self {
+        Self {
+            idle_sweep: DEF_IDLE_SWEEP.to_string(),
+        }
+    }
+}
+
+impl SuspendManagerConfigFull {
+    /// `idleSweep` as a duration; an unparseable or sub-second value falls
+    /// back to the default with a warning, so a typo never stops idle
+    /// suspend outright.
+    pub fn idle_sweep_interval(&self) -> std::time::Duration {
+        let default = std::time::Duration::from_secs(15);
+        match humantime::parse_duration(self.idle_sweep.trim()) {
+            Ok(interval) if interval >= std::time::Duration::from_secs(1) => interval,
+            _ => {
+                tracing::warn!(
+                    idle_sweep = %self.idle_sweep,
+                    "suspend.idleSweep is not a duration of at least 1s; using 15s"
+                );
+                default
+            }
+        }
+    }
+}
+
+impl SuspendManagerConfig {
+    pub fn with_defaults(&self) -> SuspendManagerConfigFull {
+        SuspendManagerConfigFull {
+            idle_sweep: self
+                .idle_sweep
+                .clone()
+                .unwrap_or_else(|| DEF_IDLE_SWEEP.to_string()),
+        }
+    }
 }
 
 /// KV encryption at rest (docs/kv-encryption.md).
@@ -1648,6 +1712,8 @@ pub struct ManagerConfigFull {
     pub liveness: LivenessConfigFull,
     #[serde(default)]
     pub encryption: EncryptionConfigFull,
+    #[serde(default)]
+    pub suspend: SuspendManagerConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1800,6 +1866,9 @@ impl From<ManagerConfigFull> for ManagerConfig {
             heartbeat: Some(val.heartbeat.into()),
             liveness: Some(val.liveness.into()),
             encryption: Some(val.encryption.into()),
+            suspend: Some(SuspendManagerConfig {
+                idle_sweep: Some(val.suspend.idle_sweep),
+            }),
         }
     }
 }
@@ -1883,6 +1952,11 @@ impl ManagerConfig {
                 .as_ref()
                 .map(EncryptionConfig::with_defaults)
                 .unwrap_or_default(),
+            suspend: self
+                .suspend
+                .as_ref()
+                .map(SuspendManagerConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -1912,6 +1986,7 @@ impl Default for ManagerConfigFull {
             heartbeat: HeartbeatConfigFull::default(),
             liveness: LivenessConfigFull::default(),
             encryption: EncryptionConfigFull::default(),
+            suspend: SuspendManagerConfigFull::default(),
         }
     }
 }
@@ -2150,6 +2225,14 @@ pub struct WorkerConfigAlt {
     pub max_allocations: Option<u32>,
     #[serde(default)]
     pub artifacts: Option<WorkerArtifactsConfig>,
+    /// The node content store: budgets per class, TTL, and the free-disk
+    /// floor (docs/artifacts.md). Absent means the defaults, store enabled.
+    #[serde(default)]
+    pub content: Option<WorkerContentConfig>,
+    /// Where this worker publishes content by digest (docs/artifacts.md,
+    /// "Publishing content"). Absent means the node publishes nothing.
+    #[serde(default)]
+    pub content_store: Option<crate::content_publish::ContentStoreTarget>,
     /// Host paths this worker offers to jobs through the `host` volume driver
     /// (see docs/volumes.md), keyed by the name jobs claim.
     #[serde(default)]
@@ -2165,6 +2248,12 @@ pub struct WorkerConfigAlt {
     /// unless declared.
     #[serde(default)]
     pub resource_enforcement: Option<WorkerResourceEnforcementConfig>,
+    /// `sandbox` runtime settings for workers of this type. Only meaningful
+    /// with `resourceEnforcement.enabled`, so the manager carries it to the
+    /// worker inside the enforcement payload (see
+    /// [`WorkerResourceEnforcementConfig::sandbox`]).
+    #[serde(default)]
+    pub sandbox: Option<WorkerSandboxConfig>,
     /// Whether this node accepts edge-initiated starts, and how it verifies
     /// the tickets that authorize them (see docs/edge-boot.md). Absent = off.
     #[serde(default)]
@@ -2172,7 +2261,7 @@ pub struct WorkerConfigAlt {
 }
 
 /// Worker `resourceEnforcement` block: cgroup v2 limits for `exec` tasks.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerResourceEnforcementConfig {
     /// Enforce `resources` as cgroup limits. Default false — a declaration
@@ -2185,6 +2274,194 @@ pub struct WorkerResourceEnforcementConfig {
     /// and `+cpu` in its `cgroup.subtree_control`.
     #[serde(default = "default_cgroup_parent")]
     pub cgroup_parent: String,
+    /// The worker type's top-level `sandbox` block, folded in by the manager
+    /// when it stores the worker type. It rides here rather than as its own
+    /// worker-type column because every setting in it is about enforcement,
+    /// and a worker without enforcement has no use for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<WorkerSandboxConfig>,
+    /// How far the scheduler may pack this node past its physical capacity
+    /// (docs/resource-enforcement.md, "Oversubscription"). Nested here, not
+    /// top-level, because oversubscription without cgroups to act on is a
+    /// bet on the kernel OOM killer: a node that does not enforce cannot
+    /// declare it. Absent means 1.0 for both, today's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oversubscribe: Option<WorkerOversubscribeConfig>,
+    /// Tuning for the memory pressure response (docs/resource-enforcement.md,
+    /// "Memory pressure"). The response is on whenever enforcement is, with
+    /// defaults that scale with the node, so this block is optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure: Option<WorkerMemoryPressureConfig>,
+}
+
+impl WorkerResourceEnforcementConfig {
+    /// The memory oversubscription ratio, 1.0 when unset.
+    pub fn memory_ratio(&self) -> f64 {
+        self.oversubscribe
+            .as_ref()
+            .and_then(|ratios| ratios.memory)
+            .unwrap_or(1.0)
+    }
+
+    /// The CPU oversubscription ratio, 1.0 when unset.
+    pub fn cpu_ratio(&self) -> f64 {
+        self.oversubscribe
+            .as_ref()
+            .and_then(|ratios| ratios.cpu)
+            .unwrap_or(1.0)
+    }
+
+    /// Reject a block that would silently not do what it says. Called by the
+    /// manager when it loads the worker type, so a typo fails at startup
+    /// rather than on the node at its first pressure episode.
+    pub fn validate(&self) -> R<()> {
+        for (name, ratio) in [
+            ("memory", self.oversubscribe.as_ref().and_then(|r| r.memory)),
+            ("cpu", self.oversubscribe.as_ref().and_then(|r| r.cpu)),
+        ] {
+            let Some(ratio) = ratio else { continue };
+            if !ratio.is_finite() || ratio < 1.0 {
+                bail!(
+                    "resourceEnforcement.oversubscribe.{name} must be a number of at least 1.0, \
+                     got {ratio}. To hold capacity back from the scheduler, use \
+                     reservedResources instead"
+                );
+            }
+        }
+        if !self.enabled
+            && (self.memory_ratio() > 1.0
+                || self.cpu_ratio() > 1.0
+                || self.memory_pressure.is_some())
+        {
+            bail!(
+                "resourceEnforcement.oversubscribe and resourceEnforcement.memoryPressure need \
+                 resourceEnforcement.enabled = true: without cgroups the node cannot give memory \
+                 back under pressure, and oversubscribing it would leave the kernel OOM killer \
+                 to choose what dies"
+            );
+        }
+        if let Some(pressure) = self.memory_pressure.as_ref() {
+            pressure.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Worker `resourceEnforcement.oversubscribe` block: schedulable capacity as
+/// a multiple of physical capacity, after `reservedResources`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerOversubscribeConfig {
+    /// Memory ratio. Above 1.0 the sum of reservations may exceed physical
+    /// memory, which voids the "within its reservation is never evicted"
+    /// guarantee and enables the `evict-reserved` pressure step.
+    #[serde(default)]
+    pub memory: Option<f64>,
+    /// CPU (MHz) ratio. CPU is weight-shared, so this only changes how much
+    /// the scheduler will place and never throttles anything. `cores` is
+    /// never oversubscribed: a pinned core is exclusive.
+    #[serde(default)]
+    pub cpu: Option<f64>,
+}
+
+/// The names the memory pressure response's `steps` list accepts, in the
+/// only order they ever run.
+pub const MEMORY_PRESSURE_STEPS: [&str; 4] =
+    ["reclaim", "suspend", "evict-bursting", "evict-reserved"];
+
+/// Worker `resourceEnforcement.memoryPressure` block. Every field is
+/// optional: the defaults are resolved on the worker, against its own
+/// memory size (`src/worker/pressure.rs`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerMemoryPressureConfig {
+    /// Set false to keep enforcement but turn the response off. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Act when `MemAvailable` drops below this byte size ("2GiB"). Default
+    /// 5% of node memory, at least 256MiB and at most 4GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_below: Option<String>,
+    /// Act when node-wide PSI `some avg10` exceeds this percentage ("10%" or
+    /// 10). Default 10%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_above: Option<Value>,
+    /// Wait this long after each action for pressure to clear before taking
+    /// the next ("5s"). Default 5s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle: Option<String>,
+    /// The steps this node may take. They always run in the fixed order of
+    /// [`MEMORY_PRESSURE_STEPS`], whatever order they are listed in. Default:
+    /// all four.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<String>>,
+}
+
+impl WorkerMemoryPressureConfig {
+    /// Parse every field once, so a bad value fails at manager startup.
+    pub fn validate(&self) -> R<()> {
+        if let Some(raw) = self.free_below.as_deref() {
+            parse_byte_size(raw).with_context(|| {
+                format!("invalid resourceEnforcement.memoryPressure.freeBelow {raw:?}")
+            })?;
+        }
+        self.stall_above_percent()?;
+        self.settle_duration()?;
+        for step in self.steps.iter().flatten() {
+            if !MEMORY_PRESSURE_STEPS.contains(&step.as_str()) {
+                bail!(
+                    "unknown resourceEnforcement.memoryPressure step {step:?}; the steps are {}",
+                    MEMORY_PRESSURE_STEPS.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `stallAbove` as a percentage, when set. Accepts `"10%"`, `"10"`, or
+    /// `10`.
+    pub fn stall_above_percent(&self) -> R<Option<f64>> {
+        let Some(value) = self.stall_above.as_ref() else {
+            return Ok(None);
+        };
+        let percent = match value {
+            Value::Number(number) => number.as_f64(),
+            Value::String(raw) => raw.trim().trim_end_matches('%').trim().parse::<f64>().ok(),
+            _ => None,
+        };
+        match percent {
+            Some(percent) if (0.0..=100.0).contains(&percent) => Ok(Some(percent)),
+            _ => bail!(
+                "resourceEnforcement.memoryPressure.stallAbove must be a percentage between 0 \
+                 and 100 (\"10%\"), got {value}"
+            ),
+        }
+    }
+
+    /// `settle` as a duration, when set.
+    pub fn settle_duration(&self) -> R<Option<std::time::Duration>> {
+        self.settle
+            .as_deref()
+            .map(|raw| {
+                humantime::parse_duration(raw.trim()).with_context(|| {
+                    format!("invalid resourceEnforcement.memoryPressure.settle {raw:?}")
+                })
+            })
+            .transpose()
+    }
+}
+
+/// Worker `sandbox` block: settings for the `sandbox` runtime on this node.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSandboxConfig {
+    /// MiB a sandbox allocation's cgroup allows on top of its guest memory,
+    /// for the VMM process itself (device emulation, page tables, its own
+    /// heap). Default 64. Too low and the kernel OOM-kills the VMM, taking
+    /// the guest with it; too high and a runaway VMM can take more than the
+    /// node planned for.
+    #[serde(default, rename = "vmmOverheadMiB")]
+    pub vmm_overhead_mib: Option<u64>,
 }
 
 fn default_cgroup_parent() -> String {
@@ -2196,6 +2473,9 @@ impl Default for WorkerResourceEnforcementConfig {
         Self {
             enabled: false,
             cgroup_parent: default_cgroup_parent(),
+            sandbox: None,
+            oversubscribe: None,
+            memory_pressure: None,
         }
     }
 }
@@ -2230,6 +2510,93 @@ pub struct WorkerArtifactFetchConfig {
     pub max_artifact_size: Option<String>,
     /// Worker-side scheme allowlist (defense in depth alongside admission).
     pub allowed_schemes: Option<Vec<String>>,
+}
+
+/// Worker `content` block: the node content store (docs/artifacts.md, "The
+/// node content store"). Every field is optional; absent means the default.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerContentConfig {
+    /// Keep a content store on this node. Default true. False stages every
+    /// artifact straight from origin, as before the store existed.
+    pub enabled: Option<bool>,
+    /// Byte budget per content class.
+    pub budgets: Option<WorkerContentBudgets>,
+    /// Unpinned entries unused this long are removed (humantime). "0s"
+    /// disables expiry. Default "72h".
+    pub ttl: Option<String>,
+    /// Evict unpinned content, then refuse new content, rather than leave the
+    /// filesystem with less free space than this. Default "5GiB".
+    pub min_free_disk: Option<String>,
+}
+
+/// Worker `content.budgets`: one byte budget per content class.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerContentBudgets {
+    /// Cached artifacts. Default "20GiB".
+    pub artifacts: Option<String>,
+    /// Checkpoint parts. Default "50GiB".
+    pub snapshots: Option<String>,
+}
+
+impl WorkerContentConfig {
+    /// Resolved store settings, or `None` when the store is disabled.
+    pub fn resolve(&self) -> R<Option<crate::content_store::ContentStoreConfig>> {
+        use crate::content_store::{
+            ContentBudgets, ContentStoreConfig, DEF_CONTENT_ARTIFACTS_BUDGET,
+            DEF_CONTENT_MIN_FREE_DISK, DEF_CONTENT_SNAPSHOTS_BUDGET, DEF_CONTENT_TTL,
+        };
+        if self.enabled == Some(false) {
+            return Ok(None);
+        }
+        let budgets = self.budgets.clone().unwrap_or_default();
+        let size = |field: &str, raw: Option<&str>, default: &str| -> R<u64> {
+            let raw = raw.unwrap_or(default);
+            parse_byte_size(raw).with_context(|| format!("invalid content.{field} {raw:?}"))
+        };
+        let ttl_raw = self.ttl.as_deref().unwrap_or(DEF_CONTENT_TTL);
+        let ttl = ttl_raw
+            .parse::<humantime::Duration>()
+            .with_context(|| format!("invalid content.ttl {ttl_raw:?}"))?;
+        Ok(Some(ContentStoreConfig {
+            budgets: ContentBudgets {
+                artifacts: size(
+                    "budgets.artifacts",
+                    budgets.artifacts.as_deref(),
+                    DEF_CONTENT_ARTIFACTS_BUDGET,
+                )?,
+                snapshots: size(
+                    "budgets.snapshots",
+                    budgets.snapshots.as_deref(),
+                    DEF_CONTENT_SNAPSHOTS_BUDGET,
+                )?,
+            },
+            ttl: (!ttl.is_zero()).then(|| *ttl),
+            min_free_disk: size(
+                "minFreeDisk",
+                self.min_free_disk.as_deref(),
+                DEF_CONTENT_MIN_FREE_DISK,
+            )?,
+        }))
+    }
+}
+
+/// What travels to the worker in `WorkerConfig.artifacts`: the `artifacts`
+/// block plus the top-level `content` block. They share one wire field so the
+/// content store needed no new proto field or worker-type column; an older
+/// worker ignores the extra key.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerArtifactsPayload {
+    #[serde(flatten)]
+    pub artifacts: WorkerArtifactsConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<WorkerContentConfig>,
+    /// The top-level `contentStore` block, riding the same payload for the
+    /// same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_store: Option<crate::content_publish::ContentStoreTarget>,
 }
 
 /// Resolved worker fetch settings with defaults applied.
@@ -2324,6 +2691,98 @@ pub fn parse_byte_size(raw: &str) -> R<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversubscribe_and_memory_pressure_validate() {
+        let parse = |value: serde_json::Value| -> WorkerResourceEnforcementConfig {
+            serde_json::from_value(value).expect("parses")
+        };
+        parse(serde_json::json!({
+            "enabled": true,
+            "oversubscribe": { "memory": 1.5, "cpu": 2 },
+            "memoryPressure": {
+                "freeBelow": "2GiB",
+                "stallAbove": "10%",
+                "settle": "5s",
+                "steps": ["reclaim", "suspend", "evict-bursting", "evict-reserved"],
+                "enabled": true,
+            },
+        }))
+        .validate()
+        .expect("the documented example is valid");
+
+        for (bad, needle) in [
+            (
+                serde_json::json!({ "enabled": true, "oversubscribe": { "memory": 0.8 } }),
+                "at least 1.0",
+            ),
+            (
+                serde_json::json!({ "enabled": false, "oversubscribe": { "memory": 1.5 } }),
+                "need resourceEnforcement.enabled = true",
+            ),
+            (
+                serde_json::json!({ "enabled": true, "memoryPressure": { "steps": ["oom"] } }),
+                "unknown resourceEnforcement.memoryPressure step",
+            ),
+            (
+                serde_json::json!({ "enabled": true, "memoryPressure": { "stallAbove": "150%" } }),
+                "stallAbove",
+            ),
+            (
+                serde_json::json!({ "enabled": true, "memoryPressure": { "freeBelow": "lots" } }),
+                "freeBelow",
+            ),
+        ] {
+            let err = parse(bad).validate().expect_err("invalid");
+            assert!(format!("{err:#}").contains(needle), "{err:#}");
+        }
+        // Ratio 1.0 without enforcement is the default, not an error.
+        parse(serde_json::json!({ "enabled": false, "oversubscribe": { "memory": 1.0 } }))
+            .validate()
+            .expect("1.0 is off");
+    }
+
+    #[test]
+    fn worker_content_config_resolves_and_rides_the_artifacts_payload() -> R<()> {
+        let defaults = WorkerContentConfig::default()
+            .resolve()?
+            .expect("enabled by default");
+        assert_eq!(
+            defaults,
+            crate::content_store::ContentStoreConfig::default()
+        );
+
+        let raw = r#"{"fetch":{"attempts":2},
+            "content":{"budgets":{"snapshots":"1GiB"},"ttl":"0s","minFreeDisk":"1MiB"}}"#;
+        let payload: WorkerArtifactsPayload = serde_json::from_str(raw)?;
+        assert_eq!(payload.artifacts.fetch_with_defaults()?.attempts, 2);
+        let content = payload
+            .content
+            .expect("content")
+            .resolve()?
+            .expect("enabled");
+        assert_eq!(content.budgets.snapshots, 1024 * 1024 * 1024);
+        assert_eq!(content.budgets.artifacts, defaults.budgets.artifacts);
+        assert_eq!(content.ttl, None, "0s disables expiry");
+        assert_eq!(content.min_free_disk, 1024 * 1024);
+
+        // Payloads from before the store existed carry no content key.
+        let old: WorkerArtifactsPayload = serde_json::from_str(r#"{"fetch":{}}"#)?;
+        assert!(old.content.is_none());
+
+        let disabled = WorkerContentConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(disabled.resolve()?.is_none());
+        let bad = WorkerContentConfig {
+            ttl: Some("soon".into()),
+            ..Default::default()
+        };
+        assert!(format!("{:#}", bad.resolve().unwrap_err()).contains("content.ttl"));
+        assert!(serde_json::from_str::<WorkerContentConfig>(r#"{"budget":{}}"#).is_err());
+        Ok(())
+    }
 
     #[test]
     fn byte_sizes_parse_decimal_and_binary_suffixes() -> R<()> {

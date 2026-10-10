@@ -1663,6 +1663,20 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub speculative_start: Option<crate::structs::edge_boot::SpeculativeStartConfig>,
+    /// Opts the task into snapshots (`legion snapshot`, see
+    /// `docs/suspend-and-resume.md`) and sets their expiry. None = no
+    /// snapshots block: disk snapshots still work for an instance volume that
+    /// supports them, memory snapshots do not, and snapshots never expire on
+    /// their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub snapshots: Option<crate::structs::snapshot::SnapshotsConfig>,
+    /// How `legion instance suspend` checkpoints this task and how a resume
+    /// behaves (see `docs/suspend-and-resume.md`). Keyed stateful tasks only.
+    /// None = suspend with the runtime's best checkpoint and the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub suspend: Option<crate::structs::suspend::SuspendConfig>,
 }
 
 /// A declared action: a named command template with typed parameters.
@@ -2149,6 +2163,10 @@ struct TaskConfigInput {
     actions: Vec<ActionSpec>,
     #[serde(default)]
     speculative_start: Option<crate::structs::edge_boot::SpeculativeStartConfig>,
+    #[serde(default)]
+    snapshots: Option<crate::structs::snapshot::SnapshotsConfig>,
+    #[serde(default)]
+    suspend: Option<crate::structs::suspend::SuspendConfig>,
 }
 
 #[derive(Deserialize)]
@@ -2284,6 +2302,8 @@ impl TaskConfigInput {
             artifacts: self.artifacts,
             actions: self.actions,
             speculative_start: self.speculative_start,
+            snapshots: self.snapshots,
+            suspend: self.suspend,
         })
     }
 }
@@ -2446,6 +2466,8 @@ impl TaskConfig {
     pub fn new(name: impl Into<String>, runtime: impl Into<String>) -> Self {
         TaskConfig {
             speculative_start: None,
+            snapshots: None,
+            suspend: None,
             name: name.into(),
             count: default_task_count(),
             runtime: runtime.into(),

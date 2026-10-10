@@ -44,8 +44,26 @@
   #   # Cap on concurrent unratified claims per node.
   #   maxProvisionalPerNode = 32,
   # },
+  # Automatic suspend (docs/suspend-and-resume.md, "Idle policy"). The idle
+  # sweep reads the usage reports workers send every 10s and suspends
+  # instances quiet past their task's `suspend.idle.after`. It reads no
+  # store state until it has something to suspend.
+  # suspend = {
+  #   idleSweep = "15s",
+  # },
   schedulerSettings = {
     plan_conflict_max_retries = 3,
+    # Score weights (docs/jobs-tasks-and-scheduling.md, "Score weights"). The
+    # values below are the defaults. `spread` and `bin_pack` follow the
+    # scheduling policy.
+    # weights = {
+    #   affinities = 1.0,
+    #   automatic_anti_affinity = 0.2,
+    #   # Prefer nodes whose content store already holds a placement's
+    #   # digest-pinned artifacts. 0 turns it off (docs/artifacts.md,
+    #   # "Content locality").
+    #   locality = 1.0,
+    # },
     # Late-binding plan apply (docs/late-binding-plan-apply.md): ranked
     # candidates per placement; the apply binds the first candidate whose
     # node epoch is unchanged, so concurrent submits cost a fallback rank

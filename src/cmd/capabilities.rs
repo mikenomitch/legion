@@ -214,16 +214,16 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "instance.create",
-            cli: "legion instance create <JOB> [--id <KEY>]",
+            cli: "legion instance create <JOB> [--id <KEY>] [--from-snapshot <NAME|ID>]",
             grpc: Some("Manager/CreateInstance"),
-            summary:
-                "Create a keyed-mode instance (never-recycled id). Supports --idempotency-key.",
+            summary: "Create a keyed-mode instance (never-recycled id), optionally restored from \
+                 a snapshot of the job (needs snapshot:read). Supports --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },
         Capability {
             name: "instance.create-batch",
-            cli: "legion instance create <JOB> --id <KEY>... --count <N>",
+            cli: "legion instance create <JOB> --id <KEY>... --count <N> [--from-snapshot <NAME|ID>]",
             grpc: Some("Manager/CreateInstances"),
             summary:
                 "Create several keyed instances atomically (all-or-nothing: explicit ids plus N \
@@ -242,10 +242,33 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "instance.start",
-            cli: "legion instance start <ID>",
+            cli: "legion instance start <ID> [--cold] [--wait]",
             grpc: Some("Manager/StartInstance"),
-            summary: "Resume a stopped keyed instance: re-place it with the same id and retained \
-                 storage handle. Supports --idempotency-key.",
+            summary: "Start a stopped keyed instance (same id, retained storage), or resume a \
+                 suspended one from its checkpoint (--cold boots fresh instead). Supports \
+                 --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "instance.suspend",
+            cli: "legion instance suspend <ID> [--checkpoint memory|disk] [--wait]",
+            grpc: Some("Manager/SuspendInstance"),
+            summary: "Checkpoint a keyed instance, stop it, and free its reservation; a failed \
+                 capture leaves it running. Memory checkpoints need snapshot:write. Supports \
+                 --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        // Fork.
+        Capability {
+            name: "instance.fork",
+            cli: "legion instance fork <ID> [--count N] [--checkpoint memory|disk] [--spread] [--wait]",
+            grpc: Some("Manager/ForkInstance"),
+            summary: "Fork a running keyed instance into N new instances (<id>-f<n>), each with \
+                 its own cloned volume and identity, on the origin's node (or, with --spread, \
+                 each on its own node from a published checkpoint); the origin keeps running. \
+                 Needs job:write and snapshot:write. Supports --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },
@@ -292,6 +315,82 @@ pub fn catalog() -> Vec<Capability> {
             summary: "Delete a volume and reclaim its storage (DESTROYS DATA). --force \
                  tombstones without driver confirmation for a node that is gone for good. \
                  Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        // --- Snapshots (see docs/suspend-and-resume.md) ---
+        Capability {
+            name: "snapshot.list",
+            cli: "legion snapshot list [--job <J>] [--instance <I>] [--state <S>]",
+            grpc: Some("Manager/ListSnapshots"),
+            summary: "List instance snapshots, newest first, with kind, state, node, and size.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "snapshot.get",
+            cli: "legion snapshot get <ID|NAME> [--job <J>]",
+            grpc: Some("Manager/GetSnapshot"),
+            summary: "Inspect one snapshot, including its manifest and why it failed, if it did.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "snapshot.create",
+            cli: "legion snapshot create <INSTANCE> [--memory|--disk] [--name <N>] [--publish] \
+                 [--wait]",
+            grpc: Some("Manager/CreateSnapshot"),
+            summary: "Snapshot a running instance's volume (disk) or its guest memory too \
+                 (memory, sandbox tasks). --publish uploads it to the node's contentStore so it \
+                 restores on any compatible node. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "snapshot.delete",
+            cli: "legion snapshot delete <ID>",
+            grpc: Some("Manager/DeleteSnapshot"),
+            summary: "Delete a snapshot; its node reclaims the bytes. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        // Phase 6: named snapshots.
+        Capability {
+            name: "snapshot.alias.set",
+            cli: "legion snapshot alias set <JOB> <NAME> <SNAPSHOT>",
+            grpc: Some("Manager/SetSnapshotAlias"),
+            summary: "Point a snapshot name at a local or published manual snapshot of the \
+                 job, creating or moving it (instance create --from-snapshot <NAME> uses it). \
+                 Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "snapshot.alias.delete",
+            cli: "legion snapshot alias delete <JOB> <NAME>",
+            grpc: Some("Manager/DeleteSnapshotAlias"),
+            summary: "Remove a snapshot name; the snapshot is untouched. Supports \
+                 --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "snapshot.restore",
+            cli: "legion snapshot restore <INSTANCE> <SNAPSHOT> [--wait]",
+            grpc: Some("Manager/RestoreInstance"),
+            summary: "Roll a keyed instance back to one of its snapshots in place, on the node \
+                 that holds it (any compatible node for a published snapshot). Supports \
+                 --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "snapshot.warm",
+            cli: "legion snapshot warm <ID|NAME> [--job <J>] [--constraint <K=V>]...",
+            grpc: Some("Manager/WarmSnapshot"),
+            summary: "Pre-fetch a published snapshot's parts onto matching nodes so a restore \
+                 there starts from local bytes. Best effort and idempotent; triggers downloads, \
+                 so it counts as mutating. Supports --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },
@@ -362,6 +461,16 @@ pub fn catalog() -> Vec<Capability> {
             summary: "Report whether the fleet is sustaining its heartbeat cadence: freshness \
                  ratio, lost window, sustainable fleet size, and the heartbeatSeconds value to \
                  set if it is falling behind.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "node.usage",
+            cli: "legion node usage <ID>",
+            grpc: Some("Manager/GetNodeUsage"),
+            summary: "Show a node's memory and CPU capacity, reservations, and measured usage per \
+                 allocation (current, peak, CPU, idle time), from cgroup reports workers with \
+                 resource enforcement send every 10 seconds.",
             mutates: false,
             read_only_safe: true,
         },
@@ -761,6 +870,17 @@ pub fn catalog() -> Vec<Capability> {
             summary: "Internal: the gated sandbox guest agent, started by the generated guest \
                  init inside a microVM to relay the guest's loopback proxy and DNS ports to the \
                  node datapath over vsock. Not for operators or agents to run.",
+            mutates: false,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "sandbox.guest-resume",
+            cli: "legion guest-resume",
+            grpc: None,
+            summary: "Internal: the resume handler inside a sandbox launched for memory \
+                 checkpoints, started by the generated guest init. Refreshes the guest's \
+                 identity, RNG, and clock and runs suspend.onResume after a restore. Not for \
+                 operators or agents to run.",
             mutates: false,
             read_only_safe: false,
         },

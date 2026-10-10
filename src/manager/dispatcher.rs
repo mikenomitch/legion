@@ -632,6 +632,12 @@ pub fn build_task_allocation_with(
         task_stop,
         task_network,
         provisional,
+        // Filled by the heartbeat's desired-set builder, the one path that
+        // feeds the worker's pressure response (`build_desired_allocations`).
+        priority_band: String::new(),
+        // Attached by the heartbeat builder, which knows the instance's
+        // restore source (see `snapshot_restore_payload`).
+        restore: None,
     })
 }
 
@@ -868,6 +874,7 @@ mod tests {
             storage_handle: Some("local-dir/abc".into()),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+            restore_from: None,
         }
     }
 

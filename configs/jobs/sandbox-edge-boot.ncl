@@ -77,7 +77,6 @@
                     "sleep 3600",
                 ],
                 vcpus = 2,
-                memory_mib = 1024,
                 rootfs_headroom_mib = 256,
                 # The `boot` gate is a REAL network boundary only for this
                 # runtime, and only through a TAP device Legion can hold
@@ -87,7 +86,7 @@
                 # network = { mode = "tap", tap = "tap0" },
             },
             resources = {
-                cpus = 2,
+                cpu = 2000,
                 memory = 1024,
             },
             # Edge nodes live in their own pool; the ticket names the same

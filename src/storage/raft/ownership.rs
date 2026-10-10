@@ -237,6 +237,16 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // `instance.storage_handle` — same lane, so the detach and the state flip
     // stay one atomic op).
     ("volume", Owner::Lane(Lane::Scheduler)),
+    // `snapshot` and `snapshot_alias` ride the scheduler lane with
+    // `instance`: RestoreInstance writes `instance.restore_from` and reads the
+    // snapshot in one op, placement pins a restoring instance to its
+    // snapshot's node, and the worker reports that advance a snapshot's state
+    // machine (capture, delete, restore outcomes) are scheduler-lane ops like
+    // the volume reports beside them. Writers: `create_snapshot`,
+    // `apply_snapshot_report`, `delete_snapshot`, `expire_snapshots`,
+    // `restore_keyed_instance`, and job destroy's scheduler cleanup.
+    ("snapshot", Owner::Lane(Lane::Scheduler)),
+    ("snapshot_alias", Owner::Lane(Lane::Scheduler)),
     // The eval queue is REPLICATED, on the lane that consumes it (JC-41,
     // reversing JC-27). Evals are not regenerable work: an acknowledged
     // `job stop`'s teardown tail, a mid-flight rollout tick, a config

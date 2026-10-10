@@ -25,7 +25,7 @@ pub mod status;
 
 pub use fetcher::{ArtifactFetcher, Credential, FetchLimits, FetchRequest, FetcherRegistry};
 pub use stage::{AnonymousCredentials, ArtifactSink, ArtifactStager, CredentialSource};
-pub use status::{ArtifactState, ArtifactStatus, ArtifactStatusBoard};
+pub use status::{ArtifactCacheOutcome, ArtifactState, ArtifactStatus, ArtifactStatusBoard};
 
 /// What staging produced for one artifact, attached to `TaskInstance` before
 /// `prepare()` so plugins consume typed payloads instead of guessing paths.

@@ -88,6 +88,23 @@ struct RegistrationPayload {
     config_attrs: String,
     fingerprint_attrs: String,
     health_checks: String,
+    /// Worker capabilities advertised at registration
+    /// (`WorkerRegisterRequest.capabilities`).
+    capabilities: Vec<String>,
+}
+
+/// What this worker advertises at registration: it always takes
+/// checkpoints and fetches published snapshot parts it does not hold, and it
+/// publishes snapshot parts when a `contentStore` is configured (and usable).
+fn worker_capabilities(publishing: bool) -> Vec<String> {
+    let mut capabilities = vec![
+        crate::structs::snapshot::CHECKPOINT_CAPABILITY.to_string(),
+        crate::structs::snapshot::CHECKPOINT_FETCH_CAPABILITY.to_string(),
+    ];
+    if publishing {
+        capabilities.push(crate::structs::snapshot::CONTENT_PUBLISH_CAPABILITY.to_string());
+    }
+    capabilities
 }
 
 #[instrument(err, skip_all)]
@@ -171,14 +188,32 @@ async fn run_worker_with_manager(
     ));
     // Access logs sit next to each allocation's own logs.
     let logs_base_dir = WorkerStateStore::new(state_path.clone()).logs_base_dir();
+    let content_dir = WorkerStateStore::new(state_path.clone()).content_dir();
     let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
         WorkerStateStore::new(state_path),
     )));
-    let artifact_fetch_config =
-        parse_artifact_fetch_config(&config.artifacts).unwrap_or_else(|err| {
+    let (artifact_fetch_config, content_config, content_store_target) =
+        parse_artifacts_payload(&config.artifacts).unwrap_or_else(|err| {
             warn!(error = ?err, "Invalid worker artifacts config; using defaults");
-            crate::structs::WorkerArtifactFetchConfigFull::default()
+            (
+                crate::structs::WorkerArtifactFetchConfigFull::default(),
+                crate::structs::WorkerContentConfig::default()
+                    .resolve()
+                    .ok()
+                    .flatten(),
+                None,
+            )
         });
+    let content_store = open_content_store(&content_dir, content_config);
+    let content_publishing = build_content_publishing(
+        content_store.clone(),
+        content_store_target.as_ref(),
+        Arc::new(ManagerCredentialSource::new(
+            manager_addr.clone(),
+            name.clone(),
+            credentials.clone(),
+        )),
+    );
     // Volume drivers must be ready before any allocation can arrive, and they
     // need the node id (it goes into every plugin request) plus the operator's
     // hostVolumes declarations from the worker config.
@@ -186,11 +221,15 @@ async fn run_worker_with_manager(
     // Task runtimes run in-process as dylibs and take no config of their own,
     // so cross-cutting worker settings reach them through the environment —
     // the same channel `sandbox` uses for LEGION_SANDBOX_KERNEL.
-    apply_resource_enforcement_env(&config.resource_enforcement);
+    let enforcement_config = parse_resource_enforcement(&config.resource_enforcement);
+    apply_resource_enforcement_env(&enforcement_config);
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
         manager.load_builtin_plugins();
         manager.configure_volumes(&name, host_volumes);
+        // Before `configure_artifacts`, which hands the store to the stager.
+        manager.configure_content_store(content_store.clone());
+        manager.configure_content_publishing(content_publishing);
         manager.configure_artifacts(
             artifact_fetch_config,
             Box::new(ManagerCredentialSource::new(
@@ -312,6 +351,27 @@ async fn run_worker_with_manager(
     if let Some(max_allocations) = config.max_allocations {
         config_attrs.insert("maxAllocations".into(), json!(max_allocations));
     }
+    // Oversubscription rides registration into the scheduler's capacity
+    // math (`ResourcePool::from_node`). Only advertised by a node that can
+    // actually enforce: a ratio on a node without cgroups would pack it past
+    // physical memory with nothing to give memory back.
+    if enforcement_config.enabled
+        && crate::worker::resources::enforcement_available()
+        && (enforcement_config.memory_ratio() > 1.0 || enforcement_config.cpu_ratio() > 1.0)
+    {
+        config_attrs.insert(
+            "oversubscribe".into(),
+            json!({
+                "memory": enforcement_config.memory_ratio(),
+                "cpu": enforcement_config.cpu_ratio(),
+            }),
+        );
+    } else if enforcement_config.memory_ratio() > 1.0 || enforcement_config.cpu_ratio() > 1.0 {
+        warn!(
+            "resourceEnforcement.oversubscribe is set but this node cannot enforce (no cgroup \
+             v2, or not Linux); registering at physical capacity"
+        );
+    }
     config_attrs.insert(
         "workerAddress".into(),
         Value::String(format!("http://{}:{}", DEF_MANAGER_HOSTNAME, server_port)),
@@ -333,6 +393,13 @@ async fn run_worker_with_manager(
         config_attrs: serde_json::to_string(&config_attrs)?,
         fingerprint_attrs: serde_json::to_string(&fingerprint_data)?,
         health_checks: serde_json::to_string(&health_checks)?,
+        capabilities: worker_capabilities(
+            task_manager
+                .lock()
+                .expect("task manager")
+                .content_publishing()
+                .is_some(),
+        ),
     };
     register_self(client.clone(), &registration, &credentials).await?;
     info!(worker_name = %name, "Worker registered with manager");
@@ -342,6 +409,7 @@ async fn run_worker_with_manager(
     crate::worker::balance::set_local_node(&name);
 
     start_worker_telemetry();
+    spawn_pressure_responder(task_manager.clone(), &enforcement_config, &name);
 
     // Registration just succeeded, so "now" is an honest last-contact time;
     // every successful heartbeat refreshes it. The self-fence watchdog kills
@@ -495,40 +563,134 @@ pub(crate) async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerC
 /// the task runtimes read (see `docs/task-supervision.md`). An empty or
 /// unparseable payload leaves enforcement off, which is the default and the
 /// behavior every worker had before this existed.
-fn apply_resource_enforcement_env(raw: &str) {
-    let config = if raw.trim().is_empty() {
-        crate::structs::WorkerResourceEnforcementConfig::default()
-    } else {
-        match serde_json::from_str::<crate::structs::WorkerResourceEnforcementConfig>(raw) {
-            Ok(config) => config,
-            Err(err) => {
-                warn!(error = ?err, "Invalid worker resourceEnforcement config; enforcement off");
-                crate::structs::WorkerResourceEnforcementConfig::default()
-            }
+fn parse_resource_enforcement(raw: &str) -> crate::structs::WorkerResourceEnforcementConfig {
+    if raw.trim().is_empty() {
+        return crate::structs::WorkerResourceEnforcementConfig::default();
+    }
+    match serde_json::from_str::<crate::structs::WorkerResourceEnforcementConfig>(raw) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(error = ?err, "Invalid worker resourceEnforcement config; enforcement off");
+            crate::structs::WorkerResourceEnforcementConfig::default()
         }
-    };
-
-    if config.enabled {
-        info!(
-            cgroup_parent = %config.cgroup_parent,
-            "Resource enforcement enabled: exec tasks run in worker-owned cgroups"
-        );
-        std::env::set_var(crate::constants::ENV_RESOURCE_ENFORCEMENT, "1");
-        std::env::set_var(crate::constants::ENV_CGROUP_PARENT, &config.cgroup_parent);
-    } else {
-        std::env::remove_var(crate::constants::ENV_RESOURCE_ENFORCEMENT);
-        std::env::remove_var(crate::constants::ENV_CGROUP_PARENT);
     }
 }
 
-/// Parses the worker config's `artifacts` JSON payload (empty = defaults).
-fn parse_artifact_fetch_config(raw: &str) -> R<crate::structs::WorkerArtifactFetchConfigFull> {
-    if raw.trim().is_empty() {
-        return Ok(crate::structs::WorkerArtifactFetchConfigFull::default());
+fn apply_resource_enforcement_env(config: &crate::structs::WorkerResourceEnforcementConfig) {
+    if config.enabled {
+        info!(
+            cgroup_parent = %config.cgroup_parent,
+            "Resource enforcement enabled: exec and sandbox tasks run in worker-owned cgroups"
+        );
+        std::env::set_var(crate::constants::ENV_RESOURCE_ENFORCEMENT, "1");
+        std::env::set_var(crate::constants::ENV_CGROUP_PARENT, &config.cgroup_parent);
+        let overhead = config
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.vmm_overhead_mib)
+            .unwrap_or(crate::constants::DEF_SANDBOX_VMM_OVERHEAD_MIB);
+        std::env::set_var(
+            crate::constants::ENV_SANDBOX_VMM_OVERHEAD_MIB,
+            overhead.to_string(),
+        );
+    } else {
+        std::env::remove_var(crate::constants::ENV_RESOURCE_ENFORCEMENT);
+        std::env::remove_var(crate::constants::ENV_CGROUP_PARENT);
+        std::env::remove_var(crate::constants::ENV_SANDBOX_VMM_OVERHEAD_MIB);
     }
-    let config: crate::structs::WorkerArtifactsConfig =
-        serde_json::from_str(raw).context("parse worker artifacts config")?;
-    config.fetch_with_defaults()
+}
+
+/// Parses the worker config's `artifacts` JSON payload (empty = defaults):
+/// the fetch settings plus the node content store settings, which ride in the
+/// same payload. A `None` store config means the operator disabled the store.
+fn parse_artifacts_payload(
+    raw: &str,
+) -> R<(
+    crate::structs::WorkerArtifactFetchConfigFull,
+    Option<crate::content_store::ContentStoreConfig>,
+    Option<crate::content_publish::ContentStoreTarget>,
+)> {
+    let payload: crate::structs::WorkerArtifactsPayload = if raw.trim().is_empty() {
+        Default::default()
+    } else {
+        serde_json::from_str(raw).context("parse worker artifacts config")?
+    };
+    let content = payload.content.unwrap_or_default().resolve()?;
+    Ok((
+        payload.artifacts.fetch_with_defaults()?,
+        content,
+        payload.content_store,
+    ))
+}
+
+/// The publisher for the worker's `contentStore`, when one is configured.
+/// Publishing reads from the node content store, so a node without one
+/// cannot publish: that is logged, not fatal, because nothing in 7a requires
+/// a publish to succeed.
+fn build_content_publishing(
+    store: Option<Arc<crate::content_store::ContentStore>>,
+    target: Option<&crate::content_publish::ContentStoreTarget>,
+    credentials: Arc<dyn crate::artifacts::CredentialSource>,
+) -> Option<Arc<crate::content_publish::ContentPublishing>> {
+    let target = target?;
+    let Some(store) = store else {
+        warn!(url = %target.url, "contentStore is configured but the node content store is \
+            disabled; this node will not publish content");
+        return None;
+    };
+    match target.publisher(credentials) {
+        Ok(publisher) => {
+            info!(url = %target.url, "Content publishing enabled");
+            Some(Arc::new(crate::content_publish::ContentPublishing::new(
+                store, publisher,
+            )))
+        }
+        Err(err) => {
+            warn!(error = ?err, "Invalid contentStore config; this node will not publish content");
+            None
+        }
+    }
+}
+
+/// How often the worker runs content store GC (TTL expiry and budget trim).
+/// Puts already evict on demand, so this only bounds how long expired content
+/// lingers.
+const CONTENT_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Opens the node content store and starts its GC loop. A store that cannot
+/// open is logged and skipped: artifacts then stage straight from origin,
+/// which is slower but correct.
+fn open_content_store(
+    dir: &Path,
+    config: Option<crate::content_store::ContentStoreConfig>,
+) -> Option<Arc<crate::content_store::ContentStore>> {
+    let Some(config) = config else {
+        info!("Node content store disabled by worker config");
+        return None;
+    };
+    let store = match crate::content_store::ContentStore::open(dir, config) {
+        Ok(store) => Arc::new(store),
+        Err(err) => {
+            warn!(error = ?err, dir = %dir.display(), "Failed to open node content store; \
+                artifacts will not be cached");
+            return None;
+        }
+    };
+    info!(dir = %dir.display(), "Node content store open");
+    let gc_store = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CONTENT_GC_INTERVAL);
+        loop {
+            interval.tick().await;
+            let store = gc_store.clone();
+            match tokio::task::spawn_blocking(move || store.gc()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => warn!(error = ?err, "Content store GC failed"),
+                Err(err) => warn!(error = ?err, "Content store GC task panicked"),
+            }
+        }
+    });
+    Some(store)
 }
 
 fn resolve_worker_name(name_override: Option<&str>, name_prefix: Option<String>) -> R<String> {
@@ -857,7 +1019,14 @@ async fn heartbeat_tick(
 
     {
         let start = std::time::Instant::now();
-        let (allocations, failures, terminations, allocation_health, volume_reports) = {
+        let (
+            allocations,
+            failures,
+            terminations,
+            allocation_health,
+            volume_reports,
+            snapshot_reports,
+        ) = {
             let mut manager = task_manager.lock().expect("task manager");
             let failures = manager
                 .drain_failures()
@@ -871,14 +1040,17 @@ async fn heartbeat_tick(
             let terminations = manager.drain_terminations();
             let allocation_health = manager.allocation_health_snapshot();
             let volume_reports = manager.drain_volume_reports();
+            let snapshot_reports = manager.drain_snapshot_reports();
             (
                 manager.allocations_snapshot(),
                 failures,
                 terminations,
                 allocation_health,
                 volume_reports,
+                snapshot_reports,
             )
         };
+        let snapshot_reports_for_redrive = snapshot_reports.clone();
         let running = allocations.clone();
         let failures_for_redrive = failures.clone();
         let terminations_for_redrive = terminations.clone();
@@ -911,6 +1083,59 @@ async fn heartbeat_tick(
         // contract as the denials.
         let net_edges = forwarder.context().edges().drain();
         let net_edges_for_redrive = net_edges.clone();
+        // Measured usage, on the heartbeat that falls due each report
+        // interval (docs/resource-enforcement.md, "Measuring usage"). Only
+        // with enforcement on: without it there are no worker-owned cgroups
+        // to read, and an absent report reads as "not governed".
+        let usage = if crate::task_plugins::exec_isolation::enforcement_enabled() {
+            let targets = task_manager.lock().expect("task manager").usage_targets();
+            let mut sampler = USAGE_SAMPLER.lock().unwrap_or_else(|p| p.into_inner());
+            sampler.note_network_activity(net_edges.iter().map(|edge| edge.allocation_id));
+            let now = std::time::Instant::now();
+            sampler.due(now).then(|| {
+                // What the datapath and exec server saw, for activity and
+                // the idle policy (docs/suspend-and-resume.md, "Idle policy").
+                let activity = forwarder.context().activity();
+                activity.retain(&targets.iter().map(|target| target.allocation_id).collect());
+                let inputs = crate::worker::usage::ActivityInputs {
+                    ingress: activity.snapshot(),
+                    exec_sessions: crate::worker::exec::open_sessions(),
+                };
+                let mut report = sampler.sample_with(
+                    now,
+                    chrono::Utc::now().timestamp_millis(),
+                    &targets,
+                    crate::worker::usage::read_cgroup_sample,
+                    crate::worker::usage::read_node_memory(),
+                    &inputs,
+                );
+                // "Who goes first", from the same ordering the responder
+                // acts with, so `legion node usage` previews it.
+                let metas = targets
+                    .iter()
+                    .map(|target| (target.allocation_id, target.pressure.clone()))
+                    .collect();
+                let view = PRESSURE_SETTINGS
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                crate::worker::pressure::annotate(
+                    &mut report,
+                    &metas,
+                    view.as_ref().map(|(settings, _)| settings),
+                    view.as_ref().is_some_and(|(_, under)| *under),
+                );
+                // The responder measures memory itself but not activity:
+                // hand it this report's quiet times for "most idle first".
+                crate::worker::pressure::publish_quiet_since(&report);
+                report
+            })
+        } else {
+            None
+        };
+        let pressure_actions =
+            std::mem::take(&mut *PRESSURE_ACTIONS.lock().unwrap_or_else(|p| p.into_inner()));
+        let pressure_actions_for_redrive = pressure_actions.clone();
         // The datapath's status for the allocations it was last told about.
         let net_status = {
             let last = LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner());
@@ -935,7 +1160,31 @@ async fn heartbeat_tick(
             }
         }
 
+        // What the node content store holds, as a delta against the epoch
+        // the manager last acknowledged. Nothing advances until the reply
+        // arrives, so a failed heartbeat needs no restore: the next diff
+        // carries the same change.
+        let content_report = {
+            let store = task_manager.lock().expect("task manager").content_store();
+            match crate::worker::content_report::advertised_set(store.as_deref()) {
+                Ok(current) => Some(
+                    CONTENT_ADVERTISER
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .prepare(current),
+                ),
+                Err(err) => {
+                    warn!(error = ?err, "Failed to list the content store for advertisement");
+                    None
+                }
+            }
+        };
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
+            content_locations: content_report
+                .as_ref()
+                .map(|pending| pending.report.clone()),
+            usage,
+            pressure_actions,
             net_denials,
             net_status,
             net_edges,
@@ -945,6 +1194,7 @@ async fn heartbeat_tick(
             failed_allocations: failures,
             allocation_health,
             volume_reports,
+            snapshot_reports,
             terminated_allocations: terminations
                 .into_iter()
                 .map(|report| crate::structs::TerminatedAllocation {
@@ -974,16 +1224,34 @@ async fn heartbeat_tick(
                 // dead connection would leave the manager re-dispatching a
                 // reclaim forever.
                 manager.requeue_volume_reports(volume_reports_for_redrive);
+                // Same for checkpoint outcomes; the manager would re-send the
+                // request anyway, but a capture should not wait a heartbeat.
+                manager.requeue_snapshot_reports(snapshot_reports_for_redrive);
                 if let Some(denials) = forwarder.context().denials() {
                     denials.restore(net_denials_for_redrive);
                 }
                 forwarder.context().edges().restore(net_edges_for_redrive);
+                // Pressure actions too: an eviction the manager never hears
+                // about would leave it waiting on an allocation that is gone.
+                // Restored ahead of anything queued since, to keep order.
+                {
+                    let mut pending = PRESSURE_ACTIONS.lock().unwrap_or_else(|p| p.into_inner());
+                    let newer = std::mem::take(&mut *pending);
+                    *pending = pressure_actions_for_redrive;
+                    pending.extend(newer);
+                }
                 return Err(err.into());
             }
         };
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let reply = response.into_inner();
         served_interval = reply.next_interval_seconds;
+        if let Some(pending) = content_report {
+            CONTENT_ADVERTISER
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .acknowledge(pending, reply.content_resync);
+        }
         // The desired set is the other place a node learns job configs it may
         // later be asked to start from a ticket.
         if let Some(cache) = spec_cache {
@@ -1072,6 +1340,29 @@ async fn heartbeat_tick(
             tokio::task::spawn_blocking(move || {
                 volumes.destroy_requested(&requests);
             });
+        }
+
+        // Checkpoint work (the checkpoint channel, docs/suspend-and-resume.md).
+        // New work runs off the heartbeat task; work already done re-queues
+        // its report for the next beat; restore outcomes are re-sent while
+        // the manager still attaches the restore payload.
+        {
+            let fresh = {
+                let mut manager = task_manager.lock().expect("task manager");
+                manager
+                    .checkpoints_mut()
+                    .reconcile_restores(&reply.desired_allocations);
+                manager
+                    .checkpoints_mut()
+                    .reconcile_local_suspensions(&reply.desired_allocations);
+                manager.checkpoints_mut().accept(&reply.checkpoint_requests)
+            };
+            for request in fresh {
+                let task_manager = task_manager.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::worker::checkpoints::run_request(&task_manager, &request);
+                });
+            }
         }
 
         let mut launched_this_tick: Vec<i64> = Vec::new();
@@ -1877,6 +2168,134 @@ fn dns_specs(
     specs
 }
 
+/// Start the memory pressure response (docs/resource-enforcement.md, "Memory
+/// pressure") when this node can run it: enforcement on and able to enforce,
+/// `/proc/meminfo` readable, and `memoryPressure.enabled` not false.
+///
+/// The responder runs on its own one-second tick rather than on the
+/// heartbeat, because a node running out of memory cannot wait for the next
+/// beat, let alone a manager round trip. Its actions queue in
+/// [`PRESSURE_ACTIONS`] for the next heartbeat to report.
+fn spawn_pressure_responder(
+    task_manager: Arc<Mutex<WorkerTaskManager>>,
+    config: &crate::structs::WorkerResourceEnforcementConfig,
+    node_name: &str,
+) {
+    if !config.enabled || !crate::worker::resources::enforcement_available() {
+        return;
+    }
+    let Some(memory) = crate::worker::usage::read_node_memory() else {
+        return;
+    };
+    let settings = match crate::worker::pressure::PressureSettings::resolve(
+        config.memory_pressure.as_ref(),
+        config.memory_ratio(),
+        memory.total_bytes,
+        node_name,
+    ) {
+        Ok(settings) => settings,
+        Err(err) => {
+            warn!(error = ?err, "Invalid memoryPressure config; the memory pressure response is off");
+            return;
+        }
+    };
+    *PRESSURE_SETTINGS.lock().unwrap_or_else(|p| p.into_inner()) = Some((settings.clone(), false));
+    if !settings.enabled {
+        info!("Memory pressure response disabled by resourceEnforcement.memoryPressure.enabled");
+        return;
+    }
+    info!(
+        free_below_bytes = settings.free_below_bytes,
+        stall_above_percent = settings.stall_above_percent,
+        settle_ms = settings.settle.as_millis() as u64,
+        steps = %settings
+            .active_steps()
+            .iter()
+            .map(|step| step.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        oversubscribe_memory = settings.oversubscribe_memory,
+        "Memory pressure response armed"
+    );
+    let responder = Arc::new(Mutex::new(crate::worker::pressure::PressureResponder::new(
+        settings,
+    )));
+    tokio::spawn(async move {
+        let mut source = crate::worker::pressure::LivePressureSource::new(task_manager);
+        let mut interval = tokio::time::interval(crate::worker::pressure::RESPONDER_TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let responder = responder.clone();
+            // Blocking: `memory.reclaim` reclaims synchronously, and the
+            // eviction path takes the task-manager lock.
+            let joined = tokio::task::spawn_blocking(move || {
+                let mut responder = responder.lock().unwrap_or_else(|p| p.into_inner());
+                let actions = responder.tick(
+                    std::time::Instant::now(),
+                    chrono::Utc::now().timestamp_millis(),
+                    &mut source,
+                );
+                let view = (responder.settings().clone(), responder.under_pressure());
+                (source, actions, view)
+            })
+            .await;
+            let (returned, actions, view) = match joined {
+                Ok(result) => result,
+                Err(err) => {
+                    warn!(error = ?err, "Memory pressure tick panicked; the response is off");
+                    return;
+                }
+            };
+            source = returned;
+            *PRESSURE_SETTINGS.lock().unwrap_or_else(|p| p.into_inner()) = Some(view);
+            if actions.is_empty() {
+                continue;
+            }
+            for action in &actions {
+                warn!(
+                    allocation_id = action.allocation_id,
+                    job_id = %action.job_id,
+                    step = %action.step,
+                    freed_bytes = action.freed_bytes,
+                    "{}",
+                    action.detail
+                );
+            }
+            let metrics = crate::manager::telemetry::worker_metrics();
+            for action in &actions {
+                metrics.pressure_actions_total.inc(&[action.step.as_str()]);
+            }
+            PRESSURE_ACTIONS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(actions);
+        }
+    });
+}
+
+/// Pressure actions taken since the last successful heartbeat, oldest first.
+static PRESSURE_ACTIONS: std::sync::LazyLock<Mutex<Vec<crate::structs::PressureAction>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// The pressure response's resolved settings and whether a trigger fired on
+/// its last tick, for the usage report. `None` when the response never armed.
+static PRESSURE_SETTINGS: std::sync::LazyLock<
+    Mutex<Option<(crate::worker::pressure::PressureSettings, bool)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// Usage sampler state carried between heartbeats: the previous sample per
+/// allocation (for CPU rates and activity) and when the last report went out.
+static USAGE_SAMPLER: std::sync::LazyLock<Mutex<crate::worker::usage::UsageSampler>> =
+    std::sync::LazyLock::new(|| Mutex::new(crate::worker::usage::UsageSampler::default()));
+
+/// The content store advertisement's epoch state (docs/artifacts.md,
+/// "Content locality"). Process-wide like the usage sampler: a restarted
+/// worker process starts over with a full report, which is the protocol.
+static CONTENT_ADVERTISER: std::sync::LazyLock<
+    Mutex<crate::worker::content_report::ContentAdvertiser>,
+> = std::sync::LazyLock::new(|| Mutex::new(Default::default()));
+
 /// The desired allocations from the last successful heartbeat, so the next
 /// request can report the datapath's status for them.
 static LAST_DESIRED: std::sync::LazyLock<Mutex<Vec<TaskAllocation>>> =
@@ -2369,6 +2788,7 @@ async fn register_self(
         join_token: credentials.join_secret.clone(),
         build_version: build_version.to_string(),
         protocol_version: PROTOCOL_VERSION,
+        capabilities: registration.capabilities.clone(),
     });
 
     let response = c2.worker_register(req).await?;
@@ -2677,6 +3097,7 @@ mod tests {
                 config_attrs: "{}".into(),
                 fingerprint_attrs: "{}".into(),
                 health_checks: "[]".into(),
+                capabilities: worker_capabilities(false),
             },
             Arc::new(UpstreamForwarder::new()),
             Duration::from_secs(WORKER_HEARTBEAT_DURATION_SEC),
@@ -3088,9 +3509,11 @@ mod tests {
         };
         let forwarder = UpstreamForwarder::new();
         let reply = HeartbeatReply {
+            content_resync: false,
             net_policies: Vec::new(),
             claim_verdicts: Vec::new(),
             next_interval_seconds: None,
+            checkpoint_requests: Vec::new(),
             message: "ack".into(),
             desired_allocations: vec![connect_allocation(11, "db", local_port)],
             volume_destroy: Vec::new(),

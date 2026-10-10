@@ -150,6 +150,13 @@ pub const INSTANCE_ATTRS: &str = r#"
 instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at
 "#;
 
+/// [`INSTANCE_ATTRS`] plus the columns no generic upsert writes:
+/// `restore_from` is set and cleared only by the snapshot restore ops, so an
+/// upsert of an instance (a re-bind, a reschedule) can never drop it.
+pub const INSTANCE_SELECT_ATTRS: &str = r#"
+instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at, restore_from
+"#;
+
 pub const INSTANCE_ATTRS_VALS: &str = r#"
 :instance_id, :job_id, :group_name, :task_name, :mode, :state, :slot_index, :current_alloc_id, :storage_handle, :created_at, :updated_at
 "#;
@@ -161,14 +168,14 @@ job_id = :job_id, group_name = :group_name, task_name = :task_name, mode = :mode
 lazy_static! {
     pub static ref GET_INSTANCE: String = format!(
         r#"
-    SELECT {INSTANCE_ATTRS}
+    SELECT {INSTANCE_SELECT_ATTRS}
     FROM instance
     WHERE instance_id = ?;
     "#
     );
     pub static ref GET_INSTANCES_FOR_JOB: String = format!(
         r#"
-    SELECT {INSTANCE_ATTRS}
+    SELECT {INSTANCE_SELECT_ATTRS}
     FROM instance
     WHERE job_id = ?
     ORDER BY group_name ASC, slot_index ASC, instance_id ASC;
@@ -179,7 +186,7 @@ lazy_static! {
     INSERT INTO instance ({INSTANCE_ATTRS})
     VALUES ({INSTANCE_ATTRS_VALS})
     ON CONFLICT(instance_id) DO UPDATE SET {INSTANCE_PARAM_SET}
-    RETURNING {INSTANCE_ATTRS};
+    RETURNING {INSTANCE_SELECT_ATTRS};
     "#
     );
 }
@@ -333,11 +340,11 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start
+id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start
+name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
@@ -345,7 +352,7 @@ name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, co
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect, :restart, :stop, :disruption, :speculative_start
+:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect, :restart, :stop, :disruption, :speculative_start, :snapshots, :suspend
 "#;
 
 lazy_static! {

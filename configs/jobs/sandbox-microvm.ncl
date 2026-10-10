@@ -56,10 +56,9 @@
                     "echo \"boots so far: $(wc -l < /workspace/boots.log)\"; " ++
                     "sleep 3600",
                 ],
-                # Guest size. The microVM gets exactly this; the scheduler's
-                # `resources` block below governs placement.
+                # Guest vCPUs. Guest RAM follows `resources` below
+                # (memoryMax, else memory), so placement and the VM agree.
                 vcpus = 1,
-                memory_mib = 512,
                 # Writable scratch inside the ephemeral root disk. Everything
                 # outside /workspace is discarded when the allocation ends.
                 rootfs_headroom_mib = 256,
@@ -80,7 +79,7 @@
                 # network = { mode = "tap", tap = "tap0" },
             },
             resources = {
-                cpus = 1,
+                cpu = 1000,
                 memory = 512,
             },
             constraints = {

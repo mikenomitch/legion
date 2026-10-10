@@ -265,6 +265,39 @@ impl VolumeDriver for ExecVolumeDriver {
     fn destroy(&self, request: &VolumeRequest) -> R<()> {
         self.invoke::<Empty>(request).map(|_| ())
     }
+
+    // The optional ops ride the same ABI: argv[1] is the op name, stdin the
+    // request (now carrying `snapshot`). The op is forced here so a caller
+    // that reused a request built for another op cannot run the wrong verb.
+
+    fn snapshot(
+        &self,
+        request: &VolumeRequest,
+    ) -> R<crate::structs::checkpoint::VolumeSnapshotRef> {
+        self.invoke(&with_op(request, VolumeOp::Snapshot))
+    }
+
+    fn restore(&self, request: &VolumeRequest) -> R<()> {
+        self.invoke::<Empty>(&with_op(request, VolumeOp::Restore))
+            .map(|_| ())
+    }
+
+    fn clone_volume(&self, request: &VolumeRequest) -> R<()> {
+        self.invoke::<Empty>(&with_op(request, VolumeOp::Clone))
+            .map(|_| ())
+    }
+
+    fn delete_snapshot(&self, request: &VolumeRequest) -> R<()> {
+        self.invoke::<Empty>(&with_op(request, VolumeOp::DeleteSnapshot))
+            .map(|_| ())
+    }
+}
+
+fn with_op(request: &VolumeRequest, op: VolumeOp) -> VolumeRequest {
+    VolumeRequest {
+        op,
+        ..request.clone()
+    }
 }
 
 /// Every valid exec plugin under `root` (`<root>/<name>/plugin.json`).

@@ -251,6 +251,8 @@ mod worker_edge_test {
             task_resources: r#"{"memory":512}"#.into(),
             task_stop: String::new(),
             provisional: None,
+            priority_band: String::new(),
+            restore: None,
         }
     }
 

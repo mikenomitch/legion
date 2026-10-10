@@ -309,8 +309,12 @@ fn build_apple_launch(
 
     // Declared resources become the guest VM's size. Apple `container` boots a
     // VM per container, so an unsized guest gets the runtime default (1 GiB /
-    // 4 CPUs) no matter what the job asked the scheduler to reserve.
-    if let Some(memory_mib) = resource_amount(&task.resources, "memory") {
+    // 4 CPUs) no matter what the job asked the scheduler to reserve. A
+    // `memoryMax` is the ceiling the task may use, so it sizes the VM when
+    // set, the same rule the `sandbox` runtime follows.
+    if let Some(memory_mib) = resource_amount(&task.resources, crate::resources::MEMORY_MAX_KEY)
+        .or_else(|| resource_amount(&task.resources, "memory"))
+    {
         args.push("--memory".to_string());
         args.push(format!("{}M", memory_mib.round().max(1.0) as u64));
     }
@@ -2119,6 +2123,7 @@ mod tests {
             cores: None,
             cpu_weight: None,
             memory_limit_bytes: Some(32 * 1024 * 1024),
+            memory_low_bytes: None,
         };
         let tmp = tempfile::tempdir()?;
         let mut instance = TaskInstance {
@@ -2163,6 +2168,7 @@ mod tests {
                 cores: Some(vec![0, 1]),
                 cpu_weight: None,
                 memory_limit_bytes: None,
+                memory_low_bytes: None,
             }),
             ..TaskInstance::default()
         };

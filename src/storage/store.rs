@@ -17,13 +17,23 @@ use crate::storage::migrations::get_migrations;
 // live in their own file so the keyring's write paths read as one unit.
 mod keyring_ops;
 mod read_model_check;
+// Phase 6: fork, create-from-snapshot, and snapshot names.
+mod fork_ops;
+mod snapshot_ops;
+mod suspend_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
 };
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
+pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
+pub use snapshot_ops::{
+    DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
+    SnapshotReportOutcome, SnapshotReportRecord,
+};
+pub use suspend_ops::{AbandonedResume, ResumeOutcome};
 
 use crate::storage::queries::{
     DELETE_SIGNING_KEY, GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB,
@@ -351,6 +361,11 @@ pub struct SchedulingReadModel {
     /// `Arc`'d so a hot reader ([`Store::shared_task_configs_for_job_config`])
     /// takes a refcount bump instead of deep-cloning every task's JSON.
     pub task_configs: HashMap<String, Arc<Vec<(i64, TaskConfig)>>>,
+    /// Priority band per job config id, filled lazily by
+    /// [`Store::cached_band_for_job_config`]. Never invalidated, for the same
+    /// reason `task_configs` is not: a job config's band is immutable, and a
+    /// change mints a new config id.
+    pub job_config_bands: HashMap<String, Band>,
     /// Declared scheduling indexes over `nodes` (docs/scheduling-indexes.md).
     /// Maintained by the same write path that mutates `nodes` and
     /// `allocations_by_node`, so it cannot drift from them; derived state
@@ -694,6 +709,11 @@ pub struct PlanSubmission {
 pub struct PlanSubmissionPlacement {
     pub task_id: i64,
     pub candidates: Vec<String>,
+    /// Bind exactly this keyed instance (a restore the planner placed for
+    /// that instance). Absent in rows written before restores carried it,
+    /// and in the format-1 shape, which bind any unbound instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 /// A successfully applied plan: the inserted allocations plus the candidate
@@ -1111,6 +1131,14 @@ pub struct Store {
     // no fsync, no pipeline-thread hop. Shared across clones so the gRPC
     // handler and the status-checker tick see the same table.
     liveness: Arc<crate::storage::liveness::LivenessTable>,
+    // Which node holds which content, by digest (suspend plan §6.8): the
+    // `locality` score term's input. Leader-local soft state like liveness,
+    // rebuilt from worker reports after a restart or failover. Shared across
+    // clones so the heartbeat handler writes what every Scheduler reads.
+    content_locations: Arc<crate::storage::content_index::ContentLocationIndex>,
+    // Queued snapshot warms (WarmSnapshot), per node. Leader-local soft
+    // state like the content index: best effort, never replicated.
+    snapshot_warms: Arc<crate::storage::snapshot_warm::SnapshotWarmQueue>,
     // Missed beats before a node is lost, from `heartbeat.missedBeatsBeforeLost`.
     // A node's window is ALWAYS this times its own interval.
     missed_beats_before_lost: u32,
@@ -1716,6 +1744,8 @@ impl Store {
                 TASK_STATUS_SEED_BATCH_MAX,
             )),
             liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
+            content_locations: Arc::new(crate::storage::content_index::ContentLocationIndex::new()),
+            snapshot_warms: Arc::new(crate::storage::snapshot_warm::SnapshotWarmQueue::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2936,7 +2966,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend
             FROM task_config;
             "#,
         )?;
@@ -2955,6 +2985,8 @@ impl Store {
                 // while the incremental path kept it (found by the
                 // read-model shadow check).
                 speculative_start: parse_json_column(29, row.get(29)?)?,
+                snapshots: parse_json_column(30, row.get(30)?)?,
+                suspend: parse_json_column(31, row.get(31)?)?,
                 name: row.get(1)?,
                 runtime: row.get(2)?,
                 count: TaskCount {
@@ -3024,6 +3056,7 @@ impl Store {
                 .into_iter()
                 .map(|(job_config_id, tasks)| (job_config_id, Arc::new(tasks)))
                 .collect(),
+            job_config_bands: HashMap::new(),
             indexes: IndexSet::new(Arc::clone(&self.index_settings)),
             node_pools: SharedNodePools::new(),
             scope_epochs,
@@ -3785,6 +3818,28 @@ impl Store {
         let tasks = self.get_task_configs_for_job_config(job_config_id)?;
         self.cache_set_task_configs_for_job_config(job_config_id, tasks.clone())?;
         Ok(Arc::new(tasks))
+    }
+
+    /// A job config's priority band, from the read model when it has it.
+    ///
+    /// The heartbeat path calls this once per distinct job config per node
+    /// per beat (it rides `TaskAllocation.priority_band` to the worker's
+    /// pressure response), so it must not cost a read connection in steady
+    /// state. A miss pays one point read and caches the answer.
+    pub fn cached_band_for_job_config(&self, job_config_id: &str) -> R<Band> {
+        {
+            let guard = self.read_model_reader()?;
+            if let Some(band) = guard.job_config_bands.get(job_config_id) {
+                return Ok(*band);
+            }
+        }
+        let (_, band) = self.job_band_for_job_config(job_config_id)?;
+        if !capture::in_capture() {
+            self.read_model_writer()?
+                .job_config_bands
+                .insert(job_config_id.to_string(), band);
+        }
+        Ok(band)
     }
 
     /// Deep-cloned allocations map, for callers that need owned vectors.
@@ -4979,6 +5034,7 @@ impl Store {
                     .map(|(node_id, task_id)| PlanSubmissionPlacement {
                         task_id,
                         candidates: vec![node_id],
+                        instance_id: None,
                     })
                     .collect()
             }
@@ -5519,6 +5575,12 @@ impl Store {
                     Err(error) => return Err(error),
                 };
 
+                // A restore placed for one instance binds that instance:
+                // its node was chosen for that instance's pin or `compat`.
+                let bind_instance = placement
+                    .instance_id
+                    .as_deref()
+                    .or(target_instance.as_deref());
                 let allocation = self.insert_allocation_with_data(
                     tx,
                     node_id,
@@ -5526,7 +5588,7 @@ impl Store {
                     &state.job_config_id,
                     &state.resources,
                     network.as_ref(),
-                    target_instance.as_deref(),
+                    bind_instance,
                 )?;
                 allocations.push(allocation);
                 candidate_ranks.push(rank);
@@ -6811,6 +6873,8 @@ impl Store {
             stop: parse_json_column(28, row.get(28)?)?,
             disruption: parse_json_column(29, row.get(29)?)?,
             speculative_start: parse_json_column(30, row.get(30)?)?,
+            snapshots: parse_json_column(31, row.get(31)?)?,
+            suspend: parse_json_column(32, row.get(32)?)?,
         };
 
         Ok(task_config)
@@ -6854,6 +6918,7 @@ impl Store {
             storage_handle: row.get(8)?,
             created_at: row.get(9)?,
             updated_at: row.get(10)?,
+            restore_from: row.get(11)?,
         };
 
         Ok(instance)
@@ -7335,6 +7400,9 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn remove_node(&self, id: &str) -> R<()> {
         self.remove_allocs_for_node(id)?;
+        // Snapshots stored on the node go with it (scheduler lane, like the
+        // allocation half above).
+        self.mark_node_snapshots_lost(id)?;
         let id = id.to_owned();
         self.replicated(Lane::Control, "remove_node", move |s| {
             s.remove_node_apply(&id)
@@ -7993,6 +8061,16 @@ impl Store {
     /// The liveness soft-state table (liveness plan §6.2).
     pub fn liveness(&self) -> &Arc<crate::storage::liveness::LivenessTable> {
         &self.liveness
+    }
+
+    /// The content location index (see [`crate::storage::content_index`]).
+    pub fn content_locations(&self) -> &Arc<crate::storage::content_index::ContentLocationIndex> {
+        &self.content_locations
+    }
+
+    /// Queued snapshot warms (see [`crate::storage::snapshot_warm`]).
+    pub fn snapshot_warms(&self) -> &Arc<crate::storage::snapshot_warm::SnapshotWarmQueue> {
+        &self.snapshot_warms
     }
 
     /// Missed beats before a node is lost (`heartbeat.missedBeatsBeforeLost`).
@@ -8869,6 +8947,7 @@ impl Store {
             [job_id],
         )?;
         tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
+        Self::destroy_job_snapshots_tx(&tx, job_id)?;
         tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
         let mut stopping_event = None;
@@ -9911,6 +9990,12 @@ impl Store {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let snapshots = t
+                .snapshots
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let suspend = t.suspend.as_ref().map(serde_json::to_string).transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -9943,6 +10028,8 @@ impl Store {
                 ":stop": stop,
                 ":disruption": disruption,
                 ":speculative_start": speculative_start,
+                ":snapshots": snapshots,
+                ":suspend": suspend,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -10057,13 +10144,15 @@ impl Store {
             .tasks
             .iter()
             .map(|task| {
+                // The runtime's own defaults first, so they win over
+                // `taskResourceDefaults` (the sandbox guest size, docs/
+                // task-runtime-sandbox.md "Guest size").
+                let mut task = task.clone();
+                crate::task_plugins::normalize_runtime_task(&mut task);
                 let resources = self
                     .resource_policy
                     .normalize_task_resources(&task.resources, true)?;
-                let mut task = TaskConfig {
-                    resources,
-                    ..task.clone()
-                };
+                let mut task = TaskConfig { resources, ..task };
                 task.normalize_network()?;
                 Ok(task)
             })
@@ -12407,26 +12496,38 @@ impl Store {
         // Ordering by `node_local_pin DESC` first makes an allocation bind the
         // instance whose node-local data already lives on the node it landed
         // on; without a pin the ordering is unchanged (oldest wins), so keyed
-        // binding without volumes behaves exactly as before.
+        // binding without volumes behaves exactly as before. A restoring
+        // instance binds only on its snapshot's node while the snapshot is
+        // `local`. A `published` snapshot binds anywhere, preferring the node
+        // that captured it (which still holds the parts).
         let instance: Option<Instance> = tx
             .query_row(
                 "SELECT instance.instance_id, instance.job_id, instance.group_name, \
                  instance.task_name, instance.mode, instance.state, instance.slot_index, \
                  instance.current_alloc_id, instance.storage_handle, instance.created_at, \
-                 instance.updated_at FROM instance \
+                 instance.updated_at, instance.restore_from FROM instance \
                  LEFT JOIN volume ON volume.instance_id = instance.instance_id \
                  AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
                  AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
                  WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
                  AND instance.task_name = ?3 \
-                 AND instance.mode = 'keyed' AND instance.state NOT IN ('terminated', 'stopped') \
+                 AND instance.mode = 'keyed' \
+                 AND instance.state NOT IN ('terminated', 'stopped', 'suspended') \
+                 AND COALESCE(instance.pending_op, '') != 'fork' \
                  AND instance.instance_id NOT IN (\
                      SELECT instance_id FROM allocation \
                      WHERE task_config_id = ?4 AND instance_id IS NOT NULL\
                  ) \
                  AND (?6 = '' OR instance.instance_id = ?6) \
-                 ORDER BY (volume.node_id = ?5) DESC, instance.created_at ASC, \
-                 instance.instance_id ASC LIMIT 1;",
+                 AND (instance.restore_from IS NULL OR COALESCE((\
+                     SELECT CASE WHEN snapshot.state = 'published' THEN ?5 \
+                     ELSE snapshot.node_id END FROM snapshot \
+                     WHERE snapshot.snapshot_id = instance.restore_from\
+                 ), ?5) = ?5) \
+                 ORDER BY (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
+                 COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
+                     WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
+                 instance.created_at ASC, instance.instance_id ASC LIMIT 1;",
                 params![
                     job_id,
                     group,
@@ -12721,6 +12822,16 @@ impl Store {
                 instance.state,
                 InstanceState::Terminated | InstanceState::Stopped
             ) {
+                continue;
+            }
+            // A suspended instance's held reservation went away (node loss, a
+            // job stop or update). It stays suspended, now holding nothing.
+            if instance.state == InstanceState::Suspended {
+                tx.execute(
+                    "UPDATE instance SET current_alloc_id = NULL, updated_at = ?1 \
+                     WHERE instance_id = ?2;",
+                    params![now, instance_id],
+                )?;
                 continue;
             }
 
@@ -14977,7 +15088,7 @@ impl Store {
             "UPDATE instance SET \
              state = CASE WHEN mode = 'keyed' THEN 'stopped' ELSE 'terminated' END, \
              current_alloc_id = NULL, updated_at = ?1 \
-             WHERE job_id = ?2 AND state NOT IN ('terminated', 'stopped');",
+             WHERE job_id = ?2 AND state NOT IN ('terminated', 'stopped', 'suspended');",
             params![now, job_id],
         )?;
         tx.commit()?;
@@ -15327,9 +15438,12 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE instance SET state = 'terminated', current_alloc_id = NULL, \
-             storage_handle = NULL, updated_at = ?1 WHERE instance_id = ?2;",
+             storage_handle = NULL, restore_from = NULL, updated_at = ?1 \
+             WHERE instance_id = ?2;",
             params![now, instance_id],
         )?;
+        // A suspend checkpoint is owned by its instance and dies with it.
+        Self::clear_suspend_tx(&tx, instance_id)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Destroy)?;
         tx.commit()?;
@@ -15393,7 +15507,12 @@ impl Store {
                      forever and cannot be stopped"
                 ),
             }),
-            InstanceState::Pending | InstanceState::Active | InstanceState::Rescheduling => {}
+            // A suspended instance can be stopped too: its checkpoint is
+            // discarded below and its held reservation, if any, removed.
+            InstanceState::Pending
+            | InstanceState::Active
+            | InstanceState::Rescheduling
+            | InstanceState::Suspended => {}
         }
 
         let now = Self::now_rfc3339()?;
@@ -15422,11 +15541,37 @@ impl Store {
             "DELETE FROM allocation WHERE instance_id = ?;",
             [instance_id],
         )?;
+        // A new instance that has not restored yet (a fork, or a create from
+        // a snapshot) keeps its restore source across the stop, and a fork
+        // still waiting for its checkpoint keeps waiting: a later start then
+        // restores it instead of booting it on an empty volume. Its own
+        // snapshots (a resume, a rollback) are dropped as before.
+        let seeding: Option<String> = tx
+            .query_row(
+                "SELECT instance.restore_from FROM instance \
+                 INNER JOIN snapshot ON snapshot.snapshot_id = instance.restore_from \
+                 WHERE instance.instance_id = ?1 \
+                 AND COALESCE(snapshot.origin_instance_id, '') != instance.instance_id;",
+                [instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let waiting_fork = Self::instance_suspend_state_on(&tx, instance_id)?
+            .pending_op
+            .as_deref()
+            == Some(crate::structs::fork::PENDING_FORK);
         tx.execute(
-            "UPDATE instance SET state = 'stopped', current_alloc_id = NULL, updated_at = ?1 \
-             WHERE instance_id = ?2;",
-            params![now, instance_id],
+            "UPDATE instance SET state = 'stopped', current_alloc_id = NULL, \
+             restore_from = ?3, updated_at = ?1 WHERE instance_id = ?2;",
+            params![now, instance_id, seeding],
         )?;
+        Self::clear_suspend_tx(&tx, instance_id)?;
+        if waiting_fork && seeding.is_some() {
+            tx.execute(
+                "UPDATE instance SET pending_op = ?2 WHERE instance_id = ?1;",
+                params![instance_id, crate::structs::fork::PENDING_FORK],
+            )?;
+        }
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
@@ -15486,6 +15631,12 @@ impl Store {
                      create a new instance instead"
                 ),
             }),
+            InstanceState::Suspended => bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is suspended; resume it through StartInstance, which \
+                     restores its checkpoint"
+                ),
+            }),
             InstanceState::Stopped => {}
         }
 
@@ -15525,7 +15676,7 @@ impl Store {
             .prepare_cached(
                 "SELECT COUNT(*) FROM instance \
                  WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
-                 AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped');",
+                 AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped', 'suspended');",
             )?
             .query_row(params![job_id, group, task_name], |row| row.get(0))?;
         Ok(count.max(0) as u32)
@@ -16289,7 +16440,8 @@ impl Store {
                      )
                      OR EXISTS (
                        SELECT 1 FROM instance i
-                       WHERE i.job_id = j.id AND i.state NOT IN ('stopped', 'terminated')
+                       WHERE i.job_id = j.id
+                         AND i.state NOT IN ('stopped', 'terminated', 'suspended')
                      )
                    );",
             )?;
@@ -22529,6 +22681,7 @@ mod tests {
                 placements: PlanPlacements::Candidates(vec![PlanSubmissionPlacement {
                     task_id,
                     candidates: vec!["node-a".to_string()],
+                    instance_id: None,
                 }]),
                 expected_versions: versions,
                 evictions: Vec::new(),
@@ -23546,6 +23699,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -23583,6 +23737,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
             &[PlanEviction {
@@ -23622,6 +23777,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -23690,6 +23846,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -23934,6 +24091,7 @@ mod tests {
                     .map(|node| PlanSubmissionPlacement {
                         task_id,
                         candidates: vec![node.clone()],
+                        instance_id: None,
                     })
                     .collect();
                 batch.push(PlanApplyRequest {
@@ -24060,6 +24218,7 @@ mod tests {
                     .map(|node| PlanSubmissionPlacement {
                         task_id,
                         candidates: vec![node.clone()],
+                        instance_id: None,
                     })
                     .collect();
                 batch.push(PlanApplyRequest {
@@ -24228,6 +24387,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -24274,6 +24434,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -24324,6 +24485,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -24361,6 +24523,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -24421,6 +24584,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -24457,6 +24621,7 @@ mod tests {
         let placement = || PlanSubmissionPlacement {
             task_id,
             candidates: vec!["node-a".to_string()],
+            instance_id: None,
         };
         let submission = store.insert_plan_submission_with_candidates(
             &job_config_id,
@@ -24511,6 +24676,7 @@ mod tests {
         let placement = || PlanSubmissionPlacement {
             task_id,
             candidates: vec!["node-a".to_string(), "node-b".to_string()],
+            instance_id: None,
         };
         let submission = store.insert_plan_submission_with_candidates(
             &job_config_id,
@@ -24558,6 +24724,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;

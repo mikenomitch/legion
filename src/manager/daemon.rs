@@ -497,6 +497,9 @@ pub async fn run_manager_with(
         }
     };
 
+    // The idle sweep reads the usage table heartbeats fill, so it shares
+    // the service's handle.
+    let usage_for_idle_sweep = manager_node.usage_handle();
     let manager_service = ManagerServer::new(manager_node);
     // Browser origins (docs/ui-architecture.md): loopback plus
     // `server.allowedOrigins`. The guard refuses everything else before any
@@ -550,6 +553,10 @@ pub async fn run_manager_with(
             heartbeat: full_config.heartbeat.clone(),
             liveness: full_config.liveness.clone(),
             manager_node_id: manager_node_id.clone(),
+            idle_sweep: Some(IdleSweepConfig {
+                usage: usage_for_idle_sweep,
+                interval: full_config.suspend.idle_sweep_interval(),
+            }),
         },
     );
     let eval_loop_fut = start_eval_loop(store_copy_b, full_config.eval_threads);
@@ -1098,6 +1105,17 @@ pub struct LivenessCheckerConfig {
     pub liveness: crate::structs::LivenessConfigFull,
     /// This manager's own id, as the digest identifies its sender.
     pub manager_node_id: String,
+    /// The idle sweep (docs/suspend-and-resume.md, "Idle policy"). `None`
+    /// turns it off (embedded uses with no heartbeat service).
+    pub idle_sweep: Option<IdleSweepConfig>,
+}
+
+/// What the idle sweep needs: the usage table heartbeats fill, and how
+/// often to look (manager `suspend.idleSweep`).
+#[derive(Debug, Clone)]
+pub struct IdleSweepConfig {
+    pub usage: Arc<Mutex<crate::manager::usage::UsageTable>>,
+    pub interval: Duration,
 }
 
 /// The interval this manager currently serves, and the ladder state behind it.
@@ -1153,6 +1171,10 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
     // engine, is the steady state.
     let mut last_divergent_regen: Option<std::time::Instant> = None;
     let mut last_kv_sweep: Option<std::time::Instant> = None;
+    // Automatic suspend: its own cadence (default 15s), independent of the
+    // status checker's, and its memory of what it already tried.
+    let mut last_idle_sweep: Option<std::time::Instant> = None;
+    let mut idle_sweeper = crate::manager::server::IdleSweeper::default();
     loop {
         // Leader-only actions (raft mode, per lane): only the STATUS-lane
         // leader may mark nodes lost / sweep health orphans; non-leaders
@@ -1542,6 +1564,27 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                     }
                 }
                 Err(err) => warn!(error = ?err, "Failed reaping orphaned volumes"),
+            }
+            // `snapshots.ttl`: expired snapshots move to `deleting`, and their
+            // nodes reclaim the bytes on the next heartbeat (see
+            // docs/suspend-and-resume.md). A read-only check when nothing is
+            // due.
+            crate::manager::server::expire_snapshots(&store);
+            // Resumes whose checkpoint was lost with its node, or that waited
+            // out `suspend.resumeTimeout`, settle per `onRestoreFailure`. One
+            // indexed read when nothing is resuming.
+            crate::manager::server::settle_stalled_resumes(&store);
+        }
+
+        // Idle sweep: suspend instances quiet past their task's
+        // `suspend.idle.after`. Not leader-gated: the usage it reads lives
+        // on whichever manager the nodes heartbeat to, and `begin_suspend`
+        // forwards to the scheduler-lane leader. An in-memory scan when
+        // nothing is due.
+        if let Some(idle) = config.idle_sweep.as_ref() {
+            if last_idle_sweep.is_none_or(|at| at.elapsed() >= idle.interval) {
+                last_idle_sweep = Some(std::time::Instant::now());
+                crate::manager::server::idle_sweep(&store, &idle.usage, &mut idle_sweeper);
             }
         }
 
@@ -2709,17 +2752,35 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             .transpose()?
             .unwrap_or_else(|| "{}".to_string());
 
-        let artifacts = match wcp.artifacts.as_ref() {
-            None => String::new(),
-            Some(config) => {
-                // Fail fast on malformed fetch settings (bad humantime /
-                // byte-size strings) at manager startup, not on the worker.
-                config.fetch_with_defaults().with_context(|| {
-                    format!("invalid artifacts config in worker config {path_str}")
-                })?;
-                serde_json::to_string(config)?
-            }
-        };
+        // Fail fast on malformed fetch and content settings (bad humantime /
+        // byte-size strings) at manager startup, not on the worker.
+        if let Some(config) = wcp.artifacts.as_ref() {
+            config
+                .fetch_with_defaults()
+                .with_context(|| format!("invalid artifacts config in worker config {path_str}"))?;
+        }
+        if let Some(content) = wcp.content.as_ref() {
+            content
+                .resolve()
+                .with_context(|| format!("invalid content config in worker config {path_str}"))?;
+        }
+        if let Some(target) = wcp.content_store.as_ref() {
+            target.validate().with_context(|| {
+                format!("invalid contentStore config in worker config {path_str}")
+            })?;
+        }
+        // The top-level `content` and `contentStore` blocks ride in the
+        // artifacts payload (see `WorkerArtifactsPayload`).
+        let artifacts =
+            if wcp.artifacts.is_none() && wcp.content.is_none() && wcp.content_store.is_none() {
+                String::new()
+            } else {
+                serde_json::to_string(&crate::structs::WorkerArtifactsPayload {
+                    artifacts: wcp.artifacts.clone().unwrap_or_default(),
+                    content: wcp.content.clone(),
+                    content_store: wcp.content_store.clone(),
+                })?
+            };
 
         // Host volumes are validated here so a typo (a relative path) fails at
         // manager startup rather than at a task's first mount.
@@ -2778,7 +2839,20 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                         enforcement.cgroup_parent
                     );
                 }
-                serde_json::to_string(enforcement)?
+                enforcement
+                    .validate()
+                    .with_context(|| format!("invalid worker config {path_str}"))?;
+                let mut enforcement = enforcement.clone();
+                if let Some(sandbox) = wcp.sandbox.as_ref() {
+                    if sandbox.vmm_overhead_mib == Some(0) {
+                        bail!(
+                            "worker config {path_str}: sandbox.vmmOverheadMiB must be at least 1; \
+                             a VMM process always needs some memory of its own"
+                        );
+                    }
+                    enforcement.sandbox = Some(sandbox.clone());
+                }
+                serde_json::to_string(&enforcement)?
             }
         };
 
@@ -3343,6 +3417,7 @@ mod tests {
                 heartbeat,
                 liveness: crate::structs::LivenessConfigFull::default(),
                 manager_node_id: "test-manager".into(),
+                idle_sweep: None,
             },
         ));
         tokio::time::sleep(Duration::from_millis(300)).await;

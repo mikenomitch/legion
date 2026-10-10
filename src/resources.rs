@@ -84,6 +84,12 @@ impl ResourcePolicy {
                     bail!("task resources missing required custom resource {required}");
                 }
             }
+            // Checked against the NORMALIZED memory, so a task that leaves
+            // `memory` to `taskResourceDefaults` cannot set a ceiling below
+            // the default it will be reserved at. Submit-path only: a stored
+            // row is never re-judged, or raising the default would make every
+            // node holding an old row fit nothing.
+            validate_memory_max(&normalized)?;
         }
 
         Ok(Value::Object(normalized))
@@ -124,9 +130,46 @@ impl ResourcePolicy {
         let rendered = serde_json::json!({
             "defaults": defaults,
             "required": required,
+            // Bumped when what an aggregate contains changes shape, not just
+            // its inputs. v2: `memoryMax` is a ceiling, not a dimension, so it
+            // is no longer summed (an aggregate cached before that would carry
+            // a stray `memoryMax` dim that fits nothing). Oversubscription
+            // ratios are deliberately NOT here: they scale capacity, which is
+            // read from the fresh node row on every pool build, never from
+            // this cache, so a ratio change invalidates nothing it needs to.
+            "aggregate": 2,
         });
         rendered.to_string()
     }
+}
+
+/// The task resource key for the burstable ceiling (MiB). A ceiling, not a
+/// scheduled dimension: the scheduler packs on `memory`, and `memoryMax` only
+/// reaches the worker, which enforces it as `memory.max`.
+pub(crate) const MEMORY_MAX_KEY: &str = "memoryMax";
+
+/// `memoryMax` must be a positive number no smaller than `memory`. The error
+/// spells out the fix, because the two fields are easy to swap.
+pub(crate) fn validate_memory_max(resources: &Map<String, Value>) -> R<()> {
+    let Some(raw) = resources.get(MEMORY_MAX_KEY) else {
+        return Ok(());
+    };
+    let Some(max) = raw.as_f64().filter(|max| max.is_finite() && *max > 0.0) else {
+        bail!("resources.memoryMax must be a positive number of MiB, got {raw}");
+    };
+    let memory = resources
+        .get("memory")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    if max < memory {
+        bail!(
+            "resources.memoryMax ({max} MiB) is below resources.memory ({memory} MiB). \
+             `memory` is what the scheduler reserves and `memoryMax` is the ceiling the task \
+             may burst to, so the ceiling must be at least the reservation. Raise memoryMax, \
+             or lower memory"
+        );
+    }
+    Ok(())
 }
 
 fn default_task_resource_defaults() -> Map<String, Value> {
@@ -242,6 +285,88 @@ mod tests {
             dynamic_attrs: json!({}),
             health_checks: json!({}),
         }
+    }
+
+    fn node_with_attrs(config_attrs: Value) -> Node {
+        Node {
+            config_attrs,
+            ..node_with_fingerprint(json!({
+                "memory_total": (8192u64 * 1024 * 1024).to_string(),
+                "cpus": { "0": { "frequency": "2000" }, "1": { "frequency": "2000" } },
+            }))
+        }
+    }
+
+    /// `(physical - reservedResources) x ratio`, for memory and CPU MHz,
+    /// never for cores. Junk ratios read as 1.0.
+    #[test]
+    fn oversubscription_scales_capacity_after_reserved_resources() -> R<()> {
+        let pool = ResourcePool::from_node(&node_with_attrs(json!({
+            "reservedResources": { "memory": 1024 },
+            "oversubscribe": { "memory": 1.5, "cpu": 2.0 },
+        })))?;
+        assert_eq!(pool.amount("memory"), Some(7168.0 * 1.5));
+        assert_eq!(pool.amount("cpu"), Some(8000.0));
+        assert_eq!(pool.amount("cores"), Some(2.0));
+
+        for junk in [
+            json!({ "memory": 0.5 }),
+            json!({ "memory": "lots" }),
+            json!(3),
+        ] {
+            let pool = ResourcePool::from_node(&node_with_attrs(json!({ "oversubscribe": junk })))?;
+            assert_eq!(pool.amount("memory"), Some(8192.0));
+        }
+        let capacity = NodeCapacity::of(&node_with_attrs(json!({
+            "oversubscribe": { "memory": 2.0 },
+        })))?;
+        assert_eq!(capacity.memory_mib, Some(16384.0));
+        assert_eq!(capacity.ratios.memory, 2.0);
+        assert_eq!(capacity.ratios.cpu, 1.0);
+        Ok(())
+    }
+
+    /// The cached per-node aggregate holds allocation demand only, and the
+    /// free pool is rebuilt from the node row each time, so a re-registration
+    /// that changes the ratio changes the pool with the very same cached
+    /// aggregate: nothing stale can overcommit further.
+    #[test]
+    fn a_ratio_change_reaches_a_pool_built_from_a_cached_aggregate() -> R<()> {
+        let policy = ResourcePolicy::from_manager_config(&ManagerConfigFull::default())?;
+        let rows = [(1, json!({ "memory": 4096, "memoryMax": 8192 }))];
+        let usage = NodeUsage::from_rows(rows.iter().map(|(id, value)| (*id, value)), &policy)?;
+        assert!(
+            !usage.dims.contains_key(MEMORY_MAX_KEY),
+            "a ceiling is never summed"
+        );
+        let plain = ResourcePool::free_from_usage(&node_with_attrs(json!({})), &usage);
+        let packed = ResourcePool::free_from_usage(
+            &node_with_attrs(json!({ "oversubscribe": { "memory": 1.5 } })),
+            &usage,
+        );
+        assert_eq!(plain.amount("memory"), Some(4096.0));
+        assert_eq!(packed.amount("memory"), Some(12288.0 - 4096.0));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_max_is_a_ceiling_not_a_dimension() -> R<()> {
+        let request = ResourceRequest::from_value(&json!({ "memory": 256, "memoryMax": 4096 }))?;
+        assert_eq!(request.amount("memory"), Some(256.0));
+        assert!(request.amount(MEMORY_MAX_KEY).is_none());
+
+        // Checked against the normalized memory on the submit path only.
+        let policy = ResourcePolicy::from_manager_config(&ManagerConfigFull::default())?;
+        let err = policy
+            .normalize_task_resources(&json!({ "memoryMax": 128 }), true)
+            .expect_err("below the 256 MiB default");
+        assert!(err.to_string().contains("memoryMax (128 MiB)"), "{err}");
+        policy.normalize_task_resources(&json!({ "memoryMax": 128 }), false)?;
+        assert!(policy
+            .normalize_task_resources(&json!({ "memory": 64, "memoryMax": -1 }), true)
+            .is_err());
+        policy.normalize_task_resources(&json!({ "memory": 64, "memoryMax": 64 }), true)?;
+        Ok(())
     }
 
     #[test]
@@ -512,11 +637,25 @@ pub(crate) struct ResourcePool {
 }
 
 impl ResourceRequest {
+    /// One amount-typed demand, if present.
+    pub(crate) fn amount(&self, name: &str) -> Option<f64> {
+        match self.values.get(name) {
+            Some(ResourceValue::Amount(amount)) => Some(*amount),
+            _ => None,
+        }
+    }
+
     pub(crate) fn from_value(value: &Value) -> R<Self> {
         let obj = value.as_object().context("resources must be an object")?;
         let mut values = HashMap::new();
 
         for (key, value) in obj {
+            // A ceiling the worker enforces, never something a node has to
+            // have free. Counting it would make it a custom resource no node
+            // advertises, which fits nothing.
+            if key == MEMORY_MAX_KEY {
+                continue;
+            }
             let demand = match value {
                 Value::Number(num) => {
                     let amount = num.as_f64().context("resource values must be numbers")?;
@@ -597,6 +736,21 @@ impl ResourcePool {
             for (name, value) in reserved {
                 let reservation = parse_resource_value(name, value)?;
                 pool.reserve(name, &reservation);
+            }
+        }
+
+        // Oversubscription scales what is left after `reservedResources`:
+        // `(physical - reserved) x ratio`. Applied here, at the one place
+        // capacity is born, so `can_fit`, the read model, and the apply
+        // transaction's recheck all see the same multiplied capacity with
+        // no change in shape. `cores` is never scaled: a pinned core is
+        // exclusive by definition.
+        let ratios = OversubscribeRatios::of(config_attrs);
+        for (name, ratio) in [("memory", ratios.memory), ("cpu", ratios.cpu)] {
+            if ratio > 1.0 {
+                if let Some(ResourceValue::Amount(available)) = pool.values.get_mut(name) {
+                    *available *= ratio;
+                }
             }
         }
 
@@ -1007,6 +1161,76 @@ const MIN_PLAUSIBLE_CPU_MHZ: f64 = 100.0;
 /// Frequency and core count are tracked separately because a platform can
 /// report one without the other: core count is reliable everywhere, while
 /// the per-core frequency is not.
+/// A node's schedulable memory and CPU, for usage displays
+/// (`GetNodeUsage`). Unknown amounts are `None` rather than the infinity
+/// the scheduler uses, because a display cannot print infinity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NodeCapacity {
+    /// Schedulable memory in MiB: fingerprinted memory minus
+    /// `reservedResources.memory`, times the memory oversubscription ratio.
+    pub memory_mib: Option<f64>,
+    /// Schedulable CPU in MHz, the same way.
+    pub cpu_mhz: Option<f64>,
+    /// Average clock per core, for turning measured cores into MHz.
+    pub mhz_per_core: Option<f64>,
+    /// The ratios already folded into the two amounts above.
+    pub ratios: OversubscribeRatios,
+}
+
+impl NodeCapacity {
+    pub(crate) fn of(node: &Node) -> R<Self> {
+        let pool = ResourcePool::from_node(node)?;
+        let finite = |value: Option<f64>| value.filter(|value| value.is_finite());
+        let cpu = fingerprint_cpu(node)?;
+        let config_attrs = node.config_attrs.as_object().cloned().unwrap_or_default();
+        Ok(Self {
+            memory_mib: finite(pool.amount("memory")),
+            cpu_mhz: finite(pool.amount("cpu")),
+            mhz_per_core: finite(Some(cpu.mhz / cpu.cores)).filter(|mhz| *mhz > 0.0),
+            ratios: OversubscribeRatios::of(&config_attrs),
+        })
+    }
+}
+
+/// A node's oversubscription ratios, as its worker reported them at
+/// registration (`config_attrs.oversubscribe`, from the worker type's
+/// `resourceEnforcement.oversubscribe`). 1.0 means off. A missing, malformed,
+/// or below-1.0 value reads as 1.0: the safe direction to guess in is "no
+/// more than physical".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OversubscribeRatios {
+    pub memory: f64,
+    pub cpu: f64,
+}
+
+impl Default for OversubscribeRatios {
+    fn default() -> Self {
+        Self {
+            memory: 1.0,
+            cpu: 1.0,
+        }
+    }
+}
+
+impl OversubscribeRatios {
+    pub(crate) fn of(config_attrs: &Map<String, Value>) -> Self {
+        let Some(block) = config_attrs.get("oversubscribe").and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let ratio = |name: &str| {
+            block
+                .get(name)
+                .and_then(Value::as_f64)
+                .filter(|ratio| ratio.is_finite() && *ratio >= 1.0)
+                .unwrap_or(1.0)
+        };
+        Self {
+            memory: ratio("memory"),
+            cpu: ratio("cpu"),
+        }
+    }
+}
+
 struct CpuFingerprint {
     /// Summed clock across all cores in MHz, or `INFINITY` when unknown.
     mhz: f64,

@@ -121,6 +121,16 @@ impl WorkerStateStore {
             .unwrap_or_else(|| PathBuf::from("logs"))
     }
 
+    /// Root of the node content store (`<state-dir>/content`). Beside the
+    /// state file for the same reason logs are: it is node state that must
+    /// survive worker restarts.
+    pub fn content_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|parent| parent.join("content"))
+            .unwrap_or_else(|| PathBuf::from("content"))
+    }
+
     /// Directory holding the captured stdout/stderr files for one allocation.
     pub fn allocation_log_dir(&self, allocation_id: i64) -> PathBuf {
         self.logs_base_dir().join(allocation_id.to_string())

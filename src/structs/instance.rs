@@ -78,6 +78,12 @@ pub enum InstanceState {
     /// by the scheduler; StartInstance moves it back to `Pending`. Unlike
     /// `Terminated` this is fully reversible.
     Stopped,
+    /// Keyed only: checkpointed and stopped by SuspendInstance. Like
+    /// `Stopped` it holds no allocation (unless `suspend.reserve` keeps its
+    /// reservation) and does not count toward desired. Unlike `Stopped`, its
+    /// `checkpoint_id` names a snapshot, and StartInstance restores from it
+    /// instead of cold-booting (see docs/suspend-and-resume.md).
+    Suspended,
     /// No longer desired (scaled in, job stopped, or destroyed). Slot-mode
     /// rows are retained so a later scale-out re-materializes the same id and
     /// reattaches the retained storage handle; keyed-mode rows are retained
@@ -92,6 +98,7 @@ impl InstanceState {
             InstanceState::Active => "active",
             InstanceState::Rescheduling => "rescheduling",
             InstanceState::Stopped => "stopped",
+            InstanceState::Suspended => "suspended",
             InstanceState::Terminated => "terminated",
         }
     }
@@ -112,6 +119,7 @@ impl std::str::FromStr for InstanceState {
             "active" => Ok(InstanceState::Active),
             "rescheduling" => Ok(InstanceState::Rescheduling),
             "stopped" => Ok(InstanceState::Stopped),
+            "suspended" => Ok(InstanceState::Suspended),
             "terminated" => Ok(InstanceState::Terminated),
             other => Err(format!("Unknown instance state {other}")),
         }
@@ -148,6 +156,11 @@ pub struct Instance {
     pub created_at: String,
     /// RFC 3339 timestamp of the last state/binding change.
     pub updated_at: String,
+    /// The snapshot this instance is restoring from (RestoreInstance), until
+    /// its node reports the outcome. Written only by the snapshot restore
+    /// ops, never by a generic upsert (see `INSTANCE_SELECT_ATTRS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_from: Option<String>,
 }
 
 /// Deterministic slot-mode instance id: `{job_id}-{group}-{slot}`.
@@ -242,6 +255,7 @@ mod tests {
             InstanceState::Active,
             InstanceState::Rescheduling,
             InstanceState::Stopped,
+            InstanceState::Suspended,
             InstanceState::Terminated,
         ] {
             let json = serde_json::to_string(&state)?;

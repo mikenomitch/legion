@@ -1,6 +1,7 @@
 pub mod acl_store;
 pub mod boot_ticket_store;
 pub(crate) mod coalesce;
+pub mod content_index;
 pub mod errors;
 pub mod events;
 pub mod keyring;
@@ -10,6 +11,7 @@ pub mod netpolicy_store;
 pub mod persistence;
 pub mod queries;
 pub mod raft;
+pub mod snapshot_warm;
 pub mod store;
 
 pub(crate) use raft::Lane;

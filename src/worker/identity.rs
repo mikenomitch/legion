@@ -804,6 +804,155 @@ mod tests {
         }
     }
 
+    /// Issues a token that names the allocation it was issued for, as the
+    /// manager's `legion.io/alloc` claim does.
+    struct AllocNamingIssuer;
+
+    #[tonic::async_trait]
+    impl TokenIssuer for AllocNamingIssuer {
+        async fn issue(
+            &self,
+            alloc_id: i64,
+            _identity_name: &str,
+        ) -> R<Option<IssuedIdentityToken>> {
+            Ok(Some(IssuedIdentityToken {
+                token: format!("token-for-alloc-{alloc_id}"),
+                expires_at: unix_now() + 900,
+            }))
+        }
+    }
+
+    /// Suspend plan §6.12: a restored guest's token must name the NEW
+    /// allocation. The resume allocation's tokens are issued before the
+    /// restore like any start's, and the identity disk the guest re-reads
+    /// carries them, with the new allocation id.
+    #[tokio::test]
+    async fn a_restored_guest_gets_a_token_naming_the_new_allocation() -> R<()> {
+        let identities = vec![WorkloadIdentity {
+            name: "acme".into(),
+            audience: vec!["acme-api".into()],
+            env: Some("ACME_TOKEN".into()),
+            ..Default::default()
+        }];
+        let manager = Arc::new(WorkerIdentityManager::new(Arc::new(AllocNamingIssuer)));
+        // The resume runs as allocation 52; the suspended one was 51.
+        let mut allocation = TaskAllocation {
+            allocation_id: 52,
+            job_id: "agents".into(),
+            task_name: "workspace".into(),
+            task_runtime: "sandbox".into(),
+            task_config: json!({ "image": "alpine", "command": ["sleep", "1"] }).to_string(),
+            task_identities: serde_json::to_string(&identities)?,
+            ..Default::default()
+        };
+        manager
+            .prepare_task_allocation(&mut allocation, None)
+            .await?;
+        let (alloc, task) = crate::worker::task_manager::task_and_allocation(&allocation)?;
+        let restore = crate::structs::SnapshotRestore {
+            snapshot_id: "snap-suspend".into(),
+            kind: "memory".into(),
+            manifest_json: "{}".into(),
+            on_resume: vec!["/bin/reconnect".into()],
+            ..Default::default()
+        };
+        let identity = crate::worker::checkpoints::resume_identity(&alloc, &task, &restore);
+        assert_eq!(identity.alloc_id, 52);
+        assert_eq!(identity.token.as_deref(), Some("token-for-alloc-52"));
+        assert_eq!(
+            identity.env.get("ACME_TOKEN").map(String::as_str),
+            Some("token-for-alloc-52")
+        );
+        assert_eq!(
+            identity.env.get("LEGION_ALLOC_ID").map(String::as_str),
+            Some("52")
+        );
+        assert_eq!(identity.hostname, "legion-sbx-52");
+        assert_eq!(identity.on_resume, vec!["/bin/reconnect".to_string()]);
+        assert!(identity.host_time_unix_ms > 0);
+        assert_eq!(identity.entropy.len(), 64);
+        Ok(())
+    }
+
+    /// Phase 6 (plan §9): three forks of one checkpoint diverge in
+    /// everything that names them. Each restores as its own allocation, so
+    /// it gets its own token (the `legion.io/alloc` claim names it), its own
+    /// instance id, hostname, MAC, and entropy. The TAP each one gets is
+    /// covered in `sandbox_checkpoint`.
+    #[tokio::test]
+    async fn three_forks_get_divergent_identities() -> R<()> {
+        let identities = vec![WorkloadIdentity {
+            name: "acme".into(),
+            audience: vec!["acme-api".into()],
+            env: Some("ACME_TOKEN".into()),
+            ..Default::default()
+        }];
+        let manager = Arc::new(WorkerIdentityManager::new(Arc::new(AllocNamingIssuer)));
+        let mut seen: Vec<crate::structs::checkpoint::ResumeIdentity> = Vec::new();
+        for (n, allocation_id) in [(1, 61), (2, 62), (3, 63)] {
+            let mut allocation = TaskAllocation {
+                allocation_id,
+                job_id: "agents".into(),
+                task_name: "workspace".into(),
+                task_runtime: "sandbox".into(),
+                task_config: json!({ "image": "alpine", "command": ["sleep", "1"] }).to_string(),
+                task_identities: serde_json::to_string(&identities)?,
+                ..Default::default()
+            };
+            manager
+                .prepare_task_allocation(&mut allocation, None)
+                .await?;
+            let (alloc, task) = crate::worker::task_manager::task_and_allocation(&allocation)?;
+            let restore = crate::structs::SnapshotRestore {
+                snapshot_id: "snap-fork".into(),
+                kind: "memory".into(),
+                manifest_json: "{}".into(),
+                fork: true,
+                instance_id: format!("run-17-f{n}"),
+                ..Default::default()
+            };
+            let identity = crate::worker::checkpoints::resume_identity(&alloc, &task, &restore);
+            assert!(identity.fork);
+            assert_eq!(
+                identity.env.get("LEGION_INSTANCE_ID").map(String::as_str),
+                Some(format!("run-17-f{n}").as_str())
+            );
+            seen.push(identity);
+        }
+        let distinct = |field: fn(&crate::structs::checkpoint::ResumeIdentity) -> String| {
+            seen.iter()
+                .map(field)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+        assert_eq!(distinct(|i| i.alloc_id.to_string()), 3);
+        assert_eq!(distinct(|i| i.instance_id.clone().unwrap_or_default()), 3);
+        assert_eq!(distinct(|i| i.hostname.clone()), 3);
+        assert_eq!(distinct(|i| i.mac.clone().unwrap_or_default()), 3);
+        assert_eq!(distinct(|i| i.token.clone().unwrap_or_default()), 3);
+        assert_eq!(distinct(|i| i.entropy.clone()), 3);
+        assert_eq!(seen[0].token.as_deref(), Some("token-for-alloc-61"));
+
+        // A resume of the same instance keeps its NIC: no new MAC.
+        let (alloc, task) = crate::worker::task_manager::task_and_allocation(&TaskAllocation {
+            allocation_id: 64,
+            task_name: "workspace".into(),
+            task_runtime: "sandbox".into(),
+            task_config: "{}".into(),
+            ..Default::default()
+        })?;
+        let resume = crate::worker::checkpoints::resume_identity(
+            &alloc,
+            &task,
+            &crate::structs::SnapshotRestore {
+                instance_id: "user-42".into(),
+                ..Default::default()
+            },
+        );
+        assert!(resume.mac.is_none() && !resume.fork);
+        Ok(())
+    }
+
     fn file_identity(path: &Path, change_mode: ChangeMode) -> WorkloadIdentity {
         WorkloadIdentity {
             name: "aws".into(),

@@ -8,7 +8,13 @@ use std::collections::HashMap;
 
 use crate::constraints::AffinitySet;
 use crate::prelude::*;
+use crate::storage::content_index::LocalityScores;
 use crate::structs::config::DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT;
+
+/// Default `schedulerSettings.weights.locality`: the same scale as
+/// `affinities`, so a node holding all of a placement's content gains as much
+/// as one satisfied affinity.
+pub const DEF_SCHEDULER_LOCALITY_WEIGHT: f64 = 1.0;
 use crate::structs::{Node, TaskConfig};
 use libloading::{Library, Symbol};
 use rand::seq::SliceRandom;
@@ -21,6 +27,11 @@ pub struct SchedulerWeights {
     pub spread: f64,
     pub bin_pack: f64,
     pub automatic_anti_affinity: f64,
+    /// `schedulerSettings.weights.locality`: how strongly to prefer nodes
+    /// that already hold a placement's content (docs/artifacts.md, "Content
+    /// locality"). The term is in `0.0..=1.0` and is skipped entirely for a
+    /// placement with no content set.
+    pub locality: f64,
 }
 
 impl SchedulerWeights {
@@ -31,18 +42,21 @@ impl SchedulerWeights {
                 spread: 1.0,
                 bin_pack: 0.0,
                 automatic_anti_affinity: DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT,
+                locality: DEF_SCHEDULER_LOCALITY_WEIGHT,
             },
             "bin_pack" => SchedulerWeights {
                 affinity: 1.0,
                 spread: 0.0,
                 bin_pack: 1.0,
                 automatic_anti_affinity: DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT,
+                locality: DEF_SCHEDULER_LOCALITY_WEIGHT,
             },
             _ => SchedulerWeights {
                 affinity: 1.0,
                 spread: 0.0,
                 bin_pack: 0.0,
                 automatic_anti_affinity: DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT,
+                locality: DEF_SCHEDULER_LOCALITY_WEIGHT,
             },
         }
     }
@@ -62,6 +76,9 @@ pub struct SchedulingContext<'a> {
     pub planned_task_allocations: &'a HashMap<String, Vec<i64>>,
     pub planned: &'a HashMap<String, usize>,
     pub weights: SchedulerWeights,
+    /// Per-node locality for this placement's content set. `None` (no
+    /// content set) skips the term.
+    pub locality: Option<&'a LocalityScores>,
 }
 
 #[allow(dead_code)]
@@ -91,7 +108,14 @@ impl<'a> SchedulingContext<'a> {
             planned_task_allocations,
             planned,
             weights,
+            locality: None,
         }
+    }
+
+    /// Attach the placement's locality scores (see [`LocalityScores`]).
+    pub fn with_locality(mut self, locality: Option<&'a LocalityScores>) -> Self {
+        self.locality = locality;
+        self
     }
 
     pub fn total_assigned(&self, node_id: &str) -> usize {
@@ -294,10 +318,16 @@ pub(crate) fn score_node_for_context(
     let affinity_score = affinity_score(ctx.task, ctx.affinity_set, node, ctx);
     let anti_affinity_penalty = automatic_anti_affinity_penalty(ctx, node);
 
+    let locality_score = ctx
+        .locality
+        .map(|scores| scores.score(&node.id))
+        .unwrap_or(0.0);
+
     ctx.weights.affinity * affinity_score
         + ctx.weights.spread * spread_score
         + ctx.weights.bin_pack * bin_pack_score
         - ctx.weights.automatic_anti_affinity * anti_affinity_penalty
+        + ctx.weights.locality * locality_score
 }
 
 fn automatic_anti_affinity_penalty(ctx: &SchedulingContext<'_>, node: &Node) -> f64 {
@@ -684,6 +714,7 @@ mod tests {
                         spread: 0.0,
                         bin_pack: 5e-10,
                         automatic_anti_affinity: 0.0,
+                        locality: 0.0,
                     },
                 ))
                 .expect("node expected");
@@ -754,5 +785,67 @@ mod tests {
 
         let choice = policy.select_node(ctx);
         assert!(choice.is_none());
+    }
+
+    #[test]
+    fn locality_breaks_an_otherwise_equal_tie_toward_the_warm_node() {
+        let nodes = [node("cold"), node("warm")];
+        let allocations = SharedNodeAllocations::new();
+        let planned: HashMap<String, usize> = HashMap::new();
+        let task = task("agent");
+        let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
+        let scores = LocalityScores::from_scores(HashMap::from([("warm".to_string(), 1.0)]), 1);
+        for policy in ["bin_pack", "spread"] {
+            // Equal on every other term, so without locality this is a coin
+            // flip; with it, the warm node wins every time.
+            for _ in 0..32 {
+                let ctx = SchedulingContext::new(
+                    nodes.iter().collect(),
+                    &task,
+                    1,
+                    &affinity_set,
+                    "job",
+                    &allocations,
+                    empty_task_name_to_id(),
+                    empty_task_id_to_group(),
+                    empty_planned_task_allocations(),
+                    &planned,
+                    SchedulerWeights::for_policy(policy),
+                )
+                .with_locality(Some(&scores));
+                let choice = load_policy(policy).expect("policy").1.select_node(ctx);
+                assert_eq!(choice.expect("node").id, "warm", "{policy}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_locality_weight_ignores_the_scores() {
+        let nodes = [node("cold"), node("warm")];
+        let allocations = SharedNodeAllocations::new();
+        let planned: HashMap<String, usize> = HashMap::new();
+        let task = task("agent");
+        let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
+        let scores = LocalityScores::from_scores(HashMap::from([("warm".to_string(), 1.0)]), 1);
+        let mut weights = SchedulerWeights::for_policy("bin_pack");
+        weights.locality = 0.0;
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            1,
+            &affinity_set,
+            "job",
+            &allocations,
+            empty_task_name_to_id(),
+            empty_task_id_to_group(),
+            empty_planned_task_allocations(),
+            &planned,
+            weights,
+        )
+        .with_locality(Some(&scores));
+        let loads = HashMap::new();
+        let warm = score_node_for_context(&ctx, &nodes[1], &loads, 0.0, 0.0);
+        let cold = score_node_for_context(&ctx, &nodes[0], &loads, 0.0, 0.0);
+        assert_eq!(warm, cold);
     }
 }

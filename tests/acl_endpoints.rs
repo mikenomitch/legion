@@ -106,6 +106,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("FetchNetPolicy", Plane::Worker),
         ("GetNodes", Plane::Protected("node:read")),
         ("GetHeartbeatCadence", Plane::Protected("node:read")),
+        ("GetNodeUsage", Plane::Protected("node:read")),
         ("GetNode", Plane::Protected("node:read")),
         ("RestartWorker", Plane::Protected("node:write")),
         ("SetNodeAvailability", Plane::Protected("node:write")),
@@ -144,9 +145,29 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("DestroyInstance", Plane::Protected("job:write")),
         ("StopInstance", Plane::Protected("job:write")),
         ("StartInstance", Plane::Protected("job:write")),
+        // SuspendInstance also needs `snapshot:write` for a memory checkpoint.
+        ("SuspendInstance", Plane::Protected("job:write")),
+        // Phase 6: ForkInstance also needs `snapshot:write` (a fork reads
+        // everything the origin held in memory); the coarse gate it reports
+        // first is `job:write`.
+        ("ForkInstance", Plane::Protected("job:write")),
         ("ReplaceInstance", Plane::Protected("job:write")),
         ("ListInstances", Plane::Protected("job:read")),
         ("GetInstance", Plane::Protected("job:read")),
+        // Snapshots are their own resource: a memory snapshot holds the
+        // workload's in-memory secrets, which `job:write` must not imply.
+        // RestoreInstance also needs `job:write` (it replaces an allocation);
+        // the coarse gate it reports first is `snapshot:read`.
+        ("CreateSnapshot", Plane::Protected("snapshot:write")),
+        ("ListSnapshots", Plane::Protected("snapshot:read")),
+        ("GetSnapshot", Plane::Protected("snapshot:read")),
+        ("DeleteSnapshot", Plane::Protected("snapshot:write")),
+        ("RestoreInstance", Plane::Protected("snapshot:read")),
+        // Snapshot names.
+        ("SetSnapshotAlias", Plane::Protected("snapshot:write")),
+        ("DeleteSnapshotAlias", Plane::Protected("snapshot:write")),
+        // Warming only reads the snapshot (its published parts).
+        ("WarmSnapshot", Plane::Protected("snapshot:read")),
         // Volumes are job-scoped storage, so they read/write under `job`.
         // ListVolumePlugins is cluster capability data, like node fingerprints.
         ("ListVolumes", Plane::Protected("job:read")),
@@ -595,6 +616,15 @@ async fn call_endpoint(
             .get_heartbeat_cadence(req(GetHeartbeatCadenceRequest {}, token))
             .await
             .map(|_| ()),
+        "GetNodeUsage" => svc
+            .get_node_usage(req(
+                GetNodeUsageRequest {
+                    node_id: NODE_ID.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "GetNode" => svc
             .get_node(req(GetNodeRequest { id: NODE_ID.into() }, token))
             .await
@@ -864,6 +894,50 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "SuspendInstance" => svc
+            .suspend_instance(req(
+                legion::structs::SuspendInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ForkInstance" => svc
+            .fork_instance(req(
+                ForkInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    count: 1,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "SetSnapshotAlias" => svc
+            .set_snapshot_alias(req(
+                SetSnapshotAliasRequest {
+                    job_id: JOB_NAME.into(),
+                    name: "golden".into(),
+                    snapshot: "snap-missing".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteSnapshotAlias" => svc
+            .delete_snapshot_alias(req(
+                DeleteSnapshotAliasRequest {
+                    job_id: JOB_NAME.into(),
+                    name: "golden".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "ReplaceInstance" => svc
             .replace_instance(req(
                 ReplaceInstanceRequest {
@@ -888,6 +962,62 @@ async fn call_endpoint(
             .get_instance(req(
                 GetInstanceRequest {
                     instance_id: "missing-instance".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "CreateSnapshot" => svc
+            .create_snapshot(req(
+                CreateSnapshotRequest {
+                    instance_id: "missing-instance".into(),
+                    kind: "disk".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListSnapshots" => svc
+            .list_snapshots(req(ListSnapshotsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetSnapshot" => svc
+            .get_snapshot(req(
+                GetSnapshotRequest {
+                    snapshot: "snap-missing".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteSnapshot" => svc
+            .delete_snapshot(req(
+                DeleteSnapshotRequest {
+                    snapshot_id: "snap-missing".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "RestoreInstance" => svc
+            .restore_instance(req(
+                RestoreInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    snapshot: "snap-missing".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "WarmSnapshot" => svc
+            .warm_snapshot(req(
+                WarmSnapshotRequest {
+                    snapshot: "snap-missing".into(),
+                    ..Default::default()
                 },
                 token,
             ))
@@ -2819,6 +2949,7 @@ async fn worker_register_version_handshake_round_trip() -> R<()> {
                 join_token: None,
                 build_version: "9.9.9-test".into(),
                 protocol_version: PROTOCOL_VERSION,
+                capabilities: vec!["checkpoint".into()],
             },
             None,
         ))
@@ -2830,6 +2961,12 @@ async fn worker_register_version_handshake_round_trip() -> R<()> {
     // The versions land in the node's dynamic attrs.
     let node = store.get_node("versioned-worker")?;
     assert_eq!(node.dynamic_attrs["buildVersion"], "9.9.9-test");
+    // Capabilities are recorded, so checkpoint work only goes to workers
+    // that advertised it.
+    assert_eq!(
+        node.dynamic_attrs["capabilities"],
+        serde_json::json!(["checkpoint"])
+    );
     assert_eq!(
         node.dynamic_attrs["protocolVersion"],
         serde_json::json!(PROTOCOL_VERSION)
@@ -2871,6 +3008,7 @@ async fn worker_register_version_handshake_round_trip() -> R<()> {
                 join_token: None,
                 build_version: "99.0.0".into(),
                 protocol_version: PROTOCOL_VERSION + 1,
+                capabilities: Vec::new(),
             },
             None,
         ))
@@ -2886,5 +3024,98 @@ async fn worker_register_version_handshake_round_trip() -> R<()> {
         store.get_node("future-worker").is_err(),
         "rejected workers must not be inserted into the node table"
     );
+    Ok(())
+}
+
+/// SuspendInstance is `job:write`, plus `snapshot:write` for a memory
+/// checkpoint (a memory checkpoint holds the workload's in-memory secrets).
+/// An explicit `checkpoint = "memory"` is refused before any lookup.
+#[tokio::test]
+async fn memory_suspend_needs_snapshot_write() -> R<()> {
+    let (svc, _fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    svc.store.upsert_acl_policy(
+        "job-writer",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+    )?;
+    let (_, secret) = authenticator
+        .mint_token(
+            &svc.store,
+            "job-writer",
+            "client",
+            &["job-writer".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+    let suspend = |checkpoint: Option<&str>| legion::structs::SuspendInstanceRequest {
+        instance_id: "missing-instance".into(),
+        checkpoint: checkpoint.map(str::to_string),
+        idempotency_key: None,
+    };
+
+    let status = svc
+        .suspend_instance(req(suspend(Some("memory")), Some(&secret)))
+        .await
+        .expect_err("memory needs snapshot:write");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    // A disk suspend passes the ACL check and reaches the lookup.
+    let status = svc
+        .suspend_instance(req(suspend(Some("disk")), Some(&secret)))
+        .await
+        .expect_err("no such instance");
+    assert_eq!(status.code(), Code::NotFound);
+    Ok(())
+}
+
+/// Phase 6: ForkInstance needs `snapshot:write` as well as `job:write` (a
+/// fork reads everything the origin held in memory), and a create from a
+/// snapshot needs `snapshot:read` as well as `job:write`. Both are refused
+/// before any lookup.
+#[tokio::test]
+async fn fork_and_create_from_snapshot_need_snapshot_grants() -> R<()> {
+    let (svc, _fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    svc.store.upsert_acl_policy(
+        "job-writer",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+    )?;
+    let (_, secret) = authenticator
+        .mint_token(
+            &svc.store,
+            "job-writer",
+            "client",
+            &["job-writer".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    let status = svc
+        .fork_instance(req(
+            ForkInstanceRequest {
+                instance_id: "missing-instance".into(),
+                count: 3,
+                ..Default::default()
+            },
+            Some(&secret),
+        ))
+        .await
+        .expect_err("fork needs snapshot:write");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    let status = svc
+        .create_instances(req(
+            CreateInstancesRequest {
+                job_id: JOB_NAME.into(),
+                count: 2,
+                from_snapshot: Some("golden".into()),
+                ..Default::default()
+            },
+            Some(&secret),
+        ))
+        .await
+        .expect_err("a create from a snapshot needs snapshot:read");
+    assert_eq!(status.code(), Code::PermissionDenied);
     Ok(())
 }

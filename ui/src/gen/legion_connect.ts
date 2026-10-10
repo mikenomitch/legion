@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, TestNetPolicyReply, TestNetPolicyRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, SuspendInstanceReply, SuspendInstanceRequest, TestNetPolicyReply, TestNetPolicyRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -388,6 +388,10 @@ export const Manager = {
      *   lifetime of the job (the never-recycle guarantee; destroying the whole
      *   job clears its instance history — see DestroyJob).
      *
+     * `from_snapshot` restores the new instance from a snapshot
+     * instead of booting it empty. See `CreateInstances` for the contract,
+     * which is the same for one instance.
+     *
      * @generated from rpc legion.Manager.CreateInstance
      */
     createInstance: {
@@ -432,6 +436,31 @@ export const Manager = {
      *   instance row — including duplicates within the request itself, Stopped
      *   instances, and Terminated tombstones. Nothing is created.
      *
+     * Restoring from a snapshot (docs/suspend-and-resume.md, "Create from a
+     * snapshot"): with `from_snapshot` set to a snapshot id or
+     * a name of the job (see SetSnapshotAlias), every created instance starts
+     * from that snapshot instead of booting empty. Each gets its own clone of
+     * the snapshot's volume (the volume driver's `clone` op) and its own
+     * identity (allocation id, hostname, workload-identity token, fresh
+     * entropy, and for a memory snapshot of a TAP-wired sandbox its own MAC
+     * and TAP device). A `local` snapshot pins the instances to its node and
+     * is checked against its `compat` there. A `published` one places each
+     * instance on any node whose worker can fetch it and whose fingerprint
+     * passes its `compat`. Either way one call creates at most 64 instances.
+     * A restore that fails on the node follows `suspend.onRestoreFailure`
+     * like a fork does (see ForkInstance). The snapshot itself is untouched
+     * and can seed any number of later creates.
+     *
+     * `from_snapshot` also needs `snapshot:read` on the job (restoring reads
+     * the snapshot), and adds these errors:
+     * - NotFound: no snapshot with that id or name in the job.
+     * - InvalidArgument: the snapshot was taken from another task, or more
+     *   than 64 instances were asked for.
+     * - FailedPrecondition: the snapshot is not `local` or `published`, is a
+     *   suspend or fork checkpoint (owned by an instance, not a seed; take a
+     *   manual snapshot), or is a memory snapshot and the task now declares
+     *   gated networking.
+     *
      * @generated from rpc legion.Manager.CreateInstances
      */
     createInstances: {
@@ -458,7 +487,9 @@ export const Manager = {
      * call is safe to retry even without an idempotency key.
      *
      * Destroy also applies to Stopped instances: the row transitions
-     * stopped -> terminated and its retained storage handle is dropped.
+     * stopped -> terminated and its retained storage handle is dropped. It
+     * applies to Suspended instances the same way, and their suspend
+     * checkpoint is reclaimed on its node.
      *
      * Errors:
      * - NotFound: no instance row with this id exists.
@@ -491,6 +522,10 @@ export const Manager = {
      * resubmits / config updates / reschedules will not resurrect it. Only an
      * explicit `StartInstance` does.
      *
+     * A `suspended` instance can be stopped too: its checkpoint is discarded
+     * (and any held reservation released), and the next `StartInstance` boots
+     * it cold.
+     *
      * Stopping an already-stopped instance succeeds as a no-op, so the call is
      * safe to retry even without an idempotency key.
      *
@@ -511,12 +546,36 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Starts (resumes) a stopped keyed-mode instance.
+     * Starts a stopped keyed-mode instance, or resumes a suspended one.
      *
-     * The instance transitions `stopped -> pending` and a placement evaluation
-     * is enqueued (exactly like `CreateInstance` does), so the scheduler
-     * places a new allocation bound to the same instance id and its RETAINED
-     * storage handle — the revived workload is *the same* logical instance.
+     * A `stopped` instance transitions `stopped -> pending` and a placement
+     * evaluation is enqueued (exactly like `CreateInstance` does), so the
+     * scheduler places a new allocation bound to the same instance id and its
+     * RETAINED storage handle — the revived workload is *the same* logical
+     * instance, booted cold.
+     *
+     * A `suspended` instance resumes from its checkpoint
+     * (docs/suspend-and-resume.md): it transitions `suspended -> pending` with
+     * its checkpoint as the restore source, and placement pins it to the node
+     * that holds the checkpoint (`durability = "local"`), checking the
+     * manifest's `compat` there. The node restores instead of booting: a
+     * memory checkpoint resumes the guest where it was, with a refreshed
+     * identity (a new allocation id and a newly issued workload-identity
+     * token naming it); a disk checkpoint boots fresh on the retained volume.
+     * The reply returns once the resume is queued. `instance.resumed` (or
+     * `instance.restore_failed`) reports the outcome, and `instance get` shows
+     * `last_restore_ms`. A held reservation (`suspend.reserve`) is released in
+     * the same transaction, so the restore lands on the capacity it held.
+     *
+     * When the checkpoint cannot be used (it was lost with its node, or its
+     * capture failed), `suspend.onRestoreFailure` decides: `cold` (default)
+     * boots fresh on the retained storage and emits `instance.restore_failed`;
+     * `fail` leaves the instance `suspended` and returns FailedPrecondition
+     * with the reason, which also lands in the instance's `detail`. A resume
+     * that waits longer than `suspend.resumeTimeout` (default 30s) for its
+     * checkpoint's node also boots cold under `onRestoreFailure = "cold"`.
+     * `cold = true` discards the checkpoint and boots fresh: the responder's
+     * escape hatch.
      *
      * Starting an instance that is already live (pending, active, or
      * rescheduling) succeeds as a no-op, so the call is safe to retry even
@@ -527,8 +586,10 @@ export const Manager = {
      * - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
      *   by the scheduler via `count.num`, not this API).
      * - FailedPrecondition: the instance is Terminated (destroyed ids are
-     *   tombstoned forever — create a NEW id instead), or the owning job is
-     *   stopped (run the job first; a stopped job schedules nothing).
+     *   tombstoned forever — create a NEW id instead), the owning job is
+     *   stopped (run the job first; a stopped job schedules nothing), or a
+     *   suspended instance's checkpoint is unusable under
+     *   `onRestoreFailure = "fail"` (retry with `cold = true`).
      *
      * @generated from rpc legion.Manager.StartInstance
      */
@@ -536,6 +597,167 @@ export const Manager = {
       name: "StartInstance",
       I: StartInstanceRequest,
       O: StartInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Suspends a keyed-mode instance: checkpoint it, stop it, and release its
+     * reservation (docs/suspend-and-resume.md).
+     *
+     * The manager records a `purpose = suspend` snapshot and asks the
+     * instance's node, on its next heartbeat, to capture the running
+     * allocation and leave it stopped. A memory checkpoint pauses the guest,
+     * writes its memory and device state into the node content store, and
+     * only then stops the VMM. A disk checkpoint stops the task and retains
+     * its volume in place (no copy is made). When the node reports success,
+     * one transaction deletes the allocation (freeing its reservation, which
+     * `legion node usage` shows), sets the instance `suspended` with
+     * `checkpoint_id`, and emits `instance.suspended` and `allocation.removed`
+     * with `cause = suspended`. With `suspend.reserve = true` the allocation
+     * row stays, holding the reservation, and is never dispatched.
+     *
+     * A suspend never stops a workload it failed to capture: on a capture
+     * failure the instance stays `active`, its allocation keeps running, and
+     * `instance.suspend_failed` carries the node's error. The reply returns
+     * once the suspend is queued; poll GetInstance (or `legion instance
+     * suspend --wait`) for `state = suspended`.
+     *
+     * Suspended instances hold no allocation, do not count toward desired,
+     * survive a job stop, and keep their checkpoint until they resume
+     * successfully, are stopped, or are destroyed. Suspend checkpoints are
+     * never subject to `snapshots.ttl` or `snapshots.keep`.
+     *
+     * ACLs: `job:write` on the instance's job, plus `snapshot:write` when the
+     * checkpoint is `memory` (a memory checkpoint holds everything the
+     * workload had in RAM, including secrets).
+     *
+     * Mutating and retry-safe: pass `idempotency_key`, and a retry returns
+     * the first call's result with `deduplicated = true`. Suspending an
+     * instance that is already suspended, or already being suspended, is a
+     * no-op that names the existing checkpoint.
+     *
+     * Errors:
+     * - NotFound: no instance row with this id exists.
+     * - InvalidArgument: the instance is slot-mode, `checkpoint` is not
+     *   `memory` or `disk`, or the task is not a keyed stateful task.
+     * - FailedPrecondition: the instance has no running allocation (it is
+     *   pending, rescheduling, stopped, or terminated); its node runs a worker
+     *   without the `checkpoint` capability (the message names the worker
+     *   version: upgrade it); a memory checkpoint was asked of a runtime that
+     *   supports disk only (`Hint: use --checkpoint disk`), of a gated
+     *   sandbox, or of a sandbox not launched for memory checkpoints.
+     *   With `suspend.durability = "store"`, the instance's data is
+     *   on a node-local volume (`local-dir`, or a driver advertising
+     *   `nodeLocal`), or its node's worker has no `contentStore` (it does not
+     *   advertise the `content-publish` capability).
+     *
+     * With `suspend.durability = "store"`, the suspend completes exactly
+     * as above (the instance is `suspended` once the checkpoint is on the
+     * node), and the node then publishes the checkpoint to its
+     * `contentStore`. When the upload finishes the snapshot is `published`
+     * (`snapshot.published`), a resume can run on any compatible node, and
+     * node loss no longer loses it. A failed upload leaves it `local`, with
+     * the reason in the snapshot's `error` and `snapshot.publish_failed`, and
+     * the manager asks the node to publish again after one minute, then five
+     * (three attempts in all).
+     *
+     * @generated from rpc legion.Manager.SuspendInstance
+     */
+    suspendInstance: {
+      name: "SuspendInstance",
+      I: SuspendInstanceRequest,
+      O: SuspendInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Forks a running keyed instance into `count` new instances
+     * (docs/suspend-and-resume.md, "Fork").
+     *
+     * The origin is checkpointed live: a memory checkpoint pauses the guest
+     * only while its memory and disks are captured (`pause_ms`), then it
+     * resumes; a disk checkpoint copies the instance volume while the task
+     * keeps running (crash-consistent, like pulling the power cord). The
+     * origin keeps its allocation, id, storage, and identity throughout.
+     *
+     * Each fork is a NEW keyed instance of the origin's task, created by this
+     * call and returned in `instances`:
+     * - Its id is `<origin>-f<n>`, with `n` the lowest number whose id has
+     *   never existed (ids are never recycled). An origin id too long to
+     *   suffix gets server-minted ids instead.
+     * - Its storage is a clone of the origin's volume at the checkpoint, made
+     *   with the volume driver's `clone` op (a reflink or a sparse copy on
+     *   `local-dir`), so a write in one fork is never seen by another or by
+     *   the origin.
+     * - Its identity is its own: a new allocation id, hostname, and workload
+     *   identity token, fresh entropy, and for a memory fork of a sandbox
+     *   wired to a TAP device, its own MAC address and TAP device.
+     *
+     * Forks wait in `pending` (`pending_op = forking`) until the checkpoint
+     * lands. Then `instance.forked` is emitted and they are placed. By default
+     * the checkpoint is node-local, so every fork is pinned to the origin's
+     * node, and a fork that does not fit there waits for room like any pending
+     * placement. A failed capture leaves the origin running, terminates the
+     * forks with the reason in their `detail`, and emits
+     * `instance.fork_failed`.
+     *
+     * With `spread = true` the checkpoint is published (`durability =
+     * store`) to the origin node's `contentStore`, and the forks wait for the
+     * publish rather than the capture. Each fork is then placed on a
+     * compatible node that none of its siblings runs on (any node whose
+     * worker can fetch published snapshots, whose fingerprint passes the
+     * checkpoint's `compat`), fetches the parts there, and restores. The
+     * origin's node may take one fork. A fork with no such node left waits,
+     * like a `distinct` placement. A publish that fails for good (after the
+     * manager's retries) terminates the forks with the reason and emits
+     * `instance.fork_failed`; the origin keeps running. A fork whose restore fails on the node follows
+     * the task's `suspend.onRestoreFailure`: `cold` (default) boots it fresh
+     * on its cloned volume, `fail` stops it. Either way
+     * `instance.restore_failed` names the reason.
+     *
+     * Forks of one memory checkpoint on one node map the same memory file
+     * copy-on-write (Firecracker), so unmodified pages are shared. Each fork
+     * is still charged its full memory reservation.
+     *
+     * The fork checkpoint (`purpose = fork`) is reclaimed once every fork has
+     * restored from it (for a spread fork, the origin node's copy; the
+     * published parts stay in the content store, which Legion never deletes
+     * from). It is never subject to `snapshots.ttl` or `snapshots.keep`. A
+     * fork stopped before it restored keeps its checkpoint, and restores from
+     * it when started.
+     *
+     * ACLs: `job:write` and `snapshot:write` on the origin's job (a fork reads
+     * everything the origin held in memory).
+     *
+     * Mutating and retry-safe: pass `idempotency_key`, and a retry returns the
+     * first call's forks with `deduplicated = true` instead of creating more.
+     *
+     * Errors:
+     * - NotFound: no instance row with this id exists.
+     * - InvalidArgument: the instance is slot-mode, `count` is above 64, or
+     *   `checkpoint` is not `memory` or `disk`.
+     * - FailedPrecondition, each with a message naming the fix:
+     *   - the origin has no running allocation, is being suspended or resumed,
+     *     or its job is stopped;
+     *   - its node runs a worker without the `checkpoint` capability;
+     *   - a disk fork of an instance with no `stateful.storage` volume, or one
+     *     whose volume driver lacks the `snapshot` or `clone` op (so `exec`
+     *     and `container` tasks without a snapshot-capable volume cannot fork);
+     *   - a memory fork of a task that cannot take one (not a sandbox, not
+     *     launched for memory checkpoints, or gated networking), or of a
+     *     Firecracker sandbox wired to a TAP device on Firecracker older than
+     *     1.12, which cannot move a restored NIC to a new TAP device;
+     *   - a disk fork of a sandbox wired to a TAP device: every fork would
+     *     boot on the TAP device the origin holds;
+     *   - `spread = true` with a disk checkpoint, with an instance that has a
+     *     `stateful.storage` volume (forks clone it on the origin's node, so
+     *     a fork elsewhere could not get its copy), or on a node whose worker
+     *     has no `contentStore` to publish to.
+     *
+     * @generated from rpc legion.Manager.ForkInstance
+     */
+    forkInstance: {
+      name: "ForkInstance",
+      I: ForkInstanceRequest,
+      O: ForkInstanceReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -598,6 +820,274 @@ export const Manager = {
       name: "GetInstance",
       I: GetInstanceRequest,
       O: GetInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Captures a point-in-time snapshot of an instance's running allocation.
+     *
+     * A snapshot is either:
+     * - `disk`: a copy of the instance's `stateful.storage` volume, taken with
+     *   the volume driver's `snapshot` op. Works for every runtime whose
+     *   instance volume uses a driver that advertises `snapshot` (the built-in
+     *   `local-dir` does). The task keeps running, so the copy is
+     *   crash-consistent, like pulling the power cord.
+     * - `memory`: the guest's memory and device state plus its root disk and
+     *   instance volume, captured while the guest is paused. Only `sandbox`
+     *   tasks on Firecracker or cloud-hypervisor support it, and only when the
+     *   task declares a `snapshots` block (which launches the sandbox ready
+     *   for checkpoints). The guest resumes as soon as the capture finishes.
+     *
+     * The call returns as soon as the snapshot row exists, in state
+     * `capturing`. The instance's node takes the snapshot on its next
+     * heartbeat and reports back, which moves it to `local` (success, the
+     * bytes live on that node) or `failed` (with `error`). Poll GetSnapshot,
+     * or use `legion snapshot create --wait`, to wait for the outcome.
+     *
+     * A snapshot is local to the node that captured it: restoring it pins the
+     * instance to that node, and losing the node loses the snapshot. With
+     * `publish` the node also uploads it to its `contentStore` once
+     * captured, and the snapshot moves `local -> published`: it then restores
+     * on any compatible node and survives the node. Expiry follows the task's
+     * `snapshots { ttl, keep }` block.
+     *
+     * Requires `snapshot:write` on the instance's job. A memory snapshot holds
+     * everything the workload had in memory, secrets included, so granting
+     * `snapshot:write` on a job is equivalent to granting read access to its
+     * in-memory secrets (docs/auth-and-acls.md).
+     *
+     * Errors:
+     * - NotFound: no instance row with this id exists.
+     * - InvalidArgument: `kind` is not `memory` or `disk`, or `name` has an
+     *   invalid charset (must match `[A-Za-z0-9._-]{1,64}`).
+     * - FailedPrecondition, each with a message naming the fix:
+     *   - the instance has no running allocation (it is pending, stopped, or
+     *     terminated);
+     *   - the instance's node runs a worker that does not advertise the
+     *     `checkpoint` capability (the message names the worker version;
+     *     upgrade the worker);
+     *   - `memory` was asked for a task that cannot take one: not a `sandbox`
+     *     task, no `snapshots` block, `snapshots.memory = false`, or gated
+     *     networking (which memory checkpoints do not support yet);
+     *   - `disk` was asked for an instance with no `stateful.storage` volume;
+     *   - a snapshot of this instance is already being captured.
+     * - AlreadyExists: `name` is already used by another snapshot of the job.
+     *
+     * @generated from rpc legion.Manager.CreateSnapshot
+     */
+    createSnapshot: {
+      name: "CreateSnapshot",
+      I: CreateSnapshotRequest,
+      O: CreateSnapshotReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists snapshots, newest first, optionally filtered by job, instance, or
+     * state. Includes `failed` rows (until they expire) so a failed capture
+     * stays diagnosable. Rows the caller has no `snapshot:read` on are left
+     * out rather than failing the call.
+     *
+     * @generated from rpc legion.Manager.ListSnapshots
+     */
+    listSnapshots: {
+      name: "ListSnapshots",
+      I: ListSnapshotsRequest,
+      O: ListSnapshotsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Returns one snapshot by id, including its manifest.
+     *
+     * Requires `snapshot:read` on the snapshot's job.
+     *
+     * Errors:
+     * - NotFound: no snapshot with this id exists (or it was deleted).
+     *
+     * @generated from rpc legion.Manager.GetSnapshot
+     */
+    getSnapshot: {
+      name: "GetSnapshot",
+      I: GetSnapshotRequest,
+      O: GetSnapshotReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes a snapshot.
+     *
+     * The row moves to `deleting` and the owning node reclaims the bytes on its
+     * next heartbeat: it releases the snapshot's pins in the node content store
+     * (memory parts) and runs the volume driver's `snapshot-delete` op (disk
+     * part). The row is removed, and `snapshot.deleted` emitted, once the node
+     * confirms. A snapshot whose node no longer exists is removed at once,
+     * since there is nothing left to reclaim.
+     *
+     * Deleting a snapshot that is already `deleting` succeeds as a no-op.
+     * A snapshot an instance is currently restoring from cannot be deleted
+     * until the restore reports back.
+     *
+     * Requires `snapshot:write` on the snapshot's job.
+     *
+     * Errors:
+     * - NotFound: no snapshot with this id exists.
+     * - FailedPrecondition: the snapshot is still `capturing`, or an instance
+     *   is restoring from it right now.
+     *
+     * @generated from rpc legion.Manager.DeleteSnapshot
+     */
+    deleteSnapshot: {
+      name: "DeleteSnapshot",
+      I: DeleteSnapshotRequest,
+      O: DeleteSnapshotReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Rolls a keyed instance back to one of its own snapshots, in place.
+     *
+     * The instance keeps its id and storage handle. Its current allocation is
+     * stopped (stop notice cause `restore`), the instance moves to `pending`
+     * with the snapshot recorded as its restore source, and a placement
+     * evaluation is enqueued. The scheduler places the replacement:
+     *
+     * - **Pinned to the snapshot's node.** A `local` snapshot exists on one
+     *   node only, so the replacement can only run there. When that node is
+     *   down or full, the instance waits in `pending` with the reason in the
+     *   placement diagnostic.
+     * - **Checked for compatibility.** A memory snapshot records the VMM and
+     *   CPU it was taken on (`compat` in the manifest). A node whose
+     *   `sandbox.vmm.<name>.version`, `cpu.vendor`, `cpu.model`, or
+     *   `cpu.features` differ is rejected, and the diagnostic names the
+     *   attribute and both values (for example
+     *   `cpu.model is "6:143:8", the checkpoint needs "6:106:6"`).
+     *
+     * The node then restores the instance volume from the snapshot's disk
+     * part, and for a memory snapshot loads the guest's memory instead of
+     * booting it. The worker reports the outcome, which emits
+     * `snapshot.restored` or `snapshot.restore_failed`. A failed restore fails
+     * the allocation with the worker's error, and the normal restart and
+     * reschedule path then boots the instance cold on its retained storage.
+     *
+     * Restoring uses the instance's current job config (network policy,
+     * mounts, identity), never values from the snapshot.
+     *
+     * Requires `snapshot:read` on the snapshot's job (reading the snapshot is
+     * what a restore does) and `job:write` (it replaces an allocation).
+     *
+     * Errors:
+     * - NotFound: the instance or the snapshot does not exist.
+     * - InvalidArgument: the snapshot belongs to a different instance (to
+     *   start a new instance from it, use CreateInstance(s) `from_snapshot`;
+     *   to copy a running instance, use ForkInstance), or the instance is
+     *   slot-mode (slot lifecycles are owned by the scheduler).
+     * - FailedPrecondition: the instance is stopped or terminated, its job is
+     *   stopped, or the snapshot is not `local` or `published` (still
+     *   capturing, failed, deleting, or lost with its node).
+     *
+     * A `published` snapshot is not pinned: the replacement is
+     * placed on any node whose fingerprint passes the manifest's `compat`,
+     * preferring nodes that already hold its parts (the `locality` score), and
+     * that node fetches the parts from the content store before restoring.
+     *
+     * @generated from rpc legion.Manager.RestoreInstance
+     */
+    restoreInstance: {
+      name: "RestoreInstance",
+      I: RestoreInstanceRequest,
+      O: RestoreInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Points a snapshot name (an alias) at a snapshot of the same job,
+     * creating the name or moving it.
+     *
+     * A name is how a golden snapshot is used: `CreateInstance(s)` with
+     * `from_snapshot = "<name>"` restores new instances from whatever the
+     * name points at right now, so a weekly rebuild takes a new snapshot and
+     * repoints the name, and every create after that uses it. Repointing never
+     * touches the snapshot it moves away from, and instances already restoring
+     * from it are unaffected.
+     *
+     * Names are unique within a job and share the namespace of
+     * `CreateSnapshot`'s `name` (`[A-Za-z0-9._-]{1,64}`, not starting with
+     * `snap-`). Only a `local` or `published` `manual` snapshot can be named:
+     * a suspend checkpoint belongs to its instance and a fork checkpoint to
+     * its forks, and both are reclaimed when they are spent. Deleting a
+     * snapshot removes the names pointing at it. Instances created from a
+     * `published` snapshot may run on any compatible node.
+     *
+     * Requires `snapshot:write` on the job.
+     *
+     * Mutating and retry-safe: pass `idempotency_key`. Pointing a name at the
+     * snapshot it already names is a no-op.
+     *
+     * Errors:
+     * - NotFound: the snapshot does not exist.
+     * - InvalidArgument: the name has an invalid charset, or the snapshot
+     *   belongs to another job.
+     * - FailedPrecondition: the snapshot is not `local`, or its purpose is not
+     *   `manual`.
+     *
+     * @generated from rpc legion.Manager.SetSnapshotAlias
+     */
+    setSnapshotAlias: {
+      name: "SetSnapshotAlias",
+      I: SetSnapshotAliasRequest,
+      O: SetSnapshotAliasReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Removes a snapshot name. The snapshot itself is untouched.
+     *
+     * Requires `snapshot:write` on the job. Removing a name that does not
+     * exist succeeds as a no-op, so the call is safe to retry.
+     *
+     * @generated from rpc legion.Manager.DeleteSnapshotAlias
+     */
+    deleteSnapshotAlias: {
+      name: "DeleteSnapshotAlias",
+      I: DeleteSnapshotAliasRequest,
+      O: DeleteSnapshotAliasReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Pre-fetches a published snapshot's parts onto matching nodes, so a later
+     * resume, restore, or fork there starts from local bytes
+     * (docs/suspend-and-resume.md, "Warming nodes"). This is the artifact
+     * cache plan's warm operation applied to a snapshot.
+     *
+     * The manager picks every available node that matches `constraints` (node
+     * attributes, the same `key = value` matching a jobspec `constraint`
+     * block uses; empty matches every node) and whose fingerprint passes the
+     * manifest's `compat` (a node that could never restore the snapshot is
+     * not warmed). Each picked node gets a `warm` checkpoint request on its
+     * next heartbeat. The node fetches each part it does not already hold
+     * from its published URL through its ordinary artifact fetcher, verifies
+     * the digest, and stores it unpinned in its content store, where the
+     * location index advertises it and the `locality` score then prefers the
+     * node. The reply returns as soon as the requests are queued.
+     *
+     * Warming is best effort and never blocks placement. A node that cannot
+     * fetch (no access to the store, a full content store) reports why in the
+     * `snapshot.warm_failed` event and is simply not warm. Warmed parts are
+     * ordinary cache entries: LRU and the content store's idle TTL can evict
+     * them. Warming the same snapshot again is a no-op on nodes that already
+     * hold the parts or already have a warm queued, so the call is idempotent
+     * by nature. Queued warms live in the memory of the manager that accepted
+     * the call and are lost if it restarts before the nodes heartbeat.
+     *
+     * Requires `snapshot:read` on the snapshot's job (warming only reads it).
+     *
+     * Errors:
+     * - NotFound: no snapshot with this id (or name within `job_id`).
+     * - InvalidArgument: a constraint is not `key=value`.
+     * - FailedPrecondition: the snapshot is not `published` (a `local`
+     *   snapshot exists on one node only; publish it with `durability =
+     *   "store"` or `snapshot create --publish`), or no available node matches.
+     *
+     * @generated from rpc legion.Manager.WarmSnapshot
+     */
+    warmSnapshot: {
+      name: "WarmSnapshot",
+      I: WarmSnapshotRequest,
+      O: WarmSnapshotReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -899,6 +1389,41 @@ export const Manager = {
       name: "GetHeartbeatCadence",
       I: GetHeartbeatCadenceRequest,
       O: GetHeartbeatCadenceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Reports one node's memory and CPU: what it has, what the scheduler has
+     * reserved on it, and what its allocations actually use, per allocation.
+     *
+     * Capacity and reservations come from the state store. Usage comes from
+     * the node's own cgroup measurements, which workers with
+     * `resourceEnforcement.enabled` send on the heartbeat every 10 seconds.
+     * The manager keeps usage in memory only and never writes it to the state
+     * store, so a manager restart or failover shows no usage until the next
+     * report arrives, and a manager that did not receive this node's
+     * heartbeats has none to show (`usage_reported` is false). Usage is
+     * never a scheduling input: placement still packs on reservations.
+     *
+     * Allocations on runtimes the worker does not govern (`noop`, third-party
+     * plugins that have not adopted enforcement) and on workers with
+     * enforcement off are listed with their reservation and no usage.
+     *
+     * Backs `legion node usage <node>` and the `legion_node_usage` MCP tool.
+     *
+     * Errors:
+     * - NotFound: no node with `node_id` is registered.
+     * - PermissionDenied: the caller lacks node:read on the node's pool.
+     *
+     * ACL: node:read, scoped to the node's pool (checked unscoped before the
+     * lookup, so a caller with no node access cannot probe which nodes exist).
+     * See docs/resource-enforcement.md, "Measuring usage".
+     *
+     * @generated from rpc legion.Manager.GetNodeUsage
+     */
+    getNodeUsage: {
+      name: "GetNodeUsage",
+      I: GetNodeUsageRequest,
+      O: GetNodeUsageReply,
       kind: MethodKind.Unary,
     },
     /**

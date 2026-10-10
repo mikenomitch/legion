@@ -1167,6 +1167,7 @@ mod tests {
             cores: None,
             cpu_weight: Some(500),
             memory_limit_bytes: Some(64 * 1024 * 1024),
+            memory_low_bytes: None,
         };
 
         // No explicit cgroup: the worker's assignment is what the task joins.
@@ -1242,6 +1243,7 @@ mod tests {
                 allocation.id,
                 &task,
                 crate::task_plugins::ResourceEnforcement::WorkerCgroup,
+                None,
             )?
             .expect("governed");
 
