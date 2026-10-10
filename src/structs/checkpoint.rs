@@ -340,6 +340,51 @@ pub struct ResumeIdentity {
     /// side only: never written to the identity disk.
     #[serde(skip)]
     pub fork: bool,
+    /// File-delivered workload-identity tokens the guest keeps under
+    /// `/legion/identity/` (`identities[].file` on a sandbox). The worker
+    /// rewrites the identity disk in place on every refresh, and the guest's
+    /// handler rewrites these files with no restart. Secret, like `token`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<GuestTokenFile>,
+}
+
+/// One token file inside a sandbox guest.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestTokenFile {
+    /// Absolute guest path, under `/legion/identity/`.
+    pub path: String,
+    /// File mode, `0o400` unless the identity's `file.mode` says otherwise.
+    pub mode: u32,
+    pub token: String,
+}
+
+impl std::fmt::Debug for GuestTokenFile {
+    // Never print the token: these structs reach debug logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuestTokenFile")
+            .field("path", &self.path)
+            .field("mode", &format_args!("{:o}", self.mode))
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResumeIdentity {
+    /// The workload-identity tokens this identity carries: the env-delivered
+    /// ones (keys not starting `LEGION_`) and the file-delivered ones. A
+    /// change in these alone, with the same allocation and host time, is a
+    /// token refresh rather than a restore.
+    pub fn tokens_differ(&self, other: &ResumeIdentity) -> bool {
+        let tokens = |identity: &ResumeIdentity| {
+            identity
+                .env
+                .iter()
+                .filter(|(key, _)| !key.starts_with("LEGION_"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>()
+        };
+        tokens(self) != tokens(other) || self.files != other.files
+    }
 }
 
 fn is_zero(value: &i64) -> bool {

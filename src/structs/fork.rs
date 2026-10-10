@@ -43,15 +43,29 @@ pub fn fork_mac(allocation_id: i64) -> String {
     )
 }
 
-/// The host TAP device a forked sandbox's NIC is moved to on restore:
-/// `lgf` plus 12 hex characters of the instance id's SHA-256, which fits
-/// Linux's 15-character interface name limit. Derived from the instance id
-/// (not the allocation) so a fork that is later suspended and resumed asks
-/// for the same device again.
-pub fn fork_tap_name(instance_id: &str) -> String {
+/// The host TAP device Legion owns for one sandbox instance: `lgf` plus 12
+/// hex characters of the instance id's SHA-256, which fits Linux's
+/// 15-character interface name limit.
+///
+/// Two features share it, so one instance always asks for one device:
+///
+/// - a forked sandbox's NIC is moved to it on restore, and
+/// - `config.network = { mode = "tap", tap = "auto", bridge = ... }` boots
+///   every instance on it.
+///
+/// Derived from the instance id (not the allocation) so an instance that is
+/// suspended and resumed, or forked and later resumed, asks for the same
+/// device again. A task without instances names it after its allocation
+/// ([`allocation_tap_owner`]).
+pub fn own_tap_name(instance_id: &str) -> String {
     let digest = Sha256::digest(instance_id.as_bytes());
     let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
     format!("lgf{hex}")
+}
+
+/// What [`own_tap_name`] hashes for an allocation that serves no instance.
+pub fn allocation_tap_owner(allocation_id: i64) -> String {
+    format!("alloc-{allocation_id}")
 }
 
 /// Whether a Firecracker version can move a restored NIC to a different TAP
@@ -96,12 +110,12 @@ mod tests {
 
     #[test]
     fn fork_taps_fit_ifnamsiz_and_are_per_instance() {
-        let a = fork_tap_name("run-17-f1");
-        let b = fork_tap_name("run-17-f2");
+        let a = own_tap_name("run-17-f1");
+        let b = own_tap_name("run-17-f2");
         assert_ne!(a, b);
         assert_eq!(a.len(), 15);
         assert!(a.starts_with("lgf"));
-        assert_eq!(a, fork_tap_name("run-17-f1"), "stable per instance");
+        assert_eq!(a, own_tap_name("run-17-f1"), "stable per instance");
     }
 
     #[test]

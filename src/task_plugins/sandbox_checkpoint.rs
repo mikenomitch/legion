@@ -65,6 +65,11 @@ const ROOT_LINK: &str = "rootfs.img";
 const IDENTITY_LINK: &str = "identity.img";
 const IDENTITY_FILE: &str = "identity.img";
 
+/// The identity disk of the guest whose scratch dir is `scratch`.
+pub(crate) fn identity_disk_path(scratch: &Path) -> PathBuf {
+    scratch.join(IDENTITY_FILE)
+}
+
 /// How long a freshly spawned VMM gets to open its API socket.
 const API_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -257,6 +262,7 @@ pub(crate) fn boot_identity(
     allocation: &Allocation,
     task_name: &str,
     hostname: &str,
+    tokens: &GuestTokens,
 ) -> ResumeIdentity {
     ResumeIdentity {
         alloc_id: allocation.id,
@@ -266,12 +272,48 @@ pub(crate) fn boot_identity(
         hostname: hostname.to_string(),
         token: None,
         mac: None,
-        env: Default::default(),
+        env: tokens.env.clone(),
         entropy: fresh_entropy(),
         host_time_unix_ms: chrono::Utc::now().timestamp_millis(),
         on_resume: Vec::new(),
         fork: false,
+        files: tokens.files.clone(),
     }
+}
+
+/// The workload-identity tokens a sandbox keeps in its guest through the
+/// identity disk (docs/workload-identity.md, "Sandboxes"): env-delivered
+/// ones by env key (published at `/legion/identity/<ENV>`) and
+/// file-delivered ones at their guest paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GuestTokens {
+    pub env: std::collections::BTreeMap<String, String>,
+    pub files: Vec<crate::structs::checkpoint::GuestTokenFile>,
+}
+
+/// Put `tokens` on a running guest's identity disk at `path`, keeping the
+/// rest of what the disk says (allocation, host time), so the guest's
+/// handler sees a token refresh and not a restore.
+pub(crate) fn refresh_identity_tokens(path: &Path, tokens: &GuestTokens) -> R<bool> {
+    let mut identity = crate::task_plugins::checkpoint::read_identity_disk(path)?;
+    let mut env = identity
+        .env
+        .iter()
+        .filter(|(key, _)| key.starts_with("LEGION_"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    env.extend(tokens.env.clone());
+    let refreshed = ResumeIdentity {
+        env,
+        files: tokens.files.clone(),
+        ..identity.clone()
+    };
+    if !refreshed.tokens_differ(&identity) {
+        return Ok(false);
+    }
+    identity = refreshed;
+    crate::task_plugins::checkpoint::rewrite_identity_disk_in_place(path, &identity)?;
+    Ok(true)
 }
 
 /// Rewrite `spec` so the VMM sees stable link paths and an identity disk,
@@ -284,6 +326,7 @@ pub(crate) fn prepare_checkpoint_launch(
     instance: &TaskInstance,
     scratch: &Path,
     spec: &mut VmSpec,
+    tokens: &GuestTokens,
 ) -> R<SandboxCheckpointState> {
     let state = SandboxCheckpointState {
         vmm: backend.vmm_name().to_string(),
@@ -299,7 +342,7 @@ pub(crate) fn prepare_checkpoint_launch(
     let identity_path = scratch.join(IDENTITY_FILE);
     write_identity_disk(
         &identity_path,
-        &boot_identity(allocation, task_name, &spec.name),
+        &boot_identity(allocation, task_name, &spec.name, tokens),
     )?;
 
     let links = DeviceLinks::new(&vmdev_root(instance, scratch), &state.link_key);
@@ -528,6 +571,25 @@ pub(crate) struct HostTaps;
 /// operator made.
 const RESTORED_TAP_RECORD: &str = "restored-tap";
 
+/// Written into the scratch dir whenever a guest is wired to a TAP device
+/// (any mode), naming it. The usage sampler counts the device's bytes as
+/// the allocation's network activity, and the `boot` network gate shuts and
+/// opens it, so neither has to re-derive an auto or fork TAP's name.
+const TAP_DEVICE_RECORD: &str = "tap-device";
+
+/// Record the TAP device the guest in `scratch` is wired to.
+pub(crate) fn record_attached_tap(scratch: &Path, device: &str) -> R<()> {
+    std::fs::write(scratch.join(TAP_DEVICE_RECORD), device)
+        .with_context(|| format!("failed to record TAP device {device}"))
+}
+
+/// The TAP device the guest in `scratch` is wired to, if any.
+pub fn attached_tap(scratch: &Path) -> Option<String> {
+    let device = std::fs::read_to_string(scratch.join(TAP_DEVICE_RECORD)).ok()?;
+    let device = device.trim();
+    (!device.is_empty()).then(|| device.to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn run_ip(args: &[&str]) -> R<()> {
     let output = Command::new("ip")
@@ -671,19 +733,47 @@ impl TapHost for HostTaps {
     }
 }
 
+/// Create `device` as a persistent TAP Legion owns: recorded in `scratch`
+/// (so destroy removes exactly what Legion made), enslaved to `master` when
+/// one is given, and brought up. `need` names the device in every error
+/// (`restore needs TAP device <name>`, `sandbox needs TAP device <name>`).
+///
+/// One path for the three places Legion makes a TAP: a fork's own device, a
+/// restore whose recorded device is gone, and an auto TAP at boot.
+fn create_owned_tap(
+    taps: &dyn TapHost,
+    device: &str,
+    master: Option<&str>,
+    scratch: &Path,
+    need: &str,
+) -> R<()> {
+    taps.create(device)
+        .with_context(|| format!("{need}: creating it failed"))?;
+    std::fs::write(scratch.join(RESTORED_TAP_RECORD), device)?;
+    if let Some(master) = master {
+        taps.set_master(device, master)
+            .with_context(|| format!("{need}: attaching it to bridge {master} failed"))?;
+    }
+    taps.set_up(device)
+        .with_context(|| format!("{need}: bringing it up failed"))?;
+    Ok(())
+}
+
 /// Phase 6: give a guest restored into a NEW instance (a fork, or a create
 /// from a snapshot) a TAP device of its own, `own`, instead of the `origin`
 /// TAP its checkpoint recorded (which the origin, or a sibling fork, holds).
 ///
 /// `own` is created when missing (and recorded, so destroy removes it),
-/// brought up, and enslaved to the same bridge as `origin`, so the fork
-/// lands on the origin's network segment. An operator may pre-create `own`
-/// to wire it differently: a free existing TAP is used as is. Every failure
-/// is a named `restore needs TAP device <own>: ...` error.
+/// brought up, and enslaved to `bridge` when the task names one (an auto
+/// TAP), else to the same bridge as `origin`, so the fork lands on the
+/// origin's network segment. An operator may pre-create `own` to wire it
+/// differently: a free existing TAP is used as is. Every failure is a named
+/// `restore needs TAP device <own>: ...` error.
 pub(crate) fn ensure_fork_tap(
     taps: &dyn TapHost,
     origin: &str,
     configured: Option<&str>,
+    bridge: Option<&str>,
     own: &str,
     scratch: &Path,
 ) -> R<()> {
@@ -701,16 +791,19 @@ pub(crate) fn ensure_fork_tap(
              that name exists but is not a TAP device"
         ),
         TapState::Missing => {
-            // The origin's TAP is how the operator wired the network; a fork
-            // joins the same bridge. On another node (a spread fork) the
-            // origin's TAP may not exist, so the task's configured TAP there
-            // says which bridge to join. A TAP with no master stays
-            // standalone, but a fork that finds neither device would have no
-            // network at all, which is refused by name.
-            let master = taps.master(origin).ok().flatten().or_else(|| {
-                configured
-                    .filter(|device| *device != origin)
-                    .and_then(|device| taps.master(device).ok().flatten())
+            // An auto TAP names its bridge, which wins. Otherwise the
+            // origin's TAP is how the operator wired the network, and a
+            // fork joins the same bridge. On another node (a spread fork)
+            // the origin's TAP may not exist, so the task's configured TAP
+            // there says which bridge to join. A TAP with no master stays
+            // standalone, but a fork that finds neither device would have
+            // no network at all, which is refused by name.
+            let master = bridge.map(str::to_string).or_else(|| {
+                taps.master(origin).ok().flatten().or_else(|| {
+                    configured
+                        .filter(|device| *device != origin)
+                        .and_then(|device| taps.master(device).ok().flatten())
+                })
             });
             if master.is_none() && matches!(taps.state(origin), Ok(TapState::Missing)) {
                 let configured = configured.unwrap_or(origin);
@@ -721,24 +814,59 @@ pub(crate) fn ensure_fork_tap(
                      every node a spread fork can land on"
                 );
             }
-            taps.create(own).with_context(|| {
-                format!("restore needs TAP device {own}: creating this fork's own TAP failed")
-            })?;
-            std::fs::write(scratch.join(RESTORED_TAP_RECORD), own)?;
-            if let Some(master) = master {
-                taps.set_master(own, &master).with_context(|| {
-                    format!(
-                        "restore needs TAP device {own}: attaching it to bridge {master} failed"
-                    )
-                })?;
-            }
-            taps.set_up(own).with_context(|| {
-                format!("restore needs TAP device {own}: bringing it up failed")
-            })?;
+            create_owned_tap(
+                taps,
+                own,
+                master.as_deref(),
+                scratch,
+                &format!("restore needs TAP device {own} (this fork's own TAP)"),
+            )?;
             info!(
                 device = own,
                 origin, "Created a forked sandbox's own TAP device"
             );
+            Ok(())
+        }
+    }
+}
+
+/// Wire a fresh boot to its auto TAP (`config.network.tap = "auto"`):
+/// `device` is this instance's own TAP ([`crate::structs::fork::own_tap_name`]),
+/// created and attached to `bridge` when missing.
+///
+/// A free device of that name is reused and re-attached to `bridge` if it
+/// drifted: Legion owns `lgf` names, and one left behind by an allocation
+/// that never got to clean up (a worker crash) belongs to this instance. A
+/// busy one means this instance already runs here, which is refused by name.
+pub(crate) fn ensure_auto_tap(
+    taps: &dyn TapHost,
+    device: &str,
+    bridge: &str,
+    scratch: &Path,
+) -> R<()> {
+    let need = format!("sandbox needs TAP device {device} (network.tap = \"auto\")");
+    let state = taps.state(device).with_context(|| need.clone())?;
+    match state {
+        TapState::Free => {
+            std::fs::write(scratch.join(RESTORED_TAP_RECORD), device)?;
+            if taps.master(device).ok().flatten().as_deref() != Some(bridge) {
+                taps.set_master(device, bridge)
+                    .with_context(|| format!("{need}: attaching it to bridge {bridge} failed"))?;
+            }
+            taps.set_up(device)
+                .with_context(|| format!("{need}: bringing it up failed"))?;
+            Ok(())
+        }
+        TapState::Busy => bail!(
+            "{need}: it exists and another process holds it, so this instance already runs a \
+             guest on this node"
+        ),
+        TapState::NotTap => {
+            bail!("{need}: a network interface with that name exists but is not a TAP device")
+        }
+        TapState::Missing => {
+            create_owned_tap(taps, device, Some(bridge), scratch, &need)?;
+            info!(device, bridge, "Created a sandbox's auto TAP device");
             Ok(())
         }
     }
@@ -777,6 +905,7 @@ pub(crate) fn ensure_restore_tap(
     taps: &dyn TapHost,
     recorded: Option<&str>,
     configured: Option<&str>,
+    bridge: Option<&str>,
     scratch: &Path,
 ) -> R<()> {
     let device = match (recorded, configured) {
@@ -810,14 +939,20 @@ pub(crate) fn ensure_restore_tap(
              not a TAP device"
         ),
         TapState::Missing => {
-            taps.create(device).with_context(|| {
-                format!("restore needs TAP device {device}: creating it failed")
-            })?;
-            std::fs::write(scratch.join(RESTORED_TAP_RECORD), device)?;
-            taps.set_up(device).with_context(|| {
-                format!("restore needs TAP device {device}: bringing it up failed")
-            })?;
-            info!(device, "Created the TAP device a sandbox restore needs");
+            // An auto TAP is recreated on its bridge, under the name the
+            // checkpoint recorded. A fixed one comes back standalone, the
+            // way an operator creates one for `mode: 'tap'`.
+            create_owned_tap(
+                taps,
+                device,
+                bridge,
+                scratch,
+                &format!("restore needs TAP device {device}"),
+            )?;
+            info!(
+                device,
+                bridge, "Created the TAP device a sandbox restore needs"
+            );
             Ok(())
         }
     }
@@ -872,8 +1007,11 @@ pub(crate) struct RestoreTarget<'a> {
     pub scratch: PathBuf,
     /// The TAP device the task's current config attaches, if any. Restore
     /// uses the destination's config, never the manifest's, and refuses when
-    /// the two disagree.
+    /// the two disagree. For an auto TAP this is the instance's own device.
     pub tap: Option<String>,
+    /// The bridge an auto TAP joins (`config.network.bridge`). A restore
+    /// that has to recreate the device attaches it here.
+    pub bridge: Option<String>,
 }
 
 /// Phase 6: which TAP device a restore attaches the guest NIC to.
@@ -899,7 +1037,7 @@ pub(crate) fn restore_tap(
     let own = identity
         .instance_id
         .as_deref()
-        .map(crate::structs::fork::fork_tap_name);
+        .map(crate::structs::fork::own_tap_name);
     match (recorded, configured, own) {
         (Some(origin), Some(_), Some(own)) if identity.fork => RestoreTap::Own {
             origin: origin.to_string(),
@@ -993,17 +1131,33 @@ pub(crate) fn restore_microvm(
     let tap = restore_tap(state.tap.as_deref(), target.tap.as_deref(), identity);
     let moved_to = match &tap {
         RestoreTap::Recorded { configured } => {
-            ensure_restore_tap(taps, state.tap.as_deref(), configured.as_deref(), scratch)?;
+            ensure_restore_tap(
+                taps,
+                state.tap.as_deref(),
+                configured.as_deref(),
+                target.bridge.as_deref(),
+                scratch,
+            )?;
             None
         }
         RestoreTap::Own { origin, own } => {
-            ensure_fork_tap(taps, origin, target.tap.as_deref(), own, scratch)?;
+            ensure_fork_tap(
+                taps,
+                origin,
+                target.tap.as_deref(),
+                target.bridge.as_deref(),
+                own,
+                scratch,
+            )?;
             if matches!(target.backend, Backend::CloudHypervisor { .. }) {
                 retarget_cloud_hypervisor_tap(source, own)?;
             }
             Some(own.clone())
         }
     };
+    if let Some(device) = moved_to.as_deref().or(state.tap.as_deref()) {
+        record_attached_tap(scratch, device)?;
+    }
     let identity_path = scratch.join(IDENTITY_FILE);
     write_identity_disk(&identity_path, identity)?;
 
@@ -1246,6 +1400,7 @@ mod tests {
             memory_mib,
             scratch: PathBuf::from("/nonexistent"),
             tap: None,
+            bridge: None,
         };
         let manifest = manifest_for(&state, MemoryParts::default());
 
@@ -1288,7 +1443,15 @@ mod tests {
             identity_disk: None,
             balloon: None,
         };
-        prepare_checkpoint_launch(backend, &alloc(id), "box", &instance, &scratch, &mut spec)?;
+        prepare_checkpoint_launch(
+            backend,
+            &alloc(id),
+            "box",
+            &instance,
+            &scratch,
+            &mut spec,
+            &GuestTokens::default(),
+        )?;
         Ok((instance, scratch, spec))
     }
 
@@ -1392,6 +1555,7 @@ mod tests {
             memory_mib: 256,
             scratch: scratch.clone(),
             tap: None,
+            bridge: None,
         };
         restore_microvm(
             &target,
@@ -1476,7 +1640,7 @@ mod tests {
         let mut macs = std::collections::HashSet::new();
         for (n, id) in [(1, 8), (2, 9), (3, 10)] {
             let instance_id = format!("run-17-f{n}");
-            let own = crate::structs::fork::fork_tap_name(&instance_id);
+            let own = crate::structs::fork::own_tap_name(&instance_id);
             let mut restored = TaskInstance {
                 alloc_dir: Some(tmp.path().join(format!("allocs/{id}"))),
                 ..TaskInstance::default()
@@ -1505,6 +1669,7 @@ mod tests {
                 memory_mib: 256,
                 scratch: scratch.clone(),
                 tap: Some("tap0".into()),
+                bridge: None,
             };
             restore_microvm(&target, &mut restored, &manifest, &out, &identity, &taps)?;
             let calls = vmm.drain();
@@ -1569,7 +1734,7 @@ mod tests {
             restore_tap(Some("tap0"), Some("tap0"), &fork),
             RestoreTap::Own {
                 origin: "tap0".into(),
-                own: crate::structs::fork::fork_tap_name("run-17-f1"),
+                own: crate::structs::fork::own_tap_name("run-17-f1"),
             }
         );
         // No NIC: nothing to move.
@@ -1597,7 +1762,8 @@ mod tests {
             states: [("lgf0".to_string(), TapState::Busy)].into(),
             ..FakeTaps::default()
         };
-        let err = ensure_fork_tap(&taps, "tap0", Some("tap0"), "lgf0", dir.path()).unwrap_err();
+        let err =
+            ensure_fork_tap(&taps, "tap0", Some("tap0"), None, "lgf0", dir.path()).unwrap_err();
         assert!(
             format!("{err:#}").starts_with("restore needs TAP device lgf0"),
             "{err:#}"
@@ -1608,7 +1774,7 @@ mod tests {
             states: [("tap0".to_string(), TapState::Busy)].into(),
             ..FakeTaps::default()
         };
-        ensure_fork_tap(&taps, "tap0", Some("tap0"), "lgf1", dir.path())?;
+        ensure_fork_tap(&taps, "tap0", Some("tap0"), None, "lgf1", dir.path())?;
         assert_eq!(*taps.log.lock().unwrap(), vec!["create lgf1", "up lgf1"]);
         Ok(())
     }
@@ -1641,7 +1807,14 @@ mod tests {
             masters: [("tap0".to_string(), "br1".to_string())].into(),
             ..FakeTaps::default()
         };
-        ensure_fork_tap(&taps, "lgf0aaaaaaaaaaa", Some("tap0"), "lgf2", dir.path())?;
+        ensure_fork_tap(
+            &taps,
+            "lgf0aaaaaaaaaaa",
+            Some("tap0"),
+            None,
+            "lgf2",
+            dir.path(),
+        )?;
         assert_eq!(
             *taps.log.lock().unwrap(),
             vec!["create lgf2", "master lgf2 br1", "up lgf2"]
@@ -1649,7 +1822,8 @@ mod tests {
 
         // Neither the origin's TAP nor a bridged tap0 on this node.
         let taps = FakeTaps::default();
-        let err = ensure_fork_tap(&taps, "tap0", Some("tap0"), "lgf3", dir.path()).unwrap_err();
+        let err =
+            ensure_fork_tap(&taps, "tap0", Some("tap0"), None, "lgf3", dir.path()).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.starts_with("restore needs TAP device lgf3")
@@ -1815,6 +1989,148 @@ mod tests {
         log: std::sync::Mutex<Vec<String>>,
     }
 
+    /// An auto TAP at boot: a missing device is created on its bridge and
+    /// recorded for destroy; a leftover free one is reused and re-attached;
+    /// a busy one is this instance running here already, refused by name.
+    #[test]
+    fn an_auto_tap_is_created_on_its_bridge_reused_or_refused() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let taps = FakeTaps::default();
+        ensure_auto_tap(&taps, "lgf0123456789ab", "br0", dir.path())?;
+        assert_eq!(
+            *taps.log.lock().unwrap(),
+            vec![
+                "create lgf0123456789ab",
+                "master lgf0123456789ab br0",
+                "up lgf0123456789ab"
+            ]
+        );
+        release_restore_tap(&taps, dir.path());
+        assert_eq!(
+            taps.log.lock().unwrap().last().map(String::as_str),
+            Some("delete lgf0123456789ab"),
+            "destroy removes the TAP Legion made"
+        );
+
+        let leftover = FakeTaps {
+            states: [("lgf0".to_string(), TapState::Free)].into(),
+            masters: [("lgf0".to_string(), "br9".to_string())].into(),
+            ..Default::default()
+        };
+        ensure_auto_tap(&leftover, "lgf0", "br0", dir.path())?;
+        assert_eq!(
+            *leftover.log.lock().unwrap(),
+            vec!["master lgf0 br0", "up lgf0"]
+        );
+
+        let busy = FakeTaps {
+            states: [("lgf0".to_string(), TapState::Busy)].into(),
+            ..Default::default()
+        };
+        let err = ensure_auto_tap(&busy, "lgf0", "br0", dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("already runs a guest on this node"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    /// Restore of an auto-TAP sandbox whose device is gone (the node
+    /// rebooted, or the suspended allocation's destroy removed it):
+    /// recreated under the recorded name, on the task's bridge. A fork of
+    /// one joins the declared bridge even when the origin's TAP is gone.
+    #[test]
+    fn an_auto_tap_is_recreated_on_its_bridge_on_restore_and_fork() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let taps = FakeTaps::default();
+        ensure_restore_tap(
+            &taps,
+            Some("lgfaaaaaaaaaaaa"),
+            Some("lgfaaaaaaaaaaaa"),
+            Some("br0"),
+            dir.path(),
+        )?;
+        assert_eq!(
+            *taps.log.lock().unwrap(),
+            vec![
+                "create lgfaaaaaaaaaaaa",
+                "master lgfaaaaaaaaaaaa br0",
+                "up lgfaaaaaaaaaaaa"
+            ]
+        );
+
+        let fork = FakeTaps::default();
+        ensure_fork_tap(
+            &fork,
+            "lgfaaaaaaaaaaaa",
+            Some("lgfbbbbbbbbbbbb"),
+            Some("br0"),
+            "lgfbbbbbbbbbbbb",
+            dir.path(),
+        )?;
+        assert_eq!(
+            *fork.log.lock().unwrap(),
+            vec![
+                "create lgfbbbbbbbbbbbb",
+                "master lgfbbbbbbbbbbbb br0",
+                "up lgfbbbbbbbbbbbb"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_attached_tap_is_recorded_beside_the_vmm() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(attached_tap(dir.path()), None);
+        record_attached_tap(dir.path(), "lgf0123456789ab")?;
+        assert_eq!(attached_tap(dir.path()).as_deref(), Some("lgf0123456789ab"));
+        Ok(())
+    }
+
+    /// A token refresh rewrites the tokens on a running guest's disk and
+    /// keeps what makes it the same allocation, so the guest's handler sees
+    /// a refresh and not a restore. Unchanged tokens leave the disk alone.
+    #[test]
+    fn a_token_refresh_keeps_the_allocation_on_the_identity_disk() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let path = identity_disk_path(dir.path());
+        let boot_tokens = GuestTokens {
+            env: [("VAULT_TOKEN".to_string(), "old".to_string())].into(),
+            files: vec![crate::structs::checkpoint::GuestTokenFile {
+                path: "/legion/identity/aws".into(),
+                mode: 0o400,
+                token: "old-aws".into(),
+            }],
+        };
+        let mut boot = boot_identity(&alloc(7), "box", "legion-sbx-7", &boot_tokens);
+        boot.env.insert("LEGION_ALLOC_ID".into(), "7".into());
+        write_identity_disk(&path, &boot)?;
+
+        assert!(
+            !refresh_identity_tokens(&path, &boot_tokens)?,
+            "nothing new"
+        );
+        let fresh = GuestTokens {
+            env: [("VAULT_TOKEN".to_string(), "new".to_string())].into(),
+            files: vec![crate::structs::checkpoint::GuestTokenFile {
+                token: "new-aws".into(),
+                ..boot_tokens.files[0].clone()
+            }],
+        };
+        assert!(refresh_identity_tokens(&path, &fresh)?);
+        let on_disk = crate::task_plugins::checkpoint::read_identity_disk(&path)?;
+        assert_eq!(on_disk.alloc_id, 7);
+        assert_eq!(on_disk.host_time_unix_ms, boot.host_time_unix_ms);
+        assert_eq!(on_disk.env["VAULT_TOKEN"], "new");
+        assert_eq!(on_disk.env["LEGION_ALLOC_ID"], "7", "LEGION_ env is kept");
+        assert_eq!(on_disk.files[0].token, "new-aws");
+        assert!(crate::task_plugins::guest_resume::is_token_refresh(
+            &boot, &on_disk
+        ));
+        Ok(())
+    }
+
     impl TapHost for FakeTaps {
         fn state(&self, device: &str) -> R<TapState> {
             Ok(*self.states.get(device).unwrap_or(&TapState::Missing))
@@ -1850,7 +2166,7 @@ mod tests {
     fn a_missing_restore_tap_is_created_up_and_removed_on_release() -> R<()> {
         let dir = tempfile::tempdir()?;
         let taps = FakeTaps::default();
-        ensure_restore_tap(&taps, Some("tap7"), Some("tap7"), dir.path())?;
+        ensure_restore_tap(&taps, Some("tap7"), Some("tap7"), None, dir.path())?;
         assert_eq!(*taps.log.lock().unwrap(), vec!["create tap7", "up tap7"]);
         release_restore_tap(&taps, dir.path());
         assert_eq!(taps.log.lock().unwrap().last().unwrap(), "delete tap7");
@@ -1867,7 +2183,7 @@ mod tests {
             states: [("tap7".to_string(), TapState::Free)].into(),
             ..FakeTaps::default()
         };
-        ensure_restore_tap(&taps, Some("tap7"), Some("tap7"), dir.path())?;
+        ensure_restore_tap(&taps, Some("tap7"), Some("tap7"), None, dir.path())?;
         release_restore_tap(&taps, dir.path());
         assert!(taps.log.lock().unwrap().is_empty());
         Ok(())
@@ -1880,7 +2196,8 @@ mod tests {
             states: [("tap7".to_string(), TapState::Busy)].into(),
             ..FakeTaps::default()
         };
-        let err = ensure_restore_tap(&busy, Some("tap7"), Some("tap7"), dir.path()).unwrap_err();
+        let err =
+            ensure_restore_tap(&busy, Some("tap7"), Some("tap7"), None, dir.path()).unwrap_err();
         assert!(
             format!("{err:#}").starts_with("restore needs TAP device tap7: it exists and another"),
             "{err:#}"
@@ -1890,14 +2207,16 @@ mod tests {
             states: [("tap7".to_string(), TapState::NotTap)].into(),
             ..FakeTaps::default()
         };
-        let err = ensure_restore_tap(&not_tap, Some("tap7"), Some("tap7"), dir.path()).unwrap_err();
+        let err =
+            ensure_restore_tap(&not_tap, Some("tap7"), Some("tap7"), None, dir.path()).unwrap_err();
         assert!(format!("{err:#}").contains("not a TAP device"), "{err:#}");
 
         let broken = FakeTaps {
             fail_create: Some("operation not permitted".into()),
             ..FakeTaps::default()
         };
-        let err = ensure_restore_tap(&broken, Some("tap7"), Some("tap7"), dir.path()).unwrap_err();
+        let err =
+            ensure_restore_tap(&broken, Some("tap7"), Some("tap7"), None, dir.path()).unwrap_err();
         let text = format!("{err:#}");
         assert!(
             text.starts_with("restore needs TAP device tap7: creating it failed"),
@@ -1908,16 +2227,22 @@ mod tests {
         release_restore_tap(&broken, dir.path());
         assert_eq!(*broken.log.lock().unwrap(), vec!["create tap7"]);
 
-        let err = ensure_restore_tap(&FakeTaps::default(), Some("tap7"), Some("tap9"), dir.path())
-            .unwrap_err();
+        let err = ensure_restore_tap(
+            &FakeTaps::default(),
+            Some("tap7"),
+            Some("tap9"),
+            None,
+            dir.path(),
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("now names TAP tap9"), "{err:#}");
-        let err =
-            ensure_restore_tap(&FakeTaps::default(), None, Some("tap9"), dir.path()).unwrap_err();
+        let err = ensure_restore_tap(&FakeTaps::default(), None, Some("tap9"), None, dir.path())
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("without a TAP device"),
             "{err:#}"
         );
-        assert!(ensure_restore_tap(&FakeTaps::default(), None, None, dir.path()).is_ok());
+        assert!(ensure_restore_tap(&FakeTaps::default(), None, None, None, dir.path()).is_ok());
     }
 
     /// The failure reaches the caller before any VMM starts, so a restore
@@ -1954,6 +2279,7 @@ mod tests {
             memory_mib: 256,
             scratch: scratch.clone(),
             tap: Some("tap7".into()),
+            bridge: None,
         };
         let mut instance = TaskInstance {
             alloc_dir: Some(dir.path().join("allocs/8")),

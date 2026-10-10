@@ -929,6 +929,9 @@ pub fn resume_identity(
         host_time_unix_ms: chrono::Utc::now().timestamp_millis(),
         on_resume: restore.on_resume.clone(),
         fork: restore.fork,
+        // File-delivered tokens live under the task directory, which the
+        // sandbox runtime reads when it writes the disk.
+        files: Vec::new(),
     }
 }
 

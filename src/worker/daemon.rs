@@ -1095,13 +1095,15 @@ async fn heartbeat_tick(
         // Measured usage, on the heartbeat that falls due each report
         // interval (docs/resource-enforcement.md, "Measuring usage"). Only
         // with enforcement on: without it there are no worker-owned cgroups
-        // to read, and an absent report reads as "not governed".
+        // to read, and an absent report reads as "not governed". On macOS
+        // the same switch measures dev-mode sandboxes through `container
+        // stats` instead (docs/suspend-and-resume.md, "macOS dev loop").
         let usage = if crate::task_plugins::exec_isolation::enforcement_enabled() {
-            let targets = task_manager.lock().expect("task manager").usage_targets();
             let mut sampler = USAGE_SAMPLER.lock().unwrap_or_else(|p| p.into_inner());
             sampler.note_network_activity(net_edges.iter().map(|edge| edge.allocation_id));
             let now = std::time::Instant::now();
             sampler.due(now).then(|| {
+                let targets = task_manager.lock().expect("task manager").usage_targets();
                 // What the datapath and exec server saw, for activity and
                 // the idle policy (docs/suspend-and-resume.md, "Idle policy").
                 let activity = forwarder.context().activity();
@@ -1110,11 +1112,29 @@ async fn heartbeat_tick(
                     ingress: activity.snapshot(),
                     exec_sessions: crate::worker::exec::open_sessions(),
                 };
+                // One `container stats` call covers every Apple container
+                // sandbox; a node with none never runs it.
+                let apple = if targets.iter().any(|target| {
+                    matches!(
+                        target.source,
+                        crate::worker::usage::UsageSource::AppleContainer(_)
+                    )
+                }) {
+                    crate::worker::usage::read_apple_container_stats()
+                } else {
+                    Default::default()
+                };
                 let mut report = sampler.sample_with(
                     now,
                     chrono::Utc::now().timestamp_millis(),
                     &targets,
-                    crate::worker::usage::read_cgroup_sample,
+                    |target| {
+                        crate::worker::usage::read_target_sample(
+                            target,
+                            &apple,
+                            &crate::worker::usage::SysfsNicCounters,
+                        )
+                    },
                     crate::worker::usage::read_node_memory(),
                     &inputs,
                 );

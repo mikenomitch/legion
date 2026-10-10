@@ -24,7 +24,7 @@ mod oci_image;
 pub mod resource_enforcement;
 mod sandbox;
 mod sandbox_checkpoint;
-pub use sandbox::vsock_socket_base_for;
+pub use sandbox::{sandbox_usage_source, vsock_socket_base_for, SandboxUsageSource};
 pub use sandbox_checkpoint::{
     firecracker_needs_api_socket, sandbox_checkpoint_support, sandbox_vmm_attrs, IDENTITY_DRIVE_ID,
 };
@@ -537,6 +537,28 @@ pub trait TaskPlugin: Send + Sync {
     /// identity naming already takes for traversal).
     fn file_delivery_root(&self) -> Option<&'static str> {
         None
+    }
+
+    /// The subdirectory of the host task directory that
+    /// [`TaskPlugin::file_delivery_root`] maps to, when it is not the task
+    /// directory itself. A sandbox projects only its identity files into the
+    /// guest, so they get a directory of their own on the host.
+    fn file_delivery_host_subdir(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The worker just rewrote this allocation's workload-identity tokens on
+    /// the host (a refresh). A runtime whose workload cannot read the host
+    /// files directly, such as a microVM guest, copies them in here, with no
+    /// restart. The default does nothing: the host file is what the task
+    /// reads.
+    fn identity_tokens_refreshed(
+        &self,
+        _allocation: &Allocation,
+        _task: &TaskConfig,
+        _instance: &mut TaskInstance,
+    ) -> R<()> {
+        Ok(())
     }
 
     /// Whether this runtime can deliver a Unix signal to the running task (needed
@@ -1328,10 +1350,17 @@ pub fn resolve_task_dir_destination(root: &str, declared: &str) -> Result<PathBu
         return Err("path cannot be empty".to_string());
     }
     let path = std::path::Path::new(declared);
+    // Containers see their task directory at /legion/task; a sandbox guest
+    // receives its token files under /legion/identity.
+    let what = if root == sandbox::GUEST_IDENTITY_ROOT {
+        "sandbox identity directory"
+    } else {
+        "container task directory"
+    };
     let relative = if path.is_absolute() {
         path.strip_prefix(root).map_err(|_| {
             format!(
-                "{declared:?} is outside the container task directory; use a path under {root} \
+                "{declared:?} is outside the {what}; use a path under {root} \
                  (or a relative path), or switch to env delivery"
             )
         })?
@@ -1350,7 +1379,7 @@ pub fn resolve_task_dir_destination(root: &str, declared: &str) -> Result<PathBu
             std::path::Component::RootDir if normalized.as_os_str().is_empty() => {}
             _ => {
                 return Err(format!(
-                    "{declared:?} escapes the container task directory; use a path under {root}"
+                    "{declared:?} escapes the {what}; use a path under {root}"
                 ))
             }
         }
@@ -2865,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_task_accepts_env_identity_but_not_file_delivery() -> R<()> {
+    fn sandbox_task_scopes_identity_files_to_the_guest_identity_dir() -> R<()> {
         let config = json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]});
 
         // Env delivery is baked into the guest env file at boot, so it works.
@@ -2882,15 +2911,66 @@ mod tests {
             ..TaskConfig::new("box", "sandbox")
         }))?;
 
-        // File delivery would have to reach inside a running guest, which
-        // needs an agent the runtime does not have yet.
+        // File delivery reaches the guest under /legion/identity (the
+        // identity disk on a microVM, a bind mount in dev mode). A host path
+        // is refused with the fix.
         let err = validate_job_config(&job_with(TaskConfig {
             identities: vec![file_identity("aws")],
-            config,
+            config: config.clone(),
             ..TaskConfig::new("box", "sandbox")
         }))
-        .expect_err("sandbox has no identity file delivery");
-        assert!(err.to_string().contains("identity file delivery"), "{err}");
+        .expect_err("/var/run/... is not in the guest");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("outside the sandbox identity directory")
+                && message.contains("/legion/identity"),
+            "{message}"
+        );
+        for path in ["/legion/identity/aws", "aws"] {
+            validate_job_config(&job_with(TaskConfig {
+                identities: vec![WorkloadIdentity {
+                    file: Some(WorkloadIdentityFile {
+                        path: path.into(),
+                        mode: None,
+                    }),
+                    ..file_identity("aws")
+                }],
+                config: config.clone(),
+                ..TaskConfig::new("box", "sandbox")
+            }))
+            .unwrap_or_else(|err| panic!("{path} should be accepted: {err:#}"));
+        }
+        Ok(())
+    }
+
+    /// Env with `changeMode = "noop"` (the default) is accepted on a
+    /// memory-checkpointable sandbox, which keeps the token fresh at
+    /// `/legion/identity/<ENV>`, and refused on one without an identity disk.
+    #[test]
+    fn env_noop_identities_need_a_sandbox_that_refreshes_them() -> R<()> {
+        let identity = WorkloadIdentity {
+            name: "vault".into(),
+            audience: vec!["vault.internal".into()],
+            env: Some("VAULT_TOKEN".into()),
+            ..Default::default()
+        };
+        let mut checkpointable: TaskConfig = serde_json::from_value(json!({
+            "name": "box",
+            "runtime": "sandbox",
+            "config": {"image": "alpine", "command": ["sleep", "1"]},
+            "stateful": {"mode": "keyed"},
+            "suspend": {"checkpoint": "memory"},
+        }))?;
+        checkpointable.identities = vec![identity.clone()];
+        validate_job_config(&job_with(checkpointable))?;
+
+        let err = validate_job_config(&job_with(TaskConfig {
+            identities: vec![identity],
+            config: json!({"image": "alpine", "command": ["sleep", "1"]}),
+            ..TaskConfig::new("box", "sandbox")
+        }))
+        .expect_err("no identity disk to refresh it");
+        assert!(format!("{err:#}").contains("can never"), "{err:#}");
         Ok(())
     }
 

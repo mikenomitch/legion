@@ -37,18 +37,166 @@ pub struct CgroupSample {
     pub memory_anon_bytes: u64,
     pub cpu_usage_usec: u64,
     pub psi_memory_some_avg10: f64,
+    /// Cumulative bytes the guest sent on its own NIC, for an allocation
+    /// whose traffic never crosses the node datapath: a sandbox's TAP device
+    /// (its `rx_bytes`, since the host receives what the guest sends) or an
+    /// Apple container's interface. A rise between samples is network
+    /// activity. Only the guest's sends count: what arrives on a bridge
+    /// includes broadcast noise a quiet guest never asked for.
+    pub guest_sent_bytes: Option<u64>,
 }
 
-/// What to measure: an allocation id as the manager knows it, its cgroup's
-/// absolute directory, and what the memory pressure response needs to place
+/// Where an allocation's CPU and memory are read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageSource {
+    /// A worker-owned cgroup's absolute directory (Linux, with resource
+    /// enforcement on).
+    Cgroup(PathBuf),
+    /// A dev-mode sandbox on Apple `container` (macOS), by container name:
+    /// `container stats` reports its CPU, memory, and network, since there
+    /// is no cgroup to read.
+    AppleContainer(String),
+}
+
+/// What to measure: an allocation id as the manager knows it, where its
+/// usage is read from, and what the memory pressure response needs to place
 /// it in order (`src/worker/pressure.rs`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageTarget {
     pub allocation_id: i64,
-    pub cgroup_dir: PathBuf,
+    pub source: UsageSource,
+    /// The host TAP device a microVM sandbox's NIC is wired to, whose
+    /// counters are the guest's network activity.
+    pub tap_device: Option<String>,
     pub pressure: crate::worker::pressure::PressureMeta,
     /// The task's idle policy (`suspend.idle`), when it has one.
     pub idle: Option<crate::worker::idle::IdlePolicy>,
+}
+
+impl UsageTarget {
+    /// The cgroup directory, for a cgroup-governed allocation.
+    pub fn cgroup_dir(&self) -> Option<&Path> {
+        match &self.source {
+            UsageSource::Cgroup(dir) => Some(dir),
+            UsageSource::AppleContainer(_) => None,
+        }
+    }
+}
+
+/// A TAP device's byte counters, behind a seam so the sampler is testable
+/// without Linux.
+pub trait NicCounters {
+    /// Bytes the guest behind `tap` has sent since the device was created.
+    fn guest_sent_bytes(&self, tap: &str) -> Option<u64>;
+}
+
+/// The real counters: `/sys/class/net/<tap>/statistics/rx_bytes`. On a TAP
+/// device the host's receive side is what the guest transmitted.
+pub struct SysfsNicCounters;
+
+/// [`SysfsNicCounters`] against any `/sys/class/net`-shaped tree.
+pub fn read_tap_guest_sent_bytes(class_net: &Path, tap: &str) -> Option<u64> {
+    if tap.is_empty() || tap.contains('/') {
+        return None;
+    }
+    read_u64(&class_net.join(tap).join("statistics").join("rx_bytes"))
+}
+
+impl NicCounters for SysfsNicCounters {
+    fn guest_sent_bytes(&self, tap: &str) -> Option<u64> {
+        if cfg!(target_os = "linux") {
+            read_tap_guest_sent_bytes(Path::new("/sys/class/net"), tap)
+        } else {
+            None
+        }
+    }
+}
+
+/// One Apple container's `container stats --format json` entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppleContainerStats {
+    pub id: String,
+    #[serde(default)]
+    pub cpu_usage_usec: u64,
+    #[serde(default)]
+    pub memory_usage_bytes: u64,
+    #[serde(default)]
+    pub network_rx_bytes: u64,
+    #[serde(default)]
+    pub network_tx_bytes: u64,
+}
+
+impl AppleContainerStats {
+    /// The sample the sampler reads. Apple's VM reports no anon split, peak,
+    /// or pressure stall, so those stay empty, and the container's transmit
+    /// side is what the guest sent.
+    pub fn sample(&self) -> CgroupSample {
+        CgroupSample {
+            memory_current_bytes: self.memory_usage_bytes,
+            memory_peak_bytes: None,
+            memory_anon_bytes: 0,
+            cpu_usage_usec: self.cpu_usage_usec,
+            psi_memory_some_avg10: 0.0,
+            guest_sent_bytes: Some(self.network_tx_bytes),
+        }
+    }
+}
+
+/// Parse `container stats --format json --no-stream` (a JSON array, one
+/// object per running container) into stats by container name.
+pub fn parse_apple_container_stats(json: &str) -> HashMap<String, AppleContainerStats> {
+    serde_json::from_str::<Vec<AppleContainerStats>>(json)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|stats| (stats.id.clone(), stats))
+        .collect()
+}
+
+/// Every running Apple container's stats, from one `container stats` call.
+/// Empty when the CLI is missing or its service is down: the allocations
+/// are then left out of the report, the way an unreadable cgroup is.
+///
+/// One call for all containers, never one per name: `container stats`
+/// fails the whole call when any named container is not running.
+pub fn read_apple_container_stats() -> HashMap<String, AppleContainerStats> {
+    let output = std::process::Command::new("container")
+        .args(["stats", "--format", "json", "--no-stream"])
+        .stdin(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            parse_apple_container_stats(&String::from_utf8_lossy(&output.stdout))
+        }
+        Ok(output) => {
+            tracing::debug!(
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "container stats failed; Apple container sandboxes go unmeasured this report"
+            );
+            HashMap::new()
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "container CLI unavailable; Apple container sandboxes go unmeasured");
+            HashMap::new()
+        }
+    }
+}
+
+/// Read one target: its cgroup (plus its TAP's counters), or its Apple
+/// container's stats from `apple` (one `container stats` call per report).
+pub fn read_target_sample(
+    target: &UsageTarget,
+    apple: &HashMap<String, AppleContainerStats>,
+    nics: &dyn NicCounters,
+) -> Option<CgroupSample> {
+    let mut sample = match &target.source {
+        UsageSource::Cgroup(dir) => read_cgroup_sample(dir)?,
+        UsageSource::AppleContainer(name) => apple.get(name)?.sample(),
+    };
+    if let Some(tap) = target.tap_device.as_deref() {
+        sample.guest_sent_bytes = nics.guest_sent_bytes(tap).or(sample.guest_sent_bytes);
+    }
+    Some(sample)
 }
 
 /// Activity the sampler cannot read from a cgroup: what the datapath and the
@@ -114,6 +262,7 @@ pub fn read_cgroup_sample(dir: &Path) -> Option<CgroupSample> {
         memory_anon_bytes: parse_flat_keyed(&read("memory.stat"), "anon").unwrap_or(0),
         cpu_usage_usec: parse_flat_keyed(&read("cpu.stat"), "usage_usec").unwrap_or(0),
         psi_memory_some_avg10: parse_psi_some_avg10(&read("memory.pressure")).unwrap_or(0.0),
+        guest_sent_bytes: None,
     })
 }
 
@@ -151,6 +300,7 @@ struct AllocationState {
     sampled_at_unix_ms: i64,
     peak_bytes: u64,
     last_activity_unix: i64,
+    guest_sent_bytes: Option<u64>,
 }
 
 /// Turns periodic cgroup samples into [`UsageReport`]s: decides when a
@@ -180,14 +330,14 @@ impl UsageSampler {
         self.network_activity.extend(allocation_ids);
     }
 
-    /// Take one report. `read` samples a cgroup directory (the real reader
-    /// is [`read_cgroup_sample`]); targets it cannot read are left out.
+    /// Take one report. `read` samples one target (the real reader is
+    /// [`read_target_sample`]); targets it cannot read are left out.
     pub fn sample(
         &mut self,
         now: Instant,
         now_unix_ms: i64,
         targets: &[UsageTarget],
-        read: impl Fn(&Path) -> Option<CgroupSample>,
+        read: impl Fn(&UsageTarget) -> Option<CgroupSample>,
         node_memory: Option<NodeMemoryUsage>,
     ) -> UsageReport {
         self.sample_with(
@@ -208,7 +358,7 @@ impl UsageSampler {
         now: Instant,
         now_unix_ms: i64,
         targets: &[UsageTarget],
-        read: impl Fn(&Path) -> Option<CgroupSample>,
+        read: impl Fn(&UsageTarget) -> Option<CgroupSample>,
         node_memory: Option<NodeMemoryUsage>,
         inputs: &ActivityInputs,
     ) -> UsageReport {
@@ -218,7 +368,7 @@ impl UsageSampler {
         let mut seen = HashSet::with_capacity(targets.len());
 
         for target in targets {
-            let Some(sample) = read(&target.cgroup_dir) else {
+            let Some(sample) = read(target) else {
                 continue;
             };
             seen.insert(target.allocation_id);
@@ -245,10 +395,19 @@ impl UsageSampler {
                 && previous.is_none_or(|previous| {
                     ingress.last_bytes_unix >= previous.sampled_at_unix_ms / 1000
                 });
+            // Bytes the guest sent on its own NIC (a TAP, an Apple
+            // container) since the previous sample. The first sample has
+            // nothing to compare with, and a counter that went backwards
+            // (the device was recreated) restarts the count.
+            let guest_sent = matches!(
+                (previous.and_then(|previous| previous.guest_sent_bytes), sample.guest_sent_bytes),
+                (Some(before), Some(now)) if now > before
+            );
             let interval = crate::worker::idle::IntervalActivity {
                 cpu_millicores,
                 network_bytes: self.network_activity.contains(&target.allocation_id)
-                    || ingress_bytes,
+                    || ingress_bytes
+                    || guest_sent,
                 open_connections: ingress.open_connections,
                 exec_sessions: inputs
                     .exec_sessions
@@ -284,6 +443,7 @@ impl UsageSampler {
                     sampled_at_unix_ms: now_unix_ms,
                     peak_bytes,
                     last_activity_unix,
+                    guest_sent_bytes: sample.guest_sent_bytes,
                 },
             );
             allocations.push(AllocationUsage {
@@ -417,13 +577,15 @@ mod tests {
             memory_anon_bytes: current / 2,
             cpu_usage_usec: usage_usec,
             psi_memory_some_avg10: 0.0,
+            guest_sent_bytes: None,
         }
     }
 
     fn target(id: i64) -> UsageTarget {
         UsageTarget {
             allocation_id: id,
-            cgroup_dir: PathBuf::from(format!("/fake/legion-{id}")),
+            source: UsageSource::Cgroup(PathBuf::from(format!("/fake/legion-{id}"))),
+            tap_device: None,
             pressure: Default::default(),
             idle: None,
         }
@@ -446,7 +608,7 @@ mod tests {
             cpu_active_millicores: 20,
         });
         let targets = [idle_target, target(2)];
-        let quiet = |_: &Path| Some(sample_of(10, 0));
+        let quiet = |_: &UsageTarget| Some(sample_of(10, 0));
         let at = |n: u32| start + USAGE_REPORT_INTERVAL * n;
 
         let first = sampler.sample(start, 100_000, &targets, quiet, None);
@@ -485,6 +647,107 @@ mod tests {
         inputs.exec_sessions.clear();
         let after = sampler.sample_with(at(4), 140_000, &targets, quiet, None, &inputs);
         assert_eq!(after.allocations[0].idle_since_unix, 130);
+    }
+
+    /// A fake TAP: fixed counters per device.
+    struct FakeNics(HashMap<String, u64>);
+
+    impl NicCounters for FakeNics {
+        fn guest_sent_bytes(&self, tap: &str) -> Option<u64> {
+            self.0.get(tap).copied()
+        }
+    }
+
+    #[test]
+    fn tap_counters_read_the_hosts_receive_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let stats = dir.path().join("lgf0123456789ab").join("statistics");
+        std::fs::create_dir_all(&stats).unwrap();
+        std::fs::write(stats.join("rx_bytes"), "4096\n").unwrap();
+        std::fs::write(stats.join("tx_bytes"), "999999\n").unwrap();
+        assert_eq!(
+            read_tap_guest_sent_bytes(dir.path(), "lgf0123456789ab"),
+            Some(4096)
+        );
+        assert_eq!(read_tap_guest_sent_bytes(dir.path(), "missing"), None);
+        assert_eq!(read_tap_guest_sent_bytes(dir.path(), "../etc"), None);
+    }
+
+    /// `container stats --format json --no-stream`, as Apple `container`
+    /// 1.1.0 prints it.
+    #[test]
+    fn apple_container_stats_parse_into_samples() {
+        let json = r#"[{"blockReadBytes":1744896,"blockWriteBytes":0,"cpuUsageUsec":129924,
+            "id":"legion-sbx-7","memoryLimitBytes":1073741824,"memoryUsageBytes":2408448,
+            "networkRxBytes":14464,"networkTxBytes":602,"numProcesses":1}]"#;
+        let stats = parse_apple_container_stats(json);
+        let sample = stats["legion-sbx-7"].sample();
+        assert_eq!(sample.cpu_usage_usec, 129_924);
+        assert_eq!(sample.memory_current_bytes, 2_408_448);
+        assert_eq!(sample.guest_sent_bytes, Some(602));
+        assert!(parse_apple_container_stats("not json").is_empty());
+        assert!(parse_apple_container_stats("[]").is_empty());
+    }
+
+    #[test]
+    fn a_target_reads_from_its_source_and_its_tap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("legion-7");
+        fixture_cgroup(&cgroup, 100, None, 0);
+        let nics = FakeNics([("lgf7".to_string(), 512)].into());
+        let mut microvm = target(7);
+        microvm.source = UsageSource::Cgroup(cgroup);
+        microvm.tap_device = Some("lgf7".into());
+        let sample = read_target_sample(&microvm, &HashMap::new(), &nics).expect("readable");
+        assert_eq!(sample.guest_sent_bytes, Some(512));
+
+        let mut apple = target(8);
+        apple.source = UsageSource::AppleContainer("legion-sbx-8".into());
+        let stats = parse_apple_container_stats(
+            r#"[{"id":"legion-sbx-8","cpuUsageUsec":5,"memoryUsageBytes":10,"networkTxBytes":3}]"#,
+        );
+        let sample = read_target_sample(&apple, &stats, &nics).expect("listed");
+        assert_eq!(sample.memory_current_bytes, 10);
+        assert_eq!(sample.guest_sent_bytes, Some(3));
+        // Not running (not listed): left out, like a vanished cgroup.
+        assert_eq!(read_target_sample(&apple, &HashMap::new(), &nics), None);
+        assert_eq!(apple.cgroup_dir(), None);
+    }
+
+    /// A microVM's guest traffic never crosses the datapath. Bytes it sends
+    /// on its TAP count as network activity for its idle policy; a counter
+    /// that holds still is quiet, and the first sample has no baseline.
+    #[test]
+    fn bytes_the_guest_sends_on_its_nic_keep_it_awake() {
+        use crate::structs::suspend::IdleSignal;
+        let mut sampler = UsageSampler::default();
+        let start = Instant::now();
+        let mut sandbox = target(1);
+        sandbox.idle = Some(crate::worker::idle::IdlePolicy {
+            after_seconds: 60,
+            signals: vec![IdleSignal::Network],
+            cpu_active_millicores: 20,
+        });
+        let targets = [sandbox];
+        let sent = |bytes: u64| {
+            move |_: &UsageTarget| {
+                Some(CgroupSample {
+                    guest_sent_bytes: Some(bytes),
+                    ..sample_of(10, 0)
+                })
+            }
+        };
+        let at = |n: u32| start + USAGE_REPORT_INTERVAL * n;
+        let first = sampler.sample(at(0), 100_000, &targets, sent(1000), None);
+        assert_eq!(first.allocations[0].idle_since_unix, 100);
+        let held = sampler.sample(at(1), 110_000, &targets, sent(1000), None);
+        assert_eq!(held.allocations[0].idle_since_unix, 100, "no new bytes");
+        let talked = sampler.sample(at(2), 120_000, &targets, sent(1400), None);
+        assert_eq!(talked.allocations[0].idle_since_unix, 120);
+        assert_eq!(talked.allocations[0].last_activity_unix, 120);
+        // Recreated device: the counter restarts, which is not activity.
+        let reset = sampler.sample(at(3), 130_000, &targets, sent(10), None);
+        assert_eq!(reset.allocations[0].idle_since_unix, 120);
     }
 
     #[test]
@@ -586,7 +849,7 @@ mod tests {
             start,
             0,
             &[target(1), target(2)],
-            |dir| (!dir.ends_with("legion-2")).then(|| sample_of(1, 0)),
+            |target| (!target.cgroup_dir().unwrap().ends_with("legion-2")).then(|| sample_of(1, 0)),
             None,
         );
         assert_eq!(

@@ -721,6 +721,11 @@ pub(crate) fn apply_refreshed_token(
         // and any restart starts with the fresh token.
         manager.update_task_env(alloc_id, env_key, token)?;
     }
+    // A runtime with an isolated guest (a sandbox) copies the fresh token in
+    // itself; for the rest the host file just written is what the task reads.
+    if identity.change_mode != ChangeMode::Restart {
+        manager.identity_tokens_refreshed(alloc_id)?;
+    }
 
     match identity.change_mode {
         ChangeMode::Noop => {}

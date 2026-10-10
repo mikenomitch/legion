@@ -126,7 +126,9 @@ struct SandboxTaskConfig {
     #[serde(default)]
     kernel_args: Option<String>,
 
-    /// Guest network interface backed by a pre-created host TAP device.
+    /// Guest network interface backed by a host TAP device: one the
+    /// operator created (`tap = "tap0"`), or one Legion creates per
+    /// instance and attaches to a bridge (`tap = "auto"`).
     #[serde(default)]
     network: Option<SandboxNetworkConfig>,
 
@@ -143,14 +145,129 @@ struct SandboxNetworkConfig {
     #[serde(default)]
     mode: Option<String>,
 
-    /// Name of the pre-created host TAP device (required with `mode: tap`).
-    /// Legion does not create TAP devices; an operator or network plugin does.
+    /// The host TAP device (required with `mode: tap`). Either the name of
+    /// a device an operator or network plugin created, which serves one
+    /// guest per node, or `"auto"`: Legion creates a device per instance
+    /// (`lgf` plus a hash of the instance id), attaches it to `bridge`,
+    /// recreates it under the same name on restore, and deletes it when the
+    /// allocation is destroyed. Any number of auto-TAP sandboxes fit on a
+    /// node, and each one can take memory checkpoints.
     #[serde(default)]
     tap: Option<String>,
 
-    /// MAC address handed to the guest interface.
+    /// The host bridge an auto TAP joins (required with `tap: "auto"`, and
+    /// only allowed with it). The bridge itself, its addressing, and any DHCP
+    /// on it are the operator's: Legion only enslaves the TAP to it.
+    #[serde(default)]
+    bridge: Option<String>,
+
+    /// MAC address handed to the guest interface. An auto TAP defaults to a
+    /// locally administered address derived from the allocation id, so
+    /// guests sharing a bridge never collide.
     #[serde(default)]
     mac: Option<String>,
+}
+
+/// Where a sandbox guest reads its workload-identity token files
+/// (`identities[].file.path` resolves under it).
+pub const GUEST_IDENTITY_ROOT: &str = crate::task_plugins::guest_resume::GUEST_TOKEN_DIR;
+
+/// The host side of [`GUEST_IDENTITY_ROOT`]: file delivery writes tokens to
+/// `<task dir>/identity/`, and the runtime projects them into the guest
+/// (through the identity disk on a microVM, a read-only bind mount in dev
+/// mode).
+const HOST_IDENTITY_SUBDIR: &str = "identity";
+
+fn has_file_identities(task: &TaskConfig) -> bool {
+    task.identities
+        .iter()
+        .any(crate::structs::workload_identity::WorkloadIdentity::delivers_file)
+}
+
+/// The tokens a microVM guest keeps on its identity disk: each env-delivered
+/// identity's current value (from `env`), and each file-delivered one read
+/// from the host file the worker keeps fresh under `task_dir`. A token the
+/// worker has not delivered (identities disabled on the manager) is left
+/// out, exactly as the task would start without it.
+fn guest_tokens(
+    task: &TaskConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+    task_dir: Option<&Path>,
+) -> sandbox_checkpoint::GuestTokens {
+    let mut tokens = sandbox_checkpoint::GuestTokens::default();
+    for identity in &task.identities {
+        if let Some(key) = identity.env.as_deref().filter(|key| !key.trim().is_empty()) {
+            if let Some(value) = env(key) {
+                tokens.env.insert(key.to_string(), value);
+            }
+        }
+        let (Some(file), Some(task_dir)) = (
+            identity
+                .file
+                .as_ref()
+                .filter(|file| !file.path.trim().is_empty()),
+            task_dir,
+        ) else {
+            continue;
+        };
+        // Re-resolved here, never trusted from admission alone, so no path
+        // can name anything outside the identity directory on either side.
+        let relative = match crate::task_plugins::resolve_task_dir_destination(
+            GUEST_IDENTITY_ROOT,
+            &file.path,
+        ) {
+            Ok(relative) => relative,
+            Err(err) => {
+                warn!(identity = %identity.name, error = %err, "Skipping a sandbox identity file outside /legion/identity");
+                continue;
+            }
+        };
+        let Ok(token) =
+            std::fs::read_to_string(task_dir.join(HOST_IDENTITY_SUBDIR).join(&relative))
+        else {
+            continue;
+        };
+        let mode = file
+            .mode
+            .as_deref()
+            .and_then(|mode| crate::structs::workload_identity::parse_file_mode(mode).ok())
+            .unwrap_or(crate::worker::identity::DEFAULT_TOKEN_FILE_MODE);
+        tokens
+            .files
+            .push(crate::structs::checkpoint::GuestTokenFile {
+                path: Path::new(GUEST_IDENTITY_ROOT)
+                    .join(&relative)
+                    .to_string_lossy()
+                    .into_owned(),
+                mode,
+                token,
+            });
+    }
+    tokens
+}
+
+/// `config.network.tap` value that asks Legion for a per-instance TAP.
+pub const AUTO_TAP: &str = "auto";
+
+/// How a sandbox's guest NIC is wired to the host, as declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TapWiring {
+    /// An operator-created device, the same name for every instance.
+    Fixed(String),
+    /// A Legion-created device per instance, on this bridge.
+    Auto { bridge: String },
+}
+
+/// Whether `name` can be a Linux network interface name: 1 to 15 bytes, no
+/// `/`, whitespace, or `:`, and not `.` or `..`.
+fn valid_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() < 16
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|c| c == '/' || c == ':' || c.is_whitespace() || c.is_control())
 }
 
 /// Beside the VMM socket: the balloon's bounds, written at boot for a
@@ -281,14 +398,46 @@ impl SandboxTaskConfig {
             match network.mode.as_deref().unwrap_or("none") {
                 "none" => {}
                 "tap" => {
-                    if network
+                    let Some(tap) = network
                         .tap
                         .as_deref()
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
-                        .is_none()
-                    {
-                        bail!("sandbox task network.mode `tap` requires network.tap (the host TAP device name)");
+                    else {
+                        bail!(
+                            "sandbox task network.mode `tap` requires network.tap (a host TAP \
+                             device name, or \"auto\" for one per instance)"
+                        );
+                    };
+                    let bridge = network.bridge.as_deref().map(str::trim);
+                    if tap == AUTO_TAP {
+                        match bridge {
+                            None | Some("") => bail!(
+                                "sandbox task network.tap = \"auto\" requires network.bridge: \
+                                 the host bridge each instance's TAP joins\nHint: set bridge = \
+                                 \"br0\" (or whichever bridge carries your sandbox network)"
+                            ),
+                            Some(bridge) if !valid_interface_name(bridge) => bail!(
+                                "sandbox task network.bridge {bridge:?} is not a valid interface \
+                                 name (1 to 15 characters, no `/`, `:`, or whitespace)"
+                            ),
+                            Some(_) => {}
+                        }
+                    } else {
+                        if !valid_interface_name(tap) {
+                            bail!(
+                                "sandbox task network.tap {tap:?} is not a valid interface name \
+                                 (1 to 15 characters, no `/`, `:`, or whitespace)"
+                            );
+                        }
+                        if bridge.is_some_and(|bridge| !bridge.is_empty()) {
+                            bail!(
+                                "sandbox task network.bridge applies only to tap = \"auto\": a \
+                                 fixed TAP ({tap}) is wired by whoever created it\nHint: set tap \
+                                 = \"auto\" to have Legion create and attach a TAP per \
+                                 instance, or drop bridge"
+                            );
+                        }
                     }
                 }
                 other => bail!("sandbox task network.mode must be `none` or `tap`, got `{other}`"),
@@ -310,16 +459,61 @@ impl SandboxTaskConfig {
             .unwrap_or(DEFAULT_ROOTFS_HEADROOM_MIB)
     }
 
-    fn tap(&self) -> Option<TapNet> {
+    /// The declared TAP wiring, or `None` for a loopback-only guest.
+    fn tap_wiring(&self) -> Option<TapWiring> {
         let network = self.network.as_ref()?;
         if network.mode.as_deref().unwrap_or("none") != "tap" {
             return None;
         }
-        Some(TapNet {
-            device: network.tap.clone()?,
-            mac: network.mac.clone(),
+        let tap = network.tap.as_deref()?.trim();
+        Some(if tap == AUTO_TAP {
+            TapWiring::Auto {
+                bridge: network.bridge.as_deref()?.trim().to_string(),
+            }
+        } else {
+            TapWiring::Fixed(tap.to_string())
         })
     }
+
+    /// The bridge an auto TAP joins.
+    fn auto_bridge(&self) -> Option<String> {
+        match self.tap_wiring()? {
+            TapWiring::Auto { bridge } => Some(bridge),
+            TapWiring::Fixed(_) => None,
+        }
+    }
+
+    /// The TAP device (and MAC) this allocation's guest attaches. A fixed
+    /// TAP is the declared name. An auto TAP is the instance's own device
+    /// ([`crate::structs::fork::own_tap_name`], the name a fork of it would
+    /// get too), or the allocation's when it serves no instance.
+    fn tap_for(&self, instance_id: Option<&str>, allocation_id: i64) -> Option<TapNet> {
+        let mac = self
+            .network
+            .as_ref()
+            .and_then(|network| network.mac.clone());
+        match self.tap_wiring()? {
+            TapWiring::Fixed(device) => Some(TapNet { device, mac }),
+            TapWiring::Auto { .. } => {
+                let owner = instance_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::structs::fork::allocation_tap_owner(allocation_id));
+                Some(TapNet {
+                    device: crate::structs::fork::own_tap_name(&owner),
+                    mac: mac.or_else(|| Some(crate::structs::fork::fork_mac(allocation_id))),
+                })
+            }
+        }
+    }
+}
+
+/// The instance an allocation serves, from the `LEGION_INSTANCE_ID` the
+/// manager put in its env (the worker's allocation carries no instance
+/// binding of its own).
+fn instance_id_from_env(env: &HashMap<String, String>) -> Option<&str> {
+    env.get("LEGION_INSTANCE_ID")
+        .map(String::as_str)
+        .filter(|id| !id.is_empty())
 }
 
 /// The task's `hypervisor` selection, read without failing on an otherwise
@@ -354,12 +548,43 @@ pub fn vsock_socket_base_for(alloc_dir: &Path) -> PathBuf {
 /// Per-allocation scratch: image layout, extracted rootfs, root disk, and the
 /// VMM control socket. Removed on destroy.
 fn work_root(allocation: &Allocation, instance: &TaskInstance) -> PathBuf {
+    work_root_for(allocation.id, instance)
+}
+
+fn work_root_for(allocation_id: i64, instance: &TaskInstance) -> PathBuf {
     instance
         .alloc_dir
         .clone()
         .or_else(|| instance.task_dir.clone())
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("legion-sandbox-{}", allocation.id)))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("legion-sandbox-{allocation_id}")))
         .join(".sandbox")
+}
+
+/// Written into the scratch dir by a dev-mode start on Apple `container`,
+/// naming the container, so the usage sampler knows to read it.
+const APPLE_CONTAINER_RECORD: &str = "apple-container";
+
+/// Where the usage sampler reads a running sandbox's activity besides its
+/// cgroup (`src/worker/usage.rs`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxUsageSource {
+    /// The host TAP device the guest's NIC is wired to.
+    pub tap_device: Option<String>,
+    /// The Apple container a macOS dev-mode sandbox runs as.
+    pub apple_container: Option<String>,
+}
+
+/// What [`SandboxUsageSource`] the sandbox in `instance` recorded when it
+/// started or was restored.
+pub fn sandbox_usage_source(allocation_id: i64, instance: &TaskInstance) -> SandboxUsageSource {
+    let scratch = work_root_for(allocation_id, instance);
+    SandboxUsageSource {
+        tap_device: sandbox_checkpoint::attached_tap(&scratch),
+        apple_container: std::fs::read_to_string(scratch.join(APPLE_CONTAINER_RECORD))
+            .ok()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+    }
 }
 
 /// Bring a host TAP device administratively up or down.
@@ -637,6 +862,7 @@ fn build_apple_launch(
     config: &SandboxTaskConfig,
     env: &BTreeMap<String, String>,
     volumes: &[MountedVolume],
+    identity_dir: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
@@ -667,6 +893,12 @@ fn build_apple_launch(
             "{}:{destination}{suffix}",
             volume.host_path.display()
         ));
+    }
+    // File-delivered identity tokens: the host directory the worker keeps
+    // fresh, read-only at the path a microVM guest would read them.
+    if let Some(dir) = identity_dir {
+        args.push("--volume".to_string());
+        args.push(format!("{}:{GUEST_IDENTITY_ROOT}:ro", dir.display()));
     }
     if let Some(cwd) = config.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
         args.push("--workdir".to_string());
@@ -711,16 +943,35 @@ impl SandboxTaskPlugin {
     ) -> R<Command> {
         let scratch = work_root(allocation, instance);
         let name = sandbox_name(allocation);
-        // A fixed `network.tap` serves one guest per node. Booting on a TAP
-        // another VMM holds fails by name here, rather than as an opaque VMM
-        // error: a disk fork, or a fork that fell back to a cold boot, of a
-        // TAP-wired task lands on the node where its origin holds the TAP.
-        if let Some(tap) = config.tap() {
-            sandbox_checkpoint::ensure_boot_tap_free(
-                &sandbox_checkpoint::HostTaps,
-                &tap.device,
-                &task.name,
-            )?;
+        let tap = config.tap_for(instance_id_from_env(env), allocation.id);
+        std::fs::create_dir_all(&scratch)?;
+        match (config.tap_wiring(), tap.as_ref()) {
+            // An auto TAP is this instance's own device: created, attached
+            // to its bridge, and recorded so destroy deletes it.
+            (Some(TapWiring::Auto { bridge }), Some(tap)) => {
+                sandbox_checkpoint::ensure_auto_tap(
+                    &sandbox_checkpoint::HostTaps,
+                    &tap.device,
+                    &bridge,
+                    &scratch,
+                )?;
+            }
+            // A fixed `network.tap` serves one guest per node. Booting on a
+            // TAP another VMM holds fails by name here, rather than as an
+            // opaque VMM error: a disk fork, or a fork that fell back to a
+            // cold boot, of a TAP-wired task lands on the node where its
+            // origin holds the TAP.
+            (Some(TapWiring::Fixed(_)), Some(tap)) => {
+                sandbox_checkpoint::ensure_boot_tap_free(
+                    &sandbox_checkpoint::HostTaps,
+                    &tap.device,
+                    &task.name,
+                )?;
+            }
+            _ => {}
+        }
+        if let Some(tap) = tap.as_ref() {
+            sandbox_checkpoint::record_attached_tap(&scratch, &tap.device)?;
         }
         let kernel = microvm::resolve_kernel(config.kernel.as_deref())?;
         let layout = oci_image::resolve_layout(&config.image, instance, &scratch)?;
@@ -755,21 +1006,31 @@ impl SandboxTaskPlugin {
         // and the guest agent (this binary, copied in) makes the host
         // datapath reachable on the guest's loopback.
         let gated = crate::task_plugins::allocation_is_gated(allocation);
-        if gated && config.tap().is_some() {
+        if gated && tap.is_some() {
             bail!(
                 "sandbox task {} is network.mode = \"gated\" but its config declares a TAP \
                  device; a gated guest has no NIC (drop config.network, or set mode = \"host\")",
                 task.name
             );
         }
+        // Workload-identity tokens the guest keeps fresh through its
+        // identity disk: file-delivered ones always, env-delivered ones
+        // whenever the guest has the disk anyway (a checkpoint launch).
+        let tokens = guest_tokens(
+            task,
+            &|key| env.get(key).cloned(),
+            instance.task_dir.as_deref(),
+        );
+        let file_tokens = has_file_identities(task);
         let mut payload = GuestPayload {
             command: config.command.clone(),
             env: guest_env,
             cwd: payload_cwd,
             disk_mounts: volumes.mounts,
             guest_agent: gated,
-            // Gated sandboxes are never launched for checkpoints (see below).
-            resume_watch: instance.checkpoint_launch && !gated,
+            // Gated sandboxes are never launched for checkpoints (see below),
+            // but any guest with token files watches its identity disk.
+            resume_watch: (instance.checkpoint_launch && !gated) || file_tokens,
         };
 
         let staged = instance.staged_artifacts.clone();
@@ -834,7 +1095,7 @@ impl SandboxTaskPlugin {
             volume_disks: volumes.disks,
             vcpus: config.vcpus(),
             memory_mib: config.memory_mib(),
-            tap: config.tap(),
+            tap,
             api_socket: scratch.join("vmm.sock"),
             vsock: gated.then(|| microvm::VsockSpec {
                 cid: microvm::vsock_cid(allocation.id),
@@ -857,10 +1118,21 @@ impl SandboxTaskPlugin {
             false
         } else {
             sandbox_checkpoint::prepare_checkpoint_launch(
-                hypervisor, allocation, &task.name, instance, &scratch, &mut spec,
+                hypervisor, allocation, &task.name, instance, &scratch, &mut spec, &tokens,
             )?;
             true
         };
+        if !checkpointable && file_tokens {
+            // No checkpoint support, but token files to keep fresh: the
+            // identity disk alone, attached directly (no device links, since
+            // nothing restores this guest elsewhere).
+            let path = sandbox_checkpoint::identity_disk_path(&scratch);
+            crate::task_plugins::checkpoint::write_identity_disk(
+                &path,
+                &sandbox_checkpoint::boot_identity(allocation, &task.name, &spec.name, &tokens),
+            )?;
+            spec.identity_disk = Some(path);
+        }
         // A balloon for the guests that run above a reservation: the
         // `reclaim` pressure step's lever for guest RAM. Recorded beside the
         // socket so reclaim knows the bounds without re-reading the task.
@@ -933,6 +1205,7 @@ impl SandboxTaskPlugin {
     fn start_apple_container(
         &self,
         allocation: &Allocation,
+        task: &TaskConfig,
         config: &SandboxTaskConfig,
         env: &HashMap<String, String>,
         instance: &TaskInstance,
@@ -941,11 +1214,31 @@ impl SandboxTaskPlugin {
         reject_block_volumes_in_dev_mode(&instance.volumes, backend)?;
         let name = sandbox_name(allocation);
         remove_stale_dev_sandbox(backend, &name);
+        // Named for the usage sampler: `container stats` is how an idle
+        // policy sees this sandbox on macOS, where there is no cgroup.
+        let scratch = work_root(allocation, instance);
+        std::fs::create_dir_all(&scratch)?;
+        std::fs::write(scratch.join(APPLE_CONTAINER_RECORD), &name)
+            .with_context(|| format!("failed to record Apple container {name}"))?;
         let mut env: BTreeMap<String, String> = env.clone().into_iter().collect();
         env.extend(instance.volume_env());
 
+        let identity_dir = match (has_file_identities(task), instance.task_dir.as_ref()) {
+            (true, Some(task_dir)) => {
+                let dir = task_dir.join(HOST_IDENTITY_SUBDIR);
+                std::fs::create_dir_all(&dir)?;
+                Some(dir)
+            }
+            _ => None,
+        };
         let mut cmd = Command::new("container");
-        cmd.args(build_apple_launch(&name, config, &env, &instance.volumes));
+        cmd.args(build_apple_launch(
+            &name,
+            config,
+            &env,
+            &instance.volumes,
+            identity_dir.as_deref(),
+        ));
         Ok(cmd)
     }
 
@@ -1155,6 +1448,62 @@ impl TaskPlugin for SandboxTaskPlugin {
         true
     }
 
+    /// Identity files reach the guest through its identity disk (a microVM)
+    /// or a read-only bind mount (dev mode), both under `/legion/identity`,
+    /// and a refresh rewrites them with no restart.
+    fn supports_identity_file(&self) -> bool {
+        true
+    }
+
+    fn file_delivery_root(&self) -> Option<&'static str> {
+        Some(GUEST_IDENTITY_ROOT)
+    }
+
+    fn file_delivery_host_subdir(&self) -> Option<&'static str> {
+        Some(HOST_IDENTITY_SUBDIR)
+    }
+
+    /// A refreshed token reaches a microVM guest by rewriting its identity
+    /// disk in place: the guest's handler sees new tokens with the same
+    /// allocation and rewrites `/legion/identity/` with no restart. Dev mode
+    /// needs nothing: the bind mount already shows the rewritten host file.
+    fn identity_tokens_refreshed(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+    ) -> R<()> {
+        let backend = Backend::detect(configured_backend(task).as_deref())?;
+        if !backend.is_microvm() {
+            return Ok(());
+        }
+        let disk = sandbox_checkpoint::identity_disk_path(&work_root(allocation, instance));
+        if !disk.exists() {
+            // Launched without an identity disk (no checkpoint support and
+            // no token files): env tokens refresh by restart only.
+            return Ok(());
+        }
+        let task_env = task.config.get("env").and_then(Value::as_object);
+        let tokens = guest_tokens(
+            task,
+            &|key| {
+                task_env
+                    .and_then(|env| env.get(key))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            },
+            instance.task_dir.as_deref(),
+        );
+        if sandbox_checkpoint::refresh_identity_tokens(&disk, &tokens)? {
+            info!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                "Refreshed workload identity tokens on the sandbox's identity disk"
+            );
+        }
+        Ok(())
+    }
+
     fn supports_artifacts(&self) -> bool {
         true
     }
@@ -1270,7 +1619,7 @@ impl TaskPlugin for SandboxTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        _instance: &mut TaskInstance,
+        instance: &mut TaskInstance,
         open: bool,
     ) -> R<()> {
         let config = SandboxTaskConfig::from_value(&task.config)?;
@@ -1279,15 +1628,24 @@ impl TaskPlugin for SandboxTaskPlugin {
             // policy-withheld marker every vsock listener checks.
             return crate::task_plugins::set_gated_namespace_gate(allocation, open);
         }
-        let Some(tap) = config.tap() else {
+        // The device the guest was wired to at boot (an auto TAP's name is
+        // per instance), else the declared fixed one.
+        let device =
+            sandbox_checkpoint::attached_tap(&work_root(allocation, instance)).or_else(|| {
+                match config.tap_wiring() {
+                    Some(TapWiring::Fixed(device)) => Some(device),
+                    _ => None,
+                }
+            });
+        let Some(device) = device else {
             // Loopback-only guest: nothing to gate, and nothing to open.
             return Ok(());
         };
-        set_tap_link(&tap.device, open).with_context(|| {
+        set_tap_link(&device, open).with_context(|| {
             format!(
                 "failed to {} TAP device {} for allocation {}",
                 if open { "open" } else { "shut" },
-                tap.device,
+                device,
                 allocation.id
             )
         })
@@ -1352,7 +1710,7 @@ impl TaskPlugin for SandboxTaskPlugin {
                 self.start_microvm(&hypervisor, allocation, task, &config, &env, instance)?
             }
             Backend::AppleContainer => {
-                self.start_apple_container(allocation, &config, &env, instance, &hypervisor)?
+                self.start_apple_container(allocation, task, &config, &env, instance, &hypervisor)?
             }
             Backend::OciRuntime { binary } => {
                 let binary = binary.clone();
@@ -1541,16 +1899,23 @@ impl TaskPlugin for SandboxTaskPlugin {
             vcpus: config.vcpus(),
             memory_mib: config.memory_mib(),
             scratch: work_root(allocation, instance),
-            tap: config.tap().map(|tap| tap.device),
+            tap: config
+                .tap_for(identity.instance_id.as_deref(), allocation.id)
+                .map(|tap| tap.device),
+            bridge: config.auto_bridge(),
         };
         let scratch = target.scratch.clone();
         let guest_mib = u64::from(target.memory_mib);
+        // The new allocation's file-delivered tokens ride the identity disk
+        // the restore writes, beside its env tokens.
+        let mut identity = identity.clone();
+        identity.files = guest_tokens(task, &|_| None, instance.task_dir.as_deref()).files;
         sandbox_checkpoint::restore_microvm(
             &target,
             instance,
             manifest,
             source,
-            identity,
+            &identity,
             &sandbox_checkpoint::HostTaps,
         )?;
         // Every memory-checkpointable guest boots with a balloon, and the
@@ -1710,7 +2075,7 @@ mod tests {
         assert_eq!(parsed.vcpus(), 2);
         assert_eq!(parsed.memory_mib(), 1024);
         assert_eq!(
-            parsed.tap(),
+            parsed.tap_for(Some("user-42"), 7),
             Some(TapNet {
                 device: "tap0".into(),
                 mac: Some("02:00:00:00:00:01".into())
@@ -1821,7 +2186,7 @@ mod tests {
         assert_eq!(parsed.vcpus(), DEFAULT_VCPUS);
         assert_eq!(parsed.memory_mib(), DEFAULT_MEMORY_MIB);
         assert_eq!(parsed.rootfs_headroom_mib(), DEFAULT_ROOTFS_HEADROOM_MIB);
-        assert_eq!(parsed.tap(), None);
+        assert_eq!(parsed.tap_for(None, 1), None);
         Ok(())
     }
 
@@ -1919,6 +2284,115 @@ mod tests {
         )
         .expect_err("unknown mode");
         assert!(err.to_string().contains("must be `none` or `tap`"));
+    }
+
+    /// The guest's identity disk carries env tokens by key and file tokens
+    /// read from the host's `<task dir>/identity/`, at their guest paths and
+    /// modes. An undelivered token is left out.
+    #[test]
+    fn guest_tokens_read_env_and_the_host_identity_dir() -> R<()> {
+        let task_dir = tempfile::tempdir()?;
+        let host = task_dir.path().join(HOST_IDENTITY_SUBDIR);
+        std::fs::create_dir_all(host.join("cloud"))?;
+        std::fs::write(host.join("cloud").join("aws"), "aws-token")?;
+        let mut task = task_with(json!({"image": "a", "command": ["x"]}));
+        task.identities = serde_json::from_value(json!([
+            { "name": "vault", "audience": ["v"], "env": "VAULT_TOKEN" },
+            { "name": "aws", "audience": ["a"], "file": { "path": "cloud/aws", "mode": "0440" } },
+            { "name": "gcp", "audience": ["g"], "file": { "path": "/legion/identity/gcp" } },
+        ]))?;
+        let env = |key: &str| (key == "VAULT_TOKEN").then(|| "vault-token".to_string());
+        let tokens = guest_tokens(&task, &env, Some(task_dir.path()));
+        assert_eq!(tokens.env["VAULT_TOKEN"], "vault-token");
+        assert_eq!(tokens.files.len(), 1, "gcp was never delivered");
+        assert_eq!(tokens.files[0].path, "/legion/identity/cloud/aws");
+        assert_eq!(tokens.files[0].mode, 0o440);
+        assert_eq!(tokens.files[0].token, "aws-token");
+        Ok(())
+    }
+
+    #[test]
+    fn apple_launch_mounts_the_identity_dir_read_only() -> R<()> {
+        let config = SandboxTaskConfig::from_value(&json!({"image": "a", "command": ["x"]}))?;
+        let args = build_apple_launch(
+            "legion-sbx-7",
+            &config,
+            &BTreeMap::new(),
+            &[],
+            Some(Path::new("/allocs/7/box/identity")),
+        );
+        assert!(
+            args.windows(2).any(|pair| pair[0] == "--volume"
+                && pair[1] == "/allocs/7/box/identity:/legion/identity:ro"),
+            "{args:?}"
+        );
+        Ok(())
+    }
+
+    /// `tap = "auto"` names a device per instance (the name a fork of it
+    /// would get), attached to the declared bridge, with a MAC per
+    /// allocation unless the spec pins one.
+    #[test]
+    fn an_auto_tap_is_named_per_instance_and_needs_a_bridge() -> R<()> {
+        let auto = SandboxTaskConfig::from_value(&json!({
+            "image": "a", "command": ["x"],
+            "network": { "mode": "tap", "tap": "auto", "bridge": "br0" },
+        }))?;
+        assert_eq!(
+            auto.tap_wiring(),
+            Some(TapWiring::Auto {
+                bridge: "br0".into()
+            })
+        );
+        assert_eq!(auto.auto_bridge().as_deref(), Some("br0"));
+        let user = auto.tap_for(Some("user-42"), 7).expect("a TAP");
+        assert_eq!(user.device, crate::structs::fork::own_tap_name("user-42"));
+        assert_eq!(user.mac.as_deref(), Some("02:4c:00:00:00:07"));
+        // Another instance, another device; the same instance on a later
+        // allocation (a resume), the same device.
+        assert_ne!(
+            auto.tap_for(Some("user-43"), 8).unwrap().device,
+            user.device
+        );
+        assert_eq!(
+            auto.tap_for(Some("user-42"), 99).unwrap().device,
+            user.device
+        );
+        // No instance: named after the allocation.
+        assert_eq!(
+            auto.tap_for(None, 7).unwrap().device,
+            crate::structs::fork::own_tap_name("alloc-7")
+        );
+
+        let err = SandboxTaskConfig::from_value(&json!({
+            "image": "a", "command": ["x"], "network": { "mode": "tap", "tap": "auto" },
+        }))
+        .expect_err("auto without a bridge");
+        assert!(
+            format!("{err:#}").contains("requires network.bridge"),
+            "{err:#}"
+        );
+
+        let err = SandboxTaskConfig::from_value(&json!({
+            "image": "a", "command": ["x"],
+            "network": { "mode": "tap", "tap": "tap0", "bridge": "br0" },
+        }))
+        .expect_err("bridge with a fixed TAP");
+        assert!(
+            format!("{err:#}").contains("applies only to tap = \"auto\""),
+            "{err:#}"
+        );
+
+        let err = SandboxTaskConfig::from_value(&json!({
+            "image": "a", "command": ["x"],
+            "network": { "mode": "tap", "tap": "auto", "bridge": "a-bridge-name-too-long" },
+        }))
+        .expect_err("bridge name too long");
+        assert!(
+            format!("{err:#}").contains("not a valid interface name"),
+            "{err:#}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2278,7 +2752,7 @@ mod tests {
             ),
             models,
         ];
-        let args = build_apple_launch("legion-sbx-7", &config, &env, &volumes);
+        let args = build_apple_launch("legion-sbx-7", &config, &env, &volumes, None);
 
         assert_eq!(args[0], "run");
         assert!(args.contains(&"--rm".to_string()));
@@ -2303,7 +2777,7 @@ mod tests {
     fn apple_launch_omits_sizing_flags_when_unset() -> R<()> {
         let config =
             SandboxTaskConfig::from_value(&json!({"image": "alpine", "command": ["true"]}))?;
-        let args = build_apple_launch("legion-sbx-7", &config, &BTreeMap::new(), &[]);
+        let args = build_apple_launch("legion-sbx-7", &config, &BTreeMap::new(), &[], None);
         assert!(!args.contains(&"--cpus".to_string()));
         assert!(!args.contains(&"--memory".to_string()));
         assert!(!args.contains(&"--volume".to_string()));

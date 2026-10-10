@@ -1884,6 +1884,7 @@ impl ManagerDaemonService {
                 .band_submit_warnings(&config)
                 .into_iter()
                 .chain(crate::task_plugins::resource_submit_warnings(&config))
+                .chain(crate::structs::suspend::sandbox_submit_warnings(&config))
                 .collect(),
         })
     }

@@ -21,6 +21,13 @@
 //!    workload-identity token), and `/legion/identity/<ENV>` per token,
 //! 5. runs `suspend.onResume` with that env, after everything above.
 //!
+//! The same disk carries workload-identity token refreshes with no restore.
+//! The worker rewrites it in place with the same allocation and host time
+//! and new tokens, and the handler then only rewrites the token files
+//! ([`apply_tokens`]): no reseed, no clock step, no `onResume`. It also
+//! writes the tokens the disk carries at boot, so `/legion/identity/` is
+//! populated from the start (docs/workload-identity.md, "Sandboxes").
+//!
 //! The logic is a pure function over a [`GuestHost`], so it is tested with a
 //! fake on any platform. The real host is Linux-only, like the guest.
 
@@ -100,34 +107,10 @@ pub fn apply_resume(identity: &ResumeIdentity, host: &dyn GuestHost) -> ResumeOu
         step("nic", host.set_mac(mac));
     }
 
-    let json = serde_json::to_vec_pretty(identity).unwrap_or_default();
-    step(
-        "identity.json",
-        host.write_file(Path::new(GUEST_IDENTITY_JSON), &json, 0o600),
-    );
-    let mut env = identity.env.clone();
-    env.insert("LEGION_ALLOC_ID".into(), identity.alloc_id.to_string());
-    if let Some(instance) = identity.instance_id.as_deref() {
-        env.insert("LEGION_INSTANCE_ID".into(), instance.to_string());
-    }
-    step(
-        "resume.env",
-        host.write_file(
-            Path::new(GUEST_RESUME_ENV),
-            crate::task_plugins::microvm::render_env_file(&env).as_bytes(),
-            0o600,
-        ),
-    );
-    for (key, value) in &identity.env {
-        if key.starts_with("LEGION_") {
-            continue;
-        }
-        let path = PathBuf::from(GUEST_TOKEN_DIR).join(key);
-        step(
-            &format!("token {key}"),
-            host.write_file(&path, value.as_bytes(), 0o400),
-        );
-    }
+    let tokens = apply_tokens(identity, host);
+    outcome.done.extend(tokens.done);
+    outcome.failed.extend(tokens.failed);
+    let env = resume_env(identity);
 
     if !identity.on_resume.is_empty() {
         match host.run(
@@ -149,6 +132,82 @@ pub fn apply_resume(identity: &ResumeIdentity, host: &dyn GuestHost) -> ResumeOu
         }
     }
     outcome
+}
+
+/// The env the handler publishes in `/legion/resume.env` and hands to
+/// `onResume`: the identity's env plus `LEGION_ALLOC_ID` and
+/// `LEGION_INSTANCE_ID`.
+fn resume_env(identity: &ResumeIdentity) -> BTreeMap<String, String> {
+    let mut env = identity.env.clone();
+    env.insert("LEGION_ALLOC_ID".into(), identity.alloc_id.to_string());
+    if let Some(instance) = identity.instance_id.as_deref() {
+        env.insert("LEGION_INSTANCE_ID".into(), instance.to_string());
+    }
+    env
+}
+
+/// Write what the identity says the workload reads, without touching
+/// anything else in the guest: `/legion/identity.json`, `/legion/resume.env`,
+/// one `/legion/identity/<ENV>` per env-delivered token, and each
+/// file-delivered token at its own path and mode. A restore runs this as one
+/// step of [`apply_resume`]; a token refresh runs only this.
+pub fn apply_tokens(identity: &ResumeIdentity, host: &dyn GuestHost) -> ResumeOutcome {
+    let mut outcome = ResumeOutcome::default();
+    let mut step = |name: &str, result: R<()>| match result {
+        Ok(()) => outcome.done.push(name.to_string()),
+        Err(err) => outcome.failed.push(format!("{name}: {err:#}")),
+    };
+    let json = serde_json::to_vec_pretty(identity).unwrap_or_default();
+    step(
+        "identity.json",
+        host.write_file(Path::new(GUEST_IDENTITY_JSON), &json, 0o600),
+    );
+    step(
+        "resume.env",
+        host.write_file(
+            Path::new(GUEST_RESUME_ENV),
+            crate::task_plugins::microvm::render_env_file(&resume_env(identity)).as_bytes(),
+            0o600,
+        ),
+    );
+    for (key, value) in &identity.env {
+        if key.starts_with("LEGION_") {
+            continue;
+        }
+        let path = PathBuf::from(GUEST_TOKEN_DIR).join(key);
+        step(
+            &format!("token {key}"),
+            host.write_file(&path, value.as_bytes(), 0o400),
+        );
+    }
+    for file in &identity.files {
+        // The worker only names paths under /legion/identity (checked at
+        // submit and again when it builds the list). Refuse anything else
+        // here too, so a bad disk can never write elsewhere in the guest.
+        let path = Path::new(&file.path);
+        if !path.starts_with(GUEST_TOKEN_DIR)
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            step(
+                &format!("token file {}", file.path),
+                Err(anyhow!("outside {GUEST_TOKEN_DIR}")),
+            );
+            continue;
+        }
+        step(
+            &format!("token file {}", file.path),
+            host.write_file(path, file.token.as_bytes(), file.mode),
+        );
+    }
+    outcome
+}
+
+/// Whether `current` refreshes only tokens relative to `seen`: the same
+/// allocation and host time (no restore), different tokens.
+pub fn is_token_refresh(seen: &ResumeIdentity, current: &ResumeIdentity) -> bool {
+    !is_new_identity(seen, current) && seen.tokens_differ(current)
 }
 
 /// Whether `current` is a new identity relative to `seen`: a restore names a
@@ -188,11 +247,25 @@ pub fn read_identity_fresh(device: &Path) -> R<ResumeIdentity> {
 /// then poll for a new one and apply it. Never returns.
 pub fn watch(device: &Path, host: &dyn GuestHost, poll: Duration) -> ! {
     let mut seen = read_identity_fresh(device).ok();
+    // Tokens the disk carries at boot land in /legion/identity right away.
+    if let Some(boot) = seen.as_ref() {
+        if boot.tokens_differ(&ResumeIdentity::default()) {
+            log_tokens("boot", &apply_tokens(boot, host));
+        }
+    }
     loop {
         std::thread::sleep(poll);
         let Ok(current) = read_identity_fresh(device) else {
             continue;
         };
+        if seen
+            .as_ref()
+            .is_some_and(|seen| is_token_refresh(seen, &current))
+        {
+            log_tokens("refresh", &apply_tokens(&current, host));
+            seen = Some(current);
+            continue;
+        }
         let restored = seen
             .as_ref()
             .is_none_or(|seen| is_new_identity(seen, &current));
@@ -216,6 +289,18 @@ pub fn watch(device: &Path, host: &dyn GuestHost, poll: Duration) -> ! {
             );
         }
         seen = Some(current);
+    }
+}
+
+/// One console line for a token write that was not part of a restore.
+fn log_tokens(why: &str, outcome: &ResumeOutcome) {
+    if outcome.failed.is_empty() {
+        eprintln!("legion-guest-resume: {why}: wrote identity tokens");
+    } else {
+        eprintln!(
+            "legion-guest-resume: {why}: FAILED {}",
+            outcome.failed.join("; ")
+        );
     }
 }
 
@@ -404,6 +489,11 @@ mod tests {
             host_time_unix_ms: 1_760_000_000_123,
             on_resume: vec!["/usr/local/bin/reconnect".into()],
             fork: false,
+            files: vec![crate::structs::checkpoint::GuestTokenFile {
+                path: "/legion/identity/vault".into(),
+                mode: 0o440,
+                token: format!("vault-for-{alloc_id}"),
+            }],
         }
     }
 
@@ -464,6 +554,81 @@ mod tests {
             ..boot.clone()
         };
         assert!(is_new_identity(&boot, &rewritten));
+    }
+
+    /// A refreshed token rewrites the disk with the same allocation and
+    /// host time: that is a token refresh, which writes the token files and
+    /// nothing else (no reseed, no clock step, no `onResume`).
+    #[test]
+    fn a_token_refresh_only_rewrites_the_token_files() {
+        let boot = restored(7);
+        let refreshed = ResumeIdentity {
+            env: [("ACME_TOKEN".to_string(), "fresh".to_string())].into(),
+            files: vec![crate::structs::checkpoint::GuestTokenFile {
+                token: "fresh-vault".into(),
+                ..boot.files[0].clone()
+            }],
+            ..boot.clone()
+        };
+        assert!(is_token_refresh(&boot, &refreshed));
+        assert!(!is_new_identity(&boot, &refreshed));
+        assert!(!is_token_refresh(&boot, &boot.clone()));
+        assert!(
+            !is_token_refresh(&boot, &restored(9)),
+            "a restore is not a refresh"
+        );
+        // LEGION_* env is not a token.
+        let relabeled = ResumeIdentity {
+            env: boot
+                .env
+                .clone()
+                .into_iter()
+                .chain([("LEGION_X".to_string(), "1".to_string())])
+                .collect(),
+            ..boot.clone()
+        };
+        assert!(!is_token_refresh(&boot, &relabeled));
+
+        let host = Recorder::default();
+        let outcome = apply_tokens(&refreshed, &host);
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        let calls = host.calls.lock().unwrap().clone();
+        assert!(
+            calls.iter().all(|call| !call.starts_with("reseed")
+                && !call.starts_with("clock")
+                && !call.starts_with("run")),
+            "{calls:?}"
+        );
+        let files = host.files.lock().unwrap();
+        assert_eq!(
+            files[&PathBuf::from("/legion/identity/ACME_TOKEN")].0,
+            b"fresh"
+        );
+        let (vault, mode) = &files[&PathBuf::from("/legion/identity/vault")];
+        assert_eq!(vault, b"fresh-vault");
+        assert_eq!(*mode, 0o440);
+    }
+
+    #[test]
+    fn a_token_file_outside_the_identity_dir_is_refused() {
+        let mut identity = restored(7);
+        identity.files[0].path = "/legion/identity/../etc/passwd".into();
+        identity
+            .files
+            .push(crate::structs::checkpoint::GuestTokenFile {
+                path: "/etc/shadow".into(),
+                mode: 0o400,
+                token: "x".into(),
+            });
+        let host = Recorder::default();
+        let outcome = apply_tokens(&identity, &host);
+        assert_eq!(outcome.failed.len(), 2, "{:?}", outcome.failed);
+        assert!(!host
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|path| path.starts_with("/etc") || path.to_string_lossy().contains("..")));
     }
 
     #[test]

@@ -290,6 +290,39 @@ pub fn write_identity_disk(path: &Path, identity: &ResumeIdentity) -> R<()> {
     Ok(())
 }
 
+/// Rewrite a running guest's identity disk in place, for a token refresh.
+///
+/// [`write_identity_disk`] renames a new file over the path, which a VMM
+/// that already opened the old file never sees. This writes into the same
+/// file (the VMM's open disk), so the guest's next uncached read of the
+/// device returns the new identity. A read that races the write gets a
+/// length that does not match its JSON and fails to parse, and the guest's
+/// handler simply reads again on its next poll.
+pub fn rewrite_identity_disk_in_place(path: &Path, identity: &ResumeIdentity) -> R<()> {
+    use std::io::{Seek, SeekFrom};
+    let payload = serde_json::to_vec(identity)?;
+    let capacity = IDENTITY_DISK_BYTES as usize - IDENTITY_HEADER_BYTES;
+    if payload.len() > capacity {
+        bail!(
+            "identity payload is {} bytes, the identity disk holds {capacity}",
+            payload.len()
+        );
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open identity disk {}", path.display()))?;
+    // Payload first, then the header that points at it.
+    file.seek(SeekFrom::Start(IDENTITY_HEADER_BYTES as u64))?;
+    file.write_all(&payload)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(IDENTITY_DISK_MAGIC)?;
+    file.write_all(&IDENTITY_DISK_VERSION.to_le_bytes())?;
+    file.write_all(&(payload.len() as u32).to_le_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
 /// Read an identity disk (or the block device it is attached as). The guest
 /// agent's resume handler uses this; the host uses it in tests.
 pub fn read_identity_disk(path: &Path) -> R<ResumeIdentity> {
@@ -333,6 +366,29 @@ pub fn fresh_entropy() -> String {
 mod tests {
     use super::*;
 
+    /// An in-place rewrite keeps the file (the inode a running VMM holds
+    /// open) and reads back as the new identity.
+    #[cfg(unix)]
+    #[test]
+    fn an_in_place_rewrite_keeps_the_open_file() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("identity.img");
+        let mut first = identity();
+        first
+            .env
+            .insert("VAULT".into(), "a-much-longer-first-token".into());
+        write_identity_disk(&path, &first)?;
+        let inode = std::fs::metadata(&path)?.ino();
+        let mut refreshed = first.clone();
+        refreshed.env.insert("VAULT".into(), "short".into());
+        rewrite_identity_disk_in_place(&path, &refreshed)?;
+        assert_eq!(std::fs::metadata(&path)?.ino(), inode);
+        assert_eq!(std::fs::metadata(&path)?.len(), IDENTITY_DISK_BYTES);
+        assert_eq!(read_identity_disk(&path)?, refreshed);
+        Ok(())
+    }
+
     fn identity() -> ResumeIdentity {
         ResumeIdentity {
             alloc_id: 42,
@@ -347,6 +403,7 @@ mod tests {
             host_time_unix_ms: 1_760_000_000_000,
             on_resume: vec!["/bin/reconnect".into()],
             fork: false,
+            files: Vec::new(),
         }
     }
 

@@ -802,9 +802,11 @@ impl PressureSource for LivePressureSource {
         targets
             .into_iter()
             .filter_map(|target| {
-                let sample = crate::worker::usage::read_cgroup_sample(&target.cgroup_dir)?;
-                self.cgroups
-                    .insert(target.allocation_id, target.cgroup_dir.clone());
+                // Only cgroup-governed work can be measured and acted on
+                // here; an Apple container (macOS dev mode) has no cgroup.
+                let dir = target.cgroup_dir()?.to_path_buf();
+                let sample = crate::worker::usage::read_cgroup_sample(&dir)?;
+                self.cgroups.insert(target.allocation_id, dir);
                 Some(PressureCandidate {
                     allocation_id: target.allocation_id,
                     meta: target.pressure,

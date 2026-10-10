@@ -830,19 +830,36 @@ impl WorkerTaskManager {
         allocations
     }
 
-    /// Every allocation running in a worker-owned cgroup, addressed by the
-    /// id the manager knows: what the usage sampler measures
-    /// (`src/worker/usage.rs`). Ungoverned runtimes have no assignment and are
-    /// absent, as is unratified provisional work.
+    /// Every allocation the usage sampler can measure, addressed by the id
+    /// the manager knows (`src/worker/usage.rs`): those running in a
+    /// worker-owned cgroup, and macOS dev-mode sandboxes on Apple
+    /// `container`, which `container stats` measures instead. Other
+    /// ungoverned work is absent, as is unratified provisional work.
     pub fn usage_targets(&self) -> Vec<crate::worker::usage::UsageTarget> {
+        use crate::worker::usage::UsageSource;
         let mut targets: Vec<_> = self
             .instances
             .iter()
             .filter_map(|(local_key, instance)| {
-                let assignment = instance.resource_assignment.as_ref()?;
+                let allocation_id = self.external_id(*local_key).filter(|id| *id >= 0)?;
+                let sandbox = self
+                    .task_configs
+                    .get(local_key)
+                    .filter(|task| task.runtime == "sandbox")
+                    .map(|_| crate::task_plugins::sandbox_usage_source(*local_key, instance))
+                    .unwrap_or_default();
+                let source = match (
+                    instance.resource_assignment.as_ref(),
+                    sandbox.apple_container,
+                ) {
+                    (Some(assignment), _) => UsageSource::Cgroup(assignment.absolute_cgroup_path()),
+                    (None, Some(name)) => UsageSource::AppleContainer(name),
+                    (None, None) => return None,
+                };
                 Some(crate::worker::usage::UsageTarget {
-                    allocation_id: self.external_id(*local_key).filter(|id| *id >= 0)?,
-                    cgroup_dir: assignment.absolute_cgroup_path(),
+                    allocation_id,
+                    source,
+                    tap_device: sandbox.tap_device,
                     pressure: self.pressure_meta(*local_key),
                     idle: self.task_configs.get(local_key).and_then(|task| {
                         crate::worker::idle::IdlePolicy::for_task(
@@ -1194,6 +1211,29 @@ impl WorkerTaskManager {
         Ok(())
     }
 
+    /// Hand a refreshed identity token to the runtime, for runtimes whose
+    /// workload cannot read the host file the worker just rewrote (a sandbox
+    /// guest, through its identity disk). A no-op for every other runtime.
+    pub fn identity_tokens_refreshed(&mut self, allocation_id: i64) -> R<()> {
+        let (Some(allocation), Some(task)) = (
+            self.allocations.get(&allocation_id).cloned(),
+            self.task_configs.get(&allocation_id).cloned(),
+        ) else {
+            return Ok(());
+        };
+        let Some(plugin) = self.registry.plugin(&task.runtime) else {
+            return Ok(());
+        };
+        let Some(instance) = self.instances.get_mut(&allocation_id) else {
+            return Ok(());
+        };
+        plugin
+            .identity_tokens_refreshed(&allocation, &task, instance)
+            .with_context(|| {
+                format!("Failed to refresh identity tokens in allocation {allocation_id}")
+            })
+    }
+
     /// Per-allocation health, addressed by the ids the manager knows.
     /// Unratified provisional work is omitted for the same reason it is
     /// omitted from [`Self::allocations_snapshot`].
@@ -1445,8 +1485,13 @@ impl WorkerTaskManager {
         if self.registry.load_plugin(runtime, false).is_err() {
             return None;
         }
-        let root = self.registry.plugin(runtime)?.file_delivery_root()?;
-        Some((root, self.alloc_dir(allocation_id).join(task_name)))
+        let plugin = self.registry.plugin(runtime)?;
+        let root = plugin.file_delivery_root()?;
+        let mut host = self.alloc_dir(allocation_id).join(task_name);
+        if let Some(subdir) = plugin.file_delivery_host_subdir() {
+            host.push(subdir);
+        }
+        Some((root, host))
     }
 
     /// Root of per-allocation directories (`<state>/allocs/`).

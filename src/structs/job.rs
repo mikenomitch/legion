@@ -2881,8 +2881,24 @@ impl TaskConfig {
 
     /// Validate workload identities declared on this task (see the
     /// workload-identity OIDC plan). No identities = today's behavior.
+    /// Whether this task runs as a sandbox that keeps every env-delivered
+    /// identity token fresh at `/legion/identity/<ENV>` in its guest: one
+    /// launched for memory checkpoints (so it has an identity disk and a
+    /// resume handler) on non-gated networking. Its env identities may use
+    /// `changeMode = "noop"` (docs/workload-identity.md, "Sandboxes").
+    pub fn sandbox_refreshes_env_tokens(&self) -> bool {
+        self.runtime == "sandbox"
+            && crate::structs::snapshot::memory_checkpoint_ask(self).is_some()
+            && !crate::structs::snapshot::task_declares_gated_network(self)
+    }
+
     pub fn validate_identities(&self) -> R<()> {
-        validate_identities(&self.name, &self.identities, self.is_stateful())
+        validate_identities(
+            &self.name,
+            &self.identities,
+            self.is_stateful(),
+            self.sandbox_refreshes_env_tokens(),
+        )
     }
 
     /// Validate artifacts declared on this task (artifact system plan):

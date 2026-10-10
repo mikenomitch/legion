@@ -549,7 +549,11 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     // `speculativeStart.mode` cannot be honored is capped at `stage` — never
     // silently, because the symptom otherwise is a speedup that quietly did
     // not happen.
-    let warnings = speculative_start_warnings(&config);
+    let mut warnings = speculative_start_warnings(&config);
+    // Valid settings that will not do what the author most likely expects
+    // (an idle signal a microVM cannot see, an identity refresh that reboots
+    // the guest). `job run` prints the same lines.
+    warnings.extend(crate::structs::suspend::sandbox_submit_warnings(&config));
 
     if format.is_json() {
         output::print_success(&json!({

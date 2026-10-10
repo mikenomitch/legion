@@ -84,7 +84,8 @@ impl IdleSignal {
                 "suspend.idle.signals \"hint\" is not implemented yet: the workload's own \
                  busy/idle signal ships in suspend plan Phase 8\nHint: remove \"hint\". To keep \
                  an instance awake through a quiet call, add \"connections\" (any open \
-                 ingress connection counts as activity)"
+                 ingress connection through the node datapath counts as activity; a sandbox \
+                 sees it only on gated networking)"
                     .to_string(),
             ),
             other => Err(format!(
@@ -580,6 +581,9 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
             true,
         ));
     }
+    if let Some(idle) = resolved.idle.as_ref() {
+        validate_sandbox_idle_signals(task, suspend, idle)?;
+    }
     if !resolved.on_resume.is_empty()
         && (task.runtime != "sandbox" || resolved.checkpoint == Some(SnapshotKind::Disk))
     {
@@ -652,6 +656,121 @@ fn validate_reserve_amount(
         }
     }
     Ok(())
+}
+
+/// The `hypervisor` a sandbox task's config declares, `"auto"` when unset.
+fn sandbox_hypervisor(task: &crate::structs::TaskConfig) -> &str {
+    task.config
+        .get("hypervisor")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("auto")
+}
+
+/// Whether a sandbox task always runs as a microVM, which takes no exec
+/// sessions: its `hypervisor` names a VMM rather than `auto` or `dev`.
+fn sandbox_is_always_microvm(task: &crate::structs::TaskConfig) -> bool {
+    matches!(sandbox_hypervisor(task), "firecracker" | "cloud-hypervisor")
+}
+
+/// Idle signals a sandbox cannot see, refused at submit rather than
+/// accepted and never fired (docs/suspend-and-resume.md, "What each signal
+/// sees on a sandbox").
+///
+/// - `connections` counts ingress connections the node datapath fronts. A
+///   sandbox's traffic crosses the datapath only when it is gated, so on
+///   `none`, `tap`, or a dev-mode container it would never fire, and a
+///   harness waiting on a quiet model call would still be suspended.
+/// - `exec`, listed explicitly, on a task pinned to a microVM VMM: a
+///   microVM takes no exec sessions. (Listed by default, or on `auto`,
+///   it is a warning instead: see [`sandbox_submit_warnings`].)
+fn validate_sandbox_idle_signals(
+    task: &crate::structs::TaskConfig,
+    suspend: &SuspendConfig,
+    idle: &ResolvedIdle,
+) -> Result<(), String> {
+    if task.runtime != "sandbox" {
+        return Ok(());
+    }
+    if idle.signals.contains(&IdleSignal::Connections)
+        && !crate::structs::snapshot::task_declares_gated_network(task)
+    {
+        return Err(format!(
+            "task {:?}: suspend.idle.signals \"connections\" counts open ingress connections \
+             through the node datapath, and this sandbox's traffic never crosses it (it is not \
+             network.mode = \"gated\", so clients reach the guest directly or not at all)\n\
+             Hint: remove \"connections\". To keep a sandbox awake through a quiet model call, \
+             set idle.after longer than the call, or suspend from your platform, which knows \
+             when a call is in flight",
+            task.name
+        ));
+    }
+    let listed_exec = suspend
+        .idle
+        .as_ref()
+        .and_then(|idle| idle.signals.as_ref())
+        .is_some_and(|signals| signals.iter().any(|signal| signal.trim() == "exec"));
+    if listed_exec && sandbox_is_always_microvm(task) {
+        return Err(format!(
+            "task {:?}: suspend.idle.signals lists \"exec\", but this sandbox always runs as a \
+             microVM (hypervisor = {:?}), which takes no exec sessions, so the signal would \
+             never fire\nHint: remove \"exec\"; \"cpu\" and \"network\" (bytes on the \
+             guest's TAP) are what a microVM's idle policy sees",
+            task.name,
+            sandbox_hypervisor(task)
+        ));
+    }
+    Ok(())
+}
+
+/// Advisory lines for a job's sandbox tasks, shown by `job run` and `job
+/// validate`: settings that are valid but will not do what the author most
+/// likely expects.
+pub fn sandbox_submit_warnings(config: &crate::structs::JobConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for task in &config.tasks {
+        if task.runtime != "sandbox" {
+            continue;
+        }
+        // A restart reboots the guest, which throws away the running state a
+        // memory checkpoint exists to keep, about every half TTL.
+        if crate::structs::snapshot::memory_checkpoint_ask(task).is_some() {
+            for identity in &task.identities {
+                if identity.change_mode == crate::structs::workload_identity::ChangeMode::Restart {
+                    warnings.push(format!(
+                        "task {}: identity {:?} sets changeMode = \"restart\", which reboots \
+                         this sandbox's guest on every token refresh (about every half TTL) and \
+                         loses its running state. Drop changeMode: a memory-checkpointable \
+                         sandbox refreshes tokens in place under /legion/identity/ (the env \
+                         token's file is /legion/identity/<ENV>). See \
+                         docs/workload-identity.md, \"Sandboxes\"",
+                        task.name, identity.name
+                    ));
+                }
+            }
+        }
+        let Some(resolved) = task
+            .suspend
+            .as_ref()
+            .and_then(|suspend| suspend.resolve().ok())
+        else {
+            continue;
+        };
+        if let Some(idle) = resolved.idle.as_ref() {
+            if idle.signals.contains(&IdleSignal::Exec) && sandbox_hypervisor(task) != "dev" {
+                warnings.push(format!(
+                    "task {}: suspend.idle counts \"exec\", which never fires while the \
+                     sandbox runs as a microVM (firecracker and cloud-hypervisor take no exec \
+                     sessions). Only a dev-mode sandbox (macOS Apple container) sees it, so on \
+                     Linux nodes \"cpu\" and \"network\" decide. List signals explicitly, \
+                     such as [\"network\", \"cpu\"], to drop it",
+                    task.name
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 /// Why an instance is (or was last) suspended: SuspendInstance.
@@ -854,6 +973,108 @@ mod tests {
         .resolve()
         .unwrap_err();
         assert!(err.contains("suspend.durability"), "{err}");
+    }
+
+    fn with_config(
+        mut task: crate::structs::TaskConfig,
+        config: serde_json::Value,
+    ) -> crate::structs::TaskConfig {
+        task.config = config;
+        task
+    }
+
+    /// `connections` counts datapath ingress, which a sandbox only has when
+    /// it is gated. Anywhere else it is refused, with what to do instead.
+    #[test]
+    fn connections_on_a_sandbox_off_the_datapath_is_refused() {
+        let idle = serde_json::json!({
+            "checkpoint": "disk",
+            "idle": { "signals": ["cpu", "connections"] },
+        });
+        let err = validate_suspend(&task("sandbox", true, idle.clone())).unwrap_err();
+        assert!(
+            err.contains("\"connections\" counts open ingress connections"),
+            "{err}"
+        );
+        assert!(err.contains("Hint: remove \"connections\""), "{err}");
+
+        let mut gated = task("sandbox", true, idle.clone());
+        gated.network =
+            Some(serde_json::from_value(serde_json::json!({ "mode": "gated" })).unwrap());
+        assert!(
+            validate_suspend(&gated).is_ok(),
+            "a gated sandbox counts connections"
+        );
+        assert!(validate_suspend(&task("exec", true, idle)).is_ok());
+    }
+
+    /// `exec` never fires on a microVM. Listed on a task pinned to one, it
+    /// is refused; listed by default, or where the backend may be dev mode,
+    /// it is a submit warning.
+    #[test]
+    fn exec_on_a_microvm_sandbox_is_refused_or_warned() {
+        let listed = serde_json::json!({ "idle": { "signals": ["cpu", "exec"] } });
+        let pinned = with_config(
+            task("sandbox", true, listed.clone()),
+            serde_json::json!({ "command": ["x"], "hypervisor": "firecracker" }),
+        );
+        let err = validate_suspend(&pinned).unwrap_err();
+        assert!(err.contains("takes no exec sessions"), "{err}");
+
+        let job = |tasks: Vec<crate::structs::TaskConfig>| -> crate::structs::JobConfig {
+            let mut job: crate::structs::JobConfig =
+                serde_json::from_value(serde_json::json!({ "name": "agents", "tasks": [] }))
+                    .unwrap();
+            job.tasks = tasks;
+            job
+        };
+        // Auto: may be dev mode, so a warning, never an error.
+        let auto = task("sandbox", true, listed);
+        assert!(validate_suspend(&auto).is_ok());
+        let defaults = task("sandbox", true, serde_json::json!({ "idle": {} }));
+        let warnings = sandbox_submit_warnings(&job(vec![auto, defaults]));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("never fires while the sandbox runs as a microVM"));
+
+        // Explicitly without exec, or in dev mode: quiet.
+        let quiet = task(
+            "sandbox",
+            true,
+            serde_json::json!({ "idle": { "signals": ["network", "cpu"] } }),
+        );
+        let dev = with_config(
+            task("sandbox", true, serde_json::json!({ "idle": {} })),
+            serde_json::json!({ "command": ["x"], "hypervisor": "dev" }),
+        );
+        assert!(sandbox_submit_warnings(&job(vec![quiet, dev])).is_empty());
+    }
+
+    /// `changeMode = "restart"` on a memory-checkpointable sandbox reboots
+    /// the guest every refresh: valid, and warned.
+    #[test]
+    fn a_restarting_identity_on_a_checkpointable_sandbox_warns() {
+        let mut restarting = task(
+            "sandbox",
+            true,
+            serde_json::json!({ "idle": { "signals": ["network", "cpu"] } }),
+        );
+        restarting.identities = vec![serde_json::from_value(serde_json::json!({
+            "name": "vault",
+            "audience": ["vault"],
+            "env": "VAULT_TOKEN",
+            "changeMode": "restart",
+        }))
+        .unwrap()];
+        let mut job: crate::structs::JobConfig =
+            serde_json::from_value(serde_json::json!({ "name": "agents", "tasks": [] })).unwrap();
+        job.tasks = vec![restarting.clone()];
+        let warnings = sandbox_submit_warnings(&job);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("reboots this sandbox's guest"));
+
+        restarting.identities[0].change_mode = crate::structs::workload_identity::ChangeMode::Noop;
+        job.tasks = vec![restarting];
+        assert!(sandbox_submit_warnings(&job).is_empty());
     }
 
     #[test]
