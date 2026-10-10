@@ -1255,19 +1255,31 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       guest-agent path would implement.
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
-- [ ] **Sandbox snapshots, fast start, and forking** —
-      [plan](plans/sandbox-snapshots-and-fast-start-plan.md) (PLANNED; §0 storage
-      convergence shipped with the sandbox runtime)
-  - [ ] Phase 1 — disk snapshots (volume `snapshot` op, `local-dir` reflink,
-        snapshot table + CRUD RPCs/CLI/MCP, ACL resource)
-  - [ ] Phase 2 — restore in place (`RestoreInstance`, quiesce hooks wired to actions)
-  - [ ] Phase 3 — memory snapshots (Firecracker pause/create/resume, `compat`
-        constraints in the scheduler)
-  - [ ] Phase 4 — fast start (regional snapshot stores, `legion snapshot warm`,
-        warm-node scoring)
-  - [ ] Phase 5 — forking (volume `clone`, identity disk, `legion-guest-agent`,
-        `instance create --from-snapshot --count N`)
-  - [ ] Phase 6 — lazy memory (UFFD handler, remote page sources)
+- [ ] **Suspend, resume, fork, and oversubscription** (generic primitives
+      for dense sandboxes, also useful to ordinary services):
+      [plan](plans/suspend-resume-and-oversubscription-plan.md) (PLANNED).
+      Supersedes the phasing of the
+      [sandbox snapshots plan](plans/sandbox-snapshots-and-fast-start-plan.md),
+      whose mechanics remain the reference (its §0 storage convergence shipped).
+  - [ ] Phase 1: measure and govern (sandbox VMMs in the allocation cgroup,
+        per-allocation usage in the heartbeat, `legion node usage`)
+  - [ ] Phase 2: burst and oversubscribe (`resources.memoryMax`, worker
+        `oversubscription` ratios, worker pressure ladder, `node_pressure` cause)
+  - [ ] Phase 3: local checkpoints (`TaskPlugin::checkpoint/restore`,
+        Firecracker `--api-sock`, node content store, `snapshot` table/CLI/ACL,
+        `compat` constraints, `local-dir` `snapshot` op)
+  - [ ] Phase 4: suspend and resume (`suspended` instance state,
+        `SuspendInstance`, resume via `StartInstance`, guest-agent identity
+        refresh, disk-mode suspend for `exec`/`container`)
+  - [ ] Phase 5: automatic suspend (idle policy, pressure-ladder suspend rung,
+        sandbox free page reporting)
+  - [ ] Phase 6: fork (`ForkInstance`, `create --from-snapshot --count`,
+        `local-dir` `clone`)
+  - [ ] Phase 7: content locality (publishing, location index, `locality`
+        score, `durability = "store"`, `snapshot warm`). Executes the artifact
+        cache plan's Phases 1 and 3.
+  - [ ] Phase 8: fast paths, each needing its own review (wake on connect,
+        `hint` idle signal, UFFD lazy memory, diff snapshots)
 - [ ] Split a task runtime's implementation into parts — isolation vs. runner vs.
       artifact consumption? (idea, needs a plan). The container-runtime plan's
       `resource_enforcement()` interface carves off the first slice of this —
@@ -1290,7 +1302,11 @@ Plan: [rollout-strategy-plugins](../docs/rollout-strategy-plugins.md) · docs: [
 Plan: [artifact-system-plan.md](plans/artifact-system-plan.md) · docs: [artifacts.md](../docs/artifacts.md)
 
 - [ ] **Artifact cache + pre-warming/pre-pull + scheduler locality scoring** —
-      [plan](plans/artifact-cache-and-prewarm-plan.md) (PLANNED)
+      [plan](plans/artifact-cache-and-prewarm-plan.md) (PLANNED). Phases 1 and 3
+      are now scheduled inside the
+      [suspend/resume plan](plans/suspend-resume-and-oversubscription-plan.md)
+      (Phases 3 and 7), amended to add a publish path and an off-raft location
+      index in place of the `legion.artifact_cache` dynamic attribute.
   - [ ] Phase 1 — content-addressed cache
   - [ ] Phase 2 — warm RPCs and policies
   - [ ] Phase 3 — cache advertisement + `artifact_locality` scoring

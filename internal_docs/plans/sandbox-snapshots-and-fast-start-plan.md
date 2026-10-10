@@ -1,5 +1,15 @@
 # Plan: Sandbox Snapshots, Fast Start, and Forking
 
+> **Superseded in part (2026-10-09) by
+> [`suspend-resume-and-oversubscription-plan.md`](suspend-resume-and-oversubscription-plan.md).**
+> That plan wins on scope, phasing, the warm-pool and idle-handling stance
+> (suspend and idle policy now live inside Legion), blob transport (the node
+> content store and location index), and store configuration (per worker, not
+> `snapshots.stores`). This document remains the reference for capture
+> mechanics, the manifest and `compat` block, quiesce hooks, the fork
+> identity-collision analysis, and lazy memory. Its open questions 4 and 5 are
+> answered there. Its phase list below is no longer the execution order.
+
 > **Status:** PLANNED — not implemented. Design for snapshot/restore, sub-second
 > starts, and forking on the [`sandbox` task runtime](../../docs/task-runtime-sandbox.md).
 >
