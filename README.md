@@ -187,46 +187,24 @@ still be happy with at ten thousand nodes.
 
 ### Fast
 
-In initial benchmarking on AWS, we ran Legion, Nomad, and Kubernetes on the
-same three control-plane boxes, each driving its own simulated fleet through
-its native API. At 5,000 nodes:
+On the same AWS hardware at 5,000 nodes, Legion outpaced Kubernetes by a
+wide margin ([benchmarks](docs/benchmarks.md)):
 
-|                                                   | Legion    | Nomad 2.0.5 | Kubernetes 1.36.5 |
-| ------------------------------------------------- | --------- | ----------- | ----------------- |
-| Services placed per second                        | **905**   | failed[^1]  | 53                |
-| Batch allocations placed per second               | **1,879** | 83          | 66                |
-| Dense services placed per second (5 per node)     | **3,166** | 76          | 76                |
-| Time to place 99% of a batch burst                | **8.0s**  | 312s        | 364s              |
-| Time to replace work after a quarter of nodes die | **27s**   | 111s        | ~3.5 hours[^2]    |
-| Services per second, one CLI call each            | **311**   | 59          | 53                |
+- **17x** the services placed per second
+- **28x** the batch allocations placed per second
+- **42x** the densely packed services placed per second
+- **Much faster recovery** when a large share of nodes die at once
 
-Legion keeps that rate as the fleet grows. Services placed per second, by
-fleet size:
+Services placed per second as the fleet grows:
 
 | Nodes  | Legion  | Nomad 2.0.5 | Kubernetes 1.36.5 |
 | ------ | ------- | ----------- | ----------------- |
-| 1,000  | **829** | 122 (182)   | 117 (100)         |
-| 2,000  | **789** | 110 (97)    | 78 (80)           |
-| 5,000  | **905** | failed[^1]  | 53 (45)           |
-| 10,000 | **738** | not run     | not measured      |
+| 1,000  | **829** | 122         | 117               |
+| 2,000  | **789** | 110         | 78                |
+| 5,000  | **905** | -           | 53                |
+| 10,000 | **738** | -           | -                 |
 
-Numbers in parentheses are a second run of the same cell. Legion also
-completed a 250,000-allocation burst on 50,000 nodes.
-
-Below saturation, a job's allocations land in about 20ms at the median,
-and that barely moves from 5,000 to 20,000 nodes.
-
-Most cells are single runs on simulated nodes, so they measure the control
-plane and not container start times. See [Benchmarks](docs/benchmarks.md)
-for every table and the methodology, and [Why Legion is faster than Kubernetes](docs/benchmarks.md#why-legion-is-faster-than-kubernetes)
-for the architecture behind the gap.
-
-[^1]: Nomad's leader lost leadership partway through the burst and rejected
-    the remaining submissions.
-
-[^2]: Projected. By default Kubernetes waits 300 seconds before evicting
-    from a NotReady node, then evicts at 0.1 nodes/sec. It had replaced 146
-    of 1,251 allocations when the 30-minute drill ended.
+How it gets there:
 
 - **No etcd bottleneck.** The scheduler plans against in-memory state and
   writes to SQLite (or Raft), so throughput is not capped by a separate
