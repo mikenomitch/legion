@@ -816,6 +816,10 @@ pub struct Metrics {
     pub nodes_marked_lost_total: Arc<Counter>,
     /// `legion_nodes_recovered_total{path}`
     pub nodes_recovered_total: Arc<CounterVec>,
+    /// `legion_read_model_drift_repaired_total{source}`
+    pub read_model_drift_repaired_total: Arc<CounterVec>,
+    /// `legion_read_model_external_writes_total`
+    pub read_model_external_writes_total: Arc<Counter>,
     /// `legion_liveness_tracked_nodes`
     pub liveness_tracked_nodes: Arc<Gauge>,
     /// `legion_liveness_responsible_seconds`
@@ -1343,6 +1347,24 @@ impl Metrics {
             series: Series::new(),
         });
 
+        // Read-model coherence (docs/state-store.md).
+        let read_model_drift_repaired_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_read_model_drift_repaired_total",
+                help: "Nodes whose cached scheduling state disagreed with the state database and was reloaded, by source: 'scrub' (the timed sweep) or 'delta' (a committed change contradicted the cache). Should stay at zero; any increase is a bug worth reporting.",
+                labels: &["source"],
+            },
+            series: Series::new(),
+        });
+        let read_model_external_writes_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_read_model_external_writes_total",
+                help: "Times another process or connection committed to the state database behind the manager's back, forcing a full rebuild of the cached scheduling state.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
         // Node liveness (docs/node-liveness.md).
         let liveness_tracked_nodes = Arc::new(Gauge {
             meta: FamilyMeta {
@@ -1408,6 +1430,8 @@ impl Metrics {
             Arc::clone(&heartbeat_sustainable_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&read_model_drift_repaired_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&read_model_external_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_responsible_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_digest_rpcs_total) as Arc<dyn RenderMetric>,
@@ -1532,6 +1556,8 @@ impl Metrics {
             heartbeat_sustainable_nodes,
             nodes_marked_lost_total,
             nodes_recovered_total,
+            read_model_drift_repaired_total,
+            read_model_external_writes_total,
             liveness_tracked_nodes,
             liveness_responsible_seconds,
             liveness_digest_rpcs_total,

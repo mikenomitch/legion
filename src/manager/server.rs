@@ -12277,10 +12277,18 @@ mod tests {
                 artifact_states: None,
             }],
         )?;
-        std::thread::sleep(Duration::from_millis(10));
+        // The reschedule is enqueued from a spawned thread, so poll rather
+        // than sleep a fixed 10ms, which flaked under a loaded machine.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let evals = loop {
+            let evals = store.get_evals()?;
+            if !evals.is_empty() || std::time::Instant::now() >= deadline {
+                break evals;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
 
         assert!(store.get_allocation_by_id(allocation.id)?.is_none());
-        let evals = store.get_evals()?;
         let eval = evals.first().context("missing eval")?;
         assert_eq!(eval.kind, "job_reschedule");
         assert_eq!(eval.job_config_id, job_config_id);

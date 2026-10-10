@@ -43,11 +43,41 @@ thread_local! {
     /// JC-41) or Commutative-table pruning (JC-28, plan §7-C2). Lets
     /// `write_connection` through the raft-mode bypass guard.
     static IN_LOCAL_WRITE: Cell<bool> = const { Cell::new(false) };
+    /// Set while this thread runs a `local_disk` mutation body under
+    /// [`local_projected_mutation`]: the body commits for real, and the
+    /// read model is projected from its changeset afterwards, so read-model
+    /// hooks defer exactly as they do under capture
+    /// (read-model-coherence plan § 5.4).
+    static IN_LOCAL_PROJECTION: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Whether the current thread is inside an active changeset capture.
 pub(crate) fn in_capture() -> bool {
     IN_CAPTURE.with(Cell::get)
+}
+
+/// Whether the current thread is inside a `local_disk` mutation body whose
+/// read-model effects are projected from its changeset afterwards.
+pub(crate) fn in_local_projection() -> bool {
+    IN_LOCAL_PROJECTION.with(Cell::get)
+}
+
+/// Whether read-model updates must wait for changeset projection: inside a
+/// raft capture (rolled back, re-projected at apply) or a `local_disk`
+/// projected mutation (projected when the body returns). Every `cache_*`
+/// hook and `refresh_read_model` checks this, so the changeset is the only
+/// way into the read model in both modes.
+pub(crate) fn read_model_deferred() -> bool {
+    in_capture() || in_local_projection()
+}
+
+/// Whether the current thread is inside a mutation body that holds the
+/// capture mutex (a raft capture or a `local_disk` projected mutation).
+/// Code that would otherwise hand work to another thread and wait for it
+/// (the job-intake coalescers) must run inline instead: the other thread
+/// needs the mutex this one holds.
+pub(crate) fn in_mutation_body() -> bool {
+    in_capture() || in_local_projection()
 }
 
 /// Whether the current thread is applying a committed changeset.
@@ -332,9 +362,10 @@ pub(crate) fn local_write<T>(
              or after the replicated operation instead"
         );
     }
-    if in_local_write() {
-        // Compose: the outer local_write already holds the capture mutex and
-        // owns the scope assertion.
+    if in_local_write() || in_local_projection() {
+        // Compose: the outer local_write (or local projected mutation)
+        // already holds the capture mutex. In `local_disk` mode there is no
+        // scope assertion to run.
         return f(store);
     }
     let _capture_lock = capture_lock();
@@ -490,6 +521,124 @@ fn assert_local_write_scope(op: &str, changeset: &[u8]) -> R<()> {
         }
     }
     Ok(())
+}
+
+/// Tables whose rows the read model holds or keys off: the only ones a
+/// `local_disk` projected mutation records. Everything else (events, evals,
+/// jobs) keeps its existing direct side effects in `local_disk` mode.
+const READ_MODEL_TABLES: [&str; 5] = [
+    "node",
+    "node_health",
+    "allocation",
+    "task_config",
+    "allocation_epoch_partition",
+];
+
+/// RAII guard for the local-projection thread flag.
+struct LocalProjectionGuard {
+    prev: bool,
+}
+
+impl LocalProjectionGuard {
+    fn new() -> Self {
+        let prev = IN_LOCAL_PROJECTION.with(|flag| flag.replace(true));
+        LocalProjectionGuard { prev }
+    }
+}
+
+impl Drop for LocalProjectionGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        IN_LOCAL_PROJECTION.with(|flag| flag.set(prev));
+    }
+}
+
+/// Run a `local_disk` mutation body so the read model follows from what it
+/// committed, the same way raft replicas follow from a committed changeset
+/// (read-model-coherence plan § 5.4):
+///
+/// 1. take the capture mutex, so no other local mutation's rows land in
+///    this body's session;
+/// 2. set [`in_local_projection`], which defers every read-model hook;
+/// 3. attach a session filtered to [`READ_MODEL_TABLES`];
+/// 4. run the body, which commits normally;
+/// 5. extract the changeset whether or not the body succeeded, because a
+///    body that fails after a commit has still changed state;
+/// 6. project the changeset's read-model effects, still under the mutex,
+///    so projections land in commit order (the delta path assumes it);
+/// 7. run `after` (the shadow check) while nothing else can write.
+///
+/// A panicking body skips projection: the scrub repairs whatever it
+/// committed. Callers nested inside the body compose inline (see
+/// `Store::replicated`).
+pub(crate) fn local_projected_mutation<T>(
+    store: &Store,
+    f: impl FnOnce(&Store) -> R<T>,
+    after: impl FnOnce(&Store),
+) -> R<T> {
+    let _capture_lock = capture_lock();
+    let _in_local = LocalProjectionGuard::new();
+
+    let mut session = {
+        let guard = store.write_connection()?;
+        let conn: &Connection = &guard;
+        // SAFETY: same argument as `capture_mutation`. The connection lives
+        // in an `Arc<Mutex<..>>` on `store`, which outlives this function,
+        // and is never moved while the Arc is alive. The capture mutex
+        // (held for this whole function) excludes every other replicated
+        // op and local write; a write outside those seams in `local_disk`
+        // mode would be recorded here too, which is harmless because
+        // projection re-reads committed rows rather than trusting the
+        // changeset's values. The session is dropped before return.
+        let static_conn: &'static Connection =
+            unsafe { std::mem::transmute::<&Connection, &'static Connection>(conn) };
+        let mut session = Session::new(static_conn)
+            .context("failed creating sqlite session for local projection")?;
+        session.table_filter(Some(|table: &str| READ_MODEL_TABLES.contains(&table)));
+        session
+            .attach(None)
+            .context("failed attaching sqlite session for local projection")?;
+        session
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(store)));
+
+    // Changeset generation reads the current rows through the connection,
+    // and deleting the session detaches it from the connection, so both
+    // happen under the connection's mutex.
+    let mut changeset: Vec<u8> = Vec::new();
+    let extract = match store.write_connection() {
+        Ok(guard) => {
+            let extracted = session
+                .changeset_strm(&mut changeset)
+                .context("failed extracting local projection changeset");
+            drop(session);
+            drop(guard);
+            extracted
+        }
+        Err(err) => {
+            // Without the mutex the session cannot be deleted safely; leak
+            // it rather than touch the connection unguarded. Only reachable
+            // if the connection mutex is poisoned, which already wedges
+            // every writer.
+            std::mem::forget(session);
+            Err(err)
+        }
+    };
+    drop(_in_local);
+
+    let result = match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    extract?;
+    // Projection failures never un-commit the write; surface them after the
+    // body's own error, which is the more useful one when both happen.
+    let projected = store.project_read_model_from_changeset(&changeset);
+    let value = result?;
+    projected?;
+    after(store);
+    Ok(value)
 }
 
 /// Apply a committed changeset to this node's database inside a transaction,

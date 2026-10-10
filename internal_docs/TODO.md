@@ -1741,6 +1741,24 @@ Still unplanned, and not covered by the plan:
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
+- [ ] **Delete the deferred read-model hooks.** Since
+      [read-model coherence](plans/read-model-coherence-plan.md) Phase 4,
+      every `cache_*` / `refresh_read_model` call inside a mutation body is
+      a no-op (`capture::read_model_deferred`), and the changeset projection
+      is the only way into the read model. Remove the ~30 call sites once a
+      release has run with the shadow check on
+      ([calls entry 3](calls/read-model-coherence-plan_calls.md)).
+- [ ] **Shadow check for raft replicas.** The read-model shadow check only
+      covers `local_disk` mutations: raft lanes apply concurrently and
+      project outside the capture mutex, so there is no quiet point to
+      compare at without a per-lane barrier
+      ([plan § 9](plans/read-model-coherence-plan.md)).
+- [ ] **Task-config cache: scrub it and close the read-through race.**
+      `cached_task_configs_for_job_config` caches what it read on a miss, so
+      a read that straddles a `destroy_job` can re-insert the destroyed list
+      after projection removed it, and the timed scrub does not visit task
+      configs ([calls entry 7](calls/read-model-coherence-plan_calls.md)).
+
 - [x] **A sync forward to a new lane leader panicked the manager.**
       `MultiRaftDriver::forward_lane_write` dialed the leader through
       `ChannelPool::get` *before* entering the raft runtime, and
@@ -2808,6 +2826,21 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       with the old `.legion/store.sqlite/` layout still opened
       ([plan](plans/data-dir-env-plan.md) ·
       [docs](../docs/data-directory.md))
+- [x] The read model follows SQLite in every mode (2026-10-10). A shadow
+      check found 95 unit tests where `local_disk` left the cache
+      disagreeing with SQLite: registration and mark-lost cached values a
+      later op would commit, `complete_allocation` never updated the cached
+      status, and `destroy_job` leaked the destroyed config's task configs.
+      With the check on in integration tests it also found that a full
+      read-model rebuild (restart, snapshot install) dropped every cached
+      task's `speculative_start`.
+      `local_disk` mutations now project the read model from a session
+      changeset like raft replicas do. Every manager also rebuilds after an
+      outside commit (`PRAGMA data_version`) and scrubs 128 nodes every 5s,
+      counted in `legion_read_model_external_writes_total` and
+      `legion_read_model_drift_repaired_total`
+      ([plan](plans/read-model-coherence-plan.md) ·
+      [docs](../docs/state-store.md#read-model-coherence))
 
 ## Workload identity
 

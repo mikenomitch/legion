@@ -59,10 +59,55 @@ The in-memory `SchedulingReadModel` cache stores:
 
 Scheduler hot paths read this cache through `available_node_arcs`,
 `plan_capacity_snapshot`, and `cached_task_configs_for_job_config`. Other
-callers use the deep-clone `cached_nodes`. Write operations update both the
-DB and the cache. The same write-locked pass re-derives the affected node's
-free pool and index projections, so derived state is never visible out of
-step with the nodes and allocations it came from.
+callers use the deep-clone `cached_nodes`. The same write-locked pass that
+updates a node or its allocations re-derives that node's free pool and index
+projections, so derived state is never visible out of step with the nodes and
+allocations it came from.
+
+### Read model coherence
+
+SQLite is the source of truth and the cache follows it. In every persistence
+mode, the cache is updated from the committed changeset of each write, not by
+the write's own code:
+
+- **`raft`**: each manager projects the cache from the changeset it applies
+  (see [Persistence Modes](#persistence-modes)).
+- **`local_disk` and `streaming`**: each mutation runs with a SQLite session
+  attached to the cache's tables (`node`, `node_health`, `allocation`,
+  `task_config`, `allocation_epoch_partition`). When the mutation returns, the
+  cache is projected from what it committed. That includes rows removed by
+  `ON DELETE CASCADE` and rows a mutation committed before it failed.
+  Mutations run one at a time on a process-wide lock, so projections apply in
+  commit order.
+
+A stale cache cannot oversubscribe a node, because plan-apply rechecks free
+capacity against SQLite inside its write transaction. It can still make the
+scheduler skip a node that has room, or keep picking one that does not. Two
+background checks run every 5 seconds on every manager to bound that:
+
+- **Outside writes.** If another process commits to the state database (for
+  example `sqlite3` against the live file), the manager notices through
+  `PRAGMA data_version`, rebuilds the whole cache from disk, logs a warning,
+  and increments `legion_read_model_external_writes_total`. Writing the state
+  database while the manager runs is still unsupported. This check only
+  limits the damage. A `TRUNCATE` or `RESTART` checkpoint run by another
+  process also counts as an outside write and costs one rebuild. The
+  manager's own checkpoints are `PASSIVE` and do not count.
+- **Scrub.** The manager reloads 128 nodes per tick from SQLite (the node row
+  and its allocation list), compares them with the cache, and repairs any
+  that differ. The rotation covers every node, cached or committed, so a
+  10,000-node fleet is swept in about 6.5 minutes. Each repair logs a warning
+  and increments `legion_read_model_drift_repaired_total{source="scrub"}`.
+  Task configs are not scrubbed.
+
+Either counter rising in a healthy cluster is a bug worth reporting.
+
+For tests and soak runs, `LEGION_READ_MODEL_SHADOW_CHECK=1` compares the whole
+cache with a fresh load after every `local_disk` mutation and panics on any
+difference, naming the operation. It is always on in Legion's unit tests. It
+reloads the whole cache on every write, so never set it in production. It does
+not cover raft replicas, which apply lanes concurrently and have no quiet point
+to compare at.
 
 ## Key Tables
 
@@ -168,9 +213,10 @@ durable the writes are:
   in full. Any changeset whose allocation records cannot be classified
   falls back to a full reload. And one node per changeset is reloaded in
   full on a round-robin sweep of the fleet. The fallbacks log at `warn`
-  with the allocation ids or nodes involved. They should not happen in a
-  healthy cluster. Repeated occurrences mean the cache and committed state
-  disagree.
+  with the allocation ids or nodes involved, and a contradicted delta
+  increments `legion_read_model_drift_repaired_total{source="delta"}`. They
+  should not happen in a healthy cluster. Repeated occurrences mean the cache
+  and committed state disagree.
   In raft mode, calling `write_connection()` outside the capture and apply
   paths fails with an error (a runtime bypass guard), so no code path can
   change state without replicating it. Snapshots, log compaction,
