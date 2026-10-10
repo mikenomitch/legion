@@ -2801,28 +2801,43 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
   - [x] UI-2: job Snapshots card with take (disk or memory), restore, and
         delete, ACL-gated and two-step, row expansion with the manifest, a
         "restoring from" badge on instances
-  - [ ] UI-3: `suspended` badge and filter, checkpoint column, Suspend,
-        Resume, Resume cold, `instance` events category. Unblocked: server
-        Phase 4 shipped (`InstanceInfo.checkpoint_*`, `suspended_at`,
-        `suspend_reason`, `SuspendInstance`, `StartInstanceRequest.cold`)
-        ([plan §7.2](plans/suspend-resume-ui-plan.md#72-what-pass-2-waits-on-parent-plan-7)).
-        Keep `InstancesTable` row objects stable across polls before adding
-        two-step buttons there
-        ([call 7](calls/suspend-resume-ui-plan_calls.md#7-snapshot-rows-keep-their-objects-across-polls))
-  - [ ] UI-4: idle countdown and a live `suspend` step chip. Unblocked: server
-        Phase 5 shipped (`InstanceInfo.idle_since`, the `suspend` pressure step)
-  - [ ] UI-5: Fork with a count. Unblocked: `ForkInstance` (Phase 6) shipped
-  - [ ] UI-6: durability column, Warm action, content store card. Phase 7b
-        shipped. Still waits on a content read RPC
-  - [ ] Server changes the UI needs
+  - [x] UI-3: `suspended` badge and state filter, checkpoint column (kind,
+        local or published, size, node, age), Suspend (kind menu when both
+        are possible), Resume, and Resume cold, two-step and ACL-gated, last
+        suspend and restore durations, `last_stop` on the row, and an
+        `instance` events category with summaries. Rows are keyed by id so
+        an armed confirm survives polls
+        ([calls 6](calls/suspend-resume-ui-plan_calls.md#6-instance-rows-are-keyed-by-id-and-cells-read-the-row-through-an-accessor))
+  - [x] UI-4: idle countdown from `idle_since` and `idle_after_seconds`,
+        `suspend_reason` on suspended rows, and the `suspend` step chip
+  - [x] UI-5: Fork with count and spread (spread only when the manager
+        allows it), fork lineage, snapshot names shown, set, and removed
+  - [x] UI-6: durability column, publish on create, Warm, snapshot holders,
+        and the worker page's "Content and locality" card
+  - [x] Server changes the UI needs
         ([plan §7.3](plans/suspend-resume-ui-plan.md#73-server-changes-the-ui-needs)):
-        a batch node-usage RPC for the workers index (it fans out one
-        `GetNodeUsage` per row today), `InstanceInfo.last_stop` plus
-        `instance_id` in `node.pressure` metadata, a `GetNodeContent` read
-        RPC, and a memory-checkpoint eligibility field
+        `ListNodeUsage` (the workers index makes one call), `InstanceInfo.last_stop`
+        plus `instance_id` in `node.pressure`, `GetNodeContent` and
+        `SnapshotInfo.holders`, `InstanceInfo.checkpoint_support` per
+        operation, `forked_from`, and CPU `cores` and `used_millicores` on
+        node usage (`legion node usage` with no node, `legion node content`,
+        and the `legion_node_usage_list` and `legion_node_content` MCP tools)
+  - [ ] Show the content store's per-class budgets on the worker page's
+        "Content and locality" card once GetNodeUsage carries the disk
+        budget. The card has the slot (`NodeContentCard`'s `budgets`)
+        ([calls 8](calls/suspend-resume-ui-plan_calls.md#8-getnodecontent-reads-only-what-the-manager-already-holds))
+  - [ ] The Jobs index still lists a running job as `done`; only the job
+        page derives `running`
+        ([calls 9](calls/suspend-resume-ui-plan_calls.md#9-a-done-job-with-live-work-reads-running-derived-in-the-ui)).
+        A server-side status that reflects live work would fix both
+  - [ ] `create --from-snapshot` from the UI needs an instance-create
+        surface, which the UI does not have
+        ([calls 15](calls/suspend-resume-ui-plan_calls.md#15-creating-instances-from-a-snapshot-stays-in-the-cli))
   - [ ] Linux visual check: `/nodes/<id>` against `legion node usage <id>`
-        on a worker with enforcement on. macOS only exercises the
-        not-reported shape
+        on a worker with enforcement on, and an idle countdown reaching zero
+        within one poll of the idle sweep suspending the instance. macOS
+        only exercises the not-reported shape, so the countdown is checked
+        against fixtures at `/testing` only
 
 Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 

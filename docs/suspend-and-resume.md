@@ -553,6 +553,43 @@ The handler logs each step to the guest console, so `legion job logs` shows
 what a restore refreshed and what failed. A failed step does not stop the
 others.
 
+## Inspecting an instance
+
+`legion instance get <id> -j` (and `instance list -j`, the UI, and
+`legion_instance_get`) answers three questions without reading events:
+
+- **Why did it last stop?** `last_stop` names the cause (`node_pressure`,
+  `preempted`, `node_lost`, `drain`, `suspended`, `update`, `stop`, and the
+  rest of the [stop-cause vocabulary](graceful-stop.md)), a sentence, the
+  allocation and node, and when. A memory pressure eviction carries the
+  worker's own detail and hint, the same text as its `node.pressure` event,
+  so a job-scoped token without `operator:read` still sees it. The manager
+  writes it in the same transaction that removes the allocation, and each
+  later stop replaces it.
+- **What can it checkpoint right now?** For an `active` instance,
+  `checkpoint_support` says whether a memory or disk snapshot, a memory
+  suspend, a memory or disk fork, a spread fork, and a published snapshot
+  would be accepted, and `suspend_default` names the kind a plain `instance
+  suspend` takes. Each `*_blocker` is the exact refusal the command would
+  return, hint included. The manager runs the same checks the commands run,
+  so a stored network policy that gates the task, a node without a VMM, or a
+  volume driver without `clone` is already accounted for.
+- **Where did it come from?** `forked_from` names the instance a fork was
+  forked from, for the fork's whole life (the fork checkpoint itself is
+  reclaimed once every fork has restored).
+
+```console
+$ legion instance get user-17 -j | jq .data.last_stop
+{ "cause": "node_pressure", "detail": "evicted by evict-bursting on w-03: using 1.9 GiB of a 400 MiB reservation ...",
+  "hint": "raise resources.memory toward real usage", "at": "2026-10-10T06:12:44Z", "allocation_id": 1063, "node_id": "w-03" }
+```
+
+`legion snapshot get <id> -j` adds `holders` for a memory snapshot: every
+node that advertises its parts to the manager's location index, with how
+many of the parts it holds. That is where a published resume, restore, or
+fork will start from local bytes. `legion node content <node>` shows the same
+fact from the node's side ([artifacts.md](artifacts.md)).
+
 ## Snapshots
 
 The rest of this page covers snapshots you take and restore yourself:
@@ -799,13 +836,28 @@ Destroying an instance keeps its snapshots until they are deleted or expire.
 ### In the UI
 
 The job page has a Snapshots card for jobs with stateful tasks. It lists
-each snapshot's kind, state, node, size, and expiry, expands a row to show
-its manifest, and offers Take snapshot, Restore, and Delete. Restore and
-Delete ask for a second click, and so does a memory snapshot, because it
-pauses the guest. The card follows the same permissions as the CLI: it is
-hidden without `snapshot:read`, and its buttons are disabled with the reason
-when your token lacks `snapshot:write` (create, delete) or `job:write`
-(restore). The Events page has a `snapshot` category. See
+each snapshot's kind, purpose, state, durability, node, size, and expiry,
+with its names. A row expands to show its manifest, pause time, and the nodes
+holding its parts. The card offers Take snapshot (with publish), Restore,
+Name, Warm (published snapshots), and Delete. Restore and Delete ask for a
+second click, and so does a memory snapshot, because it pauses the guest. A
+disk suspend checkpoint's size reads `in place`: it keeps the volume where
+it is and copies nothing.
+
+The Instances card above it filters by state and shows each instance's
+checkpoint (kind, local or published, size, node, age), its idle countdown,
+the last suspend and restore durations, why it last stopped, and fork
+lineage. Keyed instances get Suspend, Resume, Resume cold, and Fork (count
+and spread), each a second click to confirm. Memory and spread are offered
+only when `checkpoint_support` allows them, and a disabled control's tooltip
+is the manager's own refusal.
+
+Both cards follow the same permissions as the CLI: the Snapshots card is
+hidden without `snapshot:read`, and buttons are disabled with the reason
+when your token lacks `snapshot:write` (create, delete, name, a memory
+suspend, fork) or `job:write` (restore, suspend, resume, fork). Creating
+instances, including from a snapshot, stays in the CLI. The Events page has
+`snapshot` and `instance` categories. See
 [ui-architecture.md](ui-architecture.md#usage-pressure-and-snapshots).
 
 ## Fork

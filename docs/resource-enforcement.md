@@ -372,6 +372,26 @@ Node w-03 (ready)  usage sampled 4s ago
   average clock per core.
 - `-j` prints the `GetNodeUsage` reply as JSON. Agents get the same reply from
   the `legion_node_usage` MCP tool.
+- A node that reports a core count but no usable clock speed (Apple Silicon)
+  has no MHz capacity. Its CPU capacity reads in cores (`10 cores`), and the
+  reply's `cpu.cores` and `cpu.used_millicores` carry the figures that do not
+  need a clock speed.
+
+Without a node, `legion node usage` prints one line per node from the
+`ListNodeUsage` RPC (also the `legion_node_usage_list` MCP tool and the UI's
+workers index). Each entry is exactly that node's `GetNodeUsage` reply, with
+the per-allocation rows left out unless asked for
+(`include_allocations`):
+
+```console
+$ legion node usage
+ NODE  STATUS  MEMORY           RESERVED  USED  CPU        PRESSURE
+ w-03  ready   65536 MiB ×1.5   91%       64%   64000 MHz  ok
+ mac   ready   32768 MiB        2%        -     10 cores   -
+```
+
+An empty node list means every node, up to 500 by node id. Nodes in pools
+your token cannot read are left out.
 
 `legion instance list` and `instance get` show the current allocation's
 measured memory, CPU, and idle time in `mem MiB`, `cpu`, and `idle` columns,
@@ -380,7 +400,8 @@ gauges, listed in [metrics.md](metrics.md#node-usage).
 
 In the UI, the worker page's Usage card shows the same reply: capacity with
 the ratio, reserved and used bars, the pressure status, the per-allocation
-table, and the pressure order. The workers index has a memory column, and
+table, and the pressure order. The workers index has a memory column from
+one `ListNodeUsage` call, and
 the job page's instance and allocation tables show used memory against
 `res/max`. See [ui-architecture.md](ui-architecture.md#usage-pressure-and-snapshots).
 

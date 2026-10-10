@@ -2,13 +2,18 @@
 
 > **Judgement calls:** [`calls/suspend-resume-ui-plan_calls.md`](../calls/suspend-resume-ui-plan_calls.md)
 
-Status: **IN EXECUTION** (written 2026-10-10). UI-1 (usage and pressure)
-and UI-2 (snapshots) shipped on top of server Phases 1, 2, 3 and 7a of
+Status: **SHIPPED** (written 2026-10-10). UI-1 (usage and pressure) and
+UI-2 (snapshots) shipped on top of server Phases 1, 2, 3 and 7a of
 [`suspend-resume-and-oversubscription-plan.md`](suspend-resume-and-oversubscription-plan.md).
-UI-3 to UI-6 wait on server Phases 4, 5, 6 and 7b and on the server changes
-listed in §7.3. Deliberately deferred: usage history charts (the manager
-keeps only the latest sample), a locality view (no read RPC exists), instance
-create from the UI, and a UI test runner.
+UI-3 to UI-6 shipped in pass 2, together with every server change §7.3 asked
+for (`ListNodeUsage`, `InstanceInfo.last_stop` and `instance_id` in
+`node.pressure`, `GetNodeContent` and `SnapshotInfo.holders`,
+`InstanceInfo.checkpoint_support`, plus `forked_from` and CPU `cores`).
+Deliberately deferred: usage history charts (the manager keeps only the
+latest sample), instance create (including `--from-snapshot`) from the UI
+(calls entry 15), content store budgets on the locality card (they arrive
+with the disk budget on GetNodeUsage), and a UI test runner. The Linux visual
+check of populated usage and a live idle countdown is still open.
 
 This plan covers the UI for all seven primitives of the parent plan, built
 and unbuilt. The parent plan owns the semantics. This one owns how they look
@@ -373,6 +378,11 @@ hold its parts.
 
 ### 7.3 Server changes the UI needs
 
+All four shipped in pass 2, with the shapes the
+[calls doc](../calls/suspend-resume-ui-plan_calls.md) records (entries 2, 3,
+7, 8): `ListNodeUsage`, `InstanceInfo.last_stop`, `GetNodeContent`, and
+`InstanceInfo.checkpoint_support` (per operation, not one flag).
+
 - **Batch usage for the workers index.** A `ListNodeUsage` RPC (or a
   `usage_summary` on `GetNodes` rows) returning capacity, reserved, used,
   ratio, and `under_pressure` per node. Today the index fans out one
@@ -400,14 +410,17 @@ Each UI phase ships with the server phase it needs, and stands alone.
 - **UI-2: snapshots** (server Phase 3, shipped). Snapshots card with create,
   restore, delete, row expansion, ACL gating, `snapshot` events category,
   restoring badge.
-- **UI-3: suspended instances** (server Phase 4). Badge, filter, checkpoint
-  column, Suspend, Resume, Resume cold, `instance` events.
-- **UI-4: idle and pressure suspend** (server Phase 5). Idle countdown,
-  `suspend_reason`, a live `suspend` chip.
-- **UI-5: fork** (server Phase 6). Fork action with count, `purpose = fork`
-  rows.
+- **UI-3: suspended instances** (server Phase 4, shipped). Badge, filter,
+  checkpoint column, Suspend, Resume, Resume cold, `instance` events, last
+  suspend and restore durations, `last_stop` on the row.
+- **UI-4: idle and pressure suspend** (server Phase 5, shipped). Idle
+  countdown, `suspend_reason`, a live `suspend` chip.
+- **UI-5: fork** (server Phase 6, shipped). Fork action with count and
+  spread, fork lineage, snapshot names shown and settable, `purpose = fork`
+  rows. `create --from-snapshot` stays in the CLI (calls entry 15).
 - **UI-6: locality and durability** (server Phase 7b plus §7.3's content
-  RPC). Durability column, Warm, content store card.
+  RPC, shipped). Durability column, publish on create, Warm, snapshot
+  holders, and the worker page's "Content and locality" card.
 
 ## 9. Testing plan
 

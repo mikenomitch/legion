@@ -292,9 +292,10 @@ the Access page reports it instead.
   allocation filters and **Find in logs** (case-insensitive, hits
   highlighted, "N of M lines match").
 - `TestingUtils.tsx`: unlisted (`/testing`), lazy-loaded. Renders the
-  usage, pressure, and snapshot components from fixtures in
-  `ui/src/fixtures/`, for shapes a dev cluster cannot produce. Nothing on it
-  calls the manager.
+  usage, pressure, instance (suspended, idle countdown, last stop, forks),
+  snapshot (published, named, fork and suspend checkpoints), and content
+  locality components from fixtures in `ui/src/fixtures/`, for shapes a dev
+  cluster cannot produce. Nothing on it calls the manager.
 
 ## Service Discovery
 
@@ -332,11 +333,12 @@ Storage shows up wherever you'd ask "where is my data"
 ## Usage, pressure, and snapshots
 
 Measured usage, the memory pressure response
-([resource-enforcement.md](resource-enforcement.md)), and snapshots
-([suspend-and-resume.md](suspend-and-resume.md)) appear on the pages where
-their questions get asked. `utils/usage.ts`, `utils/snapshots.ts`, and
-`utils/events.ts` hold the pure helpers, so the pages and the fixtures share
-one vocabulary.
+([resource-enforcement.md](resource-enforcement.md)), suspend, resume, fork,
+and snapshots ([suspend-and-resume.md](suspend-and-resume.md)), and content
+locality ([artifacts.md](artifacts.md)) appear on the pages where their
+questions get asked. `utils/usage.ts`, `utils/instances.ts`,
+`utils/snapshots.ts`, and `utils/events.ts` hold the pure helpers, so the
+pages and the fixtures share one vocabulary.
 
 - **Worker page, Usage card** (`components/NodeUsagePanel.tsx`), from
   `GetNodeUsage`: memory and CPU capacity with the `×ratio` when
@@ -344,34 +346,72 @@ one vocabulary.
   used (percent of physical) bars, the pressure status (`ok`, `under
   pressure`, `response off`, `status unknown`, `not reported`), every
   allocation's res/max, used, peak, CPU, and idle, and the "Under pressure,
-  in order" list with a chip per step. It matches `legion node usage`. The
-  old reservation-only card stays for custom resources, and for the whole
-  page when the manager has no `GetNodeUsage` or the caller lacks
-  `node:read`.
+  in order" list with a chip per step (`suspend` included). It matches
+  `legion node usage`. A node that reports cores but no clock speed (Apple
+  Silicon) shows `10 cores` and measures CPU use in cores. The old
+  reservation-only card stays for custom resources, and for the whole page
+  when the manager has no `GetNodeUsage` or the caller lacks `node:read`.
+- **Worker page, Content and locality card**
+  (`components/NodeContentCard.tsx`), from `GetNodeContent`: whether the
+  worker can checkpoint and publish, the snapshots captured here or fetched
+  or warmed here with their parts held, and every advertised digest with the
+  snapshot and role it belongs to and how many nodes hold it. When the
+  manager holds no content report for the node, the card says why.
+- **Workers index, Memory column**, from one `ListNodeUsage` call per poll
+  (one `GetNodeUsage` per row against a manager without it).
 - **Memory pressure cards** (`components/PressureHistory.tsx`) read
   `node.pressure` events (job page by job, worker page by node) and put each
-  action's detail and hint on their own lines. They need `operator:read`,
-  like every event view, and are hidden when empty.
-- **Snapshots card** on the job page: kind, purpose, state, node, size,
-  created, and expiry per snapshot, with a row expansion that loads the
-  manifest (`GetSnapshot`). Take snapshot (memory is offered only for a
-  `sandbox` task with a `snapshots` block and no gated networking, and is a
-  two-step confirm because it pauses the guest), Restore (two-step,
-  `local` snapshots of keyed, running instances), and Delete (two-step). An
-  instance restoring from a snapshot carries a "restoring from" badge.
+  action's detail and hint on their own lines, with the instance when the
+  event names one. They need `operator:read`, like every event view, and are
+  hidden when empty.
+- **Instances card** on the job page (`components/InstancesPanel.tsx` and
+  `components/InstancesTable.tsx`): a state filter, and per instance its
+  state (`suspended` has its own accent tone, with the suspend reason and
+  any operation in flight), memory and CPU, idle time with a live countdown
+  to the idle suspend, the checkpoint (kind, local or published, size, node,
+  age) with the last suspend and restore durations, fork lineage, storage,
+  and why the platform last stopped it (`last_stop`, with the hint). Keyed
+  instances get Suspend (with a kind menu when both kinds are possible),
+  Resume, Resume cold, and Fork (count 1 to 10, and spread only when the
+  manager allows it), each a two-step confirm. Rows are keyed by instance
+  id and cells read their row through an accessor, so an armed confirm
+  survives every poll.
+- **Snapshots card** on the job page: kind, purpose, state, durability,
+  node, size, created, and expiry per snapshot, with names shown and
+  removable, and a row expansion that loads the manifest, pause time, fork
+  lineage, and which nodes hold the parts (`GetSnapshot`). Take snapshot
+  (with publish when the manager allows it; memory is a two-step confirm
+  because it pauses the guest), Restore (two-step, `local` or `published`
+  manual snapshots of keyed, running instances), Name, Warm (published
+  snapshots), and Delete (two-step).
+- **Eligibility.** Every Suspend, Fork, spread, and memory snapshot control
+  reads `InstanceInfo.checkpoint_support`, which the manager computes with
+  the same checks the RPCs apply, and shows its blocker message as the
+  tooltip. Against a manager without the field the UI falls back to the job
+  spec.
+- **Job status.** The manager stores `done` for every accepted job. The job
+  page shows `running` while any allocation or instance of the job is live.
+- **Events.** `snapshot` and `instance` are filter categories, and their
+  expanded rows show the snapshot, instance, kind, size, durations, forks,
+  and error above the raw JSON.
 - **Tolerance.** Every field the manager may not send renders as `-` or a
   named state rather than an error. Unknown snapshot states and purposes
-  render as plain badges.
+  render as plain badges. Each new RPC treats `Unimplemented` and a denied
+  permission as "no card".
 
 Known limitations:
 
-- The workers index makes one `GetNodeUsage` call per visible row per poll.
-  There is no batch RPC yet.
 - Pressure history comes from the bounded event journal and needs
-  `operator:read`. A job-scoped token sees no Memory pressure card.
-- The memory snapshot option is derived from the job spec. A stored network
-  policy that gates the task is invisible to it, so the manager can still
-  refuse with the reason.
+  `operator:read`. A job-scoped token sees no Memory pressure card, though
+  each instance row still shows its own last stop.
+- The Jobs index lists the stored status, so a running job reads `done`
+  there.
+- Instances, including from a snapshot (`legion instance create
+  --from-snapshot`), are created and destroyed from the CLI only.
+- The content card shows no content store budgets: `GetNodeContent` reads
+  the location index, which carries digests and sizes but not classes.
+- A macOS worker reports no usage, so the idle countdown and populated usage
+  are only visible on Linux workers with enforcement on, and on `/testing`.
 
 ## Job Templates
 

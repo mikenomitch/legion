@@ -593,6 +593,35 @@ often placements land warm, watch
 `legion_scheduler_locality_placements_total` (see
 [metrics.md](metrics.md#scheduler--eval-loop)).
 
+**Seeing what a node holds.** `legion node content <node>` (the
+`GetNodeContent` RPC, the `legion_node_content` MCP tool, and the worker
+page's "Content and locality" card) reads the same index the score reads:
+
+```console
+$ legion node content w-04
+Node w-04  publish: yes  checkpoint: yes
+Advertises 3 entries, 574 MiB (epoch 42)
+
+ DIGEST               MiB  SNAPSHOT               ROLE      HOLDERS
+ sha256:3f9a0c21d4e5  480  snap-90d1e90d1e90d1e9  memory    3
+ sha256:aa00aa00aa00  64   -                      -         5
+ sha256:bb11bb11bb11  30   snap-90d1e90d1e90d1e9  vm-state  2
+
+ SNAPSHOT                       JOB         KIND    STATE      CAPTURED HERE  PARTS HERE
+ golden (snap-90d1e90d1e90d1e9)  workspaces  memory  published  no             3/3
+```
+
+Each entry names the snapshot and part role it belongs to when the manager
+knows one, and how many nodes advertise the same digest. The snapshot list
+covers what the node captured and every published snapshot it holds parts
+of (fetched for a resume or fork, or warmed). It needs `node:read` on the
+node's pool, and snapshot rows also need `snapshot:read` on their job.
+Because the index is soft state, the reply says `index_reported: false`
+when this manager holds no report from the node (it just started, the node
+has no store or an older worker, or the node reports to another manager).
+It lists entries of 1 MiB and up only, and carries no per-class budgets:
+the index records digests and sizes, not classes.
+
 ### Publishing content
 
 A worker can also publish content from its store to a shared store, by
