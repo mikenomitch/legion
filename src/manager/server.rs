@@ -5415,11 +5415,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RotateMeshCaRequest>,
     ) -> Result<Response<RotateMeshCaReply>, Status> {
+        // The mesh CA signs every node's certificate, so rotating it is a
+        // cluster-wide write. `AclScope::none()` carries no pool, so only an
+        // unscoped `net:write` rule matches; `any()` (list gating) would let a
+        // pool-scoped net admin rotate trust for every pool.
         let identity = self.check_acl(
             &request,
             AclResource::Net,
             AclAction::Write,
-            AclScope::any(),
+            AclScope::none(),
         )?;
         let ca = self
             .store

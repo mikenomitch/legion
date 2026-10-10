@@ -2201,6 +2201,40 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
     Ok(())
 }
 
+/// The mesh CA signs every node's certificate, so rotating it needs
+/// cluster-wide `net:write`. A pool-scoped net admin may not rotate it.
+#[tokio::test]
+async fn rotate_mesh_ca_requires_cluster_wide_net_write() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    let mut secrets = Vec::new();
+    for (name, rules) in [
+        (
+            "net-pool-admin",
+            r#"[{"resources": ["net"], "actions": ["write"], "pools": ["gpu"]}]"#,
+        ),
+        (
+            "net-cluster-admin",
+            r#"[{"resources": ["net"], "actions": ["write"]}]"#,
+        ),
+    ] {
+        svc.store.upsert_acl_policy(name, "", rules)?;
+        let (_, secret) = authenticator
+            .mint_token(&svc.store, name, "client", &[name.into()], None)
+            .map_err(|s| anyhow!(s.to_string()))?;
+        secrets.push(secret);
+    }
+
+    let status = call_endpoint(&svc, &fixtures, "RotateMeshCa", Some(&secrets[0]))
+        .await
+        .expect_err("a pool-scoped net admin must not rotate the mesh CA");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    call_endpoint(&svc, &fixtures, "RotateMeshCa", Some(&secrets[1]))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?;
+    Ok(())
+}
+
 /// Node-pool scoping: a token limited to one pool cannot read or restart
 /// nodes in other pools, and GetNodes filters.
 #[tokio::test]
