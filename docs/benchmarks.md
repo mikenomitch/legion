@@ -178,11 +178,14 @@ fleet, with one allocation per node resident.
 | ----------------- | -------------------- | ----------------------- | ------------------ |
 | Legion            | 1,267                | 20.8s                   | **27.1s**          |
 | Nomad 2.0.5       | 1,270                | 13.2s                   | 110.7s             |
-| Kubernetes 1.36.5 | pending rerun        | -                       | -                  |
+| Kubernetes 1.36.5 | 146 of 1,251 in 30m  | 343s                    | not within 30m     |
 
 Nomad notices the loss sooner, and Legion finishes the replacement about 4x
-faster. Kubernetes waits 300 seconds by default before evicting from a
-NotReady node, then evicts at 0.1 nodes/sec.
+faster. Kubernetes behaves as its defaults say it should. It waits 300
+seconds before evicting from a NotReady node, then evicts at 0.1 nodes/sec,
+so it had replaced 146 allocations when the drill's 30-minute watch ended.
+At that rate the full replacement would take about 3.5 hours. Both
+settings are tunable, and we ran the defaults.
 
 **Legion at larger fleets:**
 
