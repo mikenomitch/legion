@@ -15,6 +15,11 @@ How to use it:
 
 ---
 
+- [ ] **Architecture audit (2026-10-09).** Design-level findings across the
+      store, scheduler, manager API, worker, and lifecycle, each with an ID and
+      a status line: [architecture-audit-2026-10-09.md](architecture-audit-2026-10-09.md).
+      Anything the fix PR left open is listed there and under its area below.
+
 - [ ] **The `fit` index does not see `maxAllocations`.** A node at its
       allocation cap still projects into a fitting (cpu, memory, disk)
       cell, so under `bin_pack` (tight order: fullest fitting cell first)
