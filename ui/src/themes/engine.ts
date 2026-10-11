@@ -1,8 +1,8 @@
 // Turns a DesignTheme into CSS variables (plus the studio's fine-tuning
 // rules) and applies it to the page. Pure string building apart from
 // `applyTheme`, so the studio's "Copy CSS" export uses the same code.
-import { RADIUS_SCALES, type DesignTheme, type StatusColors, type ThemeColors } from './catalog'
-import { hexToRgb, rgbToHex, statusRamp } from './contrast'
+import { RADIUS_SCALES, type DesignTheme, type StatusColors, type ThemeColors, type TweakAxis } from './catalog'
+import { contrast, hexToRgb, rgbToHex, statusRamp } from './contrast'
 
 const STYLE_ID = 'design-lab-vars'
 
@@ -37,6 +37,11 @@ export const statusVars = (status?: StatusColors) => {
   return vars
 }
 
+// Text on a signal-colored fill (an active nav item): whichever of white or
+// near-black reads better on it, so bright dark-mode reds and yellow get
+// black and deep reds and blues get white.
+const signalInk = (signal: string) => (contrast('#ffffff', signal) >= contrast('#0a0a0a', signal) ? '#ffffff' : '#0a0a0a')
+
 export const tokenVars = (theme: DesignTheme): Record<string, string> => {
   const radius = RADIUS_SCALES[theme.radius]
   return {
@@ -53,7 +58,7 @@ export const tokenVars = (theme: DesignTheme): Record<string, string> => {
     ...(theme.shadow ? { '--shadow-card': theme.shadow.card, '--shadow-pop': theme.shadow.pop } : {}),
     ...colorVars(theme.colors),
     ...statusVars(theme.status),
-    ...(theme.signal ? { '--c-signal': triplet(theme.signal) } : {}),
+    ...(theme.signal ? { '--c-signal': triplet(theme.signal), '--signal-ink': signalInk(theme.signal) } : {}),
   }
 }
 
@@ -103,9 +108,27 @@ export const exportCss = (theme: DesignTheme) => {
   return `${header}\n${block(selector, decls)}\n${theme.sidebar ? `\n${block(`${selector} #app-sidebar`, colorVars(theme.sidebar))}\n` : ''}`
 }
 
+const TWEAK_AXES: TweakAxis[] = ['type', 'titles', 'density', 'cards', 'header', 'rail']
+
+// The picker contract: palette and tweaks are plain attributes on <html>, so
+// a production picker can set them (and the `dark` class) from localStorage
+// before first paint without any of the lab's code.
+const applyAttributes = (theme: DesignTheme | undefined) => {
+  const root = document.documentElement
+  if (theme?.palette) root.dataset.palette = theme.palette
+  else delete root.dataset.palette
+  for (const axis of TWEAK_AXES) {
+    const value = theme?.tweaks?.[axis]
+    const key = `tweak${axis[0].toUpperCase()}${axis.slice(1)}`
+    if (value && value !== 'default') root.dataset[key] = value
+    else delete root.dataset[key]
+  }
+}
+
 export const applyTheme = (theme: DesignTheme | undefined) => {
   const root = document.documentElement
   document.getElementById(STYLE_ID)?.remove()
+  applyAttributes(theme)
   if (!theme) {
     delete root.dataset.design
     return

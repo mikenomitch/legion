@@ -136,7 +136,7 @@ When one is required and what goes in it:
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
 | [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md) | shipped |
 | [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md) | shipped (2026-09-02; embedding the UI in the binary deliberately left open) |
-| [ui-theme-lab-plan.md](plans/ui-theme-lab-plan.md) | in execution (tokenized design system, twenty candidate themes, dev-only theme studio + recorded fake data built; round two: Command Post/Forge/Swiss with opposite modes and five riffs each; shipping the pick waits on a decision) |
+| [ui-theme-lab-plan.md](plans/ui-theme-lab-plan.md) | in execution (tokenized design system, twenty candidate themes, dev-only theme studio + recorded fake data built; round two: Command Post/Forge/Swiss with opposite modes and five riffs each; round three: Swiss as 7 light/dark palettes × 6 tweak axes for a picker; shipping Swiss + the picker is next) |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
 | [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
 | [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | superseded in part by suspend-resume-and-oversubscription (§0 convergence shipped; mechanics still the reference) |

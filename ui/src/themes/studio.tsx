@@ -8,8 +8,9 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup } from 'solid-js'
 import { createStore, reconcile, unwrap } from 'solid-js/store'
 import { render } from 'solid-js/web'
-import { ALL_PRESETS, BASELINE_THEMES, DESIGN_THEMES, type DesignTheme, type RadiusScale, type StatusColors, type ThemeColors } from './catalog'
+import { ALL_PRESETS, BASELINE_THEMES, DESIGN_THEMES, type DesignTheme, type RadiusScale, type StatusColors, type ThemeColors, type TweakAxis } from './catalog'
 import { RIFF_THEMES } from './riffs'
+import { SWISS_COMBO_PRESETS, SWISS_PALETTES, SWISS_PALETTE_PRESETS, SWISS_TWEAKS, SWISS_TWEAK_PRESETS } from './swiss'
 import { auditTheme, badgeContrast, contrast, type StatusName } from './contrast'
 import { applyTheme, exportCss, normalizeHex } from './engine'
 import { FONT_OPTIONS, type FontOption } from './fontOptions'
@@ -160,6 +161,40 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
     setShipped(false)
     setTheme(reconcile(clone(preset)))
   }
+
+  // --- Swiss picker: palette × mode × tweaks (the contract a production
+  // picker would store in localStorage) ------------------------------------
+  const applyPalette = (paletteId: string, mode: 'light' | 'dark' = theme.mode) => {
+    const palette = SWISS_PALETTES.find((entry) => entry.id === paletteId)
+    if (!palette) return
+    const spec = palette[mode]
+    edit(() => {
+      if (!(theme.flourishes ?? theme.id).startsWith('swiss')) setTheme('flourishes', 'swiss')
+      setTheme('mode', mode)
+      setTheme('palette', palette.id)
+      setTheme('colors', clone(spec.colors))
+      setTheme('status', clone(spec.status))
+      setTheme('signal', spec.signal)
+      setTheme('sidebar', undefined)
+    })
+  }
+  const setTweak = (axis: TweakAxis, value: string) =>
+    edit(() => setTheme('tweaks', (current) => ({ ...(current ?? {}), [axis]: value })))
+  const pickerState = () =>
+    JSON.stringify({ palette: theme.palette ?? 'red', mode: theme.mode, tweaks: Object.fromEntries(Object.entries(theme.tweaks ?? {}).filter(([, v]) => v && v !== 'default')) })
+
+  // The app's own sun/moon toggle flips the `dark` class. For a preset with a
+  // twin in the other mode, follow it there instead of leaving the palette
+  // mismatched; edited themes and unpaired presets are left alone.
+  const followAppToggle = new MutationObserver(() => {
+    const isDark = document.documentElement.classList.contains('dark')
+    if (shipped() || isDark === (theme.mode === 'dark')) return
+    // A Swiss palette knows both modes, so keep every tweak and swap colors.
+    if (theme.palette) return applyPalette(theme.palette, isDark ? 'dark' : 'light')
+    if (theme.pair && !edited()) loadPreset(theme.pair)
+  })
+  followAppToggle.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
+  onCleanup(() => followAppToggle.disconnect())
 
   const order = () => [SHIPPED, ...presets().map((preset) => preset.id)]
   const step = (delta: number) => {
@@ -331,6 +366,9 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
       .filter((preset) => preset.family === name)
       .sort((a, b) => ['base', 'counterpart', 'riff'].indexOf(a.role ?? 'riff') - ['base', 'counterpart', 'riff'].indexOf(b.role ?? 'riff'))
   const groups = createMemo(() => [
+    { label: 'Swiss palettes · light and dark', items: [presetById('swiss')!, presetById('swiss-dark')!, ...SWISS_PALETTE_PRESETS] },
+    { label: 'Swiss tweaks · on Swiss Red', items: SWISS_TWEAK_PRESETS },
+    { label: 'Swiss combinations', items: SWISS_COMBO_PRESETS },
     { label: 'Command Post family', items: family('command-post') },
     { label: 'Forge family', items: family('forge') },
     { label: 'Swiss family', items: family('swiss') },
@@ -385,6 +423,23 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
               </select>
               <button type="button" class="icon-btn" onClick={() => step(1)} aria-label="Next preset">›</button>
             </div>
+            <Show when={!shipped() && !theme.palette && presetById(presetId())?.pair}>
+              {(pairId) => (
+                <div class="seg" role="group" aria-label="Light or dark version of this preset">
+                  <For each={['light', 'dark'] as const}>
+                    {(mode) => (
+                      <button
+                        type="button"
+                        aria-pressed={theme.mode === mode}
+                        onClick={() => mode !== theme.mode && loadPreset(pairId())}
+                      >
+                        {mode === 'light' ? 'Light version' : 'Dark version'}
+                      </button>
+                    )}
+                  </For>
+                </div>
+              )}
+            </Show>
             <div class="edited">
               <Show when={edited()} fallback={<span>{shipped() ? 'Showing the shipped CSS, untouched.' : presetById(presetId())?.tagline}</span>}>
                 <b>● Edited</b>
@@ -396,6 +451,63 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
           </header>
 
           <div class="body">
+            <details open>
+              <summary>Picker <span class="pill">Swiss · palette × tweaks</span></summary>
+              <div class="section">
+                <p class="hint">
+                  What a theme picker would offer. It sets <code>data-palette</code>, the <code>dark</code> class and{' '}
+                  <code>data-tweak-*</code> on &lt;html&gt;; the stored value is shown below.
+                </p>
+                <label class="field">
+                  <span>Palette</span>
+                  <select value={theme.palette ?? ''} onChange={(event) => applyPalette(event.currentTarget.value)}>
+                    <Show when={!theme.palette}>
+                      <option value="">Not a Swiss palette</option>
+                    </Show>
+                    <For each={SWISS_PALETTES}>{(palette) => <option value={palette.id}>{palette.name}</option>}</For>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Mode</span>
+                  <span class="seg" role="group" aria-label="Picker mode">
+                    <For each={['light', 'dark'] as const}>
+                      {(mode) => (
+                        <button
+                          type="button"
+                          aria-pressed={theme.mode === mode}
+                          onClick={() => (theme.palette ? applyPalette(theme.palette, mode) : edit(() => setTheme('mode', mode)))}
+                        >
+                          {mode === 'light' ? 'Light' : 'Dark'}
+                        </button>
+                      )}
+                    </For>
+                  </span>
+                </label>
+                <For each={SWISS_TWEAKS}>
+                  {(tweak) => (
+                    <label class="field">
+                      <span>{tweak.label}</span>
+                      <span class="seg" role="group" aria-label={tweak.label}>
+                        <For each={tweak.options}>
+                          {(option) => (
+                            <button
+                              type="button"
+                              title={option.description}
+                              aria-pressed={(theme.tweaks?.[tweak.axis] ?? 'default') === option.value}
+                              onClick={() => setTweak(tweak.axis, option.value)}
+                            >
+                              {option.label}
+                            </button>
+                          )}
+                        </For>
+                      </span>
+                    </label>
+                  )}
+                </For>
+                <code class="stored">{pickerState()}</code>
+              </div>
+            </details>
+
             <details open>
               <summary>Data <span class="pill">{dataLabel()}</span></summary>
               <div class="section">

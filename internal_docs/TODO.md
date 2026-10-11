@@ -2259,9 +2259,18 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 
 From [ui-theme-lab-plan.md](plans/ui-theme-lab-plan.md):
 
-- [ ] Pick a theme from the lab and ship it as the default (plan phase 3;
-      round two narrowed to Command Post, Forge and Swiss with five riffs
-      each — a riff that wins needs its opposite mode designed):
+- [ ] Theme picker (maintainer is building it): ship Swiss as the default
+      and offer the round-three palettes (7, light/dark) and tweaks (6 axes)
+      from `ui/src/themes/swiss.ts`. Move the Swiss family + "Swiss picker"
+      rules from `themes.css` and the palette tokens into production CSS,
+      load only the typefaces the picker offers, and apply the stored
+      `{ palette, mode, tweaks }` before first paint to avoid a flash
+      ([plan round three](plans/ui-theme-lab-plan.md#round-three-swiss-as-palettes--tweaks),
+      [calls entry 2](calls/ui-theme-lab-plan_calls.md)).
+- [ ] The black-rail tweak barely shows in dark palettes whose page is
+      already near-black; the active item carries it. Consider lifting the
+      page or tinting the rail for those palettes.
+- [ ] Ship the pick as the default (plan phase 3):
       paste its tokens into `index.css`, fold its `themes.css` rules into the
       components, design its second mode, re-run `npm run lab:contrast`, and
       update the Design System section of `docs/ui-architecture.md`. Then
@@ -3102,7 +3111,9 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       presets, live contrast, CSS/JSON export and saved presets; recorded
       fake data (`lab:record`, `lab:crawl`) served when no manager answers;
       `lab:shots` and `lab:contrast`. Round two (2026-10-11): Forge Light,
-      Swiss Dark and five riffs each for Command Post, Forge and Swiss
+      Swiss Dark and five riffs each for Command Post, Forge and Swiss.
+      Round three (2026-10-11): Swiss as palettes × tweaks with a Picker
+      section in the studio
       ([plan](plans/ui-theme-lab-plan.md),
       [calls](calls/ui-theme-lab-plan_calls.md),
       [docs](../docs/ui-architecture.md#design-lab-and-theme-studio-dev-server-only)).

@@ -102,3 +102,6 @@ footer.bottom { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px; bo
 .btn.danger { color: var(--bad); }
 .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .toast { color: var(--ok); font-size: 11.5px; }
+
+.stored { display: block; font: 11px/1.4 ui-monospace, Menlo, monospace; color: var(--muted); background: var(--bg-2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; word-break: break-all; }
+.field .seg { flex-wrap: wrap; }

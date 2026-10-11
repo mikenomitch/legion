@@ -17,6 +17,7 @@
  */
 
 import { RIFF_THEMES } from './riffs.ts'
+import { SWISS_PRESETS } from './swiss.ts'
 import { monoStack, stack } from './stacks.ts'
 
 export type Hex = `#${string}`
@@ -65,8 +66,19 @@ export type DesignTheme = {
   signal?: Hex
   // Round-two grouping: which family a theme belongs to and its role in it.
   family?: 'command-post' | 'forge' | 'swiss'
-  role?: 'base' | 'counterpart' | 'riff'
+  role?: 'base' | 'counterpart' | 'riff' | 'variation'
+  // The same theme in the other mode. When set, the app's own light/dark
+  // toggle switches to it in the lab instead of mismatching the palette.
+  pair?: string
+  // Swiss picker axes (swiss.ts): the palette this theme's colors come from,
+  // and the structural tweaks it turns on. Applied as `data-palette` and
+  // `data-tweak-<axis>` on <html>, which is what themes.css keys on.
+  palette?: string
+  tweaks?: Tweaks
 }
+
+export type TweakAxis = 'type' | 'titles' | 'density' | 'cards' | 'header' | 'rail'
+export type Tweaks = Partial<Record<TweakAxis, string>>
 
 
 export const RADIUS_SCALES: Record<RadiusScale, Record<string, string>> = {
@@ -150,6 +162,7 @@ export const DESIGN_THEMES: DesignTheme[] = [
   },
   {
     id: 'forge',
+    pair: 'forge-light',
     family: 'forge',
     role: 'base',
     name: 'Forge',
@@ -298,6 +311,8 @@ export const DESIGN_THEMES: DesignTheme[] = [
   },
   {
     id: 'swiss',
+    palette: 'red',
+    pair: 'swiss-dark',
     family: 'swiss',
     role: 'base',
     name: 'Swiss',
@@ -458,6 +473,7 @@ const COMMAND_POST_TYPE = {
 export const BASELINE_THEMES: DesignTheme[] = [
   {
     id: 'command-post',
+    pair: 'command-post-dark',
     family: 'command-post',
     role: 'base',
     name: 'Command Post (shipped, light)',
@@ -474,6 +490,7 @@ export const BASELINE_THEMES: DesignTheme[] = [
   },
   {
     id: 'command-post-dark',
+    pair: 'command-post',
     family: 'command-post',
     role: 'counterpart',
     name: 'Command Post (shipped, dark)',
@@ -490,6 +507,6 @@ export const BASELINE_THEMES: DesignTheme[] = [
   },
 ]
 
-export const ALL_PRESETS = [...BASELINE_THEMES, ...DESIGN_THEMES, ...RIFF_THEMES]
+export const ALL_PRESETS = [...BASELINE_THEMES, ...DESIGN_THEMES, ...RIFF_THEMES, ...SWISS_PRESETS]
 
 export const findTheme = (id: string | null | undefined) => ALL_PRESETS.find((theme) => theme.id === id)

@@ -155,6 +155,7 @@ export const RIFF_THEMES: DesignTheme[] = [
   // -------------------------------------------------------------------------
   {
     id: 'forge-light',
+    pair: 'forge',
     family: 'forge',
     role: 'counterpart',
     name: 'Forge Light',
@@ -287,6 +288,8 @@ export const RIFF_THEMES: DesignTheme[] = [
   // -------------------------------------------------------------------------
   {
     id: 'swiss-dark',
+    palette: 'red',
+    pair: 'swiss',
     family: 'swiss',
     role: 'counterpart',
     name: 'Swiss Dark',

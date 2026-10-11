@@ -510,7 +510,22 @@ default only in `npm run lab`.
   A riff's id is `<family>-<riff>`, and `themes.css` matches family rules with
   `[data-design|='<family>']`, so riffs inherit their family's structure. A
   theme may set a `signal` color (`--c-signal`) for structural details such as
-  Swiss's red square; it is never used for text.
+  Swiss's red square; it is never used for text. Text on a signal-colored
+  fill uses `--signal-ink`, which the engine sets to white or near-black,
+  whichever has more contrast.
+- **Swiss palettes and tweaks** (`swiss.ts`) are the options a theme picker
+  offers. A palette (`data-palette`: `red`, `blue`, `yellow`, `duotone`,
+  `concrete`, `paper`, `mono`) is colors only, with a light and a dark
+  version. A tweak is one structural axis set as `data-tweak-<axis>` on
+  `<html>`: `type` (`akzidenz`, `geist`, `mono`), `titles` (`hairline`),
+  `density` (`compact`), `cards` (`boxed`, `soft`), `header` (`masthead`),
+  `rail` (`black`); no attribute means the default. Tweaks combine freely
+  with each other and with every palette in both modes. The studio's
+  **Picker** section sets exactly these attributes and shows the value a
+  picker would store, for example
+  `{"palette":"concrete","mode":"dark","tweaks":{"density":"compact"}}`.
+  Presets with a twin in the other mode follow the app's own light/dark
+  toggle.
 - **Data.** In `npm run lab` the dev server answers the UI's manager calls
   itself. **Auto** (the default) proxies to the manager when it accepts a
   connection and serves recorded responses when it does not; **Live** and
@@ -534,7 +549,7 @@ default only in `npm run lab`.
 
 Limits: each candidate theme is designed for one mode (light or dark) — the
 studio's mode switch flips the app's light/dark status shades but does not
-invent the other palette. The app's own sun/moon toggle still flips the
-`dark` class under a lab theme, which mismatches its colors; use the studio's
-mode control instead. The recording reflects one cluster at one moment, and
+invent the other palette. The app's own sun/moon toggle follows a preset's twin
+or a Swiss palette's other mode; for other presets it flips the `dark` class
+without changing colors, so use the studio's mode control instead. The recording reflects one cluster at one moment, and
 it does not learn new proto fields until it is re-recorded.

@@ -23,7 +23,37 @@ is a permanent surface to keep accessible and consistent across every future
 page (simplicity/ease). Keeping it dev-only makes the whole lab free to leave
 in the repo or delete after the pick.
 
-## 2. Type, shape, depth and status became CSS variables
+*Revisited in round three:* the maintainer now plans a picker saved to
+localStorage. The lab itself stays dev-only; entry 2 is the shape it hands the
+picker.
+
+## 2. Swiss is a palette × tweaks system, applied as attributes on `<html>`
+
+**Call.** Round three splits Swiss into **palettes** (colors only, each a
+light/dark pair: Red, Zurich Blue, Signal Yellow, Duotone, Concrete, Paper,
+Mono) and **tweaks** (independent structural axes: typeface, titles, density,
+cards, page header, nav rail). A picker sets `data-palette`, the `dark` class
+and `data-tweak-<axis>` on `<html>` and stores
+`{"palette":"concrete","mode":"dark","tweaks":{"density":"compact"}}`.
+
+**Alternatives.** Ten fixed light/dark variations (what round three started
+as, before the maintainer said a picker is coming); one `data-theme` naming a
+combination; or tweak classes on components.
+
+**Trade-off.** Combinations are not individually designed — each tweak is
+written against tokens and has to hold up with every palette in both modes,
+and some pairings are weaker (the black rail barely contrasts with Swiss
+Dark's near-black page). Seven palettes × 4 × 2 × 2 × 3 × 2 × 2 tweak options
+is 1,344 looks per mode; only defaults, each tweak alone and three
+combinations are screenshotted.
+
+**Why.** A picker needs orthogonal choices, not a list of finished themes:
+"Concrete, compact, black rail" should be three independent settings, each
+undoable on its own (extensibility: a new palette or tweak is one block of
+CSS). Plain attributes keep the production picker free of lab code and let it
+apply the stored choice before first paint.
+
+## 3. Type, shape, depth and status became CSS variables
 
 **Call.** Tailwind's `font-*`, `rounded-*`, `shadow-card/pop` and the
 `emerald/amber/red/sky` 200–800 shades now read CSS variables whose defaults
@@ -40,7 +70,7 @@ hooks become a contract: renaming one silently drops a theme's structural CSS.
 components, and it is behaviour-preserving for the shipped look
 (extensibility: the next reskin is a token change).
 
-## 3. "Notes page" read as the Workers page; "allocation page" as the task page
+## 4. "Notes page" read as the Workers page; "allocation page" as the task page
 
 **Call.** The request named the Notes page, the allocation page and the job
 page. The screenshots show Workers (`/nodes`), the task detail page
@@ -56,7 +86,7 @@ logs).
 **Why.** `/nodes` is literally "nodes"; the index shows every theme's table,
 status and badge treatment at once, which is what a look is judged on.
 
-## 4. Each candidate theme is designed for one mode
+## 5. Each candidate theme is designed for one mode
 
 **Call.** Every catalog theme is either light or dark (11 dark, 9 light), and
 the lab pins the app to that mode.
@@ -69,7 +99,7 @@ the lab pins the app to that mode.
 **Why.** Twenty strong directions beat twenty pairs of half-considered ones;
 the second mode is cheap once the direction is fixed.
 
-## 5. "A dark/light mode for each" means the three finalists, and Command Post's is the shipped dark
+## 6. "A dark/light mode for each" means the three finalists, and Command Post's is the shipped dark
 
 **Call.** Round two adds the opposite mode for Command Post, Forge and Swiss —
 not for each of the fifteen riffs. Command Post's opposite (dark) already
@@ -86,7 +116,7 @@ more palettes before the direction is chosen would spend effort on themes that
 will be discarded (simplicity/ease). Showing the shipped dark untouched keeps it
 an honest baseline.
 
-## 6. Each riff changes one or two things on purpose
+## 7. Each riff changes one or two things on purpose
 
 **Call.** Every riff keeps its family's structure and moves one or two
 variables: Command Post's accent, temperature, frame, density, darkness;
@@ -103,7 +133,7 @@ studio exists for those.
 over Swiss says "softer paper", not just "this one". It also makes the pick
 cheap to compose in the studio.
 
-## 7. Fake data is recorded real traffic, stored as proto3 JSON
+## 8. Fake data is recorded real traffic, stored as proto3 JSON
 
 **Call.** The dev server records the manager's unary gRPC-web responses into
 `ui/dev/fixtures/<Method>.json` (decoded with the generated descriptors) and
@@ -120,7 +150,7 @@ mutating call fails with an explicit message), and streams are not recorded.
 JSON keeps it editable; doing it in the dev server keeps app code untouched.
 The seed has two workers and no running tasks, too thin to judge a theme.
 
-## 8. Structural theme CSS hangs off `data-ui` hooks with attribute selectors
+## 9. Structural theme CSS hangs off `data-ui` hooks with attribute selectors
 
 **Call.** `themes.css` uses `:root[data-design='x'] [data-ui='…']` rules; the
 studio's tweaks use `:root[data-design]` and win by source order.
@@ -133,7 +163,7 @@ or a higher-specificity rule could override a theme.
 **Why.** It keeps every component unaware of themes, which is what makes the
 lab deletable.
 
-## 9. Riffs inherit by id prefix, and Swiss's structure is drawn from tokens
+## 10. Riffs inherit by id prefix, and Swiss's structure is drawn from tokens
 
 **Call.** Riff ids are `<family>-<riff>` and family rules match
 `:root[data-design|='<family>']`. Swiss's rules, which hard-coded black,
@@ -149,7 +179,22 @@ with `forge-` or `swiss-` would silently pick up those rules.
 **Why.** One rule set per family keeps riffs to a palette plus their single
 structural move, and the token rewrite is what makes Swiss Dark free.
 
-## 10. Screenshot data came from a real local cluster, with two local workarounds
+## 11. Text on a signal fill is computed, not chosen per palette
+
+**Call.** The engine sets `--signal-ink` to whichever of white or near-black
+has more contrast on the signal color, and every signal-filled element (the
+active nav item in Yellow, Blue and the black rail) uses it.
+
+**Alternative.** White everywhere, with per-palette overrides.
+
+**Trade-off.** Bright dark-mode reds get black text on the active item, which
+is less conventional than white.
+
+**Why.** White on the brighter dark-mode reds is about 3.7:1, under AA; the
+computed choice is never below 4.77:1 across all palettes, and new palettes
+get it for free.
+
+## 12. Screenshot data came from a real local cluster, with two local workarounds
 
 **Call.** The gallery shots come from a manager plus seven named workers
 (three pools; one drained, one lost) and four jobs, all on one host. Two
@@ -175,7 +220,7 @@ rather than the live cluster, so every shot of all twenty-one themes shows
 byte-identical data; the recording was taken from the same cluster right
 after round one.
 
-## 11. The studio renders in a shadow root
+## 13. The studio renders in a shadow root
 
 **Call.** The panel is a Solid tree inside a shadow root with its own CSS.
 

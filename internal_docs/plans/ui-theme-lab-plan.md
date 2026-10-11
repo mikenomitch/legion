@@ -6,8 +6,11 @@
 `claude/ui-design-variations-ibx1qw`: the tokenized design system, twenty
 candidate themes, the dev-only theme studio, and recorded fake data. Round two
 narrowed to three finalists — Command Post, Forge and Swiss — each with its
-opposite mode and five riffs (`ui/src/themes/riffs.ts`). Phase 3 (ship the
-chosen theme as the default) waits on a pick. Deliberately deferred: a
+opposite mode and five riffs (`ui/src/themes/riffs.ts`). Round three picked
+Swiss and turned it into a picker-ready system: seven light/dark palettes and
+six independent tweak axes (`ui/src/themes/swiss.ts`). Phase 3 now means
+shipping Swiss as the default plus a user-facing theme picker over those
+axes, which the maintainer plans to build. Deliberately deferred: a
 user-facing theme picker in production builds, and opposite-mode palettes for
 the riffs (only the three finalists have both modes).
 
@@ -124,12 +127,38 @@ of `--c-ink`, `--c-canvas` and a new `--c-signal` token so its dark mode and
 riffs get it for free. All thirty-nine presets are in the studio, grouped by
 family.
 
+## Round three: Swiss as palettes × tweaks
+
+The maintainer picked Swiss and said a theme picker saved to localStorage is
+coming, so the variations are split into two independent kinds:
+
+- **Palettes** — colors only, each designed as a light/dark pair: Swiss Red
+  (default), Zurich Blue, Signal Yellow, Duotone, Concrete, Paper, Mono.
+- **Tweaks** — structural axes, each with a default: typeface (Inter Tight ·
+  Akzidenz · Geist · Mono), titles (Bold · Hairline), density (Comfortable ·
+  Compact), cards (Rules · Boxed · Soft), page header (Plain · Masthead), nav
+  rail (Plain · Black).
+
+The picker contract is three things on `<html>`: `data-palette`, the `dark`
+class, and `data-tweak-<axis>` for each non-default tweak; the stored value is
+`{ palette, mode, tweaks }`. All tweak and palette rules live in
+`ui/src/themes/themes.css` under "Swiss picker" and are written against
+tokens, so they combine freely in both modes. The studio's Picker section
+drives exactly these attributes, and the app's own light/dark toggle swaps a
+palette's colors while keeping every tweak.
+
 ## Phases
 
 1. **Tokens + catalog + screenshots** (built). Behaviour-preserving
    tokenization, twenty themes, `lab:shots`, `lab:contrast`.
 2. **Studio + fake data** (built). Live editing, presets, export, record/replay.
-3. **Ship the pick** (waiting). Paste the chosen theme's tokens into
+3. **Ship Swiss and a picker** (next; the maintainer is building the
+   picker). Move the Swiss family rules, the picker rules and the seven
+   palettes' tokens from the lab into production CSS (`index.css` and a
+   picker stylesheet), load only the fonts the typeface axis offers, and apply
+   the stored choice in `index.html` before first paint. The original phase 3
+   text follows for the single-theme part.
+   **Ship the pick** (waiting). Paste the chosen theme's tokens into
    `index.css`, move its structural CSS from `themes.css` into the components
    or `index.css`, design its second mode, re-run `lab:contrast`, update the
    Design System section of `docs/ui-architecture.md`. Then decide whether the
