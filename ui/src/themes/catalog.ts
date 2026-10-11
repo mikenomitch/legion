@@ -16,6 +16,9 @@
  * `npm run lab:contrast` (scripts/lab-contrast.mjs) checks the numbers.
  */
 
+import { RIFF_THEMES } from './riffs.ts'
+import { monoStack, stack } from './stacks.ts'
+
 export type Hex = `#${string}`
 
 export type ThemeColors = {
@@ -51,14 +54,20 @@ export type DesignTheme = {
   sidebar?: Partial<ThemeColors>
   // Fine-tuning the theme studio exposes; unset means "leave the theme's own".
   baseSize?: number // root font size, px
-  title?: { size?: number; weight?: number; transform?: 'none' | 'uppercase'; tracking?: number } // rem, 100-900, em
+  title?: { size?: number; weight?: number; transform?: 'none' | 'uppercase' | 'lowercase'; tracking?: number } // rem, 100-900, em
   cardBorder?: number // px
   // Whose structural CSS (themes.css) to use; defaults to the theme's own id.
+  // Riffs are named `<family>-<riff>`, and family rules in themes.css match
+  // `[data-design|='<family>']`, so a riff inherits its family's structure.
   flourishes?: string
+  // A structural accent separate from the interactive one (Swiss's red
+  // square, Vexillum's banner red), as `--c-signal`. Never used for text.
+  signal?: Hex
+  // Round-two grouping: which family a theme belongs to and its role in it.
+  family?: 'command-post' | 'forge' | 'swiss'
+  role?: 'base' | 'counterpart' | 'riff'
 }
 
-const stack = (primary: string, fallback = 'system-ui, -apple-system, sans-serif') => `'${primary}', ${fallback}`
-const monoStack = (primary: string) => `'${primary}', ui-monospace, SFMono-Regular, Menlo, monospace`
 
 export const RADIUS_SCALES: Record<RadiusScale, Record<string, string>> = {
   none: { sm: '0', r: '0', md: '0', lg: '0', xl: '0', '2xl': '0', full: '0' },
@@ -141,6 +150,8 @@ export const DESIGN_THEMES: DesignTheme[] = [
   },
   {
     id: 'forge',
+    family: 'forge',
+    role: 'base',
     name: 'Forge',
     mode: 'dark',
     tagline: 'Charcoal and molten orange — heavy machinery, condensed type.',
@@ -287,6 +298,8 @@ export const DESIGN_THEMES: DesignTheme[] = [
   },
   {
     id: 'swiss',
+    family: 'swiss',
+    role: 'base',
     name: 'Swiss',
     mode: 'light',
     tagline: 'International Typographic Style: black, white, one red square.',
@@ -301,6 +314,7 @@ export const DESIGN_THEMES: DesignTheme[] = [
       ink: '#0a0a0a', muted: '#474747', faint: '#666666', accent: '#0a0a0a', accentStrong: '#0a0a0a',
     },
     status: { ok: '#00a651', warn: '#d68b00', danger: '#e10600', info: '#0062ff' },
+    signal: '#e10600',
   },
   {
     id: 'brutalist',
@@ -444,6 +458,8 @@ const COMMAND_POST_TYPE = {
 export const BASELINE_THEMES: DesignTheme[] = [
   {
     id: 'command-post',
+    family: 'command-post',
+    role: 'base',
     name: 'Command Post (shipped, light)',
     mode: 'light',
     tagline: 'The current look: warm stone neutrals with a brass accent.',
@@ -458,6 +474,8 @@ export const BASELINE_THEMES: DesignTheme[] = [
   },
   {
     id: 'command-post-dark',
+    family: 'command-post',
+    role: 'counterpart',
     name: 'Command Post (shipped, dark)',
     mode: 'dark',
     tagline: 'The current dark look: near-black stone with a gold accent.',
@@ -472,6 +490,6 @@ export const BASELINE_THEMES: DesignTheme[] = [
   },
 ]
 
-export const ALL_PRESETS = [...BASELINE_THEMES, ...DESIGN_THEMES]
+export const ALL_PRESETS = [...BASELINE_THEMES, ...DESIGN_THEMES, ...RIFF_THEMES]
 
 export const findTheme = (id: string | null | undefined) => ALL_PRESETS.find((theme) => theme.id === id)

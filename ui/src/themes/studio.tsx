@@ -9,6 +9,7 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, on, 
 import { createStore, reconcile, unwrap } from 'solid-js/store'
 import { render } from 'solid-js/web'
 import { ALL_PRESETS, BASELINE_THEMES, DESIGN_THEMES, type DesignTheme, type RadiusScale, type StatusColors, type ThemeColors } from './catalog'
+import { RIFF_THEMES } from './riffs'
 import { auditTheme, badgeContrast, contrast, type StatusName } from './contrast'
 import { applyTheme, exportCss, normalizeHex } from './engine'
 import { FONT_OPTIONS, type FontOption } from './fontOptions'
@@ -324,10 +325,17 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
     </label>
   )
 
+  // Round two first, by family (base, other mode, riffs), then round one.
+  const family = (name: NonNullable<DesignTheme['family']>) =>
+    [...BASELINE_THEMES, ...DESIGN_THEMES, ...RIFF_THEMES]
+      .filter((preset) => preset.family === name)
+      .sort((a, b) => ['base', 'counterpart', 'riff'].indexOf(a.role ?? 'riff') - ['base', 'counterpart', 'riff'].indexOf(b.role ?? 'riff'))
   const groups = createMemo(() => [
-    { label: 'Shipped', items: BASELINE_THEMES },
-    { label: 'Dark', items: DESIGN_THEMES.filter((preset) => preset.mode === 'dark') },
-    { label: 'Light', items: DESIGN_THEMES.filter((preset) => preset.mode === 'light') },
+    { label: 'Command Post family', items: family('command-post') },
+    { label: 'Forge family', items: family('forge') },
+    { label: 'Swiss family', items: family('swiss') },
+    { label: 'Round one · dark', items: DESIGN_THEMES.filter((preset) => preset.mode === 'dark' && !preset.family) },
+    { label: 'Round one · light', items: DESIGN_THEMES.filter((preset) => preset.mode === 'light' && !preset.family) },
     { label: 'My presets', items: saved() },
   ])
   const number = (preset: DesignTheme) => {
@@ -451,6 +459,11 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
                     />
                   )}
                 </For>
+                <ColorRow
+                  label="Signal (structural red/gold)"
+                  value={theme.signal ?? '#e10600'}
+                  onChange={(hex) => edit(() => setTheme('signal', hex as `#${string}`))}
+                />
                 <div class="checks">
                   <div>
                     <span>Primary button text on accent</span>
@@ -519,10 +532,10 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
                 <label class="field">
                   <span>Title case</span>
                   <span class="seg" role="group" aria-label="Title case">
-                    <For each={['none', 'uppercase'] as const}>
+                    <For each={['none', 'uppercase', 'lowercase'] as const}>
                       {(transform) => (
                         <button type="button" aria-pressed={(theme.title?.transform ?? 'none') === transform} onClick={() => setTitle({ transform })}>
-                          {transform === 'none' ? 'As written' : 'UPPERCASE'}
+                          {transform === 'none' ? 'As written' : transform === 'uppercase' ? 'UPPER' : 'lower'}
                         </button>
                       )}
                     </For>
@@ -569,7 +582,7 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
                     title="Structural CSS from src/themes/themes.css: title treatments, card headers, backgrounds, nav states"
                   >
                     <option value="custom">None (tokens only)</option>
-                    <For each={DESIGN_THEMES}>{(preset) => <option value={preset.id}>From {preset.name}</option>}</For>
+                    <For each={[...DESIGN_THEMES, ...RIFF_THEMES]}>{(preset) => <option value={preset.id}>From {preset.name}</option>}</For>
                   </select>
                 </label>
                 <p class="hint">Flourishes are each preset's structural extras (title treatment, card headers, backgrounds). Mix them with any palette.</p>

@@ -9,7 +9,7 @@
 import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { DESIGN_THEMES } from '../src/themes/catalog.ts'
+import { ALL_PRESETS } from '../src/themes/catalog.ts'
 
 const args = Object.fromEntries(
   process.argv.slice(2).reduce((pairs, value, index, all) => {
@@ -43,7 +43,7 @@ const pages = [
   { key: 'task', path: `/jobs/${encodeURIComponent(job)}/tasks/${encodeURIComponent(task)}`, ready: '[data-ui="page-title"]' },
 ]
 
-const themes = [{ id: 'current' }, ...DESIGN_THEMES].filter((theme) => !only || only.has(theme.id))
+const themes = [{ id: 'current' }, ...ALL_PRESETS].filter((theme) => !only || only.has(theme.id))
 
 const { chromium } = await loadPlaywright()
 const browser = await chromium.launch()

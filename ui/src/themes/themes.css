@@ -142,26 +142,26 @@
   background: linear-gradient(90deg, #ff4fd8, #c86bff);
 }
 
-/* ===== Forge ============================================================ */
-:root[data-design='forge'] [data-ui='page-title'],
-:root[data-design='forge'] [data-ui='brand'] {
+/* ===== Forge (and forge-* riffs) ======================================= */
+:root[data-design|='forge'] [data-ui='page-title'],
+:root[data-design|='forge'] [data-ui='brand'] {
   font-stretch: 72%;
   font-weight: 800;
   text-transform: uppercase;
   letter-spacing: 0.01em;
 }
-:root[data-design='forge'] [data-ui='page-title'] {
+:root[data-design|='forge'] [data-ui='page-title'] {
   font-size: 2.3rem;
   line-height: 1;
 }
-:root[data-design='forge'] [data-ui='page-header'] {
+:root[data-design|='forge'] [data-ui='page-header'] {
   border-bottom: 3px solid rgb(var(--c-brass));
   padding-bottom: 1rem;
 }
-:root[data-design='forge'] [data-ui='card-header'] {
+:root[data-design|='forge'] [data-ui='card-header'] {
   background: rgb(var(--c-surface2));
 }
-:root[data-design='forge'] [data-ui='card-title'] {
+:root[data-design|='forge'] [data-ui='card-title'] {
   font-family: var(--font-sans);
   font-stretch: 80%;
   font-size: 0.8125rem;
@@ -169,8 +169,8 @@
   color: rgb(var(--c-ink)) !important;
   letter-spacing: 0.1em;
 }
-:root[data-design='forge'] thead th,
-:root[data-design='forge'] .eyebrow {
+:root[data-design|='forge'] thead th,
+:root[data-design|='forge'] .eyebrow {
   font-stretch: 85%;
 }
 
@@ -371,57 +371,59 @@
   border-color: rgb(var(--c-line-strong));
 }
 
-/* ===== Swiss ============================================================ */
-:root[data-design='swiss'] [data-ui='page-title'] {
+/* ===== Swiss (and swiss-* riffs) ======================================= */
+/* Drawn from tokens (ink, canvas, signal) so Swiss Dark and the riffs get
+   the same structure in their own colors. */
+:root[data-design|='swiss'] [data-ui='page-title'] {
   font-size: 3rem;
   font-weight: 700;
   letter-spacing: -0.04em;
   line-height: 1.05;
 }
-:root[data-design='swiss'] [data-ui='page-header'] .eyebrow {
+:root[data-design|='swiss'] [data-ui='page-header'] .eyebrow {
   color: rgb(var(--c-ink));
   font-weight: 700;
 }
-:root[data-design='swiss'] [data-ui='page-header'] .eyebrow::before {
+:root[data-design|='swiss'] [data-ui='page-header'] .eyebrow::before {
   content: '';
   display: inline-block;
   width: 0.6rem;
   height: 0.6rem;
   margin-right: 0.5rem;
-  background: #e10600;
+  background: rgb(var(--c-signal, 225 6 0));
 }
-:root[data-design='swiss'] [data-ui='card'] {
+:root[data-design|='swiss'] [data-ui='card'] {
   border-width: 2px 0 0;
-  border-color: #0a0a0a;
+  border-color: rgb(var(--c-ink));
   box-shadow: none;
   background: transparent;
 }
-:root[data-design='swiss'] [data-ui='card-header'] {
+:root[data-design|='swiss'] [data-ui='card-header'] {
   padding-left: 0;
   padding-right: 0;
 }
-:root[data-design='swiss'] [data-ui='card-title'] {
+:root[data-design|='swiss'] [data-ui='card-title'] {
   text-transform: none;
   letter-spacing: -0.01em;
   font-size: 1rem;
   font-weight: 700;
   color: rgb(var(--c-ink)) !important;
 }
-:root[data-design='swiss'] thead th {
+:root[data-design|='swiss'] thead th {
   color: rgb(var(--c-ink));
   font-weight: 700;
 }
-:root[data-design='swiss'] [data-ui='nav-item'][data-active] {
-  background: #0a0a0a;
-  color: #ffffff;
+:root[data-design|='swiss'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-ink));
+  color: rgb(var(--c-canvas));
 }
-:root[data-design='swiss'] [data-ui='nav-item'][data-active] svg {
-  color: #ffffff;
+:root[data-design|='swiss'] [data-ui='nav-item'][data-active] svg {
+  color: rgb(var(--c-canvas));
 }
-:root[data-design='swiss'] [data-ui='nav-item'] > span:first-child {
-  background: #e10600;
+:root[data-design|='swiss'] [data-ui='nav-item'] > span:first-child {
+  background: rgb(var(--c-signal, 225 6 0));
 }
-:root[data-design='swiss'] [data-ui='nav-heading'] {
+:root[data-design|='swiss'] [data-ui='nav-heading'] {
   color: rgb(var(--c-ink));
   font-weight: 700;
 }
@@ -660,4 +662,105 @@
 }
 :root[data-design='hi-vis'] [data-ui='nav-item'][data-active] svg {
   color: #121212;
+}
+
+/* ===== Round two: Command Post riffs ==================================== */
+:root[data-design='command-post-vexillum'] [data-ui='page-header'] {
+  border-bottom: 2px solid rgb(var(--c-signal));
+  padding-bottom: 0.9rem;
+}
+:root[data-design='command-post-vexillum'] [data-ui='card'] {
+  border-top: 2px solid rgb(var(--c-signal));
+}
+:root[data-design='command-post-vexillum'] [data-ui='nav-item'] > span:first-child {
+  background: rgb(var(--c-signal));
+}
+
+:root[data-design='command-post-field-desk'] .eyebrow {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+:root[data-design='command-post-field-desk'] [data-ui='main'] td {
+  padding-top: 0.3rem;
+  padding-bottom: 0.3rem;
+}
+:root[data-design='command-post-field-desk'] [data-ui='card-header'] {
+  min-height: 36px;
+  padding-top: 0.3rem;
+  padding-bottom: 0.3rem;
+}
+:root[data-design='command-post-field-desk'] [data-ui='page-header'] {
+  margin-bottom: 0.9rem;
+}
+
+/* ===== Round two: Forge riffs (on top of the Forge family rules) ======== */
+:root[data-design='forge-crucible'] body {
+  background-image:
+    radial-gradient(ellipse 70% 45% at 50% -5%, rgb(255 90 31 / 0.1), transparent),
+    radial-gradient(ellipse 60% 40% at 50% 110%, rgb(255 90 31 / 0.06), transparent);
+  background-attachment: fixed;
+}
+:root[data-design='forge-crucible'] [data-ui='page-title'] {
+  text-shadow: 0 0 22px rgb(255 90 31 / 0.4);
+}
+:root[data-design='forge-crucible'] [data-ui='page-header'] {
+  border-bottom: 3px solid transparent;
+  border-image: linear-gradient(90deg, #ff5a1f, rgb(255 90 31 / 0.12)) 1;
+}
+
+:root[data-design='forge-shipyard'] [data-ui='page-title'],
+:root[data-design='forge-shipyard'] [data-ui='brand'] {
+  font-family: var(--font-display);
+  letter-spacing: 0.02em;
+}
+:root[data-design='forge-shipyard'] [data-ui='card-title'] {
+  font-family: var(--font-display);
+  font-size: 0.95rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+/* ===== Round two: Swiss riffs (on top of the Swiss family rules) ======== */
+:root[data-design='swiss-neue-grafik'] [data-ui='main'] {
+  background-image: repeating-linear-gradient(90deg, rgb(var(--c-signal) / 0.07) 0 1px, transparent 1px calc(100% / 12));
+}
+:root[data-design='swiss-neue-grafik'] [data-ui='card'] {
+  border-color: rgb(var(--c-signal));
+}
+
+:root[data-design='swiss-zurich'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-signal));
+  color: #ffffff;
+}
+:root[data-design='swiss-zurich'] [data-ui='nav-item'][data-active] svg {
+  color: #ffffff;
+}
+
+/* The rail is red, so the active item goes black and the marker white. */
+:root[data-design='swiss-poster'] [data-ui='nav-item'][data-active] {
+  background: #0a0a0a;
+  color: #ffffff;
+}
+:root[data-design='swiss-poster'] [data-ui='nav-item'][data-active] svg {
+  color: #ffffff;
+}
+:root[data-design='swiss-poster'] [data-ui='nav-item'] > span:first-child {
+  background: #ffffff;
+}
+
+:root[data-design='swiss-basel'] [data-ui='main'] table,
+:root[data-design='swiss-basel'] [data-ui='badge'] {
+  font-family: var(--font-mono);
+}
+:root[data-design='swiss-basel'] [data-ui='main'] table {
+  font-size: 0.8125rem;
+}
+:root[data-design='swiss-basel'] thead th,
+:root[data-design='swiss-basel'] [data-ui='badge'],
+:root[data-design='swiss-basel'] [data-ui='card-title'],
+:root[data-design='swiss-basel'] [data-ui='nav-heading'],
+:root[data-design='swiss-basel'] .eyebrow {
+  text-transform: lowercase;
+  letter-spacing: 0;
 }

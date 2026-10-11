@@ -4,10 +4,12 @@
 
 **Status: IN EXECUTION.** Phases 1 and 2 are built on
 `claude/ui-design-variations-ibx1qw`: the tokenized design system, twenty
-candidate themes, the dev-only theme studio, and recorded fake data. Phase 3
-(ship the chosen theme as the default) waits on a pick. Deliberately deferred:
-a user-facing theme picker in production builds, and second-mode palettes for
-the candidates (each is designed for one mode).
+candidate themes, the dev-only theme studio, and recorded fake data. Round two
+narrowed to three finalists — Command Post, Forge and Swiss — each with its
+opposite mode and five riffs (`ui/src/themes/riffs.ts`). Phase 3 (ship the
+chosen theme as the default) waits on a pick. Deliberately deferred: a
+user-facing theme picker in production builds, and opposite-mode palettes for
+the riffs (only the three finalists have both modes).
 
 ## Problem
 
@@ -100,6 +102,27 @@ npm run lab:record & npm run lab:crawl
 npm run lab:shots -- --out ../.lab-shots
 npm run lab:contrast
 ```
+
+## Round two: finalists, opposite modes, riffs
+
+The maintainer shortlisted Command Post, Forge and Swiss. Each now has:
+
+- **Its opposite mode.** Command Post's is the shipped dark theme, unchanged;
+  Forge gets Forge Light; Swiss gets Swiss Dark.
+- **Five riffs**, each changing one or two things on purpose so a reaction
+  points at a choice: Command Post → Vexillum (red accent, gold structure),
+  Marble (cool neutrals, soft depth), Brass Rail (dark rail on light), Field
+  Desk (compact density), Lamplight (warm-brown dark). Forge → Foundry (blue
+  steel), Crucible (glow), Oxide (rust), Anvil (neutral graphite, Hubot Sans),
+  Shipyard (Big Shoulders, amber). Swiss → Neue Grafik (visible grid), Zurich
+  Blue (cobalt signal), Poster (red rail, 64px titles), Lausanne (warm paper),
+  Basel Mono (lowercase titles, mono tables).
+
+Riffs are named `<family>-<riff>` and inherit their family's structural CSS
+through `[data-design|='<family>']`; Swiss's structure was rewritten in terms
+of `--c-ink`, `--c-canvas` and a new `--c-signal` token so its dark mode and
+riffs get it for free. All thirty-nine presets are in the studio, grouped by
+family.
 
 ## Phases
 

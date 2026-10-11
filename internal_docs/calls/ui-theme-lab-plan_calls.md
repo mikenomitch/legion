@@ -69,7 +69,41 @@ the lab pins the app to that mode.
 **Why.** Twenty strong directions beat twenty pairs of half-considered ones;
 the second mode is cheap once the direction is fixed.
 
-## 5. Fake data is recorded real traffic, stored as proto3 JSON
+## 5. "A dark/light mode for each" means the three finalists, and Command Post's is the shipped dark
+
+**Call.** Round two adds the opposite mode for Command Post, Forge and Swiss —
+not for each of the fifteen riffs. Command Post's opposite (dark) already
+ships, so it is shown unchanged; Forge Light and Swiss Dark are new.
+
+**Alternatives.** Opposite modes for all fifteen riffs (thirty more
+palettes); or a redesigned Command Post dark.
+
+**Trade-off.** A riff picked in round three still needs its other mode
+designed, and the shipped dark is not re-examined.
+
+**Why.** "Each" in the request most naturally refers to "these" three. Forty
+more palettes before the direction is chosen would spend effort on themes that
+will be discarded (simplicity/ease). Showing the shipped dark untouched keeps it
+an honest baseline.
+
+## 6. Each riff changes one or two things on purpose
+
+**Call.** Every riff keeps its family's structure and moves one or two
+variables: Command Post's accent, temperature, frame, density, darkness;
+Forge's metal, heat and type; Swiss's signal, grid, volume and type. The
+gallery names what changed on every card.
+
+**Alternative.** Five free reinterpretations per family, as in round one.
+
+**Trade-off.** Some riffs are subtle side by side (Marble vs Command Post),
+and combinations (Forge's type with Oxide's palette) are not shown — the
+studio exists for those.
+
+**Why.** Isolated changes make the feedback attributable: liking Lausanne
+over Swiss says "softer paper", not just "this one". It also makes the pick
+cheap to compose in the studio.
+
+## 7. Fake data is recorded real traffic, stored as proto3 JSON
 
 **Call.** The dev server records the manager's unary gRPC-web responses into
 `ui/dev/fixtures/<Method>.json` (decoded with the generated descriptors) and
@@ -86,7 +120,7 @@ mutating call fails with an explicit message), and streams are not recorded.
 JSON keeps it editable; doing it in the dev server keeps app code untouched.
 The seed has two workers and no running tasks, too thin to judge a theme.
 
-## 6. Structural theme CSS hangs off `data-ui` hooks with attribute selectors
+## 8. Structural theme CSS hangs off `data-ui` hooks with attribute selectors
 
 **Call.** `themes.css` uses `:root[data-design='x'] [data-ui='…']` rules; the
 studio's tweaks use `:root[data-design]` and win by source order.
@@ -99,7 +133,23 @@ or a higher-specificity rule could override a theme.
 **Why.** It keeps every component unaware of themes, which is what makes the
 lab deletable.
 
-## 7. Screenshot data came from a real local cluster, with two local workarounds
+## 9. Riffs inherit by id prefix, and Swiss's structure is drawn from tokens
+
+**Call.** Riff ids are `<family>-<riff>` and family rules match
+`:root[data-design|='<family>']`. Swiss's rules, which hard-coded black,
+white and red, now use `--c-ink`, `--c-canvas` and a new optional
+`--c-signal`; Vexillum and Zurich Blue vary the signal the same way.
+
+**Alternative.** Copy the family's rules per riff, or add a second
+`data-design-family` attribute.
+
+**Trade-off.** Naming is now load-bearing: a round-one theme whose id began
+with `forge-` or `swiss-` would silently pick up those rules.
+
+**Why.** One rule set per family keeps riffs to a palette plus their single
+structural move, and the token rewrite is what makes Swiss Dark free.
+
+## 10. Screenshot data came from a real local cluster, with two local workarounds
 
 **Call.** The gallery shots come from a manager plus seven named workers
 (three pools; one drained, one lost) and four jobs, all on one host. Two
@@ -120,7 +170,12 @@ An attempt at a persistently unhealthy allocation on the Job page was dropped:
 Legion correctly reaps it within two minutes, so it could not stay consistent
 across a 2.5-minute shoot.
 
-## 8. The studio renders in a shadow root
+Round two was shot on the recorded data (`npm run lab` with the Fake source)
+rather than the live cluster, so every shot of all twenty-one themes shows
+byte-identical data; the recording was taken from the same cluster right
+after round one.
+
+## 11. The studio renders in a shadow root
 
 **Call.** The panel is a Solid tree inside a shadow root with its own CSS.
 

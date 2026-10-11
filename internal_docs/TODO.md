@@ -2259,7 +2259,9 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 
 From [ui-theme-lab-plan.md](plans/ui-theme-lab-plan.md):
 
-- [ ] Pick a theme from the lab and ship it as the default (plan phase 3):
+- [ ] Pick a theme from the lab and ship it as the default (plan phase 3;
+      round two narrowed to Command Post, Forge and Swiss with five riffs
+      each — a riff that wins needs its opposite mode designed):
       paste its tokens into `index.css`, fold its `themes.css` rules into the
       components, design its second mode, re-run `npm run lab:contrast`, and
       update the Design System section of `docs/ui-architecture.md`. Then
@@ -3099,7 +3101,8 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       twenty candidate themes; a dev-only theme studio (`npm run lab`) with
       presets, live contrast, CSS/JSON export and saved presets; recorded
       fake data (`lab:record`, `lab:crawl`) served when no manager answers;
-      `lab:shots` and `lab:contrast`
+      `lab:shots` and `lab:contrast`. Round two (2026-10-11): Forge Light,
+      Swiss Dark and five riffs each for Command Post, Forge and Swiss
       ([plan](plans/ui-theme-lab-plan.md),
       [calls](calls/ui-theme-lab-plan_calls.md),
       [docs](../docs/ui-architecture.md#design-lab-and-theme-studio-dev-server-only)).

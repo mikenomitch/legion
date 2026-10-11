@@ -505,6 +505,12 @@ default only in `npm run lab`.
   entry.
 - `?design=<id>` opens a preset (`?design=current` is the shipped look);
   `&shot=1` hides the studio for screenshots.
+- Presets live in `catalog.ts` (round one) and `riffs.ts` (round two:
+  Command Post, Forge and Swiss, each with its opposite mode and five riffs).
+  A riff's id is `<family>-<riff>`, and `themes.css` matches family rules with
+  `[data-design|='<family>']`, so riffs inherit their family's structure. A
+  theme may set a `signal` color (`--c-signal`) for structural details such as
+  Swiss's red square; it is never used for text.
 - **Data.** In `npm run lab` the dev server answers the UI's manager calls
   itself. **Auto** (the default) proxies to the manager when it accepts a
   connection and serves recorded responses when it does not; **Live** and

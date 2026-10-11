@@ -53,6 +53,7 @@ export const tokenVars = (theme: DesignTheme): Record<string, string> => {
     ...(theme.shadow ? { '--shadow-card': theme.shadow.card, '--shadow-pop': theme.shadow.pop } : {}),
     ...colorVars(theme.colors),
     ...statusVars(theme.status),
+    ...(theme.signal ? { '--c-signal': triplet(theme.signal) } : {}),
   }
 }
 
