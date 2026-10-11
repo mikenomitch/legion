@@ -622,7 +622,7 @@ which already has the node id:
 | `sandbox`, no `config.network` | `sandbox.vmm` is `firecracker` or `cloud-hypervisor`, and `hypervisor` is not `dev` | `gated` |
 | `sandbox`, no `config.network` | a dev backend (Apple `container`, Linux `dev`) | `host`, with a warning (§6.6) |
 | `sandbox` with `config.network` set (`none` or `tap`) | any | `host` |
-| `exec`, `container` | any | `host`, as today |
+| `exec`, `container` | any | `host`, as today. Superseded for `container`: the [worker-plane auth plan](worker-plane-auth-plan.md) Phase 3 makes Linux containers gated by default |
 
 An explicit `network.mode = "gated"` is never downgraded. On a dev backend
 it still fails at start, which is the guarantee a security admin gets by

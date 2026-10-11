@@ -553,7 +553,7 @@ certificate revocation. The 24-hour lifetime takes its place.
 | `mode` | Meaning | Default for |
 | --- | --- | --- |
 | `host` | host networking. Policy is cooperative (proxy env vars, upstreams, the resolver) | `container`, `exec`, `sandbox` |
-| `gated` | the workload's network namespace holds loopback and the datapath only. It cannot be bypassed on Linux for `container` and `exec`. For a `sandbox`, it is a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | — |
+| `gated` | the workload's network namespace holds loopback and the datapath only, so a `container` or non-root `exec` task can't open a socket around it. It is not yet a full boundary: the egress proxy dials from the host and does not refuse loopback, link-local, or the node's own addresses, and CIDR rules only match IP literals, so a hostname reaches a denied range. A root `exec` task can also leave the namespace. For a `sandbox`, it is a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | — |
 | `auto` | `host` for every runtime | — |
 | `bridge`, `cni/<name>` | reserved for the datapath plugin, rejected at submit | — |
 
@@ -897,12 +897,16 @@ This section lists what that covers and what it does not.
   header), `dlp`, the `http` traffic block, and the external `authz` and
   `proxy` hops on every path (upstream splices, HTTP mode, the gated egress
   proxy, ingress).
-- **Egress is cooperative in `host` mode and cannot be bypassed in `gated`
-  mode.** In `host` mode, policy applies to traffic that goes through an
+- **Egress is cooperative in `host` mode, and `gated` mode is not yet a full
+  boundary.** In `host` mode, policy applies to traffic that goes through an
   upstream and to names resolved through the allocation's resolver. A
   process that dials a raw address bypasses it. `mode = "gated"` (Linux,
   `container` and `exec`) closes that gap, because the namespace has no
-  route except Legion's listeners. On macOS, egress stays cooperative, and
+  route except Legion's listeners. But the egress proxy dials from the host
+  and does not refuse loopback, link-local (including the cloud metadata
+  service), or the node's own addresses, CIDR rules match only IP literals
+  (a hostname reaches a denied range), and a root `exec` task can leave the
+  namespace. Don't rely on `gated` to contain untrusted code yet. On macOS, egress stays cooperative, and
   there are no VIPs, per-allocation resolvers, or gated namespaces. A gated
   `sandbox` is captured over vsock. That path is implemented and
   unit-tested but not exercised on a real VMM in CI. `auto` resolves to
