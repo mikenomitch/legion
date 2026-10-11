@@ -2012,9 +2012,14 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           make-room round with real sandbox memory captures, and a `snapshots`
           budget filled by real checkpoints. Tested with the heartbeat
           standing in for the worker on macOS only.
-    - [ ] Clean `scheduler_bench` pass for the `snapshot_budget` and
-          `restore` groups. One noisy run on a busy laptop is in the Track 2
-          report. The filter adds no per-candidate work when no node is short.
+    - [x] `scheduler_bench` A/B against main, two rounds in opposite order
+          ([PR #15](https://github.com/mikenomitch/legion/pull/15)).
+          Candidate construction and plan-only are flat within noise.
+    - [ ] Plan-and-apply is about 8% slower than main (`plan_under_fill`
+          plan_and_apply +6 to +11%, `scheduler_speed` 1k×1k +7 to +13%, both
+          rounds), while plan-only is flat, so the cost is in the apply
+          transaction. Profile it: likely the extra allocation columns and
+          the oversubscription and held-share bookkeeping per placement.
     - [ ] The budget filter checks one checkpoint per placement against the
           last report, so a plan placing many memory-suspend instances can
           still overfill one node's budget. Count checkpoints the plan itself
