@@ -8,8 +8,9 @@ reorder or cancel phases. Deliberately deferred and named: cell sharding of
 promoted instances (Phase 7, built only past a measured trigger), a
 pluggable external session registry (rejected as a default, §4), sub-VM
 isolation tiers inside Legion's own runtimes (Phase 6 ships the seam, not a
-runtime), and cross-cluster session routing (owned by
-[multi-cluster-federation-plan.md](multi-cluster-federation-plan.md)).
+runtime), cross-cluster session routing (owned by
+[multi-cluster-federation-plan.md](multi-cluster-federation-plan.md)), and
+the public exec gateway tier (Phase E5, after direct exec proves out).
 
 **Relationship to existing plans.** This plan consumes four shipped or
 in-flight plans and changes none of their guarantees for the workloads
@@ -28,8 +29,14 @@ they already serve:
   checkpoints with an identity envelope, and the density phase executes
   part of that Phase 8.
 - [gated-sandbox-checkpoints-plan.md](gated-sandbox-checkpoints-plan.md)
-  makes gated networking the sandbox default with memory checkpoints. §6.9
-  says what a session changes in the datapath's keying.
+  makes gated networking the sandbox default with memory checkpoints, and
+  ships the guest agent and the vsock restore override. §6.9 says what a
+  session changes in the datapath's keying. Exec into microVMs (§6.12)
+  builds on that plan's Phases 1 and 2 and shares host-initiated vsock with
+  its Phase 5.
+- [exec-and-actions-plan.md](exec-and-actions-plan.md) owns `legion exec`,
+  actions, and their ACLs. §6.12 adds the microVM runtime under it, and
+  §6.13 adds a second transport beside the manager proxy.
 
 ---
 
@@ -70,10 +77,23 @@ memory pages, Phase 5), with a seam for lighter isolation tiers inside an
 envelope later (Phase 6). Cell sharding is built only if promoted
 instances outgrow one raft group (Phase 7).
 
-Eight phases, each shippable alone (§9). Phase 0 measures. Phase 1 is
-group commit and write trimming inside today's model. Phases 2 to 4 move
+A sandbox that cannot be entered is not much of a sandbox, and at session
+scale the manager cannot carry every shell. Two exec changes ride along:
+
+- **Exec into Linux microVMs over vsock** (§6.12). Every microVM gets a
+  vsock device and the guest agent, and `legion exec`, actions, and the UI
+  terminal work unchanged.
+- **Exec without the manager in the data path** (§6.13). A manager, or a
+  platform with a delegated key, mints a short-lived signed exec ticket
+  with no raft write, and the client connects to the worker directly. The
+  worker's listener, which today has no authentication at all, verifies
+  tickets on every session first.
+
+Eight session phases, each shippable alone (§9). Phase 0 measures. Phase 1
+is group commit and write trimming inside today's model. Phases 2 to 4 move
 history, idle state, and then running state off raft. Phases 5 to 7 are
-density and the conditional sharding step.
+density and the conditional sharding step. A separate exec track (E1 to E5)
+is independent of session mode and can ship first.
 
 ---
 
@@ -112,6 +132,15 @@ memory but still holds an instance row, a snapshot row, and optionally a
 held `suspended` allocation row for its reserve (`docs/suspend-and-resume.md`,
 "Holding a share of the reservation"). Idle sessions are the large
 majority on an agent platform, so they set the row count.
+
+**Getting a shell into a sandbox.** On Linux, a microVM sandbox takes no
+exec sessions at all (`src/task_plugins/sandbox.rs:1551`). Only macOS dev
+mode does. An agent platform whose agents run tools inside the sandbox
+has to ship its own in-guest daemon and its own route to it, which is what
+E2B's `envd` is. And where exec does work, every byte of every session
+streams through a manager (`docs/exec-and-actions.md`, "How it works").
+Ten thousand concurrent agent shells is ten thousand long-lived proxied
+streams on the same three processes that run raft.
 
 What a platform builder does instead today is what E2B did on Nomad and
 Google did on Kubernetes: build a session layer above the scheduler with
@@ -245,6 +274,92 @@ intent, capacity, and placement summaries.
   - **Take:** these are worker and runtime work. The orchestrator only
     needs snapshot identity, location, and affinity, which Legion has.
 
+### Exec at scale
+
+Nobody who runs sandboxes at scale keeps every shell byte on the control
+plane, and the one system that tried redirects for exec abandoned them for
+security reasons.
+
+- **Modal** is the closest precedent for direct exec. The legacy path runs
+  through the control plane (`ContainerExec`, `ContainerExecGetOutput`).
+  The newer `TaskGetCommandRouterAccess` returns a JWT and a URL "for
+  direct access to a task command router running on the modal-worker",
+  and the V2 reply adds the worker's IP, so the client connects to it
+  while using the URL's hostname for TLS SNI. Create and restore replies
+  embed that access, so there is no extra round trip. The worker-side
+  service makes exec idempotent with a client `exec_id` and stdio
+  resumable by offset, and the client re-fetches its JWT on
+  `UNAUTHENTICATED`
+  ([api.proto](https://github.com/modal-labs/modal-client/blob/main/modal_proto/api.proto),
+  [task_command_router.proto](https://github.com/modal-labs/modal-client/blob/main/modal_proto/task_command_router.proto),
+  [sandbox exec](https://modal.com/docs/guide/sandbox-spawn)).
+  - **Take:** a control-plane-signed, short-lived token for one worker,
+    and an address the client dials directly. **Defer:** offset-resumable
+    stdio, which is the reattach Legion has never had (non-goal).
+- **E2B** runs `envd`, a Go daemon inside each Firecracker VM, on port
+  49983 with connect-rpc `process` and `filesystem` services, including a
+  pty mode and a reattach call
+  ([envd](https://github.com/e2b-dev/infra/tree/main/packages/envd)).
+  The SDK addresses `49983-<sandboxId>.e2b.app`, and a client proxy looks
+  the sandbox up and forwards to its node
+  ([client-proxy](https://github.com/e2b-dev/infra/tree/main/packages/client-proxy)).
+  Every call carries a per-sandbox `X-Access-Token`. Without it, "anyone
+  with a sandbox ID" can control the sandbox
+  ([secured access](https://e2b.dev/docs/sandbox/secured-access)).
+  - **Take:** an in-guest agent is the norm, and a stateless edge can route
+    on the name alone. **Reject:** one long-lived bearer secret per
+    sandbox. A Legion ticket is good for one session on one node.
+- **Fly.io** splits the two cases. `fly ssh console` reaches `hallpass`, a
+  small SSH server in each VM bound to the private 6PN address over
+  WireGuard. It trusts a per-org SSH CA, and the API signs short-lived
+  user certificates
+  ([blog](https://fly.io/blog/ssh-and-user-mode-ip-wireguard/)).
+  `fly machine exec` is synchronous request and response through the
+  Machines API ([docs](https://docs.fly.io/flyctl/machine-exec)).
+  - **Take:** a target that trusts a CA signature needs no per-user state
+    and no call home per session.
+- **Kubernetes** never took the API server out of the exec data path.
+  `kubectl exec` goes client → API server → kubelet, now over WebSockets
+  ([KEP-4006](https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/4006-transition-spdy-to-websockets/README.md)).
+  `--redirect-container-streaming` let the API server follow a redirect
+  to the CRI streaming server. It opened an SSRF hole (CVE-2018-1002102),
+  was deprecated in 1.18, and its gate was removed in 1.24. The KEP called
+  the gain "marginal", because the API server still proxied
+  ([KEP-1558](https://www.kubernetes.dev/resources/keps/1558/)). KEP-4006
+  also had to close a gap where a WebSocket upgrade, being a GET, let
+  get-only roles exec.
+  - **Take:** the credential the client presents to the worker must be
+    what authorizes the session. A redirect the server follows is not.
+    Authorize the exec verb, never the transport.
+- **Cloudflare** routes the Sandbox SDK through a Worker and the sandbox's
+  Durable Object, which authenticates and forwards to the container
+  ([architecture](https://developers.cloudflare.com/sandbox/concepts/architecture/)).
+  Preview URLs carry a random token in the hostname
+  ([preview URLs](https://developers.cloudflare.com/sandbox/concepts/preview-urls/)).
+  For SSH, Access issues short-lived certificates from a Cloudflare CA
+  that servers trust in `TrustedUserCAKeys`
+  ([infrastructure access](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/use-cases/ssh/ssh-infrastructure-access/)).
+  - **Take:** the gateway tier (E5) is Cloudflare's shape, a stateless
+    router in front of a target that verifies on its own.
+- **Kata Containers** runs `kata-agent` in the guest and drives it with
+  ttRPC over vsock: `ExecProcess`, `WriteStdin`, `ReadStdout`,
+  `TtyWinResize`, `SignalProcess`, `WaitProcess`
+  ([agent.proto](https://github.com/kata-containers/kata-containers/blob/main/src/libs/protocols/protos/agent.proto)).
+  Firecracker's host side is a Unix socket where the host writes
+  `CONNECT <port>` and reads `OK <port>`
+  ([vsock.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md)).
+  - **Take:** vsock to a guest agent is the standard host-to-guest exec
+    channel, and the agent is untrusted plumbing.
+- **Teleport** issues certificates that live minutes to hours, and servers
+  check only the CA signature and expiry, with session locks for urgent
+  revocation ([architecture](https://goteleport.com/docs/reference/architecture/authentication/)).
+  [RFC 9449 §11.1](https://www.rfc-editor.org/rfc/rfc9449.html#section-11.1)
+  recommends a `jti` cache held for the proof's short window, and admits
+  that strict single use across servers with no shared state is not
+  feasible.
+  - **Take:** bind each ticket to one worker, so a local `jti` cache is
+    strict single use without shared state.
+
 ## 3. Jobs to be done, by persona
 
 **Platform builder (the sandbox service)**
@@ -258,6 +373,9 @@ intent, capacity, and placement summaries.
 - When a session matters, like a long-running agent with a name, I want to
   pin it down as a durable, uniquely named thing, so my own code can rely
   on that name.
+- When my agent needs to run a tool inside its sandbox, I want to run the
+  command and stream its output from my own backend straight to the
+  machine, so my control plane's capacity is not my agents' I/O budget.
 
 **Cluster operator**
 - When the session count grows by 100×, I want the managers' disk, memory,
@@ -271,11 +389,17 @@ intent, capacity, and placement summaries.
   I want every session still tied to a job, a node, and a credential I
   issued, so an ACL or identity decision never rests on something a node
   made up.
+- When I let clients open shells on worker machines directly, I want each
+  permission to be narrow, short-lived, and good for one shell, so a leaked
+  one is worth almost nothing.
 
 **On-call responder**
 - When a user says "my sandbox vanished", I want to find where it ran,
   why it stopped, and whether it was suspended, from one command, so I'm
   not grepping node logs.
+- When a user says "my agent is stuck", I want a shell inside their
+  microVM with the same command I use for containers, so I can look before
+  I restart it.
 
 **Autonomous agent**
 - When I create a session and get an id back, I want to know whether it is
@@ -317,11 +441,15 @@ this plan is that sessions start fast and come back.
   write nothing to raft (Phase 4).
 - Keep every guarantee of `slot` and `keyed` instances, with one stated
   exception: Phase 2 makes server-minted keyed ids unique by randomness
-  instead of by tombstone (calls entry 3). State precisely which
+  instead of by tombstone (calls entry 4). State precisely which
   guarantees the new mode weakens (§6.7).
 - Keep one binary and no new required dependency. The content store a
   worker already uses for published checkpoints is the only external
   storage.
+- Make `legion exec`, actions, and the UI terminal work on Linux microVM
+  sandboxes, with no change to those surfaces (Phase E1).
+- Authenticate every exec session at the worker, and let exec bytes skip
+  the manager on request, with no raft write per session (Phases E2, E3).
 
 **Non-goals**
 - **Billions of running sessions in one cluster.** That is about 10 PB of
@@ -330,13 +458,18 @@ this plan is that sessions start fast and come back.
   more through federation.
 - **A pluggable external session registry** (DynamoDB, FoundationDB,
   Spanner) as a default or a Phase. It turns a self-hosted scheduler into
-  a distributed system with a cloud dependency (calls entry 8).
+  a distributed system with a cloud dependency (calls entry 12).
 - **Gossip.** Managers already receive every heartbeat.
 - **Changing `keyed` or `slot` semantics.** Existing jobs keep exact
   listing, tombstones, and at-most-one.
 - **New placement intelligence.** Envelopes are placed by today's
   scheduler. The session router is first fit within envelopes.
 - **Cross-cluster routing of sessions.** Federation owns it.
+- **Detach and reattach of exec sessions**, file transfer, and port
+  forwarding over exec. Sessions still end when the connection closes.
+- **Public internet exec without a gateway.** Direct exec targets callers
+  that can already route to workers. Browsers on the public internet wait
+  for the gateway tier (E5).
 
 ## 5. Background: what exists today
 
@@ -460,7 +593,16 @@ index, warms, and the checkpoint disk budget are already manager-memory
 soft state. Phase 8 (wake on connect, UFFD lazy restore, diff snapshots)
 is deferred.
 
-### 5.6 The worker's local state
+### 5.6 Exec today
+
+The exec plumbing is runtime-agnostic and complete above the runtime:
+`ExecSupport` and `ExecSession` in `src/task_plugins/`, `Worker.ExecTask`
+in `src/worker/exec.rs`, the `Manager.ExecAllocation` proxy in
+`src/manager/exec.rs`, and the UI's WebSocket bridge in
+`src/manager/exec_ws.rs`. The microVM runtime reports no support, and the
+worker listener has no authentication. §6.12 and §6.13 cite each piece.
+
+### 5.7 The worker's local state
 
 `WorkerStateStore` is a JSON file rewritten in full on every save
 (`src/worker/state.rs:151`). It holds allocations, task configs, and PIDs
@@ -500,11 +642,11 @@ This plan adopts it with two amendments, each a judgement call:
   invisible to the scheduler. A session-mode task reserves capacity per
   node as an ordinary allocation (Borg's alloc), and sessions fill it.
   The scheduler, quotas, preemption, and `node usage` keep working
-  unchanged (calls entry 5).
+  unchanged (calls entry 7).
 - **Idle manifests land before ephemeral running sessions.** Phase 3 works
   for today's keyed instances with `durability = "store"`, and idle
   sessions are the larger count. It ships value without a new mode
-  (calls entry 4).
+  (calls entry 6).
 
 ### 6.2 A third instance mode: `session`
 
@@ -607,7 +749,7 @@ the boot ticket stands in for the lease: the ticket names the job, task,
 pool, and an instance prefix. The manager records the pair (ticket `jti`,
 session id) in the soft index on the next heartbeat. Ticket single-use
 enforcement stays as it is for tickets with `uses = 1`. A prefix ticket
-with many uses is the session-mode shape and spends once (calls entry 10).
+with many uses is the session-mode shape and spends once (calls entry 14).
 
 The lease is a capability document. It proves which credential
 authorized a session, for identity issuance and audit, and it never
@@ -730,6 +872,7 @@ allocation. A promoted instance cannot be demoted.
 | Audit and events | Replicated journal (~10k) | Live tail plus node log shipped to the bucket | Replicated journal |
 | Survives node loss while running | Rescheduled | Lost, unless suspended | Rescheduled |
 | Survives manager failover | Yes | Yes (sessions keep running, index rebuilds) | Yes |
+| Exec (E1 to E3) | Proxied, ACL re-checked every 30 s, or a direct ticket naming the allocation | Direct ticket naming the envelope and session id, resolved through the index. Proxied exec also works | As keyed |
 
 **Idempotency without raft.** A create with an `idempotency_key` derives
 its session id as `HMAC(cluster key, accessor id ‖ job ‖ key)`, truncated
@@ -776,7 +919,7 @@ allocations placed on it. With edge-started sessions it can mint tokens
 for any session id it invents under a job its ticket names. That is the
 same blast radius edge boot already accepted ("runs anything a live ticket
 names", `docs/edge-boot.md`), applied to identity. Promoted sessions keep
-today's boundary. Calls entry 12 records the trade.
+today's boundary. Calls entry 16 records the trade.
 
 ### 6.9 Composition with gated networking and suspend
 
@@ -833,6 +976,224 @@ trigger is measured, not guessed: build it when the Phase 0 harness shows
 the scheduler lane above 70% busy from instance writes at the target
 rate, or the store above 4 GiB from instance rows.
 
+### 6.12 Exec into microVM sandboxes over vsock (Phase E1)
+
+**Today.** `legion exec` and actions work on `exec` and `container` tasks
+and on macOS dev-mode sandboxes. On Linux, a microVM reports no exec
+support: `exec_support()` returns false because "exec into a microVM needs
+a vsock guest agent (deferred)" (`src/task_plugins/sandbox.rs:1551`), and
+the public table shows `sandbox (microVM)` without exec or tty
+(`docs/exec-and-actions.md`, "Which task runtimes support exec"). The
+plumbing around the runtime is complete and runtime-agnostic:
+
+- `TaskPlugin::exec_support()` returns `ExecSupport { exec, pty,
+  host_level }`, and `TaskPlugin::exec()` returns a `Box<dyn ExecSession>`
+  (`src/task_plugins/mod.rs:472`, `:834-848`).
+- `ExecSession` is `take_output`, `write_stdin`, `close_stdin`, `resize`,
+  `wait`, `try_wait`, and `kill` (`src/task_plugins/exec_session.rs:61`),
+  with `ExecOptions { command, tty, winsize, cwd, env }`.
+- The worker's `Worker.ExecTask` bidi stream drives a session on dedicated
+  threads and counts open sessions per allocation for the idle policy's
+  `exec` signal (`src/worker/exec.rs`).
+- The manager's `Manager.ExecAllocation` authorizes, renders action argv,
+  resolves the worker, and splices the stream (`src/manager/exec.rs`). The
+  UI reaches the same core through the WebSocket bridge on the manager
+  port + 1 (`src/manager/exec_ws.rs`).
+
+So the whole feature is one runtime implementation and one guest-side
+listener. Nothing above the runtime changes.
+
+**Design.**
+
+- **Every microVM gets a vsock device and the guest agent**, whatever its
+  network mode. Today only gated sandboxes get one
+  (`src/task_plugins/sandbox.rs:1128`). The path is the gated plan's
+  per-allocation `<alloc>/.sandbox/vsock.sock` with the constant CID 3
+  (gated plan §6.2).
+- **The agent listens on one guest vsock port for exec** (proposed 1100)
+  and nothing else new. For `tap` and `none` sandboxes the worker binds no
+  guest-initiated listeners, so the guest still cannot dial the host. The
+  device carries host-initiated connections only, and `none` keeps its air
+  gap for anything the guest starts. This amends the gated plan's
+  definition of `none` ("no vsock device, no agent") and is recorded in
+  calls entry 8.
+- **The worker's `exec()` connects to the guest.** A new
+  `VsockExecSession` dials `uds_path`, sends Firecracker's `CONNECT 1100`
+  line and reads `OK <port>` (cloud-hypervisor uses the same convention),
+  and speaks
+  length-delimited `ExecClientFrame` and `ExecServerFrame` protobufs, the
+  frames every other leg already uses. The first exchange is a version
+  hello, because the gated plan requires any agent protocol beyond raw
+  bytes to negotiate (gated plan §6.3, "Agent version skew").
+- **The agent spawns the command** under a pty (`openpty` in the guest) or
+  with pipes, in the task's environment, working directory, and user from
+  the identity disk. Stdin, output, and resize frames ride the connection.
+  The exit status is the process's own. Closing the connection kills the
+  process group, which is how the worker's `kill()` and a client
+  disconnect both land.
+- **The host treats the agent as untrusted plumbing**, as Kata does. The
+  worker bounds frame sizes and session counts per allocation, and never
+  parses anything from the guest except frames. Exec into a sandbox is
+  root in the guest, the same promise as `container exec`, and
+  `runtime_is_host_level("sandbox")` stays false
+  (`src/task_plugins/mod.rs:460`), so the `exec` ACL without `host` covers
+  it.
+- **Suspend and resume.** A memory capture resets open vsock connections
+  (gated plan §6.3), so an open exec session ends with a typed reason
+  (`session ended: instance suspended`). After a resume the VMM listens on
+  the new allocation's path through the gated plan's `vsock_override`, and
+  a new `legion exec` reaches it. Exec targets an allocation, and a resume
+  is a new allocation, so callers that hold an instance id use
+  `legion exec --instance <id>` (new, below).
+- **The `exec` idle signal works on Linux microVMs** with no new code:
+  the worker already counts open sessions per allocation. Remove the
+  submit warning that says it never fires (`src/structs/suspend.rs:713`,
+  `docs/suspend-and-resume.md`, "What each signal sees on a sandbox").
+- **Unchanged surfaces.** `legion exec`, `legion action run`, the MCP
+  `legion_exec_run` and `legion_action_run` tools, and the UI terminal need
+  no change. `exec_support()` reports `exec` and `pty` true on a microVM
+  backend.
+
+```console
+$ legion exec --instance user-42 -it -- /bin/bash
+root@user-42:/workspace# ls
+$ legion exec --instance user-42 -- uname -s
+Linux
+```
+
+**Dependency order.**
+
+1. Gated plan Phase 0 (a gated sandbox booted on a real VMM).
+2. Gated plan Phase 1 (`vsock_override` on every restore). This is a hard
+   prerequisite, not a convenience. Memory checkpoints are refused for
+   gated sandboxes today because the vsock path is baked into the VMM's
+   saved state. Giving *every* microVM a vsock device before the override
+   exists would spread that refusal to TAP and `none` sandboxes, which
+   checkpoint fine today.
+3. **This plan's Phase E1.** Host-initiated vsock and the agent's vsock
+   listener are shared with gated plan Phase 5 (ingress). Whichever lands
+   first builds them, and the other reuses them.
+4. Gated plan Phase 2's static `legion-guest` widens the images exec works
+   on. Before it, exec on an image the self-copied agent cannot run on
+   (a musl image such as `alpine:latest`) fails by name:
+   `sandbox exec needs the guest agent, which did not start in this guest`.
+
+Firecracker 1.17.0 fixed host-initiated RX stalling after a bare pause and
+resume (gated plan §2), so E1 sets that as the floor for exec.
+
+### 6.13 Exec without the manager in the data path (Phases E2 to E5)
+
+**Today every byte goes through a manager.** CLI, UI, and MCP sessions
+stream client → manager → worker, and the manager holds both legs for the
+session's life (`docs/exec-and-actions.md`, "How it works"). A platform
+running thousands of concurrent agent shells puts all of their bandwidth
+and connections on three managers that also run raft.
+
+**A finding that changes the starting point.** The worker's gRPC listener
+has no authentication and no TLS. `Worker.ExecTask` runs whatever
+`ExecStart` it receives (`src/worker/server.rs:200`, `src/worker/exec.rs`),
+and the server is built with no interceptor (`src/worker/daemon.rs:318`).
+The proto says `ExecTask` is "called only by the manager"
+(`proto/legion.proto:7224`), but nothing enforces it. `PostWork`,
+`RestartWorker`, and `GetTaskLogs` share the listener. Today's safety rests
+on clients never learning worker addresses and on network isolation of the
+worker port. Direct exec would publish those addresses, so the listener
+has to authenticate first. That fix is worth shipping on its own, and it
+is Phase E2 (calls entry 2).
+
+**The design: signed exec tickets, verified by the worker.** This is
+Modal's command-router shape, a signed token plus a worker address, and it
+avoids the mistake Kubernetes made with streaming redirects: the worker
+never follows anything, and the ticket the client presents is what
+authorizes the session (§2, "Exec at scale").
+
+An exec ticket is a short-lived JWT signed with the cluster's
+workload-identity key, the same signer and JWKS that boot tickets use.
+Workers already cache that JWKS and verify boot tickets offline
+(`src/worker/boot_ticket.rs`), including a local spent-`jti` set bounded by
+expiry.
+
+```jsonc
+{
+  "aud": "legion:exec",
+  "sub": "accessor:7c1f…",                 // who minted it, for audit
+  "jti": "ext_91ab…", "iat": 1793635451, "exp": 1793635511,   // 60s to redeem
+  "legion.io/node": "w-17",                // redeemable on this node only
+  "legion.io/job": "agents", "legion.io/task": "workspace",
+  "legion.io/alloc": 88213,                // or the envelope, for a session
+  "legion.io/instance": "user-42",         // optional
+  "legion.io/argv": ["/bin/bash"],         // rendered, absent = any command
+  "legion.io/action": "flush-cache",       // set when minted for an action
+  "legion.io/tty": true,
+  "legion.io/max_session": 3600,           // seconds the session may run
+  "legion.io/uses": 1
+}
+```
+
+- **Minting is a signature, not a write.** `Manager.MintExecTicket` runs
+  the exact authorization `ExecAllocation` runs (`resolve_exec_start`,
+  `src/manager/exec.rs`): coarse `exec`/`action` gate before any lookup,
+  precise job scope after, `host` for host-level runtimes, action argv
+  rendered from the stored spec. It returns the ticket, the worker's exec
+  address, and the mesh CA certificate to verify it with. No raft entry.
+- **The client connects to the worker.** A new opt-in worker exec listener
+  serves TLS with the node certificate the mesh CA already issues
+  (`<node>.node.legion`, `src/manager/mesh_ca.rs`). The client verifies
+  that name against the CA from the mint reply. The ticket rides the first
+  frame, as the UI's bearer token does today (`ExecStart.bearer_token`).
+- **The worker verifies offline**: signature, `aud`, expiry with the boot
+  ticket's clock skew, `node` equals itself, the target allocation or
+  session is running here under that job and task, the requested argv and
+  tty fit the ticket, and the `jti` is unspent.
+- **Audit flows asynchronously.** The mint is audited at the manager under
+  `exec_audit` as today. The worker writes redemption, argv, tty, and exit
+  code to its local log and reports them on the next heartbeat, and the
+  manager logs them under `exec_audit` too. The manager-proxied path keeps
+  its synchronous audit.
+
+```console
+$ legion exec --instance user-42 --direct -it -- /bin/bash
+# one MintExecTicket call, then the stream goes to w-17:4750 directly
+
+$ legion exec-ticket mint --instance user-42 --argv /bin/bash --tty -j
+{"ok":true,"data":{"ticket":"eyJ…","worker":"10.0.3.17:4750","node":"w-17",
+ "caPem":"-----BEGIN CERTIFICATE-----…","expiresAt":"2026-11-02T18:05:11Z"}}
+```
+
+**The manager-proxied path stays the default** for the CLI, the UI, and
+MCP. It needs no route to workers, and it re-checks the caller's credential
+every 30 seconds. After E2 the manager proxy mints a ticket for itself on
+every session, so the worker has one rule for every caller.
+
+**The security boundary.**
+
+| Question | Answer |
+| --- | --- |
+| Who can mint | Anyone `ExecAllocation` would admit for the same target: `exec:write` on the job (plus `host` for host-level runtimes), or `action:write` for an action ticket. Delegated keys (E4) are scoped to a job glob, non-host runtimes, and a TTL ceiling. |
+| What a ticket allows | One session, on one node, into one allocation or session, with the ticket's argv (or any argv for an `exec` rule) and tty flag, for at most `max_session`. |
+| Replay | `jti` is spent in the node's local set, bounded by the ticket's `exp`. A ticket names its node, so it cannot be replayed elsewhere. A worker restart empties the set, so a restarted worker refuses tickets issued before it started (`iat` older than process start minus the clock skew). A client whose ticket is refused for that reason mints again. |
+| Revocation | By TTL (60 s to redeem by default, 10 min ceiling). Revoking an ACL token also pushes its accessor id to workers in the next heartbeat reply, and workers end that accessor's open direct sessions. The bound is one heartbeat interval, against 30 s on the proxied path. |
+| A stolen ticket | Opens one session on the named target, within the redeem window, if the thief redeems before the owner. It cannot reach another instance, node, or command. With `bind = true` (open question) the ticket also names the client's ephemeral key, and a thief without the key gets nothing. |
+| Transport | TLS on the worker exec listener with the mesh CA's node certificate. The listener is off by default and binds an operator-chosen address, so it can stay on a private network. |
+| ACL mapping | Unchanged vocabulary: `exec` and `action` rules, `names`, `action_names`, `host`. No new resource. |
+
+**Composition with session mode.** An unnamed session has no raft row.
+`MintExecTicket` resolves it through the leader's session index (§6.4),
+after the coarse ACL gate, and names the envelope allocation and the
+session id. The worker checks that the session is running locally under
+that envelope. A platform holding a delegated key (E4) can mint exec
+tickets for sessions it started at the edge without calling a manager at
+all, which makes start-and-shell a zero-manager-call path end to end.
+
+**The gateway tier, later (E5).** Some callers cannot route to workers:
+browsers on the public internet, and customers who refuse to expose
+worker addresses. `legion start exec-gateway` runs a stateless tier that
+terminates client TLS or WebSocket, verifies the same ticket, and forwards
+over mesh mTLS to the worker. Gateways scale horizontally, hold no state,
+and keep worker addresses private. They come after E3 because the common
+agent-platform case is the platform's own backend, already inside the
+network, which E3 serves without any public exposure.
+
 ## 7. Target numbers per phase
 
 Targets assume the AWS rig's control plane (3 × m6id.xlarge, `lanes`
@@ -859,6 +1220,19 @@ idle, with the idle fraction set by the platform's activity rate. Phase 4's
 index target is per leader, and a 10^7 index is about 2 GiB of manager
 memory, which is where Phase 7's sharded index (the same cell split,
 applied to the soft index) would start.
+
+**Exec track targets.** Measured on the same rig with simulated workers
+that run real exec sessions against a `noop`-backed echo process, plus a
+KVM node for E1.
+
+| Phase | Manager work per session | Manager bytes per session | Concurrent sessions per cluster | Session opens/s |
+| --- | --- | --- | --- | --- |
+| Today (proxied) | two streams held for the session's life | every byte, twice | bounded by manager sockets and CPU, unmeasured | unmeasured |
+| E1: microVM exec | unchanged | unchanged | unchanged | first byte under 100 ms on a warm guest |
+| E2: ticketed worker | + one ES256 signature | unchanged | unchanged | unchanged within noise |
+| E3: direct exec | one unary mint RPC | about 1 KiB (the mint) | ≥ 10,000 with managers idle on bytes | ≥ 5,000 mints/s per manager |
+| E4: delegated keys | none | none | worker-bound | worker-bound |
+| E5: gateway | none | none | gateway-bound, scales with gateways | gateway-bound |
 
 ## 8. Proto, struct, config, and persistence changes
 
@@ -887,6 +1261,27 @@ indexMaxEntries = 2000000 }`.
 
 **Worker config:** `sessions { logPath, shipLogEvery = "5m" }`. Session
 mode requires `contentStore`.
+
+**Exec (E1 to E5):**
+- `ExecStart` gains `instance_id` (exec by instance or session id, resolved
+  to the current allocation) and `exec_ticket`. `Manager.MintExecTicket
+  { target, argv, action, action_params, tty, ttl, bind_key? }` returns
+  `{ ticket, worker_address, node, ca_pem, expires_at }`, under the same
+  ACL as `ExecAllocation`, in `tests/acl_endpoints.rs`, `catalog()` as
+  `exec-ticket mint` (`mutates: false`, `read_only_safe: false`, since a
+  ticket opens a shell), and an MCP tool gated like `legion_exec_run`.
+- `Manager.CreateExecKey` / `ListExecKeys` / `DeleteExecKey` (E4), ACL
+  `acl:write`, with a `exec_key` control-lane table (public key, job glob,
+  TTL ceiling, created by). One raft write per key, never per session.
+- `HeartbeatRequest.exec_audit` (redemptions and exits) and
+  `HeartbeatReply.revoked_accessors`.
+- Worker config `exec = { listener = { enabled = false, address =
+  "0.0.0.0:4750" } }`. Manager config `exec.tickets = { defaultTtl = "60s",
+  maxTtl = "10m", maxSession = "1h" }`.
+- Sandbox runtime: the vsock device and agent on every microVM, the exec
+  vsock port, and the Firecracker 1.17.0 floor for exec. No job-config
+  field. `config.network = { mode = "none" }` keeps its meaning for
+  guest-initiated traffic.
 
 **Persistence:**
 - Phase 2: `instance` gains `named BOOLEAN`. Server-minted ids are not
@@ -957,6 +1352,32 @@ Each phase ships alone and is worth having alone.
   `sessionsPerInstance`, accounting, and the isolation warning in docs.
 - **Phase 7: cells (conditional).** Built only past the §6.11 trigger.
 
+**The exec track.** Independent of session mode. E1 and E2 can ship before
+Phase 0.
+
+- **E1: exec into microVMs over vsock (§6.12).** After gated plan Phases 0
+  and 1. The vsock device and agent on every microVM, the agent's exec
+  listener and pty spawn, `VsockExecSession`, the version hello,
+  `exec --instance`, the idle-signal warning removed, and the
+  `docs/exec-and-actions.md` table row flipped. Valuable alone: shells and
+  actions in production sandboxes.
+- **E2: authenticate the worker listener.** Every `ExecTask` requires an
+  exec ticket. The manager proxy mints one for itself per session.
+  `PostWork`, `RestartWorker`, and `GetTaskLogs` require a manager-signed
+  worker-plane token (`aud = legion:worker`). Worker restart refuses
+  tickets issued before it started. Valuable alone: it closes an
+  unauthenticated exec endpoint on every worker.
+- **E3: direct exec, opt-in.** `MintExecTicket`, the worker's TLS exec
+  listener on the mesh CA node certificate, `legion exec --direct`,
+  `legion exec-ticket mint`, async audit on the heartbeat, accessor
+  revocation pushed to workers, and session resolution through the session
+  index once Phase 4 exists.
+- **E4: delegated minting keys.** A platform registers a public key scoped
+  to a job glob, and workers trust it alongside the cluster JWKS.
+- **E5: the exec gateway.** `legion start exec-gateway`, stateless, for
+  browsers and private-worker deployments. Built when public or browser
+  access at scale needs it.
+
 ## 10. Testing plan
 
 - **Phase 0** is itself the test harness: the op-count test fails when a
@@ -990,8 +1411,26 @@ Each phase ships alone and is worth having alone.
 - **Phase 5:** ignored KVM tests for UFFD restore and diff snapshots, plus
   a density benchmark that records sessions per node at a fixed memory
   budget, cold versus clone.
+- **E1:** ignored KVM tests: a pty session into Firecracker and
+  cloud-hypervisor guests (stdin, resize, exit status, kill on
+  disconnect), exec after a memory resume reaches the new allocation,
+  exec on a `none` sandbox works while the guest still cannot dial the
+  host, and an image without a runnable agent fails by name. Unit tests
+  for the frame codec and the version hello against an older agent.
+- **E2:** a raw `ExecTask` without a ticket is refused, a ticket for
+  another node, allocation, argv, or an expired one is refused, a replayed
+  `jti` is refused, a ticket issued before a worker restart is refused,
+  and the proxied path still works end to end. `PostWork` without a worker
+  token is refused.
+- **E3:** direct sessions against simulated workers, accessor revocation
+  ends an open direct session within one heartbeat, the audit record
+  arrives on the next heartbeat, the CLI verifies the worker's certificate
+  name, and an ACL matrix shows `MintExecTicket` admits exactly what
+  `ExecAllocation` admits.
 - **Benchmarks:** the Phase 0 matrix re-run after Phases 1, 3, and 4, with
   before and after numbers in each PR, per the `AGENTS.md` scheduler rule.
+  The exec matrix (proxied versus direct, 1k and 10k concurrent sessions)
+  runs before and after E3.
 
 ## 11. Rollout and backward compatibility
 
@@ -1015,6 +1454,17 @@ Each phase ships alone and is worth having alone.
   loses its session index (sessions keep running inside envelopes until
   their nodes restart) and cannot read archived rows. The upgrade doc says
   so.
+- **E1 is default on** for microVM sandboxes on workers that ship it. A
+  guest captured before E1 has no exec listener, so exec into a sandbox
+  resumed from an old checkpoint fails by name until its next cold boot.
+- **E2 is a breaking change on the worker plane** and rolls out in two
+  releases: managers first start attaching tickets and tokens (workers
+  ignore them), then workers start requiring them. A worker config flag
+  (`workerPlane.requireAuth`, default true in the second release) lets an
+  operator stage it. Any tool that calls workers directly breaks, which is
+  the point.
+- **E3 to E5 are opt-in**: the worker listener is off by default, and the
+  CLI uses the proxy unless `--direct` is passed.
 
 ## 12. Open questions
 
@@ -1040,6 +1490,19 @@ Each phase ships alone and is worth having alone.
   old envelope stay until they suspend or stop, and resume into the new
   config. This needs a drain rule, and the lean is "new sessions go to new
   envelopes, old envelopes are removed when empty".
+- **Should direct-exec tickets be bound to the client's key (lean: yes for
+  the CLI, optional for platforms)?** A `cnf` claim naming the client's
+  ephemeral key makes a stolen ticket useless. It costs the client a key
+  and a proof, which a platform backend may not want.
+- **How much revocation lag is acceptable for direct sessions (lean: one
+  heartbeat)?** The proxied path re-checks every 30 s. Adaptive cadence can
+  stretch a heartbeat to 21 s on a large fleet, so the two are close, but
+  an operator revoking a leaked token wants faster. A dedicated revocation
+  push is the fallback.
+- **Should `instance create` return an exec ticket (lean: on request, with
+  `--exec-ticket`)?** Modal embeds command-router access in create and
+  restore replies to save a round trip. Doing it by default would mint a
+  shell capability nobody asked for.
 - **What triggers cells (lean: the §6.11 thresholds)?** Measured in Phase 0
   and re-checked after Phase 4.
 
@@ -1068,3 +1531,13 @@ Each phase ships alone and is worth having alone.
   correct accounting.
 - **Phase 7:** built only with the trigger met, with its own plan
   amendment.
+- **E1:** on a KVM node, `legion exec --instance <id> -it -- /bin/sh` opens
+  a shell in a Firecracker and a cloud-hypervisor sandbox, an action runs
+  there from the UI, and the `exec` idle signal keeps an instance with an
+  open shell awake.
+- **E2:** a request to a worker's `ExecTask` or `PostWork` with no ticket
+  or token is refused, and every existing exec test passes through the
+  proxy.
+- **E3:** 10,000 concurrent direct sessions on simulated workers move no
+  session bytes through a manager, and minting writes no raft entry.
+- **E4 and E5:** each ships with its own acceptance test when built.

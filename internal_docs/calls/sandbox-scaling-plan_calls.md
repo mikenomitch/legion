@@ -5,7 +5,7 @@ Decisions made while writing
 any code exists. **Entries are ranked by project impact, highest first. The
 number is the rank.** Implementation-time calls get inserted at their rank
 as the phases execute. If a citation elsewhere names an entry by number,
-fix it when you renumber. The plan cites entries 3, 4, 5, 8, 10, and 12.
+fix it when you renumber. The plan cites entries by number throughout.
 
 ## 1. Running sessions are node-owned soft state, and raft keeps only what must be durable
 
@@ -43,7 +43,40 @@ records nobody needs to be exact. Every system in the prior art past about
 authoritative. Legion already did the same for liveness, the location
 index, and warms, so this extends a pattern operators already run.
 
-## 2. Sessions are a third instance mode, not a new noun
+## 2. Every exec session is authorized by a ticket the worker verifies, including the manager's own
+
+**Call.** The worker's listener stops trusting its callers. Every
+`Worker.ExecTask` requires a signed exec ticket, and the manager proxy
+mints one for itself per session. `PostWork`, `RestartWorker`, and
+`GetTaskLogs` require a manager-signed worker-plane token. This is Phase
+E2, and it ships before direct exec.
+
+```text
+Error: exec refused by node w-17: no exec ticket on the session
+(the worker requires a ticket under workerPlane.requireAuth, so update the manager first)
+```
+
+**Alternatives.**
+- (a) Keep the worker listener as it is and authenticate only the new
+  direct-exec listener.
+- (b) Mutual TLS from the manager to every worker, with the worker
+  trusting any caller that presents the manager's certificate.
+
+**Trade-off.** A breaking worker-plane change that needs a two-release
+rollout (managers attach, then workers require). One signature per
+proxied session. Any operator tooling that called workers directly stops
+working.
+
+**Why (security, then simplicity).** The plan's recon found that today's
+`ExecTask` has no authentication or TLS at all (`src/worker/server.rs:200`,
+`src/worker/daemon.rs:318`), and the proto's "called only by the manager"
+is not enforced. Direct exec would publish worker addresses, so (a) would
+leave a second, open door beside the new locked one. (b) authenticates the
+caller but not the request, so a compromised manager credential is still
+a shell anywhere. A ticket names the node, target, argv, and expiry, so the
+worker has one rule for every caller, proxied or direct.
+
+## 3. Sessions are a third instance mode, not a new noun
 
 **Call.** `stateful.mode = "session"` beside `slot` and `keyed`. The
 existing `legion instance` commands, RPCs, and MCP tools work on sessions,
@@ -68,7 +101,7 @@ place. With two nouns, promotion would move an object between APIs and
 every consumer (UI, MCP, catalog, ACL tests) would handle both. One noun
 keeps one set of tools for agents and one ACL vocabulary.
 
-## 3. Naming promotes, and unnamed ids are 130 random bits with no tombstone
+## 4. Naming promotes, and unnamed ids are 130 random bits with no tombstone
 
 **Call.** A caller-chosen id always makes a durable keyed instance. A
 server-minted id is `{task}-{26 base32}`, 130 random bits, never checked
@@ -98,7 +131,40 @@ uniqueness check, and names pay it once. The reserved shape closes the
 remaining hole, a caller typing in a dead unnamed id, with the same kind
 of rule slot ids already have.
 
-## 4. Idle sessions are manifests, and archiving keyed instances ships before session mode
+## 5. Direct exec is opt-in, the manager proxy stays the default, and a gateway comes later
+
+**Call.** Exec without the manager in the data path ships as worker-verified
+tickets and a direct worker listener (E3), off by default. The CLI uses it
+with `--direct`, and platforms mint tickets with `MintExecTicket` or a
+delegated key. The stateless exec gateway (E5) is built only when browser
+or public access at scale needs it.
+
+```console
+$ legion exec --instance user-42 --direct -it -- /bin/bash
+```
+
+**Alternatives.**
+- (a) Gateway first: keep worker addresses private and scale exec with a
+  stateless tier from day one (Cloudflare's shape).
+- (b) Make direct the default for every client once E3 lands.
+- (c) Redirects: the manager answers `ExecAllocation` with a redirect the
+  client or the manager follows, as Kubernetes once did.
+
+**Trade-off.** Direct exec reverses the documented "clients never learn
+worker addresses" rule for callers who opt in, and it needs a network
+route and TLS trust from client to worker. Browsers keep going through the
+manager until E5, so the UI does not scale past the proxy yet.
+
+**Why (simplicity, then performance).** The common agent-platform caller is
+the platform's own backend, already inside the network, which can reach
+workers privately. (a) adds a tier every operator has to run before anyone
+benefits. (b) breaks every human user whose laptop cannot route to
+workers. (c) is what Kubernetes removed after CVE-2018-1002102, because a
+followed redirect authorizes nothing. Modal ships the same token-plus-
+worker-address design for its own exec, which is the best evidence it
+holds up at scale.
+
+## 6. Idle sessions are manifests, and archiving keyed instances ships before session mode
 
 **Call.** A suspended session is a manifest in
 `<contentStore.url>/sessions/<job>/...`, with no raft row. Phase 3 brings
@@ -125,7 +191,7 @@ correctness story for names, a dependency the `file://` content store
 cannot honor. (c) delays the bigger win behind the bigger design: Phase 3
 works on today's keyed model and is valuable even if Phase 4 never ships.
 
-## 5. Raft places capacity envelopes, and a router fills them
+## 7. Raft places capacity envelopes, and a router fills them
 
 **Call.** A session-mode task declares `stateful.envelope`, a per-node
 reservation that the scheduler places as an ordinary allocation. Sessions
@@ -157,7 +223,38 @@ allocation per node per pool. (b) ties the envelope to one VM and to one
 isolation tier. Borg's alloc and Lambda's slots are the precedent: place
 the container of capacity slowly and durably, fill it quickly and softly.
 
-## 6. Measure, then group commit, before any new semantics
+## 8. Every microVM gets a vsock device and the guest agent, after the gated plan's restore override
+
+**Call.** Exec into Linux microVMs (E1) gives every microVM a vsock device
+and the agent, not only gated ones. For `tap` and `none` sandboxes the
+device carries host-initiated connections only, because the worker binds
+no guest-facing listeners. E1 lands after gated plan Phase 1.
+
+```console
+$ legion exec --instance user-42 -it -- /bin/bash
+root@user-42:/workspace#
+```
+
+**Alternatives.**
+- (a) Exec only for gated sandboxes, which already have the device.
+- (b) A serial-console or SSH-in-guest path that needs no vsock.
+- (c) Ship E1 now, before the restore override.
+
+**Trade-off.** This amends the gated plan's definition of `none` ("no vsock
+device, no agent"). A `none` sandbox now runs an agent with a host-reachable
+listener. The guest still cannot dial out, but the agent is code in every
+guest. E1 waits on two gated phases.
+
+**Why (simplicity and security).** (a) makes exec depend on the network
+mode, which is the kind of hidden coupling that turns into a support
+ticket. (b) needs a network inside the guest and its own keys, and a
+serial console has no pty resize or clean exit codes. (c) breaks memory
+checkpoints for TAP and `none` sandboxes, which work today, because the
+vsock path is baked into the VMM's saved state until the override exists.
+Kata and E2B both put an agent in every guest. The air gap that matters,
+guest-initiated traffic, is unchanged.
+
+## 9. Measure, then group commit, before any new semantics
 
 **Call.** Phase 0 is a gate that measures entries per lifecycle, rates,
 and bytes per row, and leaves an op-count test in CI. Phase 1 trims and
@@ -181,7 +278,7 @@ are allocations with health). Phase 1 helps every keyed user now, without
 a new mode, and the eval-path plan already showed that fewer rounds beat
 faster rounds on a serial lane.
 
-## 7. Unnamed sessions converge to one, and idempotency derives the id
+## 10. Unnamed sessions converge to one, and idempotency derives the id
 
 **Call.** Two nodes may briefly run the same unnamed session id. The
 leader stops the one with the later lease within a heartbeat. A create
@@ -201,7 +298,35 @@ makes the leader a per-create hop. The derived id gives the agent the one
 property it needs, the same id on retry, and a duplicate is rare and
 bounded.
 
-## 8. No external session registry, not even as a seam
+## 11. Replay and revocation for direct exec use local state and TTLs, not raft
+
+**Call.** A ticket names one node. Single use is the node's local spent-`jti`
+set, bounded by expiry, the same structure boot tickets use. A restarted
+worker refuses tickets issued before it started. Revocation is the TTL (60
+s to redeem by default, 10 min ceiling), plus revoked accessor ids pushed to
+workers in the heartbeat reply, which end open direct sessions. A session
+is capped by `max_session` (1 h by default).
+
+**Alternatives.**
+- (a) Record spent tickets in raft, for global single use and a revocation
+  list.
+- (b) Have the worker call the manager to validate each ticket.
+- (c) Re-check the caller's credential every 30 s, as the proxy does.
+
+**Trade-off.** Revocation of an open direct session lags by up to one
+heartbeat interval, which adaptive cadence can stretch to about 21 s on a
+very large fleet. A client whose ticket was minted just before a worker
+restart has to mint again. A ticket stolen in its redeem window opens one
+session.
+
+**Why (scale).** (a) is a raft write per session, the cost this plan
+removes everywhere else. (b) puts the manager back on the path of every
+session open. (c) needs the user's credential on the worker, which a
+ticket exists to avoid. Binding to one node makes a local cache strict
+single use, which RFC 9449 notes is otherwise infeasible without shared
+state.
+
+## 12. No external session registry, not even as a seam
 
 **Call.** Option 6 is rejected as a default and is not built as a plugin
 seam in this plan.
@@ -221,7 +346,7 @@ exists usually fits the first one only. The node-owned design needs no
 external store beyond the content store that published checkpoints already
 require.
 
-## 9. Cells are deferred behind a measured trigger
+## 13. Cells are deferred behind a measured trigger
 
 **Call.** Key-range sharding of instance rows across raft groups is Phase
 7, built only when Phase 0's harness shows the scheduler lane above 70%
@@ -239,7 +364,7 @@ Cells add scatter-gather lists, cross-cell renames, and per-cell
 leadership to every operator's mental model. That cost is worth paying
 only with evidence.
 
-## 10. Prefix tickets stand in for leases at the edge, and spend once
+## 14. Prefix tickets stand in for leases at the edge, and spend once
 
 **Call.** An edge-started session uses a multi-use, instance-prefix boot
 ticket as its authorization. The node mints the session id. The ticket is
@@ -257,7 +382,7 @@ another to spend, two raft writes per session. Edge boot already allowed
 prefix and multi-use tickets and already accepted "runs anything a live
 ticket names" as the edge blast radius.
 
-## 11. Per-session events stay off the replicated journal
+## 15. Per-session events stay off the replicated journal
 
 **Call.** Session lifecycle events go to the live `StreamEvents`
 broadcast and to the node's session log, shipped in batches to the bucket.
@@ -276,7 +401,7 @@ starts per second it would roll over in under a second, so journaling
 costs raft writes and still loses the record. The shipped log is the
 honest audit trail at that rate.
 
-## 12. Session workload identity comes from the lease, and the boundary moves to the envelope
+## 16. Session workload identity comes from the lease, and the boundary moves to the envelope
 
 **Call.** The manager issues tokens for a session after verifying the
 node, the lease (or ticket), and the envelope allocation, not an
@@ -297,7 +422,26 @@ a credential, so promote-on-identity would put nearly every session back
 in raft. The blast radius matches what edge boot already accepted, and
 promoted sessions keep today's boundary for workloads that need it.
 
-## 13. The target is millions running and hundreds of millions idle per cluster, not billions running
+## 17. Platforms mint exec tickets with delegated keys scoped to job globs
+
+**Call.** E4 lets a platform register a public key with a job glob and a
+TTL ceiling (`CreateExecKey`, one control-lane write per key). Workers
+trust tickets signed by it for matching jobs on non-host runtimes.
+
+**Alternative.** Platforms always call `MintExecTicket`, so the manager
+signs every ticket.
+
+**Trade-off.** A leaked platform key is a shell capability for every
+matching job until the key is deleted, and deletion reaches workers on
+their next heartbeat. Operators manage one more kind of secret.
+
+**Why (performance).** With session mode and edge boot, a platform can
+start a sandbox with no manager call. Requiring a manager call to open a
+shell into it would bring the manager back onto the hottest per-session
+path. The glob and the `host` exclusion keep a key narrower than the
+`exec:write` grant that created it.
+
+## 18. The target is millions running and hundreds of millions idle per cluster, not billions running
 
 **Call.** The plan's per-cluster targets are at least 10^6 running
 sessions and 10^8 idle ones, with billions reached through federation.
@@ -314,7 +458,26 @@ agents". The largest primary claims are Cloudflare's tens of millions of
 agents and Google's tens to hundreds of millions of instances, mostly
 idle. A target the design can be measured against beats one it cannot.
 
-## 14. Snapshot-clone density before a sub-VM tier
+## 19. Exec over vsock reuses the existing exec frames, behind a version hello
+
+**Call.** The worker and the guest agent speak the same length-delimited
+`ExecClientFrame` and `ExecServerFrame` protobufs every other exec leg
+uses, after a one-message version hello.
+
+**Alternatives.** Kata's ttRPC agent API (`ExecProcess`, `WriteStdin`,
+`ReadStdout`, polled per stream), or E2B's connect-rpc process service.
+
+**Trade-off.** Legion's frames have no reattach or output offsets, so a
+dropped vsock connection ends the session, as a dropped manager connection
+does today.
+
+**Why (simplicity).** One frame format end to end means the worker splices
+bytes instead of translating, and the agent has one codec. The gated plan
+requires any agent protocol beyond raw bytes to negotiate, because a
+restored guest can run an older agent than its worker, and the hello is
+that negotiation.
+
+## 20. Snapshot-clone density before a sub-VM tier
 
 **Call.** Phase 5 densifies with one microVM per session sharing pages
 from a warm base checkpoint (option 8). Phase 6 adds only a seam for
@@ -333,7 +496,7 @@ keeps the promise and reuses fork machinery that already shares pages on
 Firecracker. Tier 2 belongs to a runtime plugin that can make its own
 isolation claim.
 
-## 15. The worker's session log is a new SQLite database, not the JSON state file
+## 21. The worker's session log is a new SQLite database, not the JSON state file
 
 **Call.** Sessions are recorded in `sessions.db` on the worker. The JSON
 `WorkerStateStore` keeps allocations only.

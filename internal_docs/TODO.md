@@ -1536,7 +1536,8 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 - [ ] **The `sandbox` runtime still cannot exec, signal, or deliver identity
       files** — all three need the guest agent the sandbox plan owns. The
       container runtime's `TaskPlugin::signal` override is the seam its
-      guest-agent path would implement.
+      guest-agent path would implement. Exec is now planned as Phase E1 of
+      [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md#612-exec-into-microvm-sandboxes-over-vsock-phase-e1).
 - [ ] **Sandbox scaling to very large session counts**:
       [plan](plans/sandbox-scaling-plan.md) (PLANNED) ·
       [calls](calls/sandbox-scaling-plan_calls.md). Every keyed sandbox is a
@@ -1559,6 +1560,26 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `PromoteInstance`.
   - [ ] Phases 5 to 7: snapshot-clone density (with suspend plan Phase 8),
         a sub-VM tier seam, and cells only past the plan §6.11 trigger.
+  - [ ] Exec E1: exec into Linux microVM sandboxes over vsock. Every
+        microVM gets a vsock device and the guest agent, the agent spawns
+        the command under a pty, and `legion exec`, actions, and the UI
+        terminal work unchanged (plan §6.12). Needs gated plan Phases 0 and
+        1 first: without the vsock restore override, a vsock device on
+        every microVM would break memory checkpoints of TAP and `none`
+        sandboxes. Replaces the "sandbox runtime still cannot exec" item
+        under Task runtimes for the exec part.
+  - [ ] Exec E2: authenticate the worker listener. Found during the plan:
+        `Worker.ExecTask` has no authentication or TLS
+        (`src/worker/server.rs:200`, `src/worker/daemon.rs:318`), and
+        `PostWork`, `RestartWorker`, and `GetTaskLogs` share the listener.
+        The proto's "called only by the manager" is not enforced. Every
+        `ExecTask` should require a signed exec ticket, the others a
+        manager-signed token, rolled out over two releases.
+  - [ ] Exec E3: direct exec, opt-in. `MintExecTicket`, a TLS worker exec
+        listener on the mesh CA node certificate, `legion exec --direct`,
+        async audit, and accessor revocation on the heartbeat.
+  - [ ] Exec E4 and E5: delegated minting keys scoped to job globs, then a
+        stateless exec gateway for browsers and private-worker setups.
   - [ ] Found during the plan: allocation health is a status-lane raft
         write per node per beat, because the manager upserts every
         allocation with `updated_at = now` and nothing skips unchanged rows
