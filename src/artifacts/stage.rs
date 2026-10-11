@@ -864,17 +864,20 @@ impl ArtifactStager {
             );
         }
         let _flight = self.claim_flight(&digest);
-        if store.contains(&digest)? {
-            if let Some(owner) = opts.pin.as_ref() {
-                store.pin(&digest, owner)?;
+        // Pin and check presence in one step: unpinned content (a published
+        // snapshot's parts, a warmed copy) can be evicted between a separate
+        // check and pin, and then this fetches it instead.
+        let present = match opts.pin.as_ref() {
+            Some(owner) => store.pin_if_present(&digest, owner)?,
+            None => store.contains(&digest)?,
+        };
+        if present {
+            if let Some(entry) = store.get(&digest)? {
+                return Ok(FetchedIntoStore {
+                    entry,
+                    fetched_bytes: 0,
+                });
             }
-            let entry = store
-                .get(&digest)?
-                .context("content vanished from the store")?;
-            return Ok(FetchedIntoStore {
-                entry,
-                fetched_bytes: 0,
-            });
         }
         let fetcher = self
             .registry

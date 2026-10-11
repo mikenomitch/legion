@@ -2016,6 +2016,17 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           ([call 42](calls/suspend-resume-and-oversubscription-plan_calls.md)).
     - [ ] A manual `snapshot publish <id>` for a snapshot whose attempts are
           spent.
+    - [x] Published checkpoints are unpinned on their node once the upload
+          succeeds, so the content store evicts them like any cache entry,
+          and a resume there pins what is present or fetches what was
+          evicted. `node usage` counts only `local` checkpoints as suspended
+          on a node
+          ([call 131](calls/suspend-resume-and-oversubscription-plan_calls.md#131-published-checkpoints-are-unpinned-on-their-node-content-store-follow-up),
+          [docs](../docs/suspend-and-resume.md#what-happens)).
+    - [ ] Check a published resume for room to fetch its parts. The
+          checkpoint-room filter covers fresh placements only, so a resume
+          onto a node without its parts and without room fails in the fetch
+          ([call 134](calls/suspend-resume-and-oversubscription-plan_calls.md#134-a-resume-is-still-not-checked-for-room-for-its-parts-content-store-follow-up)).
     - [x] Placement did not know which workers can fetch published parts.
           Workers advertise `checkpoint-fetch`, and published restores and
           warms only go to them
@@ -2981,9 +2992,10 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
         operation, `forked_from`, and CPU `cores` and `used_millicores` on
         node usage (`legion node usage` with no node, `legion node content`,
         and the `legion_node_usage_list` and `legion_node_content` MCP tools)
-  - [ ] Show the content store's per-class budgets on the worker page's
-        "Content and locality" card once GetNodeUsage carries the disk
-        budget. The card has the slot (`NodeContentCard`'s `budgets`)
+  - [ ] Show the `artifacts` budget on the worker page's "Content and
+        locality" card. The `snapshots` bar ships, with the room left for a
+        new checkpoint and whether the budget or the disk limits it, but
+        GetNodeUsage carries only the `snapshots` class
         ([calls 8](calls/suspend-resume-ui-plan_calls.md#8-getnodecontent-reads-only-what-the-manager-already-holds))
   - [ ] The Jobs index still lists a running job as `done`; only the job
         page derives `running`
@@ -3588,6 +3600,32 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] A plugin system for fetchers (`plugins/artifacts/<scheme>/`)
 - [x] OCI layout → runtime bundle conversion so Legion-managed images work on
       Linux container workloads
+- [x] **Content store budgets that fit the disk, and a disk-aware checkpoint
+      room check.** Content-store follow-up to the
+      [suspend plan](plans/suspend-resume-and-oversubscription-plan.md),
+      [calls 131 to 134](calls/suspend-resume-and-oversubscription-plan_calls.md#131-published-checkpoints-are-unpinned-on-their-node-content-store-follow-up) ·
+      [docs: the node content store](../docs/artifacts.md#the-node-content-store),
+      [the checkpoint disk budget](../docs/suspend-and-resume.md#the-checkpoint-disk-budget)
+  - [x] `content.budgets.*` takes a size or a share of the content
+        filesystem (`"20%"`), sized at worker start. Defaults are 10%
+        clamped to 1..20 GiB (artifacts) and 20% clamped to 2..200 GiB
+        (snapshots). Bad percentages and shares over 100% fail config load.
+  - [x] Workers report `disk_free_bytes`, `min_free_disk_bytes`, and
+        `reclaimable_bytes` on `SnapshotBudget`. A node's checkpoint room is
+        `min(budget - pinned, free + reclaimable - minFreeDisk)`, used by
+        the placement filter (whose error counts each limit), `legion node
+        usage`, and the worker page's content card. `scheduler_bench`
+        `snapshot_budget` reports disk numbers too.
+  - [ ] Rerun `scheduler_bench` `snapshot_budget` and
+        `candidate_construction` on a quiet host. The local before/after
+        (2026-10-11, load average 11 to 22) moved `unreported/nodes_5000`,
+        which never reaches the changed filter, from 11.8 ms to 21.6 ms, so
+        it measured the host, not the change: `half_full/nodes_5000` 14.8 ms
+        before, 23.4 to 29.1 ms after, `half_full/nodes_1000` 4.0 ms before,
+        2.7 to 3.6 ms after. The filter itself is one pass over reported
+        nodes per task, as before, with a `min` added per node.
+  - [x] Published checkpoints are unpinned on their node (see Phase 7b
+        under Scheduling & placement).
 
 ## Rollouts
 

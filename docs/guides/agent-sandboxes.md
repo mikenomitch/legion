@@ -91,12 +91,13 @@ tune the trigger or check that `suspend` is in `steps`. The block above
 mostly restates the defaults. See
 [memory pressure](../resource-enforcement.md#memory-pressure).
 
-**`content`** is on by default with a 50 GiB snapshot budget. That is enough
-to try the guide and too small for a node that parks hundreds of sandboxes.
-A suspend whose checkpoint would go over the budget fails, and the sandbox
-keeps running. Once a node's budget has no room for one more checkpoint, the
-scheduler places new sandboxes elsewhere, and `legion node usage` shows the
-budget under `checkpoints`. See
+**`content`** is on by default with a snapshot budget of 20% of the worker's
+disk, capped at 200 GiB. That is enough to try the guide and may be too small
+for a node that parks hundreds of sandboxes. A suspend whose checkpoint would
+go over the budget fails, and the sandbox keeps running. Once a node has no
+room for one more checkpoint, whether its budget or its disk is what ran out,
+the scheduler places new sandboxes elsewhere, and `legion node usage` shows
+the room under `checkpoints`. See
 [the checkpoint disk budget](../suspend-and-resume.md#the-checkpoint-disk-budget)
 and [the node content store](../artifacts.md#the-node-content-store).
 
@@ -635,7 +636,15 @@ and it counts toward `content.budgets.snapshots`. The `bytes` in the suspend
 reply, and the `legion_checkpoint_bytes` histogram, tell you what one costs
 for your image. Size the budget as parked sandboxes per node times that, plus
 your snapshots. A node that parks 300 sandboxes at 1.5 GiB each needs about
-450 GiB.
+450 GiB, so set `content.budgets.snapshots = "450GiB"` (or a share such as
+`"60%"` on a dedicated disk) rather than rely on the default's 200 GiB cap,
+and leave the disk room for it beyond `content.minFreeDisk`.
+
+With `suspend.durability = "store"`, a checkpoint is pinned only until it is
+published. After that the node's copy is an evictable cache entry, so the
+budget has to cover sandboxes whose upload is still running, not every
+parked sandbox. A resume on a node whose copy was evicted fetches it back
+from the content store first.
 
 ### Room to resume
 

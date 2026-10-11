@@ -620,32 +620,60 @@ placed in time (no eligible instances, or a node that is down) follows
 ### The checkpoint disk budget
 
 Memory checkpoints live in the node content store under the `snapshots`
-budget (`content.budgets.snapshots`, 50 GiB by default). Every suspended
-instance's checkpoint stays pinned there until it resumes or is destroyed, so
-a node full of suspended instances can run out of room for the next
-checkpoint, and a suspend that cannot store its checkpoint fails.
+budget (`content.budgets.snapshots`). By default that is 20% of the disk
+holding the worker's state directory, clamped to 2 GiB to 200 GiB (see
+[the node content store](artifacts.md#the-node-content-store)). Every
+suspended instance's `local` checkpoint stays pinned there until it resumes
+or is destroyed, so a node full of suspended instances can run out of room
+for the next checkpoint, and a suspend that cannot store its checkpoint
+fails. A `published` checkpoint is not pinned on its node (see
+[Durability](#durability-surviving-the-node)), so it takes no room the next
+checkpoint needs.
 
-Workers report the budget on every heartbeat: its size, what it holds, and
-what is pinned. `node usage` shows it under `checkpoints`, beside the bytes of
-the checkpoints suspended there. The manager computes those from its own
-records, so the figure survives a worker restart.
+The budget is not the only limit. The store also keeps `content.minFreeDisk`
+(5 GiB by default) free on its disk: it evicts unpinned content of any class
+to stay above that floor, then refuses the write. So a node whose disk is
+filled by something else (volumes, logs, images) has no room for a
+checkpoint even with budget to spare.
 
-When a node's budget has less room left (budget minus pinned bytes) than one
-more checkpoint of a task, the scheduler does not place **new** instances of
-that task on the node. This applies only to tasks whose `suspend` block
-checkpoints memory. A checkpoint's size is estimated as the guest's memory
-(`config.memory_mib`, else `resources.memoryMax`, else `resources.memory`).
-Resumes and other restores are never held back, since their checkpoint
-already exists. When no node has room, placement fails with:
+Workers report both on every heartbeat: the budget's size, what it holds,
+what is pinned, the disk's free space, the `minFreeDisk` floor, and how much
+unpinned content the store could evict. A node's **checkpoint room** is the
+smaller of:
 
-```text
-Failed to place task workspace: 4 eligible node(s), but every one's snapshots content budget is full: less than 1024 MiB free for this task's memory checkpoint (suspend). Raise content.budgets.snapshots on those workers, delete snapshots you no longer need (`legion snapshot list`), or resume or destroy suspended instances to release their checkpoints. `legion node usage <node>` shows each node's budget
+- the budget's room: budget minus pinned bytes, and
+- the disk's room: free space plus evictable content, minus `minFreeDisk`.
+
+`node usage` shows the room under `checkpoints`, beside the bytes of the
+`local` checkpoints suspended there. The manager computes those bytes from
+its own records, so the figure survives a worker restart. When the disk is
+what limits the room, the line says so with the numbers behind it:
+
+```console
+$ legion node usage w-03
+...
+checkpoints: 18.4 GiB suspended here, snapshots budget 19 GiB pinned of 50 GiB (2.5 GiB free, limited by disk: 6.5 GiB free + 1 GiB evictable - 5 GiB minFreeDisk)
 ```
 
-A node that has not reported a budget (an older worker, or a manager that
-just started) is treated as having room. An instance that failed to place
-for a full budget stays `pending` until its job is evaluated again, like any
-placement that failed for capacity.
+The worker page in the UI shows the same room under the `snapshots` bar of
+its content card.
+
+When a node's checkpoint room is smaller than one more checkpoint of a
+task, the scheduler does not place **new** instances of that task on the
+node. This applies only to tasks whose `suspend` block checkpoints memory. A
+checkpoint's size is estimated as the guest's memory (`config.memory_mib`,
+else `resources.memoryMax`, else `resources.memory`). Resumes and other
+restores are never held back, since their checkpoint already exists. When no
+node has room, placement fails with a count of which limit was short:
+
+```text
+Failed to place task workspace: 4 eligible node(s), but none has 1024 MiB of room for this task's memory checkpoint (suspend): 3 short on the snapshots content budget, 1 short on disk (free space plus evictable content, less content.minFreeDisk). Raise content.budgets.snapshots or free disk on those workers, delete snapshots you no longer need (`legion snapshot list`), or resume or destroy suspended instances to release their checkpoints. `legion node usage <node>` shows each node's checkpoint room
+```
+
+A node that has not reported (a manager that just started, or a worker
+without a content store) is treated as having room. An instance that failed
+to place for lack of room stays `pending` until its job is evaluated again,
+like any placement that failed for capacity.
 
 ## Durability: surviving the node
 
@@ -684,6 +712,11 @@ contentStore = { url = "s3://legion-content-usw2/" },
    records each part's URL, and `snapshot.published` is emitted with the bytes
    sent and the time it took. `instance list` shows the checkpoint as
    `(memory, published)`.
+4. The node unpins its copy of the parts. They stay in its content store,
+   but as ordinary cache entries: LRU within the `snapshots` budget, the idle
+   TTL, and `minFreeDisk` can evict them to make room for other work. The
+   node stops counting the checkpoint as suspended there in `node usage`,
+   and its bytes no longer count as pinned against the budget.
 
 From then on:
 
@@ -695,12 +728,15 @@ From then on:
   that could not run the guest is never chosen,
   and the [`locality` score](artifacts.md#content-locality) prefers a node
   that already holds the parts. With weights otherwise equal, that is the
-  node that took the checkpoint, while it lives.
+  node that took the checkpoint, while it still holds them.
 - **The new node fetches the parts first.** A part missing from its node
   content store is fetched from its URL through the node's ordinary artifact
   fetchers (`s3://` or `file://`), verified against its digest, and stored in
   the content store before the restore starts. The allocation shows
-  `fetching snapshot` meanwhile.
+  `fetching snapshot` meanwhile. This includes the node that took the
+  checkpoint, when its copy was evicted: it fetches the parts back like any
+  other node. Parts that are present are pinned to the restoring allocation
+  until it has started, so they cannot be evicted mid-restore.
 - **Losing the node no longer loses the checkpoint.** A resume does not wait
   for a node that is down, and removing a node from the cluster marks its
   `local` snapshots `lost` but leaves `published` ones alone.
@@ -1492,10 +1528,12 @@ On the node, a memory capture writes the VMM's memory and state files into the
 content store's staging directory, then moves each one into the store's
 `snapshots` class, pinned to the snapshot id and verified against the digest
 the capture recorded. A restore re-verifies each part (rehashing it) and
-hardlinks it into the new allocation. A snapshot's pinned parts are never
-evicted, and they count toward `content.budgets.snapshots` (50 GiB by
-default). A capture that would go over the budget fails with an error naming
-it.
+hardlinks it into the new allocation. A `local` snapshot's pinned parts are
+never evicted, and they count toward `content.budgets.snapshots`. A capture
+that would go over the budget fails with an error naming it. Once a
+snapshot is published, the node drops its pins and the parts become
+evictable cache entries. Deleting a snapshot removes its parts from the
+capturing node either way.
 
 A disk capture is the volume driver's `snapshot` op. For `local-dir` that is a
 reflink on btrfs, XFS, and APFS, and a sparse copy elsewhere. The copy lives
@@ -1609,7 +1647,8 @@ See [metrics](metrics.md#suspend-and-resume).
 | `instance.suspend_failed` | The capture failed on the node (content store disabled or full, the VMM API failed) | Read `detail` or the event's `error`. The instance keeps running |
 | Instance stuck `pending (resuming)` | The checkpoint's node is down or full, and nothing there can be suspended to make room | Wait, `instance start --cold`, or let `resumeTimeout` boot it cold. To keep room for resumes, see [Capacity for resumes](#capacity-for-resumes) |
 | `legion_make_room_suspends_total{outcome="no_room"}` rising | Resumes wait on nodes whose instances are not eligible to make room (no `suspend` block, not opted in, a more important band, or active under two minutes) | Set `onPressure = true` or an idle policy on the work sharing those nodes, or hold a share with `suspend.reserve` |
-| Placement fails: `every one's snapshots content budget is full` | Suspended checkpoints fill `content.budgets.snapshots` on every eligible node | Raise the budget, delete old snapshots, or resume or destroy suspended instances |
+| Placement fails: `none has ... MiB of room for this task's memory checkpoint` | Every eligible node is short on its `snapshots` budget (pinned `local` checkpoints fill it) or on disk (free space plus evictable content is under `minFreeDisk` plus one checkpoint). The message counts each | Raise the budget, free disk, delete old snapshots, or resume or destroy suspended instances. `legion node usage <node>` shows which limit binds |
+| Resume of a `published` checkpoint fails: `fetching part ... from its content store` | The node's copy was evicted after publishing (or it never had one), and the `contentStore` is unreachable from it | Fix the store's reachability or credentials. The checkpoint itself is intact |
 | Submit: `suspend.reserve ... is out of range` or `exceeds the task's resources` | A ratio outside 0 to 1, or an amount larger than the reservation | Follow the hint |
 | `instance start`: `cannot resume: checkpoint ... is lost` | The node holding it was removed, and `onRestoreFailure = "fail"` | `legion instance start <id> --cold` |
 | `detail: idle-unmeasured: ...` | The node sends no usage reports, so nothing measures activity | Set `resourceEnforcement.enabled` on the worker type |
@@ -1743,6 +1782,17 @@ See [metrics](metrics.md#suspend-and-resume).
   check is per placement and estimates a checkpoint at the guest's full
   memory size, so a plan placing many instances at once can still overfill a
   budget that had room for one.
+- **The disk half of the room check is a heartbeat old.** Free space is
+  read when the worker builds its report, so a disk that fills between two
+  heartbeats is seen on the next one. Evictable content counts as room, but
+  an evicted blob that a running restore still hardlinks frees nothing, so
+  the room can be slightly overstated.
+- **A resume is not checked for room.** A `published` checkpoint resuming on
+  a node that lacks its parts must fetch them, and that fetch can fail on a
+  node with no room left. The placement does not yet look for a node with
+  room for the parts.
+- **Share budgets are sized at worker start.** Growing or shrinking the disk
+  under a running worker changes nothing until the worker restarts.
 
 ## Reference
 

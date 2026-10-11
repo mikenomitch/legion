@@ -126,7 +126,7 @@ export const pressuredNode = new GetNodeUsageReply({
     heldMemoryMib: 512,
     heldCpuMhz: 250,
     checkpointBytes: 1100n * MIB,
-    snapshotBudget: new SnapshotBudget({ budgetBytes: 20n * 1024n * MIB, usedBytes: 6n * 1024n * MIB, pinnedBytes: 1100n * MIB }),
+    snapshotBudget: new SnapshotBudget({ budgetBytes: 20n * 1024n * MIB, usedBytes: 6n * 1024n * MIB, pinnedBytes: 1100n * MIB, diskFreeBytes: 180n * 1024n * MIB, minFreeDiskBytes: 5n * 1024n * MIB, reclaimableBytes: 4n * 1024n * MIB }),
   }),
   sampledAtUnixMs: BigInt(Date.now() - 4000),
   reportAgeSeconds: 4n,

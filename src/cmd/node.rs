@@ -896,14 +896,26 @@ fn render_suspended_capacity(reply: &GetNodeUsageReply) -> String {
         out.push('\n');
     }
     if let Some(budget) = suspended.snapshot_budget.as_ref() {
-        let room = budget.budget_bytes.saturating_sub(budget.pinned_bytes);
+        use crate::storage::content_index::{checkpoint_room, RoomLimit};
+        let room = checkpoint_room(budget);
+        // When the disk, not the budget, is what binds, say so with the
+        // numbers behind it.
+        let disk = match (room.limit, budget.disk_free_bytes) {
+            (RoomLimit::Disk, Some(free)) => format!(
+                ", limited by disk: {} free + {} evictable - {} minFreeDisk",
+                human_bytes(free),
+                human_bytes(budget.reclaimable_bytes),
+                human_bytes(budget.min_free_disk_bytes)
+            ),
+            _ => String::new(),
+        };
         out.push_str(&format!(
-            "checkpoints: {} suspended here, snapshots budget {} pinned of {} ({} free{})\n",
+            "checkpoints: {} suspended here, snapshots budget {} pinned of {} ({} free{disk}{})\n",
             human_bytes(suspended.checkpoint_bytes),
             human_bytes(budget.pinned_bytes),
             human_bytes(budget.budget_bytes),
-            human_bytes(room),
-            if room == 0 {
+            human_bytes(room.bytes),
+            if room.bytes == 0 {
                 ", FULL: no new memory-checkpoint instances placed here"
             } else {
                 ""
@@ -1424,6 +1436,9 @@ mod tests {
                     budget_bytes: 50 * GIB,
                     used_bytes: 12 * GIB,
                     pinned_bytes: 12 * GIB,
+                    disk_free_bytes: Some(400 * GIB),
+                    min_free_disk_bytes: 5 * GIB,
+                    reclaimable_bytes: 0,
                 }),
             }),
             ..Default::default()
@@ -1450,6 +1465,24 @@ mod tests {
         let out = render_node_usage(&full, 1_000);
         assert!(
             out.contains("FULL: no new memory-checkpoint instances"),
+            "{out}"
+        );
+
+        // A nearly full disk binds before the budget does.
+        let mut tight = reply.clone();
+        if let Some(budget) = tight
+            .suspended
+            .as_mut()
+            .and_then(|suspended| suspended.snapshot_budget.as_mut())
+        {
+            budget.disk_free_bytes = Some(9 * GIB);
+            budget.reclaimable_bytes = GIB;
+        }
+        let out = render_node_usage(&tight, 1_000);
+        assert!(
+            out.contains(
+                "(5 GiB free, limited by disk: 9 GiB free + 1 GiB evictable - 5 GiB minFreeDisk)"
+            ),
             "{out}"
         );
 

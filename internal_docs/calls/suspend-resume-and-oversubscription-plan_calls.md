@@ -3187,3 +3187,124 @@ from inside the start, and a restore failure follows `onRestoreFailure`. Both
 need the manager state the lock guards. Moving that across the unlocked
 handoff is a real change to restore's failure handling, not a merge fix, so
 it is a TODO item under the audit's W3 follow-up instead.
+
+> **Entries 131 and later are appended, not ranked in.** TODO.md and the
+> plan cite entries 1 to 130 by number in many places, so renumbering to
+> insert the content-store follow-ups at their rank would break those
+> citations for little gain. Treat 131 onward as unranked against the
+> entries above, and ranked among themselves.
+
+## 131. Published checkpoints are unpinned on their node (content-store follow-up)
+
+**Call.** When a checkpoint's upload succeeds, the worker that captured it
+releases the snapshot's pins on its parts. The bytes stay in the node
+content store as ordinary cache entries, still advertised to the location
+index, so locality keeps steering a resume there until the evictor takes
+them. A restore of a published snapshot always goes through the fetch step,
+on the capturing node too: present parts are pinned to the restoring
+allocation in one atomic step (`ContentStore::pin_if_present`), missing ones
+are fetched from their URL. `node usage` stops counting the checkpoint as
+"suspended here".
+
+**Alternatives.** (a) Keep published parts pinned until the instance resumes
+or the snapshot is deleted (the old behavior). (b) Unpin only once the
+manager stops re-sending `op = publish`, which is the manager's implicit
+acknowledgement that the snapshot is `published`. (c) Delete the local copy
+outright after publishing.
+
+**Trade-off.** A resume on the capturing node can now pay for a download it
+would not have paid before, if LRU or `minFreeDisk` took its copy. A restore
+of a published snapshot always runs on the staging thread, even when every
+part is local. And the worker unpins on its own upload result, not on the
+manager's state change: in the one case where the manager ignores a
+successful report (the snapshot was already being deleted) the pins are gone
+early, which the delete then cleans up anyway.
+
+**Why (performance, simplicity).** The point of `durability = "store"` is
+that the node's copy is a cache, and a pinned cache entry is just a leak:
+with (a) a node parking hundreds of published sandboxes filled its
+`snapshots` budget with bytes that already lived in S3, and the placement
+filter then kept new sandboxes off it. (b) is more exact but needs a worker
+restart story (the in-memory `done` map is lost, so a pin could leak
+forever), for a window the manager's own rules already make harmless. (c)
+throws away the locality win for the common case of resuming where you
+suspended.
+
+## 132. Checkpoint room counts evictable content as disk room (content-store follow-up)
+
+**Call.** The scheduler's room for a new checkpoint is
+`min(budget - pinned, disk_free + reclaimable - minFreeDisk)`, where
+`reclaimable` is every unpinned byte in the store, all classes. The worker
+reports `disk_free_bytes`, `min_free_disk_bytes`, and `reclaimable_bytes`
+beside the budget on each heartbeat. The placement error counts how many
+nodes were short on each limit:
+
+```text
+... none has 1024 MiB of room for this task's memory checkpoint (suspend): 3 short on the snapshots content budget, 1 short on disk (free space plus evictable content, less content.minFreeDisk) ...
+```
+
+**Alternatives.** (a) The request as written: `disk_free - minFreeDisk`,
+with no credit for evictable content. (b) Report a single precomputed "room"
+number from the worker. (c) Check the disk against the node's fingerprinted
+free space, which the scheduler already has.
+
+**Trade-off.** One more proto field than asked for, and the room is slightly
+optimistic when an evicted blob is still hardlinked into a running restore,
+since unlinking it frees nothing.
+
+**Why (simplicity for operators).** The store evicts unpinned content of any
+class before it breaches `minFreeDisk`, so ignoring it (a) would turn a node
+into "no room" as soon as its cache filled the disk, which, with
+entry 131, is exactly what published checkpoints and warmed parts do. That is
+a false "full" an operator cannot act on. (b) would hide which limit binds,
+and the CLI and UI need the parts to say why. (c) is the wrong filesystem
+when the state directory is on its own disk, and it is refreshed less often.
+
+## 133. Budget defaults are clamped shares, and an operator's share is not (content-store follow-up)
+
+**Call.** `content.budgets.*` accepts a size or a percentage of the
+filesystem holding `<state dir>/content`, sized once at worker start.
+Unset budgets default to 10% clamped to 1..20 GiB (artifacts) and 20%
+clamped to 2..200 GiB (snapshots). A percentage the operator writes is not
+clamped. Shares that add up past 100%, defaults included, fail config load:
+
+```text
+content.budgets.artifacts (90%) and content.budgets.snapshots (20%, the default) together claim 110% of the disk. Keep their sum at or below 100%
+```
+
+**Alternatives.** (a) Clamp an explicit share with the same range. (b) A
+richer syntax (`{ share = "20%", max = "500GiB" }`). (c) Keep fixed defaults
+(20 GiB, 50 GiB) and only add the percentage syntax. (d) Re-measure the disk
+periodically.
+
+**Trade-off.** Writing `snapshots = "20%"` is not the same as leaving it
+unset on a disk over 1 TiB, which is surprising. The shipped
+`configs/workers/default.ncl` therefore leaves the budgets commented out, and
+a test checks it keeps the defaults. A disk that changes size takes effect
+only on worker restart.
+
+**Why (simplicity).** The fixed defaults were wrong at both ends: 50 GiB of
+checkpoints overran a 40 GB root disk, and capped a 2 TB NVMe node at a
+fraction of what it could park. Shares fit both, and the clamps keep tiny and
+huge disks sensible. An operator who writes a share has decided on the
+number, so silently capping it (a) would be worse than the surprise above,
+and (b) adds a config shape for a need nobody has shown. Sizing once matches
+when the store opens and keeps the budget stable for a running worker.
+
+## 134. A resume is still not checked for room for its parts (content-store follow-up)
+
+**Call.** The new disk-aware room check, like the budget check before it,
+filters only fresh placements of memory-suspend tasks. A published resume
+onto a node that lacks its parts is not checked, even though the fetch now
+has to fit.
+
+**Alternatives.** Filter floating restores by room for the snapshot's
+`total_bytes` on nodes that do not advertise its parts.
+
+**Trade-off.** A published resume can land on a node with no room and fail
+in the fetch, then follow `onRestoreFailure`.
+
+**Why (scope).** It needs the scheduler to treat restore candidates
+differently by locality, which touches the restore binder and the
+per-instance compat filter. With entry 131 most capturing nodes still hold
+the parts, which locality prefers. It is a TODO item.

@@ -2952,10 +2952,14 @@ impl WorkerTaskManager {
         })))
     }
 
-    /// The manifest of the snapshot `allocation_id` restores from, when it
-    /// has memory parts this node's content store lacks. `None` for every
-    /// allocation that is not restoring, and for a restore whose parts are
-    /// all here (a resume on the node that took the checkpoint). An
+    /// The manifest of the snapshot `allocation_id` restores from, when its
+    /// memory parts must go through the fetch step: some are missing from
+    /// this node's content store, or the snapshot is published. A published
+    /// snapshot's parts are unpinned everywhere, the capturing node
+    /// included, so even when they are all here the fetch step pins them to
+    /// the allocation until it has started, and refetches any evicted in
+    /// between. `None` for every allocation that is not restoring, and for a
+    /// local snapshot whose parts are all here (pinned to the snapshot). An
     /// unreadable manifest is left for the restore itself to report.
     fn restore_parts_to_fetch(
         &self,
@@ -2964,6 +2968,7 @@ impl WorkerTaskManager {
         let restore = self.checkpoints.restores.get(&allocation_id)?;
         let manifest =
             crate::structs::checkpoint::SnapshotManifest::from_json(&restore.manifest_json).ok()?;
+        let published = manifest.memory.iter().any(|part| part.url.is_some());
         let store = self.content_store.as_deref();
         let missing = manifest.memory.iter().any(|part| {
             let Ok(digest) = crate::content_store::ContentDigest::parse(&part.digest) else {
@@ -2971,7 +2976,7 @@ impl WorkerTaskManager {
             };
             !store.is_some_and(|store| store.contains(&digest).unwrap_or(false))
         });
-        missing.then_some(manifest)
+        (published || missing).then_some(manifest)
     }
 
     /// Drop the pins a cross-node restore held on its fetched parts while
@@ -5099,6 +5104,96 @@ mod tests {
             "the fetch pins are released once the allocation started"
         );
         stop_and_reap(&node_b);
+        Ok(())
+    }
+
+    /// Publishing unpins the parts on the node that captured them, so its
+    /// content store can evict them like any cache entry. A resume there
+    /// afterwards pins what is still present and fetches what was evicted,
+    /// exactly as on a node that never held them. A delete then frees the
+    /// unpinned parts at once.
+    #[test]
+    fn a_published_snapshot_is_unpinned_and_restores_at_home_after_eviction() -> R<()> {
+        let shared = TempDir::new()?;
+        let node_dir = TempDir::new()?;
+        let node = worker_with_store(&node_dir, Some(shared.path()))?;
+        let store = node.lock().unwrap().content_store().expect("store");
+        let owner = crate::content_store::PinOwner::snapshot("snap-home");
+        let bytes = b"guest memory page ".repeat(64 * 1024);
+        let entry = store.put_bytes(
+            crate::content_store::ContentClass::Snapshots,
+            &bytes,
+            crate::content_store::PutOptions::default().pin(owner.clone()),
+        )?;
+        let captured = json!({
+            "apiVersion": 1, "id": "snap-home", "jobId": "agent-sandboxes",
+            "task": "workspace", "originAllocId": 80, "runtime": "exec", "kind": "disk",
+            "createdAt": "2026-10-10T00:00:00Z",
+            "memory": [{
+                "role": "scratch", "file": "scratch.bin",
+                "digest": entry.digest.as_str(), "size": bytes.len(),
+            }],
+        });
+        let usage_pinned = |store: &crate::content_store::ContentStore| -> R<u64> {
+            Ok(store
+                .usage()?
+                .into_iter()
+                .find(|class| class.class == crate::content_store::ContentClass::Snapshots)
+                .map_or(0, |class| class.pinned_bytes))
+        };
+        assert_eq!(usage_pinned(&store)?, bytes.len() as u64);
+
+        let publish = crate::structs::CheckpointRequest {
+            snapshot_id: "snap-home".into(),
+            op: "publish".into(),
+            kind: "disk".into(),
+            purpose: "suspend".into(),
+            manifest_json: captured.to_string(),
+            ..Default::default()
+        };
+        node.lock()
+            .unwrap()
+            .checkpoints_mut()
+            .accept(std::slice::from_ref(&publish));
+        crate::worker::checkpoints::run_request(&node, &publish);
+        let report = next_report(&node, "publish");
+        assert!(report.ok, "{}", report.error);
+        assert!(store.contains(&entry.digest)?, "the bytes stay");
+        assert!(store.pins(&entry.digest)?.is_empty(), "the pin goes");
+        assert_eq!(usage_pinned(&store)?, 0, "no longer counted as pinned");
+
+        // The evictor takes the unpinned part, then the instance resumes here.
+        assert!(store.remove(&entry.digest)?);
+        let restore = TaskAllocation {
+            restore: Some(crate::structs::SnapshotRestore {
+                snapshot_id: "snap-home".into(),
+                kind: "disk".into(),
+                manifest_json: report.manifest_json.clone(),
+                on_resume: Vec::new(),
+                ..Default::default()
+            }),
+            ..provisional_payload(81)
+        };
+        launch_task_allocation(&node, &restore)?;
+        let restored = next_report(&node, "restore");
+        assert!(restored.ok, "{}", restored.error);
+        assert_eq!(store.verify(&entry.digest)?.size, bytes.len() as u64);
+        assert!(
+            store.pins(&entry.digest)?.is_empty(),
+            "the restore's pin is released once the allocation started"
+        );
+        stop_and_reap(&node);
+
+        // Deleting the snapshot frees its unpinned part on this node.
+        let delete = crate::structs::CheckpointRequest {
+            snapshot_id: "snap-home".into(),
+            op: "delete".into(),
+            manifest_json: report.manifest_json.clone(),
+            ..Default::default()
+        };
+        let deleted = crate::worker::checkpoints::run_delete(&node, &delete);
+        assert!(deleted.ok, "{}", deleted.error);
+        assert!(!store.contains(&entry.digest)?);
         Ok(())
     }
 

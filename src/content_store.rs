@@ -21,12 +21,14 @@
 //!   [`ContentClass`] (`artifacts` or `snapshots`), and each class has its own
 //!   byte budget. Eviction for a class only ever removes entries of that
 //!   class, so a 4 GiB memory file cannot push every cached artifact off the
-//!   node.
+//!   node. A budget is configured as a size or a share of the filesystem
+//!   ([`BudgetSpec`]), and the worker sizes shares when it opens the store.
 //! - **LRU within a class.** When a put would take a class over budget, the
 //!   least recently used *unpinned* entries of that class are evicted first.
 //! - **TTL.** [`ContentStore::gc`] also removes unpinned entries that have not
 //!   been used for the configured TTL, even under budget.
-//! - **Pins.** A [`PinOwner`] (a snapshot id, an allocation) pins a digest.
+//! - **Pins.** A [`PinOwner`] (a local snapshot, an allocation mid-restore)
+//!   pins a digest. A snapshot's pins are released once it is published.
 //!   Neither LRU, TTL, nor [`ContentStore::remove`] touches a pinned entry.
 //!   Pinned bytes still count toward their class budget, so a class whose
 //!   budget is entirely pinned refuses new puts with an explicit error.
@@ -77,10 +79,28 @@ use sha2::{Digest as _, Sha256};
 
 use crate::prelude::*;
 
-/// Default `content.budgets.artifacts`.
-pub const DEF_CONTENT_ARTIFACTS_BUDGET: &str = "20GiB";
-/// Default `content.budgets.snapshots`.
-pub const DEF_CONTENT_SNAPSHOTS_BUDGET: &str = "50GiB";
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Default `content.budgets.artifacts`: 10% of the content filesystem,
+/// clamped to 1 GiB..20 GiB. Artifacts are a cache whose misses cost one
+/// refetch, so a large disk gains little past 20 GiB, and below 1 GiB a
+/// single model or toolchain image would not fit.
+pub const DEF_CONTENT_ARTIFACTS_BUDGET: BudgetSpec = BudgetSpec::Share {
+    percent: 10.0,
+    min: GIB,
+    max: 20 * GIB,
+};
+/// Default `content.budgets.snapshots`: 20% of the content filesystem,
+/// clamped to 2 GiB..200 GiB. Memory checkpoints are pinned while their
+/// instance is suspended, so this is the share a node gives to suspended
+/// guests. 2 GiB holds one small guest's checkpoint. The 200 GiB cap keeps a
+/// multi-terabyte data disk mostly for volumes unless the operator says
+/// otherwise.
+pub const DEF_CONTENT_SNAPSHOTS_BUDGET: BudgetSpec = BudgetSpec::Share {
+    percent: 20.0,
+    min: 2 * GIB,
+    max: 200 * GIB,
+};
 /// Default `content.ttl`: unpinned entries unused this long are removed.
 pub const DEF_CONTENT_TTL: &str = "72h";
 /// Default `content.minFreeDisk`.
@@ -233,6 +253,129 @@ impl fmt::Display for PinOwner {
     }
 }
 
+/// One class budget as configured: a fixed size (`"50GiB"`) or a share of
+/// the filesystem holding the store (`"20%"`). A share is resolved once, when
+/// the worker opens its store, against that filesystem's total size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BudgetSpec {
+    /// A fixed number of bytes.
+    Bytes(u64),
+    /// `percent` of the filesystem's total size, clamped to `min..=max`. An
+    /// operator's `"20%"` has no clamp (`0..=u64::MAX`), only the built-in
+    /// defaults carry one.
+    Share { percent: f64, min: u64, max: u64 },
+}
+
+impl BudgetSpec {
+    /// Parses a budget: a percentage (`"20%"`, `"12.5%"`, above 0 and at
+    /// most 100) or a byte size (`"50GiB"`).
+    pub fn parse(raw: &str) -> R<Self> {
+        let trimmed = raw.trim();
+        if let Some(number) = trimmed.strip_suffix('%') {
+            let percent: f64 = number
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid percentage {raw:?}"))?;
+            if !(percent > 0.0 && percent <= 100.0) {
+                bail!("percentage {raw:?} must be above 0% and at most 100%");
+            }
+            return Ok(BudgetSpec::Share {
+                percent,
+                min: 0,
+                max: u64::MAX,
+            });
+        }
+        Ok(BudgetSpec::Bytes(crate::structs::parse_byte_size(trimmed)?))
+    }
+
+    /// The share of the filesystem this budget claims, if it is a share.
+    pub fn percent(&self) -> Option<f64> {
+        match self {
+            BudgetSpec::Bytes(_) => None,
+            BudgetSpec::Share { percent, .. } => Some(*percent),
+        }
+    }
+
+    /// The budget in bytes on a filesystem of `filesystem_bytes` total.
+    pub fn resolve(&self, filesystem_bytes: u64) -> u64 {
+        match *self {
+            BudgetSpec::Bytes(bytes) => bytes,
+            BudgetSpec::Share { percent, min, max } => {
+                let share = (filesystem_bytes as f64 * percent / 100.0) as u64;
+                share.clamp(min, max.max(min))
+            }
+        }
+    }
+}
+
+impl fmt::Display for BudgetSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            BudgetSpec::Bytes(bytes) => write!(f, "{bytes} bytes"),
+            BudgetSpec::Share { percent, min, max } if min == 0 && max == u64::MAX => {
+                write!(f, "{percent}% of the disk")
+            }
+            BudgetSpec::Share { percent, min, max } => write!(
+                f,
+                "{percent}% of the disk, clamped to {} GiB..{} GiB",
+                min / GIB,
+                max / GIB
+            ),
+        }
+    }
+}
+
+/// Budgets as configured, before they are sized against a filesystem.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContentBudgetSpecs {
+    pub artifacts: BudgetSpec,
+    pub snapshots: BudgetSpec,
+}
+
+impl Default for ContentBudgetSpecs {
+    fn default() -> Self {
+        ContentBudgetSpecs {
+            artifacts: DEF_CONTENT_ARTIFACTS_BUDGET,
+            snapshots: DEF_CONTENT_SNAPSHOTS_BUDGET,
+        }
+    }
+}
+
+/// Store settings as configured (worker config `content`, defaults applied,
+/// validated), before shares are sized against the content filesystem.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentStoreSettings {
+    pub budgets: ContentBudgetSpecs,
+    pub ttl: Option<Duration>,
+    pub min_free_disk: u64,
+}
+
+impl ContentStoreSettings {
+    /// The store config for a filesystem of `filesystem_bytes` total. `None`
+    /// (the size could not be read) is only an error when a budget is a
+    /// share.
+    pub fn config_for(&self, filesystem_bytes: Option<u64>) -> R<ContentStoreConfig> {
+        let size = |class: ContentClass, spec: BudgetSpec| -> R<u64> {
+            match (spec, filesystem_bytes) {
+                (BudgetSpec::Bytes(bytes), _) => Ok(bytes),
+                (spec, Some(total)) => Ok(spec.resolve(total)),
+                (spec, None) => bail!(
+                    "content.budgets.{class} is {spec}, but the size of the content \
+                     filesystem could not be read. Set a fixed size such as \"20GiB\""
+                ),
+            }
+        };
+        Ok(ContentStoreConfig {
+            budgets: ContentBudgets {
+                artifacts: size(ContentClass::Artifacts, self.budgets.artifacts)?,
+                snapshots: size(ContentClass::Snapshots, self.budgets.snapshots)?,
+            },
+            ttl: self.ttl,
+            min_free_disk: self.min_free_disk,
+        })
+    }
+}
+
 /// Byte budget per class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContentBudgets {
@@ -249,7 +392,8 @@ impl ContentBudgets {
     }
 }
 
-/// Resolved store settings (worker config `content`, with defaults applied).
+/// Resolved store settings: [`ContentStoreSettings`] sized against the
+/// content filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentStoreConfig {
     pub budgets: ContentBudgets,
@@ -261,13 +405,15 @@ pub struct ContentStoreConfig {
     pub min_free_disk: u64,
 }
 
+/// The built-in defaults as they resolve on a 1 TiB filesystem (both shares
+/// hit their caps). Fixed numbers, so tests do not depend on the disk they
+/// run on.
 impl Default for ContentStoreConfig {
     fn default() -> Self {
-        const GIB: u64 = 1024 * 1024 * 1024;
         ContentStoreConfig {
             budgets: ContentBudgets {
                 artifacts: 20 * GIB,
-                snapshots: 50 * GIB,
+                snapshots: 200 * GIB,
             },
             ttl: Some(Duration::from_secs(72 * 3600)),
             min_free_disk: 5 * GIB,
@@ -431,6 +577,12 @@ impl ContentStore {
 
     pub fn config(&self) -> &ContentStoreConfig {
         &self.config
+    }
+
+    /// Free bytes on the filesystem holding the store, as `minFreeDisk`
+    /// measures them. `None` when the platform cannot say.
+    pub fn free_disk_bytes(&self) -> Option<u64> {
+        (self.free_space)(&self.root)
     }
 
     /// Where the blob for `digest` lives (whether or not it is present).
@@ -861,6 +1013,19 @@ impl ContentStore {
         insert_pin(&inner.db, digest, owner, now_secs())
     }
 
+    /// Pins `digest` for `owner` if the store holds it, in one step, so
+    /// eviction cannot slip between a presence check and the pin. Returns
+    /// whether it pinned. Unlike [`Self::pin`], absence is not an error: the
+    /// caller fetches the bytes instead.
+    pub fn pin_if_present(&self, digest: &ContentDigest, owner: &PinOwner) -> R<bool> {
+        let inner = self.inner.lock().expect("content store");
+        if self.load_entry(&inner.db, digest)?.is_none() {
+            return Ok(false);
+        }
+        insert_pin(&inner.db, digest, owner, now_secs())?;
+        Ok(true)
+    }
+
     /// Removes one pin. Returns whether it existed. The entry stays and
     /// becomes an eviction candidate once no pins remain.
     pub fn unpin(&self, digest: &ContentDigest, owner: &PinOwner) -> R<bool> {
@@ -1214,8 +1379,21 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-#[cfg(unix)]
 fn free_bytes(path: &Path) -> Option<u64> {
+    statvfs(path).map(|(_, free)| free)
+}
+
+/// Total size in bytes of the filesystem holding `path`, which must exist.
+/// What share budgets (`content.budgets.snapshots = "20%"`) are sized
+/// against. `None` when the platform cannot say.
+pub fn filesystem_bytes(path: &Path) -> Option<u64> {
+    statvfs(path).map(|(total, _)| total)
+}
+
+/// `(total, available to unprivileged users)` bytes of the filesystem
+/// holding `path`.
+#[cfg(unix)]
+fn statvfs(path: &Path) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -1227,11 +1405,13 @@ fn free_bytes(path: &Path) -> Option<u64> {
         return None;
     }
     #[allow(clippy::unnecessary_cast)]
-    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+    let frsize = stat.f_frsize as u64;
+    #[allow(clippy::unnecessary_cast)]
+    Some((stat.f_blocks as u64 * frsize, stat.f_bavail as u64 * frsize))
 }
 
 #[cfg(not(unix))]
-fn free_bytes(_path: &Path) -> Option<u64> {
+fn statvfs(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -1549,6 +1729,44 @@ mod tests {
         assert_eq!(store.pins(&kept.digest)?, vec![owner]);
         assert!(!store.contains(&lost.digest)?, "row without blob dropped");
         assert!(!stray.exists(), "blob without row deleted");
+        Ok(())
+    }
+
+    #[test]
+    fn pin_if_present_pins_only_what_is_there() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let store = open(dir.path(), config(1000, 1000));
+        let owner = PinOwner::allocation(9);
+        let entry = store.put_bytes(ContentClass::Snapshots, b"part", PutOptions::default())?;
+        assert!(store.pin_if_present(&entry.digest, &owner)?);
+        assert_eq!(store.pins(&entry.digest)?, vec![owner.clone()]);
+        let absent = ContentDigest::of_bytes(b"evicted");
+        assert!(!store.pin_if_present(&absent, &owner)?);
+        assert!(store.pins(&absent)?.is_empty(), "no dangling pin");
+        Ok(())
+    }
+
+    #[test]
+    fn budget_specs_parse_and_size_against_the_disk() -> R<()> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(BudgetSpec::parse("50GiB")?, BudgetSpec::Bytes(50 * GIB));
+        assert_eq!(BudgetSpec::parse("25%")?.resolve(400 * GIB), 100 * GIB);
+        assert!(BudgetSpec::parse("0%").is_err());
+        assert!(BudgetSpec::parse("100.5%").is_err());
+        // Defaults clamp, an operator's share does not.
+        assert_eq!(DEF_CONTENT_SNAPSHOTS_BUDGET.resolve(GIB), 2 * GIB);
+        assert_eq!(
+            DEF_CONTENT_SNAPSHOTS_BUDGET.resolve(10_000 * GIB),
+            200 * GIB
+        );
+        assert_eq!(BudgetSpec::parse("20%")?.resolve(10_000 * GIB), 2_000 * GIB);
+        assert_eq!(
+            DEF_CONTENT_ARTIFACTS_BUDGET.to_string(),
+            "10% of the disk, clamped to 1 GiB..20 GiB"
+        );
+        // A real filesystem has a size.
+        #[cfg(unix)]
+        assert!(filesystem_bytes(&std::env::temp_dir()).is_some_and(|total| total > 0));
         Ok(())
     }
 

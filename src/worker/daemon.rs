@@ -638,7 +638,7 @@ fn parse_artifacts_payload(
     raw: &str,
 ) -> R<(
     crate::structs::WorkerArtifactFetchConfigFull,
-    Option<crate::content_store::ContentStoreConfig>,
+    Option<crate::content_store::ContentStoreSettings>,
     Option<crate::content_publish::ContentStoreTarget>,
 )> {
     let payload: crate::structs::WorkerArtifactsPayload = if raw.trim().is_empty() {
@@ -688,17 +688,37 @@ fn build_content_publishing(
 /// lingers.
 const CONTENT_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Opens the node content store and starts its GC loop. A store that cannot
-/// open is logged and skipped: artifacts then stage straight from origin,
-/// which is slower but correct.
+/// Opens the node content store and starts its GC loop. Share budgets
+/// (`"20%"`) are sized here, once, against the filesystem holding `dir`. A
+/// store that cannot open is logged and skipped: artifacts then stage
+/// straight from origin, which is slower but correct.
 fn open_content_store(
     dir: &Path,
-    config: Option<crate::content_store::ContentStoreConfig>,
+    settings: Option<crate::content_store::ContentStoreSettings>,
 ) -> Option<Arc<crate::content_store::ContentStore>> {
-    let Some(config) = config else {
+    let Some(settings) = settings else {
         info!("Node content store disabled by worker config");
         return None;
     };
+    // The directory must exist before its filesystem can be measured.
+    let _ = std::fs::create_dir_all(dir);
+    let filesystem_bytes = crate::content_store::filesystem_bytes(dir);
+    let config = match settings.config_for(filesystem_bytes) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(error = ?err, dir = %dir.display(), "Cannot size the node content store; \
+                artifacts will not be cached");
+            return None;
+        }
+    };
+    info!(
+        dir = %dir.display(),
+        filesystem_bytes = filesystem_bytes.unwrap_or(0),
+        artifacts_budget_bytes = config.budgets.artifacts,
+        snapshots_budget_bytes = config.budgets.snapshots,
+        min_free_disk_bytes = config.min_free_disk,
+        "Sized node content store budgets"
+    );
     let store = match crate::content_store::ContentStore::open(dir, config) {
         Ok(store) => Arc::new(store),
         Err(err) => {

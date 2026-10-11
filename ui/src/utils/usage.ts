@@ -1,5 +1,5 @@
 import { Code, ConnectError } from '@connectrpc/connect'
-import type { AllocationUsage, GetNodeUsageReply, MemoryPressureStatus, NodeAllocationUsage, NodeResourceUsage } from '../gen/legion_pb'
+import type { AllocationUsage, GetNodeUsageReply, MemoryPressureStatus, NodeAllocationUsage, NodeResourceUsage, SnapshotBudget } from '../gen/legion_pb'
 import { managerClient } from '../grpcClient'
 import { formatBytes } from './format'
 import type { Tone } from './status'
@@ -255,14 +255,39 @@ export const cpuCapacityLabel = (cpu: NodeResourceUsage): string | undefined => 
 export const usedCoresLabel = (cpu: NodeResourceUsage): string => `${(Number(cpu.usedMillicores) / 1000).toFixed(2)} cores`
 
 /**
- * The `snapshots` content budget a worker reports on GetNodeUsage, shaped
- * for the content card. Pinned bytes (live suspend checkpoints) are part of
- * used. Empty when the node has not reported a budget.
+ * One content-store budget class for the worker page's content card. `note`
+ * is a line under the bar, and `tight` tints it as a warning.
  */
-export function snapshotBudgets(usage: GetNodeUsageReply | null | undefined): { name: string; usedBytes: number; budgetBytes: number }[] {
+export type ContentBudget = { name: string; usedBytes: number; budgetBytes: number; note?: string; tight?: boolean }
+
+/**
+ * Room for one more memory checkpoint on a node, as the scheduler computes
+ * it (proto `SnapshotBudget`): the smaller of the budget less what is
+ * pinned, and the disk's free space plus evictable content less
+ * `minFreeDisk`. Without disk numbers only the budget counts.
+ */
+export function checkpointRoom(budget: SnapshotBudget): { bytes: number; limitedBy: 'budget' | 'disk' } {
+  const budgetRoom = Math.max(0, Number(budget.budgetBytes) - Number(budget.pinnedBytes))
+  if (budget.diskFreeBytes === undefined) return { bytes: budgetRoom, limitedBy: 'budget' }
+  const diskRoom = Math.max(0, Number(budget.diskFreeBytes) + Number(budget.reclaimableBytes) - Number(budget.minFreeDiskBytes))
+  return diskRoom < budgetRoom ? { bytes: diskRoom, limitedBy: 'disk' } : { bytes: budgetRoom, limitedBy: 'budget' }
+}
+
+/**
+ * The `snapshots` content budget a worker reports on GetNodeUsage, shaped
+ * for the content card, with the room left for a new checkpoint. Pinned
+ * bytes (local suspend checkpoints) are part of used. Empty when the node
+ * has not reported a budget.
+ */
+export function snapshotBudgets(usage: GetNodeUsageReply | null | undefined): ContentBudget[] {
   const budget = usage?.suspended?.snapshotBudget
   if (!budget || Number(budget.budgetBytes) <= 0) return []
-  return [{ name: 'snapshots', usedBytes: Number(budget.usedBytes), budgetBytes: Number(budget.budgetBytes) }]
+  const room = checkpointRoom(budget)
+  const note =
+    room.limitedBy === 'disk'
+      ? `${formatBytes(room.bytes)} of room for a new checkpoint, limited by disk: ${formatBytes(Number(budget.diskFreeBytes))} free + ${formatBytes(Number(budget.reclaimableBytes))} evictable - ${formatBytes(Number(budget.minFreeDiskBytes))} minFreeDisk`
+      : `${formatBytes(room.bytes)} of room for a new checkpoint (${formatBytes(Number(budget.pinnedBytes))} pinned)`
+  return [{ name: 'snapshots', usedBytes: Number(budget.usedBytes), budgetBytes: Number(budget.budgetBytes), note, tight: room.bytes === 0 || room.limitedBy === 'disk' }]
 }
 
 /** "512 MiB and 250 MHz held", or undefined when nothing is held. */

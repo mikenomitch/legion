@@ -28,18 +28,32 @@
     # a content-addressed cache under <worker state dir>/content/. Artifacts
     # with a `checksum` are served from it on every allocation after the
     # first. Each class has its own budget, so checkpoint parts cannot evict
-    # cached artifacts. The values below are the defaults.
+    # cached artifacts. The values below are the defaults, except the
+    # budgets, which are left unset so the clamped default shares apply.
     content = {
         # false stages every artifact straight from origin.
         enabled = true,
+        # Each budget is a fixed size ("50GiB") or a share of the filesystem
+        # holding <worker state dir>/content/ ("20%"), sized once at worker
+        # start. An unset budget takes a default share clamped to a range.
+        # A share you set is not clamped, so writing "20%" here is not the
+        # same as leaving it unset. Shares, defaults included, must add up
+        # to at most 100%.
         budgets = {
-            artifacts = "20GiB",
-            snapshots = "50GiB",
+            # Unset: 10% of the disk, clamped to 1GiB..20GiB.
+            # artifacts = "20GiB",
+            # Unset: 20% of the disk, clamped to 2GiB..200GiB. Holds memory
+            # checkpoints: local ones pinned until resumed or deleted,
+            # published ones (suspend.durability = "store") as evictable
+            # cache entries.
+            # snapshots = "40%",
         },
         # Unpinned content unused this long is removed. "0s" disables expiry.
         ttl = "72h",
         # Evict unpinned content, then refuse new content, before the disk
-        # drops below this.
+        # drops below this. The scheduler counts it too: a node whose free
+        # disk (plus evictable content) less this floor cannot hold one more
+        # memory checkpoint takes no new memory-suspend instances.
         minFreeDisk = "5GiB",
     },
     # Where this worker publishes content by digest (docs/artifacts.md,

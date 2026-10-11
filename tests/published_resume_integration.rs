@@ -592,6 +592,62 @@ async fn a_published_resume_prefers_the_node_holding_its_parts() -> R<()> {
     Ok(())
 }
 
+/// Publishing releases the checkpoint from the node that captured it: the
+/// node's usage stops counting it as suspended there (the worker unpins the
+/// parts, so its content store may evict them), and a resume follows the
+/// parts wherever the location index says they are, the capturing node
+/// included only while it still advertises them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_published_checkpoint_leaves_its_node_and_resumes_where_its_parts_are() -> R<()> {
+    for (round, evicted_from_a) in [true, false].into_iter().enumerate() {
+        let cluster = Cluster::new()?;
+        let checkpoint = cluster.suspended_on_a("store").await?;
+        assert_eq!(
+            cluster.store().suspended_on_node(NODE_A)?,
+            (1, PART_BYTES),
+            "local until published"
+        );
+        cluster.published_by_a(&checkpoint).await?;
+        assert_eq!(
+            cluster.store().suspended_on_node(NODE_A)?,
+            (0, 0),
+            "a published checkpoint is no longer the node's"
+        );
+
+        cluster.add_node(NODE_B, CPU_MODEL, "us-west", false)?;
+        // A's copy was evicted after the unpin, and B fetched one (a warm, or
+        // an earlier resume). Or A still holds its copy and B has nothing.
+        if evicted_from_a {
+            cluster.advertise(NODE_A, &[]);
+            cluster.advertise(NODE_B, &[&digest()]);
+        } else {
+            cluster.advertise(NODE_A, &[&digest()]);
+            cluster.advertise(NODE_B, &[]);
+        }
+        let started = cluster.start().await?;
+        assert!(started.node_id.is_empty(), "not pinned to node A");
+        assert!(cluster.reschedule()?.is_empty());
+        let expected = if evicted_from_a { NODE_B } else { NODE_A };
+        assert_eq!(
+            cluster.node_of_instance()?.as_deref(),
+            Some(expected),
+            "round {round}"
+        );
+        // Wherever it lands, the restore carries the URLs to fetch from, so
+        // a node whose copy is gone (A included) can still restore.
+        let allocation_id = cluster.info().await?.current_alloc_id.context("placed")?;
+        let reply = cluster.heartbeat(expected, Vec::new()).await?;
+        let restore = reply
+            .desired_allocations
+            .iter()
+            .find(|allocation| allocation.allocation_id == allocation_id)
+            .and_then(|allocation| allocation.restore.clone())
+            .context("restore payload")?;
+        assert!(restore.manifest_json.contains(&url()));
+    }
+    Ok(())
+}
+
 /// A published memory checkpoint has no pin, so `compat` is checked on every
 /// candidate: an incompatible node is never chosen, and with only
 /// incompatible nodes the placement fails naming the attribute.

@@ -28,12 +28,19 @@ pub fn advertised_set(store: Option<&ContentStore>) -> R<HashMap<String, u64>> {
         .collect())
 }
 
-/// The store's `snapshots` budget class, for the report's
-/// `snapshot_budget` (docs/suspend-and-resume.md, "Capacity for resumes").
-/// `None` without a store, or when the store cannot be read: the manager
-/// then treats the node as having room rather than as full.
+/// The store's `snapshots` budget class and the disk under it, for the
+/// report's `snapshot_budget` (docs/suspend-and-resume.md, "Capacity for
+/// resumes"). `None` without a store, or when the store cannot be read: the
+/// manager then treats the node as having room rather than as full.
 pub fn snapshot_budget(store: Option<&ContentStore>) -> Option<SnapshotBudget> {
-    let usage = store?.usage().ok()?;
+    let store = store?;
+    let usage = store.usage().ok()?;
+    // Unpinned content of every class is what `minFreeDisk` eviction can
+    // free, so the manager counts it as room on the disk.
+    let reclaimable_bytes = usage
+        .iter()
+        .map(|class| class.used_bytes.saturating_sub(class.pinned_bytes))
+        .sum();
     usage
         .into_iter()
         .find(|class| class.class == ContentClass::Snapshots)
@@ -41,6 +48,9 @@ pub fn snapshot_budget(store: Option<&ContentStore>) -> Option<SnapshotBudget> {
             budget_bytes: class.budget,
             used_bytes: class.used_bytes,
             pinned_bytes: class.pinned_bytes,
+            disk_free_bytes: store.free_disk_bytes(),
+            min_free_disk_bytes: store.config().min_free_disk,
+            reclaimable_bytes,
         })
 }
 
@@ -191,7 +201,7 @@ mod tests {
                     snapshots: 8 * MIB,
                 },
                 ttl: None,
-                min_free_disk: 0,
+                min_free_disk: 3 * MIB,
             },
         )?;
         store.put_bytes(
@@ -209,14 +219,22 @@ mod tests {
             &vec![3u8; MIB as usize],
             PutOptions::default(),
         )?;
+        let budget = snapshot_budget(Some(&store)).expect("a budget");
         assert_eq!(
-            snapshot_budget(Some(&store)),
-            Some(SnapshotBudget {
+            budget,
+            SnapshotBudget {
                 budget_bytes: 8 * MIB,
                 used_bytes: 2 * MIB,
                 pinned_bytes: MIB,
-            })
+                // The real disk's free space, read alongside.
+                disk_free_bytes: budget.disk_free_bytes,
+                min_free_disk_bytes: 3 * MIB,
+                // The unpinned snapshot part and the artifact.
+                reclaimable_bytes: 2 * MIB,
+            }
         );
+        #[cfg(unix)]
+        assert!(budget.disk_free_bytes.is_some_and(|free| free > 0));
         Ok(())
     }
 

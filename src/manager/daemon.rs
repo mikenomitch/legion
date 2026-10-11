@@ -2964,6 +2964,25 @@ mod tests {
         }))?)
     }
 
+    /// The shipped worker config documents the content defaults without
+    /// overriding them: its budgets stay unset, so the clamped default
+    /// shares apply (an explicit "20%" would drop the clamp).
+    #[test]
+    fn the_default_worker_config_keeps_the_default_content_budgets_test() -> R<()> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/configs/workers/default.ncl");
+        let config = parse_worker_config(path)?;
+        let settings = config
+            .content
+            .context("content block")?
+            .resolve()?
+            .context("enabled")?;
+        assert_eq!(
+            settings.budgets,
+            crate::content_store::ContentBudgetSpecs::default()
+        );
+        Ok(())
+    }
+
     /// M2 regression: a manager whose gRPC listener cannot bind must exit
     /// with an error instead of running its eval loop and node checker
     /// headless, with no API and no raft transport.

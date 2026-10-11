@@ -345,9 +345,12 @@ export class WorkerConfig extends Message<WorkerConfig> {
    *
    * The worker config's top-level `content` block (the node content store,
    * see docs/artifacts.md) rides in this payload under a `content` key:
-   * `{"content":{"enabled":true,"budgets":{"artifacts":"20GiB",
-   *   "snapshots":"50GiB"},"ttl":"72h","minFreeDisk":"5GiB"}}`. Workers
-   * that predate the store ignore the key.
+   * `{"content":{"enabled":true,"budgets":{"artifacts":"10%",
+   *   "snapshots":"50GiB"},"ttl":"72h","minFreeDisk":"5GiB"}}`. A budget
+   * is a fixed size or a share of the filesystem holding the store, which
+   * the worker sizes when it starts. Absent budgets take the defaults: 10%
+   * clamped to 1..20 GiB for artifacts, 20% clamped to 2..200 GiB for
+   * snapshots.
    *
    * Default: empty string (worker applies conservative built-in defaults,
    * including an enabled content store).
@@ -9665,9 +9668,10 @@ export class ContentLocationReport extends Message<ContentLocationReport> {
   removed: string[] = [];
 
   /**
-   * The store's `snapshots` budget class, sent on every report whatever its
-   * epoch outcome, so the manager can show checkpoint headroom and keep new
-   * memory-checkpoint instances off a node whose budget is full.
+   * The store's `snapshots` budget class and the free space on its disk,
+   * sent on every report whatever its epoch outcome, so the manager can show
+   * checkpoint headroom and keep new memory-checkpoint instances off a node
+   * with no room for their checkpoint (see `SnapshotBudget`).
    *
    * @generated from field: optional legion.SnapshotBudget snapshot_budget = 6;
    */
@@ -11658,14 +11662,18 @@ export class GetNodeUsageReply extends Message<GetNodeUsageReply> {
 /**
  * Suspended instances on one node, as `legion node usage` prints
  * them: "suspended: 3 instances, 768 MiB held". A suspended instance counts
- * here when its checkpoint is stored on this node, whether or not it holds
- * any capacity (see docs/suspend-and-resume.md, "Capacity for resumes").
+ * here when its checkpoint is local to this node (captured here and not
+ * published), or when it holds capacity here. A published checkpoint
+ * (`suspend.durability = "store"`) belongs to no node: its parts live in the
+ * `contentStore`, and the copy on the node that captured it is an ordinary
+ * cache entry (see docs/suspend-and-resume.md, "Capacity for resumes").
  *
  * @generated from message legion.SuspendedCapacity
  */
 export class SuspendedCapacity extends Message<SuspendedCapacity> {
   /**
-   * Suspended instances whose checkpoint is on this node.
+   * Suspended instances whose checkpoint is local to this node, plus any
+   * others that hold capacity here.
    *
    * @generated from field: uint32 instances = 1;
    */
@@ -11697,19 +11705,19 @@ export class SuspendedCapacity extends Message<SuspendedCapacity> {
   heldCpuMhz = 0;
 
   /**
-   * Bytes of those instances' checkpoints, from the manager's snapshot
-   * records. Memory checkpoints are stored in the node's content store
-   * under the `snapshots` budget. Disk checkpoints of node-local volumes
-   * are retained in place and report 0.
+   * Bytes of the local (unpublished) checkpoints counted in `instances`,
+   * from the manager's snapshot records. Memory checkpoints are stored in
+   * the node's content store under the `snapshots` budget, pinned. Disk
+   * checkpoints of node-local volumes are retained in place and report 0.
    *
    * @generated from field: uint64 checkpoint_bytes = 5;
    */
   checkpointBytes = protoInt64.zero;
 
   /**
-   * The node's `snapshots` content budget as its worker last reported it.
-   * Unset when the worker has no content store, predates the report, or no
-   * heartbeat has reached this manager since it started.
+   * The node's `snapshots` content budget and content-disk free space as
+   * its worker last reported them. Unset when the worker has no content
+   * store or no heartbeat has reached this manager since it started.
    *
    * @generated from field: optional legion.SnapshotBudget snapshot_budget = 6;
    */
@@ -11750,14 +11758,32 @@ export class SuspendedCapacity extends Message<SuspendedCapacity> {
 
 /**
  * A node content store's `snapshots` budget class
- * (`content.budgets.snapshots`), which holds memory checkpoints. Workers
- * report it on every heartbeat with a content report.
+ * (`content.budgets.snapshots`), which holds memory checkpoints, and the
+ * disk it lives on. Workers report it on every heartbeat with a content
+ * report.
+ *
+ * The room a new checkpoint can use on the node, which the scheduler checks
+ * before placing a new instance of a task that suspends to memory, is the
+ * smaller of two numbers:
+ *
+ * - the budget's room: `budget_bytes - pinned_bytes`, since unpinned
+ *   checkpoint parts are evicted to make room within the budget;
+ * - the disk's room: `disk_free_bytes + reclaimable_bytes -
+ *   min_free_disk_bytes`, since the store evicts unpinned content of any
+ *   class before it lets the disk drop below `content.minFreeDisk`, and
+ *   refuses the write after that.
+ *
+ * When that room is smaller than a task's expected checkpoint, the scheduler
+ * does not place new instances of the task on the node. Without
+ * `disk_free_bytes` only the budget is checked.
  *
  * @generated from message legion.SnapshotBudget
  */
 export class SnapshotBudget extends Message<SnapshotBudget> {
   /**
-   * The configured budget in bytes.
+   * The budget in bytes, as the worker sized it at start. A share budget
+   * (`"20%"`, and the default) is already resolved against the size of the
+   * filesystem holding the store.
    *
    * @generated from field: uint64 budget_bytes = 1;
    */
@@ -11771,16 +11797,45 @@ export class SnapshotBudget extends Message<SnapshotBudget> {
   usedBytes = protoInt64.zero;
 
   /**
-   * Bytes pinned by a live owner (a suspended instance's or a snapshot's
-   * checkpoint). Pinned content cannot be evicted, so the room a new
-   * checkpoint can use is `budget_bytes - pinned_bytes`. When that is
-   * smaller than a task's expected checkpoint, the scheduler does not place
-   * new instances of that task (a memory-checkpoint `suspend` block) on the
-   * node.
+   * Bytes of the class pinned by a live owner: the checkpoint of a
+   * suspended instance or a snapshot that has not been published.
+   * Published checkpoints are not pinned on their node (their parts live in
+   * the `contentStore`), so their bytes count in `used_bytes` but not here.
+   * Pinned content is never evicted.
    *
    * @generated from field: uint64 pinned_bytes = 3;
    */
   pinnedBytes = protoInt64.zero;
+
+  /**
+   * Free bytes on the filesystem holding the node content store, as
+   * available to an unprivileged process (`statvfs` `f_bavail`), read when
+   * the report was built. Unset when the platform cannot say, and then only
+   * the budget limits placement.
+   *
+   * @generated from field: optional uint64 disk_free_bytes = 4;
+   */
+  diskFreeBytes?: bigint;
+
+  /**
+   * The worker's `content.minFreeDisk` in bytes: the free space the store
+   * keeps on that filesystem. 0 when the floor is off.
+   *
+   * @generated from field: uint64 min_free_disk_bytes = 5;
+   */
+  minFreeDiskBytes = protoInt64.zero;
+
+  /**
+   * Bytes of unpinned content in the store, across every class (cached
+   * artifacts, published or fetched checkpoint parts). The store evicts
+   * them before it lets the disk drop below `min_free_disk_bytes`, so they
+   * count as room on the disk. An evicted blob that a running task still
+   * holds open (a hard link into a restored allocation) frees no space, so
+   * this can overstate the room slightly.
+   *
+   * @generated from field: uint64 reclaimable_bytes = 6;
+   */
+  reclaimableBytes = protoInt64.zero;
 
   constructor(data?: PartialMessage<SnapshotBudget>) {
     super();
@@ -11793,6 +11848,9 @@ export class SnapshotBudget extends Message<SnapshotBudget> {
     { no: 1, name: "budget_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 2, name: "used_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 3, name: "pinned_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "disk_free_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 5, name: "min_free_disk_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 6, name: "reclaimable_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SnapshotBudget {

@@ -1013,15 +1013,18 @@ impl Store {
         Self::collect_rows(rows)
     }
 
-    /// Suspended instances whose checkpoint is stored on `node_id`, and
+    /// Suspended instances whose checkpoint is local to `node_id`, and
     /// those checkpoints' bytes, for `GetNodeUsage`'s suspended line
-    /// (docs/suspend-and-resume.md, "Capacity for resumes").
+    /// (docs/suspend-and-resume.md, "Capacity for resumes"). A published
+    /// checkpoint does not count: its node holds at most an unpinned cache
+    /// copy, which the content store may already have evicted.
     pub fn suspended_on_node(&self, node_id: &str) -> R<(u32, u64)> {
         let conn = self.read_connection()?;
         let (count, bytes): (i64, i64) = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(snapshot.total_bytes), 0) FROM instance \
              INNER JOIN snapshot ON snapshot.snapshot_id = instance.checkpoint_id \
-             WHERE instance.state = 'suspended' AND snapshot.node_id = ?1;",
+             WHERE instance.state = 'suspended' AND snapshot.node_id = ?1 \
+             AND snapshot.state != 'published';",
             [node_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;

@@ -598,14 +598,14 @@ pub fn run_delete(
         (guard.volumes_handle(), guard.content_store())
     };
     let mut errors = Vec::new();
-    let volume_refs = if request.manifest_json.trim().is_empty() {
-        Vec::new()
+    let manifest = if request.manifest_json.trim().is_empty() {
+        None
     } else {
         match SnapshotManifest::from_json(&request.manifest_json) {
-            Ok(manifest) => manifest.volumes,
+            Ok(manifest) => Some(manifest),
             Err(err) => {
                 errors.push(format!("reading the manifest: {err:#}"));
-                Vec::new()
+                None
             }
         }
     };
@@ -613,8 +613,20 @@ pub fn run_delete(
         &volumes,
         content.as_deref(),
         &PinOwner::snapshot(&request.snapshot_id),
-        &volume_refs,
+        manifest.as_ref().map_or(&[], |manifest| &manifest.volumes),
     ));
+    // A published snapshot's parts were unpinned when it was published, so
+    // the pins above no longer name them. Free whichever are still here and
+    // unpinned now, as a local snapshot's are, rather than leave them to LRU.
+    if let (Some(store), Some(manifest)) = (content.as_deref(), manifest.as_ref()) {
+        for part in &manifest.memory {
+            if let Ok(digest) = ContentDigest::parse(&part.digest) {
+                if store.pins(&digest).is_ok_and(|pins| pins.is_empty()) {
+                    let _ = store.remove(&digest);
+                }
+            }
+        }
+    }
     if errors.is_empty() {
         info!(snapshot_id = %request.snapshot_id, "Snapshot reclaimed");
     } else {
@@ -649,6 +661,9 @@ pub fn run_publish(
     let started = Instant::now();
     let publishing = manager.lock().expect("task manager").content_publishing();
     let outcome = publish(publishing.as_deref(), request);
+    if outcome.is_ok() {
+        release_published_pins(publishing.as_deref(), &request.snapshot_id);
+    }
     let mut report = SnapshotReport {
         snapshot_id: request.snapshot_id.clone(),
         op: "publish".into(),
@@ -684,6 +699,34 @@ pub fn run_publish(
         }
     }
     report
+}
+
+/// Unpin a published snapshot's parts on this node, keeping the bytes. They
+/// live in the `contentStore` now, so the local copy is a cache entry like
+/// any other: LRU, the budget, and `minFreeDisk` may evict it, and a later
+/// restore here fetches what is gone (docs/suspend-and-resume.md,
+/// "Durability"). Until the evictor gets to them the parts stay advertised,
+/// so locality still steers a resume to this node. A failure only leaves the
+/// pins in place, which costs room, not correctness.
+fn release_published_pins(
+    publishing: Option<&crate::content_publish::ContentPublishing>,
+    snapshot_id: &str,
+) {
+    let Some(publishing) = publishing else {
+        return;
+    };
+    match publishing
+        .store()
+        .release_owner(&PinOwner::snapshot(snapshot_id))
+    {
+        Ok(released) => debug!(snapshot_id, released, "Unpinned published snapshot parts"),
+        Err(err) => warn!(
+            snapshot_id,
+            error = ?err,
+            "Failed to unpin published snapshot parts; they stay pinned until the snapshot is \
+             deleted"
+        ),
+    }
 }
 
 /// The publish itself: every memory part, by digest, from the node content
@@ -803,6 +846,10 @@ pub fn run_warm(
 /// parts already there are kept (and pinned to `pin`, when given), parts
 /// missing are fetched from their published `url` through the artifact
 /// stager and verified by digest. Returns the bytes downloaded.
+///
+/// A published snapshot's parts are unpinned on every node, the one that
+/// captured it included, so they can be evicted at any time. A restore
+/// passes `pin` to hold them from here until its allocation has started.
 ///
 /// A missing part without a URL is the error a restore of an unpublished
 /// snapshot on the wrong node would hit, so it says exactly that.

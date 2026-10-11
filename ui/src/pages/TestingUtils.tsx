@@ -20,6 +20,8 @@ import {
   unreportedNode,
 } from '../fixtures/suspendResume'
 import { forkPlan, resumeBlocker, suspendPlan } from '../utils/instances'
+import { snapshotBudgets } from '../utils/usage'
+import { GetNodeUsageReply, SnapshotBudget, SuspendedCapacity } from '../gen/legion_pb'
 
 /*
  * Unlisted page (/testing) that renders components from fixture data, so a
@@ -149,13 +151,23 @@ export default function TestingUtils() {
         </Card>
       </Fixture>
 
-      <Fixture title="Content and locality" note="The worker page's card from GetNodeContent: a node holding a warmed published snapshot, then one with no report. The budget bars show the slot the disk-budget fields fill once GetNodeUsage carries them.">
+      <Fixture title="Content and locality" note="The worker page's card from GetNodeContent: a node holding a warmed published snapshot whose disk, not its snapshots budget, limits new checkpoints, then one with no report.">
         <NodeContentCard
           content={nodeContent}
-          budgets={[
-            { name: 'artifacts', usedBytes: 6 * 1024 ** 3, budgetBytes: 20 * 1024 ** 3 },
-            { name: 'snapshots', usedBytes: 41 * 1024 ** 3, budgetBytes: 50 * 1024 ** 3 },
-          ]}
+          budgets={snapshotBudgets(
+            new GetNodeUsageReply({
+              suspended: new SuspendedCapacity({
+                snapshotBudget: new SnapshotBudget({
+                  budgetBytes: 50n * 1024n ** 3n,
+                  usedBytes: 41n * 1024n ** 3n,
+                  pinnedBytes: 12n * 1024n ** 3n,
+                  diskFreeBytes: 7n * 1024n ** 3n,
+                  reclaimableBytes: 2n * 1024n ** 3n,
+                  minFreeDiskBytes: 5n * 1024n ** 3n,
+                }),
+              }),
+            }),
+          )}
         />
         <NodeContentCard content={unreportedContent} />
       </Fixture>

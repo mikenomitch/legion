@@ -2549,54 +2549,85 @@ pub struct WorkerContentConfig {
     pub min_free_disk: Option<String>,
 }
 
-/// Worker `content.budgets`: one byte budget per content class.
+/// Worker `content.budgets`: one byte budget per content class. Each is a
+/// fixed size (`"50GiB"`) or a share of the filesystem holding the content
+/// store (`"20%"`), sized when the worker starts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerContentBudgets {
-    /// Cached artifacts. Default "20GiB".
+    /// Cached artifacts. Default 10% of the disk, clamped to 1..20 GiB.
     pub artifacts: Option<String>,
-    /// Checkpoint parts. Default "50GiB".
+    /// Checkpoint parts. Default 20% of the disk, clamped to 2..200 GiB.
     pub snapshots: Option<String>,
 }
 
 impl WorkerContentConfig {
-    /// Resolved store settings, or `None` when the store is disabled.
-    pub fn resolve(&self) -> R<Option<crate::content_store::ContentStoreConfig>> {
+    /// Validated store settings, or `None` when the store is disabled. Share
+    /// budgets stay shares here: the worker sizes them against its content
+    /// filesystem ([`crate::content_store::ContentStoreSettings::config_for`]),
+    /// which the manager, validating this at config load, cannot see.
+    pub fn resolve(&self) -> R<Option<crate::content_store::ContentStoreSettings>> {
         use crate::content_store::{
-            ContentBudgets, ContentStoreConfig, DEF_CONTENT_ARTIFACTS_BUDGET,
+            BudgetSpec, ContentBudgetSpecs, ContentStoreSettings, DEF_CONTENT_ARTIFACTS_BUDGET,
             DEF_CONTENT_MIN_FREE_DISK, DEF_CONTENT_SNAPSHOTS_BUDGET, DEF_CONTENT_TTL,
         };
         if self.enabled == Some(false) {
             return Ok(None);
         }
         let budgets = self.budgets.clone().unwrap_or_default();
-        let size = |field: &str, raw: Option<&str>, default: &str| -> R<u64> {
-            let raw = raw.unwrap_or(default);
-            parse_byte_size(raw).with_context(|| format!("invalid content.{field} {raw:?}"))
+        let budget = |class: &str, raw: Option<&str>, default: BudgetSpec| -> R<BudgetSpec> {
+            match raw {
+                None => Ok(default),
+                Some(raw) => BudgetSpec::parse(raw).with_context(|| {
+                    format!(
+                        "invalid content.budgets.{class} {raw:?} (expected a size such as \
+                         \"20GiB\" or a share of the disk such as \"20%\")"
+                    )
+                }),
+            }
         };
+        let artifacts = budget(
+            "artifacts",
+            budgets.artifacts.as_deref(),
+            DEF_CONTENT_ARTIFACTS_BUDGET,
+        )?;
+        let snapshots = budget(
+            "snapshots",
+            budgets.snapshots.as_deref(),
+            DEF_CONTENT_SNAPSHOTS_BUDGET,
+        )?;
+        // Shares of one disk cannot add up past all of it. Defaults count,
+        // so `artifacts = "90%"` beside the default snapshots share fails
+        // here rather than on a node whose disk then fills.
+        if let (Some(a), Some(b)) = (artifacts.percent(), snapshots.percent()) {
+            if a + b > 100.0 {
+                let origin = |set: bool| if set { "" } else { ", the default" };
+                bail!(
+                    "content.budgets.artifacts ({a}%{}) and content.budgets.snapshots \
+                     ({b}%{}) together claim {}% of the disk. Keep their sum at or below 100%",
+                    origin(budgets.artifacts.is_some()),
+                    origin(budgets.snapshots.is_some()),
+                    a + b
+                );
+            }
+        }
+        let min_free_raw = self
+            .min_free_disk
+            .as_deref()
+            .unwrap_or(DEF_CONTENT_MIN_FREE_DISK);
+        let min_free_disk = parse_byte_size(min_free_raw)
+            .with_context(|| format!("invalid content.minFreeDisk {min_free_raw:?}"))?;
         let ttl_raw = self.ttl.as_deref().unwrap_or(DEF_CONTENT_TTL);
         let ttl = ttl_raw
             .parse::<humantime::Duration>()
             .with_context(|| format!("invalid content.ttl {ttl_raw:?}"))?;
-        Ok(Some(ContentStoreConfig {
-            budgets: ContentBudgets {
-                artifacts: size(
-                    "budgets.artifacts",
-                    budgets.artifacts.as_deref(),
-                    DEF_CONTENT_ARTIFACTS_BUDGET,
-                )?,
-                snapshots: size(
-                    "budgets.snapshots",
-                    budgets.snapshots.as_deref(),
-                    DEF_CONTENT_SNAPSHOTS_BUDGET,
-                )?,
+        Ok(Some(ContentStoreSettings {
+            budgets: ContentBudgetSpecs {
+                artifacts,
+                snapshots,
             },
             ttl: (!ttl.is_zero()).then(|| *ttl),
-            min_free_disk: size(
-                "minFreeDisk",
-                self.min_free_disk.as_deref(),
-                DEF_CONTENT_MIN_FREE_DISK,
-            )?,
+            min_free_disk,
         }))
     }
 }
@@ -2773,12 +2804,40 @@ mod tests {
 
     #[test]
     fn worker_content_config_resolves_and_rides_the_artifacts_payload() -> R<()> {
+        use crate::content_store::{BudgetSpec, ContentBudgetSpecs};
+        const GIB: u64 = 1024 * 1024 * 1024;
         let defaults = WorkerContentConfig::default()
             .resolve()?
             .expect("enabled by default");
+        assert_eq!(defaults.budgets, ContentBudgetSpecs::default());
+        // The defaults are clamped shares of the disk.
+        let on = |total: u64| defaults.config_for(Some(total)).map(|c| c.budgets);
+        let small = on(8 * GIB)?;
         assert_eq!(
-            defaults,
-            crate::content_store::ContentStoreConfig::default()
+            (small.artifacts, small.snapshots),
+            (GIB, 2 * GIB),
+            "the floors"
+        );
+        let mid = on(100 * GIB)?;
+        assert_eq!(
+            (mid.artifacts, mid.snapshots),
+            (10 * GIB, 20 * GIB),
+            "the shares"
+        );
+        let big = on(4096 * GIB)?;
+        assert_eq!(
+            (big.artifacts, big.snapshots),
+            (20 * GIB, 200 * GIB),
+            "the caps"
+        );
+        assert_eq!(
+            defaults.config_for(Some(1024 * GIB))?,
+            crate::content_store::ContentStoreConfig::default(),
+            "Default is the defaults on a 1 TiB disk"
+        );
+        assert!(
+            format!("{:#}", defaults.config_for(None).unwrap_err()).contains("could not be read"),
+            "a share needs the disk size"
         );
 
         let raw = r#"{"fetch":{"attempts":2},
@@ -2790,8 +2849,24 @@ mod tests {
             .expect("content")
             .resolve()?
             .expect("enabled");
-        assert_eq!(content.budgets.snapshots, 1024 * 1024 * 1024);
+        assert_eq!(content.budgets.snapshots, BudgetSpec::Bytes(GIB));
         assert_eq!(content.budgets.artifacts, defaults.budgets.artifacts);
+        // A fixed size needs no disk size.
+        assert_eq!(
+            WorkerContentConfig {
+                budgets: Some(WorkerContentBudgets {
+                    artifacts: Some("1GiB".into()),
+                    snapshots: Some("2GiB".into()),
+                }),
+                ..Default::default()
+            }
+            .resolve()?
+            .expect("enabled")
+            .config_for(None)?
+            .budgets
+            .snapshots,
+            2 * GIB
+        );
         assert_eq!(content.ttl, None, "0s disables expiry");
         assert_eq!(content.min_free_disk, 1024 * 1024);
 
@@ -2810,6 +2885,51 @@ mod tests {
         };
         assert!(format!("{:#}", bad.resolve().unwrap_err()).contains("content.ttl"));
         assert!(serde_json::from_str::<WorkerContentConfig>(r#"{"budget":{}}"#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn content_budgets_take_a_share_of_the_disk_and_reject_bad_ones() -> R<()> {
+        use crate::content_store::BudgetSpec;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let with = |artifacts: Option<&str>, snapshots: Option<&str>| WorkerContentConfig {
+            budgets: Some(WorkerContentBudgets {
+                artifacts: artifacts.map(Into::into),
+                snapshots: snapshots.map(Into::into),
+            }),
+            ..Default::default()
+        };
+        // An operator's share has no clamp.
+        let settings = with(None, Some("50%")).resolve()?.expect("enabled");
+        assert_eq!(settings.budgets.snapshots.percent(), Some(50.0));
+        let sized = settings.config_for(Some(1000 * GIB))?;
+        assert_eq!(sized.budgets.snapshots, 500 * GIB);
+        assert_eq!(sized.budgets.artifacts, 20 * GIB, "default artifacts cap");
+        assert_eq!(BudgetSpec::parse(" 12.5% ")?.resolve(800), 100);
+
+        let err = |config: WorkerContentConfig| format!("{:#}", config.resolve().unwrap_err());
+        for bad in ["0%", "101%", "-5%", "lots%"] {
+            let message = err(with(None, Some(bad)));
+            assert!(message.contains("content.budgets.snapshots"), "{message}");
+        }
+        let message = err(with(Some("10 parsecs"), None));
+        assert!(
+            message.contains("content.budgets.artifacts") && message.contains("\"20%\""),
+            "{message}"
+        );
+        // Shares, defaults included, cannot add up past the disk.
+        let message = err(with(Some("90%"), None));
+        assert!(
+            message.contains("(90%)")
+                && message.contains("(20%, the default)")
+                && message.contains("110%"),
+            "{message}"
+        );
+        assert!(with(Some("80%"), Some("20%")).resolve().is_ok());
+        assert!(
+            with(Some("90%"), Some("50GiB")).resolve().is_ok(),
+            "a fixed size is no share"
+        );
         Ok(())
     }
 

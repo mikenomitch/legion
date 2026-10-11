@@ -27,7 +27,7 @@
 //!   worker sends a full report on its next heartbeat.
 
 use crate::structs::{ContentLocation, ContentLocationReport, SnapshotBudget};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -91,6 +91,46 @@ impl IndexInner {
             self.remove(node_id, digest);
         }
         true
+    }
+}
+
+/// Which limit binds a node's checkpoint room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomLimit {
+    /// `content.budgets.snapshots`, less what is pinned.
+    Budget,
+    /// Free disk, plus what the store could evict, less `content.minFreeDisk`.
+    Disk,
+}
+
+/// A node's room for one more memory checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointRoom {
+    pub bytes: u64,
+    pub limit: RoomLimit,
+}
+
+/// The room a new checkpoint can use on a node, from its last report: the
+/// smaller of the `snapshots` budget's room (budget minus pinned, since the
+/// class evicts its own unpinned parts to make room) and the disk's room
+/// (free plus everything unpinned in the store, minus `minFreeDisk`, since
+/// the store evicts unpinned content of any class before it breaches the
+/// floor). A report without disk numbers is checked against the budget only.
+pub fn checkpoint_room(budget: &SnapshotBudget) -> CheckpointRoom {
+    let budget_room = budget.budget_bytes.saturating_sub(budget.pinned_bytes);
+    let disk_room = budget.disk_free_bytes.map(|free| {
+        free.saturating_add(budget.reclaimable_bytes)
+            .saturating_sub(budget.min_free_disk_bytes)
+    });
+    match disk_room {
+        Some(disk) if disk < budget_room => CheckpointRoom {
+            bytes: disk,
+            limit: RoomLimit::Disk,
+        },
+        _ => CheckpointRoom {
+            bytes: budget_room,
+            limit: RoomLimit::Budget,
+        },
     }
 }
 
@@ -263,32 +303,30 @@ impl ContentLocationIndex {
             .copied()
     }
 
-    /// Every node whose `snapshots` budget has less room than
-    /// `needed_bytes` (see [`Self::snapshot_budget_short`]), read once so the
-    /// scheduler filters a task's candidates with set lookups instead of a
+    /// Every node with less checkpoint room than `needed_bytes` (see
+    /// [`checkpoint_room`]), and which limit binds there, read once so the
+    /// scheduler filters a task's candidates with map lookups instead of a
     /// lock per node. Empty, and so free to apply, when no node is short.
-    pub fn snapshot_budget_short_nodes(&self, needed_bytes: u64) -> HashSet<String> {
+    pub fn snapshot_budget_short_nodes(&self, needed_bytes: u64) -> HashMap<String, RoomLimit> {
         self.inner
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .snapshot_budgets
             .iter()
-            .filter(|(_, budget)| {
-                budget.budget_bytes.saturating_sub(budget.pinned_bytes) < needed_bytes
+            .filter_map(|(node_id, budget)| {
+                let room = checkpoint_room(budget);
+                (room.bytes < needed_bytes).then(|| (node_id.clone(), room.limit))
             })
-            .map(|(node_id, _)| node_id.clone())
             .collect()
     }
 
-    /// Whether a node's `snapshots` budget has less room than `needed_bytes`
-    /// for a new checkpoint: the budget minus what is pinned (pinned
-    /// content cannot be evicted to make room). A node that has not reported
-    /// a budget has room, because missing data is not evidence of a full
-    /// disk (the same rule the scheduler's disk fit uses).
+    /// Whether a node has less checkpoint room than `needed_bytes` (see
+    /// [`checkpoint_room`]). A node that has not reported has room, because
+    /// missing data is not evidence of a full disk (the same rule the
+    /// scheduler's disk fit uses).
     pub fn snapshot_budget_short(&self, node_id: &str, needed_bytes: u64) -> bool {
-        self.snapshot_budget(node_id).is_some_and(|budget| {
-            budget.budget_bytes.saturating_sub(budget.pinned_bytes) < needed_bytes
-        })
+        self.snapshot_budget(node_id)
+            .is_some_and(|budget| checkpoint_room(&budget).bytes < needed_bytes)
     }
 
     /// Drop a node's entries (deregistered, or gone silent).
@@ -504,6 +542,63 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_room_is_the_smaller_of_the_budget_and_the_disk() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let budget = SnapshotBudget {
+            budget_bytes: 50 * GIB,
+            used_bytes: 20 * GIB,
+            pinned_bytes: 10 * GIB,
+            ..Default::default()
+        };
+        let room = |budget: SnapshotBudget| checkpoint_room(&budget);
+        assert_eq!(
+            room(budget),
+            CheckpointRoom {
+                bytes: 40 * GIB,
+                limit: RoomLimit::Budget
+            },
+            "no disk numbers: the budget alone"
+        );
+        // 8 GiB free, 2 GiB evictable, 5 GiB floor: 5 GiB of disk room.
+        let tight = SnapshotBudget {
+            disk_free_bytes: Some(8 * GIB),
+            reclaimable_bytes: 2 * GIB,
+            min_free_disk_bytes: 5 * GIB,
+            ..budget
+        };
+        assert_eq!(
+            room(tight),
+            CheckpointRoom {
+                bytes: 5 * GIB,
+                limit: RoomLimit::Disk
+            }
+        );
+        // Below the floor with nothing to evict: no room at all.
+        let full_disk = SnapshotBudget {
+            disk_free_bytes: Some(GIB),
+            reclaimable_bytes: 0,
+            ..tight
+        };
+        assert_eq!(room(full_disk).bytes, 0);
+        // A roomy disk leaves the budget binding.
+        let roomy = SnapshotBudget {
+            disk_free_bytes: Some(900 * GIB),
+            ..tight
+        };
+        assert_eq!(room(roomy).limit, RoomLimit::Budget);
+
+        let index = ContentLocationIndex::new();
+        let mut report = full(1, Vec::new());
+        report.snapshot_budget = Some(tight);
+        index.ingest("n1", &report, Instant::now());
+        assert!(!index.snapshot_budget_short("n1", 5 * GIB));
+        assert_eq!(
+            index.snapshot_budget_short_nodes(6 * GIB),
+            HashMap::from([("n1".to_string(), RoomLimit::Disk)])
+        );
+    }
+
+    #[test]
     fn the_snapshot_budget_is_taken_on_every_report_and_dropped_with_the_node() {
         const GIB: u64 = 1024 * 1024 * 1024;
         let index = ContentLocationIndex::new();
@@ -512,6 +607,7 @@ mod tests {
             budget_bytes: 10 * GIB,
             used_bytes: 9 * GIB,
             pinned_bytes: 8 * GIB,
+            ..Default::default()
         };
         let mut report = full(1, Vec::new());
         report.snapshot_budget = Some(budget);
@@ -525,7 +621,7 @@ mod tests {
         assert!(index.snapshot_budget_short_nodes(2 * GIB).is_empty());
         assert_eq!(
             index.snapshot_budget_short_nodes(3 * GIB),
-            HashSet::from(["n1".to_string()])
+            HashMap::from([("n1".to_string(), RoomLimit::Budget)])
         );
         assert!(
             !index.snapshot_budget_short("unreported", u64::MAX),

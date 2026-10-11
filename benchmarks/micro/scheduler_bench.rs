@@ -1192,6 +1192,11 @@ fn setup_budget_placements(
                         budget_bytes: 50 * GIB,
                         used_bytes: 50 * GIB,
                         pinned_bytes: if idx % 2 == 0 { 50 * GIB } else { 10 * GIB },
+                        // Every node reports its disk, so the disk half of
+                        // the room check runs too.
+                        disk_free_bytes: Some(400 * GIB),
+                        min_free_disk_bytes: 5 * GIB,
+                        reclaimable_bytes: 0,
                     }),
                 },
                 now,

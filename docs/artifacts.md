@@ -499,8 +499,10 @@ The store keeps a separate byte budget for each **class** of content:
 
 - `artifacts`: cached artifacts.
 - `snapshots`: memory snapshot parts (VMM memory and device state, and the
-  guest root disk), pinned to their snapshot until it is deleted (see
-  [suspend and resume](suspend-and-resume.md#how-it-works)).
+  guest root disk). A local snapshot's parts are pinned to it until it is
+  deleted. A published snapshot's parts are unpinned on every node once the
+  upload finishes, so they are evicted like any cached entry (see
+  [suspend and resume](suspend-and-resume.md#durability)).
 
 A class over budget evicts its own least-recently-used entries and never
 touches the other class, so a large memory snapshot cannot push every cached
@@ -512,23 +514,54 @@ refuses new content with an error naming the budget to raise.
 Configure the store per worker type:
 
 ```nickel
-# configs/workers/default.ncl — values shown are the defaults
+# configs/workers/default.ncl
 {
   workerType = "default",
   content = {
     enabled = true,          # false stages every artifact straight from origin
     budgets = {
-      artifacts = "20GiB",   # cached artifacts
+      artifacts = "10%",     # cached artifacts: a share of the disk or a size
       snapshots = "50GiB",   # checkpoint parts
     },
-    ttl = "72h",             # unpinned content unused this long is removed; "0s" disables
+    ttl = "72h",             # unpinned content unused this long is removed. "0s" disables
     minFreeDisk = "5GiB",    # evict, then refuse, rather than drop below this
   },
 }
 ```
 
-Every field is optional. A malformed size or duration fails manager startup,
-not the worker. The worker runs garbage collection every 10 minutes (TTL
+Each budget is either a fixed size (`"50GiB"`) or a share of the filesystem
+that holds `<worker state dir>/content/` (`"20%"`, above 0 and at most
+100). The worker sizes a share once, when it starts, against that
+filesystem's total size, and logs the result (`Sized node content store
+budgets`). A disk that grows or shrinks takes effect at the next worker
+start.
+
+Without a `budgets` entry, a class takes its default share, clamped so that
+very small and very large disks still get a sensible budget:
+
+| Class | Default | Clamp | 8 GiB disk | 100 GiB disk | 1 TiB disk |
+| --- | --- | --- | --- | --- | --- |
+| `artifacts` | 10% | 1 GiB to 20 GiB | 1 GiB | 10 GiB | 20 GiB |
+| `snapshots` | 20% | 2 GiB to 200 GiB | 2 GiB | 20 GiB | 200 GiB |
+
+The artifact cache caps at 20 GiB because a miss costs one refetch, so a
+bigger cache buys little. The snapshot budget caps at 200 GiB so a node with
+a multi-terabyte data disk keeps most of it for volumes unless you ask for
+more. A share you set yourself (`snapshots = "40%"`) is not clamped. On a
+small disk the floors can add up to more than 30% of it, and then
+`minFreeDisk` is what protects the node: the store evicts unpinned content,
+then refuses new content, before free space drops below it, and the
+scheduler counts it when it checks a node's
+[checkpoint room](suspend-and-resume.md#the-checkpoint-disk-budget).
+
+Every field is optional. A malformed size, percentage, or duration fails
+manager startup, not the worker. So do shares that add up past the disk:
+`artifacts = "90%"` beside the default 20% for snapshots fails with
+`content.budgets.artifacts (90%) and content.budgets.snapshots (20%, the
+default) together claim 110% of the disk`. If a worker cannot read the size
+of its content filesystem, it cannot size a share, so it logs `Cannot size
+the node content store` and runs without a store. Set fixed sizes on such a
+platform. The worker runs garbage collection every 10 minutes (TTL
 expiry, plus trimming a class whose budget was lowered across a restart).
 Puts evict on demand, so the store never grows past a budget between passes.
 Deleting `<worker state dir>/content/` while the worker is stopped is always

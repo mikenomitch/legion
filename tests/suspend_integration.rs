@@ -1574,22 +1574,26 @@ async fn a_full_snapshot_budget_keeps_new_memory_suspend_instances_off_the_node(
         }),
         json!({ "memory": 1024 }),
     ))?;
-    let report_budget = |pinned: u64| {
+    let report = |budget: SnapshotBudget| {
         cluster.svc.heartbeat(Request::new(HeartbeatRequest {
             id: NODE.into(),
             content_locations: Some(ContentLocationReport {
                 epoch: 1,
                 base_epoch: 0,
                 full: true,
-                snapshot_budget: Some(SnapshotBudget {
-                    budget_bytes: 10 * GIB,
-                    used_bytes: pinned,
-                    pinned_bytes: pinned,
-                }),
+                snapshot_budget: Some(budget),
                 ..Default::default()
             }),
             ..Default::default()
         }))
+    };
+    let report_budget = |pinned: u64| {
+        report(SnapshotBudget {
+            budget_bytes: 10 * GIB,
+            used_bytes: pinned,
+            pinned_bytes: pinned,
+            ..Default::default()
+        })
     };
     // 512 MiB of room, and the guest is 1 GiB.
     report_budget(10 * GIB - GIB / 2).await?;
@@ -1605,8 +1609,8 @@ async fn a_full_snapshot_budget_keeps_new_memory_suspend_instances_off_the_node(
     cluster.store().set_eval_status(&eval.id, "failed")?;
     let message = format!("{err:#}");
     assert!(
-        message.contains("snapshots content budget is full")
-            && message.contains("less than 1024 MiB free")
+        message.contains("none has 1024 MiB of room")
+            && message.contains("1 short on the snapshots content budget, 0 short on disk")
             && message.contains("content.budgets.snapshots"),
         "{message}"
     );
@@ -1618,6 +1622,30 @@ async fn a_full_snapshot_budget_keeps_new_memory_suspend_instances_off_the_node(
         .and_then(|suspended| suspended.snapshot_budget)
         .context("the budget is on node usage")?;
     assert_eq!(budget.budget_bytes, 10 * GIB);
+
+    // The budget has room but the disk under it does not: 5.25 GiB free
+    // plus 512 MiB evictable, over a 5 GiB minFreeDisk floor, leaves 768 MiB.
+    report(SnapshotBudget {
+        budget_bytes: 10 * GIB,
+        disk_free_bytes: Some(5 * GIB + GIB / 4),
+        reclaimable_bytes: GIB / 2,
+        min_free_disk_bytes: 5 * GIB,
+        ..Default::default()
+    })
+    .await?;
+    cluster
+        .store()
+        .enqueue_eval("job_reschedule", Some(JOB), Some(&config_id), None, None)?;
+    let eval = cluster.store().get_next_eval()?.context("eval")?;
+    let err = eval.handle(cluster.store()).expect_err("the disk is short");
+    cluster.store().set_eval_status(&eval.id, "failed")?;
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("0 short on the snapshots content budget, 1 short on disk")
+            && message.contains("content.minFreeDisk"),
+        "{message}"
+    );
+    assert_eq!(cluster.info().await?.current_alloc_id, None);
 
     // Room again: it places.
     report_budget(GIB).await?;

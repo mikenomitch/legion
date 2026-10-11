@@ -2,7 +2,7 @@ import { A } from '@solidjs/router'
 import { For, Show } from 'solid-js'
 import type { GetNodeContentReply } from '../gen/legion_pb'
 import { formatBytes } from '../utils/format'
-import { percentOf, fillTone } from '../utils/usage'
+import { percentOf, fillTone, type ContentBudget } from '../utils/usage'
 import { snapshotLabel, snapshotStateTone } from '../utils/snapshots'
 import { Badge, Meter, MonoBadge, SectionCard, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 
@@ -21,9 +21,11 @@ import { Badge, Meter, MonoBadge, SectionCard, TableShell, cx, tableClass, tdCla
  * The content store's per-class byte budget, when the manager reports it.
  * GetNodeContent does not carry budgets (the index has digests, not
  * classes), so the caller maps the `snapshots` budget from GetNodeUsage
- * (`snapshotBudgets`). Nothing shows for a node that has not reported one.
+ * (`snapshotBudgets`), with a note on the room left for a new checkpoint
+ * and whether the budget or the disk under it is what limits it. Nothing
+ * shows for a node that has not reported one.
  */
-export type ContentBudget = { name: string; usedBytes: number; budgetBytes: number }
+export type { ContentBudget }
 
 export function NodeContentCard(props: { content: GetNodeContentReply; budgets?: readonly ContentBudget[] }) {
   const capability = (on: boolean, label: string, title: string) => (
@@ -64,6 +66,9 @@ export function NodeContentCard(props: { content: GetNodeContentReply; budgets?:
                     </span>
                   </div>
                   <Meter percent={percent()} tone={fillTone(percent())} label={`${budget.name} budget`} />
+                  <Show when={budget.note}>
+                    <p class={cx('mt-1 text-2xs', budget.tight ? 'text-amber-700 dark:text-amber-300' : 'text-faint')}>{budget.note}</p>
+                  </Show>
                 </div>
               )
             }}
