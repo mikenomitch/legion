@@ -310,6 +310,13 @@ on a network you don't trust. Known gaps:
   container, can run commands in other allocations on that node. The
   [worker-plane auth plan](internal_docs/plans/worker-plane-auth-plan.md)
   fixes this.
+- **Linux containers and `exec` tasks share the host's network by default**,
+  so they can reach the worker and manager ports, the cloud metadata service,
+  and anything else on the host. With ACLs off (the default), the manager's
+  port is full control of the cluster. `gated` mode doesn't help yet, because
+  its egress proxy still dials loopback and link-local addresses for the
+  task. Don't run untrusted code in them yet. The
+  [same plan](internal_docs/plans/worker-plane-auth-plan.md) covers it.
 - **The worker-to-manager channel is plaintext.**
 - **Workers on other hosts can't serve exec, logs, or the service mesh yet**,
   because they advertise a loopback address. Covered by the same plan.

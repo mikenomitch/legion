@@ -16,13 +16,52 @@ How to use it:
 ---
 
 - [ ] **Launch blocker: workers on another host lose exec, logs, and the
-      mesh.** The worker binds `127.0.0.1:4848` and always advertises
-      `http://127.0.0.1:4848` (`src/worker/daemon.rs:137-138`, `:315-318`).
-      Opening the port is not the fix, because `PostWork`, `ExecTask`,
-      `GetTaskLogs`, and `RestartWorker` authenticate nobody. Found while
-      preparing the pre-launch AWS spot check, which is paused until this
-      lands. Plan: [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md)
-      (PLANNED) · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
+      mesh, and any task can take over the cluster.** The worker binds
+      `127.0.0.1:4848` and always advertises `http://127.0.0.1:4848`
+      (`src/worker/daemon.rs:155`, `:376-379`). Opening the port is not the
+      fix, because `PostWork`, `ExecTask`, `GetTaskLogs`, and `RestartWorker`
+      authenticate nobody. Separately, Linux containers and `exec` tasks share
+      the host network, so they reach the manager (ACLs off by default), the
+      worker port, the cloud metadata service, and other allocations'
+      datapath listeners. Found while preparing the pre-launch AWS spot
+      check, which is paused until Phase 1 lands. Its host-guard rows need
+      Phases 2 and 3. Plan:
+      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (PLANNED)
+      · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
+      Phases in ship order, most dangerous gap first:
+  - [ ] Phase 0: ACLs on by default. The first management token is minted at
+        first start into `<dataDir>/bootstrap-token` and `~/.legion/token`
+        (`0600`), and the open `BootstrapAcl` RPC and `legion acl bootstrap`
+        are removed (plan §6.10).
+  - [ ] Phase 1: the mTLS worker plane with per-RPC caller classes,
+        including the sandbox-exec plan's `ticket` class on `ExecTask`, CSR
+        issuance, the CA pin in join tokens, reachable bind and advertise,
+        and two-step CA rotation (plan §6.1 to §6.6, §6.9).
+  - [ ] Phase 2: the host guard in the datapath. The gated egress proxy
+        dials loopback, link-local, and node-local addresses from the host
+        namespace today, and CIDR rules never see hostnames
+        (`src/worker/netd/proxy.rs:512`, `:621`, `:879`), so the documented
+        metadata deny rule is bypassed by a name. Resolve, judge, then dial
+        (plan §6.11).
+  - [ ] Phase 3: Linux containers gated by default with `gated-default`
+        deny, ingress twins and a resolver for every gated allocation, and a
+        validate warning (plan §6.12).
+  - [ ] Phase 4: the encrypted worker-to-manager channel, with the ticket
+        JWKS fetched over it (plan §6.8).
+  - [ ] Phase 5: the host guard in the kernel: an `nftables` table matched by
+        allocation cgroup, and a cgroup leaf for every task (plan §6.13).
+  - [ ] Phase 6: the container privilege floor: per-allocation user
+        namespaces, Docker's default seccomp profile, a cgroup namespace
+        (plan §6.14).
+  - [ ] Phase 7: `exec` trust. Gated `exec` refuses root, the user switch
+        drops supplementary groups (it never calls `setgroups` today,
+        `src/task_plugins/exec.rs:679-687`), and host-level jobs need `host`
+        on `job:write` (plan §6.15, §6.16).
+  - [ ] Phase 8: reachability diagnostics: `Worker/Probe`,
+        `WORKER_UNREACHABLE` (plan §6.7).
+  - [ ] Fix the public docs now, ahead of Phase 2: `docs/network-handlers.md:556`
+        says gated "cannot be bypassed" for `container` and `exec`, but the
+        proxy reaches the host, and a root `exec` task can `setns` back out.
 
 - [ ] **Pre-launch spot check findings (2026-10-11), from reading the code
       while preparing the AWS run.** None of these block the worker-plane
@@ -58,9 +97,9 @@ How to use it:
         Workers also learn only the one manager in their token. Inferred from
         code, not yet reproduced.
   - [ ] **The worker never uses TLS to reach the manager**, even when
-        `server.tls` is on (`src/worker/daemon.rs:585-598`), and raft peers
+        `server.tls` is on (`src/worker/daemon.rs:799-811`), and raft peers
         dial `http://` only. `docs/auth-and-acls.md` claims listener TLS
-        "already covers transport encryption." Phase 3 of the worker-plane
+        "already covers transport encryption." Phase 4 of the worker-plane
         plan covers the worker half. Fix the doc claim now.
   - [ ] **`configs/jobs/tls-edge.ncl` listens on the wrong port on Linux.** It
         declares `static = 9443, to = 443`, but `to` only applies on macOS, so
@@ -1612,9 +1651,12 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         the worker's host, including an `exec` task or a host-network
         container, can call `ExecTask` against any allocation on that node.
         The worker-plane-auth plan (#16) closes it.
-  - [ ] Amend the worker-plane-auth plan (exec plan §9): a ticket caller
+  - [x] Amend the worker-plane-auth plan (exec plan §9): a ticket caller
         class for `ExecTask`, a classification test that allows two classes,
-        and the JWKS verifier on every worker that admits tickets.
+        and the JWKS verifier on every worker that admits tickets. Folded
+        into [worker-plane-auth §6.1](plans/worker-plane-auth-plan.md#61-the-worker-listener-is-mutual-tls-always)
+        (2026-10-11), which added one dependency: ticket verifiers need the
+        JWKS over TLS, so direct exec also waits on worker-plane-auth Phase 4.
   - [ ] Phase 0: exec open latency and manager cost per proxied session at
         100, 1,000, and 10,000 concurrent sessions.
   - [ ] Phase 1: exec into Linux microVMs over vsock. Every microVM gets a

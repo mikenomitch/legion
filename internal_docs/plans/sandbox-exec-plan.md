@@ -17,8 +17,8 @@ exec in macOS dev mode beyond what Apple `container exec` already gives
   authentication of the worker listener: always mTLS with the node
   certificate, manager-only RPCs checked by a `legion://manager/<id>` URI
   SAN, and `StartClaim` authorized by its boot ticket. This plan designs no
-  competing scheme. It needs three amendments to that plan, listed exactly
-  in §9.
+  competing scheme. Its three amendments to that plan (§9) are folded into
+  worker-plane-auth §6.1.
 - [gated-sandbox-checkpoints-plan.md](gated-sandbox-checkpoints-plan.md)
   owns the guest agent, its static build (its Phase 2), the constant vsock
   CID, and the per-allocation `vsock_override` on every restore (its Phase
@@ -569,10 +569,15 @@ Every new RPC and field gets public-facing comments in `proto/legion.proto`.
 
 ## 9. Required amendments to the worker-plane-auth plan
 
-The worker-plane-auth plan (`internal_docs/plans/worker-plane-auth-plan.md`,
-PR #16) is the base. This plan needs these changes to it, stated as they
-should read there. Its implementer should fold them into its Phase 1, or
-into a follow-up phase if it has already shipped.
+**Folded into [worker-plane-auth-plan §6.1](worker-plane-auth-plan.md#61-the-worker-listener-is-mutual-tls-always)**
+(2026-10-11), as part of its Phase 1. That plan's caller-class table and
+classification test are now the source of truth. The three amendments are
+kept below as the record of what this plan asked for.
+
+Folding them in added one dependency: a worker builds a ticket verifier only
+when it fetches the cluster JWKS over TLS that pins the cluster CA, which is
+worker-plane-auth Phase 4 (its §6.1 and §6.8, calls entry 13). So direct exec
+(Phase 2 here) needs worker-plane-auth Phases 1 and 4.
 
 1. **A third caller class in §6.1's table.**
 
