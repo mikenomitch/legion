@@ -4419,6 +4419,7 @@ mod tests {
             restore: None,
             task_suspend: String::new(),
             task_snapshots: String::new(),
+            identity_epoch: 0,
         }
     }
 

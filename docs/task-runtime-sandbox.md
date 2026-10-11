@@ -310,7 +310,7 @@ which gives the guest loopback only. That suits compute sandboxes. With
 
 | `config.network` | Device | Instances per node | Memory checkpoints |
 | --- | --- | --- | --- |
-| `{ mode = "tap", tap = "tap0" }` | Pre-created by the operator (or a network plugin). Legion attaches it | One, since every instance names the same device | Yes |
+| `{ mode = "tap", tap = "tap0" }` | Pre-created by the operator (or a network plugin). Legion attaches it | One, since every instance names the same device. Refused on a keyed task, with `count` above one, or with a `createFirst` rollout | Yes |
 | `{ mode = "tap", tap = "auto", bridge = "br0" }` | Created by Legion per instance and attached to `bridge` | Any number | Yes |
 
 ```nickel
@@ -348,9 +348,28 @@ holds fails the boot by name: `sandbox needs TAP device lgf... (network.tap =
 because a fixed device is wired by whoever created it.
 
 **Fixed TAPs.** A device serves one guest, so a task with a fixed `tap` runs
-one instance per node. A boot on a TAP another VMM holds fails with `sandbox
-needs TAP device tap0 ..., but another process holds it`. Memory forks are
-the exception: each gets its own TAP device.
+one guest per node. Submit, `job validate`, and `job plan` refuse every spec
+that could put a second guest on one node, and so does `job scale` above one:
+
+- a keyed task (`stateful.mode = "keyed"`), since any instance, fork, or
+  snapshot seed can land next to another,
+- a `count` above one, slot mode or stateless, since two allocations can
+  share a node,
+- a rollout with `replacement = "createFirst"`, which starts the replacement
+  before the old allocation stops, on its node when it fits.
+
+```text
+Error: jobspec failed validation: task "workspace" attaches its sandbox to the fixed TAP
+device "tap0" (config.network.tap), which serves one guest per node, but it is a keyed
+task (stateful.mode = "keyed"), so a second instance, a fork that boots cold, or a disk
+snapshot seed on the same node fails to boot
+Hint: set config.network = { mode = "tap", tap = "auto", bridge = "<the bridge tap0 is
+on>" }, so Legion creates a TAP per instance
+```
+
+A fixed TAP fits a single long-lived guest, such as one slot instance. A job
+stored before this rule still runs, and a boot on a TAP another VMM holds
+fails with `sandbox needs TAP device tap0 ..., but another process holds it`.
 
 `LEGION_PORT_*` and `LEGION_ADDR_*` are still exported into the guest, but
 nothing maps host ports into the VM yet.

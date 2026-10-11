@@ -1452,6 +1452,14 @@ async fn heartbeat_tick(
         // Deliver identity tokens for not-yet-running allocations BEFORE
         // reconcile starts them: env tokens must be present at exec time.
         let mut desired = reply.desired_allocations;
+        // A raised identity epoch (a fork or snapshot of the instance was
+        // captured) re-issues that allocation's tokens now. Before the
+        // spawns below, so a new allocation's first sighting only records.
+        identity_manager.observe_identity_epochs(
+            desired
+                .iter()
+                .map(|allocation| (allocation.allocation_id, allocation.identity_epoch)),
+        );
         let mut prepared_by_alloc: HashMap<i64, Vec<PreparedIdentity>> = HashMap::new();
         let running_set: std::collections::HashSet<i64> = running.iter().copied().collect();
         let mut failed_prepare = Vec::new();

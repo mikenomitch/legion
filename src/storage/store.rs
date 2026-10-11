@@ -6936,6 +6936,7 @@ impl Store {
             created_at: row.get(9)?,
             updated_at: row.get(10)?,
             restore_from: row.get(11)?,
+            identity_epoch: row.get::<_, i64>(12)?.max(0) as u64,
         };
 
         Ok(instance)
@@ -12522,7 +12523,8 @@ impl Store {
                 "SELECT instance.instance_id, instance.job_id, instance.group_name, \
                  instance.task_name, instance.mode, instance.state, instance.slot_index, \
                  instance.current_alloc_id, instance.storage_handle, instance.created_at, \
-                 instance.updated_at, instance.restore_from FROM instance \
+                 instance.updated_at, instance.restore_from, instance.identity_epoch \
+                 FROM instance \
                  LEFT JOIN volume ON volume.instance_id = instance.instance_id \
                  AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
                  AND instance.storage_handle = volume.driver || '/' || volume.volume_id \

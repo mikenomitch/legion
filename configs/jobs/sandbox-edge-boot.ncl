@@ -79,10 +79,10 @@
                 rootfs_headroom_mib = 256,
                 # The `boot` gate is a REAL network boundary only for this
                 # runtime, and only through a TAP device Legion can hold
-                # down. Uncomment on a host with a pre-created TAP and
+                # down. Uncomment on a host with a bridge and
                 # CAP_NET_ADMIN; with the default loopback-only guest there
                 # is no network to gate, which is strictly stronger.
-                # network = { mode = "tap", tap = "tap0" },
+                # network = { mode = "tap", tap = "auto", bridge = "br0" },
             },
             resources = {
                 cpu = 2000,

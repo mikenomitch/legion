@@ -653,6 +653,7 @@ pub fn build_task_allocation_with(
         restore: None,
         task_suspend,
         task_snapshots,
+        identity_epoch: instance.map_or(0, |instance| instance.identity_epoch),
     })
 }
 
@@ -890,6 +891,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             restore_from: None,
+            identity_epoch: 0,
         }
     }
 

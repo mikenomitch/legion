@@ -1962,6 +1962,35 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           ([call 87](calls/suspend-resume-and-oversubscription-plan_calls.md)).
           A per-instance TAP for fresh boots is still open, so a fixed-TAP
           task runs one instance per node.
+    - [x] A fixed TAP is refused at submit (and `job scale`) wherever two
+          guests could share a node: a keyed task, `count` above one, or a
+          `createFirst` rollout. Disk forks of auto-TAP sandboxes are now
+          allowed, and the fixed-TAP disk-fork refusal remains only for jobs
+          stored before the rule
+          ([calls 135, 136](calls/suspend-resume-and-oversubscription-plan_calls.md#135-a-fixed-tap-is-refused-wherever-two-guests-could-share-a-node-not-removed),
+          [docs](../docs/task-runtime-sandbox.md#networking)). Removing fixed
+          TAPs altogether is the gated plan's Phase 4.
+    - [x] A fork held the origin's pre-capture workload-identity token, good
+          for one TTL. Fork and manual snapshot captures now raise the
+          instance's identity epoch (`legion.io/epoch`), the `legion` auth
+          method refuses earlier tokens, and the origin's node re-issues at
+          once from `TaskAllocation.identity_epoch`. A suspend does not move
+          the epoch
+          ([calls 137, 138](calls/suspend-resume-and-oversubscription-plan_calls.md#137-fork-and-snapshot-captures-retire-the-origins-earlier-tokens-with-a-per-instance-identity-epoch),
+          [docs](../docs/workload-identity.md#forks-and-snapshots)).
+    - [ ] ACL tokens minted with `legion login --method legion` before a fork
+          are copied into every fork and stay valid for `acl.loginTtl` (24h).
+          Record the instance and epoch on such tokens, or clamp them to the
+          identity token's expiry
+          ([call 139](calls/suspend-resume-and-oversubscription-plan_calls.md#139-acl-tokens-minted-from-an-identity-token-survive-a-fork)).
+    - [x] A resume, fork, or rollback whose restore failed under
+          `onRestoreFailure = "cold"` was visible only as an event and a
+          `detail` string. It is now `InstanceInfo.cold_boot`, persisted on
+          the instance until the next resume or restore starts: `active
+          (resumed cold)` in `instance list`, a `resumed cold at ...` line in
+          `instance get` and `start --wait`, `-j` and MCP output, and a UI
+          badge ([call 140](calls/suspend-resume-and-oversubscription-plan_calls.md#140-a-cold-boot-in-place-of-a-restore-is-a-persisted-record-on-the-instance),
+          [docs](../docs/suspend-and-resume.md#when-a-resume-cannot-restore)).
     - [x] A fork stopped while it waited for its checkpoint booted on an
           empty volume when started. A new instance now keeps its restore
           source across a stop and restores when started
@@ -3589,6 +3618,14 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([oci_bundle.rs](../src/task_plugins/oci_bundle.rs)).
 - [x] A **sandbox** runtime ([docs](../docs/task-runtime-sandbox.md)) — OCI images
       in microVMs for untrusted code and agent workspaces
+- [x] **Sandbox snapshot, fork, and suspend footguns** (2026-10-11): a fixed
+      TAP is refused at submit wherever two guests could share a node, forks
+      no longer act as their origin in Legion's own token checks, and a cold
+      resume is recorded on the instance as `cold_boot`
+      ([calls 135-140](calls/suspend-resume-and-oversubscription-plan_calls.md#135-a-fixed-tap-is-refused-wherever-two-guests-could-share-a-node-not-removed),
+      [sandbox networking](../docs/task-runtime-sandbox.md#networking),
+      [forks and snapshots](../docs/workload-identity.md#forks-and-snapshots),
+      [when a resume cannot restore](../docs/suspend-and-resume.md#when-a-resume-cannot-restore)).
 - [x] **The `container` runtime's four core gaps, closed** (2026-07-31) —
       [plan](plans/container-runtime-exec-and-signals-plan.md) ·
       [calls](calls/container-runtime-exec-and-signals-plan_calls.md). Six of
@@ -3838,6 +3875,13 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Manager as an OIDC issuer: keys, discovery, JWKS, rotation
 - [x] Token issuance RPC, job-spec API, worker delivery, change mode
 - [x] Node identity tokens and control-plane identity (phase 7)
+- [x] Identity epochs: a fork or snapshot capture retires the instance's
+      earlier tokens in Legion's own verifiers and re-issues the running
+      instance at once
+      ([calls 137-139](calls/suspend-resume-and-oversubscription-plan_calls.md#137-fork-and-snapshot-captures-retire-the-origins-earlier-tokens-with-a-per-instance-identity-epoch),
+      [docs](../docs/workload-identity.md#forks-and-snapshots)). Offline
+      verifiers (AWS, GCP, Vault) cannot see the epoch, and login-minted ACL
+      tokens are still open (Task runtimes, Phase 6 follow-ups).
 
 ## Auth & ACLs
 

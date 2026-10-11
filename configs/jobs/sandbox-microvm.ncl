@@ -72,10 +72,12 @@
                 # hypervisor = "cloud-hypervisor",
                 # kernel = "/var/lib/legion/kernels/vmlinux",
                 # kernel_args = "quiet",
-                # Guest NIC backed by a *pre-created* host TAP device. Legion
-                # does not create TAP devices (that needs CAP_NET_ADMIN and a
-                # host addressing plan). Default is loopback-only.
-                # network = { mode = "tap", tap = "tap0" },
+                # Guest NIC on a TAP device Legion creates per instance and
+                # attaches to a host bridge you own (needs CAP_NET_ADMIN on
+                # the worker). Default is loopback-only. A fixed device name
+                # (tap = "tap0") is refused on a keyed task, since it fits
+                # one guest per node.
+                # network = { mode = "tap", tap = "auto", bridge = "br0" },
             },
             resources = {
                 cpu = 1000,

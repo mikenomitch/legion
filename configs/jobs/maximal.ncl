@@ -813,10 +813,11 @@
                     # when the task's own `network.mode` below is "gated".
                     mode = "none",
                     # With mode = "tap": a pre-created host TAP device (one
-                    # guest per node), or "auto" for a TAP Legion creates
-                    # per instance (`lgf` + a hash of the instance id),
-                    # attaches to `bridge`, recreates on resume, and deletes
-                    # with the allocation:
+                    # guest per node, so refused on a keyed task, with
+                    # count above one, or with a createFirst rollout), or
+                    # "auto" for a TAP Legion creates per instance (`lgf` +
+                    # a hash of the instance id), attaches to `bridge`,
+                    # recreates on resume, and deletes with the allocation:
                     # tap = "auto",
                     # The host bridge an auto TAP joins. Required with
                     # tap = "auto", refused with a fixed tap.

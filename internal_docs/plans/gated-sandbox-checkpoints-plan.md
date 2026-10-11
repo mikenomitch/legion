@@ -809,10 +809,10 @@ this plan, each is impossible or refused before it can bite.
 
 | Combination | Today | After |
 | --- | --- | --- |
-| A fixed `tap = "tap0"` on a keyed task | One instance per node, a second fails at boot (`another process holds it`) | `config.network.tap` is removed. Every TAP is per instance on `bridge`. Submit says `config.network.tap is gone: Legion creates a TAP per instance. Set bridge = "<bridge tap0 was on>"` |
+| A fixed `tap = "tap0"` on a keyed task | Refused at submit since the sandbox footguns follow-up (suspend calls entry 135), along with `count` above one and `createFirst`. A job stored before that still fails at boot (`another process holds it`) | `config.network.tap` is removed. Every TAP is per instance on `bridge`. Submit says `config.network.tap is gone: Legion creates a TAP per instance. Set bridge = "<bridge tap0 was on>"` |
 | A pinned `mac` with forks | Every fork copies it, since only auto TAPs get derived MACs | `config.network.mac` is removed. Legion owns the MAC, derived from the allocation id |
 | A memory fork of a TAP sandbox whose guest set a static IP | Every fork answers on the origin's IP (docs say use DHCP) | Legion re-addresses every restore from the bridge pool |
-| A disk fork of a TAP sandbox | Refused at the API, since it would boot on the origin's TAP (suspend calls entry 87) | Allowed. It boots on its own TAP with its own lease |
+| A disk fork of a TAP sandbox | Allowed on `tap = "auto"` (each fork boots on its own `lgf` device). Refused at the API for a fixed TAP stored before entry 135, since it would boot on the origin's TAP (suspend calls entries 87, 136) | Allowed. It boots on its own TAP with its own lease |
 | A TAP bridge the node does not have | Fails at start or fork time (`would have no network`) | The implicit `sandbox.bridges` constraint keeps the task off that node |
 | `network.mode = "gated"` plus `config.network` | Fails at start | Refused at submit (§6.5) |
 | A memory checkpoint of a gated sandbox on a VMM that cannot retarget vsock | Not reachable (all refused) | Refused before capture, with the version and the fix (§6.2) |

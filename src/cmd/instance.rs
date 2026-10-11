@@ -664,6 +664,9 @@ async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
             "resumed_from": (resuming).then_some(reply.resuming_from.clone()),
             "node": (!reply.node_id.is_empty()).then_some(reply.node_id.clone()),
             "restore_ms": restore_ms,
+            "cold_boot": instance.as_ref().and_then(|info| info.cold_boot.as_ref()).map(|cold| {
+                json!({ "snapshot_id": cold.snapshot_id, "reason": cold.reason, "at": cold.at })
+            }),
             "detail": instance.as_ref().and_then(|info| info.detail.clone()),
             "message": reply.message,
             "deduplicated": reply.deduplicated,
@@ -671,8 +674,11 @@ async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
     } else {
         println!("{}", reply.message);
         if let Some(info) = instance.as_ref() {
-            match (resuming, info.last_restore_ms) {
-                (true, Some(ms)) => println!("Restored in {ms} ms on {}", reply.node_id),
+            match (resuming, info.last_restore_ms, info.cold_boot.as_ref()) {
+                // Set only when this start's restore fell back to a cold
+                // boot: a start clears the previous record.
+                (_, _, Some(cold)) => println!("{}", cold_boot_line(cold)),
+                (true, Some(ms), None) => println!("Restored in {ms} ms on {}", reply.node_id),
                 _ => println!("Instance {id} is {}", info.state),
             }
             if let Some(detail) = info.detail.as_deref() {
@@ -1024,9 +1030,12 @@ impl From<&InstanceInfo> for InstanceRow {
             group: instance.group.clone(),
             task: instance.task.clone(),
             mode: instance.mode.clone(),
-            state: match instance.pending_op.as_deref() {
-                Some(op) => format!("{} ({op})", instance.state),
-                None => instance.state.clone(),
+            state: match (instance.pending_op.as_deref(), instance.cold_boot.as_ref()) {
+                (Some(op), _) => format!("{} ({op})", instance.state),
+                // Loud on purpose: the restore failed, so the workload's
+                // running processes are gone.
+                (None, Some(_)) => format!("{} (resumed cold)", instance.state),
+                (None, None) => instance.state.clone(),
             },
             slot: instance
                 .slot_index
@@ -1115,6 +1124,9 @@ fn suspend_lines(instance: &InstanceInfo) -> Vec<String> {
             crate::cmd::helpers::usage_display::idle(after as i64)
         ));
     }
+    if let Some(cold) = instance.cold_boot.as_ref() {
+        lines.push(cold_boot_line(cold));
+    }
     if let Some(op) = instance.pending_op.as_deref() {
         lines.push(format!("in progress: {op}"));
     }
@@ -1122,6 +1134,16 @@ fn suspend_lines(instance: &InstanceInfo) -> Vec<String> {
         lines.push(format!("detail: {detail}"));
     }
     lines
+}
+
+/// `resumed cold at <time>: ...`: a restore failed and the instance booted
+/// fresh, so its running processes are gone (`InstanceInfo.cold_boot`).
+fn cold_boot_line(cold: &crate::structs::InstanceColdBoot) -> String {
+    format!(
+        "resumed cold at {}: restore from {} failed ({}). Running processes were lost, the \
+         volume was kept",
+        cold.at, cold.snapshot_id, cold.reason
+    )
 }
 
 #[cfg(test)]
@@ -1274,6 +1296,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(InstanceRow::from(&resuming).state, "pending (resuming)");
+    }
+
+    /// A cold boot in place of a failed restore shows in `instance list`'s
+    /// STATE column and as its own `instance get` line.
+    #[test]
+    fn a_cold_boot_is_named_in_the_state_and_the_get_lines() {
+        let cold = InstanceInfo {
+            state: "active".into(),
+            cold_boot: Some(crate::structs::InstanceColdBoot {
+                snapshot_id: "snap-77e0".into(),
+                reason: "restore needs TAP device lgf1: creating it failed".into(),
+                at: "2026-10-10T12:00:00Z".into(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(InstanceRow::from(&cold).state, "active (resumed cold)");
+        let lines = suspend_lines(&cold);
+        assert!(
+            lines.iter().any(|line| line
+                == "resumed cold at 2026-10-10T12:00:00Z: restore from snap-77e0 failed (restore \
+                    needs TAP device lgf1: creating it failed). Running processes were lost, the \
+                    volume was kept"),
+            "{lines:?}"
+        );
     }
 
     /// `instance get` names why the last suspend happened and, while the

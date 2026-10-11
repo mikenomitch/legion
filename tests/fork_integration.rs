@@ -625,7 +625,7 @@ async fn unsupported_forks_are_refused_with_a_hint() -> R<()> {
         "image": "alpine",
         "command": ["sleep", "60"],
         "hypervisor": "firecracker",
-        "network": { "mode": "tap", "tap": "tap0" },
+        "network": { "mode": "tap", "tap": "auto", "bridge": "br0" },
     });
     sandbox.snapshots = Some(Default::default());
     cluster.submit(job(sandbox))?;
@@ -814,6 +814,173 @@ async fn a_failed_fork_restore_follows_on_restore_failure() -> R<()> {
         .get_snapshot(&reply.snapshot)?
         .context("snapshot")?;
     assert_eq!(snapshot.state.as_str(), "deleting");
+    Ok(())
+}
+
+/// Under `onRestoreFailure = "cold"` (the default), a fork whose restore
+/// fails boots fresh on its own copy of the volume, and the fork says so
+/// on its instance (`cold_boot`), not only in the event.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fork_that_boots_cold_records_it_on_the_instance() -> R<()> {
+    let cluster = Cluster::new()?;
+    cluster.add_node(ALL_OPS, "1.12.0")?;
+    cluster.submit(job(task("exec", true)))?;
+    let origin_alloc = cluster.active_origin()?;
+    let reply = cluster.fork(1, None).await?;
+    cluster
+        .heartbeat(vec![capture_ok(&reply.snapshot, origin_alloc, 0)])
+        .await?;
+    cluster.reschedule()?;
+    let fork_id = &reply.instances[0];
+    let alloc = cluster.alloc_of(fork_id)?.context("placed")?;
+    cluster
+        .heartbeat(vec![restore_report(&reply.snapshot, alloc, false)])
+        .await?;
+    let info = cluster.info(fork_id).await?;
+    let cold = info.cold_boot.context("a cold boot is recorded")?;
+    assert_eq!(cold.snapshot_id, reply.snapshot);
+    assert!(cold.reason.contains("disk full"), "{}", cold.reason);
+    assert_eq!(
+        cluster.events("instance.restore_failed")?[0]["outcome"],
+        "cold"
+    );
+    Ok(())
+}
+
+/// A fork capture copies the origin's workload-identity tokens into every
+/// fork. It moves the origin to a new identity epoch in the same
+/// transaction that releases the forks: the desired set carries the new
+/// epoch (so the origin's node re-issues at once), and Legion's own
+/// verifier refuses the origin's pre-capture token while accepting the
+/// origin's new token and the fork's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fork_capture_retires_the_origins_earlier_tokens() -> R<()> {
+    use legion::manager::auth_method::{AuthMethod, ControlPlaneIdentityMethod};
+    use legion::manager::workload_identity::{claims_for_allocation, WorkloadIdentityState};
+    use legion::structs::workload_identity::{WorkloadIdentity, CONTROL_PLANE_IDENTITY_NAME};
+    use legion::structs::{AclBindingRule, WorkloadIdentityConfigFull};
+
+    let cluster = Cluster::new()?;
+    cluster.add_node(ALL_OPS, "1.12.0")?;
+    cluster.submit(job(task("exec", true)))?;
+    let origin_alloc = cluster.active_origin()?;
+    let epoch_of = |reply: &HeartbeatReply, allocation_id: i64| {
+        reply
+            .desired_allocations
+            .iter()
+            .find(|allocation| allocation.allocation_id == allocation_id)
+            .map(|allocation| allocation.identity_epoch)
+    };
+    assert_eq!(
+        epoch_of(&cluster.heartbeat(vec![]).await?, origin_alloc),
+        Some(0)
+    );
+
+    let issuer = "https://manager.test:4747";
+    let state = std::sync::Arc::new(WorkloadIdentityState::initialize(
+        cluster.store(),
+        &WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some(issuer.into()),
+            ..Default::default()
+        },
+        issuer,
+        std::time::SystemTime::now(),
+    )?);
+    let method = ControlPlaneIdentityMethod::new(
+        state.clone(),
+        vec![AclBindingRule {
+            claim: Some("legion.io/job".into()),
+            value: Some(JOB.into()),
+            policies: vec!["reader".into()],
+        }],
+        std::time::Duration::from_secs(60),
+        cluster.store().clone(),
+    );
+    let legion_identity = WorkloadIdentity {
+        name: CONTROL_PLANE_IDENTITY_NAME.into(),
+        ..Default::default()
+    };
+    let task_config = cluster.store().get_job_config(JOB)?.tasks[0].clone();
+    let token_for = |allocation_id: i64| -> R<String> {
+        let allocation = cluster
+            .store()
+            .get_allocation_by_id(allocation_id)?
+            .context("allocation")?;
+        let claims = claims_for_allocation(cluster.store(), &allocation, &task_config, "auto")?;
+        Ok(state
+            .issue(&claims, &legion_identity, std::time::SystemTime::now())?
+            .token)
+    };
+    let verifies = |token: &str| {
+        method
+            .validate_bearer(token)
+            .expect("the legion method reads a JWT")
+            .is_ok()
+    };
+    let before = token_for(origin_alloc)?;
+    assert!(verifies(&before));
+
+    let reply = cluster.fork(1, None).await?;
+    let landed = cluster
+        .heartbeat(vec![capture_ok(&reply.snapshot, origin_alloc, 0)])
+        .await?;
+    assert_eq!(
+        cluster
+            .store()
+            .get_instance(ORIGIN)?
+            .context("origin")?
+            .identity_epoch,
+        1
+    );
+    assert_eq!(
+        epoch_of(&landed, origin_alloc),
+        Some(1),
+        "the reply that lands the capture tells the origin's node"
+    );
+    let refused = method
+        .validate_bearer(&before)
+        .expect("reads a JWT")
+        .expect_err("a token from before the capture is a copy the fork holds");
+    assert!(
+        format!("{refused:?}").contains("identity epoch 0"),
+        "{refused:?}"
+    );
+    assert!(
+        verifies(&token_for(origin_alloc)?),
+        "the origin's new token"
+    );
+
+    cluster.reschedule()?;
+    let fork_alloc = cluster.alloc_of(&reply.instances[0])?.context("placed")?;
+    assert!(verifies(&token_for(fork_alloc)?), "the fork's own token");
+
+    // A manual snapshot can seed new instances, so it retires them too.
+    let snapshot = cluster
+        .svc
+        .create_snapshot(Request::new(CreateSnapshotRequest {
+            instance_id: ORIGIN.into(),
+            kind: "disk".into(),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner()
+        .snapshot
+        .context("snapshot")?
+        .snapshot_id;
+    let current = token_for(origin_alloc)?;
+    cluster
+        .heartbeat(vec![capture_ok(&snapshot, origin_alloc, 0)])
+        .await?;
+    assert_eq!(
+        cluster
+            .store()
+            .get_instance(ORIGIN)?
+            .context("origin")?
+            .identity_epoch,
+        2
+    );
+    assert!(!verifies(&current));
     Ok(())
 }
 
@@ -1076,8 +1243,10 @@ async fn unsupported_spread_and_tap_forks_are_refused_with_a_hint() -> R<()> {
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert!(status.message().contains("--checkpoint disk"), "{status:?}");
 
-    // A disk fork of a TAP-wired sandbox would boot every fork on the TAP
-    // device the origin holds.
+    // A disk fork of a fixed-TAP sandbox would boot every fork on the TAP
+    // device the origin holds. Submit refuses this spec now, so it reaches
+    // the API only from a job stored before that rule (this harness skips
+    // validation).
     let cluster = Cluster::new()?;
     cluster.add_node(ALL_OPS, "1.12.0")?;
     let mut sandbox = task("sandbox", true);
@@ -1103,6 +1272,28 @@ async fn unsupported_spread_and_tap_forks_are_refused_with_a_hint() -> R<()> {
         "{status:?}"
     );
     assert_eq!(cluster.store().list_instances(JOB)?.len(), 1);
+
+    // On `tap = "auto"` each fork boots on its own device, so a disk fork
+    // is accepted.
+    let cluster = Cluster::new()?;
+    cluster.add_node(ALL_OPS, "1.12.0")?;
+    let mut sandbox = task("sandbox", true);
+    sandbox.config = json!({
+        "image": "alpine",
+        "command": ["sleep", "60"],
+        "hypervisor": "firecracker",
+        "network": { "mode": "tap", "tap": "auto", "bridge": "br0" },
+    });
+    cluster.submit(job(sandbox))?;
+    cluster.active_origin()?;
+    cluster
+        .fork_with(ForkInstanceRequest {
+            instance_id: ORIGIN.into(),
+            checkpoint: Some("disk".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("an auto-TAP disk fork boots on its own device");
     Ok(())
 }
 

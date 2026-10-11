@@ -579,6 +579,12 @@ impl Store {
                             ],
                         )?;
                         let evicted = self.apply_snapshot_keep_tx(&tx, &snapshot)?;
+                        // A manual snapshot can seed new instances
+                        // (`from_snapshot`), which start with copies of this
+                        // instance's tokens.
+                        if let Some(instance_id) = snapshot.instance_id.as_deref() {
+                            Self::advance_identity_epoch_tx(&tx, instance_id)?;
+                        }
                         let snapshot = Self::get_snapshot_on(&tx, &report.snapshot_id)?
                             .context("snapshot row vanished")?;
                         SnapshotReportOutcome::Captured { snapshot, evicted }
@@ -765,8 +771,22 @@ impl Store {
                     )?;
                     if report.ok {
                         tx.execute(
-                            "UPDATE instance SET last_restore_ms = ?2,                              restored_from_snapshot_id = ?3 WHERE instance_id = ?1;",
+                            "UPDATE instance SET last_restore_ms = ?2, \
+                             restored_from_snapshot_id = ?3 WHERE instance_id = ?1;",
                             params![instance_id, report.duration_ms as i64, report.snapshot_id],
+                        )?;
+                    } else {
+                        // A rollback whose restore failed: the replacement
+                        // boots cold on the retained storage.
+                        tx.execute(
+                            "UPDATE instance SET cold_boot = ?2 WHERE instance_id = ?1;",
+                            params![
+                                instance_id,
+                                crate::structs::suspend::InstanceColdBoot::record_now(
+                                    &report.snapshot_id,
+                                    &report.error
+                                )
+                            ],
                         )?;
                     }
                     SnapshotReportOutcome::Restored {
@@ -1100,7 +1120,7 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE instance SET state = 'pending', current_alloc_id = NULL, \
-             restore_from = ?1, updated_at = ?2 WHERE instance_id = ?3;",
+             restore_from = ?1, cold_boot = NULL, updated_at = ?2 WHERE instance_id = ?3;",
             params![snapshot_id, now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;

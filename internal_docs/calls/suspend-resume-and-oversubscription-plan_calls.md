@@ -3308,3 +3308,171 @@ in the fetch, then follow `onRestoreFailure`.
 differently by locality, which touches the restore binder and the
 per-instance compat filter. With entry 131 most capturing nodes still hold
 the parts, which locality prefers. It is a TODO item.
+
+## 135. A fixed TAP is refused wherever two guests could share a node, not removed
+
+*Sandbox footguns follow-up, implementation.*
+
+**Call.** Submit, `job validate`, and `job plan` refuse `config.network = {
+mode = "tap", tap = "tap0" }` on a keyed task, on any task with `count`
+above one (slot mode or stateless), and under a rollout with `replacement =
+"createFirst"`. `job scale` refuses a count above one on the same rule. The
+hint names the fix:
+
+```text
+task "workspace" attaches its sandbox to the fixed TAP device "tap0" (config.network.tap),
+which serves one guest per node, but it is a keyed task ...
+Hint: set config.network = { mode = "tap", tap = "auto", bridge = "<the bridge tap0 is
+on>" }, so Legion creates a TAP per instance
+```
+
+A single fixed-TAP guest (one slot, or a stateless count of one under
+`destroyFirst`) still validates.
+
+**Alternatives.** (a) Remove `config.network.tap` now, as
+[gated-sandbox-checkpoints-plan.md §6.8](../plans/gated-sandbox-checkpoints-plan.md)
+does later. (b) Refuse only keyed tasks, as asked. (c) Exempt a task whose
+constraints keep its allocations apart (a `distinct` rule, or `count.per`).
+
+**Trade-off.** A count above one with a fixed TAP and a constraint that does
+keep allocations on separate nodes is refused although it would work. Those
+operators move to `tap = "auto"`, which needs a bridge.
+
+**Why (simplicity).** The rule is "one fixed device, one guest per node", and
+every case that can break it is refused by the same predicate
+(`fork::validate_fixed_tap`). (a) is the right end state but belongs to the
+plan that also brings per-bridge addressing, so removing the field here would
+strand fixed-TAP users with no replacement for static wiring. (b) leaves the
+slot-mode case asked about, which fails the same way: the scheduler packs two
+slots onto one node. (c) would make the refusal depend on a reading of
+constraint semantics (`distinct` keys are not guaranteed per node, and a
+rollout can still surge), for a field the next plan deletes.
+
+## 136. Disk forks of auto-TAP sandboxes are allowed, and the fixed-TAP refusal stays for stored jobs
+
+*Sandbox footguns follow-up, implementation. Narrows entry 87.*
+
+**Call.** ForkInstance refuses `--checkpoint disk` only for a fixed TAP. A
+disk fork of a `tap = "auto"` sandbox boots each fork fresh on its own `lgf`
+device on the task's `bridge`, the same path a disk snapshot seed already
+took. The fixed-TAP refusal stays, reachable only from a job stored before
+entry 135.
+
+**Alternatives.** (a) Keep refusing every TAP-wired disk fork. (b) Drop the
+API refusal, since submit now prevents new fixed-TAP keyed jobs.
+
+**Trade-off.** One small check stays for specs that predate the submit rule.
+
+**Why (simplicity).** Entry 87 predates auto TAPs: its reason, that a fresh
+boot lands on the origin's device, is false for them. Refusing a working
+combination would be a footgun of its own. The stored-job check costs a few
+lines and turns an opaque boot failure into an API refusal with a hint,
+which is the standing rule for combinations that cannot work.
+
+## 137. Fork and snapshot captures retire the origin's earlier tokens with a per-instance identity epoch
+
+*Sandbox footguns follow-up, implementation.*
+
+**Call.** Each instance has an `identity_epoch` column, stamped into its
+workload-identity tokens as `legion.io/epoch`. A fork capture (either kind)
+and a manual snapshot capture raise it in the transaction that marks the
+checkpoint `local`. The control-plane `legion` auth method refuses a token
+whose epoch is below its instance's current one (and a token naming an
+instance that no longer exists). The desired set carries the epoch
+(`TaskAllocation.identity_epoch`), and a worker that sees it rise wakes the
+allocation's refresh loops, so the origin holds a current token within about
+a heartbeat.
+
+**Alternatives.** (a) A `jti` deny list: record every token issued to the
+origin and deny them at capture. (b) An "issued after" time watermark per
+instance, compared with `iat`. (c) Bump at fork request time, before the
+capture. (d) Accept the window and document it (the prior state).
+
+**Trade-off.** Every stateful token gains a claim, and verification by the
+`legion` method costs one indexed instance read per bearer request that
+names an instance. Relying parties that verify offline (AWS, GCP, Vault) gain
+nothing: they cannot see the epoch, so there the window stays one TTL. ACL
+tokens the origin minted with `legion login` are not covered either (entry
+135).
+
+**Why (performance, simplicity).** (a) needs a table of issued tokens that
+grows with every refresh, for a check an integer comparison makes. (b) has
+one-second granularity: a refresh issued in the same second as the capture,
+before it, would pass `iat >= watermark` and sit in the fork's memory, so it
+is unsound without sub-second claims. (c) is unsound in the other direction:
+a refresh between the request and the pause carries the new epoch into the
+checkpoint. Bumping when the capture lands means every token in the
+checkpoint was issued at the old epoch, and the forks are released in the
+same transaction, so no fork runs while those tokens still verify.
+
+## 138. A suspend does not move the identity epoch
+
+*Sandbox footguns follow-up, implementation.*
+
+**Call.** A suspend capture (manual, idle, pressure, make-room) and the
+resume that follows leave the epoch alone. The resumed guest's pre-capture
+token keeps working in Legion's verifiers until it expires, as before.
+
+**Alternatives.** Raise the epoch on every suspend too, which would also
+retire tokens held in a published suspend checkpoint in the bucket.
+
+**Trade-off.** A token captured in a suspend checkpoint stays usable,
+Legion-side, by whoever reads the checkpoint bytes, for up to one TTL after
+the capture.
+
+**Why (simplicity).** The window entry 137 closes is two live instances
+holding one identity. A suspend checkpoint only ever resumes the same
+instance, and at most one copy of it runs, so there is no second holder to
+lock out. Raising the epoch would only break processes in the resumed guest
+that still hold their boot token, which is the friendlier behavior to keep.
+Whoever can read checkpoint bytes can already read every in-memory secret
+(`snapshot:write`, bucket access), which the security docs say.
+
+## 139. ACL tokens minted from an identity token survive a fork
+
+*Sandbox footguns follow-up, a known limitation.*
+
+**Call.** An ACL token the origin obtained with `legion login --method
+legion` before a fork is an ordinary ACL token, copied into every fork and
+valid for `acl.loginTtl` (24 hours by default). The public doc says so and
+recommends bearer use of the identity token instead.
+
+**Alternatives.** Record the instance and epoch on ACL tokens minted by the
+`legion` method and check them on every request, or clamp such tokens to the
+identity token's own expiry.
+
+**Trade-off.** A platform whose workloads log in, rather than presenting the
+identity token, keeps a 24-hour window after a fork.
+
+**Why (simplicity).** Either alternative changes the ACL token record and its
+hot path for a flow the identity token already serves directly. It is a TODO
+item, not part of this fix.
+
+## 140. A cold boot in place of a restore is a persisted record on the instance
+
+*Sandbox footguns follow-up, implementation.*
+
+**Call.** A restore that fails under `onRestoreFailure = "cold"` writes an
+`instance.cold_boot` record (snapshot, reason, time), served as
+`InstanceInfo.cold_boot`. `instance list` shows `active (resumed cold)`,
+`instance get` and `start --wait` print a `resumed cold at ...` line, `-j` and MCP
+return the field, and the UI shows a **resumed cold** badge. It covers a
+resume (node error, lost or failed checkpoint, `resumeTimeout`), a fork or
+`from_snapshot` restore, and a rollback restore. It stays until the next
+resume or restore starts, or the instance is stopped or destroyed. An
+explicit `start --cold` records nothing. The default stays `cold`.
+
+**Alternatives.** (a) Rely on `detail`, which already said "booted cold".
+(b) Change the default to `fail`. (c) A new instance state such as
+`active-cold`.
+
+**Trade-off.** One more column and proto field, and the record outlives the
+next suspend, so a suspended instance can show that its last resume was cold.
+
+**Why (ease).** `detail` is one string shared by four producers, shadowed by
+a node-loss or volume-pin note, and cleared by the next suspend, so a
+platform could not rely on it to tell a user their session was lost. A
+structured field is something a client can branch on. (b) trades a visible
+loss for a locked-out user, which the plan rejected for the default. (c)
+would make every state check in every client learn a new value for what is
+a property of the last resume, not a lifecycle state.

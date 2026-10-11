@@ -574,7 +574,17 @@ pub struct WorkloadIdentityClaims {
     pub instance: Option<String>,
     /// Slot index for slot-mode stateful workloads.
     pub slot: Option<u32>,
+    /// The instance's identity epoch (`legion.io/epoch`), for stateful
+    /// workloads. Raised by every fork or snapshot capture of the instance;
+    /// Legion's verifiers refuse a token from an earlier epoch
+    /// (docs/workload-identity.md, "Forks and snapshots").
+    pub epoch: Option<u64>,
 }
+
+/// The claim carrying an instance's identity epoch.
+pub const EPOCH_CLAIM: &str = "legion.io/epoch";
+/// The claim carrying the instance a token was issued to.
+pub const INSTANCE_CLAIM: &str = "legion.io/instance";
 
 impl WorkloadIdentityClaims {
     /// Build the default OIDC `sub` claim. Mirrors Nomad's composed subject
@@ -666,6 +676,9 @@ impl WorkloadIdentityClaims {
         }
         if let Some(slot) = self.slot {
             claims.insert(format!("{LEGION_CLAIM_PREFIX}slot"), slot.to_string());
+        }
+        if let (Some(_), Some(epoch)) = (&self.instance, self.epoch) {
+            claims.insert(EPOCH_CLAIM.to_string(), epoch.to_string());
         }
         claims
     }
@@ -841,6 +854,7 @@ mod tests {
             alloc_id: "alloc-42".into(),
             instance: None,
             slot: None,
+            epoch: None,
         }
     }
 
@@ -877,12 +891,14 @@ mod tests {
         let c = WorkloadIdentityClaims {
             instance: Some("api-web-0".into()),
             slot: Some(0),
+            epoch: Some(3),
             ..claims()
         };
         assert!(c.is_stateful());
         let lc = c.legion_claims();
         assert_eq!(lc["legion.io/instance"], "api-web-0");
         assert_eq!(lc["legion.io/slot"], "0");
+        assert_eq!(lc["legion.io/epoch"], "3");
     }
 
     #[test]

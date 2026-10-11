@@ -671,7 +671,18 @@ fn map_instance_info(
         preemptor_job: stop.preemptor_job,
     });
     let (held_memory_mib, held_cpu_mhz) = suspended_hold_of(store, &instance);
+    let cold_boot = suspend
+        .cold_boot
+        .clone()
+        .map(|cold| crate::structs::InstanceColdBoot {
+            snapshot_id: cold.snapshot_id,
+            reason: cold.reason,
+            at: chrono::DateTime::<chrono::Utc>::from_timestamp(cold.at, 0)
+                .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_default(),
+        });
     InstanceInfo {
+        cold_boot,
         last_stop,
         checkpoint_support,
         forked_from: history.forked_from,
@@ -4627,6 +4638,12 @@ impl Manager for ManagerDaemonService {
             inner.task_group.as_deref(),
             inner.task_name.as_deref(),
         )?;
+        // The submit-time fixed-TAP rule, asked of the count being set: a
+        // second guest on a fixed TAP fails to boot (docs/task-runtime-sandbox.md).
+        if let Some(count) = inner.count {
+            crate::structs::fork::validate_fixed_tap(task, count, false)
+                .map_err(Status::failed_precondition)?;
+        }
         let (task_group, task_name, spec_count) =
             (task.group.clone(), task.name.clone(), task.count.num);
         let job_config_id = config.id();

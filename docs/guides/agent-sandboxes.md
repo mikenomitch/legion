@@ -338,7 +338,7 @@ The options, side by side:
 | --- | --- | --- | --- |
 | none (`config.network.mode = "none"`, the default) | Loopback only | Yes | Any number |
 | `config.network = { mode = "tap", tap = "auto", bridge = "br0" }` | A NIC on a TAP Legion creates per instance, on your bridge | Yes | Any number |
-| `config.network = { mode = "tap", tap = "tap0" }` | A NIC on a host TAP device you create | Yes | One per task, since the device name is fixed in the spec |
+| `config.network = { mode = "tap", tap = "tap0" }` | A NIC on a host TAP device you create | Yes | One per node. **Refused at submit** on a keyed task, so not for agent sandboxes |
 | `network = { mode = "gated", egress = { allow = [...] } }` | Egress through the node datapath, judged by policy | **No**, refused at submit | Any number |
 
 Gated networking is the one with per-sandbox egress policy in Legion, and it
@@ -438,6 +438,24 @@ on top, so a node with no room adds a wait. See
 
 Without `--wait`, `start` returns at once with `"state":"pending"`. Poll
 `instance get` until `state` is `active` with no `pending_op`.
+
+Then check `cold_boot`. It is set when the restore failed and the default
+`onRestoreFailure = "cold"` booted the sandbox fresh on `/workspace`
+instead. The user's files are there, but the harness and anything it held in
+memory are gone, so tell the user rather than show a resumed session:
+
+```console
+$ legion instance start user-42 --wait -j
+{"ok":true,"data":{"instance":"user-42","state":"active",
+ "resumed_from":"snap-91c2a0b3d4e5f601","node":"w-03","restore_ms":null,
+ "cold_boot":{"snapshot_id":"snap-91c2a0b3d4e5f601",
+  "reason":"restore needs TAP device lgf3c1d...: creating it failed: ...",
+  "at":"2026-10-10T12:03:24Z"}, ...}}
+```
+
+`instance list` shows the same thing as `active (resumed cold)`, and the UI
+as a **resumed cold** badge. See
+[when a resume cannot restore](../suspend-and-resume.md#when-a-resume-cannot-restore).
 
 ### Force a cold boot
 
@@ -774,7 +792,7 @@ CPU and VMM it was taken on; restore an older snapshot, or restart the instance 
 
 With `onRestoreFailure = "cold"`, the resume waits `resumeTimeout` and then
 boots fresh on `/workspace`, with `instance.restore_failed` (`outcome: cold`)
-and the reason in `detail`. Plan VMM upgrades like a drain: resume or cold-boot
+and the reason in `cold_boot` and `detail`. Plan VMM upgrades like a drain: resume or cold-boot
 the node's suspended sandboxes before you upgrade, or accept that they come
 back cold. The node attributes are in
 [where a memory checkpoint can be restored](../task-runtime-sandbox.md#where-a-memory-checkpoint-can-be-restored).
@@ -932,6 +950,19 @@ and no `onResume` validates. It suspends by stopping and resumes by booting
 fresh on `/workspace`. When gating comes from a stored network policy rather
 than the spec, the sandbox launches without checkpoint support, and a memory
 suspend or snapshot fails with `FailedPrecondition` and the same hint.
+
+A fixed TAP device is refused too, because it fits one guest per node and a
+keyed task can put several on one node:
+
+```text
+$ legion job validate agents-tap0.ncl
+Error: jobspec failed validation: task "workspace" attaches its sandbox to the fixed TAP
+device "tap0" (config.network.tap), which serves one guest per node, but it is a keyed
+task (stateful.mode = "keyed"), so a second instance, a fork that boots cold, or a disk
+snapshot seed on the same node fails to boot
+Hint: set config.network = { mode = "tap", tap = "auto", bridge = "<the bridge tap0 is
+on>" }, so Legion creates a TAP per instance
+```
 
 ## The macOS dev loop
 

@@ -15,13 +15,13 @@
 use super::*;
 use crate::structs::snapshot::{SnapshotPurpose, SnapshotRecord, SnapshotState};
 use crate::structs::suspend::{
-    InstanceSuspendState, OnRestoreFailure, ResolvedSuspend, PENDING_RESUME, PENDING_SUSPEND,
-    SUSPEND_REASON_MANUAL, SUSPEND_REASON_PRESSURE,
+    InstanceColdBoot, InstanceSuspendState, OnRestoreFailure, ResolvedSuspend, PENDING_RESUME,
+    PENDING_SUSPEND, SUSPEND_REASON_MANUAL, SUSPEND_REASON_PRESSURE,
 };
 
 const SUSPEND_COLUMNS: &str = "checkpoint_id, suspend_reason, suspended_at, pending_op, \
      restored_from_snapshot_id, last_suspend_ms, last_restore_ms, resume_requested_at, \
-     lifecycle_error";
+     lifecycle_error, cold_boot";
 
 /// Work [`Store::apply_snapshot_report`] finishes after its transaction
 /// commits: publish the staged stop event and refresh the allocation cache.
@@ -95,6 +95,9 @@ fn suspend_state_from_row(
         last_restore_ms: row.get(at + 6)?,
         resume_requested_at: row.get(at + 7)?,
         lifecycle_error: row.get(at + 8)?,
+        cold_boot: row
+            .get::<_, Option<String>>(at + 9)?
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
     })
 }
 
@@ -131,7 +134,7 @@ impl Store {
             "SELECT instance_id, {SUSPEND_COLUMNS} FROM instance WHERE job_id = ?1 \
              AND (checkpoint_id IS NOT NULL OR pending_op IS NOT NULL \
              OR suspended_at IS NOT NULL OR last_restore_ms IS NOT NULL \
-             OR lifecycle_error IS NOT NULL);"
+             OR lifecycle_error IS NOT NULL OR cold_boot IS NOT NULL);"
         ))?;
         let rows = stmt.query_map([job_id], |row| {
             Ok((row.get::<_, String>(0)?, suspend_state_from_row(row, 1)?))
@@ -308,9 +311,10 @@ impl Store {
                 }
             }
         }
+        // A stop or destroy ends the run a cold boot record describes.
         tx.execute(
             "UPDATE instance SET checkpoint_id = NULL, pending_op = NULL, \
-             resume_requested_at = NULL WHERE instance_id = ?1;",
+             resume_requested_at = NULL, cold_boot = NULL WHERE instance_id = ?1;",
             [instance_id],
         )?;
         Ok(())
@@ -657,7 +661,7 @@ impl Store {
             tx.execute(
                 "UPDATE instance SET restore_from = NULL, checkpoint_id = NULL, \
                  pending_op = NULL, resume_requested_at = NULL, lifecycle_error = NULL, \
-                 last_restore_ms = ?2, restored_from_snapshot_id = ?3 \
+                 cold_boot = NULL, last_restore_ms = ?2, restored_from_snapshot_id = ?3 \
                  WHERE instance_id = ?1;",
                 params![instance_id, report.duration_ms as i64, report.snapshot_id],
             )?;
@@ -678,14 +682,15 @@ impl Store {
                 // `restore_from` cleared, its replacement boots fresh.
                 tx.execute(
                     "UPDATE instance SET restore_from = NULL, checkpoint_id = NULL, \
-                     pending_op = NULL, resume_requested_at = NULL, lifecycle_error = ?2 \
-                     WHERE instance_id = ?1;",
+                     pending_op = NULL, resume_requested_at = NULL, lifecycle_error = ?2, \
+                     cold_boot = ?3 WHERE instance_id = ?1;",
                     params![
                         instance_id,
                         format!(
                             "restore from {} failed, booted cold: {error}",
                             report.snapshot_id
-                        )
+                        ),
+                        InstanceColdBoot::record_now(&report.snapshot_id, &error)
                     ],
                 )?;
                 if let Some(snapshot) = snapshot {
@@ -822,12 +827,16 @@ impl Store {
                     unusable.clone().unwrap_or_default()
                 )
             });
+            // An explicit --cold records no cold boot: it was asked for.
+            let cold_boot = unusable.as_ref().filter(|_| !cold).map(|unusable| {
+                InstanceColdBoot::record_now(discarded.as_deref().unwrap_or_default(), unusable)
+            });
             tx.execute(
                 "UPDATE instance SET state = 'pending', current_alloc_id = NULL, \
                  checkpoint_id = NULL, pending_op = NULL, restore_from = NULL, \
-                 resume_requested_at = NULL, lifecycle_error = ?2, updated_at = ?3 \
-                 WHERE instance_id = ?1;",
-                params![instance_id, reason, now],
+                 resume_requested_at = NULL, lifecycle_error = ?2, updated_at = ?3, \
+                 cold_boot = ?4 WHERE instance_id = ?1;",
+                params![instance_id, reason, now, cold_boot],
             )?;
             ResumeOutcome::Cold { reason, discarded }
         } else {
@@ -835,7 +844,8 @@ impl Store {
             tx.execute(
                 "UPDATE instance SET state = 'pending', current_alloc_id = NULL, \
                  restore_from = ?2, pending_op = ?3, resume_requested_at = ?4, \
-                 lifecycle_error = NULL, updated_at = ?5 WHERE instance_id = ?1;",
+                 lifecycle_error = NULL, cold_boot = NULL, updated_at = ?5 \
+                 WHERE instance_id = ?1;",
                 params![
                     instance_id,
                     snapshot.snapshot_id,
@@ -953,13 +963,14 @@ impl Store {
             tx.execute(
                 "UPDATE instance SET restore_from = NULL, checkpoint_id = NULL, \
                  pending_op = NULL, resume_requested_at = NULL, lifecycle_error = ?3, \
-                 updated_at = ?4 WHERE instance_id = ?1 AND restore_from = ?2 \
+                 updated_at = ?4, cold_boot = ?5 WHERE instance_id = ?1 AND restore_from = ?2 \
                  AND pending_op = 'resume' AND current_alloc_id IS NULL;",
                 params![
                     instance_id,
                     snapshot_id,
                     format!("{reason}; booted cold on the retained storage"),
-                    now
+                    now,
+                    InstanceColdBoot::record_now(snapshot_id, reason)
                 ],
             )?
         } else {

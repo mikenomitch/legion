@@ -37,7 +37,10 @@ A workload identity token is an ES256-signed JWT. Standard claims:
 The token also carries separate Legion claims, so providers that can match
 any claim don't have to parse `sub`: `legion.io/region`, `legion.io/job`,
 `legion.io/group`, `legion.io/task`, `legion.io/node`, `legion.io/alloc` (and
-`legion.io/instance` / `legion.io/slot` for stateful workloads).
+`legion.io/instance` / `legion.io/slot` for stateful workloads). A stateful
+workload's token also carries `legion.io/epoch`, the instance's identity
+epoch, which Legion uses to retire tokens copied into a fork or snapshot (see
+[Forks and snapshots](#forks-and-snapshots)).
 
 ### The `sub` claim is a security boundary
 
@@ -409,11 +412,73 @@ resume](suspend-and-resume.md#identity-after-a-resume)). Processes already
 running in the guest keep the env they started with, so re-read the file or
 restart them from `onResume`.
 
-Tokens can't be revoked. A memory checkpoint holds whatever token the guest
-had in memory at capture, and that token stays valid until it expires: up
-to one TTL (`ttl`, 15 minutes by default) after the capture. Short TTLs are
-the mitigation. Keep them short on tasks you suspend or snapshot, and treat
-`snapshot:write` on a job as access to its in-memory secrets.
+A suspend checkpoint holds whatever token the guest had in memory at
+capture, and that token stays valid until it expires: up to one TTL (`ttl`,
+15 minutes by default) after the capture. A suspend does not retire it,
+because only one copy of the instance ever runs, and the resumed guest is the
+same instance. Forks and snapshots are different, since they can start a
+second instance with the first one's tokens (next section). Keep TTLs short on
+tasks you suspend or snapshot, and treat `snapshot:write` on a job as access
+to its in-memory secrets.
+
+### Forks and snapshots
+
+A [fork](suspend-and-resume.md#fork) starts every fork from the origin's
+memory, so each fork holds the token the origin had at capture, next to the
+token issued for the fork itself. A memory snapshot does the same for every
+instance created from it (`instance create --from-snapshot`). Without more,
+a fork could present the origin's token, with the origin's
+`legion.io/instance` and `legion.io/alloc`, for up to one TTL.
+
+Legion closes that window for the verifiers it runs itself:
+
+- Each stateful instance has an **identity epoch**, stamped into its tokens
+  as `legion.io/epoch` (a string, like `legion.io/slot`). It starts at `0`.
+- When a fork or a manual snapshot of the instance is captured, the manager
+  raises the epoch in the same transaction that marks the checkpoint
+  `local` (and, for a fork, releases the forks for placement). From then on
+  it refuses that instance's tokens from earlier epochs. Every token in the
+  checkpoint is one of those.
+- The new epoch reaches the instance's node in the heartbeat that reported
+  the capture (`TaskAllocation.identity_epoch`), and the worker re-issues
+  the allocation's tokens at once instead of at its next half-TTL refresh.
+  The running instance holds a current token again within about a heartbeat
+  (2 seconds). A sandbox guest's file follows within the resume handler's
+  200 ms poll. A refresh triggered this way applies the identity's
+  `changeMode` like any other, so `restart` restarts the origin.
+- A fork's own tokens name the fork's instance, at the fork's epoch, so they
+  are unaffected.
+
+A refused token fails with a message that says why:
+
+```text
+control-plane token refused: token was issued to instance user-42 at identity epoch 0,
+before a fork or snapshot of it was captured (now epoch 1), so it may be a copy a fork
+holds. The instance itself holds a newer token
+```
+
+What this covers, and what it does not:
+
+- **Covered:** the [control-plane identity](#control-plane-identity), both as
+  an `Authorization: Bearer` credential and for `legion login --method
+  legion`. A token naming an instance that no longer exists is refused too.
+- **Not covered: relying parties that verify offline.** AWS STS, GCP, Vault,
+  and any service that checks the JWT against the published JWKS see a
+  validly signed, unexpired token. They cannot know the instance's current
+  epoch, so the origin's pre-capture token still works there until it
+  expires. Keep `ttl` short on tasks you fork or snapshot, and bind
+  per-instance access to `legion.io/instance` only when one TTL of overlap
+  is acceptable.
+- **Not covered: ACL tokens minted from an identity token.** An ACL token
+  the origin got with `legion login --method legion` before the capture is an
+  ordinary ACL token. It is copied into every fork and stays valid for
+  `acl.loginTtl` (24 hours by default). Present the identity token as a
+  bearer credential instead of logging in, or delete the ACL token after a
+  fork.
+- **The window before the refresh.** Between the capture and the origin's
+  re-issue (about a heartbeat), the origin's own current token is already
+  refused. A process that cached its token in memory gets one failed call,
+  then must re-read the token file, as it already must after a restore.
 
 ### What each change mode does on refresh
 

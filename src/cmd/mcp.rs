@@ -193,7 +193,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_list",
-            description: "List a job's stateful instances (slot and keyed, including terminated tombstones).",
+            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `cold_boot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`cold_boot.reason` says why).",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -207,7 +207,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_get",
-            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle). For suspend: `checkpoint_id`, `suspend_reason` (manual, idle, or pressure), and, while the task's suspend.idle policy is watching a running instance, `idle_since` and `idle_after_seconds`. Also reports a live PROVISIONAL claim when a node has started this instance but the placement is not durable yet (docs/edge-boot.md) — do not build on a provisional instance, it may still be killed.",
+            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle). For suspend: `checkpoint_id`, `suspend_reason` (manual, idle, or pressure), and, while the task's suspend.idle policy is watching a running instance, `idle_since` and `idle_after_seconds`. `cold_boot` (snapshot_id, reason, at) is set when the last resume or restore failed and the instance booted fresh on its volume under onRestoreFailure = \"cold\": its running processes and memory are gone, so do not assume a resumed session survived. Also reports a live PROVISIONAL claim when a node has started this instance but the placement is not durable yet (docs/edge-boot.md) — do not build on a provisional instance, it may still be killed.",
             input_schema: || json!({
                 "type": "object",
                 "properties": { "instance_id": { "type": "string", "description": "Instance id." } },
@@ -868,7 +868,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_start",
-            description: "Start a stopped keyed-mode instance (re-place it with the same id and retained storage handle), or resume a suspended one from its checkpoint (cold=true discards the checkpoint and boots fresh). The owning job must be running. Returns at once; poll legion_instance_get for state=active and no pending_op. Mutating.",
+            description: "Start a stopped keyed-mode instance (re-place it with the same id and retained storage handle), or resume a suspended one from its checkpoint (cold=true discards the checkpoint and boots fresh). The owning job must be running. Returns at once; poll legion_instance_get for state=active and no pending_op, then check `cold_boot`: when set, the restore failed and the instance booted fresh (onRestoreFailure = \"cold\", the default), losing its running processes. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {

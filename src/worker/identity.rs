@@ -27,6 +27,13 @@
 //! `changeSignal` to the task process), or `restart` (restart the allocation
 //! in place via the task manager). Loops stop when the allocation stops.
 //!
+//! When a fork or snapshot of an allocation's instance is captured, the
+//! manager raises the instance's identity epoch and refuses its older
+//! tokens (copies of them sit in the checkpoint). The desired set carries the
+//! epoch (`TaskAllocation.identity_epoch`), and a rise wakes the allocation's
+//! refresh loops at once, so the running instance gets a current token within
+//! a heartbeat rather than at its next half-TTL refresh.
+//!
 //! If the manager has workload identity disabled, issuance returns
 //! FailedPrecondition; the worker logs one warning and treats the task's
 //! identities as inert (the task still starts, with no tokens delivered).
@@ -143,6 +150,10 @@ pub struct FileDeliveryBase {
 pub struct WorkerIdentityManager {
     issuer: Arc<dyn TokenIssuer>,
     refreshers: Mutex<HashMap<i64, Vec<JoinHandle<()>>>>,
+    /// The identity epoch last seen for each allocation, as a watch its
+    /// refresh loops wait on beside their timer
+    /// ([`WorkerIdentityManager::observe_identity_epochs`]).
+    epochs: Mutex<HashMap<i64, tokio::sync::watch::Sender<u64>>>,
     /// Backing token file(s) delivered per allocation, so they can be removed
     /// when the allocation stops (short-TTL hygiene: live token material must
     /// not linger on disk past the workload's life).
@@ -155,6 +166,7 @@ impl WorkerIdentityManager {
         Self {
             issuer,
             refreshers: Mutex::new(HashMap::new()),
+            epochs: Mutex::new(HashMap::new()),
             delivered_files: Mutex::new(HashMap::new()),
             warned_disabled: AtomicBool::new(false),
         }
@@ -281,10 +293,12 @@ impl WorkerIdentityManager {
         if prepared.is_empty() {
             return;
         }
+        let epoch = self.epoch_sender(alloc_id);
         let mut handles = Vec::new();
         for entry in prepared {
             let issuer = self.issuer.clone();
             let task_manager = task_manager.clone();
+            let epoch = epoch.subscribe();
             handles.push(tokio::spawn(async move {
                 refresh_loop(
                     issuer,
@@ -293,6 +307,7 @@ impl WorkerIdentityManager {
                     entry.expires_at,
                     entry.delivery_base,
                     task_manager,
+                    epoch,
                 )
                 .await;
             }));
@@ -301,10 +316,59 @@ impl WorkerIdentityManager {
         refreshers.entry(alloc_id).or_default().extend(handles);
     }
 
+    /// The epoch watch for one allocation, created at epoch 0 when the
+    /// desired set has not shown it yet.
+    fn epoch_sender(&self, alloc_id: i64) -> tokio::sync::watch::Sender<u64> {
+        self.epochs
+            .lock()
+            .expect("identity epochs lock")
+            .entry(alloc_id)
+            .or_insert_with(|| tokio::sync::watch::channel(0).0)
+            .clone()
+    }
+
+    /// Record each desired allocation's identity epoch
+    /// (`TaskAllocation.identity_epoch`). A rise wakes that allocation's
+    /// refresh loops to re-issue now: the manager refuses its older tokens
+    /// once a fork or snapshot of its instance is captured. The first
+    /// sighting only records, since the tokens the allocation started with
+    /// were issued at that epoch or later. Call it before
+    /// [`WorkerIdentityManager::spawn_refreshers`] for the same reply.
+    pub fn observe_identity_epochs(&self, allocations: impl IntoIterator<Item = (i64, u64)>) {
+        let mut epochs = self.epochs.lock().expect("identity epochs lock");
+        for (alloc_id, epoch) in allocations {
+            match epochs.entry(alloc_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let raised = entry.get().send_if_modified(|current| {
+                        let raised = epoch > *current;
+                        if raised {
+                            *current = epoch;
+                        }
+                        raised
+                    });
+                    if raised {
+                        info!(
+                            allocation_id = alloc_id,
+                            identity_epoch = epoch,
+                            "Instance identity epoch raised; re-issuing its tokens now"
+                        );
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(tokio::sync::watch::channel(epoch).0);
+                }
+            }
+        }
+    }
+
     /// Stop refresh loops for every allocation not in `live` (called after
     /// each reconcile so loops never outlive their allocation).
     pub fn retain(&self, live: &[i64]) {
         let live: std::collections::HashSet<i64> = live.iter().copied().collect();
+        self.epochs
+            .lock()
+            .expect("identity epochs lock")
+            .retain(|alloc_id, _| live.contains(alloc_id));
         let mut pruned = Vec::new();
         {
             let mut refreshers = self.refreshers.lock().expect("identity refreshers lock");
@@ -327,6 +391,10 @@ impl WorkerIdentityManager {
 
     /// Stop refresh loops for one allocation.
     pub fn stop(&self, alloc_id: i64) {
+        self.epochs
+            .lock()
+            .expect("identity epochs lock")
+            .remove(&alloc_id);
         {
             let mut refreshers = self.refreshers.lock().expect("identity refreshers lock");
             if let Some(handles) = refreshers.remove(&alloc_id) {
@@ -600,7 +668,9 @@ fn refresh_delay(expires_at: u64, now: u64) -> Duration {
     Duration::from_secs(half.saturating_sub(jitter).max(1))
 }
 
-/// The long-running refresh loop for one identity on one allocation.
+/// The long-running refresh loop for one identity on one allocation. It
+/// wakes at about half the token's remaining TTL, or at once when the
+/// allocation's identity epoch rises (`epoch`).
 async fn refresh_loop(
     issuer: Arc<dyn TokenIssuer>,
     alloc_id: i64,
@@ -608,9 +678,26 @@ async fn refresh_loop(
     mut expires_at: u64,
     delivery_base: Option<FileDeliveryBase>,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
+    mut epoch: tokio::sync::watch::Receiver<u64>,
 ) {
+    let mut epoch_open = true;
     loop {
-        tokio::time::sleep(refresh_delay(expires_at, unix_now())).await;
+        let delay = refresh_delay(expires_at, unix_now());
+        if epoch_open {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                changed = epoch.changed() => {
+                    // A closed watch (the allocation was pruned) never
+                    // fires again: fall back to the timer alone.
+                    epoch_open = changed.is_ok();
+                    if !epoch_open {
+                        continue;
+                    }
+                }
+            }
+        } else {
+            tokio::time::sleep(delay).await;
+        }
 
         if !allocation_is_live(&task_manager, alloc_id) {
             debug!(
@@ -1281,6 +1368,68 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(issuer.calls.load(Ordering::SeqCst), calls_after_stop);
 
+        task_manager.lock().unwrap().reconcile_allocations(&[]);
+        Ok(())
+    }
+
+    /// A fork or snapshot of the instance raises its identity epoch, and the
+    /// manager refuses the allocation's older tokens from then on. The rise
+    /// must re-issue now, not at the next half-TTL refresh an hour away.
+    #[tokio::test]
+    async fn a_raised_identity_epoch_reissues_tokens_at_once() -> R<()> {
+        let dir = TempDir::new()?;
+        let token_path = dir.path().join("token");
+        let task_manager = task_manager(&dir);
+        let allocation = alloc(12);
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            ..TaskConfig::new("api", "exec")
+        };
+        task_manager
+            .lock()
+            .unwrap()
+            .run_allocation(&allocation, &task)?;
+
+        let issuer = FakeIssuer::new(7200);
+        let manager = Arc::new(WorkerIdentityManager::new(issuer.clone()));
+        let identity = file_identity(&token_path, ChangeMode::Noop);
+        write_identity_files(&identity, 12, "tok-0", None)?;
+        // The first sighting records the epoch the tokens were issued at.
+        manager.observe_identity_epochs([(12, 2)]);
+        manager.spawn_refreshers(
+            12,
+            vec![PreparedIdentity {
+                identity,
+                expires_at: unix_now() + 7200,
+                delivery_base: None,
+            }],
+            task_manager.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(issuer.calls.load(Ordering::SeqCst), 0, "no refresh is due");
+
+        // The same epoch again changes nothing; a raised one re-issues.
+        manager.observe_identity_epochs([(12, 2)]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(issuer.calls.load(Ordering::SeqCst), 0);
+        manager.observe_identity_epochs([(12, 3)]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while issuer.calls.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the raised epoch did not re-issue"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fs::read_to_string(&token_path)?, "tok-1");
+        assert_eq!(
+            issuer.calls.load(Ordering::SeqCst),
+            1,
+            "one re-issue per rise"
+        );
+
+        manager.retain(&[]);
         task_manager.lock().unwrap().reconcile_allocations(&[]);
         Ok(())
     }

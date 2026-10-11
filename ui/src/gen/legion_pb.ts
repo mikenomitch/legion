@@ -5871,6 +5871,27 @@ export class InstanceInfo extends Message<InstanceInfo> {
    */
   heldCpuMhz?: number;
 
+  /**
+   * Set when the instance's last resume or restore could not restore its
+   * checkpoint and `suspend.onRestoreFailure = "cold"` (the default) booted
+   * it fresh on its retained storage instead. The workload's running
+   * processes and memory are gone, though its volume is intact. Covers a
+   * resume (StartInstance) whose restore failed on the node, whose
+   * checkpoint was lost or failed, or that waited past `resumeTimeout`, a
+   * fork or `from_snapshot` create whose restore failed, and a
+   * RestoreInstance rollback whose restore failed.
+   *
+   * Persisted on the instance, unlike the `instance.restore_failed` event,
+   * and kept until the next resume or restore starts, so a client that
+   * checks later still sees it. An explicit `StartInstance { cold: true }`
+   * clears it and sets nothing, since that cold boot was asked for. Unset
+   * otherwise. See docs/suspend-and-resume.md, "When a resume cannot
+   * restore".
+   *
+   * @generated from field: optional legion.InstanceColdBoot cold_boot = 34;
+   */
+  coldBoot?: InstanceColdBoot;
+
   constructor(data?: PartialMessage<InstanceInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5912,6 +5933,7 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 31, name: "forked_from", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 32, name: "held_memory_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
     { no: 33, name: "held_cpu_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
+    { no: 34, name: "cold_boot", kind: "message", T: InstanceColdBoot, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
@@ -5928,6 +5950,67 @@ export class InstanceInfo extends Message<InstanceInfo> {
 
   static equals(a: InstanceInfo | PlainMessage<InstanceInfo> | undefined, b: InstanceInfo | PlainMessage<InstanceInfo> | undefined): boolean {
     return proto3.util.equals(InstanceInfo, a, b);
+  }
+}
+
+/**
+ * A cold boot that replaced a restore (InstanceInfo.cold_boot).
+ *
+ * @generated from message legion.InstanceColdBoot
+ */
+export class InstanceColdBoot extends Message<InstanceColdBoot> {
+  /**
+   * The snapshot the instance was restoring from: its suspend checkpoint, a
+   * fork checkpoint, or the snapshot a rollback or `from_snapshot` create
+   * named.
+   *
+   * @generated from field: string snapshot_id = 1;
+   */
+  snapshotId = "";
+
+  /**
+   * Why the restore did not happen: the node's restore error, or the
+   * manager's reason (`checkpoint ... is lost (its node is gone)`, `the
+   * resume could not be placed ... within resumeTimeout (30s)`).
+   *
+   * @generated from field: string reason = 2;
+   */
+  reason = "";
+
+  /**
+   * RFC 3339 time the manager chose the cold boot.
+   *
+   * @generated from field: string at = 3;
+   */
+  at = "";
+
+  constructor(data?: PartialMessage<InstanceColdBoot>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InstanceColdBoot";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "snapshot_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceColdBoot {
+    return new InstanceColdBoot().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InstanceColdBoot {
+    return new InstanceColdBoot().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InstanceColdBoot {
+    return new InstanceColdBoot().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InstanceColdBoot | PlainMessage<InstanceColdBoot> | undefined, b: InstanceColdBoot | PlainMessage<InstanceColdBoot> | undefined): boolean {
+    return proto3.util.equals(InstanceColdBoot, a, b);
   }
 }
 
@@ -20539,6 +20622,23 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   taskSnapshots = "";
 
+  /**
+   * The allocation's instance's identity epoch (docs/workload-identity.md,
+   * "Forks and snapshots"). The manager moves an instance to a new epoch
+   * when a fork or snapshot of it is captured, and from then on refuses its
+   * workload-identity tokens from earlier epochs, since copies of them sit
+   * in the checkpoint. A worker that sees this value rise re-issues the
+   * allocation's tokens at once, rather than at its next refresh, so the
+   * running instance holds a current token again within a heartbeat.
+   *
+   * 0 for an allocation without an instance, and for an instance never
+   * forked or snapshotted. A worker that predates the field ignores it and
+   * refreshes on its normal schedule.
+   *
+   * @generated from field: uint64 identity_epoch = 25;
+   */
+  identityEpoch = protoInt64.zero;
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -20571,6 +20671,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 22, name: "restore", kind: "message", T: SnapshotRestore, opt: true },
     { no: 23, name: "task_suspend", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 24, name: "task_snapshots", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 25, name: "identity_epoch", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {

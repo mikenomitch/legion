@@ -151,10 +151,11 @@ instance_id, job_id, group_name, task_name, mode, state, slot_index, current_all
 "#;
 
 /// [`INSTANCE_ATTRS`] plus the columns no generic upsert writes:
-/// `restore_from` is set and cleared only by the snapshot restore ops, so an
-/// upsert of an instance (a re-bind, a reschedule) can never drop it.
+/// `restore_from` is set and cleared only by the snapshot restore ops, and
+/// `identity_epoch` only by a fork or snapshot capture, so an upsert of an
+/// instance (a re-bind, a reschedule) can never drop either.
 pub const INSTANCE_SELECT_ATTRS: &str = r#"
-instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at, restore_from
+instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at, restore_from, identity_epoch
 "#;
 
 pub const INSTANCE_ATTRS_VALS: &str = r#"

@@ -825,7 +825,12 @@ service Manager {
   // scheduling record (region, job, group, task, node, alloc, and the stable
   // instance/slot for stateful tasks) and applies the audience, TTL, subject
   // template, and extra claims of the *named identity in the stored task
-  // spec*. Nothing security-relevant is read from the request, so a
+  // spec*. A stateful task's token also carries `legion.io/epoch`, its
+  // instance's current identity epoch: a fork or snapshot capture raises it,
+  // and Legion's own verifiers (the `legion` auth method) refuse tokens from
+  // earlier epochs, since copies of them sit in the checkpoint (see
+  // `TaskAllocation.identity_epoch` and docs/workload-identity.md, "Forks and
+  // snapshots"). Nothing security-relevant is read from the request, so a
   // compromised worker can only obtain tokens for allocations placed on it,
   // scoped to audiences the spec already declared.
   //
@@ -3279,6 +3284,39 @@ message InstanceInfo {
   // way as `held_memory_mib`. Exclusive cores are held only with a full
   // hold, and are not counted here.
   optional double held_cpu_mhz = 33;
+
+  // Set when the instance's last resume or restore could not restore its
+  // checkpoint and `suspend.onRestoreFailure = "cold"` (the default) booted
+  // it fresh on its retained storage instead. The workload's running
+  // processes and memory are gone, though its volume is intact. Covers a
+  // resume (StartInstance) whose restore failed on the node, whose
+  // checkpoint was lost or failed, or that waited past `resumeTimeout`, a
+  // fork or `from_snapshot` create whose restore failed, and a
+  // RestoreInstance rollback whose restore failed.
+  //
+  // Persisted on the instance, unlike the `instance.restore_failed` event,
+  // and kept until the next resume or restore starts, so a client that
+  // checks later still sees it. An explicit `StartInstance { cold: true }`
+  // clears it and sets nothing, since that cold boot was asked for. Unset
+  // otherwise. See docs/suspend-and-resume.md, "When a resume cannot
+  // restore".
+  optional InstanceColdBoot cold_boot = 34;
+}
+
+// A cold boot that replaced a restore (InstanceInfo.cold_boot).
+message InstanceColdBoot {
+  // The snapshot the instance was restoring from: its suspend checkpoint, a
+  // fork checkpoint, or the snapshot a rollback or `from_snapshot` create
+  // named.
+  string snapshot_id = 1;
+
+  // Why the restore did not happen: the node's restore error, or the
+  // manager's reason (`checkpoint ... is lost (its node is gone)`, `the
+  // resume could not be placed ... within resumeTimeout (30s)`).
+  string reason = 2;
+
+  // RFC 3339 time the manager chose the cold boot.
+  string at = 3;
 }
 
 // Request payload for ListInstances.
@@ -7725,6 +7763,19 @@ message TaskAllocation {
   // "Snapshots"). A sandbox that opts into memory snapshots launches ready
   // for them. Empty when the task declares no `snapshots`.
   string task_snapshots = 24;
+
+  // The allocation's instance's identity epoch (docs/workload-identity.md,
+  // "Forks and snapshots"). The manager moves an instance to a new epoch
+  // when a fork or snapshot of it is captured, and from then on refuses its
+  // workload-identity tokens from earlier epochs, since copies of them sit
+  // in the checkpoint. A worker that sees this value rise re-issues the
+  // allocation's tokens at once, rather than at its next refresh, so the
+  // running instance holds a current token again within a heartbeat.
+  //
+  // 0 for an allocation without an instance, and for an instance never
+  // forked or snapshotted. A worker that predates the field ignores it and
+  // refreshes on its normal schedule.
+  uint64 identity_epoch = 25;
 }
 
 // Request payload for PostWork.

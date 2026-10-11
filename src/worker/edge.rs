@@ -255,6 +255,7 @@ mod worker_edge_test {
             restore: None,
             task_suspend: String::new(),
             task_snapshots: String::new(),
+            identity_epoch: 0,
         }
     }
 

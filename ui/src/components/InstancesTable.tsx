@@ -81,7 +81,12 @@ function MemoryCell(props: { row: InstanceRow }) {
   )
 }
 
-/** The state badge, plus what the manager is doing and why it last stopped. */
+/**
+ * The state badge, plus what the manager is doing, why it last stopped, and
+ * whether its last resume booted cold (InstanceInfo.cold_boot): a restore
+ * that failed under onRestoreFailure = "cold" keeps the volume but loses the
+ * running processes, which a platform must not mistake for a clean resume.
+ */
 export function InstanceStateCell(props: { instance: InstanceInfo }) {
   const stop = () => (isPlatformStop(props.instance.lastStop) ? props.instance.lastStop : undefined)
   const title = () =>
@@ -121,6 +126,20 @@ export function InstanceStateCell(props: { instance: InstanceInfo }) {
             <Show when={lastStop().hint}>
               <p class="mt-0.5 text-amber-700 dark:text-amber-300">{lastStop().hint}</p>
             </Show>
+          </div>
+        )}
+      </Show>
+      <Show when={props.instance.coldBoot}>
+        {(cold) => (
+          <div
+            class="max-w-xs text-2xs"
+            title={`Restore from ${cold().snapshotId} failed, so the instance booted fresh on its volume (onRestoreFailure = "cold"):\n${cold().reason}`}
+          >
+            <Badge tone="warn" class="mr-1">
+              resumed cold
+            </Badge>
+            <RelativeTime value={cold().at} class="text-faint" />
+            <p class="mt-0.5 text-amber-700 dark:text-amber-300">Running processes were lost: {cold().reason}</p>
           </div>
         )}
       </Show>

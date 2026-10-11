@@ -147,7 +147,9 @@ struct SandboxNetworkConfig {
 
     /// The host TAP device (required with `mode: tap`). Either the name of
     /// a device an operator or network plugin created, which serves one
-    /// guest per node, or `"auto"`: Legion creates a device per instance
+    /// guest per node (so submit refuses it on a keyed task, with a count
+    /// above one, or with a `createFirst` rollout), or `"auto"`: Legion
+    /// creates a device per instance
     /// (`lgf` plus a hash of the instance id), attaches it to `bridge`,
     /// recreates it under the same name on restore, and deletes it when the
     /// allocation is destroyed. Any number of auto-TAP sandboxes fit on a

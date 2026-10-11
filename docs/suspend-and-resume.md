@@ -473,7 +473,8 @@ node (a corrupt part, a busy TAP device). `suspend.onRestoreFailure` decides:
 
 - **`cold`** (default): boot fresh on the retained storage, emit
   `instance.restore_failed` with the reason and `outcome: cold`, and keep the
-  instance usable. `detail` says what happened.
+  instance usable. The workload's running processes and memory are gone, so
+  the instance says so where you look, not only in the event (see below).
 - **`fail`**: leave the instance `suspended`, its checkpoint kept, with the
   reason in `detail` and `instance.restore_failed` with `outcome: suspended`.
   `start` on a checkpoint known to be lost fails with `FailedPrecondition`
@@ -487,6 +488,34 @@ checkpoint). Under `cold`, a resume that waits longer
 [node-local volume](volumes.md#node-local-vs-network) the fresh boot is still
 pinned to that node, so it keeps waiting for it, just no longer for the
 checkpoint. Under `fail`, a resume waits like any pending placement.
+
+A cold boot in place of a restore is recorded on the instance as
+`cold_boot`, with the snapshot, the reason, and when. It stays until the next
+resume or restore starts, or the instance is stopped, so a platform that
+checks later still learns the user's session did not survive:
+
+```console
+$ legion instance list agents
+| id      | ... | state                 | ...
+| user-42 | ... | active (resumed cold) | ...
+
+$ legion instance get user-42
+...
+resumed cold at 2026-10-10T12:03:24Z: restore from snap-91c2a0b3d4e5f601 failed (restore
+needs TAP device lgf3c1d...: creating it failed: ...). Running processes were lost, the
+volume was kept
+
+$ legion instance get user-42 -j | jq .data.instance.cold_boot
+{ "snapshot_id": "snap-91c2a0b3d4e5f601", "reason": "restore needs TAP device ...",
+  "at": "2026-10-10T12:03:24Z" }
+```
+
+`instance start --wait` prints the same `resumed cold at ...` line and returns
+`cold_boot` in its `-j` output. The UI's instances card shows a **resumed
+cold** badge with the reason, and the MCP tools return the field. An explicit
+`start --cold` sets nothing, since that cold boot was asked for. The same
+record covers a fork or `from_snapshot` instance whose restore failed, and a
+`snapshot restore` rollback whose restore failed.
 
 ## Capacity for resumes
 
@@ -855,8 +884,11 @@ The tokens on the identity disk were issued for the new allocation, so their
 `legion.io/alloc` claim names it. Processes already running in the guest keep
 the environment they started with, so a long-lived process that needs the new
 token re-reads it from `/legion/identity/` or is restarted by `onResume`. The
-token the guest held at capture is not revoked: it stays valid until it
-expires (see [workload identity](workload-identity.md#suspended-and-restored-instances)).
+token the guest held at a suspend's capture is not revoked: it stays valid
+until it expires (see [workload identity](workload-identity.md#suspended-and-restored-instances)).
+A fork or snapshot capture does retire it in Legion's own verifiers, since
+another instance starts with a copy (see
+[forks and snapshots](workload-identity.md#forks-and-snapshots)).
 
 The handler logs each step to the guest console, so `legion job logs` shows
 what a restore refreshed and what failed. A failed step does not stop the
@@ -894,6 +926,9 @@ See [workload identity on sandboxes](workload-identity.md#sandboxes).
 - **Where did it come from?** `forked_from` names the instance a fork was
   forked from, for the fork's whole life (the fork checkpoint itself is
   reclaimed once every fork has restored).
+- **Did its last resume keep its running state?** `cold_boot` is set when a
+  restore failed and the instance booted fresh on its volume instead (see
+  [When a resume cannot restore](#when-a-resume-cannot-restore)).
 
 ```console
 $ legion instance get user-17 -j | jq .data.last_stop
@@ -1234,7 +1269,8 @@ everything the origin held in memory.
 | Instance id | `run-17` | `run-17-f1`, `run-17-f2`, ... (the lowest numbers never used) |
 | Allocation | Unchanged, keeps running | A new allocation id |
 | Volume | Untouched | Its own copy, made with the volume driver's `clone` op |
-| Workload identity | Unchanged | A token issued for the fork's own allocation |
+| Workload identity | A new [identity epoch](workload-identity.md#forks-and-snapshots): its earlier tokens are refused by Legion and re-issued within a heartbeat | A token issued for the fork's own allocation |
+| TAP device (disk fork with `tap = "auto"`) | Unchanged | Its own `lgf` device on the task's `bridge` |
 | Hostname | Unchanged | `legion-sbx-<allocation>` |
 | RNG | Unchanged | Reseeded from fresh entropy |
 | MAC (memory fork) | Unchanged | `02:4c:...`, derived from the allocation id |
@@ -1406,16 +1442,27 @@ A fork of an auto-TAP sandbox (`tap = "auto"`) gets the same `lgf` device
 name its instance would boot on, attached to the task's `bridge`. So a fork
 that later boots cold, or is suspended and resumed, keeps that device.
 
-A fresh boot of a fixed-TAP task always uses the task's configured TAP, so
-only one instance of it can run per node. That rules out two cases that
-would boot next to the origin on its TAP:
+A fresh boot of a fixed-TAP task (`tap = "tap0"`) always uses the task's
+configured TAP, so only one guest of it fits on a node. A fork, a disk
+snapshot seed, or a fork that falls back to a cold boot would boot next to
+the origin on that device. So submit, `job validate`, and `job plan` refuse a
+fixed TAP on a keyed task, the only kind that forks:
 
-- **A disk fork** of a TAP-wired sandbox is refused at the API, with the hint
-  to use `--checkpoint memory`.
-- **A fork that falls back to a cold boot** (`onRestoreFailure = "cold"`)
-  fails to start with `sandbox needs TAP device tap0 ..., but another process
-  holds it`, rather than an opaque VMM error. The same check names any other
-  second instance of a fixed-TAP task on one node.
+```text
+Error: jobspec failed validation: task "workspace" attaches its sandbox to the fixed TAP
+device "tap0" (config.network.tap), which serves one guest per node, but it is a keyed
+task (stateful.mode = "keyed"), so a second instance, a fork that boots cold, or a disk
+snapshot seed on the same node fails to boot
+Hint: set config.network = { mode = "tap", tap = "auto", bridge = "<the bridge tap0 is
+on>" }, so Legion creates a TAP per instance
+```
+
+Every fork of an auto-TAP sandbox gets its own device, so both kinds of fork
+work there, including a disk fork, which boots each fork on its own `lgf`
+device. A job stored before this rule still runs. A disk fork of it is
+refused at the API with the hint to use `--checkpoint memory`, and any second
+guest on its TAP fails to start with `sandbox needs TAP device tap0 ..., but
+another process holds it`, rather than an opaque VMM error.
 
 ### Refusals
 
@@ -1564,13 +1611,16 @@ entries.
   read them. Restrict the bucket to the workers' credentials, turn on the
   provider's server-side encryption, and keep workload-identity TTLs short.
   Legion does not encrypt the parts itself yet.
-- **Restores refresh identity, but cannot revoke what was captured.** Every
+- **Restores refresh identity, and a resume keeps what was captured.** Every
   restore (a resume or a snapshot restore) runs as a new allocation, and the
   guest's resume handler picks up a token issued for it (see
-  [Identity after a resume](#identity-after-a-resume)). The token the guest
-  held at capture stays valid until it expires, so a checkpoint taken less
-  than one TTL ago contains a live token. Keep workload-identity TTLs short
-  on tasks you suspend or snapshot.
+  [Identity after a resume](#identity-after-a-resume)). A suspend checkpoint
+  only ever resumes the same instance, so the token the guest held at capture
+  stays valid until it expires, and a checkpoint taken less than one TTL ago
+  contains a live token. A manual snapshot can seed other instances, so its
+  capture retires the instance's earlier tokens in Legion's own verifiers
+  (see [workload identity](workload-identity.md#forks-and-snapshots)). Keep
+  workload-identity TTLs short on tasks you suspend or snapshot.
 - **A memory suspend needs `snapshot:write`** as well as `job:write`, for
   the same reason as a memory snapshot. A disk suspend needs only
   `job:write`, like `instance stop`. Resume is `job:write`.
@@ -1579,9 +1629,15 @@ entries.
   instances from a snapshot needs `snapshot:read` and `job:write`. Naming a
   snapshot needs `snapshot:write`.
 - **Forks get their own identity, but share what the origin knew.** Every
-  fork gets its own token, hostname, MAC, and entropy, and the token the
-  origin held at capture is in every fork's memory until it expires. Secrets
-  the origin loaded, open connections, and leases are copied too. Use
+  fork gets its own token, hostname, MAC, and entropy. The token the origin
+  held at capture is in every fork's memory too, so a fork or snapshot
+  capture moves the origin to a new
+  [identity epoch](workload-identity.md#forks-and-snapshots): Legion refuses
+  the origin's earlier tokens from then on and re-issues the origin a fresh
+  one within a heartbeat. Relying parties that verify tokens offline (AWS,
+  GCP, Vault) cannot see the epoch, so there the copied token works until it
+  expires. Keep TTLs short on tasks you fork. Secrets the origin loaded, ACL
+  tokens it logged in for, open connections, and leases are copied too. Use
   `suspend.onResume` to drop them.
 
 ## Events
@@ -1601,7 +1657,7 @@ entries.
 | `instance.make_room` | info | A resume did not fit on its checkpoint's node, and the manager started suspends to make room. The metadata carries the resume's `instanceId` and the instances it is `suspending`. |
 | `instance.suspend_failed` | warn | A suspend's capture failed. The instance keeps running. The metadata carries `error`. |
 | `instance.resumed` | info | A resume restored as a new allocation. The metadata carries `restoreMs`. |
-| `instance.restore_failed` | warn | A resume, a fork, or a create from a snapshot could not restore. `outcome` is `cold` (booted fresh), `suspended` (a resume under `onRestoreFailure = "fail"`), or `stopped` (a fork or new instance under `"fail"`), and `error` says why. |
+| `instance.restore_failed` | warn | A resume, a fork, or a create from a snapshot could not restore. `outcome` is `cold` (booted fresh, also recorded as the instance's `cold_boot`), `suspended` (a resume under `onRestoreFailure = "fail"`), or `stopped` (a fork or new instance under `"fail"`), and `error` says why. |
 | `instance.forked` | info | A fork's checkpoint landed (for a spread fork, was published) and its forks are being placed. The metadata carries `origin`, `instances`, `pauseMs`, and the checkpoint's `kind` and `totalBytes`. |
 | `instance.fork_failed` | warn | A fork's capture failed, or a spread fork's publish failed for good. The origin keeps running and the forks in `instances` were terminated. The metadata carries `error`. |
 
@@ -1651,6 +1707,7 @@ See [metrics](metrics.md#suspend-and-resume).
 | Resume of a `published` checkpoint fails: `fetching part ... from its content store` | The node's copy was evicted after publishing (or it never had one), and the `contentStore` is unreachable from it | Fix the store's reachability or credentials. The checkpoint itself is intact |
 | Submit: `suspend.reserve ... is out of range` or `exceeds the task's resources` | A ratio outside 0 to 1, or an amount larger than the reservation | Follow the hint |
 | `instance start`: `cannot resume: checkpoint ... is lost` | The node holding it was removed, and `onRestoreFailure = "fail"` | `legion instance start <id> --cold` |
+| `instance list` STATE `active (resumed cold)`, `cold_boot` set | A restore failed (lost or incompatible checkpoint, `resumeTimeout`, an error on the node) and `onRestoreFailure = "cold"` booted it fresh. Its running processes are gone, its volume is kept | Read `cold_boot.reason`. Use `onRestoreFailure = "fail"` if a lost session must never look like a resume |
 | `detail: idle-unmeasured: ...` | The node sends no usage reports, so nothing measures activity | Set `resourceEnforcement.enabled` on the worker type |
 | An idle instance never suspends | A listed signal keeps firing (an open `exec` session, a client holding a connection with `connections` listed, background CPU above `cpuBelow`) | Compare `instance get`'s idle since with what the task is doing, then adjust `signals` or `cpuBelow` |
 | `legion_idle_sweep_suspends_total{outcome="skipped"}` rising | The sweep found idle instances it could not suspend | The manager's debug log names why (a worker without the `checkpoint` capability, a memory checkpoint the node cannot take) |
@@ -1668,7 +1725,8 @@ See [metrics](metrics.md#suspend-and-resume).
 | A spread fork stays `pending (forking)` after its capture | Its checkpoint is still being published, or a publish retry is pending | `legion snapshot get <snapshot>` shows the publish error and when it retries |
 | A fork has no network | Its own TAP was created but the origin's TAP has no bridge, or the guest uses a static IP | Pre-create the fork's TAP, put the origin's TAP on a bridge, or use DHCP in the guest |
 | Fork `restore needs TAP device lgf...: ... would have no network` | A spread fork landed on a node where neither the origin's TAP nor the task's TAP is on a bridge | Create the task's TAP on a bridge on every node a spread fork can land on |
-| Allocation fails: `sandbox needs TAP device tap0 ..., but another process holds it` | A second instance of a fixed-TAP task on one node (a fork that booted cold, or a disk snapshot seed) | Use memory forks, or run one instance of the task per node |
+| Submit: `attaches its sandbox to the fixed TAP device "tap0" ... which serves one guest per node` | A keyed task, a `count` above one, or a `createFirst` rollout on a fixed `tap` | Use `tap = "auto"` with the `bridge` the device was on |
+| Allocation fails: `sandbox needs TAP device tap0 ..., but another process holds it` | A second guest of a fixed-TAP task on one node. Submit refuses every spec that can cause it, so the job was stored before that rule | Resubmit the job with `tap = "auto"` and a `bridge` |
 | `instance create --from-snapshot`: `is a fork checkpoint` or `suspend checkpoint` | Only manual snapshots seed instances | Take one with `legion snapshot create` |
 | Submit fails: `sets suspend.durability = "store", but its stateful.storage uses volume driver ...` | The instance volume cannot leave its node | Use a network driver, drop `stateful.storage`, or keep `durability = "local"` |
 | `instance suspend`: `whose worker has no contentStore to publish to` | `durability = "store"` on a node without a `contentStore` block | Add `contentStore { url }` to that worker's config |

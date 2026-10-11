@@ -1844,6 +1844,20 @@ fn migration_list() -> Vec<M<'static>> {
         ALTER TABLE instance ADD COLUMN forked_from TEXT;",
         )
         .down(""),
+        // A resume or restore that booted cold in place of a failed restore
+        // (`onRestoreFailure = "cold"`), as JSON
+        // ([`crate::structs::suspend::InstanceColdBoot`]). Kept until the
+        // next resume or restore starts, so `instance get`, `instance list`,
+        // and the UI can say the running state was lost. Scheduler lane,
+        // like `instance`.
+        M::up("ALTER TABLE instance ADD COLUMN cold_boot TEXT;").down(""),
+        // The instance's workload-identity epoch (docs/workload-identity.md,
+        // "Forks and snapshots"): stamped into its tokens as
+        // `legion.io/epoch` and raised when a fork or snapshot of it is
+        // captured, so Legion refuses the tokens copied into the
+        // checkpoint. Scheduler lane, like `instance`.
+        M::up("ALTER TABLE instance ADD COLUMN identity_epoch INTEGER NOT NULL DEFAULT 0;")
+            .down(""),
     ]
 }
 

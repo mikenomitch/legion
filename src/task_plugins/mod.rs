@@ -1102,6 +1102,12 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         // refusals and the worker's launch decision can never disagree.
         crate::structs::snapshot::validate_memory_checkpoint_network(task)
             .map_err(|err| anyhow!(err))?;
+        let create_first = config
+            .rollout_config_for_group(&task.group)
+            .and_then(|rollout| rollout.replacement)
+            == Some(crate::structs::RolloutReplacement::CreateFirst);
+        crate::structs::fork::validate_fixed_tap(task, task.count.num, create_first)
+            .map_err(|err| anyhow!(err))?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.runtime, false)?;
             let plugin = registry
@@ -2214,6 +2220,34 @@ mod tests {
 
         let err = validate_job_config(&config).unwrap_err();
         assert!(err.to_string().contains("Sidecar task"));
+    }
+
+    #[test]
+    fn a_fixed_tap_sandbox_is_refused_when_its_rollout_creates_first() -> R<()> {
+        let config = |replacement| JobConfig {
+            priority: Default::default(),
+            rollout: Some(crate::structs::RolloutConfig {
+                replacement: Some(replacement),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "tap-job".into(),
+            tasks: vec![TaskConfig {
+                config: json!({
+                    "image": "alpine",
+                    "command": ["sleep", "60"],
+                    "network": { "mode": "tap", "tap": "tap0" },
+                }),
+                ..TaskConfig::new("box", "sandbox")
+            }],
+            version: None,
+        };
+        let err = validate_job_config(&config(crate::structs::RolloutReplacement::CreateFirst))
+            .expect_err("createFirst would boot two guests on tap0");
+        assert!(format!("{err:#}").contains("createFirst"), "{err:#}");
+        assert!(format!("{err:#}").contains("Hint:"), "{err:#}");
+        validate_job_config(&config(crate::structs::RolloutReplacement::DestroyFirst))?;
+        Ok(())
     }
 
     #[test]

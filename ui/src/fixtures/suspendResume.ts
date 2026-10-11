@@ -5,6 +5,7 @@ import {
   CheckpointSupport,
   GetNodeContentReply,
   GetNodeUsageReply,
+  InstanceColdBoot,
   InstanceInfo,
   InstanceStop,
   MemoryPressureStatus,
@@ -389,6 +390,20 @@ export const instances: InstanceInfo[] = [
     suspendedAt: ago(2 * 86400_000),
     suspendReason: 'manual',
     lastSuspendMs: 95n,
+  }),
+  // Resumed cold: the restore failed and it booted fresh on its volume.
+  instance({
+    instanceId: 'user-23',
+    state: 'active',
+    currentAllocId: 1120n,
+    storageHandle: 'local-dir/vol-user-23',
+    checkpointSupport: sandboxSupport,
+    detail: 'restore from snap-23bb23bb23bb23bb failed, booted cold: restore needs TAP device lgf0d3c2b1a0f9e: creating it failed',
+    coldBoot: new InstanceColdBoot({
+      snapshotId: 'snap-23bb23bb23bb23bb',
+      reason: 'restore needs TAP device lgf0d3c2b1a0f9e: creating it failed',
+      at: ago(6 * 60_000),
+    }),
   }),
   // Resuming.
   instance({ instanceId: 'user-31', state: 'pending', pendingOp: 'resuming', restoreSnapshotId: 'snap-31aa31aa31aa31aa', checkpointId: 'snap-31aa31aa31aa31aa', checkpointKind: 'memory', checkpointState: 'local', checkpointNodeId: 'w-03' }),

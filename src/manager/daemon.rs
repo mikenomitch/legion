@@ -287,6 +287,7 @@ pub async fn run_manager_with(
                         state,
                         full_config.workload_identity.control_plane_bindings.clone(),
                         authenticator.login_ttl,
+                        store.clone(),
                     ),
                 ))
                 .context("failed to register the control-plane identity auth method")?;

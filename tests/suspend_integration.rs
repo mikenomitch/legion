@@ -577,9 +577,29 @@ async fn a_failed_restore_boots_cold_by_default() -> R<()> {
         .detail
         .as_deref()
         .is_some_and(|detail| detail.contains("booted cold")));
+    // Persisted on the instance, not only in the event, so a client that
+    // looks later still learns the running state was lost.
+    let cold = info.cold_boot.context("a cold boot is recorded")?;
+    assert_eq!(cold.snapshot_id, checkpoint);
+    assert!(
+        cold.reason.contains("snapshot/load failed"),
+        "{}",
+        cold.reason
+    );
+    assert!(!cold.at.is_empty());
     let failed = cluster.events("instance.restore_failed")?;
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0]["outcome"], "cold");
+
+    // It survives the next suspend, and the next resume clears it.
+    let running = cluster.info().await?.current_alloc_id.context("running")?;
+    cluster.suspended(running).await?;
+    assert!(cluster.info().await?.cold_boot.is_some());
+    cluster.start(false).await?;
+    assert!(
+        cluster.info().await?.cold_boot.is_none(),
+        "a new resume clears it"
+    );
     Ok(())
 }
 
@@ -615,6 +635,7 @@ async fn a_failed_restore_stays_suspended_with_on_restore_failure_fail() -> R<()
         cluster.events("instance.restore_failed")?[0]["outcome"],
         "suspended"
     );
+    assert!(info.cold_boot.is_none(), "still suspended, nothing booted");
     // The escape hatch: --cold discards the checkpoint and boots.
     let cold = cluster.start(true).await?;
     assert!(cold.resuming_from.is_empty());
@@ -623,6 +644,10 @@ async fn a_failed_restore_stays_suspended_with_on_restore_failure_fail() -> R<()
     let info = cluster.info().await?;
     assert!(info.current_alloc_id.is_some());
     assert!(info.restore_snapshot_id.is_none());
+    assert!(
+        info.cold_boot.is_none(),
+        "an asked-for cold boot is not flagged"
+    );
     Ok(())
 }
 
@@ -657,7 +682,11 @@ async fn node_loss_marks_the_checkpoint_lost_and_start_follows_on_restore_failur
             let started = started?;
             assert!(started.resuming_from.is_empty());
             assert!(started.message.contains("lost"), "{}", started.message);
-            assert_eq!(cluster.info().await?.state, "pending");
+            let info = cluster.info().await?;
+            assert_eq!(info.state, "pending");
+            let cold = info.cold_boot.context("a cold boot is recorded")?;
+            assert_eq!(cold.snapshot_id, checkpoint);
+            assert!(cold.reason.contains("lost"), "{}", cold.reason);
             assert_eq!(cluster.events("instance.restore_failed")?.len(), 1);
         } else {
             let err = started.unwrap_err();
@@ -688,6 +717,9 @@ async fn a_resume_whose_checkpoint_is_lost_boots_cold_through_the_sweep() -> R<(
     assert!(info.restore_snapshot_id.is_none());
     assert!(info.checkpoint_id.is_none());
     assert!(info.pending_op.is_none());
+    let cold = info.cold_boot.context("a cold boot is recorded")?;
+    assert_eq!(cold.snapshot_id, checkpoint);
+    assert!(cold.reason.contains("is lost"), "{}", cold.reason);
     let failed = cluster.events("instance.restore_failed")?;
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0]["snapshotId"], checkpoint.as_str());

@@ -1185,7 +1185,12 @@ export const Manager = {
      * scheduling record (region, job, group, task, node, alloc, and the stable
      * instance/slot for stateful tasks) and applies the audience, TTL, subject
      * template, and extra claims of the *named identity in the stored task
-     * spec*. Nothing security-relevant is read from the request, so a
+     * spec*. A stateful task's token also carries `legion.io/epoch`, its
+     * instance's current identity epoch: a fork or snapshot capture raises it,
+     * and Legion's own verifiers (the `legion` auth method) refuse tokens from
+     * earlier epochs, since copies of them sit in the checkpoint (see
+     * `TaskAllocation.identity_epoch` and docs/workload-identity.md, "Forks and
+     * snapshots"). Nothing security-relevant is read from the request, so a
      * compromised worker can only obtain tokens for allocations placed on it,
      * scoped to audiences the spec already declared.
      *

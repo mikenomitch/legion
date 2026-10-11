@@ -161,6 +161,13 @@ pub struct Instance {
     /// ops, never by a generic upsert (see `INSTANCE_SELECT_ATTRS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_from: Option<String>,
+    /// The workload-identity epoch its tokens carry (`legion.io/epoch`).
+    /// Raised when a fork or snapshot of the instance is captured, so
+    /// Legion's own verifiers refuse the tokens copied into the checkpoint
+    /// (docs/workload-identity.md, "Forks and snapshots"). Written only by
+    /// the capture ops, never by a generic upsert.
+    #[serde(default)]
+    pub identity_epoch: u64,
 }
 
 /// Why an instance's last allocation stopped (`instance.last_stop`, JSON).

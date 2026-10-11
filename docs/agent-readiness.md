@@ -106,7 +106,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id, supports `idempotency_key`). `from_snapshot` restores the new instance(s) from a snapshot of the job (an id or a name), on the snapshot's node, at most 64 per call. Needs `snapshot:read` too. |
 | `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, and drop its storage (supports `idempotency_key`). |
 | `legion_instance_suspend` | **yes** | [Suspend](suspend-and-resume.md) a keyed instance: its node checkpoints it (`checkpoint = "memory"` or `"disk"`, default the best it can take), stops it, and frees its reservation. Returns at once, so poll `legion_instance_get` until `state` is `suspended`, or until `pending_op` clears with the reason in `detail` (a failed capture leaves the instance running). A memory checkpoint needs `snapshot:write`. Supports `idempotency_key`. |
-| `legion_instance_start` | **yes** | Start a stopped keyed instance, or resume a suspended one from its checkpoint (`cold = true` boots fresh instead). Returns at once with `resuming_from`. Poll `legion_instance_get` until `state` is `active` with no `pending_op`, or read `instance.resumed` / `instance.restore_failed`. Supports `idempotency_key`. |
+| `legion_instance_start` | **yes** | Start a stopped keyed instance, or resume a suspended one from its checkpoint (`cold = true` boots fresh instead). Returns at once with `resuming_from`. Poll `legion_instance_get` until `state` is `active` with no `pending_op`, or read `instance.resumed` / `instance.restore_failed`. Then check `cold_boot`: when set, the restore failed and the instance booted fresh on its volume (`onRestoreFailure = "cold"`), so its running processes are gone. Supports `idempotency_key`. |
 | `legion_instance_fork` | **yes** | [Fork](suspend-and-resume.md#fork) a running keyed instance into `count` new instances (`<id>-f<n>`), each with its own cloned volume and identity, on the origin's node, or with `spread: true` each on its own node from a published checkpoint. The origin keeps running. Returns the fork ids at once. Poll `legion_snapshot_get` on the returned `snapshot` until `local` (forks being placed, or `published` for a spread fork) or `failed` (origin unaffected, forks terminated). Needs `job:write` and `snapshot:write`. Supports `idempotency_key`, and a retry returns the same forks. |
 | `legion_instance_replace` | **yes** | Force-replace an instance's allocation that is stuck on a LOST node. Skips the `onLost.replaceAfter` loss-confirmation gate, so it risks split-brain if the node is only partitioned. Supports `idempotency_key`. |
 | `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA. `force = true` tombstones without driver confirmation, for a node that is gone for good. Supports `idempotency_key`. |
@@ -382,7 +382,10 @@ blocks until the instance is `suspended` (non-zero with `SuspendFailed` and
 the node's reason when the capture failed, in which case the instance keeps
 running), and `legion instance start … --wait` blocks until it is `active`
 and the restore has reported (non-zero with `RestoreFailed` when
-`onRestoreFailure = "fail"` left it suspended).
+`onRestoreFailure = "fail"` left it suspended). Under the default `"cold"`, a
+restore that fails still ends `active`, so check the envelope's `cold_boot`:
+when it is set, the instance booted fresh on its volume and lost its running
+processes.
 
 An instance can also become `suspended` without any call: through its task's
 [idle policy](suspend-and-resume.md#idle-policy), or the node's `suspend`

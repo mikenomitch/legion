@@ -235,6 +235,10 @@ impl Store {
                 report.pause_ms as i64
             ],
         )?;
+        // Every fork starts with the origin's tokens in memory. In the same
+        // transaction that releases the forks, so no fork runs while they
+        // still verify.
+        Self::advance_identity_epoch_tx(tx, &origin)?;
         let snapshot =
             Self::get_snapshot_on(tx, &snapshot.snapshot_id)?.context("snapshot row vanished")?;
         if snapshot.durability == SnapshotDurability::Store {
@@ -272,6 +276,21 @@ impl Store {
             Self::spend_fork_snapshot_if_unused_tx(tx, &snapshot.snapshot_id)?;
         }
         Ok(forks)
+    }
+
+    /// Move an instance to a new workload-identity epoch, because a
+    /// checkpoint that can start another instance (a fork, a manual
+    /// snapshot) now holds copies of its tokens. Legion's own verifiers then
+    /// refuse every token minted before this point, and the instance's node
+    /// re-issues its current tokens when the raised epoch reaches it in the
+    /// heartbeat's desired set (docs/workload-identity.md, "Forks and
+    /// snapshots").
+    pub(crate) fn advance_identity_epoch_tx(tx: &Connection, instance_id: &str) -> R<()> {
+        tx.execute(
+            "UPDATE instance SET identity_epoch = identity_epoch + 1 WHERE instance_id = ?1;",
+            [instance_id],
+        )?;
+        Ok(())
     }
 
     /// Terminate the forks waiting on `snapshot` with `reason`: their
@@ -343,7 +362,8 @@ impl Store {
         let outcome = if report.ok {
             tx.execute(
                 "UPDATE instance SET restore_from = NULL, lifecycle_error = NULL, \
-                 last_restore_ms = ?2, restored_from_snapshot_id = ?3 WHERE instance_id = ?1;",
+                 cold_boot = NULL, last_restore_ms = ?2, restored_from_snapshot_id = ?3 \
+                 WHERE instance_id = ?1;",
                 params![instance_id, report.duration_ms as i64, report.snapshot_id],
             )?;
             SnapshotReportOutcome::Restored {
@@ -363,14 +383,18 @@ impl Store {
                 // `restore_from` cleared, its replacement boots fresh.
                 tx.execute(
                     "UPDATE instance SET restore_from = NULL, lifecycle_error = ?2, \
-                     updated_at = ?3 WHERE instance_id = ?1;",
+                     updated_at = ?3, cold_boot = ?4 WHERE instance_id = ?1;",
                     params![
                         instance_id,
                         format!(
                             "restore from {} failed, booted cold on its own storage: {}",
                             report.snapshot_id, report.error
                         ),
-                        now
+                        now,
+                        crate::structs::suspend::InstanceColdBoot::record_now(
+                            &report.snapshot_id,
+                            &report.error
+                        )
                     ],
                 )?;
             } else {

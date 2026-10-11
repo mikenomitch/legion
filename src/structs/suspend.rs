@@ -817,6 +817,35 @@ pub struct InstanceSuspendState {
     pub resume_requested_at: Option<i64>,
     /// The last suspend or restore failure, shown as the instance `detail`.
     pub lifecycle_error: Option<String>,
+    /// Set when the last resume or restore booted cold in place of a
+    /// failed restore (`instance.cold_boot`, JSON), until the next resume
+    /// or restore starts. Served as `InstanceInfo.cold_boot`.
+    pub cold_boot: Option<InstanceColdBoot>,
+}
+
+/// A cold boot that replaced a failed restore under `onRestoreFailure =
+/// "cold"`: the instance kept its volume but lost its running processes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceColdBoot {
+    /// The snapshot the restore was from.
+    pub snapshot_id: String,
+    /// Why the restore did not happen.
+    pub reason: String,
+    /// Unix seconds when the manager chose the cold boot.
+    pub at: i64,
+}
+
+impl InstanceColdBoot {
+    /// The JSON the `instance.cold_boot` column holds for a cold boot now.
+    pub fn record_now(snapshot_id: &str, reason: &str) -> String {
+        serde_json::to_string(&Self {
+            snapshot_id: snapshot_id.to_string(),
+            reason: reason.to_string(),
+            at: chrono::Utc::now().timestamp(),
+        })
+        .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
