@@ -1537,6 +1537,36 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       files** — all three need the guest agent the sandbox plan owns. The
       container runtime's `TaskPlugin::signal` override is the seam its
       guest-agent path would implement.
+- [ ] **Gated sandboxes by default, with memory checkpoints**:
+      [plan](plans/gated-sandbox-checkpoints-plan.md) (PLANNED) ·
+      [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Agent sandboxes
+      get Legion's egress policy and memory suspend, snapshots, and fork
+      together, and TAP stops being a footgun.
+  - [ ] Phase 0: boot a gated sandbox on a real VMM for the first time,
+        measure proxy throughput against a TAP, and prove Firecracker
+        `vsock_override` (1.16.1+) and the cloud-hypervisor `config.json`
+        rewrite. Gate for the rest.
+  - [ ] Phase 1: memory checkpoints of gated sandboxes (vsock retarget on
+        every restore, constant CID, agent drops relays on restore, the
+        Firecracker floor), and remove the submit refusal and every doc
+        that states it.
+  - [ ] Phase 2: `auto` resolves to `gated` for sandboxes on microVM nodes,
+        gated with no policy denies (`gated-default`, every runtime), a
+        resolver for every gated sandbox, lower-case proxy vars and
+        `NODE_USE_ENV_PROXY`, the static `legion-guest` agent.
+  - [ ] Phase 3: live egress bytes and open egress connections for the idle
+        policy.
+  - [ ] Phase 4: Legion addresses TAP guests from a per-bridge pool and
+        re-addresses on every restore and fork. Removes `tap` and `mac`, and
+        the "use DHCP in the guest" docs.
+  - [ ] Phase 5: ingress into gated sandboxes over host-initiated vsock.
+  - [ ] Found during the plan: gated `container` and `exec` tasks without
+        upstreams get no VIP block and so no resolver
+        ([plan §6.5](plans/gated-sandbox-checkpoints-plan.md#65-gated-is-the-sandbox-default-and-it-denies-by-default)).
+  - [ ] Found during the plan: the egress proxy records bytes only when a
+        splice ends, so the service graph and idle policy miss long streams
+        until they close (`src/worker/netd/proxy.rs` `splice`). Phase 3
+        fixes the idle half.
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Suspend, resume, fork, and oversubscription** (generic primitives
@@ -1686,9 +1716,11 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           [Linux verification plan](suspend-resume-linux-verification.md#phase-3b)
           (`sandbox_memory_checkpoint_round_trip_*` are `#[ignore]`d), and
           record restore latency per VMM.
-    - [ ] Memory checkpoints of gated sandboxes: route the vsock socket
-          through the device-link dir
+    - [ ] Memory checkpoints of gated sandboxes
           ([call 55](calls/suspend-resume-and-oversubscription-plan_calls.md#55-gated-sandboxes-are-not-memory-checkpointable-yet)).
+          Now planned in [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md)
+          (Phase 1). The device-link dir is the wrong home for the socket,
+          since forks share it ([calls entry 3](calls/gated-sandbox-checkpoints-plan_calls.md#3-a-restore-retargets-the-vsock-socket-to-its-own-allocation-through-vmm-overrides-not-a-stable-path)).
     - [ ] Hashing a multi-GiB memory part adds seconds to a checkpoint (after
           the guest resumes, so not paused time). Let the content store hash
           on ingest instead of hashing twice.

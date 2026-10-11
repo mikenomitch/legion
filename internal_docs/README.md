@@ -97,6 +97,7 @@ When one is required and what goes in it:
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [edge-boot-plan.md](plans/edge-boot-plan.md) | shipped (phases 1–4); phase 0 measurement not run, phase 5 backlog |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
+| [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | planned (gated sandboxes take memory checkpoints and become the sandbox default with deny-by-default egress, Legion-addressed TAPs as the fallback; Phase 0 is a real-VMM gate) |
 | [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
 | [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
@@ -175,6 +176,7 @@ by project impact. The full template and a worked example:
 - [data-dir-env-plan_calls.md](calls/data-dir-env-plan_calls.md)
 - [edge-boot-plan_calls.md](calls/edge-boot-plan_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
+- [gated-sandbox-checkpoints-plan_calls.md](calls/gated-sandbox-checkpoints-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
 - [heartbeat-cadence-at-scale-plan_calls.md](calls/heartbeat-cadence-at-scale-plan_calls.md)
 - [heartbeat-scale-plan_calls.md](calls/heartbeat-scale-plan_calls.md)
