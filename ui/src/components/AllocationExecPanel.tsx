@@ -20,10 +20,13 @@ interface Props {
   allocationId: bigint
   jobName: string
   taskName: string
+  // Start expanded: for a page that renders one panel for an already-chosen
+  // target, the disclosure is just an extra click.
+  defaultOpen?: boolean
 }
 
 export default function AllocationExecPanel(props: Props) {
-  const [open, setOpen] = createSignal(false)
+  const [open, setOpen] = createSignal(props.defaultOpen ?? false)
   const [command, setCommand] = createSignal('/bin/sh')
   const [interactive, setInteractive] = createSignal(true)
   // A monotonically-bumped key remounts the terminal for each run.

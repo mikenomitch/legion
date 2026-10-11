@@ -244,10 +244,10 @@ the Access page reports it instead.
     slot, current allocation, storage handle, created). Keyed instance
     create/destroy is CLI-only (`legion instance ...`). The UI does not
     mutate instances.
-- `pages/details/TaskDetail.tsx`: definition, volumes, artifacts, discovery,
-  health, runtime allocations, exec, logs. The header badge is the same live
-  per-task status the job page's task cards show
-  (`utils/allocations.ts` `fetchTaskStatusByName`), so the two pages agree.
+- `pages/details/TaskDetail.tsx`: four tabs, polled as one resource. See
+  [Task page](#task-page). The header badge is the same live per-task status
+  the job page's task cards show (`utils/allocations.ts`
+  `fetchTaskStatusByName`), so the two pages agree.
 - `pages/details/NodeDetail.tsx` → `components/NodeDeepView.tsx`: the worker
   page, polled. The header has **Cordon** / **Drain** (two-step confirm)
   while the node is available and **Uncordon** while it is drained. These
@@ -314,24 +314,86 @@ Storage shows up wherever you'd ask "where is my data"
 - **Worker detail**: volumes materialized on that host, with a note that
   draining or losing the node strands the node-local ones.
 
+## Task Page
+
+`/jobs/:id/tasks/:taskName` answers "is this task healthy, and if not, which
+instance and why" first, and keeps configuration on its own tab. The header
+carries the live status, an `N/M healthy` badge, and **Logs** / **Open shell**
+buttons.
+
+| Tab | Contents |
+| --- | --- |
+| **Overview** | Tiles for instances (running, or running / desired when the task has a plain count — a `job scale` override wins over the spec), health, endpoints (when the task declares a service), and failures in the last 24h. One **Instances** table: allocation, node, status, health with the reported reason, ports, artifact progress, and per-row **Logs** / **Shell** buttons; unhealthy rows sort first. **Health checks** (declared) beside **Recent events**. |
+| **Logs** | The live log viewer for this task's allocations. With more than one allocation in view it has an allocation picker. |
+| **Exec & actions** | One target picker for this task's running allocations (default: the URL's `alloc`, else the first unhealthy one) and one exec/actions panel for it. The tab stays mounted once opened, so a shell survives switching to Logs and back. |
+| **Spec** | Definition, service & ports with live endpoints, volumes, declared artifacts, and the effective network policy. |
+
+The tab is in the URL: `?tab=overview|logs|exec|spec` (default `overview`;
+an unknown value falls back to it) and `?alloc=<allocation id>` picks the
+allocation the Logs and Exec tabs start on. A row's **Logs** / **Shell**
+buttons set both, so a link can land on one allocation's logs:
+`/jobs/web/tasks/api?tab=logs&alloc=4219`. Tab changes replace the history
+entry rather than adding one.
+
+The page degrades per permission rather than failing: events (and the
+failures tile) need `operator:read`, which `ListEvents` requires; the desired
+count needs `scale:read`; matching events to this task needs `state:read`;
+allocation placement needs `node:read`. Without one, that piece says it is
+unavailable or falls back.
+
+Known limits:
+
+- **Health is one verdict per allocation.** The store keeps one healthy flag
+  and status string per allocation, not each check's last result, so the
+  Overview lists the declared checks and each instance's overall health.
+- **Failures are counted from events.** There is no restart counter; the tile
+  counts `allocation.failed` events for this task's task configs among the
+  job's last 200 events, and shows `N+` when that window is shorter than a
+  day.
+
 ## Job Templates
 
 `/templates` lists the cluster's [job templates](job-templates.md).
-`/templates/:name` is where you use a template:
+`/templates/:name` has two tabs, **Launch** and **Source**.
 
-- The run form is generated from the template's declared variables: text
-  inputs, textareas, number fields, toggles, `<select>`s, option chips for
-  `multi_select`, and a JSON editor for `json` variables. Form state is a
-  single `Record<string, unknown>` seeded from the declared defaults. It is
-  converted to typed JSON only at submit.
-- **Preview rendered spec** calls `RenderJobTemplate`, the same render the
-  submit does, so what you see is what gets submitted. Editing any value
-  invalidates a stale preview.
-- Submitting links straight to the created job. That job's page shows a
-  `template: <name> v<N>` badge linking back to the template version that
-  made it.
-- The source editor (new template, new version) renders only for identities
-  holding `template:write`.
+**Launch** is a three-step guided launch:
+
+1. **Variables.** A form generated from the template's declared variables:
+   text inputs, textareas, number fields, toggles, `<select>`s, option chips
+   for `multi_select`, and a JSON editor for `json` variables, plus the version
+   picker. Form state is a single `Record<string, unknown>` seeded from the
+   declared defaults, converted to typed JSON only when sent. **Next: review**
+   calls `RenderJobTemplate`; a render error stays on this step.
+2. **Review.** Says whether the launch **creates a new job** or **updates the
+   running job** (naming the template and version it was last launched from).
+   A values table shows what will be sent, and — when the job's current config
+   came from this same template — marks values that changed since that launch
+   (`was 1`) and keys that are new. Below it, a unified diff of the job's
+   recorded rendered spec (`job.rendered.json`) against the new render, keys
+   sorted so ordering is not a change; a new job, or a job with no JSON spec
+   recorded, gets the full rendered spec instead. Editing any value or
+   switching version sends you back to step 1.
+3. **Launch.** Calls `RunJobTemplate` with exactly the reviewed values and
+   version, then follows the rollout it started (matched on the new config
+   id) with per-group progress until it settles. **Copy as CLI** copies the
+   equivalent `legion template run <name> --version <N> --var …/--var-json …`
+   command, version pinned.
+
+The created job's page shows a `template: <name> v<N>` badge linking back to
+the template version that made it.
+
+**Source** shows the selected version's Nickel source and the version list.
+The publish editor (new version) renders only for identities holding
+`template:write`; the header's **New version** button opens it.
+
+Known limits:
+
+- The Review diff is of rendered specs. It does not say how many allocations
+  a change replaces or whether it fits; use `legion job plan` for that.
+- A token that may only launch through templates is denied `GetJobInfo` even
+  for a job that does not exist yet, so its Review says it cannot tell whether
+  the job exists, and it cannot follow the rollout.
+- The diff is skipped (full spec shown) above 20,000 lines.
 
 ## ACL-Aware Rendering
 
@@ -435,16 +497,17 @@ committed files differ, so a proto change cannot merge without its client.
 ## Exec & Actions (interactive terminal)
 
 The task detail page (`pages/details/JobDetail.tsx` → `TaskDetail.tsx`) has an
-**Exec & Actions** section listing this task's running allocations. These are
-the job's allocations from `GetLedger`, narrowed to the ones that run the
-page's task. The ledger carries only `task_config_id`, so the task name comes
-from the state-store lookup that also carries allocation health. A token
-without `state:read` cannot make that mapping. In that case the section lists
-every running allocation of the job (the manager still rejects an exec whose
-allocation runs a different task). Each listed allocation gets an
+**Exec & actions** tab with a target picker over this task's running
+allocations. These are the job's allocations from `GetLedger`, narrowed to the
+ones that run the page's task. The ledger carries only `task_config_id`, so the
+task name comes from the state-store lookup that also carries allocation
+health. A token without `state:read` cannot make that mapping. In that case the
+picker lists every running allocation of the job (the manager still rejects an
+exec whose allocation runs a different task). The chosen allocation gets one
 `AllocationExecPanel` with a command launcher (interactive-tty toggle). For
 tasks that declare actions, it also shows action forms generated from the
-parameter schema (`ListJobActions`, filtered to this task).
+parameter schema (`ListJobActions`, filtered to this task). The panel is keyed
+on the allocation id, so a poll never remounts an open terminal.
 
 Exec is the one part of the UI that does not use gRPC-Web, because browsers
 cannot do bidirectional streaming over it. `ui/src/lib/execSocket.ts` opens a

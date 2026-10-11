@@ -69,8 +69,16 @@ export type JobTaskService = {
   meta: Record<string, string>
 }
 
+// The task's `count`: a plain number, or `{ num, per }` — `num` instances per
+// distinct value of a node attribute, so the total depends on the cluster.
+export type JobTaskCount = {
+  num: number
+  per?: string
+}
+
 export type JobTask = {
   name: string
+  count?: JobTaskCount
   runtime: string
   lifecycle: string
   group: string
@@ -270,6 +278,14 @@ const normalizeService = (value: unknown): JobTaskService | undefined => {
   }
 }
 
+const normalizeCount = (value: unknown): JobTaskCount | undefined => {
+  if (typeof value === 'number' && Number.isFinite(value)) return { num: value }
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  if (typeof raw.num !== 'number' || !Number.isFinite(raw.num)) return undefined
+  return { num: raw.num, per: readTaskString(raw.per) || undefined }
+}
+
 const normalizeTask = (value: unknown): JobTask | null => {
   if (!value || typeof value !== 'object') return null
   const raw = value as Record<string, unknown>
@@ -299,6 +315,7 @@ const normalizeTask = (value: unknown): JobTask | null => {
 
   return {
     name,
+    count: normalizeCount(raw.count),
     runtime: readTaskString(raw.runtime, 'unknown'),
     lifecycle: readTaskString(raw.lifecycle, 'service'),
     group: readTaskString(raw.group, 'default'),
@@ -313,12 +330,19 @@ const normalizeTask = (value: unknown): JobTask | null => {
   }
 }
 
+// Every submission gets the rendered spec under this path (submit_rendered_job
+// in src/manager/server.rs); it is the one submission that is always the spec.
+export const RENDERED_SPEC_SUBMISSION = 'job.rendered.json'
+
 const parseSubmissionContent = (content: string): JobSpecData | null => {
   try {
     const parsed = JSON.parse(content) as unknown
     if (!parsed || typeof parsed !== 'object') return null
     const raw = parsed as Record<string, unknown>
-    const tasksRaw = Array.isArray(raw.tasks) ? raw.tasks : []
+    // Other JSON rides along with a spec — a template run records its
+    // variables as `template.variables.json` — and is not a spec.
+    if (!Array.isArray(raw.tasks)) return null
+    const tasksRaw = raw.tasks
     const tasks = tasksRaw
       .map((task) => normalizeTask(task))
       .filter((task): task is JobTask => Boolean(task))
@@ -332,7 +356,12 @@ const parseSubmissionContent = (content: string): JobSpecData | null => {
   }
 }
 
+// Submissions come back in no particular order (the store query has no ORDER
+// BY), so the rendered spec is preferred by name rather than by position.
 export const extractJobSpecData = (submissions: readonly Submission[]): JobSpecData | null => {
+  const rendered = submissions.find((submission) => submission.path === RENDERED_SPEC_SUBMISSION)
+  const fromRendered = rendered ? parseSubmissionContent(rendered.content) : null
+  if (fromRendered) return fromRendered
   for (const submission of submissions) {
     const parsed = parseSubmissionContent(submission.content)
     if (parsed) return parsed
