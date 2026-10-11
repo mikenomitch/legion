@@ -15,6 +15,59 @@ How to use it:
 
 ---
 
+- [ ] **Launch blocker: workers on another host lose exec, logs, and the
+      mesh.** The worker binds `127.0.0.1:4848` and always advertises
+      `http://127.0.0.1:4848` (`src/worker/daemon.rs:137-138`, `:315-318`).
+      Opening the port is not the fix, because `PostWork`, `ExecTask`,
+      `GetTaskLogs`, and `RestartWorker` authenticate nobody. Found while
+      preparing the pre-launch AWS spot check, which is paused until this
+      lands. Plan: [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md)
+      (PLANNED) · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
+
+- [ ] **Pre-launch spot check findings (2026-10-11), from reading the code
+      while preparing the AWS run.** None of these block the worker-plane
+      work. Each is verified in source unless marked otherwise.
+  - [ ] **README says `legion start manager` works without a config file.**
+        It does not. With no `-c`, it evaluates `./configs/manager.ncl`
+        (`src/constants.rs:55`) and fails outside a repo checkout, so the
+        `cargo install legion-rs` quickstart breaks on its second command.
+  - [ ] **`configs/jobs/redis.ncl` cannot work.** The `exec` runtime does not
+        run argv through a shell, so redis-server receives the literal string
+        `$LEGION_STORAGE_DIR`. Its `kind = "exec"` health check has the same
+        problem. Wrap in `sh -c` and use a TCP check.
+  - [ ] **`legion action run -p` does not exist.** The flag is `--param`
+        (`src/cmd/action.rs:37-41`), but `configs/jobs/redis.ncl`,
+        `docs/guides/redis.md`, and `docs/volumes.md` all show `-p`.
+  - [ ] **Nothing says where to get a guest kernel for microVM sandboxes.**
+        `docs/task-runtime-sandbox.md` names the path and env var but no
+        source. cloud-hypervisor's [linux releases](https://github.com/cloud-hypervisor/linux/releases)
+        publish `vmlinux-x86_64`. Also document that AWS now offers
+        [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html)
+        on C7i/M7i/R7i and 8i types, so microVMs need no bare metal.
+  - [ ] **No exec into microVM sandboxes.** Documented
+        (`docs/task-runtime-sandbox.md`, "Current Scope and Limitations"), but
+        it is the headline agent-sandbox use case. macOS dev mode can exec, so
+        a demo that works locally fails on Linux.
+  - [ ] **No way to reach a microVM sandbox over HTTP** without a hand-built
+        TAP device, guest IP config, and host DNAT. Gated mode has no
+        host-to-guest ingress relay (`src/worker/daemon.rs:1934-1936`, gated
+        sandboxes never get a netns).
+  - [ ] **A worker whose join token names a raft follower likely cannot
+        register.** `WorkerRegister` is not in the follower-forwarding list
+        (`src/storage/raft/forward.rs`), so it returns `FAILED_PRECONDITION`.
+        Workers also learn only the one manager in their token. Inferred from
+        code, not yet reproduced.
+  - [ ] **The worker never uses TLS to reach the manager**, even when
+        `server.tls` is on (`src/worker/daemon.rs:585-598`), and raft peers
+        dial `http://` only. `docs/auth-and-acls.md` claims listener TLS
+        "already covers transport encryption." Phase 3 of the worker-plane
+        plan covers the worker half. Fix the doc claim now.
+  - [ ] **`configs/jobs/tls-edge.ncl` listens on the wrong port on Linux.** It
+        declares `static = 9443, to = 443`, but `to` only applies on macOS, so
+        nginx binds host :443 while the comment curls :9443.
+  - [ ] **`internal_docs/development.md` still points workers at :4748**, which
+        is now the exec WebSocket. `scripts/dev/join.sh` uses 4747.
+
 - [ ] **Architecture audit (2026-10-09).** Design-level findings across the
       store, scheduler, manager API, worker, and lifecycle, each with an ID and
       a status line: [architecture-audit-2026-10-09.md](architecture-audit-2026-10-09.md),
@@ -2072,7 +2125,9 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
       [src/manager/server.rs](../src/manager/server.rs), the RPC comment in
       `proto/legion.proto`, and the call-out in
       [docs/artifacts.md](../docs/artifacts.md). Accepted for now; close it.
-- [ ] Worker mTLS (deferred from auth phase 3)
+- [ ] **Worker mTLS (deferred from auth phase 3).** Now planned as part of
+      the worker-plane fix at the top of this file:
+      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md).
 - [ ] Dynamic auth-method dylib plugins (deferred from auth phase 2)
 - [ ] Workload-identity API credentials (deferred from auth phase 4)
 - [ ] Token-resolution cache (deferred from auth phase 4)
