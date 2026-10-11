@@ -2,7 +2,16 @@
 
 > **Judgement calls:** [`calls/checkpoint-encryption-plan_calls.md`](../calls/checkpoint-encryption-plan_calls.md)
 
-Status: **PLANNED** (2026-10-11).
+Status: **SHIPPED** (2026-10-11, plan and code on the same branch). Public
+pages: [`docs/suspend-and-resume.md`](../../docs/suspend-and-resume.md)
+("Published checkpoint encryption") and
+[`docs/artifacts.md`](../../docs/artifacts.md) ("Publishing content").
+Shipped as designed, plus two performance fixes found while measuring (calls
+entry 6): the sealer hashes with `ring` and writes whole chunks. Deliberately
+deferred, each an open item in [`TODO.md`](../TODO.md): rotating the
+checkpoint key by hand, parallel sealing inside one part, a streaming decrypt
+that never lands ciphertext on disk, and moving the rest of the content
+store's hashing to `ring`.
 
 Every memory checkpoint Legion publishes is the guest's whole RAM, so it holds
 every secret and token the workload had loaded. Today a publish uploads it to
@@ -182,7 +191,7 @@ root key   ── outside the store (file, env, or KMS), as for KV
 checkpoint key ck_…  ── a keyring_key row in state "checkpoint", replicated,
    │                    minted with the keyring, never rotated on its own
    ▼ HKDF-SHA256(info = "sha256:<hex>" of the part)
-part key   ── one per plaintext digest; computed by the manager and sent
+part key   ── one per plaintext digest, computed by the manager and sent
    │           only to the worker doing that part's publish, warm, or restore
    ├─▶ HKDF("aes-256-gcm-stream")  → the AEAD key for the object
    └─▶ HKDF("object-name")         → 32 bytes, hex: the object's name
@@ -208,7 +217,7 @@ plaintext digest. The object is:
 header   "LGNSEAL1" | chunk size (u32 BE) | plaintext length (u64 BE)   20 bytes
 chunk 0  AES-256-GCM(part AEAD key, nonce_0, aad = header, plaintext[0 .. 1 MiB]) ‖ tag
 chunk 1  …
-chunk n  the last chunk, flagged in its nonce; an empty part is one empty chunk
+chunk n  the last chunk, flagged in its nonce (an empty part is one empty chunk)
 nonce_i  = 0x000000 | i (u64 BE) | 0x01 if last else 0x00
 ```
 
@@ -264,8 +273,8 @@ zero beyond the ciphertext itself.
 | --- | --- |
 | Object modified, or sealed under another key | `sealed checkpoint part failed authentication at chunk N: it was modified, or sealed under a different key` |
 | Object cut short or extended | `sealed checkpoint part is truncated or has trailing bytes` |
-| Object has no `LGNSEAL1` header | `… is not a sealed checkpoint part (no LGNSEAL1 header); it may have been published before checkpoint encryption` |
-| Manifest part has a `url` and no `keyId` | `part … was published before checkpoint encryption and can no longer be read; take a new snapshot` |
+| Object has no `LGNSEAL1` header | `the object is not a sealed checkpoint part (no LGNSEAL1 header) …` |
+| Manifest part has a `url` and no `keyId` | `snapshot … part … was published before checkpoint encryption, and Legion no longer reads unsealed parts …` |
 | Keyring has no checkpoint key | `this cluster has no checkpoint key yet …` (with `encryption.enabled = false` named when that is why) |
 | Checkpoint key locked on this manager | the keyring's own `keyring locked: …` message, naming the root key |
 | Checkpoint key dropped by `keyring reset` | `checkpoint key ck_… is not in this cluster's keyring …` |
@@ -292,15 +301,16 @@ warm (`snapshot.warm_failed`), or the restore (`onRestoreFailure` applies).
 ### 6.8 Performance
 
 AES-256-GCM through `ring` runs about 2.6 GB/s on one Apple M-series core.
-SHA-256 runs about 1.4 GB/s, and the publisher already paid two SHA passes on
-the `file://` path (verify, then rehash the copy) and one on the S3 path. The
-new path pays one SHA pass and one AES pass on both. Publishing is already
+SHA-256 runs about 1.4 GB/s with the CPU's SHA instructions, and the
+publisher already paid two SHA passes on the `file://` path (verify, then
+rehash the copy) and one on the S3 path. The new path pays one SHA pass and
+one AES pass on both. Publishing is already
 asynchronous to the suspend, so none of it lands on the workload's pause.
 Fetching adds one AES pass to the download. Measured numbers are in §9.
 
 ## 7. Proto, struct, config, and persistence changes
 
-- `message CheckpointPartKey { string digest; string key_id; bytes key; }`,
+- `message CheckpointPartKey` with `digest`, `key_id`, and `key`,
   `skip_debug` with a redacting `Debug`, and `#[serde(skip)]` on `key`.
 - `CheckpointRequest.part_keys` (8), `CheckpointRequest.part_key_error` (9),
   `SnapshotRestore.part_keys` (7), `SnapshotRestore.part_key_error` (8).
@@ -329,10 +339,10 @@ worth nothing on its own, and the change is a few hundred lines.
   buffers, determinism (same key and bytes, same object).
 - **Unit (keyring)**: the checkpoint key is minted with the keyring, survives
   data-key rotation and root-key rewrap, and derives the same part key on a
-  replica; a locked or missing key gives the named errors.
+  replica. A locked or missing key gives the named errors.
 - **Worker (`task_manager` tests)**: publish writes a sealed object under
-  `sealed/`, never the plaintext; a node that never held the part restores
-  from it; warm fetches it; a missing key, a wrong key, and a manifest without
+  `sealed/`, never the plaintext. A node that never held the part restores
+  from it, and warm fetches it. A missing key, a wrong key, and a manifest without
   `keyId` each fail by name.
 - **Integration (`tests/published_resume_integration.rs`)**: publish and warm
   requests and the restore payload carry a key for every part, the publish
@@ -342,11 +352,14 @@ worth nothing on its own, and the change is a few hundred lines.
   the `file://` publisher, run before and after the change.
 
 Measured on an Apple M-series laptop (macOS, APFS, release build, one core,
-median of three runs, 2 GiB part):
+median of three runs, 2 GiB part, the whole `ContentPublishing::publish`):
 
-| Path | Before | After |
+| Path | Before (plaintext) | After (sealed) |
 | --- | --- | --- |
-| publish (`file://`) | see the calls doc, entry 6 | see the calls doc, entry 6 |
+| publish (`file://`) | 8.4 to 8.5 s, about 240 MiB/s | 1.35 s, about 1.5 GiB/s |
+
+The old path hashed the part twice with the `sha2` crate. The new one hashes
+once with `ring` and adds one AES pass. Calls entry 6 has the breakdown.
 
 ## 10. Rollout and backward compatibility
 

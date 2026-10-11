@@ -56,11 +56,13 @@
         # memory checkpoint takes no new memory-suspend instances.
         minFreeDisk = "5GiB",
     },
-    # Where this worker publishes content by digest (docs/artifacts.md,
-    # "Publishing content"). Absent by default: the node publishes nothing.
-    # Content lands at <url>/sha256/<hex>, so publishing is idempotent, and
-    # any worker that can read the URL fetches it back through the ordinary
-    # s3:// or file:// artifact fetcher, verified by digest. Point each
+    # Where this worker publishes content (docs/artifacts.md, "Publishing
+    # content"). Absent by default: the node publishes nothing. Every part
+    # is sealed (AES-256-GCM) with a key the manager sends, and lands at
+    # <url>/sealed/<name>, so the bucket never holds plaintext and
+    # publishing is idempotent. Any worker that can read the URL and is sent
+    # the key fetches it back through the ordinary s3:// or file:// artifact
+    # fetcher, opened and verified by digest. Point each
     # region's workers at their own bucket for region locality. A worker
     # with a contentStore publishes durable checkpoints
     # (suspend.durability = "store", `legion snapshot create --publish`) and

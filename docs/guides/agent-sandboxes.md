@@ -740,6 +740,13 @@ users' sandboxes have held. A disk suspend needs only `job:write`, and
 resume needs only `job:write`. See
 [auth and ACLs](../auth-and-acls.md#resources-and-actions).
 
+**Published checkpoints are sealed.** With `durability = "store"`, every
+part is encrypted before it leaves the node, under a key derived from the
+cluster's keyring. The bucket holds only ciphertext, so a leaked bucket
+credential does not leak your users' memory. Keep the managers' root key with
+your backups: losing it loses every published checkpoint. See
+[published checkpoint encryption](../suspend-and-resume.md#published-checkpoint-encryption).
+
 **Every restore gets a fresh identity.** A resume runs as a new allocation,
 so the worker issues that allocation's workload identity tokens before the
 restore, writes them to the guest's identity disk, and the resume handler

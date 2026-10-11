@@ -2129,9 +2129,33 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           published checkpoint, so `durability = "store"` is refused with
           one (call 8). A driver op that publishes and recreates a volume
           would lift this.
-    - [ ] Encrypt published checkpoint parts with keyring data keys (plan
-          open question 4, call 36). Parts are uploaded as plain objects
-          today.
+    - [x] Encrypt published checkpoint parts (plan open question 4, call
+          36): every part is sealed under a per-part key derived from the
+          keyring's checkpoint key, with no plaintext mode
+          ([plan](plans/checkpoint-encryption-plan.md) ·
+          [calls](calls/checkpoint-encryption-plan_calls.md) ·
+          [docs](../docs/suspend-and-resume.md#published-checkpoint-encryption)).
+          Done entry under KV & secrets.
+    - [ ] Rotate the checkpoint key by hand (`legion keyring checkpoint-key
+          rotate`): mint a new current key and keep old ones while a
+          manifest's `keyId` names them. Shares its reference count with
+          published-part GC below
+          ([calls 8](calls/checkpoint-encryption-plan_calls.md#8-manual-checkpoint-key-rotation-is-deferred-with-keyid-in-the-manifest-now)).
+    - [ ] Seal chunks of one large part in parallel. Sealing is one core per
+          part today, which is faster than any S3 upload but would matter on
+          a fast `file://` mount
+          ([calls 6](calls/checkpoint-encryption-plan_calls.md#6-publishing-hashes-while-it-seals-with-ring-replacing-the-separate-verify-pass)).
+    - [ ] Decrypt published parts as they stream in, instead of downloading
+          the ciphertext and opening it in place, to save a disk pass on
+          large fetches
+          ([calls 7](calls/checkpoint-encryption-plan_calls.md#7-fetch-opens-the-object-in-place-instead-of-streaming-through-the-fetcher)).
+    - [ ] Measure sealed publish and fetch against a real MinIO in the Phase
+          7b Linux checks (above), next to the plaintext numbers.
+    - [ ] Hash the node content store with `ring` (imports, `verify`,
+          `copy_out`). The `sha2` crate runs several times slower than the
+          CPU's SHA instructions on Apple silicon, and switching the sealer's
+          hash alone took a 2 GiB publish from 4.6 s to 1.35 s
+          ([calls 6](calls/checkpoint-encryption-plan_calls.md#6-publishing-hashes-while-it-seals-with-ring-replacing-the-separate-verify-pass)).
     - [ ] Garbage-collect published parts: Legion never deletes from the
           content store (call 62). A reference-counted sweep, or document a
           lifecycle-rule recipe per provider. Spent spread-fork checkpoints
@@ -3827,6 +3851,21 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
   - [x] Phase 4 — a joining manager receives the root key inside the raft join
         reply (sealed under a key derived from the cluster secret), so "join
         the cluster" stays one command
+
+[checkpoint encryption plan](plans/checkpoint-encryption-plan.md) ·
+[calls](calls/checkpoint-encryption-plan_calls.md) ·
+[docs](../docs/suspend-and-resume.md#published-checkpoint-encryption)
+
+- [x] **Published checkpoints are sealed** (2026-10-11): every part a worker
+      publishes (`durability = "store"`, `snapshot create --publish`,
+      `--spread` forks) is AES-256-GCM in 1 MiB STREAM chunks under a part
+      key the manager derives from the keyring's `ck_…` checkpoint key and
+      the part's plaintext digest. Keys ride the publish, warm, and restore
+      work (never a pull RPC), are redacted from Debug, and never serialize.
+      Objects live at `sealed/<keyed name>`, dedupe and stay idempotent, and
+      open in place on fetch. Plaintext leftovers, tampering, wrong keys,
+      and missing or locked keys each fail by name. Open follow-ups are under
+      the suspend item in Task runtimes.
 
 ## Service discovery (v1)
 

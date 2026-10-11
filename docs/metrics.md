@@ -635,9 +635,11 @@ root key is per-manager state ([kv-encryption.md](kv-encryption.md)).
   and decrypt every KV value (every data key unwrapped). `0` when the
   keyring is locked, disabled, or not initialized yet. Alert on `0` while
   `encryption.enabled` is true, since it means a root key is missing here.
-- **`legion_keyring_keys{state}`** (gauge): data keys by state (`active`
-  | `retired`). If the `retired` count stays above zero longer than a rewrap
-  takes, values still sit under an old key.
+- **`legion_keyring_keys{state}`** (gauge): keyring keys by state
+  (`active` | `retired` data keys, and the `checkpoint` key that seals
+  published checkpoints). If the `retired` count stays above zero longer
+  than a rewrap takes, values still sit under an old key. `checkpoint` is 1
+  once the keyring is initialized.
 - **`legion_keyring_active_key_age_seconds`** (gauge): age of the active
   data key. It rotates automatically at `encryption.dataKeyRotationAge`
   (default 30 days).

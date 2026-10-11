@@ -657,8 +657,9 @@ the index records digests and sizes, not classes.
 
 ### Publishing content
 
-A worker can also publish content from its store to a shared store, by
-digest. Configure it per worker type with `contentStore`:
+A worker can also publish content from its store to a shared store. Every
+published part is sealed (encrypted) first. Configure it per worker type with
+`contentStore`:
 
 ```nickel
 # configs/workers/default.ncl
@@ -676,19 +677,24 @@ digest. Configure it per worker type with `contentStore`:
 }
 ```
 
-Published content lands at `<url>/sha256/<hex>`. Because the key is the
-digest, publishing is idempotent: publishing bytes the destination already
-holds uploads nothing. The worker rehashes the local blob before it
-publishes, so corrupt bytes are never published, and it records the
-published URL per digest in its store's index. S3 uploads stream in 16 MiB
-parts, so a multi-gigabyte file never sits in memory.
+Published content lands at `<url>/sealed/<name>`, encrypted with
+AES-256-GCM under a key the manager derives for that part from the cluster's
+checkpoint key (see
+[published checkpoint encryption](suspend-and-resume.md#published-checkpoint-encryption)).
+The key and the name are both a keyed function of the content's digest, so
+publishing is idempotent: publishing bytes the destination already holds
+uploads nothing. The worker hashes the bytes as it seals them, so corrupt
+bytes are never published, and it records the published URL per digest in
+its store's index. Sealing and S3 uploads both stream (1 MiB chunks, 16 MiB
+upload parts), so a multi-gigabyte file never sits in memory. There is no
+plaintext mode.
 
 Reads never use the publisher. Any worker fetches published content with the
-ordinary `s3://` or `file://` fetcher, with the digest as the artifact's
-`checksum`, so the bytes are verified like any other pinned artifact and land
-in that worker's own store. Pointing each region's workers at their own
-bucket is how region locality works: Legion does not replicate between
-buckets.
+ordinary `s3://` or `file://` fetcher, opens it in place with the key the
+manager sent along with the work, and checks the plaintext against the
+digest before it lands in that worker's own store. Pointing each region's
+workers at their own bucket is how region locality works: Legion does not
+replicate between buckets.
 
 A malformed `contentStore` (an unsupported scheme, a bucket-less URL, `auth`
 on a `file://` store) fails manager startup. A worker whose content store is
@@ -705,10 +711,11 @@ capability when it registers, and `instance suspend` with `durability =
 "store"` refuses a node without it. Publishing reads only from the node
 content store, so `content.enabled = false` turns publishing off too.
 
-Published parts hold guest memory, secrets included, as plain objects:
-restrict the bucket to your workers and turn on the provider's server-side
-encryption. Legion never deletes from the store, because a digest can belong
-to more than one snapshot. Expire objects with bucket lifecycle rules.
+Published parts hold guest memory, secrets included, so they are only ever
+stored sealed. Restricting the bucket to your workers is still good practice,
+since object sizes are visible to anyone who can list it. Legion never
+deletes from the store, because one object can belong to more than one
+snapshot. Expire objects with bucket lifecycle rules.
 
 **Warming.** `legion snapshot warm <snapshot> --constraint key=value` asks
 matching nodes to fetch a published snapshot's parts into their stores ahead

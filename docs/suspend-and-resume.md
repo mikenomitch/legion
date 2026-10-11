@@ -733,13 +733,13 @@ contentStore = { url = "s3://legion-content-usw2/" },
 1. The suspend runs exactly as with `local`: the instance becomes
    `suspended`, and its reservation is freed, as soon as the checkpoint is
    written on the node. Capacity never waits on an upload.
-2. On its next heartbeat the node publishes each part of the checkpoint, by
-   digest, to its content store. While the upload runs the snapshot is
-   `local`, and a resume in that window is pinned to the node like any local
-   checkpoint.
+2. On its next heartbeat the node seals each part of the checkpoint with a
+   key the manager sends it and uploads it to its content store (see
+   [Security](#security)). While the upload runs the snapshot is `local`, and
+   a resume in that window is pinned to the node like any local checkpoint.
 3. When the upload finishes the snapshot moves to `published`, its manifest
-   records each part's URL, and `snapshot.published` is emitted with the bytes
-   sent and the time it took. `instance list` shows the checkpoint as
+   records each part's URL and the key it is sealed under, and
+   `snapshot.published` is emitted with the bytes sent and the time it took. `instance list` shows the checkpoint as
    `(memory, published)`.
 4. The node unpins its copy of the parts. They stay in its content store,
    but as ordinary cache entries: LRU within the `snapshots` budget, the idle
@@ -760,8 +760,9 @@ From then on:
   node that took the checkpoint, while it still holds them.
 - **The new node fetches the parts first.** A part missing from its node
   content store is fetched from its URL through the node's ordinary artifact
-  fetchers (`s3://` or `file://`), verified against its digest, and stored in
-  the content store before the restore starts. The allocation shows
+  fetchers (`s3://` or `file://`), opened with the key the manager sent with
+  the restore, verified against its digest, and stored in the content store
+  before the restore starts. The allocation shows
   `fetching snapshot` meanwhile. This includes the node that took the
   checkpoint, when its copy was evicted: it fetches the parts back like any
   other node. Parts that are present are pinned to the restoring allocation
@@ -844,8 +845,8 @@ Skipped (incompatible): w-09: cpu.model is "6:143:8", the checkpoint needs "6:10
 
 Every available node that matches the constraints (node attributes, matched
 like a jobspec `constraint` block) and passes the checkpoint's `compat` gets a
-`warm` request on its next heartbeat. It fetches the parts it lacks into its
-node content store and reports `snapshot.warmed` (or `snapshot.warm_failed`
+`warm` request on its next heartbeat, with the keys for the snapshot's parts.
+It fetches and opens the parts it lacks into its node content store and reports `snapshot.warmed` (or `snapshot.warm_failed`
 with the reason). The location index then advertises the parts, so placement
 prefers those nodes.
 
@@ -1172,10 +1173,10 @@ one, are removed at once. You cannot delete a snapshot that is still
 `capturing`, or one an instance is restoring from right now.
 
 Deleting a `published` snapshot does not delete its parts from the content
-store. Parts are stored by digest, so the same bytes can belong to more than
-one snapshot, and Legion keeps no count of who else uses them. Expire them
-with the bucket's own lifecycle rules (for example, delete objects under
-`sha256/` that are older than your longest-lived snapshot).
+store. The same bytes always seal to the same object, so one object can
+belong to more than one snapshot, and Legion keeps no count of who else uses
+it. Expire them with the bucket's own lifecycle rules (for example, delete
+objects under `sealed/` that are older than your longest-lived snapshot).
 
 `snapshots.ttl` and `snapshots.keep` delete through the same path. They never
 touch suspend checkpoints, which belong to their instance and go when it
@@ -1586,9 +1587,10 @@ A disk capture is the volume driver's `snapshot` op. For `local-dir` that is a
 reflink on btrfs, XFS, and APFS, and a sparse copy elsewhere. The copy lives
 beside the volume and survives the volume's destroy.
 
-A publish uploads each memory part from the node content store to
-`<contentStore.url>/sha256/<hex>`. The key is the digest, so publishing bytes
-the store already holds sends nothing. A cross-node restore fetches each
+A publish seals each memory part from the node content store and uploads it
+to `<contentStore.url>/sealed/<name>`. The name and the key both derive from
+the part's digest and the cluster's checkpoint key, so publishing bytes the
+store already holds sends nothing. A cross-node restore fetches each
 missing part on the allocation's staging thread, never under the worker's
 task-manager lock, and pins it to the allocation until the restore has
 started. The parts then stay in the node content store as ordinary cache
@@ -1605,12 +1607,12 @@ entries.
   granting read access to its in-memory secrets.
 - **Local snapshot bytes stay on the node.** Memory parts are read-only files
   owned by the worker inside its state directory.
-- **A published snapshot is in your bucket, unencrypted.** `durability =
-  "store"` and `--publish` upload the guest's memory, secrets included, to the
-  worker's `contentStore` as plain objects. Anyone who can read the bucket can
-  read them. Restrict the bucket to the workers' credentials, turn on the
-  provider's server-side encryption, and keep workload-identity TTLs short.
-  Legion does not encrypt the parts itself yet.
+- **Published parts are sealed.** Every part a worker publishes
+  (`durability = "store"`, `--publish`, and `--spread` forks) is encrypted
+  with AES-256-GCM before it leaves the node. The bucket holds only
+  ciphertext, under names that do not reveal what the part contains. There
+  is no setting that publishes plaintext. See
+  [Published checkpoint encryption](#published-checkpoint-encryption).
 - **Restores refresh identity, and a resume keeps what was captured.** Every
   restore (a resume or a snapshot restore) runs as a new allocation, and the
   guest's resume handler picks up a token issued for it (see
@@ -1639,6 +1641,93 @@ entries.
   expires. Keep TTLs short on tasks you fork. Secrets the origin loaded, ACL
   tokens it logged in for, open connections, and leases are copied too. Use
   `suspend.onResume` to drop them.
+
+## Published checkpoint encryption
+
+A memory checkpoint holds every secret the guest had loaded. So a published
+part never leaves the node in the clear, and the bucket alone is not enough
+to read one. This needs no configuration. It uses the same keyring that
+encrypts [KV values](kv-encryption.md).
+
+### How the keys work
+
+```
+root key          outside the store, as for KV (file, env, or a KMS)
+   │ wraps
+checkpoint key    ck_…, a replicated keyring row, minted with the keyring
+   │ derives, per part digest
+part key          sent by the manager to the one worker doing that part's
+                  publish, warm, or restore, and held in memory only
+```
+
+- **The manager holds the checkpoint key.** Workers never see it. A worker
+  receives one key per part, only with work the manager sent it: a publish
+  for a snapshot it captured, a warm accepted through `snapshot warm`
+  (`snapshot:read`), or a restore placed through resume, `snapshot restore`,
+  fork, or `instance create --from-snapshot`, each checked against its own
+  ACL first. A worker cannot ask for a key.
+- **Each part is sealed in 1 MiB chunks** (AES-256-GCM, with every chunk
+  bound to its position and to the part's length). A part of any size is
+  sealed and opened with one chunk in memory. Opening happens in place, so
+  a fetch needs no disk beyond the downloaded object.
+- **The same bytes seal to the same object**, so a re-publish uploads
+  nothing and identical parts are stored once. Both the key and the object
+  name are keyed by the checkpoint key, so without it nobody can tell what a
+  part contains, or test a guess against it. Someone who can list the bucket
+  can still see object sizes, and that one object is shared by two
+  snapshots.
+- **The manifest records which key** sealed each part (`keyId`, beside
+  `url`). `legion snapshot get` shows it. Key bytes never appear in a
+  manifest, a log line, an event, or the worker's state file.
+
+### Rotating and losing keys
+
+- **`legion keyring root-key rewrap`** rewraps the checkpoint key with the
+  data keys. Published objects are untouched and keep working.
+- **`legion keyring rotate`** rotates KV data keys only. The checkpoint key
+  never rotates on its own, so no published object ever has to be
+  re-encrypted.
+- **A lost root key loses every published checkpoint**, like every KV value.
+  Keep the root key with your backups ([KV encryption](kv-encryption.md)). A
+  `legion keyring reset` drops the old checkpoint key and mints a new one.
+  Snapshots published before the reset can no longer be fetched, and their
+  restores fail by name (below).
+- **A backup** carries the wrapped checkpoint key with the rest of the
+  keyring. Restore it with its root key and published checkpoints keep
+  working.
+
+### When a part cannot be opened
+
+Every case fails the publish, the warm, or the restore with a named reason,
+and a restore then follows `onRestoreFailure`. A part this node already holds
+needs no key, so a resume on the node that took the checkpoint works even
+while the manager's keyring is locked.
+
+| Error | Meaning |
+| --- | --- |
+| `failed authentication at chunk N: it was modified, or sealed under a different key` | The object was changed in the bucket, or belongs to another cluster. Not retried |
+| `truncated or has trailing bytes` | The object is cut short or has bytes appended |
+| `is not a sealed checkpoint part (no LGNSEAL1 header)` | A plaintext object, for example one published before this release. Not retried |
+| `was published before checkpoint encryption, and Legion no longer reads unsealed parts` | The manifest has a `url` and no `keyId`. Take a new snapshot |
+| `this cluster has no checkpoint key yet` | The keyring leader has not minted it. It does within seconds of initializing |
+| `this cluster has no checkpoint key, because the keyring is off` | `encryption.enabled = false` on the managers. Publishing needs the keyring |
+| `keyring locked: checkpoint key ck_… cannot be unwrapped` | The manager cannot reach its root key. See [KV encryption](kv-encryption.md) |
+| `checkpoint key ck_… is not in this cluster's keyring` | A `keyring reset` dropped it, or the snapshot came from another cluster |
+
+### Limits
+
+- **Object sizes are visible.** Sealing adds 20 bytes plus 16 bytes per MiB.
+- **Identical parts share one object**, and the bucket shows that two
+  snapshots share it. Only the checkpoint key turns that into knowing what
+  the part is.
+- **The checkpoint key cannot be rotated by hand yet.** A root-key rewrap
+  covers the usual rotation need.
+- **The node copy is not encrypted.** A part in a worker's own content store
+  is a `0444` file in its state directory, like the rest of the worker's
+  data.
+- **Publishing needs the KV keyring.** With `encryption.enabled = false` on
+  the managers and no checkpoint key from before, `durability = "store"`
+  publishes fail by name. The checkpoint stays `local` and keeps working.
 
 ## Events
 
@@ -1734,6 +1823,7 @@ See [metrics](metrics.md#suspend-and-resume).
 | Snapshot stays `local` with `publish failed after 3 attempts: ...` | Every attempt failed | Fix the store, then take a new snapshot or suspend again |
 | `snapshot.restore_failed`: `... is not on this node and was never published` | A restore of a local snapshot reached a node that does not hold it | Use a published snapshot when the restore has to run elsewhere |
 | `snapshot.restore_failed`: `fetching part ... from its content store` | The new node could not fetch a published part (no access to the bucket, a scheme not in `artifacts.fetch.allowedSchemes`) | Give the node read access to the store |
+| `snapshot.restore_failed` or `snapshot.publish_failed` naming a sealed part, a checkpoint key, or the keyring | The part could not be sealed or opened | See [When a part cannot be opened](#when-a-part-cannot-be-opened) |
 | `snapshot warm`: `is local, not published` | Only published snapshots can be warmed | Publish with `durability = "store"` or `--publish` |
 
 ## Limitations
@@ -1751,7 +1841,9 @@ See [metrics](metrics.md#suspend-and-resume).
   fixed. There is no command to retry by hand.
 - **Published parts are not deleted from the store.** Deleting the snapshot
   removes the row and the node's local copy only. Use bucket lifecycle rules.
-- **Published parts are not encrypted by Legion.** See [Security](#security).
+- **Published part sizes are visible in the bucket, and identical parts
+  share one object.** See
+  [Published checkpoint encryption](#published-checkpoint-encryption).
 - **Warms and the location index are held by one manager.** In a
   multi-manager cluster, nodes that heartbeat a different manager than the
   one that accepted `snapshot warm`, or that scheduled the placement, are
