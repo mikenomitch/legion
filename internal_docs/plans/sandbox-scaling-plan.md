@@ -5,12 +5,13 @@
 **Status: PLANNED** (written 2026-10-11). Nothing here is built. Phase 0 is a
 gate: it measures what every later phase assumes, and its numbers can
 reorder or cancel phases. Deliberately deferred and named: cell sharding of
-promoted instances (Phase 7, built only past a measured trigger), a
+promoted instances (Phase 10, built only past a measured trigger), a
 pluggable external session registry (rejected as a default, §4), sub-VM
-isolation tiers inside Legion's own runtimes (Phase 6 ships the seam, not a
+isolation tiers inside Legion's own runtimes (Phase 9 ships the seam, not a
 runtime), cross-cluster session routing (owned by
 [multi-cluster-federation-plan.md](multi-cluster-federation-plan.md)), and
-the public exec gateway tier (Phase E5, after direct exec proves out).
+exec into sandboxes, which has its own plan
+([sandbox-exec-plan.md](sandbox-exec-plan.md), §6.12).
 
 **Relationship to existing plans.** This plan consumes four shipped or
 in-flight plans and changes none of their guarantees for the workloads
@@ -31,12 +32,10 @@ they already serve:
 - [gated-sandbox-checkpoints-plan.md](gated-sandbox-checkpoints-plan.md)
   makes gated networking the sandbox default with memory checkpoints, and
   ships the guest agent and the vsock restore override. §6.9 says what a
-  session changes in the datapath's keying. Exec into microVMs (§6.12)
-  builds on that plan's Phases 1 and 2 and shares host-initiated vsock with
-  its Phase 5.
-- [exec-and-actions-plan.md](exec-and-actions-plan.md) owns `legion exec`,
-  actions, and their ACLs. §6.12 adds the microVM runtime under it, and
-  §6.13 adds a second transport beside the manager proxy.
+  session changes in the datapath's keying.
+- [sandbox-exec-plan.md](sandbox-exec-plan.md) owns exec into microVM
+  sandboxes and exec that skips the manager. §6.12 says what it needs from
+  session mode.
 
 ---
 
@@ -73,27 +72,46 @@ The recommended architecture splits state by who needs it to be durable:
 | **Named or durable sessions** (promoted) | Raft, as keyed instances, as today | 1 to promote, then today's costs |
 
 Density comes from snapshot-clone first (one VM per session, shared
-memory pages, Phase 5), with a seam for lighter isolation tiers inside an
-envelope later (Phase 6). Cell sharding is built only if promoted
-instances outgrow one raft group (Phase 7).
+memory pages, Phase 8), with a seam for lighter isolation tiers inside an
+envelope later (Phase 9). Cell sharding is built only if promoted
+instances outgrow one raft group (Phase 10).
 
-A sandbox that cannot be entered is not much of a sandbox, and at session
-scale the manager cannot carry every shell. Two exec changes ride along:
+Three changes to how work moves sit beside the state split, adapted from
+Tensorlake's published scheduler design and Nomad's:
 
-- **Exec into Linux microVMs over vsock** (§6.12). Every microVM gets a
-  vsock device and the guest agent, and `legion exec`, actions, and the UI
-  terminal work unchanged.
-- **Exec without the manager in the data path** (§6.13). A manager, or a
-  platform with a delegated key, mints a short-lived signed exec ticket
-  with no raft write, and the client connects to the worker directly. The
-  worker's listener, which today has no authentication at all, verifies
-  tickets on every session first.
+- **Sequenced delivery** (§6.13). Placements reach workers as a per-node,
+  sequenced delta stream held in the leader's memory, acked by the worker,
+  with today's full desired set kept as the resync path. Delivery latency
+  becomes one round trip, and a heartbeat stops carrying every allocation.
+- **Blocked work keyed by its blocker** (§6.15). Unplaceable work waits
+  under the constraint that blocked it and wakes only when matching
+  capacity appears, instead of a cluster-wide pass on every join and
+  nothing on freed capacity.
+- **Wake on request** (§6.14). A stateless gateway holds a request for an
+  idle session, resumes it from its manifest, and forwards when it is up.
 
-Eight session phases, each shippable alone (§9). Phase 0 measures. Phase 1
-is group commit and write trimming inside today's model. Phases 2 to 4 move
-history, idle state, and then running state off raft. Phases 5 to 7 are
-density and the conditional sharding step. A separate exec track (E1 to E5)
-is independent of session mode and can ship first.
+Every phase has latency targets at p50 and p99 beside its throughput
+targets (§7.2), measured first in Phase 0.
+
+Exec into sandboxes, and exec sessions that skip the manager, are planned
+separately in [sandbox-exec-plan.md](sandbox-exec-plan.md). §6.12 covers
+how the two plans meet.
+
+Eleven phases, each shippable alone (§9):
+
+| Phase | What ships |
+| --- | --- |
+| 0 | Measure: raft entries per lifecycle, rates, bytes per row, and the latency SLOs (gate) |
+| 1 | Group commit and write trimming, no new semantics |
+| 2 | Sequenced delivery of work |
+| 3 | Blocked work keyed by what blocks it |
+| 4 | No tombstones for server-minted ids |
+| 5 | Archived idle keyed instances (manifests in the bucket) |
+| 6 | Session mode |
+| 7 | Wake on request through the gateway |
+| 8 | Snapshot-clone density |
+| 9 | Sub-VM tier seam |
+| 10 | Cells, only past a measured trigger |
 
 ---
 
@@ -132,15 +150,6 @@ memory but still holds an instance row, a snapshot row, and optionally a
 held `suspended` allocation row for its reserve (`docs/suspend-and-resume.md`,
 "Holding a share of the reservation"). Idle sessions are the large
 majority on an agent platform, so they set the row count.
-
-**Getting a shell into a sandbox.** On Linux, a microVM sandbox takes no
-exec sessions at all (`src/task_plugins/sandbox.rs:1551`). Only macOS dev
-mode does. An agent platform whose agents run tools inside the sandbox
-has to ship its own in-guest daemon and its own route to it, which is what
-E2B's `envd` is. And where exec does work, every byte of every session
-streams through a manager (`docs/exec-and-actions.md`, "How it works").
-Ten thousand concurrent agent shells is ten thousand long-lived proxied
-streams on the same three processes that run raft.
 
 What a platform builder does instead today is what E2B did on Nomad and
 Google did on Kubernetes: build a session layer above the scheduler with
@@ -228,7 +237,7 @@ intent, capacity, and placement summaries.
   refuse, and sandbox records written asynchronously. Each worker is its
   own source of truth. Result: 1M concurrent sandboxes created in under a
   minute, tens of thousands per second, median start under 0.5 s.
-  - **Take:** the whole shape, which is this plan's Phase 4.
+  - **Take:** the whole shape, which is this plan's Phase 6.
   - **Watch:** the post does not describe failure reconciliation. This
     plan has to (§6.4).
 - **E2B** ([persistence](https://e2b.dev/docs/sandbox/persistence)).
@@ -274,91 +283,65 @@ intent, capacity, and placement summaries.
   - **Take:** these are worker and runtime work. The orchestrator only
     needs snapshot identity, location, and affinity, which Legion has.
 
-### Exec at scale
+### Delivery, blocked work, and waking
 
-Nobody who runs sandboxes at scale keeps every shell byte on the control
-plane, and the one system that tried redirects for exec abandoned them for
-security reasons.
-
-- **Modal** is the closest precedent for direct exec. The legacy path runs
-  through the control plane (`ContainerExec`, `ContainerExecGetOutput`).
-  The newer `TaskGetCommandRouterAccess` returns a JWT and a URL "for
-  direct access to a task command router running on the modal-worker",
-  and the V2 reply adds the worker's IP, so the client connects to it
-  while using the URL's hostname for TLS SNI. Create and restore replies
-  embed that access, so there is no extra round trip. The worker-side
-  service makes exec idempotent with a client `exec_id` and stdio
-  resumable by offset, and the client re-fetches its JWT on
-  `UNAUTHENTICATED`
-  ([api.proto](https://github.com/modal-labs/modal-client/blob/main/modal_proto/api.proto),
-  [task_command_router.proto](https://github.com/modal-labs/modal-client/blob/main/modal_proto/task_command_router.proto),
-  [sandbox exec](https://modal.com/docs/guide/sandbox-spawn)).
-  - **Take:** a control-plane-signed, short-lived token for one worker,
-    and an address the client dials directly. **Defer:** offset-resumable
-    stdio, which is the reattach Legion has never had (non-goal).
-- **E2B** runs `envd`, a Go daemon inside each Firecracker VM, on port
-  49983 with connect-rpc `process` and `filesystem` services, including a
-  pty mode and a reattach call
-  ([envd](https://github.com/e2b-dev/infra/tree/main/packages/envd)).
-  The SDK addresses `49983-<sandboxId>.e2b.app`, and a client proxy looks
-  the sandbox up and forwards to its node
-  ([client-proxy](https://github.com/e2b-dev/infra/tree/main/packages/client-proxy)).
-  Every call carries a per-sandbox `X-Access-Token`. Without it, "anyone
-  with a sandbox ID" can control the sandbox
-  ([secured access](https://e2b.dev/docs/sandbox/secured-access)).
-  - **Take:** an in-guest agent is the norm, and a stateless edge can route
-    on the name alone. **Reject:** one long-lived bearer secret per
-    sandbox. A Legion ticket is good for one session on one node.
-- **Fly.io** splits the two cases. `fly ssh console` reaches `hallpass`, a
-  small SSH server in each VM bound to the private 6PN address over
-  WireGuard. It trusts a per-org SSH CA, and the API signs short-lived
-  user certificates
-  ([blog](https://fly.io/blog/ssh-and-user-mode-ip-wireguard/)).
-  `fly machine exec` is synchronous request and response through the
-  Machines API ([docs](https://docs.fly.io/flyctl/machine-exec)).
-  - **Take:** a target that trusts a CA signature needs no per-user state
-    and no call home per session.
-- **Kubernetes** never took the API server out of the exec data path.
-  `kubectl exec` goes client → API server → kubelet, now over WebSockets
-  ([KEP-4006](https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/4006-transition-spdy-to-websockets/README.md)).
-  `--redirect-container-streaming` let the API server follow a redirect
-  to the CRI streaming server. It opened an SSRF hole (CVE-2018-1002102),
-  was deprecated in 1.18, and its gate was removed in 1.24. The KEP called
-  the gain "marginal", because the API server still proxied
-  ([KEP-1558](https://www.kubernetes.dev/resources/keps/1558/)). KEP-4006
-  also had to close a gap where a WebSocket upgrade, being a GET, let
-  get-only roles exec.
-  - **Take:** the credential the client presents to the worker must be
-    what authorizes the session. A redirect the server follows is not.
-    Authorize the exec verb, never the transport.
-- **Cloudflare** routes the Sandbox SDK through a Worker and the sandbox's
-  Durable Object, which authenticates and forwards to the container
-  ([architecture](https://developers.cloudflare.com/sandbox/concepts/architecture/)).
-  Preview URLs carry a random token in the hostname
-  ([preview URLs](https://developers.cloudflare.com/sandbox/concepts/preview-urls/)).
-  For SSH, Access issues short-lived certificates from a Cloudflare CA
-  that servers trust in `TrustedUserCAKeys`
-  ([infrastructure access](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/use-cases/ssh/ssh-infrastructure-access/)).
-  - **Take:** the gateway tier (E5) is Cloudflare's shape, a stateless
-    router in front of a target that verifies on its own.
-- **Kata Containers** runs `kata-agent` in the guest and drives it with
-  ttRPC over vsock: `ExecProcess`, `WriteStdin`, `ReadStdout`,
-  `TtyWinResize`, `SignalProcess`, `WaitProcess`
-  ([agent.proto](https://github.com/kata-containers/kata-containers/blob/main/src/libs/protocols/protos/agent.proto)).
-  Firecracker's host side is a Unix socket where the host writes
-  `CONNECT <port>` and reads `OK <port>`
-  ([vsock.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md)).
-  - **Take:** vsock to a guest agent is the standard host-to-guest exec
-    channel, and the agent is untrusted plumbing.
-- **Teleport** issues certificates that live minutes to hours, and servers
-  check only the CA signature and expiry, with session locks for urgent
-  revocation ([architecture](https://goteleport.com/docs/reference/architecture/authentication/)).
-  [RFC 9449 §11.1](https://www.rfc-editor.org/rfc/rfc9449.html#section-11.1)
-  recommends a `jti` cache held for the proof's short window, and admits
-  that strict single use across servers with no shared state is not
-  feasible.
-  - **Take:** bind each ticket to one worker, so a local `jti` cache is
-    strict single use without shared state.
+- **Tensorlake**, delivery
+  ([starting sandboxes in parallel](https://www.tensorlake.ai/blog/starting-1000-sandboxes-in-parallel)).
+  It replaced a reconcile loop that diffs desired against actual state on a
+  tick with a RocksDB outbox of sequenced commands written in the
+  scheduling transaction, a long-poll `poll_commands` stream per
+  dataplane, acks of the highest processed sequence, pruning after ack, a
+  `Pending → Enqueued` gate against re-emission, and a full sync on
+  sequence regression. The post gives a "1000s of sandboxes every second"
+  headline but no measured latency distribution.
+  - **Take:** sequence numbers, acks, pruning, and full resync on
+    regression. **Reject:** the outbox as a second durable store. Legion's
+    allocation rows already are one (§6.13).
+- **Tensorlake**, placement
+  ([filter and rank](https://www.tensorlake.ai/blog/multi-cloud-scheduling)).
+  Nodes sit in a spatial index over CPU, memory, disk, and GPUs, ranking
+  prefers loaded nodes and snapshot locality, and a region with no capacity
+  queues "blocked work" that only that region's new capacity re-evaluates.
+  - **Take:** wake only the work the new capacity can help.
+- **Tensorlake**, suspend and snapshot
+  ([suspend vs. snapshot](https://tensorlake.ai/blog/suspend-vs-snapshot)).
+  "Suspend is a pause button. Same sandbox ID, resumed in place." A
+  snapshot is "a save file" that restores into new sandboxes. A timeout on
+  a named sandbox suspends it rather than terminating it.
+  - **Take:** the same split Legion already has (`suspend` versus
+    `snapshot create` and `fork`).
+- **Nomad blocked evals**
+  ([blocked_evals.go](https://github.com/hashicorp/nomad/blob/main/nomad/blocked_evals.go)).
+  Unplaceable evals wait by computed node class, with an "escaped" bucket
+  for constraints classes cannot capture, one blocked eval per job, and
+  unblocks on node register, ready, eligibility change, and allocations
+  finishing.
+  - **Take:** the whole lifecycle, including escaped and missed-unblock
+    tracking (§6.15).
+- **Claude Managed Agents**
+  ([overview](https://platform.claude.com/docs/en/managed-agents/overview)).
+  A session that finishes its work goes `idle`, not `terminated`, and
+  resumes cleanly. Runtime is billed only while a session is `running`
+  ([pricing](https://platform.claude.com/docs/en/about-claude/pricing)).
+  Self-hosted environments can wake a worker on a webhook
+  (`session.status_run_started`) instead of keeping pollers up
+  ([workers](https://platform.claude.com/docs/en/managed-agents/self-hosted-sandboxes-workers)).
+  Tensorlake's integration suspends the sandbox to zero between webhooks
+  and resumes it in under a second
+  ([blog](https://tensorlake.ai/blog/claude-managed-agents)).
+  - **Take:** idle is the normal state of an agent session, and an event
+    should wake capacity.
+- **Fly.io autostart**
+  ([docs](https://docs.fly.io/reference/fly-proxy-autostop-autostart)).
+  `auto_stop_machines = "suspend"` lets the proxy suspend idle Machines, and
+  on a request "the proxy starts a stopped or suspended Machine in the
+  nearest region" and routes the request to it.
+  - **Take:** the proxy is the waker. Legion's equivalent is the gateway.
+- **Cloudflare Durable Objects hibernation**
+  ([WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)).
+  "Clients remain connected while the Durable Object is not in memory", and
+  an incoming message wakes it. Duration charges stop while hibernated.
+  - **Take:** keep the connection at the edge and let the workload sleep.
 
 ## 3. Jobs to be done, by persona
 
@@ -373,11 +356,16 @@ security reasons.
 - When a session matters, like a long-running agent with a name, I want to
   pin it down as a durable, uniquely named thing, so my own code can rely
   on that name.
-- When my agent needs to run a tool inside its sandbox, I want to run the
-  command and stream its output from my own backend straight to the
-  machine, so my control plane's capacity is not my agents' I/O budget.
+- When a webhook arrives for an agent that has been asleep for a week, I
+  want the request to wake it and get answered, so I never pay for an idle
+  agent and never write my own wake-up proxy.
+- When I start a sandbox, I want it to begin booting within a network round
+  trip of the decision, so my start latency is not a heartbeat interval.
 
 **Cluster operator**
+- When I add machines or work finishes, I want the work that was waiting
+  for that room to place right away, and only that work, so adding capacity
+  is not a cluster-wide re-plan.
 - When the session count grows by 100×, I want the managers' disk, memory,
   and snapshot size to stay flat, so I don't re-plan the control plane
   every quarter.
@@ -389,17 +377,11 @@ security reasons.
   I want every session still tied to a job, a node, and a credential I
   issued, so an ACL or identity decision never rests on something a node
   made up.
-- When I let clients open shells on worker machines directly, I want each
-  permission to be narrow, short-lived, and good for one shell, so a leaked
-  one is worth almost nothing.
 
 **On-call responder**
 - When a user says "my sandbox vanished", I want to find where it ran,
   why it stopped, and whether it was suspended, from one command, so I'm
   not grepping node logs.
-- When a user says "my agent is stuck", I want a shell inside their
-  microVM with the same command I use for containers, so I can look before
-  I restart it.
 
 **Autonomous agent**
 - When I create a session and get an id back, I want to know whether it is
@@ -436,20 +418,23 @@ this plan is that sessions start fast and come back.
 - Cut raft entries per keyed lifecycle from about 22 to 8 or fewer inside
   today's model, with no change to any guarantee (Phase 1).
 - Make raft size proportional to running plus named sessions, not to
-  history or idle sessions (Phases 2 and 3).
+  history or idle sessions (Phases 4 and 5).
 - Offer an opt-in session mode whose start, suspend, resume, and stop
-  write nothing to raft (Phase 4).
+  write nothing to raft (Phase 6).
 - Keep every guarantee of `slot` and `keyed` instances, with one stated
-  exception: Phase 2 makes server-minted keyed ids unique by randomness
-  instead of by tombstone (calls entry 4). State precisely which
+  exception: Phase 4 makes server-minted keyed ids unique by randomness
+  instead of by tombstone (calls entry 3). State precisely which
   guarantees the new mode weakens (§6.7).
 - Keep one binary and no new required dependency. The content store a
   worker already uses for published checkpoints is the only external
   storage.
-- Make `legion exec`, actions, and the UI terminal work on Linux microVM
-  sandboxes, with no change to those surfaces (Phase E1).
-- Authenticate every exec session at the worker, and let exec bytes skip
-  the manager on request, with no raft write per session (Phases E2, E3).
+- Deliver placements to workers within one round trip, and keep a
+  heartbeat's size independent of how much the node runs (Phase 2).
+- Wake only the blocked work that new capacity can help, including freed
+  capacity (Phase 3).
+- Wake an idle session on an inbound request, with no node holding it
+  (Phase 7).
+- Give every phase p50 and p99 latency targets, measured in Phase 0 (§7.2).
 
 **Non-goals**
 - **Billions of running sessions in one cluster.** That is about 10 PB of
@@ -465,11 +450,14 @@ this plan is that sessions start fast and come back.
 - **New placement intelligence.** Envelopes are placed by today's
   scheduler. The session router is first fit within envelopes.
 - **Cross-cluster routing of sessions.** Federation owns it.
-- **Detach and reattach of exec sessions**, file transfer, and port
-  forwarding over exec. Sessions still end when the connection closes.
-- **Public internet exec without a gateway.** Direct exec targets callers
-  that can already route to workers. Browsers on the public internet wait
-  for the gateway tier (E5).
+- **Exec into sandboxes.** [sandbox-exec-plan.md](sandbox-exec-plan.md)
+  owns it.
+- **Replacing the eval loop.** It stays the planner. Phase 2 changes only
+  how its results reach workers.
+- **A second durable store for delivery.** The outbox is leader memory over
+  the raft-backed allocation rows.
+- **Node-local wake on connect and ingress into gated guests.** The suspend
+  plan's Phase 8 and the gated plan's Phase 5 own them (§6.14).
 
 ## 5. Background: what exists today
 
@@ -593,14 +581,12 @@ index, warms, and the checkpoint disk budget are already manager-memory
 soft state. Phase 8 (wake on connect, UFFD lazy restore, diff snapshots)
 is deferred.
 
-### 5.6 Exec today
+### 5.6 Delivery and retry
 
-The exec plumbing is runtime-agnostic and complete above the runtime:
-`ExecSupport` and `ExecSession` in `src/task_plugins/`, `Worker.ExecTask`
-in `src/worker/exec.rs`, the `Manager.ExecAllocation` proxy in
-`src/manager/exec.rs`, and the UI's WebSocket bridge in
-`src/manager/exec_ws.rs`. The microVM runtime reports no support, and the
-worker listener has no authentication. §6.12 and §6.13 cite each piece.
+Placements reach workers through a best-effort `PostWork` push and a full
+desired set in every heartbeat reply. Unplaceable work is retried by a
+cluster-wide capacity pass on node join or uncordon, and by nothing on
+freed capacity. §6.13 and §6.15 open with the code-level detail for each.
 
 ### 5.7 The worker's local state
 
@@ -619,14 +605,14 @@ costs and which guarantee it weakens.
 
 | # | Option | Raft writes per session | What it weakens | Verdict |
 | --- | --- | --- | --- | --- |
-| 1 | Ephemeral by default, promote on demand | 0 until promoted, 1 to promote | Never-recycled becomes probabilistic for unnamed ids. At-most-one becomes converge-to-one | **Take** (Phase 4) |
-| 2 | Nodes are the source of truth for running sessions | 0 | `list` is eventually consistent. The index is rebuilt after failover | **Take** (Phase 4) |
-| 3 | Idle sessions are manifests in object storage | 0 per idle session | Listing idle sessions is a bucket listing | **Take** (Phase 3) |
-| 4 | Cell sharding by id prefix across N raft groups | unchanged, but spread | Scatter-gather lists, cross-cell moves | **Defer** (Phase 7, behind a trigger) |
+| 1 | Ephemeral by default, promote on demand | 0 until promoted, 1 to promote | Never-recycled becomes probabilistic for unnamed ids. At-most-one becomes converge-to-one | **Take** (Phase 6) |
+| 2 | Nodes are the source of truth for running sessions | 0 | `list` is eventually consistent. The index is rebuilt after failover | **Take** (Phase 6) |
+| 3 | Idle sessions are manifests in object storage | 0 per idle session | Listing idle sessions is a bucket listing | **Take** (Phase 5) |
+| 4 | Cell sharding by id prefix across N raft groups | unchanged, but spread | Scatter-gather lists, cross-cell moves | **Defer** (Phase 10, behind a trigger) |
 | 5 | Group commit and write-behind | fewer, larger entries | Nothing, if done as group commit only | **Take first** (Phase 1) |
 | 6 | Pluggable external registry | 0 in raft, 1+ in the registry | Self-hosted simplicity | **Reject** as a default |
-| 7 | Sessions inside allocations (two-level) | 0 | Isolation, when sessions share a VM | **Take the envelope**, defer sub-VM tiers (Phases 4, 6) |
-| 8 | Snapshot-clone at the edge | 0 | Nothing in the control plane | **Take** (Phase 5) |
+| 7 | Sessions inside allocations (two-level) | 0 | Isolation, when sessions share a VM | **Take the envelope**, defer sub-VM tiers (Phases 6, 9) |
+| 8 | Snapshot-clone at the edge | 0 | Nothing in the control plane | **Take** (Phase 8) |
 
 Write-behind (persist the record asynchronously and let nodes re-report
 after a crash) is not taken on its own. Doing it for keyed instances would
@@ -642,11 +628,11 @@ This plan adopts it with two amendments, each a judgement call:
   invisible to the scheduler. A session-mode task reserves capacity per
   node as an ordinary allocation (Borg's alloc), and sessions fill it.
   The scheduler, quotas, preemption, and `node usage` keep working
-  unchanged (calls entry 7).
-- **Idle manifests land before ephemeral running sessions.** Phase 3 works
+  unchanged (calls entry 6).
+- **Idle manifests land before ephemeral running sessions.** Phase 5 works
   for today's keyed instances with `durability = "store"`, and idle
   sessions are the larger count. It ships value without a new mode
-  (calls entry 6).
+  (calls entry 5).
 
 ### 6.2 A third instance mode: `session`
 
@@ -724,7 +710,7 @@ session ends and nothing remains, because there is no row to keep.
 trillion ids the birthday collision probability is about 10^-15. Ids are
 minted by whoever starts the session (a manager's session router, or an
 edge node redeeming a ticket), with no uniqueness check. No tombstone is
-kept. Caller ids may not take that shape (Phase 2's reserved-pattern
+kept. Caller ids may not take that shape (Phase 4's reserved-pattern
 rule), so a random id can only ever come from a mint. A caller-chosen id always promotes (§6.6), because a name like
 `user-42` needs durable uniqueness and only raft provides it.
 
@@ -827,7 +813,7 @@ parts it names.
   idle session lives. `legion instance destroy` on an idle session deletes
   its manifest, and the parts follow bucket lifecycle.
 
-**For keyed instances (Phase 3, before session mode exists).** A suspended
+**For keyed instances (Phase 5, before session mode exists).** A suspended
 keyed instance with `durability = "store"` can be **archived**: its
 snapshot row and held reserve row are dropped, its instance row shrinks
 to a slim `archived` row (id, job, task, state, manifest URL), and the
@@ -872,7 +858,9 @@ allocation. A promoted instance cannot be demoted.
 | Audit and events | Replicated journal (~10k) | Live tail plus node log shipped to the bucket | Replicated journal |
 | Survives node loss while running | Rescheduled | Lost, unless suspended | Rescheduled |
 | Survives manager failover | Yes | Yes (sessions keep running, index rebuilds) | Yes |
-| Exec (E1 to E3) | Proxied, ACL re-checked every 30 s, or a direct ticket naming the allocation | Direct ticket naming the envelope and session id, resolved through the index. Proxied exec also works | As keyed |
+| Delivery to the worker (Phase 2) | Sequenced deltas within a round trip, full resync on failover or gap | Started by the router over `StartClaim`, reported back as sequenced deltas | As keyed |
+| Wake on request (Phase 7) | Node-local, from a local checkpoint ([suspend plan](suspend-resume-and-oversubscription-plan.md) Phase 8) | Gateway, from the bucket manifest | Gateway or node-local |
+| Exec ([exec plan](sandbox-exec-plan.md)) | Proxied, or a direct ticket naming the allocation | Proxied or direct, resolved through the session index to the envelope and session id | As keyed |
 
 **Idempotency without raft.** A create with an `idempotency_key` derives
 its session id as `HMAC(cluster key, accessor id ‖ job ‖ key)`, truncated
@@ -946,26 +934,26 @@ today's boundary. Calls entry 16 records the trade.
   the envelope is the reservation. Make-room suspends work inside an
   envelope on the node, with no manager round trip.
 - **Suspend plan Phase 8** (UFFD lazy restore, diff snapshots, wake on
-  connect) is this plan's density lever (Phase 5), and diff snapshots are
+  connect) is this plan's density lever (Phase 8), and diff snapshots are
   what make a hundred million idle manifests affordable in a bucket.
 
 ### 6.10 Density by isolation tier
 
-- **Tier 1, one microVM per session, shared pages (Phase 5).** Every
+- **Tier 1, one microVM per session, shared pages (Phase 8).** Every
   session in an envelope restores from one warm base checkpoint, maps its
   memory `MAP_PRIVATE` (already true for forks on Firecracker), and loads
   pages lazily through UFFD. Diff snapshots make suspended sessions small.
   KSM is an operator opt-in for nodes that want it. Legion keeps charging
   each session its full `resources.memory`, as forks are charged today,
   and lets oversubscription spend the measured sharing.
-- **Tier 2, many sessions per VM (Phase 6, seam only).** A task runtime can
+- **Tier 2, many sessions per VM (Phase 9, seam only).** A task runtime can
   declare `sessionsPerInstance > 1`, and the worker hands sessions to an
   existing runtime instance (processes, isolates, WASM) through a new
   `TaskPlugin::start_session` call instead of booting one each. Legion
   ships the seam and the accounting, not a runtime, and the public doc
   states plainly that sessions sharing a VM share a kernel.
 
-### 6.11 Cells, only if needed (Phase 7)
+### 6.11 Cells, only if needed (Phase 10)
 
 If promoted instances or envelopes outgrow one raft group, partition
 `instance` rows by a hash of the id across N scheduler-lane groups
@@ -976,223 +964,257 @@ trigger is measured, not guessed: build it when the Phase 0 harness shows
 the scheduler lane above 70% busy from instance writes at the target
 rate, or the store above 4 GiB from instance rows.
 
-### 6.12 Exec into microVM sandboxes over vsock (Phase E1)
+### 6.12 Exec at scale
 
-**Today.** `legion exec` and actions work on `exec` and `container` tasks
-and on macOS dev-mode sandboxes. On Linux, a microVM reports no exec
-support: `exec_support()` returns false because "exec into a microVM needs
-a vsock guest agent (deferred)" (`src/task_plugins/sandbox.rs:1551`), and
-the public table shows `sandbox (microVM)` without exec or tty
-(`docs/exec-and-actions.md`, "Which task runtimes support exec"). The
-plumbing around the runtime is complete and runtime-agnostic:
+Exec is planned in [sandbox-exec-plan.md](sandbox-exec-plan.md): exec into
+Linux microVMs over the guest agent's vsock, and direct exec with
+worker-verified tickets on the mTLS worker listener from
+[worker-plane-auth-plan.md](worker-plane-auth-plan.md) (PR
+[#16](https://github.com/mikenomitch/legion/pull/16)). The two plans meet
+in three places:
 
-- `TaskPlugin::exec_support()` returns `ExecSupport { exec, pty,
-  host_level }`, and `TaskPlugin::exec()` returns a `Box<dyn ExecSession>`
-  (`src/task_plugins/mod.rs:472`, `:834-848`).
-- `ExecSession` is `take_output`, `write_stdin`, `close_stdin`, `resize`,
-  `wait`, `try_wait`, and `kill` (`src/task_plugins/exec_session.rs:61`),
-  with `ExecOptions { command, tty, winsize, cwd, env }`.
-- The worker's `Worker.ExecTask` bidi stream drives a session on dedicated
-  threads and counts open sessions per allocation for the idle policy's
-  `exec` signal (`src/worker/exec.rs`).
-- The manager's `Manager.ExecAllocation` authorizes, renders action argv,
-  resolves the worker, and splices the stream (`src/manager/exec.rs`). The
-  UI reaches the same core through the WebSocket bridge on the manager
-  port + 1 (`src/manager/exec_ws.rs`).
+- **Resolving unnamed sessions.** A session in `session` mode has no raft
+  row. Exec by instance id, proxied or direct, resolves the id through the
+  leader's session index (§6.4) to its node, envelope allocation, and
+  session id, after the coarse ACL gate. The worker checks that the session
+  is running locally under that envelope.
+- **No raft write per shell.** Minting an exec ticket is a signature. With
+  a delegated minting key, a platform that started a session at the edge
+  can open a shell into it without calling a manager, so start and shell
+  are both zero-manager-call paths.
+- **The gateway tier.** Wake on request (§6.14) and the exec plan's gateway
+  phase are the same stateless tier, `legion start gateway`. Whichever
+  plan builds it first, the other adds its route.
 
-So the whole feature is one runtime implementation and one guest-side
-listener. Nothing above the runtime changes.
+The exec plan's phases do not depend on session mode. Only its
+session-resolution step waits for this plan's session mode.
 
-**Design.**
+### 6.13 Sequenced delivery of work, not full desired sets (Phase 2)
 
-- **Every microVM gets a vsock device and the guest agent**, whatever its
-  network mode. Today only gated sandboxes get one
-  (`src/task_plugins/sandbox.rs:1128`). The path is the gated plan's
-  per-allocation `<alloc>/.sandbox/vsock.sock` with the constant CID 3
-  (gated plan §6.2).
-- **The agent listens on one guest vsock port for exec** (proposed 1100)
-  and nothing else new. For `tap` and `none` sandboxes the worker binds no
-  guest-initiated listeners, so the guest still cannot dial the host. The
-  device carries host-initiated connections only, and `none` keeps its air
-  gap for anything the guest starts. This amends the gated plan's
-  definition of `none` ("no vsock device, no agent") and is recorded in
-  calls entry 8.
-- **The worker's `exec()` connects to the guest.** A new
-  `VsockExecSession` dials `uds_path`, sends Firecracker's `CONNECT 1100`
-  line and reads `OK <port>` (cloud-hypervisor uses the same convention),
-  and speaks
-  length-delimited `ExecClientFrame` and `ExecServerFrame` protobufs, the
-  frames every other leg already uses. The first exchange is a version
-  hello, because the gated plan requires any agent protocol beyond raw
-  bytes to negotiate (gated plan §6.3, "Agent version skew").
-- **The agent spawns the command** under a pty (`openpty` in the guest) or
-  with pipes, in the task's environment, working directory, and user from
-  the identity disk. Stdin, output, and resize frames ride the connection.
-  The exit status is the process's own. Closing the connection kills the
-  process group, which is how the worker's `kill()` and a client
-  disconnect both land.
-- **The host treats the agent as untrusted plumbing**, as Kata does. The
-  worker bounds frame sizes and session counts per allocation, and never
-  parses anything from the guest except frames. Exec into a sandbox is
-  root in the guest, the same promise as `container exec`, and
-  `runtime_is_host_level("sandbox")` stays false
-  (`src/task_plugins/mod.rs:460`), so the `exec` ACL without `host` covers
-  it.
-- **Suspend and resume.** A memory capture resets open vsock connections
-  (gated plan §6.3), so an open exec session ends with a typed reason
-  (`session ended: instance suspended`). After a resume the VMM listens on
-  the new allocation's path through the gated plan's `vsock_override`, and
-  a new `legion exec` reaches it. Exec targets an allocation, and a resume
-  is a new allocation, so callers that hold an instance id use
-  `legion exec --instance <id>` (new, below).
-- **The `exec` idle signal works on Linux microVMs** with no new code:
-  the worker already counts open sessions per allocation. Remove the
-  submit warning that says it never fires (`src/structs/suspend.rs:713`,
-  `docs/suspend-and-resume.md`, "What each signal sees on a sandbox").
-- **Unchanged surfaces.** `legion exec`, `legion action run`, the MCP
-  `legion_exec_run` and `legion_action_run` tools, and the UI terminal need
-  no change. `exec_support()` reports `exec` and `pty` true on a microVM
-  backend.
+**Today.** The eval loop plans and the plan apply commits allocations
+through raft. Delivery then has two halves:
+
+- **A best-effort push.** `dispatch_allocations` spawns one `PostWork` per
+  allocation, bounded by a 512-permit semaphore, and does not wait for it.
+  The code says why: "Dispatch is best-effort BY DESIGN: the heartbeat
+  reply carries the full desired set, so a lost push costs at most one
+  heartbeat interval" (`src/manager/dispatcher.rs:139-146`, `:22`).
+- **A full desired set on every beat.** `build_desired_allocations`
+  rebuilds a complete `TaskAllocation` payload for every dispatchable
+  allocation on the node, every heartbeat, with a store read for each
+  keyed instance and its volume mounts (`src/manager/server.rs:10330-10388`).
+  The worker stops anything not in that set
+  (`TaskManager::reconcile_allocations`). The request side is just as
+  total: every beat lists every allocation id
+  (`HeartbeatRequest.allocation_ids`, `proto/legion.proto:4266`). An open
+  TODO already asks for a desired-state version so an unchanged node gets
+  a cheap reply.
+
+At 10 allocations a node this is cheap and self-healing. At 10,000 sandboxes
+a node, every beat carries and rebuilds thousands of full payloads, and a
+lost push waits up to one heartbeat interval, which adaptive cadence
+stretches to 21 s on a large fleet (`docs/heartbeat-cadence-and-scale.md`).
+
+**Tensorlake's design** ([blog](https://www.tensorlake.ai/blog/starting-1000-sandboxes-in-parallel)).
+The scheduler writes each `AddSandbox` command to a persistent outbox in
+RocksDB, in the same transaction as the scheduling decision, with a
+sequence number. Each dataplane holds a long-lived `poll_commands` stream
+that the scheduler holds open for up to five minutes when nothing is
+pending. The dataplane acks the highest sequence it processed, and acked
+commands are pruned. A `Pending → Enqueued` transition stops a sandbox
+being emitted twice, and a sequence regression after a dataplane restart
+triggers a full state sync. Latency is "bounded only by network round-trip
+time, not by any polling interval".
+
+**For Legion: the eval loop stays the planner, and only delivery changes.**
+
+- **The source of truth stays where it is.** Committed allocation rows in
+  raft are already durable. The outbox is not a second durable record: it
+  is a per-node delta log held in the leader's memory, built from the
+  changesets the leader already projects into the read model (the delta
+  refresh knows exactly which allocation rows changed on which node,
+  `docs/state-store.md`, "Persistence Modes").
+- **A per-node sequence.** Each delta (add, update, stop with its stop
+  notice) gets `(leader_epoch, seq)` for its node. The leader epoch is the
+  raft term the leader took office in.
+- **One stream per worker.** `Manager.StreamWork` is a server-streaming RPC
+  the worker opens and the leader holds, long-polling when there is nothing
+  to send. The worker acks its last applied `seq` on the stream, and the
+  leader prunes acked deltas. A worker that reconnects sends its last
+  `(epoch, seq)`.
+- **Full resync is the fallback, not the steady state.** A worker whose
+  `epoch` differs from the leader's (failover), whose `seq` is ahead of the
+  leader's (regression) or behind what the leader still holds (pruned), gets
+  today's full desired set once, then deltas. The heartbeat reply carries a
+  desired-set digest, so a missed delta is still caught within one beat.
+- **No re-emission gate is needed.** A delta is produced once per committed
+  changeset, so Tensorlake's `Pending → Enqueued` state is implicit.
+- **Speculative dispatch rides the stream too.** Edge boot's pre-commit
+  payloads (`docs/edge-boot.md`) become a `provisional` delta, and the
+  apply's verdict follows on the same stream.
+- **The request side goes delta too.** The worker sends allocation ids and
+  health only when they change, plus a digest, which completes Phase 1's
+  allocation-health fix: a steady beat is a few hundred bytes whatever the
+  node runs.
+
+**Why not an outbox in raft.** Writing each command in the plan's own
+transaction would add rows to every placement entry, and every ack and
+prune would be a raft write per node per beat, which is the per-beat raft
+write Phase 1 removes from allocation health. The allocation rows already
+carry the durability, so the outbox only needs to survive as long as one
+leader's term (calls entry 4).
+
+**Sessions use the same mechanism in the other direction.** A running
+session in session mode is node-local (§6.4). Its lifecycle reaches the
+leader's index as sequenced deltas from the node's session log, with the
+same ack, epoch, and full-report rules.
+
+**Composition with the worker plane.** The stream runs on the
+worker-to-manager channel, authenticated by the node token and encrypted
+once [worker-plane-auth-plan.md](worker-plane-auth-plan.md) (PR
+[#16](https://github.com/mikenomitch/legion/pull/16)) Phase 3 lands. Delivery
+then no longer needs the manager to dial the worker at all. `PostWork`
+stays for older workers, behind the worker-plane-auth plan's manager-only
+caller class. Exec, proxied or direct, is unaffected
+([sandbox-exec-plan.md](sandbox-exec-plan.md)).
+
+### 6.14 Wake on request (Phase 7)
+
+An idle session that exists only as a manifest in the bucket has no node.
+Something has to hold the inbound request, trigger the resume, and forward
+once the guest is ready. Three plans touch this, and each owns one part:
+
+- **The suspend plan's Phase 8** owns *node-local* wake on connect: a
+  suspended instance with a local checkpoint keeps its ingress port on its
+  node, and the worker holds a parked listener
+  ([suspend plan §6.10](suspend-resume-and-oversubscription-plan.md)).
+  That cannot work for a manifest, because no node holds the port.
+- **The gated plan's Phase 5** owns the last hop: ingress into a gated
+  guest over host-initiated vsock.
+- **This plan owns wake for idle sessions in the bucket.** The waker lives
+  off-node, in the stateless gateway tier, `legion start gateway`. The exec
+  plan's Phase 4 adds exec to the same tier (calls entry 7).
+
+**The surface.**
+
+```nickel
+suspend = {
+  checkpoint = "memory",
+  durability = "store",
+  idle = { after = "3m" },
+  wake = { on = "request", port = 8080, timeout = "10s" },   # new
+},
+```
+
+The gateway serves `https://<port>-<instance>.<gateway domain>`, the
+addressing E2B uses, and a webhook form, `POST /v1/wake/<instance>`, that
+resumes and returns the address without a held request. Platforms that run
+their own router keep calling `legion instance start`, which is already a
+wake.
+
+**The path.**
+
+1. A request arrives for `8080-workspace-7k2q….gw.example.com`. The gateway
+   asks the session index whether the session is running. If it is, it
+   forwards.
+2. If not, the gateway holds the request and asks the session router to
+   resume it. Concurrent requests for one id share one resume
+   (single-flight at the gateway, and converge-to-one at the router, §6.7).
+3. The router reads the manifest, places the resume like a new session,
+   preferring nodes whose content store already holds the parts or the
+   base image (the `locality` score), and the node fetches what it lacks
+   and restores.
+4. The node reports `serving`, the router answers with the node address,
+   and the gateway forwards the held request. Past `wake.timeout` it
+   answers `503` with `Retry-After`.
+
+Tensorlake's Managed Agents integration and Anthropic's session model show
+the target behavior. A webhook-mode sandbox "suspends to zero when no
+webhook is arriving" and "wakes on the next one", answering in about 0.6 s
+from suspended
+([blog](https://tensorlake.ai/blog/claude-managed-agents),
+[docs](https://docs.tensorlake.ai/sandboxes/claude-managed-agents)).
+Claude Managed Agents sessions go `idle`, not `terminated`, when they
+finish work, and runtime is billed only while a session is `running`
+([session operations](https://platform.claude.com/docs/en/managed-agents/session-operations),
+[pricing](https://platform.claude.com/docs/en/about-claude/pricing)).
+
+### 6.15 Blocked work, keyed by what blocks it (Phase 3)
+
+**Today.**
+
+- A node registering or being uncordoned calls `request_capacity_reconcile`
+  (`src/manager/server.rs:6718`, `:6971`), which enqueues one cluster-wide
+  `node_join` eval unless one is already pending
+  (`src/storage/store.rs:14616-14632`).
+- That eval runs `reschedule_allocations_for_new_node`, which scans every
+  job that is not stopped or failed and re-plans each one short of its
+  `count` or with a `count.per` task (`job_configs_waiting_on_capacity`,
+  `src/storage/store.rs:14557-14607`). It re-plans them whether or not the
+  new node could ever host them.
+- That SQL compares allocations to the task's `count`. Keyed tasks define no
+  count (their desired count comes from `count_live_keyed_instances` in the
+  scheduler), so keyed instances left `pending` appear not to be covered.
+  Phase 0 confirms this with a test.
+- Freed capacity triggers nothing. An allocation that stops, or an instance
+  that suspends, does not wake work waiting for room.
+- A plan that finds no capacity at all fails its eval terminally. The
+  late-binding requeue backstop covers only conflict errors, paced by
+  `schedulerSettings.plan_conflict_requeue_delay_ms`
+  (`docs/scheduler-and-eval-loop.md`, `internal_docs/TODO.md`, "Capacity
+  exhaustion still fails evals terminally").
+- The [gang scheduling plan](gang-scheduling-plan.md) proposes a blocked-eval
+  queue for gangs only.
+
+**Prior art.** Nomad's `BlockedEvals` tracks evaluations "that shouldn't be
+queued until a certain class of nodes becomes available". Each blocked eval
+records which computed node classes it is eligible for, and one that the
+classes cannot capture is "escaped" and wakes on any change. The FSM
+unblocks by class when a node registers, becomes ready, or turns eligible,
+and when allocations finish on a node. There is one blocked eval per job,
+and missed unblocks while an eval is in the scheduler are tracked by index
+([blocked_evals.go](https://github.com/hashicorp/nomad/blob/main/nomad/blocked_evals.go),
+[fsm.go](https://github.com/hashicorp/nomad/blob/main/nomad/fsm.go)).
+Tensorlake queues requests for a region with no capacity "as blocked work",
+and new capacity re-evaluates "only the blocked work for that specific
+region" ([filter and rank](https://www.tensorlake.ai/blog/multi-cloud-scheduling)).
+
+**Design.** An eval that cannot place goes `blocked` instead of `failed`,
+with a **blocking key**, and the leader keeps an index from key to blocked
+evals (calls entry 8):
+
+- **Keys.** The node class the placement could use (pool plus the
+  attributes its constraints read, Nomad's computed class), the resource
+  shape it needs, a checkpoint pin (a resume waiting on the node that holds
+  its checkpoint, or on its checkpoint disk budget), or `escaped` when the
+  constraints cannot be reduced to a class.
+- **Wake events.** Node register or uncordon (its class), allocations
+  stopped, removed, or suspended on a node (that node's class and freed
+  shape), a dynamic attribute change, a checkpoint budget report, and a
+  completed `snapshot warm`. Each wakes only the evals whose key matches,
+  plus `escaped`.
+- **One blocked eval per job**, replaced by a newer one, and an unblock that
+  fires while the job's eval is running is remembered and re-applied, as
+  Nomad does.
+- **State.** The blocked status and key are on the eval row, written in the
+  same entry that today marks it failed, so no new raft write. The index is
+  leader memory, rebuilt from rows on election, like liveness.
+- **Pending keyed instances** are covered: a keyed placement that finds no
+  room blocks under its key like any other.
+- **Session mode.** The router admits sessions into envelopes from soft
+  state, so a full envelope pool is a router refusal (`ENVELOPE_FULL`), not
+  a blocked eval. Blocked evals cover envelopes, keyed instances, and
+  everything else the scheduler places.
+- **The gang plan** reuses this queue as its waiting state rather than
+  building its own, and its shortfall diagnosis becomes the blocked eval's
+  status detail.
 
 ```console
-$ legion exec --instance user-42 -it -- /bin/bash
-root@user-42:/workspace# ls
-$ legion exec --instance user-42 -- uname -s
-Linux
+$ legion job status agents -j
+{"ok":true,"data":{"status":"blocked",
+ "blocked":{"key":"class:pool=agents,cpu.arch=x86_64","shortfall":{"memory":"48GiB"},
+ "since":"2026-11-02T18:04:11Z"}}}
 ```
-
-**Dependency order.**
-
-1. Gated plan Phase 0 (a gated sandbox booted on a real VMM).
-2. Gated plan Phase 1 (`vsock_override` on every restore). This is a hard
-   prerequisite, not a convenience. Memory checkpoints are refused for
-   gated sandboxes today because the vsock path is baked into the VMM's
-   saved state. Giving *every* microVM a vsock device before the override
-   exists would spread that refusal to TAP and `none` sandboxes, which
-   checkpoint fine today.
-3. **This plan's Phase E1.** Host-initiated vsock and the agent's vsock
-   listener are shared with gated plan Phase 5 (ingress). Whichever lands
-   first builds them, and the other reuses them.
-4. Gated plan Phase 2's static `legion-guest` widens the images exec works
-   on. Before it, exec on an image the self-copied agent cannot run on
-   (a musl image such as `alpine:latest`) fails by name:
-   `sandbox exec needs the guest agent, which did not start in this guest`.
-
-Firecracker 1.17.0 fixed host-initiated RX stalling after a bare pause and
-resume (gated plan §2), so E1 sets that as the floor for exec.
-
-### 6.13 Exec without the manager in the data path (Phases E2 to E5)
-
-**Today every byte goes through a manager.** CLI, UI, and MCP sessions
-stream client → manager → worker, and the manager holds both legs for the
-session's life (`docs/exec-and-actions.md`, "How it works"). A platform
-running thousands of concurrent agent shells puts all of their bandwidth
-and connections on three managers that also run raft.
-
-**A finding that changes the starting point.** The worker's gRPC listener
-has no authentication and no TLS. `Worker.ExecTask` runs whatever
-`ExecStart` it receives (`src/worker/server.rs:200`, `src/worker/exec.rs`),
-and the server is built with no interceptor (`src/worker/daemon.rs:318`).
-The proto says `ExecTask` is "called only by the manager"
-(`proto/legion.proto:7224`), but nothing enforces it. `PostWork`,
-`RestartWorker`, and `GetTaskLogs` share the listener. Today's safety rests
-on clients never learning worker addresses and on network isolation of the
-worker port. Direct exec would publish those addresses, so the listener
-has to authenticate first. That fix is worth shipping on its own, and it
-is Phase E2 (calls entry 2).
-
-**The design: signed exec tickets, verified by the worker.** This is
-Modal's command-router shape, a signed token plus a worker address, and it
-avoids the mistake Kubernetes made with streaming redirects: the worker
-never follows anything, and the ticket the client presents is what
-authorizes the session (§2, "Exec at scale").
-
-An exec ticket is a short-lived JWT signed with the cluster's
-workload-identity key, the same signer and JWKS that boot tickets use.
-Workers already cache that JWKS and verify boot tickets offline
-(`src/worker/boot_ticket.rs`), including a local spent-`jti` set bounded by
-expiry.
-
-```jsonc
-{
-  "aud": "legion:exec",
-  "sub": "accessor:7c1f…",                 // who minted it, for audit
-  "jti": "ext_91ab…", "iat": 1793635451, "exp": 1793635511,   // 60s to redeem
-  "legion.io/node": "w-17",                // redeemable on this node only
-  "legion.io/job": "agents", "legion.io/task": "workspace",
-  "legion.io/alloc": 88213,                // or the envelope, for a session
-  "legion.io/instance": "user-42",         // optional
-  "legion.io/argv": ["/bin/bash"],         // rendered, absent = any command
-  "legion.io/action": "flush-cache",       // set when minted for an action
-  "legion.io/tty": true,
-  "legion.io/max_session": 3600,           // seconds the session may run
-  "legion.io/uses": 1
-}
-```
-
-- **Minting is a signature, not a write.** `Manager.MintExecTicket` runs
-  the exact authorization `ExecAllocation` runs (`resolve_exec_start`,
-  `src/manager/exec.rs`): coarse `exec`/`action` gate before any lookup,
-  precise job scope after, `host` for host-level runtimes, action argv
-  rendered from the stored spec. It returns the ticket, the worker's exec
-  address, and the mesh CA certificate to verify it with. No raft entry.
-- **The client connects to the worker.** A new opt-in worker exec listener
-  serves TLS with the node certificate the mesh CA already issues
-  (`<node>.node.legion`, `src/manager/mesh_ca.rs`). The client verifies
-  that name against the CA from the mint reply. The ticket rides the first
-  frame, as the UI's bearer token does today (`ExecStart.bearer_token`).
-- **The worker verifies offline**: signature, `aud`, expiry with the boot
-  ticket's clock skew, `node` equals itself, the target allocation or
-  session is running here under that job and task, the requested argv and
-  tty fit the ticket, and the `jti` is unspent.
-- **Audit flows asynchronously.** The mint is audited at the manager under
-  `exec_audit` as today. The worker writes redemption, argv, tty, and exit
-  code to its local log and reports them on the next heartbeat, and the
-  manager logs them under `exec_audit` too. The manager-proxied path keeps
-  its synchronous audit.
-
-```console
-$ legion exec --instance user-42 --direct -it -- /bin/bash
-# one MintExecTicket call, then the stream goes to w-17:4750 directly
-
-$ legion exec-ticket mint --instance user-42 --argv /bin/bash --tty -j
-{"ok":true,"data":{"ticket":"eyJ…","worker":"10.0.3.17:4750","node":"w-17",
- "caPem":"-----BEGIN CERTIFICATE-----…","expiresAt":"2026-11-02T18:05:11Z"}}
-```
-
-**The manager-proxied path stays the default** for the CLI, the UI, and
-MCP. It needs no route to workers, and it re-checks the caller's credential
-every 30 seconds. After E2 the manager proxy mints a ticket for itself on
-every session, so the worker has one rule for every caller.
-
-**The security boundary.**
-
-| Question | Answer |
-| --- | --- |
-| Who can mint | Anyone `ExecAllocation` would admit for the same target: `exec:write` on the job (plus `host` for host-level runtimes), or `action:write` for an action ticket. Delegated keys (E4) are scoped to a job glob, non-host runtimes, and a TTL ceiling. |
-| What a ticket allows | One session, on one node, into one allocation or session, with the ticket's argv (or any argv for an `exec` rule) and tty flag, for at most `max_session`. |
-| Replay | `jti` is spent in the node's local set, bounded by the ticket's `exp`. A ticket names its node, so it cannot be replayed elsewhere. A worker restart empties the set, so a restarted worker refuses tickets issued before it started (`iat` older than process start minus the clock skew). A client whose ticket is refused for that reason mints again. |
-| Revocation | By TTL (60 s to redeem by default, 10 min ceiling). Revoking an ACL token also pushes its accessor id to workers in the next heartbeat reply, and workers end that accessor's open direct sessions. The bound is one heartbeat interval, against 30 s on the proxied path. |
-| A stolen ticket | Opens one session on the named target, within the redeem window, if the thief redeems before the owner. It cannot reach another instance, node, or command. With `bind = true` (open question) the ticket also names the client's ephemeral key, and a thief without the key gets nothing. |
-| Transport | TLS on the worker exec listener with the mesh CA's node certificate. The listener is off by default and binds an operator-chosen address, so it can stay on a private network. |
-| ACL mapping | Unchanged vocabulary: `exec` and `action` rules, `names`, `action_names`, `host`. No new resource. |
-
-**Composition with session mode.** An unnamed session has no raft row.
-`MintExecTicket` resolves it through the leader's session index (§6.4),
-after the coarse ACL gate, and names the envelope allocation and the
-session id. The worker checks that the session is running locally under
-that envelope. A platform holding a delegated key (E4) can mint exec
-tickets for sessions it started at the edge without calling a manager at
-all, which makes start-and-shell a zero-manager-call path end to end.
-
-**The gateway tier, later (E5).** Some callers cannot route to workers:
-browsers on the public internet, and customers who refuse to expose
-worker addresses. `legion start exec-gateway` runs a stateless tier that
-terminates client TLS or WebSocket, verifies the same ticket, and forwards
-over mesh mTLS to the worker. Gateways scale horizontally, hold no state,
-and keep worker addresses private. They come after E3 because the common
-agent-platform case is the platform's own backend, already inside the
-network, which E3 serves without any public exposure.
 
 ## 7. Target numbers per phase
 
@@ -1202,37 +1224,56 @@ count. Phase 0 replaces every "today" estimate with a measurement, and any
 target Phase 0 shows to be wrong is rewritten here with a calls entry, not
 quietly dropped.
 
+### 7.1 Throughput and counts
+
 | Phase | Raft entries per lifecycle | Sustained session starts/s (cluster) | Running sessions | Idle sessions | Raft rows per idle session |
 | --- | --- | --- | --- | --- | --- |
 | Today (estimate) | ~22 (26 with keys) | low thousands at best, shared with all other placements | ~10^5 to 10^6 (store and snapshot size) | same pool as running | 2 to 3 (instance, snapshot, optional reserve) + tombstone forever |
 | 0: measure | measured | measured | measured bytes per instance row | measured | measured |
 | 1: group commit and trims | ≤ 8 idle cluster, ≤ 3 amortized under load | ≥ 5× Phase 0 | unchanged | unchanged | unchanged |
-| 2: no tombstones for unnamed ids | unchanged | unchanged | rows track live + suspended, not history | unchanged | unchanged |
-| 3: archived idle instances | +1 to archive, +1 to unarchive | unchanged | unchanged | ≥ 10^7 keyed per cluster | 1 slim row (named), 0 (`manifestOnly`) |
-| 4: session mode | 0 for unnamed, 1 to promote | ≥ 20,000 (bound by node boot rate and router CPU) | ≥ 10^6 per leader index (~200 B per entry) | ≥ 10^8 (bucket bound) | 0 |
-| 5: snapshot-clone density | 0 | restore-bound, ≥ 100 restores/s per node | 5× to 10× more per node than cold boots, measured | smaller manifests via diff snapshots | 0 |
-| 6: sub-VM tier seam | 0 | runtime-bound | 10^3 to 10^4 per node, runtime-dependent | as Phase 4 | 0 |
-| 7: cells (conditional) | as Phase 1, per cell | named-instance writes scale with cell count | as Phase 4 | as Phase 4 | 0 |
+| 2: sequenced delivery | unchanged | unchanged, but no longer capped by heartbeat rebuild cost | 10^4 allocations per node without heartbeat growth | unchanged | unchanged |
+| 3: blocked work | unchanged | unchanged | unchanged | unchanged | unchanged |
+| 4: no tombstones for unnamed ids | unchanged | unchanged | rows track live + suspended, not history | unchanged | unchanged |
+| 5: archived idle instances | +1 to archive, +1 to unarchive | unchanged | unchanged | ≥ 10^7 keyed per cluster | 1 slim row (named), 0 (`manifestOnly`) |
+| 6: session mode | 0 for unnamed, 1 to promote | ≥ 20,000 (bound by node boot rate and router CPU) | ≥ 10^6 per leader index (~200 B per entry) | ≥ 10^8 (bucket bound) | 0 |
+| 7: wake on request | 0 | wakes bound by restore rate | as Phase 6 | as Phase 6 | 0 |
+| 8: snapshot-clone density | 0 | restore-bound, ≥ 100 restores/s per node | 5× to 10× more per node than cold boots, measured | smaller manifests via diff snapshots | 0 |
+| 9: sub-VM tier seam | 0 | runtime-bound | 10^3 to 10^4 per node, runtime-dependent | as Phase 6 | 0 |
+| 10: cells (conditional) | as Phase 1, per cell | named-instance writes scale with cell count | as Phase 6 | as Phase 6 | 0 |
+
+Delivery and blocked work have targets of their own:
+
+| Phase | Metric | Today | Target |
+| --- | --- | --- | --- |
+| 2 | Heartbeat payload, steady state, 1,000 / 10,000 allocations per node | full `TaskAllocation` set both ways, measured in Phase 0 | ≤ 1 KiB both ways, whatever the node runs |
+| 2 | Store reads per steady heartbeat | one instance read and one volume read per keyed allocation | 0 |
+| 3 | Evals per capacity event | one cluster-wide pass per join or uncordon, re-planning every short job. Freed capacity triggers nothing | only blocked evals whose key matches, plus `escaped` |
+| 3 | Time from capacity appearing to placed | next join, resubmit, or leader change | p50 ≤ 1 s, p99 ≤ 5 s |
 
 A billion sessions on Legion therefore means federation of clusters at
-Phase 4 or later, each holding millions running and hundreds of millions
-idle, with the idle fraction set by the platform's activity rate. Phase 4's
+Phase 6 or later, each holding millions running and hundreds of millions
+idle, with the idle fraction set by the platform's activity rate. Phase 6's
 index target is per leader, and a 10^7 index is about 2 GiB of manager
-memory, which is where Phase 7's sharded index (the same cell split,
+memory, which is where Phase 10's sharded index (the same cell split,
 applied to the soft index) would start.
 
-**Exec track targets.** Measured on the same rig with simulated workers
-that run real exec sessions against a `noop`-backed echo process, plus a
-KVM node for E1.
+### 7.2 Latency SLOs
 
-| Phase | Manager work per session | Manager bytes per session | Concurrent sessions per cluster | Session opens/s |
+Throughput alone hides the number a user feels (calls entry 10). Phase 0
+measures each of these at p50 and p99, on an idle cluster and at 80% of the measured
+throughput ceiling, and every later phase states its effect on them.
+
+| Metric | From → to | Today | Target (phase) | Published reference |
 | --- | --- | --- | --- | --- |
-| Today (proxied) | two streams held for the session's life | every byte, twice | bounded by manager sockets and CPU, unmeasured | unmeasured |
-| E1: microVM exec | unchanged | unchanged | unchanged | first byte under 100 ms on a warm guest |
-| E2: ticketed worker | + one ES256 signature | unchanged | unchanged | unchanged within noise |
-| E3: direct exec | one unary mint RPC | about 1 KiB (the mint) | ≥ 10,000 with managers idle on bytes | ≥ 5,000 mints/s per manager |
-| E4: delegated keys | none | none | worker-bound | worker-bound |
-| E5: gateway | none | none | gateway-bound, scales with gateways | gateway-bound |
+| Placement decision | create or submit accepted → placement committed | measured in Phase 0 | p50 ≤ 10 ms, p99 ≤ 50 ms (1). p50 ≤ 2 ms, p99 ≤ 10 ms for a session start, which commits nothing (6) | Modal: scheduling "takes tens of milliseconds" ([post](https://modal.com/blog/scaling-to-1-million-concurrent-sandboxes-in-seconds)). Tensorlake: "100s of sandboxes under a few milliseconds" ([post](https://www.tensorlake.ai/blog/multi-cloud-scheduling)) |
+| Dispatch to worker | placement committed → worker has the payload | one push RTT, or up to one heartbeat interval (2 to 21 s) when the push is lost | p50 ≤ RTT + 5 ms, p99 ≤ 50 ms, independent of heartbeat cadence (2) | Tensorlake: "bounded only by network round-trip time" |
+| Running, cold boot | committed → task running | measured in Phase 0 | control-plane share ≤ 10% of the total (2). Boot time itself is a runtime number | Modal: start "less than half a second at the median"; Google warm pool: 90% in 200 ms at 300 per second ([GKE blog](https://cloud.google.com/blog/products/containers-kubernetes/bringing-you-agent-sandbox-on-gke-and-agent-substrate)) |
+| Running, restore | committed → restored guest running | measured in Phase 0 | p50 ≤ 300 ms, p99 ≤ 1 s for a local memory checkpoint of a 512 MiB guest (2). p50 ≤ 100 ms to first instruction with lazy restore (8) | Fly: resume "a few hundred ms" ([docs](https://docs.fly.io/reference/suspend-resume)) |
+| Resume, local memory | `instance start` → serving | measured in Phase 0 | p50 ≤ 400 ms, p99 ≤ 1.5 s (2) | Tensorlake: "a few hundred milliseconds to a second" |
+| Resume, published memory | `instance start` → serving, parts not on the node | measured in Phase 0 | p50 ≤ 2 s, p99 ≤ 5 s for 512 MiB (6). Warm node as local (5) | |
+| Resume, disk | `instance start` → serving | a cold boot | as cold boot | |
+| Wake on request | first request byte at the gateway → first response byte | not possible | p50 ≤ 1 s, p99 ≤ 3 s from a published memory manifest on a node holding the base parts (7) | Tensorlake: a suspended sandbox answered `GET /healthz` "in about 0.6s" ([docs](https://docs.tensorlake.ai/sandboxes/claude-managed-agents)) |
+| Exec session open | request → first output | measured in the exec plan's Phase 0 | per [sandbox-exec-plan.md](sandbox-exec-plan.md) §7, proxied and direct | |
 
 ## 8. Proto, struct, config, and persistence changes
 
@@ -1254,42 +1295,52 @@ KVM node for E1.
 **Job config** (`configs/jobs/maximal.ncl` gets every field):
 `stateful.mode = "session"`, `stateful.envelope { resources, constraint,
 nodes }`, `stateful.promote { onName, onVolume }`, and
-`suspend.archive = "slim" | "manifestOnly"` for keyed tasks (Phase 3).
+`suspend.archive = "slim" | "manifestOnly"` for keyed tasks (Phase 5).
 
 **Manager config:** `sessions { routerEnabled = true, fullReportEvery = 30,
 indexMaxEntries = 2000000 }`.
 
+**Delivery (Phase 2):**
+- `Manager.StreamWork` (server streaming, worker plane, ACL via
+  `acl::enforce_worker_plane` and classified in `tests/acl_endpoints.rs`).
+  The worker sends `{ node_id, last_epoch, last_seq }` and acks on the
+  stream. The server sends `WorkDelta { epoch, seq, add | update | stop |
+  provisional }` or `FullResync { desired_allocations }`.
+- `HeartbeatRequest` gains `allocations_digest` and sends
+  `allocation_ids` and `allocation_health` only on change.
+  `HeartbeatReply` gains `desired_digest` and leaves `desired_allocations`
+  empty for a worker on the stream. Old workers keep today's full set.
+- Worker capability `work-stream`, advertised at registration.
+
+**Blocked work (Phase 3):**
+- `eval.status = 'blocked'`, plus `blocked_key` and `blocked_detail`
+  columns appended to `eval`, written in the entry that today marks the
+  eval failed.
+- `JobStatus` gains a `blocked { key, shortfall, since }` block. `legion job
+  status`, the MCP job tool, and the UI show it.
+- Metrics: `legion_evals_blocked{key_kind}`, `legion_evals_unblocked_total{event}`,
+  `legion_blocked_wait_seconds`.
+
+**Wake on request (Phase 7):**
+- Job config `suspend.wake = { on = "request", port, timeout }` (added to
+  `configs/jobs/maximal.ncl`).
+- `legion start gateway` with config `{ domain, listen, tls, managers }`.
+  The gateway is stateless and authenticates to managers with an ordinary
+  ACL token scoped to the jobs it serves, with the grants `instance start`
+  already needs. No new ACL resource.
+- Manager `Session.Resume { instance_id, wait_until = "serving" }` used by
+  the gateway.
+
 **Worker config:** `sessions { logPath, shipLogEvery = "5m" }`. Session
 mode requires `contentStore`.
 
-**Exec (E1 to E5):**
-- `ExecStart` gains `instance_id` (exec by instance or session id, resolved
-  to the current allocation) and `exec_ticket`. `Manager.MintExecTicket
-  { target, argv, action, action_params, tty, ttl, bind_key? }` returns
-  `{ ticket, worker_address, node, ca_pem, expires_at }`, under the same
-  ACL as `ExecAllocation`, in `tests/acl_endpoints.rs`, `catalog()` as
-  `exec-ticket mint` (`mutates: false`, `read_only_safe: false`, since a
-  ticket opens a shell), and an MCP tool gated like `legion_exec_run`.
-- `Manager.CreateExecKey` / `ListExecKeys` / `DeleteExecKey` (E4), ACL
-  `acl:write`, with a `exec_key` control-lane table (public key, job glob,
-  TTL ceiling, created by). One raft write per key, never per session.
-- `HeartbeatRequest.exec_audit` (redemptions and exits) and
-  `HeartbeatReply.revoked_accessors`.
-- Worker config `exec = { listener = { enabled = false, address =
-  "0.0.0.0:4750" } }`. Manager config `exec.tickets = { defaultTtl = "60s",
-  maxTtl = "10m", maxSession = "1h" }`.
-- Sandbox runtime: the vsock device and agent on every microVM, the exec
-  vsock port, and the Firecracker 1.17.0 floor for exec. No job-config
-  field. `config.network = { mode = "none" }` keeps its meaning for
-  guest-initiated traffic.
-
 **Persistence:**
-- Phase 2: `instance` gains `named BOOLEAN`. Server-minted ids are not
+- Phase 4: `instance` gains `named BOOLEAN`. Server-minted ids are not
   `named` and leave no tombstone. Existing rows are `named = 1`, so nothing
   already tombstoned is released.
-- Phase 3: `instance.state = 'archived'` plus `manifest_url`. Archiving
+- Phase 5: `instance.state = 'archived'` plus `manifest_url`. Archiving
   deletes the snapshot row and any held reserve row in the same apply.
-- Phase 4: no new replicated table. Envelope allocations are ordinary
+- Phase 6: no new replicated table. Envelope allocations are ordinary
   `allocation` rows with an `envelope` flag in their task config. The
   session index is memory only. The worker gains `sessions.db`.
 - All migrations add columns at the end, preserving column order, since
@@ -1313,8 +1364,14 @@ Each phase ships alone and is worth having alone.
     per-beat write shows up.
   - Bytes per instance row, per snapshot row, and the store and snapshot
     size at 10^5 and 10^6 instances.
+  - The latency SLOs in §7.2 at p50 and p99, idle and at 80% of the
+    throughput ceiling: placement decision, dispatch to worker, running
+    from cold boot and from restore, and resume from local memory,
+    published memory, and disk. Heartbeat payload bytes at 1,000 and 10,000
+    allocations per node. A test that confirms whether a keyed instance left
+    `pending` is retried by the capacity pass.
   - Numbers go in `benchmarks/scheduler/README.md`. This phase can reorder
-    the rest: if Phase 1 alone reaches the platform's target rate, Phase 4
+    the rest: if Phase 1 alone reaches the platform's target rate, Phase 6
     waits.
 - **Phase 1: group commit and write trimming, no new semantics.**
   - Allocation health writes only on change, like node health checks. A
@@ -1331,52 +1388,43 @@ Each phase ships alone and is worth having alone.
     has no placement work.
   - Target: ≤ 8 entries per lifecycle on an idle cluster, ≤ 3 amortized
     under load, ≥ 5× the Phase 0 session rate.
-- **Phase 2: no tombstones for unnamed ids.** Server-minted ids grow to
+- **Phase 2: sequenced delivery (§6.13).** After Phase 1, because it
+  matters once raft write volume is down and the heartbeat is the next
+  per-node cost. The per-node delta log in leader memory, `StreamWork`, acks
+  and pruning, epoch and gap resync, the provisional delta for edge boot,
+  delta heartbeats with digests, and the `work-stream` capability. Docs:
+  `docs/architecture-managers-workers.md`, `docs/heartbeat-cadence-and-scale.md`,
+  `docs/edge-boot.md`.
+- **Phase 3: blocked work (§6.15).** After Phase 1. Blocked evals with keys,
+  the leader index, wake on join, uncordon, freed capacity, attribute
+  change, budget report, and warm, one blocked eval per job, missed-unblock
+  tracking, the `blocked` job status. The gang plan builds on it. Docs:
+  `docs/scheduler-and-eval-loop.md`, `docs/jobs-tasks-and-scheduling.md`.
+- **Phase 4: no tombstones for unnamed ids.** Server-minted ids grow to
   130 bits and leave no row on destroy. Caller ids keep tombstones. Caller
   ids may no longer match the server-minted shape `{task}-{26 base32}`,
   the same kind of reserved-pattern rule slot ids already have, so nobody
   can re-create a dead unnamed id by typing it. Raft size then tracks live
   and suspended instances.
-- **Phase 3: archived idle instances.** `suspend.archive` for keyed tasks
+- **Phase 5: archived idle instances.** `suspend.archive` for keyed tasks
   with `durability = "store"`, the slim row, manifests in the bucket, and
   `--include-idle` listing. Works without session mode.
-- **Phase 4: session mode.** Envelopes, the session router, leases, the
+- **Phase 6: session mode.** Envelopes, the session router, leases, the
   worker session log, heartbeat deltas and full reports, the leader index,
   `PromoteInstance`, identity from leases, derived-id idempotency, the
   session log shipper, CLI and MCP fields (`durable`, `complete`),
   `catalog()` entries, and `docs/agent-readiness.md`.
-- **Phase 5: snapshot-clone density.** Executes suspend plan Phase 8's
+- **Phase 7: wake on request (§6.14).** After Phase 6, since it wakes
+  sessions from manifests. `legion start gateway`, `suspend.wake`, the
+  hostname and webhook routes, single-flight resumes, and the held-request
+  timeout. The exec plan's gateway phase adds exec to the same binary.
+  Docs: a new `docs/gateway.md`, `docs/suspend-and-resume.md`.
+- **Phase 8: snapshot-clone density.** Executes suspend plan Phase 8's
   UFFD lazy restore and diff snapshots for session envelopes, a warm base
   checkpoint per envelope, and density measurements per node.
-- **Phase 6: sub-VM tier seam.** `TaskPlugin::start_session`,
+- **Phase 9: sub-VM tier seam.** `TaskPlugin::start_session`,
   `sessionsPerInstance`, accounting, and the isolation warning in docs.
-- **Phase 7: cells (conditional).** Built only past the §6.11 trigger.
-
-**The exec track.** Independent of session mode. E1 and E2 can ship before
-Phase 0.
-
-- **E1: exec into microVMs over vsock (§6.12).** After gated plan Phases 0
-  and 1. The vsock device and agent on every microVM, the agent's exec
-  listener and pty spawn, `VsockExecSession`, the version hello,
-  `exec --instance`, the idle-signal warning removed, and the
-  `docs/exec-and-actions.md` table row flipped. Valuable alone: shells and
-  actions in production sandboxes.
-- **E2: authenticate the worker listener.** Every `ExecTask` requires an
-  exec ticket. The manager proxy mints one for itself per session.
-  `PostWork`, `RestartWorker`, and `GetTaskLogs` require a manager-signed
-  worker-plane token (`aud = legion:worker`). Worker restart refuses
-  tickets issued before it started. Valuable alone: it closes an
-  unauthenticated exec endpoint on every worker.
-- **E3: direct exec, opt-in.** `MintExecTicket`, the worker's TLS exec
-  listener on the mesh CA node certificate, `legion exec --direct`,
-  `legion exec-ticket mint`, async audit on the heartbeat, accessor
-  revocation pushed to workers, and session resolution through the session
-  index once Phase 4 exists.
-- **E4: delegated minting keys.** A platform registers a public key scoped
-  to a job glob, and workers trust it alongside the cluster JWKS.
-- **E5: the exec gateway.** `legion start exec-gateway`, stateless, for
-  browsers and private-worker deployments. Built when public or browser
-  access at scale needs it.
+- **Phase 10: cells (conditional).** Built only past the §6.11 trigger.
 
 ## 10. Testing plan
 
@@ -1388,13 +1436,26 @@ Phase 0.
   an empty changeset. A ratification that creates its row refuses a
   tombstoned or existing id. Coalesced creates isolate a failing request
   (per-request savepoints, like intake).
-- **Phase 2:** an unnamed destroy leaves no row, a named destroy leaves a
+- **Phase 2:** a worker on the stream receives an allocation within one
+  round trip of the commit with heartbeats paused. A dropped stream
+  reconnects and replays from its last ack. A leader kill makes every
+  worker resync once and lose nothing. A gap (pruned seq) resyncs. A
+  steady beat is under 1 KiB at 10,000 allocations. Old workers keep
+  today's full-set reconcile. The edge-boot suites pass unmodified with
+  provisional deltas.
+- **Phase 3:** a job blocked on a pool wakes on a node joining that pool
+  and not on one joining another. Freed capacity on a node wakes a job
+  blocked on its class. An escaped job wakes on any change. A pending keyed
+  instance blocks and wakes. An unblock during the job's running eval is not
+  lost. A leader kill rebuilds the index from rows. The gang plan's tests
+  run on it when it lands.
+- **Phase 4:** an unnamed destroy leaves no row, a named destroy leaves a
   tombstone, existing rows keep theirs across the migration, and a
   mixed-version cluster replays the column-appended migration.
-- **Phase 3:** archive and unarchive round trip, the slim row refuses a
+- **Phase 5:** archive and unarchive round trip, the slim row refuses a
   duplicate create, a lost bucket object fails resume with
   `onRestoreFailure`, and `--include-idle` pages through a bucket listing.
-- **Phase 4:**
+- **Phase 6:**
   - Integration on the `raft_lanes` harness: start 10^4 sessions on
     simulated nodes and assert zero raft entries. Kill the leader and
     assert the new index is `complete` after one full-report round, with
@@ -1408,40 +1469,34 @@ Phase 0.
   - ACL: every new RPC is in `tests/acl_endpoints.rs`.
   - Worker restart: sessions in the local log are restored or killed per
     their gate, never silently orphaned.
-- **Phase 5:** ignored KVM tests for UFFD restore and diff snapshots, plus
+- **Phase 7:** a request to an idle session's hostname resumes it and is
+  answered. Ten concurrent requests cause one resume. A wake past
+  `timeout` answers `503` with `Retry-After`. A gateway restart loses only
+  held requests. A webhook wake returns the address.
+- **Phase 8:** ignored KVM tests for UFFD restore and diff snapshots, plus
   a density benchmark that records sessions per node at a fixed memory
   budget, cold versus clone.
-- **E1:** ignored KVM tests: a pty session into Firecracker and
-  cloud-hypervisor guests (stdin, resize, exit status, kill on
-  disconnect), exec after a memory resume reaches the new allocation,
-  exec on a `none` sandbox works while the guest still cannot dial the
-  host, and an image without a runnable agent fails by name. Unit tests
-  for the frame codec and the version hello against an older agent.
-- **E2:** a raw `ExecTask` without a ticket is refused, a ticket for
-  another node, allocation, argv, or an expired one is refused, a replayed
-  `jti` is refused, a ticket issued before a worker restart is refused,
-  and the proxied path still works end to end. `PostWork` without a worker
-  token is refused.
-- **E3:** direct sessions against simulated workers, accessor revocation
-  ends an open direct session within one heartbeat, the audit record
-  arrives on the next heartbeat, the CLI verifies the worker's certificate
-  name, and an ACL matrix shows `MintExecTicket` admits exactly what
-  `ExecAllocation` admits.
-- **Benchmarks:** the Phase 0 matrix re-run after Phases 1, 3, and 4, with
+- **Benchmarks:** the Phase 0 matrix re-run after Phases 1, 2, 5, and 6, with
   before and after numbers in each PR, per the `AGENTS.md` scheduler rule.
-  The exec matrix (proxied versus direct, 1k and 10k concurrent sessions)
-  runs before and after E3.
 
 ## 11. Rollout and backward compatibility
 
 - **Phases 0 and 1 change no surface.** They are internal and default on,
   guarded by the op-count test and the unmodified suites.
-- **Phase 2 changes no existing row.** Only instances minted after the
+- **Phase 2 is negotiated per worker.** A worker that advertises
+  `work-stream` gets deltas. Every other worker keeps today's push and full
+  set, so mixed fleets work and a rollback is a worker downgrade. Managers
+  upgrade first, per `docs/upgrades.md`.
+- **Phase 3 changes a visible default.** Evals that today end `failed` for
+  lack of capacity end `blocked` and place later on their own. `job status`
+  says so. Scripts that treated `failed` as "no room" need to read
+  `blocked`, which the upgrade note calls out.
+- **Phase 4 changes no existing row.** Only instances minted after the
   upgrade can be untombstoned, and only unnamed ones. The public doc
   states that the never-recycled guarantee for server-minted ids becomes
   probabilistic from that release on. That is a change to a documented
   guarantee, so it ships with an upgrade note in `docs/upgrades.md`.
-- **Phases 3 and 4 are opt-in per job** (`suspend.archive`,
+- **Phases 5 and 6 are opt-in per job** (`suspend.archive`,
   `stateful.mode = "session"`). Nothing changes for jobs that do not set
   them.
 - **Version skew.** Envelope allocations are refused by workers that do
@@ -1450,28 +1505,18 @@ Phase 0.
   heartbeat fields ignores them, which is safe because sessions are
   invisible to it but keep running. Upgrade managers first, per
   `docs/upgrades.md`.
+- **Phase 7 is opt-in per job** (`suspend.wake`) and needs a gateway the
+  operator runs.
 - **Downgrade.** A cluster that downgrades after enabling session mode
   loses its session index (sessions keep running inside envelopes until
   their nodes restart) and cannot read archived rows. The upgrade doc says
   so.
-- **E1 is default on** for microVM sandboxes on workers that ship it. A
-  guest captured before E1 has no exec listener, so exec into a sandbox
-  resumed from an old checkpoint fails by name until its next cold boot.
-- **E2 is a breaking change on the worker plane** and rolls out in two
-  releases: managers first start attaching tickets and tokens (workers
-  ignore them), then workers start requiring them. A worker config flag
-  (`workerPlane.requireAuth`, default true in the second release) lets an
-  operator stage it. Any tool that calls workers directly breaks, which is
-  the point.
-- **E3 to E5 are opt-in**: the worker listener is off by default, and the
-  CLI uses the proxy unless `--direct` is passed.
-
 ## 12. Open questions
 
 - **Is the leader the right home for the session index (lean: yes, for
-  Phase 4)?** It matches liveness and the location index. The cost is
+  Phase 6)?** It matches liveness and the location index. The cost is
   that index memory scales with running sessions on one process. A
-  sharded index across managers is the Phase 7 cell split applied to soft
+  sharded index across managers is the Phase 10 cell split applied to soft
   state. Revisit at 10^7 running per cluster.
 - **Should `stop` on an unnamed session keep a manifest (lean: no)?**
   `suspend` keeps state, `stop` ends it. Keeping a manifest on stop makes
@@ -1490,54 +1535,58 @@ Phase 0.
   old envelope stay until they suspend or stop, and resume into the new
   config. This needs a drain rule, and the lean is "new sessions go to new
   envelopes, old envelopes are removed when empty".
-- **Should direct-exec tickets be bound to the client's key (lean: yes for
-  the CLI, optional for platforms)?** A `cnf` claim naming the client's
-  ephemeral key makes a stolen ticket useless. It costs the client a key
-  and a proof, which a platform backend may not want.
-- **How much revocation lag is acceptable for direct sessions (lean: one
-  heartbeat)?** The proxied path re-checks every 30 s. Adaptive cadence can
-  stretch a heartbeat to 21 s on a large fleet, so the two are close, but
-  an operator revoking a leaked token wants faster. A dedicated revocation
-  push is the fallback.
-- **Should `instance create` return an exec ticket (lean: on request, with
-  `--exec-ticket`)?** Modal embeds command-router access in create and
-  restore replies to save a round trip. Doing it by default would mint a
-  shell capability nobody asked for.
+- **Does the delta stream replace the heartbeat (lean: no)?** Liveness,
+  usage, and health stay on the heartbeat, and only work moves to the
+  stream. Merging them would save a connection per node but tie liveness
+  to a long-lived stream, which is harder to reason about during a
+  partition.
+- **Should freed capacity wake blocked work immediately or in batches
+  (lean: coalesce for 100 ms)?** A node draining a thousand allocations
+  would otherwise wake the same blocked eval a thousand times. Nomad
+  coalesces through its unblock index. Phase 0's churn numbers decide the
+  window.
+- **Who authenticates the request a gateway wakes for (lean: the platform,
+  with an optional per-instance route token)?** The gateway can route on
+  the hostname alone, as E2B's proxy does, and leave authorization to the
+  workload. A route token in the hostname, as Cloudflare's preview URLs
+  use, stops scanning but makes URLs secrets.
 - **What triggers cells (lean: the §6.11 thresholds)?** Measured in Phase 0
-  and re-checked after Phase 4.
+  and re-checked after Phase 6.
 
 ## 13. Acceptance criteria
 
 - **Phase 0:** `benchmarks/scheduler/README.md` records raft entries per
   lifecycle stage for `single` and `lanes`, sustained create, suspend, and
-  resume rates on the AWS rig or a stated local substitute, and bytes per
-  instance row. The op-count test runs in CI.
+  resume rates on the AWS rig or a stated local substitute, bytes per
+  instance row, every §7.2 latency SLO at p50 and p99, and heartbeat bytes
+  at 1,000 and 10,000 allocations per node. The op-count test runs in CI.
 - **Phase 1:** the op-count test shows ≤ 8 entries per lifecycle on an
   idle cluster. A 10,000-allocation node's steady beat writes zero rows.
   An edge start writes one scheduler-lane entry plus its projection. The
   session rate is at least 5× Phase 0's.
-- **Phase 2:** a churn test of 10^6 unnamed creates and destroys leaves the
+- **Phase 2:** with heartbeats paused, a placement reaches its worker
+  within one round trip plus 5 ms at p50. A 10,000-allocation node's
+  steady heartbeat is under 1 KiB both ways and does no store reads. A
+  leader kill causes one resync per worker and no lost or duplicated
+  allocation.
+- **Phase 3:** a node joining a pool causes evals only for jobs blocked on
+  that pool's class (plus escaped ones). Freed capacity places a blocked
+  job with p50 ≤ 1 s. `job status` shows the blocking key and shortfall.
+- **Phase 4:** a churn test of 10^6 unnamed creates and destroys leaves the
   instance table at the live count.
-- **Phase 3:** 10^6 archived keyed instances leave 10^6 slim rows and no
+- **Phase 5:** 10^6 archived keyed instances leave 10^6 slim rows and no
   snapshot or allocation rows, and resume one in under the published-resume
   time measured in suspend plan Phase 7b.
-- **Phase 4:** 10^4 simulated session starts write zero raft entries. A
+- **Phase 6:** 10^4 simulated session starts write zero raft entries. A
   leader kill leaves every session running, and the list reports
   `complete: true` within one full-report period. A promoted session is
   indistinguishable from a keyed instance in `instance get`.
-- **Phase 5:** sessions per node at a fixed memory budget are measured and
+- **Phase 7:** a request to an idle session's gateway hostname is answered
+  within the §7.2 wake target from a published manifest, with no node
+  holding the session beforehand.
+- **Phase 8:** sessions per node at a fixed memory budget are measured and
   published, clone versus cold.
-- **Phase 6:** a test runtime runs two sessions in one instance with
+- **Phase 9:** a test runtime runs two sessions in one instance with
   correct accounting.
-- **Phase 7:** built only with the trigger met, with its own plan
+- **Phase 10:** built only with the trigger met, with its own plan
   amendment.
-- **E1:** on a KVM node, `legion exec --instance <id> -it -- /bin/sh` opens
-  a shell in a Firecracker and a cloud-hypervisor sandbox, an action runs
-  there from the UI, and the `exec` idle signal keeps an instance with an
-  open shell awake.
-- **E2:** a request to a worker's `ExecTask` or `PostWork` with no ticket
-  or token is refused, and every existing exec test passes through the
-  proxy.
-- **E3:** 10,000 concurrent direct sessions on simulated workers move no
-  session bytes through a manager, and minting writes no raft entry.
-- **E4 and E5:** each ships with its own acceptance test when built.

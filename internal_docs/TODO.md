@@ -183,7 +183,9 @@ How to use it:
 - [ ] **Heartbeats rebuild the node's whole desired set every beat.** Add a
       desired-state version to the heartbeat so an unchanged node gets a
       cheap "unchanged" reply (proto + worker change). Adaptive cadence
-      already caps the beat rate (calls #16).
+      already caps the beat rate (calls #16). Planned more broadly as
+      sequenced delivery, Phase 2 of
+      [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md).
 - [ ] **Job stop/destroy at scale drains at ~4 evals/s** (AWS 10k cleanup,
       2026-10-10). Profile with `legion_eval_phase_seconds{kind="job_stop"}`.
 - [x] **Re-ran `web_fleet` on AWS with Phase 4 and adaptive cadence**
@@ -661,7 +663,10 @@ How to use it:
       in `failed`. Blocked-and-retried capacity waits are the gang-scheduling
       plan's blocked-eval machinery
       ([plan](plans/gang-scheduling-plan.md)) — when that lands, consider
-      routing plain single-task capacity failures through it too.
+      routing plain single-task capacity failures through it too. Now
+      planned as Phase 3 of
+      [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md), a generic
+      blocked-work queue the gang plan can reuse.
 - [ ] Edge boot follow-ups — the feature shipped (phases 1–4;
       [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
       [calls](calls/edge-boot-plan_calls.md)); these are what it left open.
@@ -1536,8 +1541,8 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 - [ ] **The `sandbox` runtime still cannot exec, signal, or deliver identity
       files** — all three need the guest agent the sandbox plan owns. The
       container runtime's `TaskPlugin::signal` override is the seam its
-      guest-agent path would implement. Exec is now planned as Phase E1 of
-      [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md#612-exec-into-microvm-sandboxes-over-vsock-phase-e1).
+      guest-agent path would implement. Exec is now planned as Phase 1 of
+      [sandbox-exec-plan.md](plans/sandbox-exec-plan.md).
 - [ ] **Sandbox scaling to very large session counts**:
       [plan](plans/sandbox-scaling-plan.md) (PLANNED) ·
       [calls](calls/sandbox-scaling-plan_calls.md). Every keyed sandbox is a
@@ -1547,39 +1552,34 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       instances.
   - [ ] Phase 0 (gate): an op-count test per lifecycle stage on the
         `raft_apply_roundtrip` harness, a `legion-loadgen` instance mode,
-        simulated allocation health, and bytes per instance row. Numbers in
-        `benchmarks/scheduler/README.md`.
+        simulated allocation health, bytes per instance row, heartbeat bytes
+        at 1,000 and 10,000 allocations per node, and the latency SLOs at p50
+        and p99 (plan §7.2). Numbers in `benchmarks/scheduler/README.md`.
   - [ ] Phase 1: group commit and write trimming with no new semantics
         (target ≤ 8 entries per lifecycle, ≥ 5× the Phase 0 rate).
-  - [ ] Phase 2: server-minted ids grow to 130 bits and leave no tombstone.
+  - [ ] Phase 2: sequenced delivery. A per-node delta log in leader memory,
+        `Manager.StreamWork` with acks, full resync on failover or gaps, and
+        delta heartbeats (plan §6.13). Targets: dispatch within a round trip
+        of the commit, steady heartbeats under 1 KiB at 10,000 allocations.
+        Supersedes the "Heartbeats rebuild the node's whole desired set every
+        beat" item under Scheduling & placement.
+  - [ ] Phase 3: blocked work keyed by what blocked it, woken by matching
+        node joins, uncordons, freed capacity, attribute changes, and budget
+        reports (plan §6.15). Covers the "Capacity exhaustion still fails
+        evals terminally" item under Scheduling & placement, and the gang
+        plan builds on it.
+  - [ ] Phase 4: server-minted ids grow to 130 bits and leave no tombstone.
         Caller ids may not take that shape.
-  - [ ] Phase 3: archive suspended keyed instances to content-store
+  - [ ] Phase 5: archive suspended keyed instances to content-store
         manifests (`suspend.archive`).
-  - [ ] Phase 4: `stateful.mode = "session"`: envelopes, the session
+  - [ ] Phase 6: `stateful.mode = "session"`: envelopes, the session
         router, leases, node session logs, the leader index, and
         `PromoteInstance`.
-  - [ ] Phases 5 to 7: snapshot-clone density (with suspend plan Phase 8),
+  - [ ] Phase 7: wake on request through `legion start gateway` and
+        `suspend.wake` (plan §6.14). The suspend plan's Phase 8 keeps
+        node-local wake on connect.
+  - [ ] Phases 8 to 10: snapshot-clone density (with suspend plan Phase 8),
         a sub-VM tier seam, and cells only past the plan §6.11 trigger.
-  - [ ] Exec E1: exec into Linux microVM sandboxes over vsock. Every
-        microVM gets a vsock device and the guest agent, the agent spawns
-        the command under a pty, and `legion exec`, actions, and the UI
-        terminal work unchanged (plan §6.12). Needs gated plan Phases 0 and
-        1 first: without the vsock restore override, a vsock device on
-        every microVM would break memory checkpoints of TAP and `none`
-        sandboxes. Replaces the "sandbox runtime still cannot exec" item
-        under Task runtimes for the exec part.
-  - [ ] Exec E2: authenticate the worker listener. Found during the plan:
-        `Worker.ExecTask` has no authentication or TLS
-        (`src/worker/server.rs:200`, `src/worker/daemon.rs:318`), and
-        `PostWork`, `RestartWorker`, and `GetTaskLogs` share the listener.
-        The proto's "called only by the manager" is not enforced. Every
-        `ExecTask` should require a signed exec ticket, the others a
-        manager-signed token, rolled out over two releases.
-  - [ ] Exec E3: direct exec, opt-in. `MintExecTicket`, a TLS worker exec
-        listener on the mesh CA node certificate, `legion exec --direct`,
-        async audit, and accessor revocation on the heartbeat.
-  - [ ] Exec E4 and E5: delegated minting keys scoped to job globs, then a
-        stateless exec gateway for browsers and private-worker setups.
   - [ ] Found during the plan: allocation health is a status-lane raft
         write per node per beat, because the manager upserts every
         allocation with `updated_at = now` and nothing skips unchanged rows
@@ -1591,9 +1591,44 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         edge start still needs `CreateInstance` first, and that create's
         placement eval can bind the row before the edge claim does. Phase 1
         makes ratification create the row.
+  - [ ] Found during the plan: the `node_join` capacity pass compares
+        allocations to `count` (`src/storage/store.rs:14557-14607`), and
+        keyed tasks define no count, so a keyed instance left `pending` for
+        lack of room appears never to be retried. Phase 0 confirms with a
+        test, and Phase 3 fixes it.
   - [ ] Found during the plan: `docs/multi-raft.md` says instance writes go
         on the control lane, but `instance` is owned by the scheduler lane
         (`src/storage/raft/ownership.rs:222`). Fix the doc.
+- [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (PLANNED) ·
+      [calls](calls/sandbox-exec-plan_calls.md). Exec into Linux microVM
+      sandboxes, and exec sessions that skip the manager. Implemented
+      together with
+      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md)
+      ([#16](https://github.com/mikenomitch/legion/pull/16)).
+  - [ ] Found during the plan: the worker listener has no authentication
+        and no TLS (`src/worker/server.rs:55`, `:200`,
+        `src/worker/daemon.rs:318`). It binds `127.0.0.1:4848`
+        (`src/worker/daemon.rs:155`), so the gap is local: any process on
+        the worker's host, including an `exec` task or a host-network
+        container, can call `ExecTask` against any allocation on that node.
+        The worker-plane-auth plan (#16) closes it.
+  - [ ] Amend the worker-plane-auth plan (exec plan §9): a ticket caller
+        class for `ExecTask`, a classification test that allows two classes,
+        and the JWKS verifier on every worker that admits tickets.
+  - [ ] Phase 0: exec open latency and manager cost per proxied session at
+        100, 1,000, and 10,000 concurrent sessions.
+  - [ ] Phase 1: exec into Linux microVMs over vsock. Every microVM gets a
+        vsock device and the guest agent, and `legion exec`, actions, MCP,
+        and the UI terminal work unchanged. After gated plan Phases 0 and 1
+        (without the vsock restore override, a vsock device on every microVM
+        would break memory checkpoints of TAP and `none` sandboxes) and
+        worker-plane-auth Phase 1.
+  - [ ] Phase 2: direct exec with `MintExecTicket` and a ticket class on the
+        mTLS worker listener, `legion exec --direct`, async audit, revoked
+        accessors on the heartbeat.
+  - [ ] Phases 3 to 5: delegated minting keys, the gateway tier (shared
+        with the scaling plan's wake on request), and exec into unnamed
+        sessions after the scaling plan's Phase 6.
 - [ ] **Gated sandboxes by default, with memory checkpoints**:
       [plan](plans/gated-sandbox-checkpoints-plan.md) (PLANNED) ·
       [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Agent sandboxes
