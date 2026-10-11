@@ -13,6 +13,9 @@
 //! reports the heartbeat carries, and the local suspensions a node's
 //! `suspend` pressure step reports.
 
+// Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
+#![allow(clippy::result_large_err)]
+
 use legion::manager::server::{
     idle_sweep, make_room_sweep, settle_stalled_resumes, IdleSweeper, MakeRoomState,
     ManagerDaemonService,

@@ -11,6 +11,9 @@
 //! `src/worker/task_manager.rs`
 //! (`a_published_snapshot_restores_on_a_node_that_never_held_it`).
 
+// Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
+#![allow(clippy::result_large_err)]
+
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;

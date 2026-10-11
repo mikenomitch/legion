@@ -18,6 +18,9 @@
 //! that references the seeded fixtures, and a one-line ACL check in the
 //! handler. See AGENTS.md ("Auth & ACL checks").
 
+// Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
+#![allow(clippy::result_large_err)]
+
 use anyhow::{anyhow, Context};
 use legion::manager::acl::Authenticator;
 use legion::manager::server::ManagerDaemonService;

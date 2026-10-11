@@ -8,6 +8,9 @@
 //! the heartbeat stands in for the worker, so every manager-side transition
 //! is driven exactly as a worker would drive it.
 
+// Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
+#![allow(clippy::result_large_err)]
+
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;

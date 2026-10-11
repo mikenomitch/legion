@@ -10,6 +10,9 @@
 //! (`an_exec_disk_fork_gives_every_fork_its_own_copy_of_the_volume`),
 //! `src/worker/identity.rs`, and `src/task_plugins/sandbox_checkpoint.rs`.
 
+// Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
+#![allow(clippy::result_large_err)]
+
 use std::collections::HashSet;
 
 use legion::manager::server::ManagerDaemonService;
