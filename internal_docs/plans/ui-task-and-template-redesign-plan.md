@@ -240,6 +240,18 @@ error. The diff helper is small enough to reason through by hand: identical
 inputs, pure insertions, pure deletions, a change in the middle, empty sides,
 and the size cap.
 
+**Run 2026-10-11** (phases 1 and 2, seeded manager with `--run-worker`, a
+two-task job with actions, a four-variable template): all four task tabs
+render; a row's Logs / Shell buttons land on `?tab=logs|exec&alloc=<id>` with
+that allocation preselected; an unhealthy instance sorts first with its
+reason; a first template launch reviews as "Creates a new job" with the full
+spec and reports that new jobs have no rollout; a re-launch with
+`replicas = 2` reviews as "Updates the running job" with `was 1` and a
+`count 1 → 2` diff, then follows the rollout to completion. The store returned
+`template.variables.json` before `job.rendered.json` for that job, confirming
+[calls entry 3](../calls/ui-task-and-template-redesign-plan_calls.md); with the
+fix its job and task pages list the task. No page errors in the console.
+
 ## Rollout and backward compatibility
 
 UI-only. Existing task links open the Overview tab. Nothing changes for the
