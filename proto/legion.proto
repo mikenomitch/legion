@@ -3719,10 +3719,11 @@ message CheckpointRequest {
   // as an error and report it, so a newer manager's op is never silently
   // dropped.
   //
-  // `publish` uploads every memory part named by `manifest_json`
-  // to the worker's `contentStore` and reports the manifest with each
-  // part's `url` filled in. `warm` fetches the parts named by
-  // `manifest_json` from their URLs into the node content store.
+  // `publish` seals every memory part named by `manifest_json` with its key
+  // from `part_keys`, uploads it to the worker's `contentStore`, and reports
+  // the manifest with each part's `url` and `keyId` filled in. `warm`
+  // fetches the parts named by `manifest_json` from their URLs, opens them
+  // with their keys, and stores them in the node content store.
   string op = 2;
 
   // `capture`: the running allocation to capture. Unset for `delete`.
@@ -3744,6 +3745,37 @@ message CheckpointRequest {
   // alone. `publish`: the manifest to publish. `warm`: the published
   // manifest, whose parts carry their URLs.
   string manifest_json = 7;
+
+  // `publish` and `warm`: one key per memory part of `manifest_json`, which
+  // the worker seals each part with before it uploads it, or opens each
+  // fetched part with (docs/suspend-and-resume.md, "Security"). The manager
+  // derives them from the cluster's checkpoint key and sends them only with
+  // the work it chose to send this worker. Empty for `capture` and `delete`,
+  // and when the manager could not derive them (see `part_key_error`).
+  repeated CheckpointPartKey part_keys = 8;
+
+  // Why `part_keys` is empty or incomplete: the keyring is locked on the
+  // manager, the cluster has no checkpoint key yet, or a part names a key
+  // the cluster no longer has. The worker fails the work with this message.
+  // Empty when every key is present.
+  string part_key_error = 9;
+}
+
+// The key for one published checkpoint part. A worker receives it with the
+// publish, warm, or restore work that needs it and keeps it in memory only.
+// The generated Rust type redacts `key` from Debug output and never
+// serializes it.
+message CheckpointPartKey {
+  // `sha256:<hex>` of the part's plaintext, as in the manifest.
+  string digest = 1;
+
+  // The checkpoint key this part key is derived from (`ck_…`), recorded in
+  // the published manifest as the part's `keyId`.
+  string key_id = 2;
+
+  // 32 bytes. Derives both the AES-256-GCM key the part is sealed under and
+  // the name of the sealed object in the content store.
+  bytes key = 3;
 }
 
 // The outcome of one piece of checkpoint work, reported by a worker in
@@ -3814,9 +3846,9 @@ message SnapshotRestore {
   // snapshot loads the memory parts (looked up by digest in the node content
   // store) instead of calling the runtime's `start`. A part missing from the
   // node content store that carries a `url` (a published snapshot) is
-  // fetched first, through the worker's artifact fetchers, verified against
-  // its digest, and stored in the content store; the allocation shows
-  // `staging artifacts` meanwhile.
+  // fetched first, through the worker's artifact fetchers, opened with its
+  // key from `part_keys`, verified against its digest, and stored in the
+  // content store. The allocation shows `staging artifacts` meanwhile.
   string manifest_json = 3;
 
   // The task's `suspend.onResume` argv. After a memory restore the guest
@@ -3837,6 +3869,18 @@ message SnapshotRestore {
   // The instance the allocation serves. The guest's identity refresh
   // re-exports it as `LEGION_INSTANCE_ID`, which a fork must change.
   string instance_id = 6;
+
+  // One key per published memory part of `manifest_json`, to open the
+  // sealed parts this worker has to fetch. Only a part missing from the
+  // node content store needs its key, so a restore on the node that holds
+  // every part succeeds without them. Empty for a snapshot that was never
+  // published.
+  repeated CheckpointPartKey part_keys = 7;
+
+  // Why `part_keys` is empty or incomplete (a locked keyring on the
+  // manager, or a part sealed under a key the cluster no longer has). A
+  // restore that has to fetch such a part fails with this message.
+  string part_key_error = 8;
 }
 
 // === VOLUME MESSAGES (see docs/volumes.md) ===
@@ -6202,16 +6246,22 @@ message GetStateBackupReply {
 // manager that answers.
 message GetKeyringStatusRequest {}
 
-// One data key in the KV keyring (see GetKeyringStatusReply).
+// One key in the KV keyring (see GetKeyringStatusReply): a data key, or
+// the checkpoint key.
 message KeyringKeyInfo {
-  // Data key id (`dk_…`). Values reference it in `kv_entry.enc_key_id`.
+  // Data key id (`dk_…`), which values reference in `kv_entry.enc_key_id`,
+  // or checkpoint key id (`ck_…`), which published checkpoint manifests
+  // reference as each part's `keyId`.
   string key_id = 1;
 
-  // `active` (encrypts new writes) or `retired` (still decrypts what it
-  // protected until the rewrap converts those values).
+  // `active` (encrypts new writes), `retired` (still decrypts what it
+  // protected until the rewrap converts those values), or `checkpoint` (the
+  // key published checkpoint parts are sealed under; it never seals a KV
+  // value, never rotates with the data keys, and is never collected).
   string state = 2;
 
-  // Cipher this key is used with (`aes-256-gcm`).
+  // `aes-256-gcm` for a data key, `hkdf-sha256` for the checkpoint key
+  // (each part's AES-256-GCM key is derived from it).
   string algorithm = 3;
 
   // Unix seconds the key was created.

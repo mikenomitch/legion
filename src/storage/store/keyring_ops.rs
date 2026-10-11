@@ -7,7 +7,8 @@
 
 use super::*;
 use crate::storage::keyring::{
-    Keyring, KeyringRow, DEF_ROOT_KEY_ENV, KEY_STATE_ACTIVE, KEY_STATE_RETIRED, PROVIDER_EXEC,
+    Keyring, KeyringRow, DEF_ROOT_KEY_ENV, KEY_STATE_ACTIVE, KEY_STATE_CHECKPOINT,
+    KEY_STATE_RETIRED, PROVIDER_EXEC,
 };
 use crate::storage::migrations::KEYRING_SCHEMA_VERSION;
 
@@ -151,7 +152,7 @@ impl Store {
                     "unlocked" => info!(
                         provider = %snapshot.provider,
                         location = %snapshot.location,
-                        data_keys = snapshot.rows.len(),
+                        keys = snapshot.rows.len(),
                         active = snapshot.active_key_id.as_deref().unwrap_or("-"),
                         "KV keyring unlocked"
                     ),
@@ -318,8 +319,13 @@ impl Store {
         if !self.keyring.enabled() {
             return Ok(KeyringInit::Disabled);
         }
-        if !self.list_keyring_rows()?.is_empty() {
+        if self
+            .list_keyring_rows()?
+            .iter()
+            .any(|row| row.state != KEY_STATE_CHECKPOINT)
+        {
             self.keyring.set_pending_upgrade(None);
+            self.ensure_checkpoint_key()?;
             return Ok(KeyringInit::AlreadyInitialized);
         }
         // Raft followers and streaming standbys leave this to the writer.
@@ -367,6 +373,7 @@ impl Store {
         }
         let key_id = row.key_id.clone();
         self.keyring.install_generated(row, key);
+        self.ensure_checkpoint_key()?;
         // Deliberately a log line and not a scheduler event: every fresh
         // store initializes once at start, and an event there would put a
         // row in every new cluster's journal before any real work happened.
@@ -377,6 +384,53 @@ impl Store {
             root_key_id,
             minted_root_key,
         })
+    }
+
+    /// Mint the cluster's checkpoint key when the keyring has none: the key
+    /// published checkpoint parts are sealed under
+    /// (internal_docs/plans/checkpoint-encryption-plan.md §6.1). Runs on the
+    /// control-lane leader from keyring initialization and the daemon's
+    /// keyring loop, so a cluster whose keyring predates checkpoint keys
+    /// gets one on the next tick. Returns the minted key id, or `None` when
+    /// one exists or this node may not mint (a follower, a closed upgrade
+    /// gate, no root key).
+    pub fn ensure_checkpoint_key(&self) -> R<Option<String>> {
+        if !self.keyring.enabled()
+            || self
+                .list_keyring_rows()?
+                .iter()
+                .any(|row| row.state == KEY_STATE_CHECKPOINT)
+            || !self.is_raft_leader(Lane::Control)
+            || self.keyring_upgrade_gate().is_some()
+            || self.keyring.provider().active_id()?.is_none()
+        {
+            return Ok(None);
+        }
+        let (row, key) = self.keyring.generate_checkpoint_key(Self::now_unix())?;
+        let to_insert = row.clone();
+        let inserted = self.replicated(Lane::Control, "mint_checkpoint_key", move |s| {
+            let mut conn = s.write_connection()?;
+            let tx = Self::write_tx(&mut conn)?;
+            let existing: i64 = tx.query_row(
+                "SELECT count(*) FROM keyring_key WHERE state = ?1;",
+                [KEY_STATE_CHECKPOINT],
+                |r| r.get(0),
+            )?;
+            if existing > 0 {
+                return Ok(false);
+            }
+            Self::insert_keyring_row_in(&tx, &to_insert)?;
+            tx.commit()?;
+            Ok(true)
+        })?;
+        if !inserted {
+            self.load_keyring()?;
+            return Ok(None);
+        }
+        let key_id = row.key_id.clone();
+        self.keyring.install_generated(row, key);
+        info!(key_id = %key_id, "Minted the checkpoint key for published checkpoints");
+        Ok(Some(key_id))
     }
 
     /// Test helper: give this store the same `keyring_key` rows as `other`,
@@ -406,7 +460,11 @@ impl Store {
     fn insert_first_keyring_row_apply(&self, row: &KeyringRow) -> R<bool> {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
-        let existing: i64 = tx.query_row("SELECT count(*) FROM keyring_key;", [], |r| r.get(0))?;
+        let existing: i64 = tx.query_row(
+            "SELECT count(*) FROM keyring_key WHERE state != ?1;",
+            [KEY_STATE_CHECKPOINT],
+            |r| r.get(0),
+        )?;
         if existing > 0 {
             return Ok(false);
         }
@@ -831,6 +889,9 @@ impl Store {
             // Every key was unusable: start over with a fresh one.
             self.ensure_keyring_initialized()?;
         }
+        // A dropped checkpoint key leaves every part sealed under it
+        // unreadable; new publishes need a new one.
+        self.ensure_checkpoint_key()?;
         warn!(
             values = deleted_values.len(),
             keys = ?unusable,
@@ -874,15 +935,17 @@ impl Store {
         telemetry
             .keyring_unlocked
             .set(i64::from(snapshot.state == "unlocked"));
-        let active = snapshot
-            .rows
-            .iter()
-            .filter(|row| row.state == KEY_STATE_ACTIVE)
-            .count() as i64;
-        let retired = snapshot.rows.len() as i64 - active;
+        let count = |state: &str| {
+            snapshot
+                .rows
+                .iter()
+                .filter(|row| row.state == state)
+                .count() as i64
+        };
         telemetry.keyring_keys.set_all(&[
-            (vec!["active".to_string()], active),
-            (vec!["retired".to_string()], retired),
+            (vec!["active".to_string()], count(KEY_STATE_ACTIVE)),
+            (vec!["retired".to_string()], count(KEY_STATE_RETIRED)),
+            (vec!["checkpoint".to_string()], count(KEY_STATE_CHECKPOINT)),
         ]);
         let age = self
             .keyring
@@ -1031,7 +1094,8 @@ mod tests {
         let store = start(&dir)?;
         let snapshot = store.keyring().snapshot();
         assert_eq!(snapshot.state, "locked");
-        assert_eq!(snapshot.locked.len(), 1);
+        // The data key and the checkpoint key.
+        assert_eq!(snapshot.locked.len(), 2);
 
         let err = store.get_kv("a/secret").unwrap_err();
         match StorageError::from_anyhow(&err) {
@@ -1067,9 +1131,21 @@ mod tests {
         }
         let before: Vec<KvEntry> = store.list_kv("k/")?;
 
+        let checkpoint_key = store
+            .list_keyring_rows()?
+            .into_iter()
+            .find(|row| row.state == KEY_STATE_CHECKPOINT)
+            .expect("checkpoint key minted with the keyring");
         let rotated = store.rotate_data_key("test")?;
         assert_ne!(rotated.key_id, first_key);
-        let rows = store.list_keyring_rows()?;
+        let data_keys = |store: &Store| -> R<Vec<KeyringRow>> {
+            Ok(store
+                .list_keyring_rows()?
+                .into_iter()
+                .filter(|row| row.state != KEY_STATE_CHECKPOINT)
+                .collect())
+        };
+        let rows = data_keys(&store)?;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].key_id, rotated.key_id);
         assert_eq!(rows[0].state, KEY_STATE_ACTIVE);
@@ -1087,7 +1163,10 @@ mod tests {
         assert_eq!(run.rewrapped, 3);
         assert_eq!(run.remaining, 0);
         assert_eq!(run.collected_keys, vec![first_key.clone()]);
-        assert_eq!(store.list_keyring_rows()?.len(), 1, "retired key collected");
+        assert_eq!(data_keys(&store)?.len(), 1, "retired key collected");
+        // Rotation and collection never touch the checkpoint key: published
+        // checkpoints sealed under it stay readable.
+        assert!(store.list_keyring_rows()?.contains(&checkpoint_key));
         let after: Vec<KvEntry> = store.list_kv("k/")?;
         for (old, new) in before.iter().zip(after.iter().filter(|e| e.key != "k/new")) {
             assert_eq!(old.key, new.key);
@@ -1113,7 +1192,8 @@ mod tests {
         std::fs::write(root_key_path(&dir), format!("{new_line}\n{contents}"))?;
 
         let outcome = store.rewrap_root_key()?;
-        assert_eq!(outcome.rows, 1);
+        // The data key and the checkpoint key.
+        assert_eq!(outcome.rows, 2);
         assert_ne!(outcome.root_key_id, old_root);
         assert!(outcome.skipped.is_empty());
         assert_eq!(
@@ -1170,6 +1250,12 @@ mod tests {
         let store = start(&dir)?;
         assert_eq!(store.keyring().snapshot().state, "locked");
 
+        let old_checkpoint_key = store
+            .list_keyring_rows()?
+            .into_iter()
+            .find(|row| row.state == KEY_STATE_CHECKPOINT)
+            .expect("checkpoint key")
+            .key_id;
         let reset = store.reset_keyring()?;
         assert_eq!(
             store
@@ -1182,12 +1268,30 @@ mod tests {
             reset.deleted_values,
             vec!["lost/one".to_string(), "lost/two".to_string()]
         );
-        assert_eq!(reset.dropped_keys.len(), 1);
+        // The data key and the checkpoint key it shared a root key with.
+        assert_eq!(reset.dropped_keys.len(), 2);
+        assert!(reset.dropped_keys.contains(&old_checkpoint_key));
         assert_eq!(store.keyring().snapshot().state, "unlocked");
         assert!(store.get_kv("lost/one")?.is_none());
         put(&store, "fresh/one", "z")?;
         assert_eq!(store.get_kv("fresh/one")?.expect("row").value, "z");
-        assert_eq!(store.list_keyring_rows()?.len(), 1);
+        // A fresh data key and a fresh checkpoint key.
+        let rows = store.list_keyring_rows()?;
+        assert_eq!(rows.len(), 2);
+        let fresh = rows
+            .iter()
+            .find(|row| row.state == KEY_STATE_CHECKPOINT)
+            .expect("a new checkpoint key");
+        assert_ne!(fresh.key_id, old_checkpoint_key);
+        let digest = crate::content_store::ContentDigest::of_bytes(b"part");
+        let err = store
+            .keyring()
+            .checkpoint_part_key(Some(&old_checkpoint_key), &digest)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is not in this cluster's keyring"),
+            "{err:#}"
+        );
         Ok(())
     }
 
@@ -1305,6 +1409,76 @@ mod tests {
         let entry = put(&store, "e/2", "secret")?;
         assert!(entry.encrypted);
         std::env::remove_var(&var);
+        Ok(())
+    }
+    /// The checkpoint key (docs/suspend-and-resume.md, "Published checkpoint
+    /// encryption") is minted with the keyring, derives the same part key on
+    /// every start, survives a root-key rewrap, and names its problems.
+    #[test]
+    fn the_checkpoint_key_is_minted_stable_and_named_when_missing() -> R<()> {
+        let dir = store_dir();
+        let store = start(&dir)?;
+        let digest = crate::content_store::ContentDigest::of_bytes(b"guest memory");
+        let current = store.keyring().checkpoint_part_key(None, &digest)?;
+        assert!(current.key_id().starts_with("ck_"));
+        let by_id = store
+            .keyring()
+            .checkpoint_part_key(Some(current.key_id()), &digest)?;
+        assert_eq!(by_id.object_name(), current.object_name());
+        let other = store.keyring().checkpoint_part_key(
+            None,
+            &crate::content_store::ContentDigest::of_bytes(b"other"),
+        )?;
+        assert_ne!(other.object_name(), current.object_name());
+        // Never shown in Debug.
+        assert!(!format!("{current:?}").contains(&format!("{:?}", current.to_proto().key)));
+
+        // Idempotent: a second ensure mints nothing.
+        assert_eq!(store.ensure_checkpoint_key()?, None);
+
+        // A root-key rewrap and a restart keep the same part keys.
+        let contents = std::fs::read_to_string(root_key_path(&dir))?;
+        let new_line = generate_root_key_line()?;
+        std::fs::write(root_key_path(&dir), format!("{new_line}\n{contents}"))?;
+        store.rewrap_root_key()?;
+        std::fs::write(root_key_path(&dir), format!("{new_line}\n"))?;
+        drop(store);
+        let reopened = start(&dir)?;
+        let again = reopened.keyring().checkpoint_part_key(None, &digest)?;
+        assert_eq!(again.key_id(), current.key_id());
+        assert_eq!(again.object_name(), current.object_name());
+
+        // Without the root key the checkpoint key is locked, by name.
+        drop(reopened);
+        std::fs::write(
+            root_key_path(&dir),
+            format!("{}\n", generate_root_key_line()?),
+        )?;
+        let locked = start(&dir)?;
+        let err = locked
+            .keyring()
+            .checkpoint_part_key(Some(current.key_id()), &digest)
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("keyring locked: checkpoint key ck_"),
+            "{message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_disabled_keyring_has_no_checkpoint_key_and_says_why() -> R<()> {
+        let dir = store_dir();
+        let store = Store::start_storage(&config_at(&dir, false))?;
+        let err = store
+            .keyring()
+            .checkpoint_part_key(None, &crate::content_store::ContentDigest::of_bytes(b"x"))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("encryption.enabled = false"),
+            "{err:#}"
+        );
         Ok(())
     }
 }

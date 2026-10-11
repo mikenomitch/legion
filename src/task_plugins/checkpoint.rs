@@ -172,6 +172,7 @@ impl CheckpointDir {
                     digest,
                     size,
                     url: None,
+                    key_id: None,
                 })
             })
             .collect()

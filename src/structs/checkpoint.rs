@@ -85,11 +85,18 @@ pub struct MemoryPart {
     /// Logical size in bytes (a sparse part may use fewer on disk).
     pub size: u64,
     /// Where the part was published (`durability = "store"`), for example
-    /// `s3://bucket/prefix/sha256/<hex>`. Any node that can read the URL
-    /// restores the part through its ordinary artifact fetcher, verified
-    /// against `digest`. Unset while the snapshot is only on its node.
+    /// `s3://bucket/prefix/sealed/<name>`. The object is sealed
+    /// ([`crate::checkpoint_seal`]): any node that can read the URL and is
+    /// sent the part's key restores it through its ordinary artifact
+    /// fetcher, opened and verified against `digest`. Unset while the
+    /// snapshot is only on its node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The checkpoint key (`ck_…`) the published object is sealed under.
+    /// Set exactly when `url` is. A part with a `url` and no `keyId` was
+    /// published before checkpoint encryption and is no longer readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
 }
 
 /// The memory half of a checkpoint, as returned by
@@ -359,6 +366,17 @@ pub struct GuestTokenFile {
     pub token: String,
 }
 
+/// Never prints the key bytes (build.rs turns off the generated Debug).
+impl fmt::Debug for crate::structs::CheckpointPartKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckpointPartKey")
+            .field("digest", &self.digest)
+            .field("key_id", &self.key_id)
+            .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for GuestTokenFile {
     // Never print the token: these structs reach debug logs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -510,6 +528,7 @@ mod tests {
                 digest: "sha256:9c".into(),
                 size: 1024,
                 url: None,
+                key_id: None,
             }],
             compat: SnapshotCompat {
                 vmm: Some(VmmCompat {

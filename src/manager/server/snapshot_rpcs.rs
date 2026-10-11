@@ -1316,27 +1316,39 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
     if !capable {
         return Vec::new();
     }
-    let warm_requests = warms.into_iter().map(|warm| CheckpointRequest {
-        snapshot_id: warm.snapshot_id,
-        op: "warm".into(),
-        allocation_id: 0,
-        kind: String::new(),
-        then: String::new(),
-        purpose: String::new(),
-        manifest_json: warm.manifest_json,
+    let warm_requests = warms.into_iter().map(|warm| {
+        let (part_keys, part_key_error) =
+            checkpoint_part_keys(store, &warm.manifest_json, PartKeyUse::Fetch);
+        CheckpointRequest {
+            snapshot_id: warm.snapshot_id,
+            op: "warm".into(),
+            allocation_id: 0,
+            kind: String::new(),
+            then: String::new(),
+            purpose: String::new(),
+            manifest_json: warm.manifest_json,
+            part_keys,
+            part_key_error,
+        }
     });
     work.into_iter()
         .map(|snapshot| match snapshot.state {
             // A `store` snapshot that is captured but not yet published.
-            SnapshotState::Local => CheckpointRequest {
-                snapshot_id: snapshot.snapshot_id,
-                op: "publish".into(),
-                allocation_id: 0,
-                kind: snapshot.kind.as_str().into(),
-                then: String::new(),
-                purpose: snapshot.purpose.as_str().into(),
-                manifest_json: snapshot.manifest_json,
-            },
+            SnapshotState::Local => {
+                let (part_keys, part_key_error) =
+                    checkpoint_part_keys(store, &snapshot.manifest_json, PartKeyUse::Publish);
+                CheckpointRequest {
+                    snapshot_id: snapshot.snapshot_id,
+                    op: "publish".into(),
+                    allocation_id: 0,
+                    kind: snapshot.kind.as_str().into(),
+                    then: String::new(),
+                    purpose: snapshot.purpose.as_str().into(),
+                    manifest_json: snapshot.manifest_json,
+                    part_keys,
+                    part_key_error,
+                }
+            }
             SnapshotState::Capturing => CheckpointRequest {
                 snapshot_id: snapshot.snapshot_id,
                 op: "capture".into(),
@@ -1353,6 +1365,7 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
                 .into(),
                 purpose: snapshot.purpose.as_str().into(),
                 manifest_json: String::new(),
+                ..Default::default()
             },
             _ => CheckpointRequest {
                 snapshot_id: snapshot.snapshot_id,
@@ -1362,10 +1375,77 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
                 then: String::new(),
                 purpose: snapshot.purpose.as_str().into(),
                 manifest_json: snapshot.manifest_json,
+                ..Default::default()
             },
         })
         .chain(warm_requests)
         .collect()
+}
+
+/// What a set of part keys is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartKeyUse {
+    /// Sealing a new publish: every part, under the current checkpoint key.
+    Publish,
+    /// Opening published parts (a restore or a warm): each part with a
+    /// `url`, under the checkpoint key its `keyId` names.
+    Fetch,
+}
+
+/// The part keys a worker needs for one piece of checkpoint work on the
+/// snapshot whose manifest is `manifest_json`, and the reason for any key
+/// it cannot have (docs/suspend-and-resume.md, "Security"). Keys are
+/// derived only for the parts of a manifest this manager holds, and only
+/// travel with work the manager chose to send, so a worker can never ask for
+/// one. Never fails the heartbeat: a missing key becomes `part_key_error`,
+/// which the worker reports when it actually needs that key.
+pub fn checkpoint_part_keys(
+    store: &Store,
+    manifest_json: &str,
+    usage: PartKeyUse,
+) -> (Vec<crate::structs::CheckpointPartKey>, String) {
+    let Ok(manifest) = crate::structs::checkpoint::SnapshotManifest::from_json(manifest_json)
+    else {
+        // The worker reports the unreadable manifest itself.
+        return (Vec::new(), String::new());
+    };
+    let mut keys = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for part in &manifest.memory {
+        let key_id = match usage {
+            PartKeyUse::Publish => None,
+            PartKeyUse::Fetch => {
+                if part.url.is_none() {
+                    continue;
+                }
+                match part.key_id.as_deref() {
+                    Some(id) => Some(id),
+                    // Published before checkpoint encryption: the worker's
+                    // fetch names it.
+                    None => continue,
+                }
+            }
+        };
+        let derived = crate::content_store::ContentDigest::parse(&part.digest)
+            .and_then(|digest| store.keyring().checkpoint_part_key(key_id, &digest));
+        match derived {
+            Ok(key) => keys.push(key.to_proto()),
+            Err(err) => {
+                let err = format!("{err:#}");
+                if !errors.contains(&err) {
+                    errors.push(err);
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        warn!(
+            snapshot_id = %manifest.id,
+            error = %errors.join("; "),
+            "Cannot derive checkpoint part keys; the work will fail on the worker"
+        );
+    }
+    (keys, errors.join("; "))
 }
 
 /// The restore payload for an allocation whose instance is restoring.
@@ -1392,6 +1472,8 @@ pub(crate) fn snapshot_restore_payload(
     // fork, or a `from_snapshot` create): the worker clones its volumes and
     // gives the guest a NIC identity of its own.
     let fork = snapshot.instance_id.as_deref() != Some(instance.instance_id.as_str());
+    let (part_keys, part_key_error) =
+        checkpoint_part_keys(store, &snapshot.manifest_json, PartKeyUse::Fetch);
     Some(crate::structs::SnapshotRestore {
         snapshot_id: snapshot.snapshot_id,
         kind: snapshot.kind.as_str().to_string(),
@@ -1399,6 +1481,8 @@ pub(crate) fn snapshot_restore_payload(
         on_resume,
         fork,
         instance_id: instance.instance_id.clone(),
+        part_keys,
+        part_key_error,
     })
 }
 

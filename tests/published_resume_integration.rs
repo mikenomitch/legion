@@ -22,9 +22,10 @@ use legion::structs::manager_server::Manager;
 use legion::structs::suspend::SuspendConfig;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::StatefulConfig, job::TaskConfig,
-    CheckpointRequest, ContentLocation, ContentLocationReport, GetInstanceRequest, HeartbeatReply,
-    HeartbeatRequest, InstanceInfo, InstanceMode, Node, NodeMsg, SnapshotReport,
-    StartInstanceRequest, Submission, SuspendInstanceRequest, WarmSnapshotRequest,
+    CheckpointPartKey, CheckpointRequest, ContentLocation, ContentLocationReport,
+    GetInstanceRequest, HeartbeatReply, HeartbeatRequest, InstanceInfo, InstanceMode, Node,
+    NodeMsg, SnapshotReport, StartInstanceRequest, Submission, SuspendInstanceRequest,
+    WarmSnapshotRequest,
 };
 use serde_json::Value;
 use tonic::{Code, Request};
@@ -244,16 +245,27 @@ impl Cluster {
         Ok(reply.snapshot_id)
     }
 
-    /// Node A publishes `snapshot_id`: the publish request it is sent, and
-    /// its successful report.
-    async fn published_by_a(&self, snapshot_id: &str) -> R<()> {
+    /// Node A publishes `snapshot_id`: the publish request it is sent,
+    /// carrying one key per part, and its successful report. Returns the
+    /// part key the manager sent.
+    async fn published_by_a(&self, snapshot_id: &str) -> R<CheckpointPartKey> {
         let asked = requests_for(&self.heartbeat(NODE_A, Vec::new()).await?, snapshot_id);
         assert_eq!(asked.len(), 1, "one publish request: {asked:?}");
         assert_eq!(asked[0].op, "publish");
         assert!(!asked[0].manifest_json.is_empty());
-        self.heartbeat(NODE_A, vec![publish_ok(snapshot_id)])
+        assert_eq!(asked[0].part_key_error, "");
+        assert_eq!(asked[0].part_keys.len(), 1, "one key per memory part");
+        let key = asked[0].part_keys[0].clone();
+        assert_eq!(key.digest, digest());
+        assert!(key.key_id.starts_with("ck_"), "{}", key.key_id);
+        assert_eq!(key.key.len(), 32);
+        // The request can be logged without leaking the key.
+        let shown = format!("{:?}", asked[0]);
+        assert!(shown.contains("redacted"), "{shown}");
+        assert!(!shown.contains(&format!("{:?}", key.key)), "{shown}");
+        self.heartbeat(NODE_A, vec![publish_ok(snapshot_id, &key.key_id)])
             .await?;
-        Ok(())
+        Ok(key)
     }
 
     fn advertise(&self, node: &str, digests: &[&str]) {
@@ -311,13 +323,22 @@ fn digest() -> String {
 }
 
 fn url() -> String {
-    format!("file:///shared/content/sha256/{}", "ab".repeat(32))
+    format!("file:///shared/content/sealed/{}", "cd".repeat(32))
 }
 
 /// A memory manifest with one part, captured on a `CPU_MODEL` node, with
 /// `url` once published.
 fn manifest(snapshot_id: &str, allocation_id: i64, url: Option<String>) -> String {
     manifest_on(snapshot_id, allocation_id, url, CPU_MODEL)
+}
+
+/// [`manifest`] as a worker reports it once published: each part's `url`,
+/// and the checkpoint key (`key_id`) it was sealed under.
+fn published_manifest(snapshot_id: &str, allocation_id: i64, key_id: &str) -> String {
+    let mut manifest: Value =
+        serde_json::from_str(&manifest(snapshot_id, allocation_id, Some(url()))).unwrap();
+    manifest["memory"][0]["keyId"] = json!(key_id);
+    manifest.to_string()
 }
 
 /// [`manifest`], captured on a node whose CPU model is `cpu_model`.
@@ -349,12 +370,12 @@ fn manifest_on(
     .to_string()
 }
 
-fn publish_ok(snapshot_id: &str) -> SnapshotReport {
+fn publish_ok(snapshot_id: &str, key_id: &str) -> SnapshotReport {
     SnapshotReport {
         snapshot_id: snapshot_id.into(),
         op: "publish".into(),
         ok: true,
-        manifest_json: manifest(snapshot_id, 1, Some(url())),
+        manifest_json: published_manifest(snapshot_id, 1, key_id),
         duration_ms: 1_500,
         total_bytes: PART_BYTES,
         ..Default::default()
@@ -384,7 +405,7 @@ async fn a_store_checkpoint_resumes_on_another_node_after_its_node_is_removed() 
         "suspended as soon as the local write finished, published later"
     );
 
-    cluster.published_by_a(&checkpoint).await?;
+    let publish_key = cluster.published_by_a(&checkpoint).await?;
     let snapshot = cluster
         .store()
         .get_snapshot(&checkpoint)?
@@ -393,6 +414,14 @@ async fn a_store_checkpoint_resumes_on_another_node_after_its_node_is_removed() 
     assert!(snapshot.published_at.is_some());
     let manifest = snapshot.manifest()?.context("manifest")?;
     assert_eq!(manifest.memory[0].url.as_deref(), Some(url().as_str()));
+    assert_eq!(
+        manifest.memory[0].key_id.as_deref(),
+        Some(publish_key.key_id.as_str())
+    );
+    assert!(
+        !snapshot.manifest_json.contains("\"key\""),
+        "a manifest never carries key bytes"
+    );
     let published = cluster.events("snapshot.published")?;
     assert_eq!(published.len(), 1);
     assert_eq!(published[0]["uploadedBytes"], PART_BYTES);
@@ -442,6 +471,10 @@ async fn a_store_checkpoint_resumes_on_another_node_after_its_node_is_removed() 
         .and_then(|allocation| allocation.restore.clone())
         .context("restore payload")?;
     assert!(restore.manifest_json.contains(&url()));
+    // ...and the key to open each part: the same key the publish sealed
+    // with, derived again from the manifest's keyId.
+    assert_eq!(restore.part_key_error, "");
+    assert_eq!(restore.part_keys, vec![publish_key.clone()]);
 
     cluster
         .heartbeat(
@@ -728,6 +761,8 @@ async fn warm_queues_matching_nodes_until_they_report() -> R<()> {
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].op, "warm");
     assert!(asked[0].manifest_json.contains(&url()));
+    assert_eq!(asked[0].part_keys.len(), 1, "a warm carries the part keys");
+    assert_eq!(asked[0].part_key_error, "");
     // Re-sent until the node reports, and warming again queues nothing new.
     assert_eq!(
         requests_for(&cluster.heartbeat(NODE_B, Vec::new()).await?, &checkpoint).len(),
@@ -1015,5 +1050,52 @@ async fn snapshot_holders_and_node_content_read_the_location_index() -> R<()> {
         .context("the checkpoint is listed for node-b")?;
     assert!(!row.captured_here);
     assert_eq!(row.parts_here, 1);
+    Ok(())
+}
+
+/// A part published before checkpoint encryption (a `url` and no `keyId`)
+/// gets no key: the worker's fetch names it. A part sealed under a key the
+/// cluster no longer has gets no key either, and the restore payload says
+/// why, so the worker can fail the fetch with that reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_payload_explains_parts_it_has_no_key_for() -> R<()> {
+    let cluster = Cluster::new()?;
+    let checkpoint = cluster.suspended_on_a("store").await?;
+    cluster.published_by_a(&checkpoint).await?;
+    // What the restore payload builder attaches for a given manifest.
+    let restore_payload = |manifest_json: String| -> R<legion::structs::SnapshotRestore> {
+        let (part_keys, part_key_error) = legion::manager::server::checkpoint_part_keys(
+            cluster.store(),
+            &manifest_json,
+            legion::manager::server::PartKeyUse::Fetch,
+        );
+        Ok(legion::structs::SnapshotRestore {
+            part_keys,
+            part_key_error,
+            ..Default::default()
+        })
+    };
+
+    let legacy = restore_payload(manifest(&checkpoint, 1, Some(url())))?;
+    assert!(legacy.part_keys.is_empty());
+    assert_eq!(
+        legacy.part_key_error, "",
+        "the worker names a legacy part itself"
+    );
+
+    let foreign = restore_payload(published_manifest(&checkpoint, 1, "ck_0000000000000000"))?;
+    assert!(foreign.part_keys.is_empty());
+    assert!(
+        foreign
+            .part_key_error
+            .contains("checkpoint key ck_0000000000000000 is not in this cluster's keyring"),
+        "{}",
+        foreign.part_key_error
+    );
+
+    // A local snapshot needs no keys at all.
+    let local = restore_payload(manifest(&checkpoint, 1, None))?;
+    assert!(local.part_keys.is_empty());
+    assert_eq!(local.part_key_error, "");
     Ok(())
 }

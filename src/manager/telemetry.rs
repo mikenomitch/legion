@@ -1262,7 +1262,7 @@ impl Metrics {
         let keyring_keys = Arc::new(GaugeVec {
             meta: FamilyMeta {
                 name: "legion_keyring_keys",
-                help: "Data keys in the KV keyring by state (active|retired). More than one for longer than a rewrap means a retired key still has values under it.",
+                help: "Keys in the KV keyring by state (active|retired data keys, checkpoint for the key that seals published checkpoints). A retired key for longer than a rewrap means values still sit under it.",
                 labels: &["state"],
             },
             series: Series::new(),

@@ -335,6 +335,7 @@ mod tests {
                     digest: (*digest).into(),
                     size: *size,
                     url: None,
+                    key_id: None,
                 })
                 .collect(),
             compat: Default::default(),

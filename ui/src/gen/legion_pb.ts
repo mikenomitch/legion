@@ -7424,10 +7424,11 @@ export class CheckpointRequest extends Message<CheckpointRequest> {
    * as an error and report it, so a newer manager's op is never silently
    * dropped.
    *
-   * `publish` uploads every memory part named by `manifest_json`
-   * to the worker's `contentStore` and reports the manifest with each
-   * part's `url` filled in. `warm` fetches the parts named by
-   * `manifest_json` from their URLs into the node content store.
+   * `publish` seals every memory part named by `manifest_json` with its key
+   * from `part_keys`, uploads it to the worker's `contentStore`, and reports
+   * the manifest with each part's `url` and `keyId` filled in. `warm`
+   * fetches the parts named by `manifest_json` from their URLs, opens them
+   * with their keys, and stores them in the node content store.
    *
    * @generated from field: string op = 2;
    */
@@ -7473,6 +7474,28 @@ export class CheckpointRequest extends Message<CheckpointRequest> {
    */
   manifestJson = "";
 
+  /**
+   * `publish` and `warm`: one key per memory part of `manifest_json`, which
+   * the worker seals each part with before it uploads it, or opens each
+   * fetched part with (docs/suspend-and-resume.md, "Security"). The manager
+   * derives them from the cluster's checkpoint key and sends them only with
+   * the work it chose to send this worker. Empty for `capture` and `delete`,
+   * and when the manager could not derive them (see `part_key_error`).
+   *
+   * @generated from field: repeated legion.CheckpointPartKey part_keys = 8;
+   */
+  partKeys: CheckpointPartKey[] = [];
+
+  /**
+   * Why `part_keys` is empty or incomplete: the keyring is locked on the
+   * manager, the cluster has no checkpoint key yet, or a part names a key
+   * the cluster no longer has. The worker fails the work with this message.
+   * Empty when every key is present.
+   *
+   * @generated from field: string part_key_error = 9;
+   */
+  partKeyError = "";
+
   constructor(data?: PartialMessage<CheckpointRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -7488,6 +7511,8 @@ export class CheckpointRequest extends Message<CheckpointRequest> {
     { no: 5, name: "then", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "purpose", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "manifest_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "part_keys", kind: "message", T: CheckpointPartKey, repeated: true },
+    { no: 9, name: "part_key_error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CheckpointRequest {
@@ -7504,6 +7529,68 @@ export class CheckpointRequest extends Message<CheckpointRequest> {
 
   static equals(a: CheckpointRequest | PlainMessage<CheckpointRequest> | undefined, b: CheckpointRequest | PlainMessage<CheckpointRequest> | undefined): boolean {
     return proto3.util.equals(CheckpointRequest, a, b);
+  }
+}
+
+/**
+ * The key for one published checkpoint part. A worker receives it with the
+ * publish, warm, or restore work that needs it and keeps it in memory only.
+ * The generated Rust type redacts `key` from Debug output and never
+ * serializes it.
+ *
+ * @generated from message legion.CheckpointPartKey
+ */
+export class CheckpointPartKey extends Message<CheckpointPartKey> {
+  /**
+   * `sha256:<hex>` of the part's plaintext, as in the manifest.
+   *
+   * @generated from field: string digest = 1;
+   */
+  digest = "";
+
+  /**
+   * The checkpoint key this part key is derived from (`ck_…`), recorded in
+   * the published manifest as the part's `keyId`.
+   *
+   * @generated from field: string key_id = 2;
+   */
+  keyId = "";
+
+  /**
+   * 32 bytes. Derives both the AES-256-GCM key the part is sealed under and
+   * the name of the sealed object in the content store.
+   *
+   * @generated from field: bytes key = 3;
+   */
+  key = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<CheckpointPartKey>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CheckpointPartKey";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "key_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "key", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CheckpointPartKey {
+    return new CheckpointPartKey().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CheckpointPartKey {
+    return new CheckpointPartKey().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CheckpointPartKey {
+    return new CheckpointPartKey().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CheckpointPartKey | PlainMessage<CheckpointPartKey> | undefined, b: CheckpointPartKey | PlainMessage<CheckpointPartKey> | undefined): boolean {
+    return proto3.util.equals(CheckpointPartKey, a, b);
   }
 }
 
@@ -7668,9 +7755,9 @@ export class SnapshotRestore extends Message<SnapshotRestore> {
    * snapshot loads the memory parts (looked up by digest in the node content
    * store) instead of calling the runtime's `start`. A part missing from the
    * node content store that carries a `url` (a published snapshot) is
-   * fetched first, through the worker's artifact fetchers, verified against
-   * its digest, and stored in the content store; the allocation shows
-   * `staging artifacts` meanwhile.
+   * fetched first, through the worker's artifact fetchers, opened with its
+   * key from `part_keys`, verified against its digest, and stored in the
+   * content store. The allocation shows `staging artifacts` meanwhile.
    *
    * @generated from field: string manifest_json = 3;
    */
@@ -7707,6 +7794,26 @@ export class SnapshotRestore extends Message<SnapshotRestore> {
    */
   instanceId = "";
 
+  /**
+   * One key per published memory part of `manifest_json`, to open the
+   * sealed parts this worker has to fetch. Only a part missing from the
+   * node content store needs its key, so a restore on the node that holds
+   * every part succeeds without them. Empty for a snapshot that was never
+   * published.
+   *
+   * @generated from field: repeated legion.CheckpointPartKey part_keys = 7;
+   */
+  partKeys: CheckpointPartKey[] = [];
+
+  /**
+   * Why `part_keys` is empty or incomplete (a locked keyring on the
+   * manager, or a part sealed under a key the cluster no longer has). A
+   * restore that has to fetch such a part fails with this message.
+   *
+   * @generated from field: string part_key_error = 8;
+   */
+  partKeyError = "";
+
   constructor(data?: PartialMessage<SnapshotRestore>) {
     super();
     proto3.util.initPartial(data, this);
@@ -7721,6 +7828,8 @@ export class SnapshotRestore extends Message<SnapshotRestore> {
     { no: 4, name: "on_resume", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 5, name: "fork", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 6, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "part_keys", kind: "message", T: CheckpointPartKey, repeated: true },
+    { no: 8, name: "part_key_error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SnapshotRestore {
@@ -15011,28 +15120,34 @@ export class GetKeyringStatusRequest extends Message<GetKeyringStatusRequest> {
 }
 
 /**
- * One data key in the KV keyring (see GetKeyringStatusReply).
+ * One key in the KV keyring (see GetKeyringStatusReply): a data key, or
+ * the checkpoint key.
  *
  * @generated from message legion.KeyringKeyInfo
  */
 export class KeyringKeyInfo extends Message<KeyringKeyInfo> {
   /**
-   * Data key id (`dk_…`). Values reference it in `kv_entry.enc_key_id`.
+   * Data key id (`dk_…`), which values reference in `kv_entry.enc_key_id`,
+   * or checkpoint key id (`ck_…`), which published checkpoint manifests
+   * reference as each part's `keyId`.
    *
    * @generated from field: string key_id = 1;
    */
   keyId = "";
 
   /**
-   * `active` (encrypts new writes) or `retired` (still decrypts what it
-   * protected until the rewrap converts those values).
+   * `active` (encrypts new writes), `retired` (still decrypts what it
+   * protected until the rewrap converts those values), or `checkpoint` (the
+   * key published checkpoint parts are sealed under; it never seals a KV
+   * value, never rotates with the data keys, and is never collected).
    *
    * @generated from field: string state = 2;
    */
   state = "";
 
   /**
-   * Cipher this key is used with (`aes-256-gcm`).
+   * `aes-256-gcm` for a data key, `hkdf-sha256` for the checkpoint key
+   * (each part's AES-256-GCM key is derived from it).
    *
    * @generated from field: string algorithm = 3;
    */

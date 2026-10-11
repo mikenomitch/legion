@@ -824,12 +824,18 @@ impl ArtifactStager {
         place_fetched_artifact(spec, fetched, task_dir, attempt_dir, limits.max_bytes)
     }
 
+    /// The node content store, when this worker has one.
+    pub fn content_store(&self) -> Option<&Arc<ContentStore>> {
+        self.content.as_ref()
+    }
+
     /// Fetch one digest-pinned, single-file artifact straight into the node
-    /// content store, with no task directory involved. This is how a node
-    /// pulls a published snapshot's parts (a cross-node restore, or a warm):
-    /// the same fetcher registry, allowed schemes, credentials, parallelism
-    /// limit, retries, size cap, and single-flight as task staging, and the
-    /// bytes are verified against `spec.checksum` before they are stored.
+    /// content store, with no task directory involved: the same fetcher
+    /// registry, allowed schemes, credentials, parallelism limit, retries,
+    /// size cap, and single-flight as task staging, and the bytes are
+    /// verified against `spec.checksum` before they are stored. A published
+    /// snapshot's parts are sealed and come through
+    /// [`ArtifactStager::fetch_sealed_into_store`] instead.
     ///
     /// A digest the store already holds is not fetched again (its pin, when
     /// `opts` names one, is still applied). Blocking: call from a blocking
@@ -840,15 +846,49 @@ impl ArtifactStager {
         class: ContentClass,
         opts: PutOptions,
     ) -> R<FetchedIntoStore> {
-        let store = self
-            .content
-            .as_deref()
-            .context("this worker has no node content store (content.enabled = false)")?;
         let digest = ContentDigest::parse(
             spec.checksum
                 .as_deref()
                 .context("fetching into the content store needs a checksum")?,
         )?;
+        self.fetch_digest_into_store(spec, &digest, None, class, opts)
+    }
+
+    /// [`ArtifactStager::fetch_into_store`] for a sealed checkpoint part
+    /// ([`crate::checkpoint_seal`]): the object at `url` is downloaded, opened
+    /// in place with `key`, and the plaintext checked against `key.digest()`
+    /// before it is stored. Tampering, truncation, a wrong key, and a
+    /// plaintext leftover each fail with a named
+    /// [`crate::checkpoint_seal::SealError`] and are retried like any failed
+    /// download.
+    pub fn fetch_sealed_into_store(
+        &self,
+        url: &str,
+        key: &crate::checkpoint_seal::PartKey,
+        class: ContentClass,
+        opts: PutOptions,
+    ) -> R<FetchedIntoStore> {
+        self.fetch_digest_into_store(
+            &ArtifactSpec::from_source(url),
+            key.digest(),
+            Some(key),
+            class,
+            opts,
+        )
+    }
+
+    fn fetch_digest_into_store(
+        &self,
+        spec: &ArtifactSpec,
+        digest: &ContentDigest,
+        sealed: Option<&crate::checkpoint_seal::PartKey>,
+        class: ContentClass,
+        opts: PutOptions,
+    ) -> R<FetchedIntoStore> {
+        let store = self
+            .content
+            .as_deref()
+            .context("this worker has no node content store (content.enabled = false)")?;
         let parsed = parse_artifact_source(&spec.source)?;
         let redacted = spec.redacted_source();
         if !self
@@ -863,16 +903,16 @@ impl ArtifactStager {
                 parsed.scheme
             );
         }
-        let _flight = self.claim_flight(&digest);
+        let _flight = self.claim_flight(digest);
         // Pin and check presence in one step: unpinned content (a published
         // snapshot's parts, a warmed copy) can be evicted between a separate
         // check and pin, and then this fetches it instead.
         let present = match opts.pin.as_ref() {
-            Some(owner) => store.pin_if_present(&digest, owner)?,
-            None => store.contains(&digest)?,
+            Some(owner) => store.pin_if_present(digest, owner)?,
+            None => store.contains(digest)?,
         };
         if present {
-            if let Some(entry) = store.get(&digest)? {
+            if let Some(entry) = store.get(digest)? {
                 return Ok(FetchedIntoStore {
                     entry,
                     fetched_bytes: 0,
@@ -891,7 +931,9 @@ impl ArtifactStager {
             deadline: Some(deadline),
         };
         let mut last_err: Option<anyhow::Error> = None;
+        let mut tried = 0;
         for attempt in 1..=self.config.attempts.max(1) {
+            tried = attempt;
             if attempt > 1 {
                 std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
             }
@@ -921,7 +963,14 @@ impl ArtifactStager {
                 let FetchedPayload::File { path, .. } = fetched.payload else {
                     bail!("{redacted} is not a single file");
                 };
-                let entry = store.import_file(class, &path, opts.clone())?;
+                // The ciphertext was downloaded unchecked (the manifest names
+                // the plaintext digest): open it in place, then the import
+                // below checks the plaintext against the digest.
+                if let Some(key) = sealed {
+                    crate::checkpoint_seal::open_file_in_place(key, &path)
+                        .with_context(|| format!("opening sealed part {redacted}"))?;
+                }
+                let entry = store.import_file(class, &path, opts.clone().expect(digest.clone()))?;
                 Ok(FetchedIntoStore {
                     fetched_bytes: entry.size,
                     entry,
@@ -937,16 +986,26 @@ impl ArtifactStager {
                         error = %format!("{err:#}"),
                         "Content store fetch attempt failed"
                     );
+                    // A wrong key, tampered bytes, or a plaintext leftover
+                    // fails the same way on every attempt: do not download
+                    // a multi-GiB part again to learn that.
+                    let permanent = err.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::checkpoint_seal::SealError>()
+                            .is_some_and(|seal| {
+                                !matches!(seal, crate::checkpoint_seal::SealError::Truncated { .. })
+                            })
+                    });
                     last_err = Some(err);
+                    if permanent {
+                        break;
+                    }
                 }
             }
         }
         Err(last_err
             .unwrap_or_else(|| anyhow!("fetch failed before any attempt ran"))
-            .context(format!(
-                "fetching {redacted} after {} attempt(s)",
-                self.config.attempts.max(1)
-            )))
+            .context(format!("fetching {redacted} after {tried} attempt(s)")))
     }
 
     fn resolve_credential(&self, spec: &ArtifactSpec, redacted: &str) -> R<Option<Credential>> {

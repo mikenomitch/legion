@@ -136,9 +136,13 @@ pub struct StagingJob {
     stager: Arc<ArtifactStager>,
     board: ArtifactStatusBoard,
     /// A published snapshot this allocation restores from, whose memory
-    /// parts are not all in the node content store yet: fetched first
-    /// (Phase 7b cross-node restore).
-    restore_fetch: Option<crate::structs::checkpoint::SnapshotManifest>,
+    /// parts are not all in the node content store yet, and the keys the
+    /// manager sent to open them: fetched first (Phase 7b cross-node
+    /// restore).
+    restore_fetch: Option<(
+        crate::structs::checkpoint::SnapshotManifest,
+        crate::checkpoint_seal::PartKeys,
+    )>,
 }
 
 impl StagingJob {
@@ -147,11 +151,12 @@ impl StagingJob {
     /// store (pinned to this allocation until it starts), then stage the
     /// task's artifacts.
     fn stage(&self) -> R<Vec<StagedArtifact>> {
-        if let Some(manifest) = self.restore_fetch.as_ref() {
+        if let Some((manifest, keys)) = self.restore_fetch.as_ref() {
             let started = std::time::Instant::now();
             let fetched = crate::worker::checkpoints::fetch_published_parts(
                 &self.stager,
                 manifest,
+                keys,
                 Some(&crate::content_store::PinOwner::allocation(
                     self.allocation.id,
                 )),
@@ -2964,7 +2969,10 @@ impl WorkerTaskManager {
     fn restore_parts_to_fetch(
         &self,
         allocation_id: i64,
-    ) -> Option<crate::structs::checkpoint::SnapshotManifest> {
+    ) -> Option<(
+        crate::structs::checkpoint::SnapshotManifest,
+        crate::checkpoint_seal::PartKeys,
+    )> {
         let restore = self.checkpoints.restores.get(&allocation_id)?;
         let manifest =
             crate::structs::checkpoint::SnapshotManifest::from_json(&restore.manifest_json).ok()?;
@@ -2976,7 +2984,13 @@ impl WorkerTaskManager {
             };
             !store.is_some_and(|store| store.contains(&digest).unwrap_or(false))
         });
-        (published || missing).then_some(manifest)
+        (published || missing).then(|| {
+            let keys = crate::checkpoint_seal::PartKeys::from_proto(
+                &restore.part_keys,
+                &restore.part_key_error,
+            );
+            (manifest, keys)
+        })
     }
 
     /// Drop the pins a cross-node restore held on its fetched parts while
@@ -4480,6 +4494,7 @@ mod tests {
             then: "resume".into(),
             purpose: "manual".into(),
             manifest_json: String::new(),
+            ..Default::default()
         };
         let fresh = manager
             .lock()
@@ -4599,6 +4614,7 @@ mod tests {
             then: "resume".into(),
             purpose: "fork".into(),
             manifest_json: String::new(),
+            ..Default::default()
         };
         manager
             .lock()
@@ -4691,6 +4707,7 @@ mod tests {
             then: "stop".into(),
             purpose: "suspend".into(),
             manifest_json: String::new(),
+            ..Default::default()
         };
         manager
             .lock()
@@ -4843,6 +4860,7 @@ mod tests {
             then: "stop".into(),
             purpose: "suspend".into(),
             manifest_json: String::new(),
+            ..Default::default()
         };
         let report = crate::worker::checkpoints::run_capture(&manager, &suspend);
         assert!(!report.ok);
@@ -4902,6 +4920,7 @@ mod tests {
             then: "resume".into(),
             purpose: "manual".into(),
             manifest_json: String::new(),
+            ..Default::default()
         };
         let report = crate::worker::checkpoints::run_capture(&manager, &capture);
         assert!(!report.ok);
@@ -4993,6 +5012,27 @@ mod tests {
         Ok(Arc::new(Mutex::new(manager)))
     }
 
+    /// The checkpoint key the tests' "manager" derives part keys from.
+    const TEST_CHECKPOINT_KEY: [u8; 32] = [42; 32];
+
+    /// What the manager attaches to a publish, warm, or restore: one key per
+    /// memory part of `manifest`.
+    fn part_keys_for(manifest: &Value) -> Vec<crate::structs::CheckpointPartKey> {
+        manifest["memory"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|part| {
+                let digest =
+                    crate::content_store::ContentDigest::parse(part["digest"].as_str().unwrap())
+                        .unwrap();
+                crate::checkpoint_seal::PartKey::derive(&TEST_CHECKPOINT_KEY, "ck_test", &digest)
+                    .unwrap()
+                    .to_proto()
+            })
+            .collect()
+    }
+
     /// Wait for the next snapshot report a worker queues.
     fn next_report(
         manager: &Arc<Mutex<WorkerTaskManager>>,
@@ -5053,13 +5093,14 @@ mod tests {
             }],
         });
 
-        // A publishes.
+        // A publishes, sealing with the key the manager sent.
         let publish = crate::structs::CheckpointRequest {
             snapshot_id: "snap-moving".into(),
             op: "publish".into(),
             kind: "disk".into(),
             purpose: "suspend".into(),
             manifest_json: captured.to_string(),
+            part_keys: part_keys_for(&captured),
             ..Default::default()
         };
         node_a
@@ -5075,19 +5116,30 @@ mod tests {
             crate::structs::checkpoint::SnapshotManifest::from_json(&report.manifest_json)?;
         let url = published.memory[0].url.clone().expect("part url");
         assert!(url.starts_with("file://"), "{url}");
-        assert!(shared
-            .path()
-            .join("sha256")
-            .join(entry.digest.hex())
-            .exists());
+        assert_eq!(published.memory[0].key_id.as_deref(), Some("ck_test"));
+        let key = crate::checkpoint_seal::PartKey::derive(
+            &TEST_CHECKPOINT_KEY,
+            "ck_test",
+            &entry.digest,
+        )?;
+        let object = shared.path().join("sealed").join(key.object_name());
+        let sealed = std::fs::read(&object)?;
+        assert_eq!(&sealed[..8], crate::checkpoint_seal::SEAL_MAGIC);
+        assert!(
+            !sealed.windows(18).any(|w| w == b"guest memory page "),
+            "the bucket never holds the guest's plaintext"
+        );
+        assert!(!shared.path().join("sha256").exists());
 
-        // B restores from the published manifest.
+        // B restores from the published manifest, with the keys the manager
+        // attaches to the restore payload.
         let restore = TaskAllocation {
             restore: Some(crate::structs::SnapshotRestore {
                 snapshot_id: "snap-moving".into(),
                 kind: "disk".into(),
                 manifest_json: report.manifest_json.clone(),
                 on_resume: Vec::new(),
+                part_keys: part_keys_for(&captured),
                 ..Default::default()
             }),
             ..provisional_payload(71)
@@ -5150,6 +5202,7 @@ mod tests {
             kind: "disk".into(),
             purpose: "suspend".into(),
             manifest_json: captured.to_string(),
+            part_keys: part_keys_for(&captured),
             ..Default::default()
         };
         node.lock()
@@ -5171,6 +5224,7 @@ mod tests {
                 kind: "disk".into(),
                 manifest_json: report.manifest_json.clone(),
                 on_resume: Vec::new(),
+                part_keys: part_keys_for(&captured),
                 ..Default::default()
             }),
             ..provisional_payload(81)
@@ -5237,60 +5291,159 @@ mod tests {
         Ok(())
     }
 
+    /// Publish `bytes` from a fresh node to `shared` under the test
+    /// checkpoint key, and return the published manifest (with `url` and
+    /// `keyId`) as JSON.
+    fn published_manifest(shared: &std::path::Path, id: &str, bytes: &[u8]) -> R<Value> {
+        let publisher_dir = TempDir::new()?;
+        let publisher = worker_with_store(&publisher_dir, Some(shared))?;
+        let publishing = publisher
+            .lock()
+            .unwrap()
+            .content_publishing()
+            .expect("publishing");
+        let entry = publishing.store().put_bytes(
+            crate::content_store::ContentClass::Snapshots,
+            bytes,
+            crate::content_store::PutOptions::default(),
+        )?;
+        let key = crate::checkpoint_seal::PartKey::derive(
+            &TEST_CHECKPOINT_KEY,
+            "ck_test",
+            &entry.digest,
+        )?;
+        let published = publishing.publish(&key)?;
+        Ok(json!({
+            "id": id, "jobId": "j", "task": "t", "originAllocId": 1,
+            "runtime": "sandbox", "kind": "memory", "createdAt": "2026-10-10T00:00:00Z",
+            "memory": [{
+                "role": "memory", "file": "memory", "digest": entry.digest.as_str(),
+                "size": bytes.len(), "url": published.url, "keyId": published.key_id,
+            }],
+        }))
+    }
+
     /// `warm` lands a published snapshot's parts in the node content store,
     /// unpinned (an ordinary cache entry), and a second warm fetches nothing.
     #[test]
     fn warm_fetches_published_parts_into_the_store_once() -> R<()> {
         let shared = TempDir::new()?;
-        let publisher_dir = TempDir::new()?;
         let warm_dir = TempDir::new()?;
-        let publisher = worker_with_store(&publisher_dir, Some(shared.path()))?;
         let warmed = worker_with_store(&warm_dir, None)?;
         let bytes = b"warm me ".repeat(32 * 1024);
-        let entry = publisher
-            .lock()
-            .unwrap()
-            .content_publishing()
-            .expect("publishing")
-            .store()
-            .put_bytes(
-                crate::content_store::ContentClass::Snapshots,
-                &bytes,
-                crate::content_store::PutOptions::default(),
-            )?;
-        let url = publisher
-            .lock()
-            .unwrap()
-            .content_publishing()
-            .expect("publishing")
-            .publish(&entry.digest)?
-            .url;
+        let manifest = published_manifest(shared.path(), "snap-warm", &bytes)?;
+        let digest = crate::content_store::ContentDigest::of_bytes(&bytes);
         let warm = crate::structs::CheckpointRequest {
             snapshot_id: "snap-warm".into(),
             op: "warm".into(),
-            manifest_json: json!({
-                "id": "snap-warm", "jobId": "j", "task": "t", "originAllocId": 1,
-                "runtime": "sandbox", "kind": "memory", "createdAt": "2026-10-10T00:00:00Z",
-                "memory": [{
-                    "role": "memory", "file": "memory", "digest": entry.digest.as_str(),
-                    "size": bytes.len(), "url": url,
-                }],
-            })
-            .to_string(),
+            manifest_json: manifest.to_string(),
+            part_keys: part_keys_for(&manifest),
             ..Default::default()
         };
         let report = crate::worker::checkpoints::run_warm(&warmed, &warm);
         assert!(report.ok, "{}", report.error);
         assert_eq!(report.total_bytes, bytes.len() as u64);
         let store = warmed.lock().unwrap().content_store().expect("store");
-        assert_eq!(store.verify(&entry.digest)?.size, bytes.len() as u64);
+        assert_eq!(store.verify(&digest)?.size, bytes.len() as u64);
         assert!(
-            store.pins(&entry.digest)?.is_empty(),
+            store.pins(&digest)?.is_empty(),
             "warmed parts are not pinned"
         );
-        let again = crate::worker::checkpoints::run_warm(&warmed, &warm);
+        // Already warm: nothing fetched, and no key needed to know that.
+        let again = crate::worker::checkpoints::run_warm(
+            &warmed,
+            &crate::structs::CheckpointRequest {
+                part_keys: Vec::new(),
+                part_key_error: "keyring locked".into(),
+                ..warm.clone()
+            },
+        );
         assert!(again.ok, "{}", again.error);
         assert_eq!(again.total_bytes, 0, "already warm: nothing fetched");
+        Ok(())
+    }
+
+    /// Every way a published part can fail to open names itself, and none
+    /// leaves anything in the content store: no key from the manager (with
+    /// its reason), the wrong key, a tampered object, and a manifest from
+    /// before checkpoint encryption.
+    #[test]
+    fn a_published_part_that_cannot_be_opened_fails_by_name() -> R<()> {
+        let shared = TempDir::new()?;
+        let bytes = b"secret guest page ".repeat(64 * 1024);
+        let manifest = published_manifest(shared.path(), "snap-sealed", &bytes)?;
+        let digest = crate::content_store::ContentDigest::of_bytes(&bytes);
+        let warm_with = |manifest: &Value,
+                         part_keys: Vec<crate::structs::CheckpointPartKey>,
+                         part_key_error: &str|
+         -> R<String> {
+            let dir = TempDir::new()?;
+            let node = worker_with_store(&dir, None)?;
+            let report = crate::worker::checkpoints::run_warm(
+                &node,
+                &crate::structs::CheckpointRequest {
+                    snapshot_id: "snap-sealed".into(),
+                    op: "warm".into(),
+                    manifest_json: manifest.to_string(),
+                    part_keys,
+                    part_key_error: part_key_error.into(),
+                    ..Default::default()
+                },
+            );
+            let store = node.lock().unwrap().content_store().expect("store");
+            assert!(!store.contains(&digest)?, "nothing unverified is stored");
+            assert!(!report.ok);
+            Ok(report.error)
+        };
+
+        let error = warm_with(
+            &manifest,
+            Vec::new(),
+            "keyring locked: checkpoint key ck_test cannot be unwrapped",
+        )?;
+        assert!(error.contains("sent no key"), "{error}");
+        assert!(error.contains("keyring locked"), "{error}");
+
+        let wrong = crate::checkpoint_seal::PartKey::derive(&[7; 32], "ck_test", &digest)?;
+        let error = warm_with(&manifest, vec![wrong.to_proto()], "")?;
+        // The wrong key also names the wrong object, which is not there.
+        assert!(error.contains("fetching part memory"), "{error}");
+
+        let key =
+            crate::checkpoint_seal::PartKey::derive(&TEST_CHECKPOINT_KEY, "ck_test", &digest)?;
+        let object = shared.path().join("sealed").join(key.object_name());
+        let mut sealed = std::fs::read(&object)?;
+        sealed[100] ^= 0x40;
+        std::fs::write(&object, &sealed)?;
+        let error = warm_with(&manifest, part_keys_for(&manifest), "")?;
+        assert!(
+            error.contains("failed authentication at chunk 0"),
+            "{error}"
+        );
+        assert!(
+            error.contains("after 1 attempt"),
+            "a tampered part is not downloaded again: {error}"
+        );
+
+        // A manifest published before checkpoint encryption: a URL to a
+        // plaintext object and no keyId.
+        let legacy = shared.path().join("sha256").join(digest.hex());
+        std::fs::create_dir_all(legacy.parent().unwrap())?;
+        std::fs::write(&legacy, &bytes)?;
+        let mut old = manifest.clone();
+        old["memory"][0]["url"] = json!(url::Url::from_file_path(&legacy).unwrap().to_string());
+        old["memory"][0].as_object_mut().unwrap().remove("keyId");
+        let error = warm_with(&old, part_keys_for(&old), "")?;
+        assert!(
+            error.contains("published before checkpoint encryption"),
+            "{error}"
+        );
+
+        // Pointed at the plaintext object anyway, the opener refuses it.
+        let mut relabeled = manifest.clone();
+        relabeled["memory"][0]["url"] = old["memory"][0]["url"].clone();
+        let error = warm_with(&relabeled, part_keys_for(&relabeled), "")?;
+        assert!(error.contains("no LGNSEAL1 header"), "{error}");
         Ok(())
     }
 

@@ -27,11 +27,13 @@
 //!
 //! Phase 7b adds two ops (docs/suspend-and-resume.md, "Durability"):
 //!
-//! - **publish**: upload a captured snapshot's memory parts to the worker's
-//!   `contentStore` ([`crate::content_publish::ContentPublishing`]) and
-//!   report the manifest with each part's URL.
+//! - **publish**: seal a captured snapshot's memory parts with the keys the
+//!   manager sent ([`crate::checkpoint_seal`]), upload them to the worker's
+//!   `contentStore` ([`crate::content_publish::ContentPublishing`]), and
+//!   report the manifest with each part's URL and key id.
 //! - **warm**: fetch a published snapshot's parts into the node content
-//!   store through the artifact stager, ahead of any restore.
+//!   store through the artifact stager, opened with the keys the manager
+//!   sent, ahead of any restore.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -436,6 +438,7 @@ pub fn run_local_suspension(
         then: AfterCheckpoint::Stop.as_str().to_string(),
         purpose: "suspend".into(),
         manifest_json: String::new(),
+        ..Default::default()
     };
     let started = Instant::now();
     match capture_for_suspend(manager, &request, kind) {
@@ -759,13 +762,21 @@ fn publish(
             volume.driver
         );
     }
+    let keys =
+        crate::checkpoint_seal::PartKeys::from_proto(&request.part_keys, &request.part_key_error);
     let mut uploaded = 0u64;
     for part in &mut manifest.memory {
         let digest = ContentDigest::parse(&part.digest)?;
+        let key = keys.for_part(&digest).with_context(|| {
+            format!(
+                "publishing part {} of snapshot {} needs its key",
+                part.role, manifest.id
+            )
+        })?;
         let mut attempt = 0;
         let published = loop {
             attempt += 1;
-            match publishing.publish(&digest) {
+            match publishing.publish(key) {
                 Ok(published) => break published,
                 Err(err) if attempt < PUBLISH_ATTEMPTS => {
                     warn!(
@@ -789,6 +800,7 @@ fn publish(
             uploaded += published.bytes;
         }
         part.url = Some(published.url);
+        part.key_id = Some(published.key_id);
     }
     Ok((manifest, uploaded))
 }
@@ -810,7 +822,13 @@ pub fn run_warm(
                 request.snapshot_id
             )
         })
-        .and_then(|manifest| fetch_published_parts(&stager, &manifest, None));
+        .and_then(|manifest| {
+            let keys = crate::checkpoint_seal::PartKeys::from_proto(
+                &request.part_keys,
+                &request.part_key_error,
+            );
+            fetch_published_parts(&stager, &manifest, &keys, None)
+        });
     let mut report = SnapshotReport {
         snapshot_id: request.snapshot_id.clone(),
         op: "warm".into(),
@@ -845,7 +863,8 @@ pub fn run_warm(
 /// Bring every memory part of `manifest` into the node content store:
 /// parts already there are kept (and pinned to `pin`, when given), parts
 /// missing are fetched from their published `url` through the artifact
-/// stager and verified by digest. Returns the bytes downloaded.
+/// stager, opened with their key from `keys`, and verified by digest.
+/// Returns the bytes downloaded.
 ///
 /// A published snapshot's parts are unpinned on every node, the one that
 /// captured it included, so they can be evicted at any time. A restore
@@ -856,6 +875,7 @@ pub fn run_warm(
 pub fn fetch_published_parts(
     stager: &crate::artifacts::ArtifactStager,
     manifest: &SnapshotManifest,
+    keys: &crate::checkpoint_seal::PartKeys,
     pin: Option<&PinOwner>,
 ) -> R<u64> {
     let mut fetched = 0u64;
@@ -876,12 +896,36 @@ pub fn fetch_published_parts(
         if let Some(owner) = pin {
             opts = opts.pin(owner.clone());
         }
-        let done = stager
-            .fetch_into_store(
-                &crate::content_publish::published_artifact(url, &digest),
-                ContentClass::Snapshots,
-                opts,
+        // A part this node already holds needs no key: pin it and move on.
+        // The stager does the same under its single-flight claim, but only
+        // after the key lookup below, which a locked keyring would fail.
+        if let Some(store) = stager.content_store() {
+            let present = match pin {
+                Some(owner) => store.pin_if_present(&digest, owner)?,
+                None => store.contains(&digest)?,
+            };
+            if present && store.get(&digest)?.is_some() {
+                continue;
+            }
+        }
+        if part.key_id.is_none() {
+            bail!(
+                "snapshot {} part {} ({}) was published before checkpoint encryption, and \
+                 Legion no longer reads unsealed parts; take a new snapshot (or let \
+                 onRestoreFailure boot the instance cold)",
+                manifest.id,
+                part.role,
+                part.digest
+            );
+        }
+        let key = keys.for_part(&digest).with_context(|| {
+            format!(
+                "fetching part {} of snapshot {} needs its key",
+                part.role, manifest.id
             )
+        })?;
+        let done = stager
+            .fetch_sealed_into_store(url, key, ContentClass::Snapshots, opts)
             .with_context(|| {
                 format!(
                     "fetching part {} of snapshot {} from its content store",
@@ -1030,6 +1074,7 @@ mod tests {
             then: "resume".into(),
             purpose: "manual".into(),
             manifest_json: String::new(),
+            ..Default::default()
         }
     }
 

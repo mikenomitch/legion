@@ -119,7 +119,9 @@ mod node_content_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
-pub use snapshot_rpcs::{expire_snapshots, CHECKPOINT_CAPABILITY};
+pub use snapshot_rpcs::{
+    checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
+};
 pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, IdleSweeper};
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
