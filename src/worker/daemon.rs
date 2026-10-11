@@ -2262,8 +2262,8 @@ fn spawn_pressure_responder(
         return;
     }
     info!(
-        free_below_bytes = settings.free_below_bytes,
-        stall_above_percent = settings.stall_above_percent,
+        min_free_bytes = settings.min_free_bytes,
+        max_stall_percent = settings.max_stall_percent,
         settle_ms = settings.settle.as_millis() as u64,
         steps = %settings
             .active_steps()

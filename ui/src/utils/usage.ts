@@ -81,8 +81,8 @@ export const pressureSummary = (memory: NodeResourceUsage | undefined, reported:
 
 export const pressureThresholds = (response: MemoryPressureStatus): string => {
   const parts = [
-    `Acts when free memory drops below ${formatBytes(Number(response.freeBelowBytes))}`,
-    `or stall rises above ${response.stallAbovePercent}%`,
+    `Acts when free memory drops below ${formatBytes(Number(response.minFreeBytes))}`,
+    `or stall rises above ${response.maxStallPercent}%`,
     `settles ${String(response.settleSeconds)}s between steps`,
   ]
   const steps = response.steps.length > 0 ? `Steps: ${response.steps.join(' → ')}` : 'No steps enabled'

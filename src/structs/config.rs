@@ -2365,7 +2365,7 @@ impl WorkerResourceEnforcementConfig {
 /// Worker `resourceEnforcement.oversubscribe` block: schedulable capacity as
 /// a multiple of physical capacity, after `reservedResources`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerOversubscribeConfig {
     /// Memory ratio. Above 1.0 the sum of reservations may exceed physical
     /// memory, which voids the "within its reservation is never evicted"
@@ -2388,7 +2388,7 @@ pub const MEMORY_PRESSURE_STEPS: [&str; 4] =
 /// optional: the defaults are resolved on the worker, against its own
 /// memory size (`src/worker/pressure.rs`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerMemoryPressureConfig {
     /// Set false to keep enforcement but turn the response off. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2396,11 +2396,11 @@ pub struct WorkerMemoryPressureConfig {
     /// Act when `MemAvailable` drops below this byte size ("2GiB"). Default
     /// 5% of node memory, at least 256MiB and at most 4GiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub free_below: Option<String>,
+    pub min_free: Option<String>,
     /// Act when node-wide PSI `some avg10` exceeds this percentage ("10%" or
     /// 10). Default 10%.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stall_above: Option<Value>,
+    pub max_stall: Option<Value>,
     /// Wait this long after each action for pressure to clear before taking
     /// the next ("5s"). Default 5s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2415,12 +2415,12 @@ pub struct WorkerMemoryPressureConfig {
 impl WorkerMemoryPressureConfig {
     /// Parse every field once, so a bad value fails at manager startup.
     pub fn validate(&self) -> R<()> {
-        if let Some(raw) = self.free_below.as_deref() {
+        if let Some(raw) = self.min_free.as_deref() {
             parse_byte_size(raw).with_context(|| {
-                format!("invalid resourceEnforcement.memoryPressure.freeBelow {raw:?}")
+                format!("invalid resourceEnforcement.memoryPressure.minFree {raw:?}")
             })?;
         }
-        self.stall_above_percent()?;
+        self.max_stall_percent()?;
         self.settle_duration()?;
         for step in self.steps.iter().flatten() {
             if !MEMORY_PRESSURE_STEPS.contains(&step.as_str()) {
@@ -2433,10 +2433,10 @@ impl WorkerMemoryPressureConfig {
         Ok(())
     }
 
-    /// `stallAbove` as a percentage, when set. Accepts `"10%"`, `"10"`, or
+    /// `maxStall` as a percentage, when set. Accepts `"10%"`, `"10"`, or
     /// `10`.
-    pub fn stall_above_percent(&self) -> R<Option<f64>> {
-        let Some(value) = self.stall_above.as_ref() else {
+    pub fn max_stall_percent(&self) -> R<Option<f64>> {
+        let Some(value) = self.max_stall.as_ref() else {
             return Ok(None);
         };
         let percent = match value {
@@ -2447,7 +2447,7 @@ impl WorkerMemoryPressureConfig {
         match percent {
             Some(percent) if (0.0..=100.0).contains(&percent) => Ok(Some(percent)),
             _ => bail!(
-                "resourceEnforcement.memoryPressure.stallAbove must be a percentage between 0 \
+                "resourceEnforcement.memoryPressure.maxStall must be a percentage between 0 \
                  and 100 (\"10%\"), got {value}"
             ),
         }
@@ -2720,8 +2720,8 @@ mod tests {
             "enabled": true,
             "oversubscribe": { "memory": 1.5, "cpu": 2 },
             "memoryPressure": {
-                "freeBelow": "2GiB",
-                "stallAbove": "10%",
+                "minFree": "2GiB",
+                "maxStall": "10%",
                 "settle": "5s",
                 "steps": ["reclaim", "suspend", "evict-bursting", "evict-reserved"],
                 "enabled": true,
@@ -2744,12 +2744,12 @@ mod tests {
                 "unknown resourceEnforcement.memoryPressure step",
             ),
             (
-                serde_json::json!({ "enabled": true, "memoryPressure": { "stallAbove": "150%" } }),
-                "stallAbove",
+                serde_json::json!({ "enabled": true, "memoryPressure": { "maxStall": "150%" } }),
+                "maxStall",
             ),
             (
-                serde_json::json!({ "enabled": true, "memoryPressure": { "freeBelow": "lots" } }),
-                "freeBelow",
+                serde_json::json!({ "enabled": true, "memoryPressure": { "minFree": "lots" } }),
+                "minFree",
             ),
         ] {
             let err = parse(bad).validate().expect_err("invalid");
@@ -2757,10 +2757,12 @@ mod tests {
         }
         // A removed or misspelled field fails to parse instead of being
         // ignored.
-        assert!(serde_json::from_value::<WorkerResourceEnforcementConfig>(
-            serde_json::json!({ "suspendedReserve": 0.25 })
-        )
-        .is_err());
+        for removed in [
+            serde_json::json!({ "suspendedReserve": 0.25 }),
+            serde_json::json!({ "memoryPressure": { "freeBelow": "2GiB" } }),
+        ] {
+            assert!(serde_json::from_value::<WorkerResourceEnforcementConfig>(removed).is_err());
+        }
         // Enforcement is on unless turned off.
         assert!(parse(serde_json::json!({})).enabled);
         // Ratio 1.0 without enforcement is the default, not an error.

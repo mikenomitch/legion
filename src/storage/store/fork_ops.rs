@@ -58,7 +58,7 @@ impl Store {
     /// Fork ids are `<origin>-f<n>` with the lowest `n` whose id has never
     /// existed in any job (ids are never recycled), or a minted id when the
     /// origin id is too long to suffix. With `derived_ids_only` (a task whose
-    /// `stateful.idSource = "caller"`, so every id must stay in the caller's
+    /// `stateful.requireId = true`, so every id must stay in the caller's
     /// namespace) a fork that would need a minted id is refused instead.
     #[instrument(err, skip_all, fields(snapshot_id = %new.snapshot_id, count))]
     pub fn begin_fork(
@@ -146,7 +146,7 @@ impl Store {
                 None if derived_ids_only => bail!(StorageError::InvalidInput {
                     message: format!(
                         "instance {} is too long to fork: a fork id is `<origin>-f<n>`, at most \
-                         128 characters, and its task sets stateful.idSource = \"caller\", so \
+                         128 characters, and its task sets stateful.requireId = true, so \
                          Legion will not mint an id outside the caller's namespace\nHint: use \
                          shorter instance ids, or create the new instances from a snapshot \
                          (`legion instance create --from-snapshot`) with ids you choose",

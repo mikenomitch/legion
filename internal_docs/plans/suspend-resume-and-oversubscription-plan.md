@@ -628,10 +628,10 @@ resourceEnforcement = {
     memoryPressure = {
         # Act when free memory (MemAvailable) drops below this.
         # Default: 5% of node memory, at least 256MiB, at most 4GiB.
-        freeBelow = "2GiB",
+        minFree = "2GiB",
         # ...or when tasks spend more than this share of time stalled
         # waiting on memory (kernel PSI "some", 10s average). Default 10%.
-        stallAbove = "10%",
+        maxStall = "10%",
         # After each step, wait this long for pressure to clear before
         # taking the next one. Default 5s.
         settle = "5s",
@@ -1077,7 +1077,7 @@ also how Fly and E2B are driven.
         group = "workspaces",
         stateful = {
             mode = "keyed",
-            idSource = "caller",
+            requireId = true,
             storage = { path = "/workspace", mode = "block", params = { size = "10G" } },
         },
         config = {
@@ -1208,7 +1208,7 @@ used by a non-agent workload somewhere in §3.
   disagrees with `memoryMax`/`memory` is a submit error.
 
 **Worker config:** `resourceEnforcement.oversubscribe { memory, cpu }`,
-`resourceEnforcement.memoryPressure { enabled, freeBelow, stallAbove, settle, steps }`,
+`resourceEnforcement.memoryPressure { enabled, minFree, maxStall, settle, steps }`,
 `contentStore { url, auth }`, `content { budgets { artifacts, snapshots } }`,
 `sandbox.vmmOverheadMiB`.
 

@@ -555,10 +555,10 @@ resourceEnforcement = {
     memoryPressure = {
         # Act when free memory (MemAvailable) drops below this.
         # Default: 5% of node memory, at least 256MiB, at most 4GiB.
-        freeBelow = "2GiB",
+        minFree = "2GiB",
         # ...or when tasks spend more than this share of time stalled
         # waiting on memory (kernel PSI "some", 10s average). Default 10%.
-        stallAbove = "10%",
+        maxStall = "10%",
         # After each step, wait this long for pressure to clear before
         # taking the next one. Default 5s.
         settle = "5s",
@@ -573,7 +573,7 @@ resourceEnforcement = {
 ```
 
 The manager validates the block when it loads the worker config: an unknown
-step, a bad size or duration, or a `stallAbove` outside 0-100% fails at
+step, a bad size or duration, or a `maxStall` outside 0-100% fails at
 startup. `memoryPressure` without `enabled = true` is rejected, like
 `oversubscribe`.
 

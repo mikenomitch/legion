@@ -32,7 +32,6 @@
                 # sandbox's identity (and its storage) can never leak into a
                 # new one.
                 mode = "keyed",
-                idSource = "uuid",
                 # The persistent half of the sandbox. `mode = "block"` because
                 # a guest kernel attaches a block device, not a host
                 # directory = the local-dir driver serves a formatted disk

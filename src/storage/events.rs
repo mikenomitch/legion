@@ -1099,9 +1099,9 @@ pub mod drafts {
             "used_bytes": action.used_bytes,
             "reserved_bytes": action.reserved_bytes,
             "available_bytes": action.available_bytes,
-            "free_below_bytes": action.free_below_bytes,
+            "min_free_bytes": action.min_free_bytes,
             "stall_percent": action.stall_percent,
-            "stall_above_percent": action.stall_above_percent,
+            "max_stall_percent": action.max_stall_percent,
             "detail": action.detail,
         });
         match action.step.as_str() {

@@ -4474,10 +4474,9 @@ export class CreateInstanceRequest extends Message<CreateInstanceRequest> {
    *
    * Must match `[A-Za-z0-9._-]{1,128}` and must not collide with any
    * existing instance id of any job — including Terminated tombstones
-   * (destroyed ids are never reusable). Required when the task declares
-   * `stateful.idSource: "caller"`; optional otherwise (the server mints an
-   * id when absent). A valid explicit key is always honored regardless of
-   * `idSource`.
+   * (destroyed ids are never reusable). Required when the task sets
+   * `stateful.requireId: true`. Optional otherwise (the server mints an id
+   * when absent). A valid explicit key is always honored.
    *
    * @generated from field: optional string instance_id = 4;
    */
@@ -4638,8 +4637,8 @@ export class CreateInstancesRequest extends Message<CreateInstancesRequest> {
 
   /**
    * Number of additional server-minted instances to create on top of
-   * `instance_ids`. Rejected (InvalidArgument) when the task declares
-   * `stateful.idSource: "caller"`, which requires caller-supplied ids. At
+   * `instance_ids`. Rejected (InvalidArgument) when the task sets
+   * `stateful.requireId: true`, which requires caller-supplied ids. At
    * least one of `instance_ids` / `count` must be non-empty/non-zero.
    *
    * @generated from field: uint32 count = 5;
@@ -9822,11 +9821,11 @@ export class PressureAction extends Message<PressureAction> {
   availableBytes = protoInt64.zero;
 
   /**
-   * The `freeBelow` threshold in force, in bytes.
+   * The `minFree` threshold in force, in bytes.
    *
-   * @generated from field: uint64 free_below_bytes = 8;
+   * @generated from field: uint64 min_free_bytes = 8;
    */
-  freeBelowBytes = protoInt64.zero;
+  minFreeBytes = protoInt64.zero;
 
   /**
    * Node-wide PSI `some avg10` when the step ran, in percent. Zero when the
@@ -9837,11 +9836,11 @@ export class PressureAction extends Message<PressureAction> {
   stallPercent = 0;
 
   /**
-   * The `stallAbove` threshold in force, in percent.
+   * The `maxStall` threshold in force, in percent.
    *
-   * @generated from field: double stall_above_percent = 10;
+   * @generated from field: double max_stall_percent = 10;
    */
-  stallAbovePercent = 0;
+  maxStallPercent = 0;
 
   /**
    * One sentence naming the step and the numbers, e.g. "evicted by
@@ -9891,9 +9890,9 @@ export class PressureAction extends Message<PressureAction> {
     { no: 5, name: "used_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 6, name: "reserved_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 7, name: "available_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
-    { no: 8, name: "free_below_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 8, name: "min_free_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 9, name: "stall_percent", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
-    { no: 10, name: "stall_above_percent", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 10, name: "max_stall_percent", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
     { no: 11, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 12, name: "hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
@@ -9935,27 +9934,27 @@ export class MemoryPressureStatus extends Message<MemoryPressureStatus> {
   enabled = false;
 
   /**
-   * Whether a trigger is firing right now: free memory below `freeBelow`,
-   * or stall above `stallAbove`.
+   * Whether a trigger is firing right now: free memory below `minFree`,
+   * or stall above `maxStall`.
    *
    * @generated from field: bool under_pressure = 2;
    */
   underPressure = false;
 
   /**
-   * `freeBelow` resolved for this node, in bytes. Default 5% of node memory,
+   * `minFree` resolved for this node, in bytes. Default 5% of node memory,
    * at least 256 MiB and at most 4 GiB.
    *
-   * @generated from field: uint64 free_below_bytes = 3;
+   * @generated from field: uint64 min_free_bytes = 3;
    */
-  freeBelowBytes = protoInt64.zero;
+  minFreeBytes = protoInt64.zero;
 
   /**
-   * `stallAbove` in percent. Default 10.
+   * `maxStall` in percent. Default 10.
    *
-   * @generated from field: double stall_above_percent = 4;
+   * @generated from field: double max_stall_percent = 4;
    */
-  stallAbovePercent = 0;
+  maxStallPercent = 0;
 
   /**
    * `settle` in seconds. Default 5.
@@ -9984,8 +9983,8 @@ export class MemoryPressureStatus extends Message<MemoryPressureStatus> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 2, name: "under_pressure", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
-    { no: 3, name: "free_below_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
-    { no: 4, name: "stall_above_percent", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 3, name: "min_free_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "max_stall_percent", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
     { no: 5, name: "settle_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 6, name: "steps", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);

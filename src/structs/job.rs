@@ -990,7 +990,7 @@ impl RolloutConfig {
 /// survive reschedules (see `docs/stateful-workloads.md`). Absent = today's
 /// stateless behavior; the feature is opt-in per task.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StatefulConfig {
     /// Instance id assignment mode: `slot` (fixed ordinal pool `0..count-1`,
     /// ids reused within the pool — the default) or `keyed` (created on demand
@@ -1003,13 +1003,13 @@ pub struct StatefulConfig {
     /// cardinality (the instance API, not the spec), so it is always explicit.
     #[serde(default)]
     pub mode: InstanceMode,
-    /// Where keyed instance ids come from by default: `caller` (the
-    /// CreateInstance request must supply one) or `uuid` (server-minted when
-    /// the request omits one). A valid caller-supplied id is always honored
-    /// regardless of this setting. Only valid in keyed mode; slot ids are
-    /// always derived from the ordinal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id_source: Option<String>,
+    /// Keyed mode only: reject creates that don't supply an instance id
+    /// (`requireId` in the jobspec). Default false, where the server mints
+    /// an id when the request omits one. A valid caller-supplied id is
+    /// always honored either way. Slot ids are always derived from the
+    /// ordinal, so slot mode rejects it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_id: bool,
     /// Keyed mode only: instance ids to SEED on job submit
     /// (`initialInstances` in the jobspec).
     ///
@@ -2611,9 +2611,9 @@ impl TaskConfig {
 
         match stateful.mode {
             InstanceMode::Slot => {
-                if stateful.id_source.is_some() {
+                if stateful.require_id {
                     bail!(
-                        "task {} stateful.idSource is only valid in keyed mode; slot ids are \
+                        "task {} stateful.requireId is only valid in keyed mode; slot ids are \
                          always derived from the ordinal",
                         self.name
                     );
@@ -2651,15 +2651,6 @@ impl TaskConfig {
                          always retains the storage handle, instance destroy always drops it)",
                         self.name
                     );
-                }
-                if let Some(id_source) = stateful.id_source.as_deref() {
-                    if !matches!(id_source, "caller" | "uuid") {
-                        bail!(
-                            "task {} stateful.idSource must be \"caller\" or \"uuid\", got {:?}",
-                            self.name,
-                            id_source
-                        );
-                    }
                 }
                 // Keyed cardinality is driven entirely by the management API
                 // (CreateInstance/DestroyInstance). An explicit `count` in the
@@ -3865,7 +3856,7 @@ mod tests {
         let task = &config.tasks[0];
         let stateful = task.stateful.as_ref().expect("stateful block parsed");
         assert_eq!(stateful.mode, InstanceMode::Slot);
-        assert!(stateful.id_source.is_none());
+        assert!(!stateful.require_id);
         let storage = stateful.storage.as_ref().expect("storage parsed");
         assert_eq!(storage.path, "/var/lib/db");
         assert!(storage.retains_on_scale_in());
@@ -3881,14 +3872,14 @@ mod tests {
     }
 
     #[test]
-    fn stateful_keyed_block_accepts_id_source() -> R<()> {
+    fn stateful_keyed_block_accepts_require_id() -> R<()> {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
                 "runtime": "container",
                 "stateful": {
                     "mode": "keyed",
-                    "idSource": "caller",
+                    "requireId": true,
                     "storage": { "path": "/workspace" }
                 }
             }
@@ -3896,8 +3887,17 @@ mod tests {
         let config: JobConfig = serde_json::from_value(spec)?;
         let stateful = config.tasks[0].stateful.as_ref().expect("stateful parsed");
         assert_eq!(stateful.mode, InstanceMode::Keyed);
-        assert_eq!(stateful.id_source.as_deref(), Some("caller"));
+        assert!(stateful.require_id);
         config.tasks[0].validate_stateful()?;
+        // The old `idSource` name fails to parse instead of being ignored.
+        let old = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "runtime": "container",
+                "stateful": { "mode": "keyed", "idSource": "caller" }
+            }
+        });
+        assert!(serde_json::from_value::<JobConfig>(old).is_err());
         Ok(())
     }
 
@@ -4094,7 +4094,7 @@ mod tests {
             let task = TaskConfig {
                 stateful: Some(StatefulConfig {
                     mode: InstanceMode::Keyed,
-                    id_source: None,
+                    require_id: false,
                     initial_instances: None,
                     on_lost: None,
                     storage: Some(StatefulStorageConfig {
@@ -4121,11 +4121,11 @@ mod tests {
     }
 
     #[test]
-    fn stateful_validation_rejects_id_source_in_slot_mode() {
+    fn stateful_validation_rejects_require_id_in_slot_mode() {
         let task = TaskConfig {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: Some("uuid".into()),
+                require_id: true,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
@@ -4134,8 +4134,8 @@ mod tests {
         };
         let err = task
             .validate_stateful()
-            .expect_err("idSource must be rejected in slot mode");
-        assert!(err.to_string().contains("idSource"), "{err}");
+            .expect_err("requireId must be rejected in slot mode");
+        assert!(err.to_string().contains("requireId"), "{err}");
     }
 
     #[test]
@@ -4144,7 +4144,7 @@ mod tests {
             count: TaskCount::new(0),
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
@@ -4163,7 +4163,7 @@ mod tests {
             count: TaskCount::per(2, "region"),
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
@@ -4182,7 +4182,7 @@ mod tests {
             let task = TaskConfig {
                 stateful: Some(StatefulConfig {
                     mode: InstanceMode::Slot,
-                    id_source: None,
+                    require_id: false,
                     initial_instances: None,
                     on_lost: None,
                     storage: Some(StatefulStorageConfig {
@@ -4207,30 +4207,12 @@ mod tests {
     }
 
     #[test]
-    fn stateful_validation_rejects_unknown_keyed_id_source() {
-        let task = TaskConfig {
-            stateful: Some(StatefulConfig {
-                mode: InstanceMode::Keyed,
-                id_source: Some("dice-roll".into()),
-                initial_instances: None,
-                on_lost: None,
-                storage: None,
-            }),
-            ..TaskConfig::new("sandbox", "container")
-        };
-        let err = task
-            .validate_stateful()
-            .expect_err("unknown idSource must be rejected");
-        assert!(err.to_string().contains("idSource"), "{err}");
-    }
-
-    #[test]
     fn stateful_validation_rejects_count_per_in_keyed_mode() {
         let task = TaskConfig {
             count: TaskCount::per(2, "region"),
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Keyed,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
@@ -4252,7 +4234,7 @@ mod tests {
                 count: TaskCount::new(count),
                 stateful: Some(StatefulConfig {
                     mode: InstanceMode::Keyed,
-                    id_source: Some("uuid".into()),
+                    require_id: true,
                     initial_instances: None,
                     on_lost: None,
                     storage: None,
@@ -4373,7 +4355,7 @@ mod tests {
         TaskConfig {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: Some(on_lost),
                 storage: None,
@@ -4389,7 +4371,7 @@ mod tests {
         let task = TaskConfig {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,

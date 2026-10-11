@@ -291,7 +291,7 @@ fn an_idle_apple_container_sandbox_suspends_and_resumes_cold_on_its_volume() {
     runtime = "sandbox",
     stateful = {
       mode = "keyed",
-      idSource = "caller",
+      requireId = true,
       storage = { path = "/workspace" },
     },
     config = {

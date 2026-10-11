@@ -770,7 +770,7 @@ fn render_node_usage(reply: &GetNodeUsageReply, now_unix: i64) -> String {
             Some(status) if !status.enabled => format!("response off ({numbers})"),
             Some(status) if status.under_pressure => format!(
                 "UNDER PRESSURE ({numbers}; acts below {} MiB free)",
-                usage_display::mib(status.free_below_bytes)
+                usage_display::mib(status.min_free_bytes)
             ),
             Some(_) => format!("ok ({numbers})"),
             None => numbers,
@@ -1320,7 +1320,7 @@ mod tests {
                 oversubscribe_ratio: 1.0,
                 pressure_response: Some(crate::structs::MemoryPressureStatus {
                     enabled: true,
-                    free_below_bytes: 400 * MIB,
+                    min_free_bytes: 400 * MIB,
                     ..Default::default()
                 }),
                 ..Default::default()

@@ -45,8 +45,8 @@ const response = (underPressure: boolean, steps = ['reclaim', 'suspend', 'evict-
   new MemoryPressureStatus({
     enabled: true,
     underPressure,
-    freeBelowBytes: 2n * GIB,
-    stallAbovePercent: 10,
+    minFreeBytes: 2n * GIB,
+    maxStallPercent: 10,
     settleSeconds: 5n,
     steps,
   })

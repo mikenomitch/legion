@@ -9,7 +9,7 @@ export type JobTaskDependency = {
 // Parsed `stateful` block from a task spec (see docs/stateful-workloads.md).
 export type JobTaskStateful = {
   mode: string
-  idSource?: string
+  requireId?: boolean
   storagePath?: string
 }
 
@@ -140,7 +140,7 @@ const normalizeStateful = (value: unknown): JobTaskStateful | undefined => {
   const storage = raw.storage && typeof raw.storage === 'object' ? (raw.storage as Record<string, unknown>) : undefined
   return {
     mode,
-    idSource: readTaskString(raw.idSource) || undefined,
+    requireId: raw.requireId === true || undefined,
     storagePath: storage ? readTaskString(storage.path) || undefined : undefined,
   }
 }

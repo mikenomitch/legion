@@ -56,8 +56,8 @@ your databases.
     # See "Picking a ratio" below before you raise it.
     oversubscribe = { memory = 1.25 },
     memoryPressure = {
-      freeBelow = "4GiB",
-      stallAbove = "10%",
+      minFree = "4GiB",
+      maxStall = "10%",
       settle = "5s",
       # Keep `suspend` in the list. It is the step that keeps a sandbox's
       # state when the node runs short.
@@ -134,7 +134,7 @@ When you do raise it, measure first:
 1. Run at 1.0 through a few busy days and read `legion node usage` on your
    busiest nodes at peak. Compare `RESERVED` with `USED`.
 2. Pick a ratio that keeps peak `USED` well under physical memory, with
-   `freeBelow` to spare. If nodes are 90% reserved and 45% used at peak, a
+   `minFree` to spare. If nodes are 90% reserved and 45% used at peak, a
    ratio of 2.0 would fill physical memory at peak. 1.5 leaves headroom, and
    1.25 is the safer start.
 3. Raise it in steps of 0.25 and watch `node.pressure` events and
@@ -167,7 +167,7 @@ registration.
 
     stateful = {
       mode = "keyed",
-      idSource = "caller",
+      requireId = true,
       storage = { path = "/workspace", mode = "block", params = { size = "10G" } },
     },
 
@@ -218,7 +218,7 @@ reschedules and suspends. Ids are never recycled, so a destroyed user's data
 can't leak into a new instance that reuses the name. See
 [keyed mode](../stateful-workloads.md#keyed-mode-the-management-api).
 
-**`idSource = "caller"`** makes `--id` required. Your platform already has
+**`requireId = true`** makes `--id` required. Your platform already has
 user or session ids, so let them be the instance ids rather than mapping
 server-minted UUIDs back to users.
 
@@ -475,7 +475,7 @@ second per GiB of guest memory on local NVMe), then keeps running. Each fork
 is a new keyed instance with its own id, its own copy of `/workspace`, its
 own MAC, RNG seed, and workload identity, and `onResume` runs in each one.
 The fork ids derive from `user-42`, so they stay in your namespace under
-`idSource = "caller"`. Forks run on the origin's node, because the checkpoint
+`requireId = true`. Forks run on the origin's node, because the checkpoint
 and the `/workspace` copies live there. Destroy the losers with `legion
 instance destroy user-42-f2`, and destroy (don't just stop) a fork you no
 longer want, since a stopped fork that never restored keeps its checkpoint
@@ -942,7 +942,7 @@ cold on resume:
     runtime = "sandbox",
     stateful = {
       mode = "keyed",
-      idSource = "caller",
+      requireId = true,
       # Dev mode bind-mounts volumes, so no `mode = "block"`.
       storage = { path = "/workspace" },
     },

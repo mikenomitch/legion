@@ -49,15 +49,15 @@ use std::time::{Duration, Instant};
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-/// Default `freeBelow`, as a fraction of node memory.
+/// Default `minFree`, as a fraction of node memory.
 pub const DEFAULT_FREE_BELOW_FRACTION: f64 = 0.05;
-/// Floor for the default `freeBelow`: below this a small node would act too
+/// Floor for the default `minFree`: below this a small node would act too
 /// late to matter.
 pub const MIN_DEFAULT_FREE_BELOW: u64 = 256 * MIB;
-/// Ceiling for the default `freeBelow`: on a large node 5% is far more slack
+/// Ceiling for the default `minFree`: on a large node 5% is far more slack
 /// than reclaim needs.
 pub const MAX_DEFAULT_FREE_BELOW: u64 = 4 * GIB;
-/// Default `stallAbove`, in percent of PSI `some avg10`.
+/// Default `maxStall`, in percent of PSI `some avg10`.
 pub const DEFAULT_STALL_ABOVE_PERCENT: f64 = 10.0;
 /// Default `settle`.
 pub const DEFAULT_SETTLE: Duration = Duration::from_secs(5);
@@ -113,8 +113,8 @@ pub struct PressureSettings {
     pub enabled: bool,
     /// This node's name, for detail strings.
     pub node_name: String,
-    pub free_below_bytes: u64,
-    pub stall_above_percent: f64,
+    pub min_free_bytes: u64,
+    pub max_stall_percent: f64,
     pub settle: Duration,
     /// Configured steps, deduplicated, in run order.
     pub steps: Vec<PressureStep>,
@@ -125,7 +125,7 @@ pub struct PressureSettings {
 
 impl PressureSettings {
     /// 5% of node memory, at least 256 MiB and at most 4 GiB.
-    pub fn default_free_below(node_total_bytes: u64) -> u64 {
+    pub fn default_min_free(node_total_bytes: u64) -> u64 {
         ((node_total_bytes as f64 * DEFAULT_FREE_BELOW_FRACTION) as u64)
             .clamp(MIN_DEFAULT_FREE_BELOW, MAX_DEFAULT_FREE_BELOW)
     }
@@ -140,10 +140,10 @@ impl PressureSettings {
     ) -> R<Self> {
         let default = WorkerMemoryPressureConfig::default();
         let config = config.unwrap_or(&default);
-        let free_below_bytes = match config.free_below.as_deref() {
+        let min_free_bytes = match config.min_free.as_deref() {
             Some(raw) => crate::structs::parse_byte_size(raw)
-                .with_context(|| format!("invalid memoryPressure.freeBelow {raw:?}"))?,
-            None => Self::default_free_below(node_total_bytes),
+                .with_context(|| format!("invalid memoryPressure.minFree {raw:?}"))?,
+            None => Self::default_min_free(node_total_bytes),
         };
         let mut steps: Vec<PressureStep> = match config.steps.as_ref() {
             Some(names) => names
@@ -161,9 +161,9 @@ impl PressureSettings {
         Ok(Self {
             enabled: config.enabled.unwrap_or(true),
             node_name: node_name.to_string(),
-            free_below_bytes,
-            stall_above_percent: config
-                .stall_above_percent()?
+            min_free_bytes,
+            max_stall_percent: config
+                .max_stall_percent()?
                 .unwrap_or(DEFAULT_STALL_ABOVE_PERCENT),
             settle: config.settle_duration()?.unwrap_or(DEFAULT_SETTLE),
             steps,
@@ -188,8 +188,8 @@ impl PressureSettings {
 
     /// Whether `memory` crosses either trigger.
     pub fn triggered(&self, memory: &NodeMemoryUsage) -> bool {
-        memory.available_bytes < self.free_below_bytes
-            || (memory.psi_available && memory.psi_some_avg10 > self.stall_above_percent)
+        memory.available_bytes < self.min_free_bytes
+            || (memory.psi_available && memory.psi_some_avg10 > self.max_stall_percent)
     }
 
     /// The wire status reported with usage.
@@ -197,8 +197,8 @@ impl PressureSettings {
         MemoryPressureStatus {
             enabled: self.enabled,
             under_pressure: self.enabled && under_pressure,
-            free_below_bytes: self.free_below_bytes,
-            stall_above_percent: self.stall_above_percent,
+            min_free_bytes: self.min_free_bytes,
+            max_stall_percent: self.max_stall_percent,
             settle_seconds: self.settle.as_secs(),
             steps: self
                 .steps
@@ -513,7 +513,7 @@ impl PressureResponder {
     /// it takes the first step (in run order) that still has a candidate it
     /// has not acted on this episode, and acts on that step's candidates in
     /// order until their expected freed bytes cover the shortfall below
-    /// `freeBelow` (at least one, when only the stall trigger fired). Then
+    /// `minFree` (at least one, when only the stall trigger fired). Then
     /// it waits `settle` to see whether that was enough. A step with nothing
     /// left to do hands over to the next, so the response escalates only as
     /// far as it has to. With every step exhausted it does nothing more, and
@@ -554,7 +554,7 @@ impl PressureResponder {
             .collect();
         let shortfall = self
             .settings
-            .free_below_bytes
+            .min_free_bytes
             .saturating_sub(memory.available_bytes);
 
         for step in self.settings.active_steps() {
@@ -654,13 +654,13 @@ impl PressureResponder {
             used_bytes: candidate.used_bytes,
             reserved_bytes: candidate.meta.reserved_bytes,
             available_bytes: memory.available_bytes,
-            free_below_bytes: self.settings.free_below_bytes,
+            min_free_bytes: self.settings.min_free_bytes,
             stall_percent: if memory.psi_available {
                 memory.psi_some_avg10
             } else {
                 0.0
             },
-            stall_above_percent: self.settings.stall_above_percent,
+            max_stall_percent: self.settings.max_stall_percent,
             detail,
             hint,
             at_unix_ms: now_unix_ms,
@@ -694,16 +694,16 @@ pub fn describe(
     settings: &PressureSettings,
     freed: u64,
 ) -> (String, String) {
-    let trigger = if memory.available_bytes < settings.free_below_bytes {
+    let trigger = if memory.available_bytes < settings.min_free_bytes {
         format!(
             "while free memory was {} (threshold {})",
             human_bytes(memory.available_bytes),
-            human_bytes(settings.free_below_bytes)
+            human_bytes(settings.min_free_bytes)
         )
     } else {
         format!(
             "while tasks were stalled on memory {:.1}% of the time (threshold {}%)",
-            memory.psi_some_avg10, settings.stall_above_percent
+            memory.psi_some_avg10, settings.max_stall_percent
         )
     };
     let used = human_bytes(candidate.used_bytes);
@@ -930,15 +930,15 @@ mod tests {
     fn defaults_scale_with_the_node_and_clamp() {
         // 5% of 16 GiB is 819 MiB, inside the clamp.
         assert_eq!(
-            PressureSettings::default_free_below(16 * GIB),
+            PressureSettings::default_min_free(16 * GIB),
             (16.0 * GIB as f64 * 0.05) as u64
         );
-        assert_eq!(PressureSettings::default_free_below(2 * GIB), 256 * MIB);
-        assert_eq!(PressureSettings::default_free_below(512 * GIB), 4 * GIB);
+        assert_eq!(PressureSettings::default_min_free(2 * GIB), 256 * MIB);
+        assert_eq!(PressureSettings::default_min_free(512 * GIB), 4 * GIB);
 
         let resolved = settings(1.0);
         assert!(resolved.enabled);
-        assert_eq!(resolved.stall_above_percent, 10.0);
+        assert_eq!(resolved.max_stall_percent, 10.0);
         assert_eq!(resolved.settle, Duration::from_secs(5));
         assert_eq!(resolved.steps, PressureStep::ALL.to_vec());
     }
@@ -947,8 +947,8 @@ mod tests {
     fn configured_values_parse_and_steps_keep_their_fixed_order() -> R<()> {
         let config = WorkerMemoryPressureConfig {
             enabled: Some(true),
-            free_below: Some("2GiB".into()),
-            stall_above: Some(serde_json::json!("25%")),
+            min_free: Some("2GiB".into()),
+            max_stall: Some(serde_json::json!("25%")),
             settle: Some("10s".into()),
             steps: Some(vec![
                 "evict-bursting".into(),
@@ -957,8 +957,8 @@ mod tests {
             ]),
         };
         let resolved = PressureSettings::resolve(Some(&config), 1.5, 64 * GIB, "w-1")?;
-        assert_eq!(resolved.free_below_bytes, 2 * GIB);
-        assert_eq!(resolved.stall_above_percent, 25.0);
+        assert_eq!(resolved.min_free_bytes, 2 * GIB);
+        assert_eq!(resolved.max_stall_percent, 25.0);
         assert_eq!(resolved.settle, Duration::from_secs(10));
         assert_eq!(
             resolved.steps,
@@ -1209,7 +1209,7 @@ mod tests {
         let mut responder = PressureResponder::new(settings(1.0));
         let start = Instant::now();
 
-        // Default freeBelow on 16 GiB is ~819 MiB; 500 MiB free is short by
+        // Default minFree on 16 GiB is ~819 MiB; 500 MiB free is short by
         // ~319 MiB, so reclaim asks both (nothing is freed) and stops there.
         let first = responder.tick(start, 1_000, &mut node);
         assert!(responder.under_pressure());

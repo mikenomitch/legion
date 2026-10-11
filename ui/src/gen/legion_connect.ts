@@ -366,18 +366,16 @@ export const Manager = {
      * created through this RPC is the task's desired allocation count (zero
      * instances = zero allocations).
      *
-     * Id assignment: the target task's `stateful.idSource` declares the default
-     * source. With `idSource: "caller"` the request must supply `instance_id`;
-     * with `idSource: "uuid"` (or unset) the server mints an id when
-     * `instance_id` is absent. A caller-supplied `instance_id` is always
-     * accepted when valid, regardless of `idSource` — the setting picks the
-     * default, it does not forbid explicit keys.
+     * Id assignment: when `instance_id` is absent the server mints an id,
+     * unless the target task sets `stateful.requireId: true`, which rejects
+     * the request instead. A caller-supplied `instance_id` is always accepted
+     * when valid.
      *
      * Errors:
      * - NotFound: the job does not exist.
      * - InvalidArgument: no keyed task matches `group`/`task`, the match is
      *   ambiguous, the id has an invalid charset (must match
-     *   `[A-Za-z0-9._-]{1,128}`), or `idSource: "caller"` and no id was given.
+     *   `[A-Za-z0-9._-]{1,128}`), or `requireId: true` and no id was given.
      * - AlreadyExists: the id collides with ANY existing instance row of the
      *   job — including Stopped instances and Terminated tombstones — or
      *   structurally aliases the reserved slot-id pattern
@@ -416,12 +414,11 @@ export const Manager = {
      * `CreateInstance`: filters may be omitted when the job has exactly one
      * keyed task; ambiguity is rejected, never guessed.
      *
-     * Interaction with `stateful.idSource`:
-     * - `idSource: "caller"` requires every id to be caller-supplied, so
-     *   `count > 0` (server minting) contradicts the policy and is rejected
-     *   with InvalidArgument.
-     * - `idSource: "uuid"` (or unset) accepts any mix of explicit ids and
-     *   minted ids.
+     * Interaction with `stateful.requireId`:
+     * - `requireId: true` requires every id to be caller-supplied, so
+     *   `count > 0` (server minting) contradicts it and is rejected with
+     *   InvalidArgument.
+     * - Without it, any mix of explicit ids and minted ids is accepted.
      *
      * Errors:
      * - NotFound: the job does not exist.
@@ -431,7 +428,7 @@ export const Manager = {
      *   ambiguous; `instance_ids` is empty AND `count` is 0 (nothing to
      *   create); an id has an invalid charset (must match
      *   `[A-Za-z0-9._-]{1,128}`, the offending id is named); or the task
-     *   declares `idSource: "caller"` and `count > 0`.
+     *   sets `requireId: true` and `count > 0`.
      * - AlreadyExists: an id (named in the message) collides with an existing
      *   instance row — including duplicates within the request itself, Stopped
      *   instances, and Terminated tombstones. Nothing is created.

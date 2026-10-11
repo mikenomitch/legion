@@ -176,18 +176,16 @@ service Manager {
   // created through this RPC is the task's desired allocation count (zero
   // instances = zero allocations).
   //
-  // Id assignment: the target task's `stateful.idSource` declares the default
-  // source. With `idSource: "caller"` the request must supply `instance_id`;
-  // with `idSource: "uuid"` (or unset) the server mints an id when
-  // `instance_id` is absent. A caller-supplied `instance_id` is always
-  // accepted when valid, regardless of `idSource` — the setting picks the
-  // default, it does not forbid explicit keys.
+  // Id assignment: when `instance_id` is absent the server mints an id,
+  // unless the target task sets `stateful.requireId: true`, which rejects
+  // the request instead. A caller-supplied `instance_id` is always accepted
+  // when valid.
   //
   // Errors:
   // - NotFound: the job does not exist.
   // - InvalidArgument: no keyed task matches `group`/`task`, the match is
   //   ambiguous, the id has an invalid charset (must match
-  //   `[A-Za-z0-9._-]{1,128}`), or `idSource: "caller"` and no id was given.
+  //   `[A-Za-z0-9._-]{1,128}`), or `requireId: true` and no id was given.
   // - AlreadyExists: the id collides with ANY existing instance row of the
   //   job — including Stopped instances and Terminated tombstones — or
   //   structurally aliases the reserved slot-id pattern
@@ -218,12 +216,11 @@ service Manager {
   // `CreateInstance`: filters may be omitted when the job has exactly one
   // keyed task; ambiguity is rejected, never guessed.
   //
-  // Interaction with `stateful.idSource`:
-  // - `idSource: "caller"` requires every id to be caller-supplied, so
-  //   `count > 0` (server minting) contradicts the policy and is rejected
-  //   with InvalidArgument.
-  // - `idSource: "uuid"` (or unset) accepts any mix of explicit ids and
-  //   minted ids.
+  // Interaction with `stateful.requireId`:
+  // - `requireId: true` requires every id to be caller-supplied, so
+  //   `count > 0` (server minting) contradicts it and is rejected with
+  //   InvalidArgument.
+  // - Without it, any mix of explicit ids and minted ids is accepted.
   //
   // Errors:
   // - NotFound: the job does not exist.
@@ -233,7 +230,7 @@ service Manager {
   //   ambiguous; `instance_ids` is empty AND `count` is 0 (nothing to
   //   create); an id has an invalid charset (must match
   //   `[A-Za-z0-9._-]{1,128}`, the offending id is named); or the task
-  //   declares `idSource: "caller"` and `count > 0`.
+  //   sets `requireId: true` and `count > 0`.
   // - AlreadyExists: an id (named in the message) collides with an existing
   //   instance row — including duplicates within the request itself, Stopped
   //   instances, and Terminated tombstones. Nothing is created.
@@ -2779,10 +2776,9 @@ message CreateInstanceRequest {
   //
   // Must match `[A-Za-z0-9._-]{1,128}` and must not collide with any
   // existing instance id of any job — including Terminated tombstones
-  // (destroyed ids are never reusable). Required when the task declares
-  // `stateful.idSource: "caller"`; optional otherwise (the server mints an
-  // id when absent). A valid explicit key is always honored regardless of
-  // `idSource`.
+  // (destroyed ids are never reusable). Required when the task sets
+  // `stateful.requireId: true`. Optional otherwise (the server mints an id
+  // when absent). A valid explicit key is always honored.
   optional string instance_id = 4;
 
   // Optional idempotency key. See `RunJobRequest.idempotency_key`. The
@@ -2834,8 +2830,8 @@ message CreateInstancesRequest {
   repeated string instance_ids = 4;
 
   // Number of additional server-minted instances to create on top of
-  // `instance_ids`. Rejected (InvalidArgument) when the task declares
-  // `stateful.idSource: "caller"`, which requires caller-supplied ids. At
+  // `instance_ids`. Rejected (InvalidArgument) when the task sets
+  // `stateful.requireId: true`, which requires caller-supplied ids. At
   // least one of `instance_ids` / `count` must be non-empty/non-zero.
   uint32 count = 5;
 
@@ -4468,15 +4464,15 @@ message PressureAction {
   // Node `MemAvailable` when the step ran.
   uint64 available_bytes = 7;
 
-  // The `freeBelow` threshold in force, in bytes.
-  uint64 free_below_bytes = 8;
+  // The `minFree` threshold in force, in bytes.
+  uint64 min_free_bytes = 8;
 
   // Node-wide PSI `some avg10` when the step ran, in percent. Zero when the
   // kernel has no PSI.
   double stall_percent = 9;
 
-  // The `stallAbove` threshold in force, in percent.
-  double stall_above_percent = 10;
+  // The `maxStall` threshold in force, in percent.
+  double max_stall_percent = 10;
 
   // One sentence naming the step and the numbers, e.g. "evicted by
   // evict-bursting on w-03: using 1.9 GiB of a 400 MiB reservation while
@@ -4505,16 +4501,16 @@ message MemoryPressureStatus {
   // watch (a non-Linux worker).
   bool enabled = 1;
 
-  // Whether a trigger is firing right now: free memory below `freeBelow`,
-  // or stall above `stallAbove`.
+  // Whether a trigger is firing right now: free memory below `minFree`,
+  // or stall above `maxStall`.
   bool under_pressure = 2;
 
-  // `freeBelow` resolved for this node, in bytes. Default 5% of node memory,
+  // `minFree` resolved for this node, in bytes. Default 5% of node memory,
   // at least 256 MiB and at most 4 GiB.
-  uint64 free_below_bytes = 3;
+  uint64 min_free_bytes = 3;
 
-  // `stallAbove` in percent. Default 10.
-  double stall_above_percent = 4;
+  // `maxStall` in percent. Default 10.
+  double max_stall_percent = 4;
 
   // `settle` in seconds. Default 5.
   uint64 settle_seconds = 5;

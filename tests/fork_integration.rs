@@ -238,7 +238,7 @@ fn task(runtime: &str, storage: bool) -> TaskConfig {
         },
         stateful: Some(StatefulConfig {
             mode: InstanceMode::Keyed,
-            id_source: None,
+            require_id: false,
             initial_instances: None,
             on_lost: None,
             storage: storage.then(|| StatefulStorageConfig {
@@ -1166,7 +1166,7 @@ async fn a_fork_stopped_before_its_checkpoint_restores_when_started() -> R<()> {
     Ok(())
 }
 
-/// Under `stateful.idSource = "caller"` forks still get derived
+/// Under `stateful.requireId = true` forks still get derived
 /// `<origin>-f<n>` ids, which stay in the caller's namespace. An origin id
 /// too long to suffix is refused rather than given a minted id.
 #[tokio::test(flavor = "multi_thread")]
@@ -1175,7 +1175,7 @@ async fn forks_of_a_caller_named_task_get_derived_ids() -> R<()> {
     cluster.add_node(ALL_OPS, "1.12.0")?;
     let mut caller_named = task("exec", true);
     if let Some(stateful) = caller_named.stateful.as_mut() {
-        stateful.id_source = Some("caller".into());
+        stateful.require_id = true;
     }
     cluster.submit(job(caller_named))?;
     cluster.active_origin()?;
@@ -1195,7 +1195,7 @@ async fn forks_of_a_caller_named_task_get_derived_ids() -> R<()> {
         .await
         .expect_err("no room for -f1");
     assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
-    assert!(status.message().contains("idSource"), "{status:?}");
+    assert!(status.message().contains("requireId"), "{status:?}");
     assert!(
         cluster
             .store()

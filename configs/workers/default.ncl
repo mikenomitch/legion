@@ -80,14 +80,14 @@
         # What the node does when it runs short of memory
         # (docs/resource-enforcement.md#memory-pressure). On whenever
         # `enabled` is. Every field is optional. Values below are the
-        # defaults except freeBelow, which scales with the node.
+        # defaults except minFree, which scales with the node.
         # memoryPressure = {
         #     enabled = true,
         #     # MemAvailable below this triggers the response. Default 5% of
         #     # node memory, at least 256MiB and at most 4GiB.
-        #     freeBelow = "2GiB",
+        #     minFree = "2GiB",
         #     # ...or memory PSI "some" (10s average) above this.
-        #     stallAbove = "10%",
+        #     maxStall = "10%",
         #     # Wait this long after each action before taking another.
         #     settle = "5s",
         #     # Always run in this order. Remove one to forbid it.

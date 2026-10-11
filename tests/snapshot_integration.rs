@@ -187,7 +187,7 @@ fn workspace_job(
         },
         stateful: Some(StatefulConfig {
             mode: InstanceMode::Keyed,
-            id_source: None,
+            require_id: false,
             initial_instances: None,
             on_lost: None,
             storage: Some(StatefulStorageConfig {

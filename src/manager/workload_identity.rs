@@ -1455,7 +1455,7 @@ mod tests {
         let task = TaskConfig {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,

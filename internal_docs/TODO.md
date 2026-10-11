@@ -1842,12 +1842,12 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           empty volume when started. A new instance now keeps its restore
           source across a stop and restores when started
           ([call 84](calls/suspend-resume-and-oversubscription-plan_calls.md)).
-    - [x] Fork ids under `idSource = "caller"`: verified derived
+    - [x] Fork ids under `requireId = true`: verified derived
           `<origin>-f<n>` ids work, and an origin id too long to suffix is
           refused there instead of given a minted id
           ([call 77](calls/suspend-resume-and-oversubscription-plan_calls.md)).
     - [ ] Caller-supplied fork ids (`ForkInstanceRequest.instance_ids`),
-          for platforms whose `idSource = "caller"` naming must choose
+          for platforms whose `requireId = true` naming must choose
           fork ids themselves.
     - [x] Cross-node fork and `--spread`: done at the Phase 6 and 7b
           integration. `--spread` publishes the memory checkpoint and places

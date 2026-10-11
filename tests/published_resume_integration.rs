@@ -285,7 +285,7 @@ fn job(durability: &str) -> JobConfig {
         // its checkpoint, so it can move.
         stateful: Some(StatefulConfig {
             mode: InstanceMode::Keyed,
-            id_source: None,
+            require_id: false,
             initial_instances: None,
             on_lost: None,
             storage: None,

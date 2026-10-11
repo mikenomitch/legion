@@ -670,9 +670,10 @@
             # LEGION_ALLOC_ID in its env (no LEGION_INSTANCE_SLOT).
             stateful = {
                 mode = "keyed",
-                # "uuid" = server mints ids when --id is omitted;
-                # "caller" = --id is required. Explicit ids always honored.
-                idSource = "uuid",
+                # Reject `instance create` without --id. Default false: the
+                # server mints an id when --id is omitted. Explicit ids are
+                # always honored.
+                requireId = true,
                 storage = {
                     # Opaque per-instance handle, reattached across
                     # reschedules and dropped on destroy.

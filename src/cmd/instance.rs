@@ -66,7 +66,7 @@ pub fn config() -> Command {
             \n\
             The target task must declare stateful.mode = \"keyed\". --group/--task\n\
             may be omitted when the job has exactly one keyed task. --id supplies\n\
-            an explicit key (required when the task sets idSource = \"caller\";\n\
+            an explicit key (required when the task sets requireId = true;\n\
             otherwise the server mints one) and may repeat; --count N asks the\n\
             server to mint N additional ids. Requests for more than one instance\n\
             are atomic (all-or-nothing): any collision or invalid id creates\n\

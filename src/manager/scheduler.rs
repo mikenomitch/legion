@@ -5431,7 +5431,7 @@ mod tests {
             count: TaskCount::new(count),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: crate::structs::InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -5713,7 +5713,7 @@ mod tests {
             count: TaskCount::new(3),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: crate::structs::InstanceMode::Keyed,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {

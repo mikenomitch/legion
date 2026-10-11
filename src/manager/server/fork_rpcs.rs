@@ -418,8 +418,7 @@ impl ManagerDaemonService {
                 count,
                 task.stateful
                     .as_ref()
-                    .and_then(|stateful| stateful.id_source.as_deref())
-                    == Some("caller"),
+                    .is_some_and(|stateful| stateful.require_id),
             )
             .map_err(|e| map_store_error("Error forking instance", e))?;
         let recorded = RecordedFork {

@@ -124,6 +124,12 @@ scheduler concern.
 
 ## 12. `idSource` declares the default, caller-supplied ids are always honored
 
+> **Revised (suspend-resume PR #15 review).** `idSource` became
+> `requireId = true`. The two-value enum only ever decided whether a create
+> without an id is rejected, and `"uuid"` read as if it forced generated ids
+> when a caller's id still won. The behavior is unchanged. No alias for the
+> old name.
+
 `idSource: 'caller'` makes `--id` required; `'uuid'`/unset lets the server mint.
 A valid caller-supplied id is accepted regardless — rejecting it under
 `idSource: 'uuid'` would add friction without a safety benefit (ids are validated

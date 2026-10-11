@@ -1046,7 +1046,7 @@ mod tests {
             config: json!({ "command": ["true"] }),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
@@ -1069,7 +1069,7 @@ mod tests {
             config: json!({ "command": ["true"] }),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: Some(crate::structs::StatefulOnLostConfig {
                     self_terminate_after: Some("30s".into()),
@@ -1257,7 +1257,7 @@ mod tests {
             speculative_start: speculative("boot"),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Keyed,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -1285,7 +1285,7 @@ mod tests {
             speculative_start: speculative("boot"),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Keyed,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {

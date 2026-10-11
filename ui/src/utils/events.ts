@@ -31,7 +31,7 @@ export type PressureEventMeta = {
   usedBytes?: number
   reservedBytes?: number
   availableBytes?: number
-  freeBelowBytes?: number
+  minFreeBytes?: number
 }
 
 export const pressureMeta = (event: SchedulerEvent): PressureEventMeta => {
@@ -46,7 +46,7 @@ export const pressureMeta = (event: SchedulerEvent): PressureEventMeta => {
     usedBytes: num(meta.used_bytes),
     reservedBytes: num(meta.reserved_bytes),
     availableBytes: num(meta.available_bytes),
-    freeBelowBytes: num(meta.free_below_bytes),
+    minFreeBytes: num(meta.min_free_bytes),
   }
 }
 

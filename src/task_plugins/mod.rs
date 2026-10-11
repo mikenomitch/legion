@@ -2263,7 +2263,7 @@ mod tests {
             count: crate::structs::TaskCount::new(2),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
@@ -2382,7 +2382,7 @@ mod tests {
             tasks: vec![TaskConfig {
                 stateful: Some(crate::structs::StatefulConfig {
                     mode: InstanceMode::Keyed,
-                    id_source: None,
+                    require_id: false,
                     initial_instances: None,
                     on_lost: None,
                     storage: None,

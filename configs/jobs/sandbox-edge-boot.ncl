@@ -35,7 +35,6 @@
                 # sandbox's identity (and its storage) can never leak into a
                 # new one.
                 mode = "keyed",
-                idSource = "uuid",
                 storage = {
                     path = "/workspace",
                     mode = "block",

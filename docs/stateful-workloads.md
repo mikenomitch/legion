@@ -131,7 +131,7 @@ restore checks, and its failure modes.
     count = 3,                    # slot cardinality: slots 0, 1, 2
     stateful = {
       mode = "slot",              # 'slot' (default) | 'keyed'
-      # idSource = "caller",     # keyed only: "caller" | "uuid"
+      # requireId = true,        # keyed only: refuse creates without --id
       # initialInstances = ["user-1", "user-2"],  # keyed only: seed list
       onLost = {                  # optional; node-loss fencing policy — see
                                  # "Node loss and fencing (at-most-one)"
@@ -162,7 +162,7 @@ Validation rules (enforced at `job validate` and submit time):
 
 - `mode` defaults to `'slot'`. Set `'keyed'` explicitly to use the
   instance-management model.
-- `idSource` is only valid in keyed mode (`'caller'` or `'uuid'`).
+- `requireId` is only valid in keyed mode.
 - Slot mode requires `count.num >= 1` and can't be combined with `count.per`
   (per-attribute pools would collide on slot ids).
 - Keyed mode **can't define `count` at all**. The spec is rejected at parse
@@ -596,8 +596,8 @@ contract. They're available as `legion instance ...` commands and as MCP
 tools (`legion_instance_create/stop/start/destroy/replace/list/get`):
 
 ```bash
-# create with an explicit key (idSource 'caller' requires one; with 'uuid'
-# or unset the server mints an id when --id is omitted)
+# create with an explicit key (requireId = true requires one; otherwise the
+# server mints an id when --id is omitted)
 legion instance create sandbox-demo --id user-42 -j
 # => { "ok": true, "data": { "instanceId": "user-42", "deduplicated": false } }
 
@@ -681,9 +681,10 @@ Resubmitting a stopped job (`job run`) clears the job's stopped status, but it
 
 - Allowed characters are `[A-Za-z0-9._-]`, and length is 1–128 (ids end up in
   env vars, workload identity subjects, and CLI args).
-- `stateful.idSource` sets the default source. `'caller'` makes the id
-  required on create. `'uuid'` (or unset) lets the server create one. A valid
-  caller-supplied id is always used regardless of `idSource`.
+- `stateful.requireId = true` makes the id required on create, and a batch
+  create can't ask the server to mint ids (`--count`). Without it (the
+  default), the server creates an id when the request omits one. A valid
+  caller-supplied id is always used either way.
 - Ids are unique across the whole cluster and **never recycled for the
   lifetime of the job that owns them**. Creating an id that matches any
   existing instance row, in this job or another one, is rejected

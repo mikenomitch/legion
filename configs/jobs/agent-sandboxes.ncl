@@ -33,7 +33,7 @@
       mode = "keyed",
       # The platform always names the instance (`--id user-42`), so its own
       # user ids map straight onto Legion's.
-      idSource = "caller",
+      requireId = true,
       storage = {
         # A guest kernel attaches a block device, so sandbox storage is
         # block mode. local-dir serves it as a disk image on the node and

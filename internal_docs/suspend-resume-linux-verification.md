@@ -393,19 +393,19 @@ This is the Phase 2 acceptance scenario on a real kernel: two tasks burst
 past their reservation, the node crosses its threshold, and the lower band is
 evicted with `cause = node_pressure` while the higher band survives.
 
-Prereqs: shared setup. Pick `freeBelow` so the two tasks can cross it: read
-`MemAvailable` from `/proc/meminfo` (call it `A` MiB) and set `freeBelow` to
+Prereqs: shared setup. Pick `minFree` so the two tasks can cross it: read
+`MemAvailable` from `/proc/meminfo` (call it `A` MiB) and set `minFree` to
 `A - 1500` MiB, so 1.5 GiB of new use triggers the response. Worker config:
 
 ```nickel
 resourceEnforcement = {
     enabled = true,
-    memoryPressure = { freeBelow = "<A - 1500>MiB", settle = "3s" },
+    memoryPressure = { minFree = "<A - 1500>MiB", settle = "3s" },
 },
 ```
 
 Restart the worker, which must log `Memory pressure response armed` with
-that `free_below_bytes`.
+that `min_free_bytes`.
 
 ```bash
 cat > /tmp/pressure.ncl <<'EOF2'
@@ -466,7 +466,7 @@ memoryMax = 1100` (no burst) and the same python command, plus a low-band
 
 Pass: only `noisy` is ever evicted, and `batch` never appears in the preview.
 Then set `oversubscribe = { memory = 1.5 }`, restart, and repeat with only
-`batch` running and `freeBelow` set so that `batch` alone crosses it: the
+`batch` running and `minFree` set so that `batch` alone crosses it: the
 preview shows `batch` with `evict-reserved`, and it is evicted with that step.
 
 ### 2.5 `memory.reclaim` frees page cache
@@ -474,7 +474,7 @@ preview shows `batch` with `evict-reserved`, and it is evicted with that step.
 Prereqs: kernel 5.19 or later. A task that fills page cache above its
 reservation, for example `exec` with `memory = 128, memoryMax = 1024` running
 `sh -c 'head -c 800m /dev/urandom > /tmp/f; cat /tmp/f > /dev/null; sleep 3600'`
-with a private tmp, and a `freeBelow` it crosses.
+with a private tmp, and a `minFree` it crosses.
 
 Pass: a `node.pressure` `reclaim` event with `freed_bytes` well above zero,
 `memory.current` of the task falls toward 128 MiB, and the task keeps
@@ -1105,7 +1105,7 @@ This is the Phase 5 pressure acceptance check. Run two allocations on one
 node: the `agents` instance (opted in, bursting to about 900 MiB of its 512
 MiB reservation) and a plain `exec` job bursting past its reservation
 (`resources = { memory = 128, memoryMax = 2048 }`, command `stress-ng --vm 1
---vm-bytes 1500M --vm-keep`). Set the worker's `memoryPressure.freeBelow` a
+--vm-bytes 1500M --vm-keep`). Set the worker's `memoryPressure.minFree` a
 little under the node's current `MemAvailable`, then push it below with a
 host-side `stress-ng --vm 1 --vm-bytes <N>M --vm-keep`.
 
@@ -1836,7 +1836,7 @@ Save as `/tmp/t1.ncl`:
     name = "workspace",
     runtime = "sandbox",
     resources = { memory = 512, memoryMax = 1024, cpu = 500 },
-    stateful = { mode = "keyed", idSource = "caller" },
+    stateful = { mode = "keyed", requireId = true },
     config = {
       image = "<your glibc image>",
       command = ["/bin/sh", "-c", "while true; do date; cat /legion/identity/platform 2>/dev/null | cut -c1-24; sleep 30; done"],

@@ -189,7 +189,7 @@ fn maximal_job_spec_parse() {
         .expect("maximal must declare the keyed sandbox task");
     let stateful = sandbox.stateful.as_ref().expect("stateful block parsed");
     assert_eq!(stateful.mode, legion::structs::InstanceMode::Keyed);
-    assert_eq!(stateful.id_source.as_deref(), Some("uuid"));
+    assert!(stateful.require_id);
     sandbox
         .validate_stateful()
         .expect("keyed sandbox task validates");

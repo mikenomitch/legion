@@ -202,7 +202,7 @@ fn evict(allocation_id: i64, job_id: &str, step: &str) -> PressureAction {
         used_bytes: 1900 * MIB,
         reserved_bytes: 400 * MIB,
         available_bytes: 1100 * MIB,
-        free_below_bytes: 2048 * MIB,
+        min_free_bytes: 2048 * MIB,
         detail: format!(
             "evicted by {step} on w-03: using 1.9 GiB of a 400 MiB reservation while free \
              memory was 1.1 GiB (threshold 2 GiB)"

@@ -361,7 +361,7 @@ with a cold boot on its retained volume. The worker needs no configuration:
   tasks = [{
     name = "workspace",
     runtime = "sandbox",
-    stateful = { mode = "keyed", idSource = "caller", storage = { path = "/workspace" } },
+    stateful = { mode = "keyed", requireId = true, storage = { path = "/workspace" } },
     config = {
       image = "alpine:latest",
       command = ["/bin/sh", "-c", "echo boot >> /workspace/boots; exec sleep 100000"],
@@ -1208,7 +1208,7 @@ Fork ids are never recycled. When `run-17-f1` was destroyed, the next fork of
 `run-17` is `run-17-f2`. An origin id too long to suffix gets server-minted
 ids instead. The reply lists the ids either way.
 
-Forks get derived ids under `stateful.idSource = "caller"` too. A fork id is
+Forks get derived ids under `stateful.requireId = true` too. A fork id is
 the caller's id plus `-f<n>`, so it stays in the caller's namespace, and the
 caller never has to pick one. There, an origin id too long to suffix (over
 124 characters) is refused instead of given a minted id. Create instances
@@ -1400,7 +1400,7 @@ Fork refuses what it cannot do, at the API, before creating anything:
 | `--spread places forks on other nodes, ... a disk checkpoint ... cannot be published` | Drop `--checkpoint disk`, or drop `--spread` |
 | `--spread places forks on other nodes, but instance ... keeps its data on a \`local-dir\` volume` | A spread fork cannot carry an instance volume. Drop `--spread`, or `stateful.storage` |
 | `--spread publishes the fork checkpoint ... whose worker has no contentStore` | Add `contentStore { url }` to the origin's worker config |
-| `is too long to fork ... idSource = "caller"` | The fork id would pass 128 characters. Use shorter ids, or create from a snapshot |
+| `is too long to fork ... requireId = true` | The fork id would pass 128 characters. Use shorter ids, or create from a snapshot |
 
 ## Create from a snapshot
 

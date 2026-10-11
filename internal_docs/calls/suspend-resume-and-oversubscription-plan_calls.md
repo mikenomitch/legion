@@ -287,6 +287,12 @@ constant keeps the surface to one toggle until someone needs to tune it.
 
 ## 11. Memory pressure is configured as named steps under `resourceEnforcement`, with a previewable order
 
+> **Revised (PR #15 review).** The triggers were renamed `minFree` and
+> `maxStall`, from `freeBelow` and `stallAbove`, to match
+> `content.minFreeDisk`: memory and disk floors use the same words, and each
+> reads as a limit the node defends. No alias for the old names. The worker
+> config rejects unknown fields, so an old name fails at load.
+
 *Execution-time revision of the plan's §6.4.*
 
 **Call.** The pressure response is described by what happens to a task, not

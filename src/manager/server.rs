@@ -4910,24 +4910,23 @@ impl Manager for ManagerDaemonService {
             inner.task.as_deref(),
         )?;
 
-        // Id policy: idSource declares the default source; a valid explicit
-        // key is always honored. See proto comments.
+        // Id policy: a valid explicit key is always honored, and requireId
+        // refuses a create without one. See proto comments.
         let requested_id = inner.instance_id.as_deref().filter(|id| !id.is_empty());
-        let id_source = task
+        let require_id = task
             .stateful
             .as_ref()
-            .and_then(|stateful| stateful.id_source.as_deref());
+            .is_some_and(|stateful| stateful.require_id);
         match requested_id {
             Some(id) => validate_keyed_instance_id(id).map_err(Status::invalid_argument)?,
-            None => {
-                if id_source == Some("caller") {
-                    return Err(Status::invalid_argument(format!(
-                        "task {} declares stateful.idSource = \"caller\"; CreateInstance must \
-                         supply instance_id",
-                        task.name
-                    )));
-                }
+            None if require_id => {
+                return Err(Status::invalid_argument(format!(
+                    "task {} sets stateful.requireId = true; CreateInstance must supply \
+                     instance_id",
+                    task.name
+                )));
             }
+            None => {}
         }
 
         // Phase 6: restore from a snapshot instead of booting empty.
@@ -5072,17 +5071,16 @@ impl Manager for ManagerDaemonService {
             inner.task.as_deref(),
         )?;
 
-        // idSource "caller" requires every id to be caller-supplied;
-        // server-minting (`count`) contradicts that policy.
-        let id_source = task
+        // requireId means every id is caller-supplied, and server-minting
+        // (`count`) contradicts that.
+        let require_id = task
             .stateful
             .as_ref()
-            .and_then(|stateful| stateful.id_source.as_deref());
-        if id_source == Some("caller") && inner.count > 0 {
+            .is_some_and(|stateful| stateful.require_id);
+        if require_id && inner.count > 0 {
             return Err(Status::invalid_argument(format!(
-                "task {} declares stateful.idSource = \"caller\", so every id must be \
-                 caller-supplied; count > 0 asks the server to mint ids — list explicit \
-                 instance_ids instead",
+                "task {} sets stateful.requireId = true, so every id must be caller-supplied; \
+                 count > 0 asks the server to mint ids. List explicit instance_ids instead",
                 task.name
             )));
         }
@@ -11582,7 +11580,7 @@ mod tests {
         let task = TaskConfig {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
@@ -11841,7 +11839,7 @@ mod tests {
         let task = TaskConfig {
             stateful: Some(crate::structs::StatefulConfig {
                 mode: crate::structs::InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -14771,12 +14769,12 @@ mod tests {
     // KEYED-MODE INSTANCE RPCs (see docs/stateful-workloads.md)
     //
 
-    fn keyed_task(name: &str, group: &str, id_source: Option<&str>) -> TaskConfig {
+    fn keyed_task(name: &str, group: &str, require_id: bool) -> TaskConfig {
         TaskConfig {
             group: group.into(),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Keyed,
-                id_source: id_source.map(String::from),
+                require_id,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -14838,7 +14836,11 @@ mod tests {
         insert_node(&store, "node-a")?;
         let manager = ManagerDaemonService::new(store.clone());
         let job_id = "sandbox-rpc";
-        submit_keyed_job(&store, job_id, vec![keyed_task("sandbox", "default", None)])?;
+        submit_keyed_job(
+            &store,
+            job_id,
+            vec![keyed_task("sandbox", "default", false)],
+        )?;
         // Keyed task with zero instances: the submit eval placed nothing.
         assert!(store.allocs_for_job(job_id)?.is_empty());
 
@@ -14985,8 +14987,8 @@ mod tests {
             &store,
             "multi",
             vec![
-                keyed_task("sandbox", "sandboxes", None),
-                keyed_task("runner", "runners", Some("caller")),
+                keyed_task("sandbox", "sandboxes", false),
+                keyed_task("runner", "runners", true),
             ],
         )?;
         let status = create("multi", None, None, None).expect_err("ambiguous keyed task");
@@ -15004,17 +15006,17 @@ mod tests {
         assert_eq!(instance.group, "sandboxes");
         assert_eq!(instance.task_name, "sandbox");
 
-        // idSource = "caller": the id is required ...
+        // requireId: the id is required ...
         let status = create("multi", None, Some("runner"), None).expect_err("caller id required");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert!(status.message().contains("idSource"));
+        assert!(status.message().contains("requireId"));
         // ... and an explicit one is accepted.
         let reply = create("multi", None, Some("runner"), Some("tenant-1"))
             .map_err(|err| anyhow!(err))?
             .into_inner();
         assert_eq!(reply.instance_id, "tenant-1");
 
-        // Explicit ids are accepted even when idSource is unset/uuid ...
+        // Explicit ids are accepted without requireId too ...
         let reply = create("multi", Some("sandboxes"), None, Some("explicit.id_OK-1"))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -15051,7 +15053,11 @@ mod tests {
         insert_node(&store, "node-a")?;
         let manager = ManagerDaemonService::new(store.clone());
         let job_id = "sandbox-idem";
-        submit_keyed_job(&store, job_id, vec![keyed_task("sandbox", "default", None)])?;
+        submit_keyed_job(
+            &store,
+            job_id,
+            vec![keyed_task("sandbox", "default", false)],
+        )?;
         let runtime = tokio::runtime::Runtime::new()?;
 
         // Create twice with the same key: one instance, replayed reply.
@@ -15117,8 +15123,8 @@ mod tests {
             &store,
             job_id,
             vec![
-                keyed_task("sandbox", "sandboxes", None),
-                keyed_task("runner", "runners", None),
+                keyed_task("sandbox", "sandboxes", false),
+                keyed_task("runner", "runners", false),
             ],
         )?;
         store.create_keyed_instance(job_id, "sandboxes", "sandbox", Some("s-1"))?;

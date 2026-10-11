@@ -281,7 +281,7 @@ fn job(runtime: &str, suspend: Option<SuspendConfig>) -> JobConfig {
         },
         stateful: Some(StatefulConfig {
             mode: InstanceMode::Keyed,
-            id_source: None,
+            require_id: false,
             initial_instances: None,
             on_lost: None,
             storage: Some(StatefulStorageConfig {
@@ -1065,7 +1065,7 @@ fn suspend_action(snapshot_id: &str, allocation_id: i64) -> PressureAction {
         used_bytes: 600 << 20,
         reserved_bytes: 512 << 20,
         available_bytes: 100 << 20,
-        free_below_bytes: 819 << 20,
+        min_free_bytes: 819 << 20,
         detail: "suspended by suspend on suspend-node: using 600 MiB of a 512 MiB reservation"
             .into(),
         snapshot_id: snapshot_id.into(),
