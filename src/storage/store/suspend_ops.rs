@@ -214,17 +214,13 @@ impl Store {
     }
 
     /// Keep a suspended instance's allocation row as its node charge, when
-    /// it holds anything: `max(suspend.reserve, node suspendedReserve)`
+    /// it holds anything under its job's `suspend.reserve`
     /// (docs/suspend-and-resume.md, "Capacity for resumes"). The row turns
     /// `suspended`, which keeps it out of every worker's desired set, and
     /// below a full hold its resources shrink to the held share, so the fit
     /// check, the read model, and the plan-apply recheck all count exactly
     /// that share. Returns false when nothing is held and the caller deletes
     /// the row as before.
-    ///
-    /// The floor is read from the node row now, once: a node that later
-    /// re-registers with a different floor does not re-charge instances
-    /// already suspended on it.
     fn hold_for_suspend_tx(
         &self,
         tx: &Connection,
@@ -237,18 +233,9 @@ impl Store {
         let Some(allocation) = allocations.first() else {
             return Ok(false);
         };
-        let floor: f64 = tx
-            .query_row(
-                "SELECT config_attrs FROM node WHERE id = ?1;",
-                [&allocation.node_id],
-                |row| row.get::<_, Value>(0),
-            )
-            .optional()?
-            .map(|attrs| crate::resources::node_suspended_reserve(&attrs))
-            .unwrap_or(0.0);
         let hold = self
             .resource_policy
-            .suspended_hold(&allocation.resources, reserve, floor)
+            .suspended_hold(&allocation.resources, reserve)
             .unwrap_or_else(|err| {
                 // A row whose resources do not parse cannot be scaled. Hold it
                 // whole rather than free capacity nobody can account for.

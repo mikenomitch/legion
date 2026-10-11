@@ -771,8 +771,8 @@ fn idle_policy_unmeasured_detail(
         )
     } else {
         format!(
-            "node {} sends no usage reports (set resourceEnforcement.enabled on its worker \
-             type)",
+            "node {} sends no usage reports (resource enforcement is off or unavailable on its \
+             worker; check the worker log)",
             allocation.node_id
         )
     };

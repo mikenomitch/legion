@@ -249,7 +249,7 @@ impl<'de> Deserialize<'de> for SuspendReserveConfig {
 }
 
 /// [`SuspendReserveConfig`] resolved: what a suspended instance keeps
-/// charged to its node, before the node's `suspendedReserve` floor.
+/// charged to its node.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SuspendReserve {
     /// A share of the reservation's memory and cpu MHz, `0.0..=1.0`. At

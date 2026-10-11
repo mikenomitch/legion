@@ -66,23 +66,11 @@ impl Cluster {
     }
 
     fn add_node(&self, capabilities: Value) -> R<()> {
-        self.add_node_with(capabilities, json!({}))
-    }
-
-    /// `add_node` with extra registration attributes (for example a
-    /// `suspendedReserve` floor) merged into `config_attrs`.
-    fn add_node_with(&self, capabilities: Value, extra_attrs: Value) -> R<()> {
-        let mut config_attrs = json!({
+        let config_attrs = json!({
             "node_id": NODE,
             "maxAllocations": 20,
             "resources": { "memory": 65536, "cpu": 40000 },
         });
-        if let (Some(attrs), Some(extra)) = (config_attrs.as_object_mut(), extra_attrs.as_object())
-        {
-            for (key, value) in extra {
-                attrs.insert(key.clone(), value.clone());
-            }
-        }
         self.store().insert_node(NodeMsg::from(Node {
             id: NODE.to_string(),
             pool: "default".into(),
@@ -1392,53 +1380,6 @@ async fn a_partial_reserve_holds_its_share_and_the_resume_releases_it() -> R<()>
     assert_eq!(allocs[0].resources["memory"], json!(2048));
     let info = cluster.info().await?;
     assert_eq!(info.held_memory_mib, None);
-    Ok(())
-}
-
-/// The node's `suspendedReserve` floor holds a share even for a job that
-/// reserves nothing, and loses to a larger job reserve.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_node_floor_holds_a_share_when_the_job_reserves_nothing() -> R<()> {
-    let cluster = Cluster::new()?;
-    cluster.add_node_with(json!(["checkpoint"]), json!({ "suspendedReserve": 0.5 }))?;
-    cluster.submit(job_with(
-        "exec",
-        Some(SuspendConfig::default()),
-        json!({ "memory": 2048, "cpu": 1000 }),
-    ))?;
-    let first = cluster.active_instance()?;
-    cluster.suspended(first).await?;
-    let held = held_row(&cluster)?.context("the floor holds a row")?;
-    assert_eq!(held.resources["memory"], json!(1024.0));
-    assert_eq!(held.resources["cpu"], json!(500.0));
-    let usage = cluster.node_usage().await?;
-    assert_eq!(usage.suspended.context("summary")?.suspended_reserve, 0.5);
-    Ok(())
-}
-
-/// A job's fixed amount beats a smaller floor, per dimension.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_amount_reserve_combines_with_the_floor_per_dimension() -> R<()> {
-    let cluster = Cluster::new()?;
-    cluster.add_node_with(json!(["checkpoint"]), json!({ "suspendedReserve": 0.25 }))?;
-    cluster.submit(job_with(
-        "exec",
-        Some(SuspendConfig {
-            reserve: Some(SuspendReserveConfig::Amount(
-                legion::structs::suspend::SuspendReserveAmount {
-                    memory: Some(json!("1GiB")),
-                    cpu: None,
-                },
-            )),
-            ..Default::default()
-        }),
-        json!({ "memory": 2048, "cpu": 1000 }),
-    ))?;
-    let first = cluster.active_instance()?;
-    cluster.suspended(first).await?;
-    let held = held_row(&cluster)?.context("held")?;
-    assert_eq!(held.resources["memory"], json!(1024.0), "the amount wins");
-    assert_eq!(held.resources["cpu"], json!(250.0), "the floor wins");
     Ok(())
 }
 

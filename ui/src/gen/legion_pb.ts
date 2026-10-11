@@ -5851,9 +5851,8 @@ export class InstanceInfo extends Message<InstanceInfo> {
 
   /**
    * MiB of memory a suspended instance keeps charged to its node, so a
-   * resume finds room: `max(suspend.reserve, the node's
-   * resourceEnforcement.suspendedReserve)` of its reservation, applied when
-   * the suspend landed. Unset when the instance holds nothing (the default)
+   * resume finds room: its job's `suspend.reserve` share of its
+   * reservation, applied when the suspend landed. Unset when the instance holds nothing (the default)
    * or is not suspended. With `reserve = true` this is the whole
    * reservation.
    *
@@ -11675,7 +11674,7 @@ export class SuspendedCapacity extends Message<SuspendedCapacity> {
 
   /**
    * Of those, how many keep a charge on the node (a held allocation row,
-   * from `suspend.reserve` or the node's `suspendedReserve` floor). Their
+   * from the job's `suspend.reserve`). Their
    * rows also appear in `GetNodeUsageReply.allocations` with
    * `suspended = true`, and their held amounts are already part of the
    * reply's `memory.reserved` and `cpu.reserved`.
@@ -11709,19 +11708,11 @@ export class SuspendedCapacity extends Message<SuspendedCapacity> {
   checkpointBytes = protoInt64.zero;
 
   /**
-   * The node's `resourceEnforcement.suspendedReserve` floor as it
-   * registered, 0 when unset.
-   *
-   * @generated from field: double suspended_reserve = 6;
-   */
-  suspendedReserve = 0;
-
-  /**
    * The node's `snapshots` content budget as its worker last reported it.
    * Unset when the worker has no content store, predates the report, or no
    * heartbeat has reached this manager since it started.
    *
-   * @generated from field: optional legion.SnapshotBudget snapshot_budget = 7;
+   * @generated from field: optional legion.SnapshotBudget snapshot_budget = 6;
    */
   snapshotBudget?: SnapshotBudget;
 
@@ -11738,8 +11729,7 @@ export class SuspendedCapacity extends Message<SuspendedCapacity> {
     { no: 3, name: "held_memory_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
     { no: 4, name: "held_cpu_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
     { no: 5, name: "checkpoint_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
-    { no: 6, name: "suspended_reserve", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
-    { no: 7, name: "snapshot_budget", kind: "message", T: SnapshotBudget, opt: true },
+    { no: 6, name: "snapshot_budget", kind: "message", T: SnapshotBudget, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SuspendedCapacity {

@@ -344,20 +344,15 @@ without it the policy cannot act, and `instance get` says so in `detail`
 ### macOS dev loop
 
 A Mac has no cgroups, so it measures sandboxes another way. A `sandbox` task
-on a macOS worker runs on Apple `container` (dev mode), and with
-`resourceEnforcement.enabled` the worker reads each one's CPU, memory, and
+on a macOS worker runs on Apple `container` (dev mode), and with resource
+enforcement on (the default) the worker reads each one's CPU, memory, and
 network from one `container stats --format json --no-stream` call per usage
 report. It confines nothing: on macOS the switch only turns measuring on.
 Legion exec sessions (`legion alloc exec`) count for `exec` too.
 
 That is enough for idle suspend in disk mode. A Mac cannot take memory
 checkpoints, so the sandbox suspends with `checkpoint = "disk"` and resumes
-with a cold boot on its retained volume:
-
-```nickel
-# workers/devsandbox.ncl, in the manager's workerConfigPath
-{ workerType = "devsandbox", resourceEnforcement = { enabled = true } }
-```
+with a cold boot on its retained volume. The worker needs no configuration:
 
 ```nickel
 # a dev copy of the sandbox job

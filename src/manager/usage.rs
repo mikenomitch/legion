@@ -279,7 +279,6 @@ pub fn build_node_usage_reply(
         holding: held.clone().count() as u32,
         held_memory_mib: held.clone().map(|row| row.reserved_memory_mib).sum(),
         held_cpu_mhz: held.map(|row| row.reserved_cpu_mhz).sum(),
-        suspended_reserve: crate::resources::node_suspended_reserve(&node.config_attrs),
         ..Default::default()
     };
 

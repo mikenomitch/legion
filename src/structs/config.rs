@@ -2257,9 +2257,9 @@ pub struct WorkerConfigAlt {
     /// loading such a config (heartbeat-scale plan §5).
     #[serde(default)]
     pub heartbeat_seconds: Option<u32>,
-    /// Whether this worker turns a task's declared `resources` into real
-    /// kernel limits for host processes (see docs/task-supervision.md). Off
-    /// unless declared.
+    /// How this worker turns a task's declared `resources` into real kernel
+    /// limits (see docs/resource-enforcement.md). Absent means the defaults:
+    /// enforcement on, wherever the node can carry it.
     #[serde(default)]
     pub resource_enforcement: Option<WorkerResourceEnforcementConfig>,
     /// `sandbox` runtime settings for workers of this type. Only meaningful
@@ -2274,18 +2274,19 @@ pub struct WorkerConfigAlt {
     pub edge_boot: Option<WorkerEdgeBootConfig>,
 }
 
-/// Worker `resourceEnforcement` block: cgroup v2 limits for `exec` tasks.
+/// Worker `resourceEnforcement` block: cgroup v2 limits for governed tasks.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerResourceEnforcementConfig {
-    /// Enforce `resources` as cgroup limits. Default false — a declaration
-    /// that was only ever a scheduling estimate should not start OOM-killing
-    /// workloads because the cluster upgraded.
-    #[serde(default)]
+    /// Enforce `resources` as cgroup limits. Default true: memory pressure,
+    /// oversubscription, `memoryMax` bursting, and sandbox confinement all
+    /// need it. A node that cannot enforce (not Linux, no cgroup v2, or no
+    /// write access to `cgroupParent`) warns once and runs tasks unconfined.
+    #[serde(default = "default_enforcement_enabled")]
     pub enabled: bool,
     /// cgroup v2 path (relative to `/sys/fs/cgroup`) under which this worker
-    /// creates one subtree per allocation. Must already exist, with `+memory`
-    /// and `+cpu` in its `cgroup.subtree_control`.
+    /// creates one subtree per allocation. The worker creates it and
+    /// delegates `+memory` and `+cpu` to it on start.
     #[serde(default = "default_cgroup_parent")]
     pub cgroup_parent: String,
     /// The worker type's top-level `sandbox` block, folded in by the manager
@@ -2306,23 +2307,9 @@ pub struct WorkerResourceEnforcementConfig {
     /// defaults that scale with the node, so this block is optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_pressure: Option<WorkerMemoryPressureConfig>,
-    /// The share of a suspended instance's reservation this node keeps
-    /// charged, whatever its job's `suspend.reserve` says (docs/
-    /// suspend-and-resume.md, "Capacity for resumes"). A ratio `0..=1`,
-    /// default 0.0. Each suspended instance is charged `max(job reserve,
-    /// this)`. It rides registration as `config_attrs.suspendedReserve`.
-    /// Unlike the other fields here it needs no cgroups: it changes only
-    /// what the scheduler counts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub suspended_reserve: Option<f64>,
 }
 
 impl WorkerResourceEnforcementConfig {
-    /// The `suspendedReserve` floor, 0.0 when unset.
-    pub fn suspended_reserve(&self) -> f64 {
-        self.suspended_reserve.unwrap_or(0.0)
-    }
-
     /// The memory oversubscription ratio, 1.0 when unset.
     pub fn memory_ratio(&self) -> f64 {
         self.oversubscribe
@@ -2370,15 +2357,6 @@ impl WorkerResourceEnforcementConfig {
         }
         if let Some(pressure) = self.memory_pressure.as_ref() {
             pressure.validate()?;
-        }
-        if let Some(floor) = self.suspended_reserve {
-            if !(floor.is_finite() && (0.0..=1.0).contains(&floor)) {
-                bail!(
-                    "resourceEnforcement.suspendedReserve must be a ratio between 0 and 1, got \
-                     {floor}. 0.25 keeps a quarter of each suspended instance's memory and cpu \
-                     reserved on this node"
-                );
-            }
         }
         Ok(())
     }
@@ -2501,6 +2479,10 @@ pub struct WorkerSandboxConfig {
     pub vmm_overhead_mib: Option<u64>,
 }
 
+fn default_enforcement_enabled() -> bool {
+    true
+}
+
 fn default_cgroup_parent() -> String {
     "legion".to_string()
 }
@@ -2508,12 +2490,11 @@ fn default_cgroup_parent() -> String {
 impl Default for WorkerResourceEnforcementConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_enforcement_enabled(),
             cgroup_parent: default_cgroup_parent(),
             sandbox: None,
             oversubscribe: None,
             memory_pressure: None,
-            suspended_reserve: None,
         }
     }
 }
@@ -2770,25 +2751,18 @@ mod tests {
                 serde_json::json!({ "enabled": true, "memoryPressure": { "freeBelow": "lots" } }),
                 "freeBelow",
             ),
-            (
-                serde_json::json!({ "suspendedReserve": 1.5 }),
-                "suspendedReserve must be a ratio between 0 and 1",
-            ),
-            (
-                serde_json::json!({ "suspendedReserve": -0.1 }),
-                "suspendedReserve",
-            ),
         ] {
             let err = parse(bad).validate().expect_err("invalid");
             assert!(format!("{err:#}").contains(needle), "{err:#}");
         }
-        // The suspended floor needs no cgroups.
-        let floor = parse(serde_json::json!({ "enabled": false, "suspendedReserve": 0.25 }));
-        floor
-            .validate()
-            .expect("a floor without enforcement is valid");
-        assert_eq!(floor.suspended_reserve(), 0.25);
-        assert_eq!(parse(serde_json::json!({})).suspended_reserve(), 0.0);
+        // A removed or misspelled field fails to parse instead of being
+        // ignored.
+        assert!(serde_json::from_value::<WorkerResourceEnforcementConfig>(
+            serde_json::json!({ "suspendedReserve": 0.25 })
+        )
+        .is_err());
+        // Enforcement is on unless turned off.
+        assert!(parse(serde_json::json!({})).enabled);
         // Ratio 1.0 without enforcement is the default, not an error.
         parse(serde_json::json!({ "enabled": false, "oversubscribe": { "memory": 1.0 } }))
             .validate()

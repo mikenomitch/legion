@@ -1519,10 +1519,15 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       affinity, no SMT-sibling avoidance. Nomad gates this behind Enterprise;
       revisit with a workload that measurably needs it
       ([docs](../docs/resource-enforcement.md#not-implemented)).
+- [x] **Resource enforcement on by default** (PR #15). `enabled` defaults to
+      `true` and an absent block means the defaults. A Linux worker that
+      can't create `cgroupParent` warns once at start and runs unconfined
+      ([docs](../docs/resource-enforcement.md#defaults-and-turning-it-off),
+      [call 4](calls/host-process-supervision-plan_calls.md)).
 - [ ] **A delegated (non-root) cgroup hierarchy root.** Enforcement assumes a
       root worker creating `legion/` at the cgroup root; a configurable root
       for delegated setups is unbuilt
-      ([docs](../docs/resource-enforcement.md#turning-it-on)).
+      ([docs](../docs/resource-enforcement.md#defaults-and-turning-it-off)).
 - [ ] **`legion alloc signal`** — an on-demand signal verb. The plumbing now
       exists (`TaskPlugin::signal`, routed through the registry); today signals
       are only delivered by declared policy (`changeSignal` on identity

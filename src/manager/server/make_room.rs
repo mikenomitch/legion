@@ -17,7 +17,7 @@
 //!   a `suspend` block is never touched.
 //! - **All or nothing.** Suspends start only when suspending the chosen set
 //!   is enough for the resume to fit, counting what each victim keeps held
-//!   (`suspend.reserve` and the node's `suspendedReserve`). A node that could
+//!   (`suspend.reserve`). A node that could
 //!   never fit the resume loses nothing.
 //! - **No thrash.** An instance that became active (started or resumed)
 //!   within [`MAKE_ROOM_COOLDOWN`] is never chosen, so two resumes cannot
@@ -309,7 +309,6 @@ fn make_room_for(
         ));
     }
 
-    let floor = crate::resources::node_suspended_reserve(&node.config_attrs);
     let now_unix = chrono::Utc::now().timestamp();
     let cooldown = state.cooldown.as_secs() as i64;
     let usage = usage.lock().unwrap_or_else(|p| p.into_inner());
@@ -375,7 +374,7 @@ fn make_room_for(
         let Ok(running) = policy.usage_request(&allocation.resources) else {
             continue;
         };
-        let held = match policy.suspended_hold(&allocation.resources, settings.reserve, floor)? {
+        let held = match policy.suspended_hold(&allocation.resources, settings.reserve)? {
             SuspendedHold::Nothing => None,
             SuspendedHold::Full => Some(running.clone()),
             SuspendedHold::Partial(resources) => Some(policy.usage_request(&resources)?),

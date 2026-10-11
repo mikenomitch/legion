@@ -59,16 +59,16 @@
     #     # object from KV, the same shape artifact auth.kv takes:
     #     # auth = { kv = "legion/content-store" },
     # },
-    # Turn a task's declared `resources` into real kernel limits for `exec`
-    # tasks (docs/task-supervision.md). Off by default: a declaration that was
-    # only ever a scheduling estimate should not start OOM-killing workloads
-    # because the cluster upgraded. Linux + cgroup v2 only; a node that cannot
-    # enforce logs a warning and runs the task unconfined.
+    # Turn a task's declared `resources` into real kernel limits
+    # (docs/resource-enforcement.md). On by default: memory pressure,
+    # oversubscription, memoryMax, usage reports, and sandbox confinement
+    # need it. Set false to treat `resources` as scheduling estimates only.
+    # Linux + cgroup v2 with a root worker; a node that cannot enforce logs a
+    # warning at startup and runs tasks unconfined.
     resourceEnforcement = {
-        enabled = false,
-        # Path under /sys/fs/cgroup. Must exist, with `+memory` and `+cpu` in
-        # its cgroup.subtree_control; Legion creates one subtree per
-        # allocation beneath it.
+        enabled = true,
+        # Path under /sys/fs/cgroup. The worker creates it and one subtree
+        # per allocation beneath it.
         cgroupParent = "legion",
         # Pack this node past its physical capacity: schedulable memory is
         # (physical - reservedResources.memory) x memory. Above 1.0 a task

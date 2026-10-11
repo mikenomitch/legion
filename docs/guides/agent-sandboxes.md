@@ -49,11 +49,9 @@ your databases.
   pool = "sandboxes",
 
   resourceEnforcement = {
-    # Required. Measures usage (which the idle policy reads), sets
-    # memory.low and memory.max per sandbox, and turns on the pressure
-    # response.
-    enabled = true,
-    cgroupParent = "legion",
+    # Enforcement is on by default. It measures usage (which the idle
+    # policy reads), sets memory.low and memory.max per sandbox, and runs
+    # the pressure response.
     # Schedulable memory = (physical - reservedResources.memory) x 1.25.
     # See "Picking a ratio" below before you raise it.
     oversubscribe = { memory = 1.25 },
@@ -84,12 +82,12 @@ your databases.
 }
 ```
 
-**`resourceEnforcement.enabled`** is not optional here. Without it the node
-sends no usage reports, so the idle policy cannot see that a sandbox went
-quiet, `memoryMax` is not enforced, and there is no pressure response. It
-needs cgroup v2 and a root worker. A node that cannot enforce logs a warning
-and runs tasks unconfined. See
-[resource enforcement](../resource-enforcement.md#turning-it-on).
+**Resource enforcement** is on by default, and sandboxes need it. Without it
+the node sends no usage reports, so the idle policy cannot see that a sandbox
+went quiet, `memoryMax` is not enforced, and there is no pressure response.
+It needs cgroup v2 and a root worker. A node that cannot enforce logs a
+warning at startup and runs tasks unconfined, so check the worker log once.
+See [resource enforcement](../resource-enforcement.md#defaults-and-turning-it-off).
 
 **`memoryPressure`** works with no block at all. Write one when you want to
 tune the trigger or check that `suspend` is in `steps`. The block above
@@ -894,13 +892,14 @@ longer than the call, or suspend from your platform, which knows when a call is 
 ```
 
 **Nothing ever suspends on a node.** Read `detail` in `instance get`. A node
-without `resourceEnforcement.enabled` sends no usage reports, and the policy
-says so:
+that does not enforce (turned off, or no cgroups it can use) sends no usage
+reports, and the policy says so:
 
 ```text
 detail: idle-unmeasured: the task's suspend.idle policy (after 180s) cannot act
-because node w-03 sends no usage reports (set resourceEnforcement.enabled on its
-worker type), so the instance will not suspend when idle
+because node w-03 sends no usage reports (resource enforcement is off or
+unavailable on its worker; check the worker log), so the instance will not
+suspend when idle
 ```
 
 ### A spec is rejected at submit
@@ -933,8 +932,8 @@ suspend or snapshot fails with `FailedPrecondition` and the same hint.
 
 ## The macOS dev loop
 
-A Mac runs sandboxes on Apple `container` (dev mode), and with
-`resourceEnforcement.enabled` its worker measures them through `container
+A Mac runs sandboxes on Apple `container` (dev mode), and with resource
+enforcement on (the default) its worker measures them through `container
 stats`: CPU, memory, and the bytes each container sends, plus `legion alloc
 exec` sessions. So the idle policy works on a Mac. It can't take memory
 checkpoints, so keep a dev copy of the spec that suspends to disk and boots
@@ -968,19 +967,12 @@ cold on resume:
 }
 ```
 
-Give the Mac's worker type the measuring switch, in the manager's
-`workerConfigPath`:
-
-```nickel
-# workers/devsandbox.ncl
-{ workerType = "devsandbox", resourceEnforcement = { enabled = true } }
-```
-
-Then:
+The Mac's worker measures with no configuration, since enforcement is on by
+default. Then:
 
 ```bash
 container system start                  # if the Apple container service is down
-legion join -a --type devsandbox
+legion join -a
 legion job run agents-dev.ncl
 legion instance create agents-dev --id user-42
 legion instance get user-42             # "idle since ..." once the first report lands

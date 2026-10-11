@@ -125,6 +125,20 @@ pub fn enforcement_available() -> bool {
     cfg!(target_os = "linux") && Path::new(CGROUP_ROOT).join("cgroup.controllers").exists()
 }
 
+/// Whether this node can enforce under `cgroup_parent`: everything
+/// [`enforcement_available`] checks, plus write access to create the parent.
+/// The worker checks once at start, so a node without access (a non-root
+/// worker, a container with a read-only `/sys/fs/cgroup`) runs unconfined
+/// instead of failing every allocation at its first cgroup write.
+pub fn cgroup_parent_usable(cgroup_parent: &str) -> R<()> {
+    if !enforcement_available() {
+        bail!("no cgroup v2 unified hierarchy at {CGROUP_ROOT}");
+    }
+    let dir = Path::new(CGROUP_ROOT).join(cgroup_parent);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create cgroup {}", dir.display()))?;
+    Ok(())
+}
+
 /// Declared `cores`: whole exclusive CPUs.
 ///
 /// Deliberately *not* `cpus` — the scheduler treats `cpus` as an alias for
@@ -199,17 +213,15 @@ impl NodeResourceGovernor {
     /// Build the governor from the worker's `resourceEnforcement` config (via
     /// the env the daemon exports).
     ///
-    /// Enforcement stays **opt-in**: a declaration that was only ever a
-    /// scheduling estimate must not start OOM-killing workloads because the
-    /// cluster upgraded. A node that opted in but cannot enforce (no cgroup
-    /// v2) warns and degrades to `disabled` rather than failing every
-    /// allocation.
+    /// Enforcement is on by default. A node that cannot enforce (no cgroup
+    /// v2) degrades to `disabled` rather than failing every allocation; the
+    /// daemon already warned about it at start.
     pub fn from_env() -> Self {
         if !crate::task_plugins::exec_isolation::enforcement_enabled() {
             return Self::disabled();
         }
         if !cfg!(target_os = "linux") {
-            warn!("Resource enforcement is only implemented on Linux; running unconfined");
+            // The daemon logged what the switch means here at start.
             return Self::disabled();
         }
         if !Path::new(CGROUP_ROOT).join("cgroup.controllers").exists() {

@@ -6,23 +6,32 @@ enforcement is on, how the worker divides up the node, how a task bursts past
 its reservation, how a node is packed past its physical memory, what the node
 does when it runs short, and how all of it fails.
 
-Enforcement is **opt-in per worker** and off by default. A declaration that
-was only ever a scheduling estimate shouldn't start getting workloads
-OOM-killed just because the cluster was upgraded.
+Enforcement is **on by default**. Memory pressure, oversubscription,
+`memoryMax` bursting, usage reports, and sandbox confinement all depend on
+it, so a worker gets them with no configuration. The cost is that
+`resources.memory` is a real limit: a task that declares less memory than it
+uses is OOM-killed instead of quietly running over.
 
-## Turning it on
+## Defaults and turning it off
+
+A worker config needs no `resourceEnforcement` block. These are the
+defaults:
 
 ```nickel
 # configs/workers/default.ncl
 {
     resourceEnforcement = {
         enabled = true,
-        # Hierarchy root under /sys/fs/cgroup. Legion creates `share/` and
-        # `reserve/` beneath it, and one cgroup per allocation beneath those.
+        # Hierarchy root under /sys/fs/cgroup. Legion creates it, then
+        # `share/` and `reserve/` beneath it, and one cgroup per allocation
+        # beneath those.
         cgroupParent = "legion",
     },
 }
 ```
+
+Set `enabled = false` to treat `resources` as scheduling estimates only. Do
+that for a pool whose jobs declare rough numbers you don't want enforced yet.
 
 Requirements:
 
@@ -33,10 +42,13 @@ Requirements:
   configurable root for delegated non-root setups is not implemented.
 - the `cpuset`, `cpu`, and `memory` controllers available for delegation.
 
-If a worker opts in but can't enforce (no cgroup v2, or no usable CPU
-fingerprint), it **logs a warning at startup and runs tasks unconfined**
-instead of failing every allocation. Enforcement shouldn't be the reason a
-workload won't run.
+If a worker can't enforce (no cgroup v2, no write access to create
+`cgroupParent`, or no usable CPU fingerprint), it **logs a warning at startup
+and runs tasks unconfined** instead of failing every allocation. Enforcement
+shouldn't be the reason a workload won't run. A non-root worker and a worker
+in a container with a read-only `/sys/fs/cgroup` both land here. On macOS
+the switch measures sandboxes for usage reports and idle policies and
+confines nothing.
 
 ## What each field means
 

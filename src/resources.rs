@@ -192,39 +192,18 @@ pub enum SuspendedHold {
     Partial(Value),
 }
 
-/// Config key a worker registers its `resourceEnforcement.suspendedReserve`
-/// floor under.
-pub const SUSPENDED_RESERVE_KEY: &str = "suspendedReserve";
-
-/// A node's `suspendedReserve` floor from its registration attributes,
-/// `0.0..=1.0`. Missing or malformed reads as 0.0, today's behavior.
-pub fn node_suspended_reserve(config_attrs: &Value) -> f64 {
-    config_attrs
-        .get(SUSPENDED_RESERVE_KEY)
-        .and_then(Value::as_f64)
-        .filter(|floor| floor.is_finite())
-        .map(|floor| floor.clamp(0.0, 1.0))
-        .unwrap_or(0.0)
-}
-
 impl ResourcePolicy {
-    /// The charge a suspended instance leaves on its node: `max(job reserve,
-    /// node floor)` per dimension. A ratio (and the floor) scale `memory` and
-    /// `cpu` MHz. A fixed amount is capped at what the task reserves. Exclusive
-    /// `cores` and devices are held only when either side is 1.0.
+    /// The charge a suspended instance leaves on its node, from its job's
+    /// `suspend.reserve`. A ratio scales `memory` and `cpu` MHz. A fixed
+    /// amount is capped at what the task reserves. Exclusive `cores` and
+    /// devices are held only by a full hold.
     pub fn suspended_hold(
         &self,
         resources: &Value,
         reserve: crate::structs::suspend::SuspendReserve,
-        node_floor: f64,
     ) -> R<SuspendedHold> {
         use crate::structs::suspend::SuspendReserve;
-        let floor = if node_floor.is_finite() {
-            node_floor.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        if reserve.is_full() || floor >= 1.0 {
+        if reserve.is_full() {
             return Ok(SuspendedHold::Full);
         }
         let normalized = self.normalize_task_resources(resources, false)?;
@@ -233,15 +212,13 @@ impl ResourcePolicy {
             .context("normalized resources must be an object")?;
         let amount = |name: &str| map.get(name).and_then(Value::as_f64).unwrap_or(0.0);
         let (memory, cpu) = (amount("memory"), amount("cpu"));
-        let (job_memory, job_cpu) = match reserve {
+        let (held_memory, held_cpu) = match reserve {
             SuspendReserve::Ratio(ratio) => (memory * ratio, cpu * ratio),
             SuspendReserve::Amount {
                 memory_mib,
                 cpu_mhz,
             } => (memory_mib.min(memory), cpu_mhz.min(cpu)),
         };
-        let held_memory = job_memory.max(memory * floor);
-        let held_cpu = job_cpu.max(cpu * floor);
         if held_memory <= 0.0 && held_cpu <= 0.0 {
             return Ok(SuspendedHold::Nothing);
         }
@@ -350,7 +327,7 @@ mod tests {
                 json!({ "memory": 2048, "memoryMax": 4096, "cpu": 1000, "gpu": ["g0"] });
             let held = partial(
                 policy
-                    .suspended_hold(&resources, SuspendReserve::Ratio(0.25), 0.0)
+                    .suspended_hold(&resources, SuspendReserve::Ratio(0.25))
                     .unwrap(),
             );
             assert_eq!(held["memory"], json!(512.0));
@@ -370,7 +347,7 @@ mod tests {
             let resources = json!({ "memory": 1024, "cores": 2 });
             let held = partial(
                 policy
-                    .suspended_hold(&resources, SuspendReserve::Ratio(0.5), 0.0)
+                    .suspended_hold(&resources, SuspendReserve::Ratio(0.5))
                     .unwrap(),
             );
             assert_eq!(held["cores"], json!(0));
@@ -383,7 +360,7 @@ mod tests {
             assert_eq!(request.amount("cores"), Some(0.0));
             assert_eq!(
                 policy
-                    .suspended_hold(&resources, SuspendReserve::FULL, 0.0)
+                    .suspended_hold(&resources, SuspendReserve::FULL)
                     .unwrap(),
                 SuspendedHold::Full
             );
@@ -401,72 +378,11 @@ mod tests {
                             memory_mib: 1024.0,
                             cpu_mhz: 5000.0,
                         },
-                        0.0,
                     )
                     .unwrap(),
             );
             assert_eq!(held["memory"], json!(1024.0));
             assert_eq!(held["cpu"], json!(1000.0));
-        }
-
-        #[test]
-        fn the_node_floor_wins_where_it_is_larger() {
-            let policy = policy();
-            let resources = json!({ "memory": 2048, "cpu": 1000 });
-            // reserve = false on a node with a 0.25 floor still holds a quarter.
-            let held = partial(
-                policy
-                    .suspended_hold(&resources, SuspendReserve::NONE, 0.25)
-                    .unwrap(),
-            );
-            assert_eq!(held["memory"], json!(512.0));
-            assert_eq!(held["cpu"], json!(250.0));
-            // Per dimension: the amount's memory beats the floor, the floor's
-            // cpu beats the amount.
-            let held = partial(
-                policy
-                    .suspended_hold(
-                        &resources,
-                        SuspendReserve::Amount {
-                            memory_mib: 1024.0,
-                            cpu_mhz: 0.0,
-                        },
-                        0.25,
-                    )
-                    .unwrap(),
-            );
-            assert_eq!(held["memory"], json!(1024.0));
-            assert_eq!(held["cpu"], json!(250.0));
-            assert_eq!(
-                policy
-                    .suspended_hold(&resources, SuspendReserve::NONE, 1.0)
-                    .unwrap(),
-                SuspendedHold::Full,
-                "a floor of 1.0 holds everything"
-            );
-            assert_eq!(
-                policy
-                    .suspended_hold(&resources, SuspendReserve::NONE, 0.0)
-                    .unwrap(),
-                SuspendedHold::Nothing
-            );
-        }
-
-        #[test]
-        fn the_floor_reads_from_registration_and_clamps() {
-            assert_eq!(node_suspended_reserve(&json!({})), 0.0);
-            assert_eq!(
-                node_suspended_reserve(&json!({ "suspendedReserve": 0.25 })),
-                0.25
-            );
-            assert_eq!(
-                node_suspended_reserve(&json!({ "suspendedReserve": 3 })),
-                1.0
-            );
-            assert_eq!(
-                node_suspended_reserve(&json!({ "suspendedReserve": "x" })),
-                0.0
-            );
         }
 
         /// The fit check, end to end on a pool: a node full of running work
@@ -490,7 +406,6 @@ mod tests {
                     .suspended_hold(
                         &json!({ "memory": 2048, "cpu": 2000 }),
                         SuspendReserve::Ratio(0.25),
-                        0.0,
                     )
                     .unwrap(),
             );

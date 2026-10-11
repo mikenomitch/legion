@@ -2841,37 +2841,35 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         };
 
         // Enforcement settings ride as JSON, like artifacts and host volumes.
-        let resource_enforcement = match wcp.resource_enforcement.as_ref() {
-            None => String::new(),
-            Some(enforcement) => {
-                if enforcement.cgroup_parent.trim().is_empty() {
-                    bail!(
-                        "worker config {path_str}: resourceEnforcement.cgroupParent must not be \
-                         empty"
-                    );
-                }
-                if enforcement.cgroup_parent.starts_with('/') {
-                    bail!(
-                        "worker config {path_str}: resourceEnforcement.cgroupParent is relative \
-                         to /sys/fs/cgroup, got {:?}",
-                        enforcement.cgroup_parent
-                    );
-                }
-                enforcement
-                    .validate()
-                    .with_context(|| format!("invalid worker config {path_str}"))?;
-                let mut enforcement = enforcement.clone();
-                if let Some(sandbox) = wcp.sandbox.as_ref() {
-                    if sandbox.vmm_overhead_mib == Some(0) {
-                        bail!(
-                            "worker config {path_str}: sandbox.vmmOverheadMiB must be at least 1; \
-                             a VMM process always needs some memory of its own"
-                        );
-                    }
-                    enforcement.sandbox = Some(sandbox.clone());
-                }
-                serde_json::to_string(&enforcement)?
+        // An absent block still sends the defaults, so the worker gets the
+        // type's `sandbox` settings and enforcement stays on.
+        let resource_enforcement = {
+            let mut enforcement = wcp.resource_enforcement.clone().unwrap_or_default();
+            if enforcement.cgroup_parent.trim().is_empty() {
+                bail!(
+                    "worker config {path_str}: resourceEnforcement.cgroupParent must not be empty"
+                );
             }
+            if enforcement.cgroup_parent.starts_with('/') {
+                bail!(
+                    "worker config {path_str}: resourceEnforcement.cgroupParent is relative to \
+                     /sys/fs/cgroup, got {:?}",
+                    enforcement.cgroup_parent
+                );
+            }
+            enforcement
+                .validate()
+                .with_context(|| format!("invalid worker config {path_str}"))?;
+            if let Some(sandbox) = wcp.sandbox.as_ref() {
+                if sandbox.vmm_overhead_mib == Some(0) {
+                    bail!(
+                        "worker config {path_str}: sandbox.vmmOverheadMiB must be at least 1; a \
+                         VMM process always needs some memory of its own"
+                    );
+                }
+                enforcement.sandbox = Some(sandbox.clone());
+            }
+            serde_json::to_string(&enforcement)?
         };
 
         // Edge-boot settings ride as JSON too. Absent means "no edge starts",

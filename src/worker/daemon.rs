@@ -221,7 +221,8 @@ async fn run_worker_with_manager(
     // Task runtimes run in-process as dylibs and take no config of their own,
     // so cross-cutting worker settings reach them through the environment —
     // the same channel `sandbox` uses for LEGION_SANDBOX_KERNEL.
-    let enforcement_config = parse_resource_enforcement(&config.resource_enforcement);
+    let enforcement_config =
+        usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
     apply_resource_enforcement_env(&enforcement_config);
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
@@ -370,15 +371,6 @@ async fn run_worker_with_manager(
         warn!(
             "resourceEnforcement.oversubscribe is set but this node cannot enforce (no cgroup \
              v2, or not Linux); registering at physical capacity"
-        );
-    }
-    // The suspended-instance floor (docs/suspend-and-resume.md, "Capacity
-    // for resumes"). Advertised whether or not the node enforces: it only
-    // changes what the scheduler keeps charged for suspended instances.
-    if enforcement_config.suspended_reserve() > 0.0 {
-        config_attrs.insert(
-            crate::resources::SUSPENDED_RESERVE_KEY.into(),
-            json!(enforcement_config.suspended_reserve()),
         );
     }
     config_attrs.insert(
@@ -568,10 +560,8 @@ pub(crate) async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerC
     }
 }
 
-/// Publishes the worker's `resourceEnforcement` settings into the environment
-/// the task runtimes read (see `docs/task-supervision.md`). An empty or
-/// unparseable payload leaves enforcement off, which is the default and the
-/// behavior every worker had before this existed.
+/// Parses the worker's `resourceEnforcement` settings. An empty or
+/// unparseable payload gets the defaults, which enforce.
 fn parse_resource_enforcement(raw: &str) -> crate::structs::WorkerResourceEnforcementConfig {
     if raw.trim().is_empty() {
         return crate::structs::WorkerResourceEnforcementConfig::default();
@@ -579,12 +569,35 @@ fn parse_resource_enforcement(raw: &str) -> crate::structs::WorkerResourceEnforc
     match serde_json::from_str::<crate::structs::WorkerResourceEnforcementConfig>(raw) {
         Ok(config) => config,
         Err(err) => {
-            warn!(error = ?err, "Invalid worker resourceEnforcement config; enforcement off");
+            warn!(error = ?err, "Invalid worker resourceEnforcement config; using the defaults");
             crate::structs::WorkerResourceEnforcementConfig::default()
         }
     }
 }
 
+/// Enforcement is on by default, so a Linux node that cannot carry it turns
+/// it off here, once, with one warning, rather than failing each allocation
+/// at its first cgroup write. Other platforms keep the switch: on macOS it
+/// only measures sandboxes (see [`apply_resource_enforcement_env`]).
+fn usable_resource_enforcement(
+    mut config: crate::structs::WorkerResourceEnforcementConfig,
+) -> crate::structs::WorkerResourceEnforcementConfig {
+    if config.enabled && cfg!(target_os = "linux") {
+        if let Err(err) = crate::worker::resources::cgroup_parent_usable(&config.cgroup_parent) {
+            warn!(
+                error = %format!("{err:#}"),
+                "Resource enforcement is on but this node cannot create its cgroups; tasks run \
+                 unconfined. Run the worker as root, delegate resourceEnforcement.cgroupParent \
+                 to it, or set resourceEnforcement.enabled = false"
+            );
+            config.enabled = false;
+        }
+    }
+    config
+}
+
+/// Publishes the worker's `resourceEnforcement` settings into the environment
+/// the task runtimes read (see `docs/resource-enforcement.md`).
 fn apply_resource_enforcement_env(config: &crate::structs::WorkerResourceEnforcementConfig) {
     if config.enabled {
         if cfg!(target_os = "linux") {

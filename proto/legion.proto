@@ -3270,9 +3270,8 @@ message InstanceInfo {
   optional string forked_from = 31;
 
   // MiB of memory a suspended instance keeps charged to its node, so a
-  // resume finds room: `max(suspend.reserve, the node's
-  // resourceEnforcement.suspendedReserve)` of its reservation, applied when
-  // the suspend landed. Unset when the instance holds nothing (the default)
+  // resume finds room: its job's `suspend.reserve` share of its
+  // reservation, applied when the suspend landed. Unset when the instance holds nothing (the default)
   // or is not suspended. With `reserve = true` this is the whole
   // reservation.
   optional double held_memory_mib = 32;
@@ -5186,7 +5185,7 @@ message SuspendedCapacity {
   uint32 instances = 1;
 
   // Of those, how many keep a charge on the node (a held allocation row,
-  // from `suspend.reserve` or the node's `suspendedReserve` floor). Their
+  // from the job's `suspend.reserve`). Their
   // rows also appear in `GetNodeUsageReply.allocations` with
   // `suspended = true`, and their held amounts are already part of the
   // reply's `memory.reserved` and `cpu.reserved`.
@@ -5204,14 +5203,10 @@ message SuspendedCapacity {
   // are retained in place and report 0.
   uint64 checkpoint_bytes = 5;
 
-  // The node's `resourceEnforcement.suspendedReserve` floor as it
-  // registered, 0 when unset.
-  double suspended_reserve = 6;
-
   // The node's `snapshots` content budget as its worker last reported it.
   // Unset when the worker has no content store, predates the report, or no
   // heartbeat has reached this manager since it started.
-  optional SnapshotBudget snapshot_budget = 7;
+  optional SnapshotBudget snapshot_budget = 6;
 }
 
 // A node content store's `snapshots` budget class

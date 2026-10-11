@@ -892,9 +892,6 @@ fn render_suspended_capacity(reply: &GetNodeUsageReply) -> String {
         if suspended.holding != suspended.instances {
             line.push_str(&format!(" ({} holding)", suspended.holding));
         }
-        if suspended.suspended_reserve > 0.0 {
-            line.push_str(&format!(", node floor {}", suspended.suspended_reserve));
-        }
         out.push_str(&line);
         out.push('\n');
     }
@@ -1423,7 +1420,6 @@ mod tests {
                 held_memory_mib: 512.0,
                 held_cpu_mhz: 250.0,
                 checkpoint_bytes: 6 * GIB,
-                suspended_reserve: 0.25,
                 snapshot_budget: Some(SnapshotBudget {
                     budget_bytes: 50 * GIB,
                     used_bytes: 12 * GIB,
@@ -1434,9 +1430,7 @@ mod tests {
         };
         let out = render_node_usage(&reply, 1_000);
         assert!(
-            out.contains(
-                "suspended: 3 instances, 512 MiB held and 250 MHz (1 holding), node floor 0.25"
-            ),
+            out.contains("suspended: 3 instances, 512 MiB held and 250 MHz (1 holding)"),
             "{out}"
         );
         assert!(

@@ -169,10 +169,10 @@ export function NodeUsageCard(props: { usage: GetNodeUsageReply; class?: string 
 
       <Show when={props.usage.suspended}>
         {(suspended) => (
-          <Show when={suspended().instances > 0 || suspended().suspendedReserve > 0}>
+          <Show when={suspended().instances > 0}>
             <p
               class="border-t border-line px-4 py-2.5 text-xs text-muted"
-              title="Suspended instances can keep part of their reservation charged here (suspend.reserve, or the node's resourceEnforcement.suspendedReserve floor) so their resumes find room"
+              title="Suspended instances can keep part of their reservation charged here (the job's suspend.reserve) so their resumes find room"
             >
               <span class="font-medium text-ink">{suspended().instances} suspended</span>
               <Show when={suspended().holding > 0}>
@@ -182,9 +182,6 @@ export function NodeUsageCard(props: { usage: GetNodeUsageReply; class?: string 
               <Show when={Number(suspended().checkpointBytes) > 0}>
                 {' · '}
                 {formatBytes(Number(suspended().checkpointBytes))} of checkpoints
-              </Show>
-              <Show when={suspended().suspendedReserve > 0}>
-                {' · '}node floor {Math.round(suspended().suspendedReserve * 100)}%
               </Show>
             </p>
           </Show>
