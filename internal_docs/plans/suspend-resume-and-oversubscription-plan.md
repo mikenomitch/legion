@@ -2,7 +2,7 @@
 
 > **Judgement calls:** [`calls/suspend-resume-and-oversubscription-plan_calls.md`](../calls/suspend-resume-and-oversubscription-plan_calls.md)
 
-Status: **IN EXECUTION** (written 2026-10-09, execution started 2026-10-10). Phases 1-7 shipped (3a content store, 3b runtime checkpoints, 3c snapshots API and restore, 4 suspend and resume, 5 automatic suspend, 6 fork, create from a snapshot, and named snapshots, 7a content publishing, the location index, and the `locality` score, 7b `durability = "store"`, cross-node resume, and `snapshot warm`). The integration of Phases 5, 6, and 7b finished their seams: `--spread` forks across nodes from a published checkpoint, published snapshots as named seeds, a bounded publish retry, and placement that binds each restore to its planned instance on a worker that can fetch. Resume guards shipped after Phase 7 (Track 2): `suspend.reserve` as a ratio or fixed amounts, the worker's `suspendedReserve` floor, make-room suspends for a resume pinned to a full node, and the checkpoint disk budget as a placement constraint ([Capacity for resumes](../../docs/suspend-and-resume.md#capacity-for-resumes), calls entries 5, 6, 10, 37, 47, 60, 109, 111, 128). Phase 8 (fast paths: wake on connect, the `hint` idle signal, lazy memory restore, diff snapshots) is deferred. The Linux and KVM checks for Phases 1-7 are pending ([verification plan](../suspend-resume-linux-verification.md)).
+Status: **IN EXECUTION** (written 2026-10-09, execution started 2026-10-10). Phases 1-7 shipped (3a content store, 3b runtime checkpoints, 3c snapshots API and restore, 4 suspend and resume, 5 automatic suspend, 6 fork, create from a snapshot, and named snapshots, 7a content publishing, the location index, and the `locality` score, 7b `durability = "store"`, cross-node resume, and `snapshot warm`). The integration of Phases 5, 6, and 7b finished their seams: `--spread` forks across nodes from a published checkpoint, published snapshots as named seeds, a bounded publish retry, and placement that binds each restore to its planned instance on a worker that can fetch. Resume guards shipped after Phase 7 (Track 2): `suspend.reserve` as a ratio or fixed amounts, make-room suspends for a resume pinned to a full node, and the checkpoint disk budget as a placement constraint ([Capacity for resumes](../../docs/suspend-and-resume.md#capacity-for-resumes), calls entries 5, 6, 10, 37, 47, 60, 109, 111, 128). Phase 8 (fast paths: wake on connect, the `hint` idle signal, lazy memory restore, diff snapshots) is deferred. The Linux and KVM checks for Phases 1-7 are pending ([verification plan](../suspend-resume-linux-verification.md)).
 
 **Relationship to existing plans.** This plan supersedes the *phasing and
 scope* of
@@ -823,9 +823,8 @@ reservation on its node while suspended. Resume is then guaranteed capacity,
 at the cost of the entire density win. It exists for the "must resume in
 200 ms, always" tier. Default `false`.
 
-> **Revised (Track 2).** `reserve` also takes a ratio or fixed amounts, a
-> worker floor (`resourceEnforcement.suspendedReserve`) holds a share for
-> every suspended instance on a node, and the manager suspends idle
+> **Revised (Track 2).** `reserve` also takes a ratio or fixed amounts, and
+> the manager suspends idle
 > suspendable work to make room for a resume pinned to a full node. See the
 > public doc's [Capacity for resumes](../../docs/suspend-and-resume.md#capacity-for-resumes).
 

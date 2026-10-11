@@ -500,7 +500,7 @@ Legion gives you three controls, from cheapest to strongest guarantee:
 
 - **Make room** (on by default): when a resume is waiting on a full node, the
   manager suspends idle instances there until it fits.
-- **Hold a share** (`suspend.reserve`, or the node's `suspendedReserve`): a
+- **Hold a share** (`suspend.reserve`): a
   suspended instance keeps part of its reservation charged to its node, so
   that much room is always waiting for it.
 - **Hold everything** (`reserve = true`): the resume always fits, at the cost
@@ -526,21 +526,6 @@ suspend = {
 | A ratio, such as `0.25` | That share of `resources.memory` and `resources.cpu` (MHz). Exclusive `cores`, devices, and custom resources are released. |
 | `true` or `1` | The whole reservation, `cores` and devices included. |
 | `{ memory, cpu }` | Those amounts. `memory` is a size (`"1GiB"`) or MiB. `cpu` is MHz. Cores and devices are released. |
-
-An operator can set a floor for every suspended instance on a node in the
-worker config, whatever the job says:
-
-```nickel
-resourceEnforcement = {
-  suspendedReserve = 0.25,   # default 0.0
-},
-```
-
-Each suspended instance is charged `max(job reserve, node floor)`, per
-dimension. A floor of `1.0` holds everything. The floor needs no cgroups, so
-it works with `resourceEnforcement.enabled = false`. It rides the node's
-registration, and it applies when a suspend lands: changing it does not
-re-charge instances already suspended on the node.
 
 The charge is the instance's allocation row, kept with status `suspended`
 and its resources cut to the held share. The row is never sent to a worker,
@@ -568,7 +553,7 @@ RESOURCE   CAPACITY      RESERVED         USED            PRESSURE
 memory     65536 MiB     41472 MiB (63%)  30120 MiB (46%)  ok (free 33792 MiB, stall 0.2%)
 cpu        40000 MHz     21000 MHz (52%)  9300 MHz (23%)
 
-suspended: 12 instances, 3072 MiB held and 1500 MHz (6 holding), node floor 0.25
+suspended: 12 instances, 3072 MiB held and 1500 MHz (6 holding)
 checkpoints: 18.4 GiB suspended here, snapshots budget 19 GiB pinned of 50 GiB (31 GiB free)
 ```
 
@@ -578,7 +563,7 @@ The held rows also appear in the allocation table as
 Which to pick:
 
 - **Interactive fleets** (agent sandboxes, dev environments) where a resume
-  should usually be instant: `0.25` on the node, and let make-room cover the
+  should usually be instant: `reserve = 0.25`, and let make-room cover the
   rest. See the [agent sandboxes guide](guides/agent-sandboxes.md).
 - **Batch-like work** that tolerates a wait: leave it at `0`.
 - **A tier that must resume within its restore time, always**: `true`.
@@ -1623,7 +1608,7 @@ See [metrics](metrics.md#suspend-and-resume).
 | `instance suspend`: `was not launched for memory checkpoints` | No `suspend` or `snapshots` block when the allocation started | Add the block and restart the instance, or use `--checkpoint disk` |
 | `instance.suspend_failed` | The capture failed on the node (content store disabled or full, the VMM API failed) | Read `detail` or the event's `error`. The instance keeps running |
 | Instance stuck `pending (resuming)` | The checkpoint's node is down or full, and nothing there can be suspended to make room | Wait, `instance start --cold`, or let `resumeTimeout` boot it cold. To keep room for resumes, see [Capacity for resumes](#capacity-for-resumes) |
-| `legion_make_room_suspends_total{outcome="no_room"}` rising | Resumes wait on nodes whose instances are not eligible to make room (no `suspend` block, not opted in, a more important band, or active under two minutes) | Set `onPressure = true` or an idle policy on the work sharing those nodes, or hold a share with `suspend.reserve` or `suspendedReserve` |
+| `legion_make_room_suspends_total{outcome="no_room"}` rising | Resumes wait on nodes whose instances are not eligible to make room (no `suspend` block, not opted in, a more important band, or active under two minutes) | Set `onPressure = true` or an idle policy on the work sharing those nodes, or hold a share with `suspend.reserve` |
 | Placement fails: `every one's snapshots content budget is full` | Suspended checkpoints fill `content.budgets.snapshots` on every eligible node | Raise the budget, delete old snapshots, or resume or destroy suspended instances |
 | Submit: `suspend.reserve ... is out of range` or `exceeds the task's resources` | A ratio outside 0 to 1, or an amount larger than the reservation | Follow the hint |
 | `instance start`: `cannot resume: checkpoint ... is lost` | The node holding it was removed, and `onRestoreFailure = "fail"` | `legion instance start <id> --cold` |
@@ -1744,8 +1729,7 @@ See [metrics](metrics.md#suspend-and-resume).
 - **`exec` and `container` suspend to disk only**: process memory is not
   kept.
 - **A held share is fixed when the suspend lands.** Changing a job's
-  `suspend.reserve` or a node's `suspendedReserve` does not re-charge
-  instances already suspended.
+  `suspend.reserve` does not re-charge instances already suspended.
 - **Make-room reads usage held by one manager.** Like the idle sweep, it
   sees only nodes that heartbeat to the manager running it, and it knows an
   instance is quiet only from nodes that send usage reports

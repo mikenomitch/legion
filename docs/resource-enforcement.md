@@ -174,32 +174,15 @@ reservation. That is the `evict-reserved` step, and it only ever runs on an
 oversubscribed node. Use oversubscription where the workloads are
 idle-heavy, and keep latency-sensitive work in a pool without it.
 
-## Suspended instances: `suspendedReserve`
+## Suspended instances
 
 A suspended instance gives its reservation back by default, which is the
-density win of suspend and the reason its resume can find the node full.
-`suspendedReserve` sets how much of each suspended instance's memory and CPU
-(MHz) the node keeps charged, as a ratio:
-
-```nickel
-resourceEnforcement = {
-    # Each suspended instance on this node keeps max(its job's
-    # suspend.reserve, 0.25) of its reservation. Default 0.0.
-    suspendedReserve = 0.25,
-},
-```
-
-- **It is a floor.** A job's own `suspend.reserve` wins where it is larger,
-  per dimension. A floor of `1.0` holds everything, exclusive `cores`
-  included. Below `1.0`, cores and devices are released.
-- **It needs no cgroups.** It only changes what the scheduler counts, so it
-  is valid with `enabled = false` and on macOS.
-- **It rides registration**, like the oversubscription ratio, and applies
-  when a suspend lands. Changing it takes a worker restart and does not
-  re-charge instances already suspended.
-- **The held share counts in `RESERVED`.** `legion node usage` adds a
-  `suspended:` line under the resource table that says how much of it is
-  held for suspended instances.
+density win of suspend and the reason its resume can find the node full. A
+job keeps a share of it charged with `suspend.reserve` (see
+[Capacity for resumes](suspend-and-resume.md#capacity-for-resumes)). The held
+share counts in `RESERVED`, and `legion node usage` adds a `suspended:` line
+under the resource table that says how much of it is held for suspended
+instances.
 
 The manager also suspends idle suspendable instances to make room for a
 resume waiting on a full node (manager `suspend.makeRoom`, on by default).
@@ -424,7 +407,7 @@ Node w-03 (ready)  usage sampled 4s ago
   `reservedResources`, the same number the scheduler packs against.
 - **Reserved** is the sum of every placed allocation's `resources` after
   defaults, plus what suspended instances keep held
-  ([`suspendedReserve`](#suspended-instances-suspendedreserve)). Held rows
+  ([`suspend.reserve`](#suspended-instances)). Held rows
   show as `<instance> (suspended, held)`.
 - **`suspended:`** (when the node has any) counts the suspended instances
   whose checkpoint is on the node and what they hold, and **`checkpoints:`**

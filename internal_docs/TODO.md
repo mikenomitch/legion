@@ -2001,8 +2001,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           TAP failures.
   - [x] Resume guards (Track 2): `suspend.reserve` as `false`/`true`, a
         ratio, or `{ memory, cpu }` (a partial hold is the suspended
-        allocation row with its resources cut to the share), the worker
-        `resourceEnforcement.suspendedReserve` floor, make-room suspends for a
+        allocation row with its resources cut to the share), make-room suspends for a
         resume pinned to a full node (manager `suspend.makeRoom`, reason
         `make_room`, `instance.make_room`, `legion_make_room_suspends_total`),
         the `snapshots` content budget reported on the heartbeat and enforced
@@ -2031,8 +2030,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           places if that shows up
           ([call 47](calls/suspend-resume-and-oversubscription-plan_calls.md#47-the-checkpoint-budget-is-a-placement-filter-on-soft-state-for-fresh-placements-of-memory-suspend-tasks-only-resume-guards)).
     - [ ] A held share is fixed when the suspend lands: a changed
-          `suspend.reserve` or `suspendedReserve` does not re-charge instances
-          already suspended
+          `suspend.reserve` does not re-charge instances already suspended
           ([call 37](calls/suspend-resume-and-oversubscription-plan_calls.md#37-the-suspendedreserve-floor-lives-under-resourceenforcement-needs-no-cgroups-and-applies-when-a-suspend-lands-resume-guards)).
     - [ ] Make-room only knows an instance is quiet from nodes that send usage
           reports. Without `resourceEnforcement.enabled`, only

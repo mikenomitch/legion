@@ -697,8 +697,7 @@
                 # (default, the density win), true (everything, exclusive
                 # cores included), a ratio of memory and cpu MHz between 0
                 # and 1, or fixed amounts { memory = "1GiB", cpu = 100 } no
-                # larger than `resources`. The node's
-                # resourceEnforcement.suspendedReserve is a floor under it.
+                # larger than `resources`.
                 reserve = 0.25,
                 # When a resume cannot restore (checkpoint lost with its
                 # node, compat drift, a failed restore): "cold" (default)

@@ -75,8 +75,9 @@
     suspend = {
       # Capture the running VM (memory, devices, root disk), not just disk.
       checkpoint = "memory",
-      # Free the reservation while suspended. That is the density win.
-      reserve = false,
+      # Keep a quarter of the reservation charged while suspended, so most
+      # resumes find room. false frees it all (the full density win).
+      reserve = 0.25,
       # A checkpoint that cannot restore (lost node, VMM upgrade) boots the
       # user fresh on their retained /workspace instead of locking them out.
       onRestoreFailure = "cold",

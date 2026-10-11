@@ -1031,6 +1031,13 @@ rewrap) would be worse than saying plainly that it is not done.
 
 ## 37. The `suspendedReserve` floor lives under `resourceEnforcement`, needs no cgroups, and applies when a suspend lands (resume guards)
 
+> **Superseded: the floor was removed (PR #15 review).** A worker-level
+> floor put a job owner's decision (is a slow resume acceptable?) in operator
+> config, gave two knobs for one thing, and sat in a cgroup block it didn't
+> need. `suspend.reserve` on the job, with make-room as the safety net, is
+> the only control now. If operators need a floor later, it belongs on the
+> node pool, not per-worker config. The original call follows.
+
 *Resume guards, implementation.*
 
 **Call.** `resourceEnforcement.suspendedReserve` (a ratio, default 0.0) rides

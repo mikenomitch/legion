@@ -97,14 +97,6 @@
         #     # and `evict-reserved` runs only when oversubscribe.memory > 1.
         #     steps = ["reclaim", "suspend", "evict-bursting", "evict-reserved"],
         # },
-        # The share of each suspended instance's memory and cpu this node
-        # keeps reserved, so resumes pinned here find room
-        # (docs/suspend-and-resume.md#capacity-for-resumes). Each suspended
-        # instance holds max(its job's suspend.reserve, this). A ratio from 0
-        # to 1. 1.0 also keeps exclusive cores. Needs no cgroups, so it works
-        # with `enabled = false`. Default 0.0: suspended instances hold
-        # nothing unless their job asks.
-        # suspendedReserve = 0.0,
     },
     # `sandbox` runtime settings. Only used with resourceEnforcement.enabled
     # (docs/resource-enforcement.md#sandbox-tasks).

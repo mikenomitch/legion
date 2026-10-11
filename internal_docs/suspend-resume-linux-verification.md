@@ -1690,8 +1690,7 @@ LEGION_SANDBOX_KERNEL=/path/to/vmlinux cargo test --lib sandbox_memory_checkpoin
 
 ## Track 2
 
-Resume guards: `suspend.reserve` as a ratio or fixed amounts, the worker's
-`resourceEnforcement.suspendedReserve` floor, make-room suspends for a resume
+Resume guards: `suspend.reserve` as a ratio or fixed amounts, make-room suspends for a resume
 pinned to a full node, and the `snapshots` content budget as a placement
 constraint (docs/suspend-and-resume.md, "Capacity for resumes"). Nothing here
 is Linux-only code: the hold math, make-room, and the budget filter all run on
@@ -1714,7 +1713,6 @@ and a budget filled by real checkpoint files.
   ```nickel
   reservedResources = { memory = <physical MiB - 3072> },
   content = { budgets = { snapshots = "3GiB" } },
-  resourceEnforcement = { enabled = true, suspendedReserve = 0.0 },
   ```
 
 - Use the Phase 4 jobspec (`/tmp/agents.ncl`) with this `suspend` block:
