@@ -286,15 +286,24 @@ See [Agent Readiness](docs/agent-readiness.md) for the full picture.
 
 ## Status
 
-Legion is a personal project made for fun and largely an experiment in
-agent-driven development. Agents wrote most of the code. Most testing has been
-done by agents, with human spot checking. Expect bugs. Don't run it in
-production.
+Legion is a personal project made for fun is largely an experiment with
+agent-driven development. Most testing has been done by agents, with human
+spot checking. Expect bugs. Don't run it in production.
 
 Don't expect stability either. APIs and the job spec may change without
 notice.
 
-The [docs](docs/README.md) state plainly what is and is not implemented for
+Traditionally, something like this should have been built carefully, 
+layer-by-layer, where you have a ton of confidence in architectural decisions
+before adding another layer. With recent LLM progress, I've taken a different
+approach and just "gone for it" in terms of merging things and building on them,
+with the expectation that I can rip out and adjust foundation after the fact.
+This is part of the experimentation with new workflows in the agent era.
+
+The core scheduler has gotten a decent amount of testing, bug fixes, and optimization,
+but the networking stack/mesh, various runtimes, and sandboxing primitives have not.
+
+The [docs](docs/README.md) should state what is and is not implemented for
 each feature.
 
 ### What's next
