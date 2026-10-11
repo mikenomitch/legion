@@ -1537,6 +1537,42 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       files** — all three need the guest agent the sandbox plan owns. The
       container runtime's `TaskPlugin::signal` override is the seam its
       guest-agent path would implement.
+- [ ] **Sandbox scaling to very large session counts**:
+      [plan](plans/sandbox-scaling-plan.md) (PLANNED) ·
+      [calls](calls/sandbox-scaling-plan_calls.md). Every keyed sandbox is a
+      raft row, about 22 raft entries across create, place, suspend, resume,
+      and destroy (26 with idempotency keys, counted from code, plan §5.1),
+      and a tombstone forever. Raft should hold only envelopes and named
+      instances.
+  - [ ] Phase 0 (gate): an op-count test per lifecycle stage on the
+        `raft_apply_roundtrip` harness, a `legion-loadgen` instance mode,
+        simulated allocation health, and bytes per instance row. Numbers in
+        `benchmarks/scheduler/README.md`.
+  - [ ] Phase 1: group commit and write trimming with no new semantics
+        (target ≤ 8 entries per lifecycle, ≥ 5× the Phase 0 rate).
+  - [ ] Phase 2: server-minted ids grow to 130 bits and leave no tombstone.
+        Caller ids may not take that shape.
+  - [ ] Phase 3: archive suspended keyed instances to content-store
+        manifests (`suspend.archive`).
+  - [ ] Phase 4: `stateful.mode = "session"`: envelopes, the session
+        router, leases, node session logs, the leader index, and
+        `PromoteInstance`.
+  - [ ] Phases 5 to 7: snapshot-clone density (with suspend plan Phase 8),
+        a sub-VM tier seam, and cells only past the plan §6.11 trigger.
+  - [ ] Found during the plan: allocation health is a status-lane raft
+        write per node per beat, because the manager upserts every
+        allocation with `updated_at = now` and nothing skips unchanged rows
+        (`src/manager/server.rs:6311`, `src/storage/store.rs:13291`). It
+        grows with sandboxes per node, and simulated workers never send it,
+        so the AWS rig has not seen it. Phase 1 fixes it.
+  - [ ] Found during the plan: edge ratification only binds an existing
+        unbound keyed instance (`src/storage/store.rs:12560-12580`), so an
+        edge start still needs `CreateInstance` first, and that create's
+        placement eval can bind the row before the edge claim does. Phase 1
+        makes ratification create the row.
+  - [ ] Found during the plan: `docs/multi-raft.md` says instance writes go
+        on the control lane, but `instance` is owned by the scheduler lane
+        (`src/storage/raft/ownership.rs:222`). Fix the doc.
 - [ ] **Gated sandboxes by default, with memory checkpoints**:
       [plan](plans/gated-sandbox-checkpoints-plan.md) (PLANNED) ·
       [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Agent sandboxes
