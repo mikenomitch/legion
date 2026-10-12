@@ -1,13 +1,52 @@
-# Judgement Calls: Session Durability and Routing Back
+# Judgement Calls: Session Durability, Routing, and Edge Starts
 
 Calls made in [`plans/session-durability-and-routing-plan.md`](../plans/session-durability-and-routing-plan.md).
 Entries are ranked by project impact, highest first; the number is the rank.
 
-## 1. Durability lives on the node, and raft gets no per-session rows by default
+## 1. Managers leave the start path, and a picker outside Legion chooses the node
+
+**Call.** For high start rates, a platform's own load balancer or router
+picks a node per start from `ListSessionNodes` (a consistent-hash ring in
+the common case) and calls the node's `Worker.StartSession` with a
+session ticket. The node admits or refuses on its own; managers learn of
+the session from heartbeats. No manager handles the start, and nothing is
+ratified.
+
+```console
+$ legion session nodes agents -j          # polled by the picker, not per start
+$ legion session start agents --node https://10.0.1.7:4848 --ticket "$T" -j
+```
+
+**Alternatives.**
+- (a) Keep every start on a manager and scale managers: a release build,
+  more managers, cheaper routing.
+- (b) Ship a picker inside Legion (`legion start edge-router`) holding the
+  ring.
+- (c) Let any node accept any start and forward it node to node to one
+  with room.
+
+**Trade-off.** The highest-rate path needs a component Legion does not
+ship, configured by the platform. Admission is only exact per node: two
+pickers can race for a node's last slot and one is refused and hops.
+A leaked session ticket starts sessions until it expires (entry 3).
+
+**Why (performance, then simplicity).** Every manager-routed start costs a
+manager some CPU and an mTLS call, so the rate is bounded by managers
+however fast each one gets, and a few managers cannot carry tens of
+thousands a second with headroom. With the node as the only party on the
+path, the rate grows with the fleet. Consistent-hash balancers are
+commodity (Envoy ring_hash and Maglev, HAProxy and nginx consistent hash)
+and already sit in front of most platforms, so the "outside logic" is
+configuration. (a) stays as the default for low rates and is measured and
+tuned in the same phase. (b) is a later plan if platforms ask; shipping
+it now would put Legion in the business of an L7 proxy. (c) adds a hop to
+every refused start and node-to-node trust the worker plane does not have.
+
+## 2. Durability lives on the node, and raft gets no per-session rows by default
 
 **Call.** Sessions survive a worker restart through a node-local
 `sessions.db`, and sleep on their node's disk. Raft stores nothing per
-session in Phases 1 to 3.
+session in Phases 1 to 5.
 
 ```text
 $ legion instance start workspace-q4n7c2rd.9m3x... -j
@@ -32,9 +71,33 @@ manager per second) but not in rows: every manager stores every
 node-held session and every snapshot carries them, which at the plan's
 10^8 idle target is past sandbox-scaling §6.11's 4 GiB trigger. The node
 already knows exactly what it holds. (a) stays as Phase 4 behind a
-measured trigger (plan §6.5).
+measured trigger (plan §6.8).
 
-## 2. The node is in the session id
+## 3. A session ticket names no instance, prefix, or job config, and is not spent per session
+
+**Call.** `legion boot-ticket create <job> --task <task> --scope session`
+mints a JWT that lets its holder start sessions of that task on nodes in
+its pool, unlimited uses, until it expires. The node mints the id and
+uses the job config of the envelope it holds.
+
+**Alternatives.**
+- (a) Edge boot's existing rule: every ticket names an instance or a
+  non-empty prefix, pinned to an exact job config, minutes long.
+- (b) One single-use ticket per session.
+
+**Trade-off.** A wider capability than any edge boot ticket: a leak lets
+the holder fill the task's envelopes until the ticket expires, with
+revocation by TTL only. Audit ties a session to the ticket's `jti`, not to
+a per-session grant.
+
+**Why (performance).** (b) is a mint per start, which puts the manager
+back on the path. (a)'s prefix exists to scope keyed ids, which sessions
+do not have, and pinning a job config would break every ticket on each
+deploy. The envelope already bounds what any holder can start, so the
+ticket's blast radius is the envelope's, the same trade sandbox-scaling
+calls entry 30 accepted for prefix tickets.
+
+## 4. The node is in the session id
 
 **Call.** A minted session id carries an 8-character keyed hash of its
 start node: `workspace-q4n7c2rd.7k2qd9x4m1b8c3rj5t0v6wye2h`. Any manager
@@ -42,7 +105,7 @@ routes `get`, `stop`, `start`, and `promote` to that node with no lookup.
 
 **Alternatives.**
 - (a) Keep the per-manager index plus peer fan-out for every lookup (today).
-- (b) Route from a replicated directory (entry 1's alternative).
+- (b) Route from a replicated directory (entry 2's alternative).
 - (c) Tag with the envelope allocation id, which is already a raft row.
 
 **Trade-off.** Ids grow by 9 characters, and the shape changes, which
@@ -56,7 +119,28 @@ manager. A collision or stale tag costs a probe, never a wrong answer,
 because the node answers for itself. (c) goes stale on every job update
 that replaces envelopes in place.
 
-## 3. Session tasks may suspend with `durability = "local"`
+## 5. The node's start path is fixed first, before edge starts
+
+**Call.** Phase 1 takes the runtime launch out from under the worker's
+single task-manager lock, stops the per-start fsync of the JSON state
+file for sessions, and bounds launch concurrency with a retryable
+refusal. Edge starts come in Phase 4.
+
+**Alternative.** Ship edge starts first, since they remove the visible
+~1k/s manager limit.
+
+**Trade-off.** The headline change (no manager on the path) lands three
+phases later.
+
+**Why (performance).** Read at #30's head, a node serializes every launch
+behind one lock (`src/worker/task_manager.rs:4535`, `:2781`), so its rate
+is about one over the launch time. Edge starts with that lock in place
+would move the ceiling from a few managers to each node, at roughly 30
+starts a second per node for a 30 ms launch, and the target needs the
+per-node number. Phase 1 also speeds the manager-routed path, so it pays
+off on its own.
+
+## 6. Session tasks may suspend with `durability = "local"`
 
 **Call.** Relax the submit refusal at `src/structs/session.rs:408`: a
 session may sleep on its node only, pinned until `suspend.keepFor`
@@ -77,7 +161,27 @@ A bucket is extra infrastructure and an upload per suspend; `store`
 stays available for platforms that want node-loss survival, and the
 `evicted` answer makes the loss explicit rather than silent.
 
-## 4. Phase 1 group-commits the session log instead of fsyncing each start
+## 7. Edge idempotency is node-local, and derived ids stay untagged
+
+**Call.** An edge start with an idempotency key derives the untagged
+session id on the node and dedupes against the node's own claim table.
+Pickers are told to hash on the idempotency key, so retries reach the
+same node.
+
+**Alternatives.**
+- (a) A tagged derived id, so even idempotent sessions route by tag.
+- (b) Record keys centrally, which needs a manager or raft per start.
+
+**Trade-off.** Idempotent sessions keep the fan-out path for `get`/`stop`
+through a manager, and a retry that crosses a ring change briefly runs a
+second copy until convergence stops it.
+
+**Why (simplicity).** A tag in a derived id would differ per node, so a
+retry on another node would start a differently named duplicate that
+nothing converges. Untagged, the id is the same everywhere, and the
+existing converge-to-one rule covers the rare cross-node retry.
+
+## 8. Phase 2 group-commits the session log instead of fsyncing each start
 
 **Call.** `sessions.db` flushes every 50 ms, and a restarted worker also
 adopts live session processes the log missed.
@@ -92,7 +196,7 @@ anyway.
 (about 2.5 ms p50 in sandbox-scaling §16.3); a per-start fsync would
 roughly double it on ordinary disks for no durability gain.
 
-## 5. The plan is written against PR #30's branch, not `main`
+## 9. The plan is written against PR #30's branch, not `main`
 
 **Call.** Citations point at #30's head (`86e0d24`), and the plan lands
 as a separate docs-only change.
