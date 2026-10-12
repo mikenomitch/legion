@@ -327,8 +327,7 @@ How to use it:
 | PR | What it lands | Notes |
 | --- | --- | --- |
 | [#31](https://github.com/mikenomitch/legion/pull/31) | Wake on request (`legion start gateway`, `suspend.wake`), credential injection on egress (`connect.upstreams[].credentials`, KV and identity providers), ingress into gated and TAP sandboxes, and upstreams in gated sandboxes | [wake plan](plans/wake-on-request-plan.md) · [credential plan](plans/egress-credential-injection-plan.md) · [gated plan](plans/gated-sandbox-checkpoints-plan.md) Phase 5; KVM checks G5.1 and G5.2 pending |
-| [#29](https://github.com/mikenomitch/legion/pull/29) | Deterministic `nodes_considered` scheduler tests (flaked ~1 in 3,000 runs) | Test-only seed on `Scheduler`; bench shows no change |
-| [#17](https://github.com/mikenomitch/legion/pull/17) | Fixes for every 2026-10-11 spot-check finding, including Phase 1 of the worker plane | [plan](plans/launch-spot-check-fixes-plan.md) · [calls](calls/launch-spot-check-fixes-plan_calls.md); AWS re-run pending |
+| [#28](https://github.com/mikenomitch/legion/pull/28) | Streaming persistence: one credential path for replica, takeover restore and lease (platform identity by default, keys in `persistence.streaming.credentials`), boot checks, and the object-storage lease that could never be acquired on real S3 | Breaking: lease keys and `LITESTREAM_*` key vars removed; [plan](plans/manager-workload-identity-plan.md) · [calls](calls/manager-workload-identity-plan_calls.md) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
 | [#4](https://github.com/mikenomitch/legion/pull/4) | Rename crate to `legion-rs`, crates.io metadata, `cargo install` docs | Not published yet; follow-ups under Templates, registry & packaging |
@@ -3023,7 +3022,29 @@ Phases 1 and 2 shipped (see Done, KV & secrets).
 
 ## Persistence & cluster operations
 
-Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
+Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md), [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
+
+- [ ] **`--restore-from` should pull from the replica URL.** It takes a local
+      file, so disaster recovery onto a fresh box needs a separate tool and
+      credential to download the replica first. Accept an `s3://` URL and
+      restore through `rustyriver::restore` on `build_s3_store`, the same
+      credential path the takeover restore already uses.
+      [Plan §9 phase 2](plans/manager-workload-identity-plan.md#9-implementation-phases) ·
+      [calls #8](calls/manager-workload-identity-plan_calls.md#8---restore-from-stays-a-local-path)
+- [ ] **No credential introspection for streaming persistence.** The resolved
+      source (`config`, `environment`, `web_identity`, `container_role`,
+      `instance_metadata`) is only in the boot log. Add it to the persistence
+      status RPC with proto comments, the capability catalog and an MCP
+      readback.
+      [Plan §9 phase 3](plans/manager-workload-identity-plan.md#9-implementation-phases) ·
+      [calls #6](calls/manager-workload-identity-plan_calls.md#6-the-resolved-source-is-logged-at-boot-there-is-no-introspection-rpc-yet)
+- [ ] **EKS Pod Identity, `~/.aws/credentials` and SSO for streaming
+      persistence.** `object_store` 0.11's AWS chain does not have them, so
+      Pod Identity is refused at boot rather than downgraded to the node's
+      role. Revisit when rustyriver moves to an `object_store` that supports
+      `AWS_CONTAINER_CREDENTIALS_FULL_URI`; the hand-mirrored resolution in
+      `src/storage/s3_credentials.rs` has to move with it.
+      [Calls #5](calls/manager-workload-identity-plan_calls.md#5-misconfigurations-that-would-change-the-principal-fail-the-boot)
 
 - [ ] **Delete the deferred read-model hooks.** Since
       [read-model coherence](plans/read-model-coherence-plan.md) Phase 4,
@@ -4526,6 +4547,20 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 [plan](plans/persistence-plan.md) · [docs](../docs/persistence-streaming.md), [raft-operations.md](../docs/raft-operations.md)
 
 - [x] Streaming SQLite replication, Litestream-style, with optional lease failover
+- [x] **The manager's own identity for state replication** (2026-10-12). The
+      WAL replica, the takeover restore and the lease share one credential
+      path: `persistence.streaming.credentials` keys, or the platform chain
+      (AWS env keys, web identity for EKS IRSA/SPIRE/Vault, ECS task role,
+      instance metadata), resolved and logged at boot, with half-configured
+      credentials and EKS Pod Identity refused. The lease's own keys were
+      removed. Legion deliberately does not issue the manager's identity
+      itself. Also fixed: the lease store sent no ETag preconditions, so the
+      object-storage lease could never be acquired on real S3, R2 or MinIO
+      ([plan](plans/manager-workload-identity-plan.md) ·
+      [calls](calls/manager-workload-identity-plan_calls.md) ·
+      [docs](../docs/persistence-streaming.md#credentials)).
+      Deferred: `--restore-from` from the replica, introspection, Pod
+      Identity (open under Persistence & cluster operations)
 - [x] Raft control plane: leader election, failover controls, membership,
       observability, CLI and UI operations
 - [x] Snapshot install no longer loses the writes that follow it (2026-09-29):
@@ -4564,6 +4599,11 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Manager as an OIDC issuer: keys, discovery, JWKS, rotation
 - [x] Token issuance RPC, job-spec API, worker delivery, change mode
 - [x] Node identity tokens and control-plane identity (phase 7)
+- [x] The manager presents a platform-issued identity for its own storage
+      access and never signs one for itself; there is deliberately no
+      `managerIdentities` block
+      ([plan §6](plans/manager-workload-identity-plan.md#6-why-the-manager-does-not-use-legions-own-idp) ·
+      [docs](../docs/workload-identity.md#the-managers-own-identity-and-why-legion-does-not-issue-it))
 - [x] Identity epochs: a fork or snapshot capture retires the instance's
       earlier tokens in Legion's own verifiers and re-issues the running
       instance at once
