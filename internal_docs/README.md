@@ -165,6 +165,7 @@ When one is required and what goes in it:
 | [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | in execution (Phases 1-7 shipped, Phase 8 deferred, KVM checks pending) |
 | [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | in execution (Phases 1-3 and 7a shipped, KVM checks pending) |
 | [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md) | in execution: Phases 0–3 shipped (measurement, group commit and write trimming, `StreamWork` delivery, blocked evals); Phases 4+ planned (very large session counts: measure raft writes and latency SLOs per lifecycle, group commit, sequenced delivery, blocked work keyed by its blocker, then idle sessions as content-store manifests, running sessions as node-owned soft state in a new `session` instance mode, and wake on request through a gateway; Phase 0 is a gate) |
+| [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md) | planned (builds on session mode in #30: sessions survive a worker restart through a node-local log, the start node is in the session id so routing needs no lookup, sessions sleep on their node with `durability = "local"` or `"store"`; a batched raft session directory deferred behind a trigger) |
 | [wake-on-request-plan.md](plans/wake-on-request-plan.md) | in execution: Phase 1 shipped (`suspend.wake`, `legion start gateway` that resumes a suspended keyed instance on a request and holds it until the instance serves, `CONNECT` for any declared port, a wake webhook, wake fields on `GetInstance`); gateway metrics, waking sessions, and node-local wake on connect planned |
 | [sandbox-exec-plan.md](plans/sandbox-exec-plan.md) | in execution: Phases 1 to 3 built and Phase 0 measured on one host; KVM and rig verification open (exec into Linux microVMs over the guest agent's vsock, and direct exec with worker-verified tickets as a third caller class on the worker-plane-auth listener; implemented together with worker-plane-auth, which it amends in §9) |
 | [suspend-resume-ui-plan.md](plans/suspend-resume-ui-plan.md) | shipped (UI-1 to UI-6, with the §7.3 server reads: ListNodeUsage, GetNodeContent, last_stop, checkpoint_support) |
@@ -201,6 +202,7 @@ by project impact. The full template and a worked example:
 - [sandbox-exec-plan_calls.md](calls/sandbox-exec-plan_calls.md)
 - [sandbox-scaling-plan_calls.md](calls/sandbox-scaling-plan_calls.md)
 - [wake-on-request-plan_calls.md](calls/wake-on-request-plan_calls.md)
+- [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
 - [heartbeat-cadence-at-scale-plan_calls.md](calls/heartbeat-cadence-at-scale-plan_calls.md)
 - [heartbeat-scale-plan_calls.md](calls/heartbeat-scale-plan_calls.md)

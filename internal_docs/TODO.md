@@ -2774,6 +2774,22 @@ Plan: [artifact-system-plan.md](plans/artifact-system-plan.md) · docs: [artifac
 
 Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.md), [volume-plugin-system](plans/volume-plugin-system-plan.md) · docs: [volumes.md](../docs/volumes.md), [stateful-workloads.md](../docs/stateful-workloads.md)
 
+- [ ] **Session durability and routing back** (needs session mode from
+      [#30](https://github.com/mikenomitch/legion/pull/30)). A worker
+      restart ends every unpromoted session, a session cannot sleep, and
+      finding one fans out to every manager. Plan:
+      [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md)
+      (PLANNED) · calls:
+      [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md).
+  - [ ] Phase 1: node-local `sessions.db`, adopt sessions on worker restart.
+  - [ ] Phase 2: the start node's tag in the minted session id, tag-first
+        routing with fan-out as the fallback.
+  - [ ] Phase 3: session suspend on the node (`durability = "local"` or
+        `"store"`), `suspend.keepFor`, `evicted` answers, resume by tag with
+        manifest fallback.
+  - [ ] Phase 4 (conditional, plan §6.5): batched raft session directory,
+        only past its trigger.
+
 All deferred from the volume plan v1:
 
 - [ ] **CSI bridge plugin** — the driver contract was designed for it; nothing in
