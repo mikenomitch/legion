@@ -1176,7 +1176,7 @@ async fn heartbeat_tick(
                 let activity = forwarder.context().activity();
                 activity.retain(&targets.iter().map(|target| target.allocation_id).collect());
                 let inputs = crate::worker::usage::ActivityInputs {
-                    ingress: activity.snapshot(),
+                    datapath: activity.snapshot(),
                     exec_sessions: crate::worker::exec::open_sessions(),
                 };
                 // One `container stats` call covers every Apple container

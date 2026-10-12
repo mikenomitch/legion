@@ -236,8 +236,8 @@ The signals:
 
 | Signal | Counts as activity |
 | --- | --- |
-| `network` | Bytes through the node datapath: connections the task dials, and ingress connections to its ports. On a sandbox, also bytes the guest sends on its own NIC (see below). |
-| `connections` | Any open ingress connection through the node datapath, even one that sends nothing. |
+| `network` | Bytes through the node datapath: connections the task dials, ingress connections to its ports, and a gated task's connections through its egress proxy, counted as the bytes move. On a sandbox, also bytes the guest sends on its own NIC (see below). |
+| `connections` | Any open connection through the node datapath, even one that sends nothing: ingress connections to the task's ports, and a gated task's connections through its egress proxy. |
 | `cpu` | CPU use at or above `cpuBelow` of the task's `cpu`. |
 | `exec` | An open exec session (`legion alloc exec`, an action). Someone working in the instance keeps it awake. |
 
@@ -268,16 +268,18 @@ slow response. Counting only open connections would never suspend it.
 Counting only bytes would suspend it in the middle of the wait and break the
 stream on resume. The default (`network`, `cpu`, `exec`, three minutes) is
 tuned for interactive work that waits on a human. A workload whose quiet
-ingress connections must not be cut adds `connections`:
+connections must not be cut adds `connections`:
 
 ```nickel
 idle = { after = "5m", signals = ["network", "cpu", "exec", "connections"] },
 ```
 
-`connections` only sees ingress the node datapath fronts. It does not
-protect an agent harness in a sandbox that waits on a model call, because
-that call is an outbound connection from the guest, and a sandbox's traffic
-crosses the datapath only when it is gated. See the next section.
+`connections` sees ingress the node datapath fronts and, for a gated task,
+every connection through its egress proxy. So it keeps an agent harness in a
+**gated** sandbox awake through a quiet model call, which is an outbound
+connection through the proxy, and a long streamed response counts as
+`network` activity the whole time it streams. A sandbox that is not gated
+has no datapath connections to count. See the next section.
 
 Suspending *during* a model call, and waking when it returns, needs the
 workload to say it is parked. That is the `hint` signal, which is not
@@ -291,8 +293,8 @@ sandbox differently from an `exec` or `container` task:
 
 | Signal | microVM on `none` or `tap` | Gated microVM | Dev mode (Apple `container`) |
 | --- | --- | --- | --- |
-| `network` | Bytes the guest sends on its TAP device, read from `/sys/class/net/<tap>/statistics/rx_bytes`. Nothing on `none` | Bytes through the datapath | Bytes the container sends, from `container stats` |
-| `connections` | **Refused at submit.** No datapath sees the guest's connections | Ingress connections through the datapath | **Refused at submit** |
+| `network` | Bytes the guest sends on its TAP device, read from `/sys/class/net/<tap>/statistics/rx_bytes`. Nothing on `none` | Bytes through the egress proxy (and any ingress), as they move | Bytes the container sends, from `container stats` |
+| `connections` | **Refused at submit.** No datapath sees the guest's connections | Every open connection through the egress proxy, so a quiet model call keeps the sandbox awake | **Refused at submit** |
 | `cpu` | The VMM's CPU, which is the guest's | The same | The container VM's CPU, from `container stats` |
 | `exec` | Never fires: a microVM takes no exec sessions | The same | `legion alloc exec` sessions |
 
@@ -305,16 +307,16 @@ is only TCP acknowledgements.
 Two rules follow, both checked at submit:
 
 - `connections` on a sandbox that is not gated is refused, with what to do
-  instead (set `after` longer than the longest quiet call, or suspend from
-  your platform):
+  instead (run it gated, set `after` longer than the longest quiet call, or
+  suspend from your platform):
 
   ```text
   Error: jobspec failed validation: task "workspace": suspend.idle.signals "connections" counts
-  open ingress connections through the node datapath, and this sandbox's traffic never crosses it
-  (it is not network.mode = "gated", so clients reach the guest directly or not at all)
-  (remove "connections". To keep a sandbox awake through a quiet model call, set idle.after
-  longer than the call, or suspend from your platform, which knows when a call is in flight)
-  [code=InvalidArgument]
+  open connections through the node datapath, and this sandbox's traffic never crosses it
+  (it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
+  (remove "connections", or run the sandbox gated, where a quiet model call through the egress
+  proxy keeps it awake. Otherwise set idle.after longer than the call, or suspend from your
+  platform, which knows when a call is in flight) [code=InvalidArgument]
   ```
 
 - `exec` listed explicitly on a sandbox pinned to a VMM (`hypervisor =
@@ -1885,8 +1887,8 @@ See [metrics](metrics.md#suspend-and-resume).
 | `detail: idle-unmeasured: ...` | The node sends no usage reports, so nothing measures activity | Set `resourceEnforcement.enabled` on the worker type |
 | An idle instance never suspends | A listed signal keeps firing (an open `exec` session, a client holding a connection with `connections` listed, background CPU above `cpuBelow`) | Compare `instance get`'s idle since with what the task is doing, then adjust `signals` or `cpuBelow` |
 | `legion_idle_sweep_suspends_total{outcome="skipped"}` rising | The sweep found idle instances it could not suspend | The manager's debug log names why (a worker without the `checkpoint` capability, a memory checkpoint the node cannot take) |
-| Submit: `suspend.idle.signals "hint" is not implemented yet` | The workload's own idle signal is not available | Remove `hint`. Add `connections` to keep quiet ingress connections awake (gated sandboxes, `exec`, `container`) |
-| Submit: `"connections" counts open ingress connections through the node datapath, and this sandbox's traffic never crosses it` | A sandbox that is not gated has no datapath ingress | Remove `connections`. Raise `after` or suspend from your platform |
+| Submit: `suspend.idle.signals "hint" is not implemented yet` | The workload's own idle signal is not available | Remove `hint`. Add `connections` to keep quiet datapath connections awake (ingress on any runtime, and egress on gated tasks, sandboxes included) |
+| Submit: `"connections" counts open connections through the node datapath, and this sandbox's traffic never crosses it` | A sandbox that is not gated has no datapath connections | Remove `connections`, or run the sandbox gated. Otherwise raise `after` or suspend from your platform |
 | Submit: `lists "exec", but this sandbox always runs as a microVM` | A microVM takes no exec sessions | Remove `exec` |
 | Warning: `suspend.idle counts "exec", which never fires while the sandbox runs as a microVM` | The default signals on a sandbox that may run as a microVM | List signals explicitly, or ignore it for a dev-mode-only job |
 | A TAP-wired sandbox never suspends | The guest keeps sending on its TAP (DHCP, NTP, a chatty agent) | Compare `node usage`'s IDLE column with the guest's traffic, or drop `network` from `signals` |
@@ -1991,14 +1993,19 @@ See [metrics](metrics.md#suspend-and-resume).
   15, so `after` is honored to within about 30 seconds, and a burst shorter
   than a sample interval counts only through bytes or an open session, not
   CPU.
-- **Only ingress through the datapath counts as `connections`.** A port the
-  task binds directly on the host (no `ingress` chain) is invisible to the
-  node, so its connections and bytes do not keep the instance awake. CPU and
-  the egress datapath still do. A sandbox that is not gated has no datapath
-  ingress at all, so `connections` is refused there.
-- **A sandbox's NIC counts bytes, not connections.** A quiet outbound
-  connection from the guest (a harness waiting on a model) sends nothing, so
-  it looks idle. Set `after` longer than the longest quiet call.
+- **Only connections through the datapath count as `connections`.** A port
+  the task binds directly on the host (no `ingress` chain) is invisible to
+  the node, so its connections and bytes do not keep the instance awake. CPU
+  and the egress datapath still do. A sandbox that is not gated has no
+  datapath connections at all, so `connections` is refused there.
+- **A sandbox's NIC counts bytes, not connections.** On a TAP, a quiet
+  outbound connection from the guest (a harness waiting on a model) sends
+  nothing, so it looks idle. Run the sandbox gated and add `connections`, or
+  set `after` longer than the longest quiet call.
+- **`connections` counts any open connection**, including an idle keepalive
+  the workload holds to some service. A gated sandbox that keeps one open
+  never suspends while it is open, which is why `connections` is not in the
+  default list.
 - **No `hint` signal yet.** A workload cannot say "parked until this call
   returns", so suspending during a model call is not possible.
 - **A pressure suspend is lost if the worker restarts before reporting it.**

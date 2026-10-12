@@ -18,7 +18,9 @@
 //!
 //! Every denial is a `403` (HTTP) or a SOCKS `connection not allowed` reply,
 //! recorded for the heartbeat with the deciding rule, exactly like a refused
-//! upstream dial. Dialing happens from the host namespace — the worker's —
+//! upstream dial. Every accepted connection is tracked in the activity
+//! ledger (`super::activity`), so idle detection sees an open egress
+//! connection and its bytes as they move, not only when the splice ends. Dialing happens from the host namespace — the worker's —
 //! which is what makes the namespace a boundary and the proxy the door.
 
 use crate::prelude::*;
@@ -263,6 +265,11 @@ async fn run(listener: TcpListener, proxy: Arc<Proxy>) {
                 continue;
             }
         };
+        // Counted as open (and its bytes as activity, as they move) for the
+        // idle policy's `connections` and `network` signals, until it
+        // closes: a quiet model call through the proxy keeps the task
+        // awake when it asks for `connections`.
+        let client = proxy.context.activity().track(proxy.allocation_id, client);
         let proxy = proxy.clone();
         tokio::spawn(async move {
             handle(client, Some(peer), proxy).await;
@@ -280,6 +287,9 @@ async fn run_unix(listener: tokio::net::UnixListener, proxy: Arc<Proxy>) {
                 continue;
             }
         };
+        // The same tracking as `run`: a gated sandbox's egress is the one
+        // datapath traffic an idle policy can see for it.
+        let client = proxy.context.activity().track(proxy.allocation_id, client);
         let proxy = proxy.clone();
         tokio::spawn(async move {
             handle(client, None, proxy).await;
@@ -1515,6 +1525,91 @@ mod tests {
             .drain()
             .iter()
             .all(|edge| edge.allocation_id != 7));
+    }
+
+    /// Gated plan §6.9, Phase 3: a connection through a gated sandbox's
+    /// egress proxy counts as open for the `connections` signal from accept
+    /// to close, and bytes stamp the allocation's activity as they move,
+    /// while the tunnel is still open, not only when the splice ends. So a
+    /// long model stream is seen throughout.
+    #[tokio::test]
+    async fn an_open_egress_tunnel_counts_and_stamps_bytes_as_they_move() {
+        // An origin that echoes for as long as the connection stays open.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (context, _denials) = gated_context(&[(9, &["127.0.0.1"])]);
+        let proxies = EgressProxies::new(context.clone());
+        let spec = vsock_spec(dir.path(), 9);
+        proxies.sync(std::slice::from_ref(&spec)).await;
+        let ledger = context.activity();
+        let open = |ledger: &crate::worker::netd::activity::ActivityLedger| {
+            ledger
+                .snapshot()
+                .get(&9)
+                .map(|activity| activity.open_connections)
+                .unwrap_or(0)
+        };
+        assert_eq!(open(ledger), 0);
+
+        let mut stream = tokio::net::UnixStream::connect(spec.unix.as_deref().unwrap())
+            .await
+            .unwrap();
+        stream
+            .write_all(format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("200 Connection Established"));
+        assert_eq!(open(ledger), 1, "open while the tunnel is");
+
+        // A quiet stretch, then bytes through the open tunnel stamp the
+        // allocation at once.
+        ledger.rewind(9, 1);
+        stream.write_all(b"model tokens").await.unwrap();
+        let mut echo = [0u8; 12];
+        stream.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"model tokens");
+        assert!(
+            ledger.snapshot()[&9].last_bytes_unix > 1,
+            "stamped mid-stream, before the splice ends"
+        );
+        assert!(
+            context
+                .edges()
+                .drain()
+                .iter()
+                .all(|edge| edge.bytes_out == 0 && edge.bytes_in == 0),
+            "the service graph still counts bytes only when the splice ends"
+        );
+
+        drop(stream);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while open(ledger) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the close was never counted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

@@ -1,17 +1,20 @@
-//! Ingress activity per allocation, for the idle policy
+//! Datapath activity per allocation, for the idle policy
 //! (docs/suspend-and-resume.md, "Idle policy").
 //!
-//! The service graph ([`super::graph`]) records traffic on the *calling*
-//! side, which covers what an allocation dials. Idle detection also needs
-//! what reaches it: a sandbox serving an interactive session is busy while
-//! bytes flow in, and with the `connections` signal it stays awake for as
-//! long as any client holds a connection open, even a silent one.
+//! The service graph ([`super::graph`]) records a flow's bytes when it
+//! ends, which is too late for idle detection: a long model stream would be
+//! seen at its start and its end, never during. And the `connections`
+//! signal keeps an allocation awake for as long as any connection is open,
+//! even a silent one: a client holding an interactive session, or a harness
+//! waiting on a quiet model call.
 //!
-//! So every ingress connection the datapath fronts is wrapped in a
-//! [`TrackedStream`]: it counts as open from accept to close, and stamps the
-//! allocation's last-bytes time whenever data moves either way. Both are
-//! atomics on a per-allocation slot fetched once per connection, so the hot
-//! path is one relaxed store per read or write and never takes a lock.
+//! So every connection the datapath fronts is wrapped in a
+//! [`TrackedStream`]: each ingress connection, and each connection through a
+//! gated allocation's egress proxy. It counts as open from accept to close,
+//! and stamps the allocation's last-bytes time whenever data moves either
+//! way. Both are atomics on a per-allocation slot fetched once per
+//! connection, so the hot path is one relaxed store per read or write and
+//! never takes a lock.
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -21,11 +24,11 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// One allocation's ingress counters.
+/// One allocation's datapath counters.
 #[derive(Debug, Default)]
 pub struct AllocActivity {
     open: AtomicU32,
-    /// Unix seconds bytes last moved through any ingress connection. 0 never.
+    /// Unix seconds bytes last moved through any tracked connection. 0 never.
     last_bytes_unix: AtomicI64,
 }
 
@@ -38,14 +41,14 @@ impl AllocActivity {
 
 /// What the sampler reads for one allocation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct IngressActivity {
-    /// Ingress connections open right now.
+pub struct DatapathActivity {
+    /// Ingress and egress connections open through the datapath right now.
     pub open_connections: u32,
     /// Unix seconds bytes last moved, 0 if never.
     pub last_bytes_unix: i64,
 }
 
-/// Every allocation's ingress counters on this node.
+/// Every allocation's datapath counters on this node.
 #[derive(Debug, Default)]
 pub struct ActivityLedger {
     slots: Mutex<HashMap<i64, Arc<AllocActivity>>>,
@@ -65,8 +68,8 @@ impl ActivityLedger {
             .clone()
     }
 
-    /// Wrap an accepted ingress connection. It counts as open until the
-    /// returned stream is dropped.
+    /// Wrap an accepted connection (ingress, or into a gated allocation's
+    /// egress proxy). It counts as open until the returned stream is dropped.
     pub fn track<S>(&self, allocation_id: i64, stream: S) -> TrackedStream<S> {
         let slot = self.slot(allocation_id);
         slot.open.fetch_add(1, Ordering::Relaxed);
@@ -78,7 +81,7 @@ impl ActivityLedger {
     }
 
     /// The counters of every allocation the ledger knows.
-    pub fn snapshot(&self) -> HashMap<i64, IngressActivity> {
+    pub fn snapshot(&self) -> HashMap<i64, DatapathActivity> {
         self.slots
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -86,13 +89,22 @@ impl ActivityLedger {
             .map(|(id, slot)| {
                 (
                     *id,
-                    IngressActivity {
+                    DatapathActivity {
                         open_connections: slot.open.load(Ordering::Relaxed),
                         last_bytes_unix: slot.last_bytes_unix.load(Ordering::Relaxed),
                     },
                 )
             })
             .collect()
+    }
+
+    /// Move an allocation's last-bytes stamp back, so a test can see the
+    /// next byte move it forward again.
+    #[cfg(test)]
+    pub(crate) fn rewind(&self, allocation_id: i64, to_unix: i64) {
+        self.slot(allocation_id)
+            .last_bytes_unix
+            .store(to_unix, Ordering::Relaxed);
     }
 
     /// Forget allocations no longer on the node, unless a connection to one
@@ -105,7 +117,7 @@ impl ActivityLedger {
     }
 }
 
-/// An ingress connection that reports its activity. Transparent otherwise.
+/// A datapath connection that reports its activity. Transparent otherwise.
 pub struct TrackedStream<S> {
     inner: S,
     slot: Arc<AllocActivity>,

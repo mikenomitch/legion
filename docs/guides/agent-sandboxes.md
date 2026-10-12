@@ -872,7 +872,7 @@ a microVM matters:
 | Signal | What it sees | On an auto-TAP microVM |
 | --- | --- | --- |
 | `network` | Bytes through the node datapath, plus bytes the guest sends on its own NIC | Bytes the guest sends on its TAP (`rx_bytes` of `/sys/class/net/lgf...`) |
-| `connections` | Open ingress connections through the datapath | Refused at submit. No datapath fronts the guest |
+| `connections` | Open connections through the datapath: ingress, and a gated sandbox's egress | Refused at submit. No datapath fronts the guest |
 | `cpu` | CPU at or above `cpuBelow` of the task's `cpu` | The VMM's CPU, which is the guest's |
 | `exec` | Open `exec` sessions and actions | Never fires. A microVM takes no exec sessions, so `job run` warns when it is listed |
 
@@ -890,9 +890,12 @@ failure modes follow:
   `cpuBelow`, or drop `network` from `signals`.
 - **It suspends in the middle of a model call.** An agent harness waiting
   40 seconds on a model holds a mostly quiet HTTPS connection, sends almost
-  nothing, and uses almost no CPU, so the wait counts as quiet. No signal sees
-  an idle open connection from the guest, and `connections` is refused for
-  that reason rather than accepted and ignored. Set `after` longer than your
+  nothing, and uses almost no CPU, so the wait counts as quiet. On a TAP no
+  signal sees an idle open connection from the guest, and `connections` is
+  refused for that reason rather than accepted and ignored. On a gated
+  sandbox the call goes through the node's egress proxy, so add
+  `connections` and the open call keeps the sandbox awake (as would any
+  other connection it holds open). Otherwise set `after` longer than your
   longest model call, or leave `idle` off and suspend from your platform,
   which knows when a call is in flight.
 - **It suspends while someone is in a shell.** Not on a microVM: `legion
@@ -906,18 +909,20 @@ and a spec that lists it is refused:
 Error: jobspec failed validation: task "workspace": suspend.idle.signals "hint" is not
 implemented yet: the workload's own busy/idle signal ships in suspend plan Phase 8
 (remove "hint". To keep an instance awake through a quiet call, add "connections"
-(any open ingress connection through the node datapath counts as activity; a sandbox
-sees it only on gated networking)) [code=InvalidArgument]
+(any open connection through the node datapath, inbound or out through a gated task's
+egress proxy, counts as activity; a sandbox has one only on gated networking))
+[code=InvalidArgument]
 ```
 
 So does `connections` on this sandbox:
 
 ```text
 Error: jobspec failed validation: task "workspace": suspend.idle.signals "connections" counts
-open ingress connections through the node datapath, and this sandbox's traffic never crosses it
-(it is not network.mode = "gated", so clients reach the guest directly or not at all)
-(remove "connections". To keep a sandbox awake through a quiet model call, set idle.after
-longer than the call, or suspend from your platform, which knows when a call is in flight)
+open connections through the node datapath, and this sandbox's traffic never crosses it
+(it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
+(remove "connections", or run the sandbox gated, where a quiet model call through the egress
+proxy keeps it awake. Otherwise set idle.after longer than the call, or suspend from your
+platform, which knows when a call is in flight)
 [code=InvalidArgument]
 ```
 
@@ -1034,9 +1039,11 @@ tokens refresh through a read-only bind mount at `/legion/identity`). See
   Firecracker, a live snapshot or a fork closes the running origin's too.
   Retry an interrupted model call. Gated memory checkpoints need Firecracker
   1.16.1 or later. See [Networking](#networking).
-- **Idle detection on a microVM sees CPU and the bytes the guest sends**,
-  never an idle open connection, for the reasons in
+- **Idle detection on a TAP-wired microVM sees CPU and the bytes the guest
+  sends**, never an idle open connection, for the reasons in
   [An instance never goes idle](#an-instance-never-goes-idle-or-goes-idle-too-soon).
+  A gated sandbox's connections go through the egress proxy, so
+  `connections` sees them there.
   Activity is sampled every 10 seconds and swept every 15, so `after` is
   honored to within about 30 seconds.
 - **A checkpoint restores only on the same VMM version, CPU, and guest
