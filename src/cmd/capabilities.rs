@@ -621,9 +621,11 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "action.run",
-            cli: "legion action run <JOB> <ACTION> [--alloc <ID>|--instance <ID>] [--param k=v]",
+            cli: "legion action run <JOB> <ACTION> [--alloc <ID>|--instance <ID>] [--param k=v] \
+                  [--json]",
             grpc: Some("Manager/ExecAllocation"),
-            summary: "Run a declared action in a running allocation, rendered by the manager.",
+            summary: "Run a declared action in a running allocation, rendered by the manager; \
+                      `--json` returns its exit code and output.",
             mutates: true,
             read_only_safe: false,
         },
@@ -1049,23 +1051,6 @@ pub fn catalog() -> Vec<Capability> {
             summary: "Run a command inside a running allocation. `--json` collects the output \
                  into one envelope (`exitCode`, `stdout`, `stderr`); the process exits with \
                  the remote exit code.",
-            mutates: true,
-            read_only_safe: false,
-        },
-        Capability {
-            name: "action.list",
-            cli: "legion action list <JOB>",
-            grpc: Some("Manager/ListJobActions"),
-            summary: "List the actions declared on a job's tasks, with their parameters.",
-            mutates: false,
-            read_only_safe: true,
-        },
-        Capability {
-            name: "action.run",
-            cli: "legion action run <JOB> <ACTION> [--alloc <ID>] [--param k=v] --json",
-            grpc: Some("Manager/ExecAllocation"),
-            summary: "Run a declared action against a running allocation; `--json` returns \
-                 its exit code and output.",
             mutates: true,
             read_only_safe: false,
         },
