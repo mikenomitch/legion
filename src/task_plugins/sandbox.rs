@@ -1006,6 +1006,19 @@ impl SandboxTaskPlugin {
         let scratch = work_root(allocation, instance);
         let name = sandbox_name(allocation);
         let tap = config.tap_for(instance_id_from_env(env), allocation.id);
+        // A gated sandbox has no NIC: its vsock device is the only way out,
+        // and the guest agent makes the host datapath reachable on the
+        // guest's loopback. Checked before anything is created. Submit
+        // refuses the combination, so only a job stored before that rule (or
+        // a `require` policy imposing `gated` on a TAP task) reaches it.
+        let gated = crate::task_plugins::allocation_is_gated(allocation);
+        if gated && tap.is_some() {
+            bail!(
+                "sandbox task {} is network.mode = \"gated\" but its config declares a TAP \
+                 device; a gated guest has no NIC (drop config.network, or set mode = \"host\")",
+                task.name
+            );
+        }
         std::fs::create_dir_all(&scratch)?;
         // The guest's NIC: this instance's own TAP on its bridge (created,
         // and recorded so destroy deletes it), and an address leased from
@@ -1066,17 +1079,6 @@ impl SandboxTaskPlugin {
             .cwd
             .clone()
             .or_else(|| image_config.working_dir.clone());
-        // A gated sandbox has no NIC: its vsock device is the only way out,
-        // and the guest agent (this binary, copied in) makes the host
-        // datapath reachable on the guest's loopback.
-        let gated = crate::task_plugins::allocation_is_gated(allocation);
-        if gated && tap.is_some() {
-            bail!(
-                "sandbox task {} is network.mode = \"gated\" but its config declares a TAP \
-                 device; a gated guest has no NIC (drop config.network, or set mode = \"host\")",
-                task.name
-            );
-        }
         // Workload-identity tokens the guest keeps fresh through its
         // identity disk: file-delivered ones always, env-delivered ones
         // whenever the guest has the disk anyway (a checkpoint launch).
