@@ -4178,6 +4178,11 @@ message Job {
   // Job status string.
   //
   // Current values written by manager include: done, stopped, failed.
+  //
+  // `blocked` is reported (never stored) for a job that is neither stopped
+  // nor failed while its eval waits for capacity: a placement found no room
+  // and the job places on its own when capacity that could help appears.
+  // `blocked` below says what it waits for.
   string status = 3;
 
   // Unix timestamp (seconds) when job was created. Immutable for the life of
@@ -4203,6 +4208,38 @@ message Job {
   // peer. See docs/preemption-and-eviction.md. Empty only when read from a
   // manager that predates bands.
   string priority = 6;
+
+  // Set while the job's eval is blocked on capacity (status `blocked`;
+  // docs/scheduler-and-eval-loop.md, "Blocked evals"). Unset otherwise,
+  // including for a stopped or failed job.
+  optional JobBlocked blocked = 7;
+}
+
+// What a blocked job waits for.
+message JobBlocked {
+  // The blocking key: `class:pool=<pool>[,<attr>=<value>...]` (any node of
+  // that pool whose attributes match the task's `=` constraints can help),
+  // `node:<id>` (a resume pinned to the node holding its checkpoint or
+  // node-local storage), or `escaped` (the cluster had no schedulable node at
+  // all; any capacity wakes it).
+  string key = 1;
+
+  // The task that could not place.
+  string task = 2;
+
+  // What one placement of `task` asks for that no eligible node had free:
+  // `cpu` (e.g. `500MHz`) and `memory` (e.g. `512MiB`), for the resources the
+  // task declares. Per placement, not the job's total.
+  map<string, string> shortfall = 3;
+
+  // The scheduler's diagnosis, the message the eval used to fail with.
+  string message = 4;
+
+  // Unix timestamp (seconds) when the eval blocked.
+  int64 since = 5;
+
+  // The blocked eval's id.
+  string eval_id = 6;
 }
 
 // Reply payload for ListJobs.
@@ -4393,7 +4430,10 @@ message HeartbeatRequest {
   // `PERMISSION_DENIED`.
   string id = 1;
 
-  // Allocation IDs currently known/running on worker.
+  // Allocation IDs currently known/running on worker. Informational: the
+  // manager decides the desired set from its own rows, not from this list.
+  // A worker that reports `work_stream` leaves it empty (the digest stands
+  // in for it).
   //
   // Default: empty list.
   repeated int64 allocation_ids = 2;
@@ -4403,7 +4443,12 @@ message HeartbeatRequest {
   // Default: empty list.
   repeated FailedAllocation failed_allocations = 3;
 
-  // Latest per-allocation health snapshots from worker.
+  // Per-allocation health snapshots from worker. A worker without
+  // `work_stream` sends every allocation's health on every beat. A worker
+  // on the stream sends only the snapshots that changed since the last
+  // reply that set `HeartbeatReply.desired_via_stream`, and everything again
+  // after any other reply. Either way the manager writes only the rows whose
+  // values changed, so a steady beat writes nothing.
   //
   // Default: empty list.
   repeated AllocationHealth allocation_health = 4;
@@ -7461,9 +7506,15 @@ message Eval {
   // Eval ID.
   string id = 1;
 
-  // Eval status (for example: pending, in_flight, failed).
+  // Eval status: `pending`, `in_flight`, `blocked`, or `failed`.
   //
-  // Newly enqueued evals start as `pending`.
+  // Newly enqueued evals start as `pending`. `in_flight` is reported only by
+  // the manager whose eval worker has claimed the eval: a claim is that
+  // manager's memory, and every other manager shows the row as `pending`.
+  // `blocked` means the eval's plan found no room and it waits, under a key
+  // (`class:pool=…`, `node:<id>`, `escaped`), for capacity that could help;
+  // it returns to `pending` on its own (docs/scheduler-and-eval-loop.md,
+  // "Blocked evals"). `failed` evals are never retried.
   string status = 2;
 
   // Eval kind (for example: job_submit, node_drop, rollout_tick).

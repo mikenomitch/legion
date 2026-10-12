@@ -91,6 +91,13 @@ const SCHEDULER_DELAY_BUCKETS: &[f64] = &[
     0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0,
 ];
 
+/// Bucket bounds (seconds) for how long an eval waited blocked on capacity
+/// (sandbox-scaling plan, Phase 3): from a node joining a moment later to an
+/// hour-long wait for a pool to scale out.
+const BLOCKED_WAIT_BUCKETS: &[f64] = &[
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 3600.0,
+];
+
 /// Bucket bounds for candidate-count histograms (scheduling indexes).
 const COUNT_BUCKETS: &[f64] = &[
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 4096.0, 16384.0,
@@ -748,6 +755,12 @@ pub struct Metrics {
     pub scheduler_plan_bind_pass: Arc<CounterVec>,
     /// `legion_eval_conflict_requeues_total`
     pub eval_conflict_requeues_total: Arc<Counter>,
+    /// `legion_evals_blocked{key_kind}`
+    pub evals_blocked: Arc<GaugeVec>,
+    /// `legion_evals_unblocked_total{event}`
+    pub evals_unblocked_total: Arc<CounterVec>,
+    /// `legion_blocked_wait_seconds`
+    pub blocked_wait_seconds: Arc<Histogram>,
     /// `legion_preemptions_total{pool,band}` — victims actually evicted.
     pub preemptions_total: Arc<CounterVec>,
     /// `legion_preemption_plans_total{outcome}` — preemption passes that
@@ -1005,6 +1018,30 @@ impl Metrics {
                 labels: &[],
             },
             cell: CounterCell::default(),
+        });
+        let evals_blocked = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_evals_blocked",
+                help: "Evals waiting blocked on capacity, by the kind of key they wait under: `class` (a pool and pinned attributes), `node` (a resume pinned to the node holding its checkpoint), `escaped` (no schedulable node at all). Set by the scheduler-lane leader's wake pass; zero elsewhere.",
+                labels: &["key_kind"],
+            },
+            series: Series::new(),
+        });
+        let evals_unblocked_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_evals_unblocked_total",
+                help: "Blocked evals returned to the pending queue, by what woke them: `register` (a node joined), `node` (a node's pool, availability, or attributes changed), `ready` (a node became ready), `freed` (allocations left a node), `missed` (capacity appeared while the eval was running, so it never blocked), `startup` (a manager starting as the scheduler's writer gives every blocked eval one more look).",
+                labels: &["event"],
+            },
+            series: Series::new(),
+        });
+        let blocked_wait_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_blocked_wait_seconds",
+                help: "How long a blocked eval waited before capacity woke it, from the entry that blocked it to the one that returned it to the queue.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(BLOCKED_WAIT_BUCKETS),
         });
         let preemptions_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -1656,6 +1693,9 @@ impl Metrics {
             Arc::clone(&checkpoint_publish_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&checkpoint_publish_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
+            Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&blocked_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_handle_seconds) as Arc<dyn RenderMetric>,
@@ -1716,6 +1756,9 @@ impl Metrics {
             scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
+            evals_blocked,
+            evals_unblocked_total,
+            blocked_wait_seconds,
             preemptions_total,
             preemption_plans_total,
             heartbeats_total,

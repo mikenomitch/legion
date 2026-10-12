@@ -129,7 +129,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_info",
-            description: "Inspect a single job's current state.",
+            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears.",
             input_schema: name_arg_schema,
             mutates: false,
         },

@@ -1174,7 +1174,10 @@ impl<'a> Scheduler<'a> {
         info!(%job_config_id, mode = mode_label, "Starting scheduler plan_only");
         let nodes = self.available_nodes()?;
         if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
+            return Err(crate::manager::blocked::PlacementBlocked::escaped(
+                "No nodes available to place allocations".to_string(),
+            )
+            .into());
         }
 
         let all_tasks = self
@@ -1331,7 +1334,10 @@ impl<'a> Scheduler<'a> {
         let mode_label = mode.as_str();
         let nodes = self.available_nodes()?;
         if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
+            return Err(crate::manager::blocked::PlacementBlocked::escaped(
+                "No nodes available to place allocations".to_string(),
+            )
+            .into());
         }
 
         let status_map = HashMap::new();
@@ -1511,7 +1517,10 @@ impl<'a> Scheduler<'a> {
         }
         timings.available_nodes_us = available_started.elapsed().as_micros() as u64;
         if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
+            return Err(crate::manager::blocked::PlacementBlocked::escaped(
+                "No nodes available to place allocations".to_string(),
+            )
+            .into());
         }
 
         let task_fetch_started = std::time::Instant::now();
@@ -3024,7 +3033,22 @@ impl<'a> Scheduler<'a> {
             }
 
             if eligible.is_empty() {
-                bail!("{}", preemption.no_placement_error(task_config));
+                // No room anywhere this task may run: the eval blocks under
+                // the task's class (or the node a restore is pinned to) and
+                // waits for capacity, instead of failing (sandbox-scaling
+                // plan §6.15).
+                let pinned_node = if hard_restore_pins > 0 || floating_restores.is_empty() {
+                    pins.front().map(|(_, node_id)| node_id.as_str())
+                } else {
+                    None
+                };
+                return Err(crate::manager::blocked::PlacementBlocked::for_task(
+                    task_config,
+                    task_id,
+                    pinned_node,
+                    preemption.no_placement_error(task_config),
+                )
+                .into());
             }
 
             // Disk fit: drop nodes whose remaining free disk (minus what this
@@ -3051,12 +3075,18 @@ impl<'a> Scheduler<'a> {
                 })
                 .collect();
             if eligible.is_empty() {
-                bail!(
-                    "Failed to place task {}: no node has enough free disk for its node-local \
-                     volume(s). Shrink the volume `size`, add disk, or use a network driver \
-                     (nfs), whose storage does not consume node disk",
-                    task_config.name
-                );
+                return Err(crate::manager::blocked::PlacementBlocked::for_task(
+                    task_config,
+                    task_id,
+                    None,
+                    format!(
+                        "Failed to place task {}: no node has enough free disk for its \
+                         node-local volume(s). Shrink the volume `size`, add disk, or use a \
+                         network driver (nfs), whose storage does not consume node disk",
+                        task_config.name
+                    ),
+                )
+                .into());
             }
 
             // A pinned instance is not a preference: placing it elsewhere would
@@ -3155,7 +3185,7 @@ impl<'a> Scheduler<'a> {
                             .filter(|node| short.get(node.id.as_str()) == Some(&RoomLimit::Disk))
                             .count();
                         let on_budget = before - on_disk;
-                        bail!(
+                        let message = format!(
                             "Failed to place task {}: {before} eligible node(s), but none has \
                              {} MiB of room for this task's memory checkpoint (suspend): \
                              {on_budget} short on the snapshots content budget, {on_disk} short \
@@ -3168,6 +3198,13 @@ impl<'a> Scheduler<'a> {
                             task_config.name,
                             needed / (1024 * 1024)
                         );
+                        return Err(crate::manager::blocked::PlacementBlocked::for_task(
+                            task_config,
+                            task_id,
+                            None,
+                            message,
+                        )
+                        .into());
                     }
                     roomy
                 }
@@ -3182,13 +3219,19 @@ impl<'a> Scheduler<'a> {
                         .filter(|node| node.id.as_str() == node_id.as_str())
                         .collect::<Vec<_>>();
                     if pinned.is_empty() {
-                        bail!(
-                            "Failed to place task {}: instance {instance_id} holds node-local \
-                             storage on node {node_id}, which is unavailable. Waiting for that \
-                             node to return; use `legion volume delete --force <id>` to abandon \
-                             the data if it never will",
-                            task_config.name
-                        );
+                        return Err(crate::manager::blocked::PlacementBlocked::for_task(
+                            task_config,
+                            task_id,
+                            Some(node_id.as_str()),
+                            format!(
+                                "Failed to place task {}: instance {instance_id} holds \
+                                 node-local storage on node {node_id}, which is unavailable. \
+                                 Waiting for that node to return; use `legion volume delete \
+                                 --force <id>` to abandon the data if it never will",
+                                task_config.name
+                            ),
+                        )
+                        .into());
                     }
                     pinned
                 }

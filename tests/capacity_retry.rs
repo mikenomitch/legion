@@ -142,6 +142,12 @@ impl Cluster {
 /// `count`, which is 1 for every keyed task, so a task with one placed
 /// instance read as satisfied and its pending siblings waited for a
 /// resubmit or a leader change.
+///
+/// Since Phase 3 an instance whose placement found no room has a blocked
+/// eval, and the wake pass places it (`tests/blocked_evals.rs`); the
+/// capacity pass skips jobs that have one. What it still covers is a job
+/// left short with no eval at all, which is the shape built here: the
+/// second instance's row exists, and no eval was ever queued for it.
 #[test]
 fn a_pending_keyed_instance_places_when_a_node_joins() -> R<()> {
     let cluster = Cluster::new()?;
@@ -153,11 +159,12 @@ fn a_pending_keyed_instance_places_when_a_node_joins() -> R<()> {
     cluster.run_eval_worker()?;
     assert!(cluster.placed("user-1")?, "the first instance fits");
 
-    cluster.create("user-2")?;
-    cluster.run_eval_worker()?;
+    cluster
+        .store()
+        .create_keyed_instance(JOB, "default", TASK, Some("user-2"))?;
     assert!(
         !cluster.placed("user-2")?,
-        "the second instance has no room yet"
+        "the second instance is pending, with nothing queued to place it"
     );
 
     cluster.join("node-b", "default")?;
@@ -166,5 +173,6 @@ fn a_pending_keyed_instance_places_when_a_node_joins() -> R<()> {
         cluster.placed("user-2")?,
         "the new node's capacity places the waiting keyed instance"
     );
+    assert!(cluster.store().blocked_evals()?.is_empty());
     Ok(())
 }

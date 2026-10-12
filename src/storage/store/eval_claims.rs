@@ -38,6 +38,10 @@ pub(crate) struct EvalClaims {
     claimed: HashMap<String, Vec<String>>,
     /// Every id held, claimed or subsumed: what a claim must skip.
     held: HashSet<String>,
+    /// The capacity log's position when each claim was taken, so an eval
+    /// that blocks can see the capacity that appeared while it ran
+    /// (`store/blocked_evals.rs`, "Missed unblocks").
+    capacity_seq: HashMap<String, u64>,
 }
 
 impl Store {
@@ -67,6 +71,7 @@ impl Store {
 
     fn claim_up_to(&self, take_for: impl FnOnce(i64) -> usize) -> R<Vec<Eval>> {
         let started = Instant::now();
+        let capacity_seq = self.capacity_seq();
         let mut claims = self.lock_eval_claims();
         let conn = self.read_connection()?;
         let now = Self::sortable_now()?;
@@ -132,6 +137,7 @@ impl Store {
             claims.held.insert(eval.id.clone());
             claims.held.extend(subsumed.iter().cloned());
             claims.claimed.insert(eval.id.clone(), subsumed);
+            claims.capacity_seq.insert(eval.id.clone(), capacity_seq);
             eval.status = "in_flight".to_string();
             claimed.push(eval);
         }
@@ -171,6 +177,7 @@ impl Store {
                 }
             }
             claims.held.remove(eval_id);
+            claims.capacity_seq.remove(eval_id);
         }
     }
 
@@ -180,6 +187,15 @@ impl Store {
         let mut claims = self.lock_eval_claims();
         claims.claimed.clear();
         claims.held.clear();
+        claims.capacity_seq.clear();
+    }
+
+    /// The capacity log's position when `eval_id` was claimed; the current
+    /// position for an eval this manager did not claim (nothing it could
+    /// have missed).
+    pub(crate) fn claim_capacity_seq(&self, eval_id: &str) -> u64 {
+        let claimed = self.lock_eval_claims().capacity_seq.get(eval_id).copied();
+        claimed.unwrap_or_else(|| self.capacity_seq())
     }
 
     /// Every eval id this manager holds.

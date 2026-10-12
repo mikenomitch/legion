@@ -1,5 +1,6 @@
 use crate::prelude::*;
 
+use crate::manager::blocked::PlacementBlocked;
 use crate::manager::oidc_http::OidcHttpLayer;
 use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
@@ -2033,6 +2034,14 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
             warn!(requeued, "Recovered stale in-flight evals at startup");
             store.events().scheduler_recovered(requeued);
         }
+        // A fresh process has no capacity-event log to replay, so every
+        // blocked eval gets one more look (docs/scheduler-and-eval-loop.md,
+        // "Blocked evals").
+        match store.wake_all_blocked_evals() {
+            Ok(0) => {}
+            Ok(woken) => info!(woken, "Returned blocked evals to the queue at startup"),
+            Err(err) => warn!(error = ?err, "Failed waking blocked evals at startup"),
+        }
         store.events().scheduler_started(max_threads);
     }
     // Raft mode: queue recovery must survive leader FAILOVER, not just
@@ -2136,6 +2145,7 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     if let Some(rx) = store.install_status_projection_queue() {
         spawn_status_projection_drain(&store, rx);
     }
+    spawn_blocked_eval_waker(&store);
     for worker_id in 0..max_threads {
         spawn_eval_worker(&mut join_set, &store, worker_id, batch_limits);
     }
@@ -2732,6 +2742,29 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
                 event: Some(drafts::eval_requeued(eval, &e, delay)),
             }
         }
+        // No room for a placement: the eval waits blocked under what it
+        // needs, instead of failing, and capacity that could help returns it
+        // to the queue (sandbox-scaling plan §6.15,
+        // docs/scheduler-and-eval-loop.md "Blocked evals"). Only the job
+        // evals that place work block; a node-scoped pass already queues a
+        // per-job reschedule for what it could not place, and a rollout tick
+        // keeps failing its rollout.
+        Err(e) if blocks_on_capacity(eval) && PlacementBlocked::in_chain(&e).is_some() => {
+            let blocked = PlacementBlocked::in_chain(&e)
+                .cloned()
+                .expect("matched by the guard");
+            warn!(
+                worker_id,
+                eval_id = %eval.id,
+                kind = %eval.kind,
+                key = %blocked.key,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Eval blocked on capacity: {}", blocked.message
+            );
+            clear_not_leader_attempts(&eval.id);
+            let event = drafts::eval_blocked(eval, &blocked.key, &blocked.detail, &blocked.message);
+            store.completion_for_blocked(eval, &blocked, event)
+        }
         Err(e) => {
             error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
             clear_not_leader_attempts(&eval.id);
@@ -2741,6 +2774,49 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
             }
         }
     }
+}
+
+/// The eval kinds that block when a plan finds no room, rather than fail.
+fn blocks_on_capacity(eval: &Eval) -> bool {
+    !eval.job_id.trim().is_empty()
+        && matches!(
+            eval.kind.as_str(),
+            "job_submit" | "job_update" | "job_reschedule" | "job_scale"
+        )
+}
+
+/// Pause after a capacity event before the wake pass runs, so a burst (a
+/// join storm, a stop freeing many nodes) costs one pass and one entry.
+const BLOCKED_WAKE_COALESCE: Duration = Duration::from_millis(50);
+
+/// How often the wake pass looks without being woken: a retry of a pass
+/// whose write failed, and the check after a leadership change.
+const BLOCKED_WAKE_FALLBACK: Duration = Duration::from_secs(1);
+
+/// The blocked-eval wake pass (sandbox-scaling plan §6.15): on the
+/// scheduler-lane leader, match new capacity events against the blocked
+/// evals and return the ones that could now place to the queue
+/// (`Store::wake_blocked_evals`). Followers only keep their event log, for
+/// the replay a new leader does.
+fn spawn_blocked_eval_waker(store: &Store) {
+    let store = store.clone();
+    let notify = store.capacity_notifier();
+    tokio::spawn(async move {
+        loop {
+            let _ = tokio::time::timeout(BLOCKED_WAKE_FALLBACK, notify.notified()).await;
+            tokio::time::sleep(BLOCKED_WAKE_COALESCE).await;
+            if !store.is_raft_leader(crate::storage::Lane::Scheduler) {
+                continue;
+            }
+            let pass_store = store.clone();
+            match tokio::task::spawn_blocking(move || pass_store.wake_blocked_evals()).await {
+                Ok(Ok(_)) => {}
+                // The events stay unhandled, so the next pass retries them.
+                Ok(Err(err)) => warn!(error = ?err, "Blocked-eval wake pass failed"),
+                Err(err) => warn!(error = ?err, "Blocked-eval wake pass panicked"),
+            }
+        }
+    });
 }
 
 /// Whether an eval-handler error is (or wraps) a raft `NotRaftLeader`

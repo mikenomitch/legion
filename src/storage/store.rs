@@ -18,6 +18,8 @@ use crate::storage::migrations::get_migrations;
 mod keyring_ops;
 mod read_model_check;
 // Phase 6: fork, create-from-snapshot, and snapshot names.
+mod blocked_evals;
+pub use blocked_evals::{BlockedEval, CAPACITY_REPLAY_WINDOW};
 mod eval_claims;
 mod fork_ops;
 mod group_commit;
@@ -146,6 +148,16 @@ pub enum EvalCompletion {
     /// and recorded `eval.completed` in its own entry
     /// ([`with_eval_settle_scope`]). Nothing left to write.
     Settled,
+    /// The plan found no room ([`crate::manager::blocked::PlacementBlocked`]):
+    /// the eval is written `blocked` under `key`, replacing any older blocked
+    /// eval of its job, and waits for capacity that could help
+    /// (`store/blocked_evals.rs`). Built by
+    /// [`Store::completion_for_blocked`].
+    Blocked {
+        key: String,
+        detail: Value,
+        event: EventDraft,
+    },
 }
 
 /// How many evals one worker may take through the loop together
@@ -1249,6 +1261,11 @@ pub struct Store {
     // evals this manager's eval workers hold. A claim writes nothing; see
     // `store/eval_claims.rs`.
     eval_claims: Arc<std::sync::Mutex<eval_claims::EvalClaims>>,
+    // Capacity events for the blocked-eval wake pass (sandbox-scaling plan,
+    // Phase 3): recorded by the changeset projection on every replica,
+    // acted on by the scheduler-lane leader. See `store/blocked_evals.rs`.
+    capacity_events: Arc<std::sync::Mutex<blocked_evals::CapacityEvents>>,
+    capacity_notify: Arc<Notify>,
     // Scheduler-lane group commit for instance-lifecycle writes and
     // snapshot reports (sandbox-scaling plan, Phase 1): concurrent creates,
     // suspends, resumes, destroys, and report batches share one entry.
@@ -1877,6 +1894,10 @@ impl Store {
             )),
             work_log: Arc::new(crate::storage::work_log::WorkLog::new()),
             eval_claims: Arc::new(std::sync::Mutex::new(eval_claims::EvalClaims::default())),
+            capacity_events: Arc::new(std::sync::Mutex::new(
+                blocked_evals::CapacityEvents::default(),
+            )),
+            capacity_notify: Arc::new(Notify::new()),
             group_commit_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
                 "instance_group_commit",
                 group_commit::GROUP_COMMIT_BATCH_MAX,
@@ -4827,6 +4848,9 @@ impl Store {
         )?;
         let (outcome, mut effects) = self.apply_plan_submission_on(tx, &submission)?;
         if let (Some(settle), PlanApplyOutcome::Applied(_)) = (&request.settle, &outcome) {
+            // The plan placed everything its eval wanted: the job's blocked
+            // eval, if any, waits for nothing.
+            Self::delete_job_blocked_evals_tx(tx, &settle.eval_id)?;
             tx.prepare_cached("DELETE FROM eval WHERE id = ?;")?
                 .execute([settle.eval_id.as_str()])?;
             Self::delete_subsumed_evals_tx(tx, &settle.subsumed)?;
@@ -6596,6 +6620,9 @@ impl Store {
             // here because "no config" and "config says normal" are
             // genuinely different states to a reader.
             priority: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            // A read-side overlay (`Store::overlay_blocked_jobs`), never
+            // stored on the job row.
+            blocked: None,
         };
 
         Ok(job)
@@ -10839,6 +10866,10 @@ impl Store {
         let mut changed_volume_jobs: HashSet<String> = HashSet::new();
         let mut event_ids: Vec<i64> = Vec::new();
         let mut evals_made_claimable = 0usize;
+        // Changes that may have made room, for the blocked-eval wake pass
+        // (`store/blocked_evals.rs`): `(node, register | node | ready)`;
+        // allocations leaving a node are added from the delta below.
+        let mut capacity_nodes: Vec<(String, &'static str)> = Vec::new();
         // A replicated keyring change (a rotation, a rewrap of the root
         // key, a reset): this replica must unwrap the new rows before it can
         // read values written under them.
@@ -10903,6 +10934,42 @@ impl Store {
                         _ => item.old_value(idx).ok(),
                     };
                     if let Some(id) = id.and_then(|value| value.as_str().ok().map(str::to_owned)) {
+                        // Capacity a blocked eval may be waiting for: a node
+                        // registering, a change to what it offers or whether
+                        // it takes work, or a node coming back to `ready`.
+                        let capacity_kind = match (table.as_str(), action) {
+                            ("node", Action::SQLITE_INSERT) => Some("register"),
+                            ("node", Action::SQLITE_UPDATE) => {
+                                let mut offered = false;
+                                for column in [
+                                    "pool",
+                                    "availability",
+                                    "config_attrs",
+                                    "fingerprint_attrs",
+                                    "dynamic_attrs",
+                                ] {
+                                    let idx = self.changeset_column_index(
+                                        &mut column_cache,
+                                        "node",
+                                        column,
+                                    )?;
+                                    offered |= item.new_value(idx).is_ok();
+                                }
+                                offered.then_some("node")
+                            }
+                            ("node_health", Action::SQLITE_UPDATE) => {
+                                let status_idx = self.changeset_column_index(
+                                    &mut column_cache,
+                                    "node_health",
+                                    "status",
+                                )?;
+                                item.new_value(status_idx).is_ok().then_some("ready")
+                            }
+                            _ => None,
+                        };
+                        if let Some(kind) = capacity_kind {
+                            capacity_nodes.push((id.clone(), kind));
+                        }
                         node_ids.insert(id);
                     }
                 }
@@ -11222,6 +11289,17 @@ impl Store {
             let tasks = self.get_task_configs_for_job_config(&job_config_id)?;
             self.cache_set_task_configs_for_job_config(&job_config_id, tasks)?;
         }
+
+        // Capacity events for the blocked-eval wake pass, on every replica
+        // (a new scheduler-lane leader replays its own copy): the node
+        // changes noted above and every allocation that left a node.
+        capacity_nodes.extend(
+            alloc_delta
+                .removals
+                .iter()
+                .map(|(_, node)| (node.clone(), "freed")),
+        );
+        self.note_capacity_events(capacity_nodes);
 
         // Tell the work delivery log which allocations moved, on every
         // replica and in every mode, after the read model reflects them.
@@ -14913,7 +14991,7 @@ impl Store {
                  WHERE j.status NOT IN ('stopped', 'failed')
                    AND NOT EXISTS (
                      SELECT 1 FROM eval e
-                     WHERE e.status IN ('pending', 'in_flight') AND e.job_id = j.id
+                     WHERE e.status IN ('pending', 'in_flight', 'blocked') AND e.job_id = j.id
                    )
                    AND NOT EXISTS (
                      SELECT 1 FROM rollout r
@@ -16398,6 +16476,9 @@ impl Store {
                 self.release_eval_for_retry_apply(eval_id, delay)
             }
             EvalCompletion::Settled => Ok(()),
+            EvalCompletion::Blocked { key, detail, event } => {
+                self.write_blocked_eval(eval_id, &key, &detail, event)
+            }
         }
     }
 
@@ -16490,8 +16571,11 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn requeue_in_flight_evals(&self) -> R<u64> {
         // Runs at startup and on gaining scheduler-lane leadership: nothing
-        // this manager claimed before is still being handled.
+        // this manager claimed before is still being handled, and the
+        // blocked-eval wake pass replays the capacity events the old leader
+        // may not have acted on.
         self.clear_eval_claims();
+        self.begin_blocked_wake_leadership();
         self.replicated(Lane::Scheduler, "requeue_in_flight_evals", move |s| {
             s.requeue_in_flight_evals_apply()
         })
@@ -17019,6 +17103,9 @@ impl Store {
         let tx = Self::write_tx(&mut conn)?;
 
         if succeeded {
+            // A job-scoped eval that succeeded placed (or stopped) everything
+            // its job wants: the job's blocked eval waits for nothing.
+            Self::delete_job_blocked_evals_tx(&tx, eval_id)?;
             tx.prepare_cached("DELETE FROM eval WHERE id = ?;")?
                 .execute([eval_id])?;
         } else {

@@ -256,6 +256,49 @@ pub mod drafts {
         }))
     }
 
+    /// `eval.blocked` — an eval found no room for a placement and now waits
+    /// under `key` for capacity that could help, instead of failing
+    /// (docs/scheduler-and-eval-loop.md, "Blocked evals").
+    pub fn eval_blocked(eval: &Eval, key: &str, detail: &Value, message: &str) -> EventDraft {
+        EventDraft::warn(
+            "eval.blocked",
+            format!(
+                "Eval {} ({}) blocked on {key}: {message}",
+                eval.id, eval.kind
+            ),
+        )
+        .job(&eval.job_id)
+        .node(&eval.node_name)
+        .eval(&eval.id)
+        .meta(json!({
+            "evalKind": eval.kind,
+            "key": key,
+            "detail": detail,
+        }))
+    }
+
+    /// `eval.unblocked` — capacity that could help a blocked eval appeared
+    /// (`cause`: `register`, `node`, `ready`, `freed`, or `missed` when it
+    /// appeared while the eval was still running), or a manager starting as
+    /// the scheduler's writer gave it one more look (`startup`), and the
+    /// eval is back in the pending queue.
+    pub fn eval_unblocked(
+        eval_id: &str,
+        job_id: &str,
+        key: &str,
+        cause: &str,
+        node_id: &str,
+    ) -> EventDraft {
+        EventDraft::info(
+            "eval.unblocked",
+            format!("Eval {eval_id} unblocked by {cause} on node {node_id} (was blocked on {key})"),
+        )
+        .job(job_id)
+        .node(node_id)
+        .eval(eval_id)
+        .meta(json!({ "key": key, "cause": cause }))
+    }
+
     /// `allocation.placed` — a plan was applied. One event per apply with up
     /// to 20 placements detailed in metadata. `None` when nothing was placed.
     ///

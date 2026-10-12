@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod auth_method;
+pub mod blocked;
 pub mod cadence;
 pub mod daemon;
 pub mod dispatcher;

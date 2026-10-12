@@ -3736,10 +3736,13 @@ impl Manager for ManagerDaemonService {
         )?;
         let name = request.into_inner().name;
 
-        let job = self
+        let mut job = self
             .store
             .get_job(&name)
             .map_err(|e| map_store_error("Error getting job", e))?;
+        self.store
+            .overlay_blocked_jobs(std::slice::from_mut(&mut job))
+            .map_err(|e| map_store_error("Error loading blocked evals", e))?;
         let template = self
             .store
             .job_template_provenance(&name)
@@ -4468,6 +4471,11 @@ impl Manager for ManagerDaemonService {
             .store
             .get_jobs()
             .map_err(|e| map_store_error("Error getting jobs", e))?;
+        // Before the query, the counts, and the status filter: `blocked` is
+        // a status like any other to all three.
+        self.store
+            .overlay_blocked_jobs(&mut jobs)
+            .map_err(|e| map_store_error("Error loading blocked evals", e))?;
         // Provenance feeds the `templates` rule selector so template-scoped
         // identities see the jobs their templates created. One batch query
         // instead of one per row; management tokens skip it entirely.
