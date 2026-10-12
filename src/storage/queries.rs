@@ -560,42 +560,6 @@ lazy_static! {
     VALUES ({EVAL_ATTRS_VALS});
     "#
     );
-    /// Claim the head of the queue: strict `priority DESC, id ASC` over every
-    /// claimable row.
-    pub static ref CLAIM_EVAL: String = claim_eval_sql("");
-    /// Claim the head of the queue among eval kinds that never invoke the
-    /// planner, for a worker the adaptive-concurrency gate has throttled
-    /// (docs/adaptive-scheduler-concurrency.md). Identical in every other
-    /// respect, so ordering among the rows it CAN see is unchanged.
-    ///
-    /// The kind list comes from a compile-time constant in
-    /// `manager::concurrency`, never from caller input, so it is built into
-    /// the statement rather than bound.
-    pub static ref CLAIM_NON_PLANNING_EVAL: String = {
-        let kinds = crate::manager::concurrency::NON_PLANNING_EVAL_KINDS
-            .iter()
-            .map(|kind| format!("'{kind}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        claim_eval_sql(&format!(" AND type IN ({kinds})"))
-    };
-}
-
-fn claim_eval_sql(kind_filter: &str) -> String {
-    format!(
-        r#"
-    UPDATE eval
-    SET status = 'in_flight'
-    WHERE id = (
-        SELECT id
-        FROM eval
-        WHERE status = 'pending' AND ready_at <= :now{kind_filter}
-        ORDER BY priority DESC, id ASC
-        LIMIT 1
-    )
-    RETURNING {EVAL_ATTRS};
-    "#
-    )
 }
 
 //

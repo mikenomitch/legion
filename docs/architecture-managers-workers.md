@@ -128,11 +128,14 @@ how to measure), see
 
 - `WorkerPreRegister`: worker fetches typed config.
 - `WorkerRegister`: worker sends initial config/fingerprint/health payload.
-- `Heartbeat`: worker sends:
-  - active allocation IDs,
-  - failed allocations,
-  - allocation health snapshots.
-  Manager responds with desired allocations.
+- `Heartbeat`: worker sends failed and terminated allocations, and either
+  (a worker without the work stream) its active allocation IDs and every
+  allocation's health, or (a worker on the work stream) its stream position,
+  a digest of what it holds, and only the health that changed. The manager
+  responds with the desired allocations, or, for a worker on the stream,
+  with `desired_via_stream` and no desired set (see [Delivery](#delivery)).
+- `StreamWork`: one long-lived stream per worker that carries its work as
+  sequenced deltas (see [Delivery](#delivery)).
 - `HealthCheck`: worker sends node health check JSON.
 - `IssueWorkloadIdentityToken`: worker fetches short-lived OIDC tokens for
   identities declared on its allocations' tasks, at launch and on refresh.
@@ -141,14 +144,70 @@ how to measure), see
 
 ### Worker APIs used by manager
 
-- `PostWork`: manager dispatches task allocations to workers.
+- `PostWork`: manager dispatches task allocations to workers that do not
+  stream their work, and edge-boot provisional starts and ratifications to
+  any worker.
 - `RestartWorker`: manager can instruct a worker process restart.
+
+### Delivery
+
+A worker gets its work over `Manager.StreamWork`: it opens one stream to
+its manager at startup and keeps it open. The manager sends a **sequenced
+delta** for each committed change to an allocation on the node, so a
+placement reaches the worker one network round trip after it commits,
+whatever the heartbeat cadence:
+
+- **Deltas.** Each message carries the node's next sequence number, the
+  allocations added or changed (the full payload, exactly what the desired
+  set would carry), and the allocations that left with why (their stop
+  notices). The worker starts a new allocation as soon as its delta lands,
+  through the same path a push takes, and runs its reconcile at once for a
+  stop or a changed payload. It acks each message it applied.
+- **Full resync.** A worker the manager cannot continue gets its whole
+  desired set once, in place of what it holds, then deltas. That happens
+  when the position the worker reconnects with is from another manager
+  process (a failover, a manager restart, a different manager), is ahead of
+  the manager's, or is older than the messages the manager still holds.
+- **Replay.** A worker that reconnects to the same manager process with a
+  position it still holds gets the messages after it, in order. Nothing is
+  lost and nothing is applied twice.
+- **Digest check.** Every heartbeat reports the stream position and a digest
+  of the allocation ids the worker holds. A manager whose own digest for the
+  node disagrees, with nothing in flight, answers `work_resync` and sends a
+  full resync on the stream, so a lost delta is caught within one beat.
+- **Any manager serves it.** The delivery log is memory on the manager the
+  worker streams from, fed by the changeset projection every manager runs on
+  its own replica. A leader failover disturbs only the streams attached to
+  the manager that died: their workers reconnect and resync once; workers
+  streaming from a surviving manager keep their position.
+
+A worker on the stream sends a heartbeat of a few dozen bytes and gets a
+reply of a few bytes, however many allocations it runs; the manager builds
+no desired set for it. Measured on a 300-allocation node: 42-byte request,
+7-byte reply, and 0.5 ms of manager time per beat, against 5,154 bytes,
+102,670 bytes, and 26 ms for the full set (debug build). The connect and
+network-policy feeds still ride the reply, computed from the payloads the
+stream sent, and only when a task on the node declares one.
+
+While its stream is down (the manager restarted, the network blipped), a
+worker reports no position, and the manager answers with today's full
+desired set, which the worker reconciles as before; a worker that does not
+stream at all, or a simulated fleet started with `--sim-no-work-stream`,
+always works that way. A worker advertises the `work-stream` capability at
+registration (informational: the manager recognizes a streaming worker by
+the position its heartbeat reports).
+
+Known limitations: edge-boot provisional dispatches and their ratification
+payloads still travel as `PostWork` pushes and the `RatifyClaim` reply, not
+as stream messages. A worker that has an unratified provisional start for a
+task does not start a streamed allocation of that task by itself; the
+ratification or its next reconcile settles it.
 
 ### Allocation reconciliation model
 
 - Manager is source of truth for desired allocations (`allocation` table).
-- Worker reports current allocations in heartbeat.
-- Manager returns desired allocations for that node.
+- A worker's desired set is the stream's mirror (or, off the stream, the
+  set in the heartbeat reply).
 - Worker reconciles by stopping undesired tasks and starting missing ones.
 - An empty desired set is authoritative. It means "run nothing here," so the
   worker stops everything it has, including the last allocation on a node that
@@ -179,8 +238,11 @@ Two code paths exist:
     control-plane problem rather than at the workers.
 - Capacity pass: a worker registration or an uncordon queues one `node_join`
   eval with no node. It re-evaluates jobs short of their count and jobs with
-  `count.per` tasks (see
+  `count.per` tasks that have no pending or blocked eval (see
   [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#node-added)).
+  A job whose placement found no room has a blocked eval, which the
+  registration, the uncordon, or capacity freed on a node wakes when the node
+  could host it ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)).
 - Eval path (used in tests/manual eval insertion):
   - `node_drop` / `node_join` eval kinds with a node call equivalent store reconciliation logic.
 

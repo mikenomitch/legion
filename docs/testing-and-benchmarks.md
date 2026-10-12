@@ -317,6 +317,65 @@ benchmarks/aws/scripts/run-campaign.sh --system legion-a --scenarios web_fleet \
 `--submit-rate` maps to `legion-loadgen --rate` and is Legion-only. A paced
 cell archives under `<run>-r<rate>` and records `submit_rate_target`.
 
+### Keyed-instance lifecycles (`--mode instances`)
+
+`legion-loadgen --mode instances` drives sandbox-style sessions instead of
+jobs: each session is a keyed instance that is created, runs for
+`--hold-ms`, is suspended to memory, resumed, and destroyed, at an
+open-loop `--rate`. It embeds `--simulate N` simulated nodes with the
+checkpoint channel faked (the `--sim-checkpoints` fleet), so it needs only a
+manager (and `--join-secret <secret>` when the cluster enforces ACLs):
+
+```bash
+legion-loadgen --mode instances --manager http://127.0.0.1:15747 \
+    --simulate 50 --sessions 2000 --rate 100 --hold-ms 2000
+```
+
+It prints one JSON summary: sessions offered, completed, and failed, the
+achieved rate, and p50/p99 latency per stage (`create_rpc`, `placement`,
+`dispatch`, `create_to_running`, `suspend`, `resume_dispatch`, `resume`,
+`destroy_rpc`). `placement` and `dispatch` come from the manager's
+`allocation.placed` events and the simulated nodes' delivery hooks, so they
+split the time a running sandbox took into the control plane's share and
+the node's. The sandbox-scaling plan's Phase 0 baseline and every later
+phase's numbers in `benchmarks/scheduler/README.md` were measured with it.
+
+On AWS, `benchmarks/aws/scripts/run-sandbox-campaign.sh` runs it against the
+rig's 3-manager raft control plane with no worker fleet (four on-demand
+boxes, about $1/hour), climbs a rate ladder to the ceiling, holds a density
+cell, and `benchmarks/aws/analysis/sandbox_report.py` writes the report:
+ceiling, latencies, raft entries and manager CPU per lifecycle, manager
+memory per resident sandbox, and labelled projections. See
+`benchmarks/aws/README.md`, "Sandbox-scaling campaign". Rig flags the
+campaign uses: `--join-token` (the fleet's worker type and secret),
+`--advertise-host`, `--sim-name-prefix` (a fixed prefix so successive runs
+re-register the same nodes), and `--sim-profiles` (the node shape).
+Use isolated ports for a local manager: never the defaults another cluster
+on the machine may be using.
+
+### Control-plane write and delivery tests
+
+These run in the ordinary `cargo test` suite and guard the numbers the
+sandbox-scaling work bought:
+
+- `tests/raft_lifecycle_ops.rs` counts the raft entries each stage of a
+  keyed instance's lifecycle costs, on `single` and `lanes`, by summing every
+  lane's applied index. A change that adds an entry to a stage fails it; a
+  change that removes one updates the expected table.
+- `tests/work_stream.rs` covers `Manager.StreamWork`: delivery within a
+  round trip with no heartbeat, replay after a dropped stream, resync on
+  another epoch or a gap, a sub-KiB steady heartbeat, and a leader kill on a
+  3-manager raft cluster. `LEGION_MEASURE_STREAM_ALLOCS=10000 cargo test
+  --release --test work_stream -- a_streaming_heartbeat --nocapture` is the
+  10,000-allocation heartbeat measurement.
+- `tests/blocked_evals.rs` covers blocked evals: wake by pool, by freed
+  capacity, escaped, an unblock during the running eval, one blocked eval
+  per job, and a scheduler-lane failover that replays a missed wake.
+- `tests/instance_scale_measure.rs` (ignored; run with `--ignored
+  --nocapture`) measures bytes per instance and snapshot row, the store
+  image at 10^5 (or `LEGION_MEASURE_INSTANCES`) instances, and full-set
+  heartbeat bytes per dense node.
+
 ## Plugin-Related Test Notes
 
 Dynamic plugin tests may depend on plugin build presence.

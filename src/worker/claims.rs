@@ -145,6 +145,19 @@ impl ClaimTable {
             .any(|claim| claim.instance_id == instance_id)
     }
 
+    /// Whether an unratified claim on this node may be running the work a
+    /// committed payload describes: same job config and task. Its
+    /// ratification binds the payload to the claim; starting the payload on
+    /// its own would run it twice. (A payload names no instance, so two
+    /// instances of one task are not told apart; the caller only defers.)
+    pub fn unratified_matches(&self, job_config_id: &str, task_name: &str) -> bool {
+        self.claims.values().any(|claim| {
+            !claim.is_ratified()
+                && claim.job_config_id == job_config_id
+                && claim.task_name == task_name
+        })
+    }
+
     pub fn by_local_key(&self, local_key: i64) -> Option<&ClaimRecord> {
         self.claims
             .values()

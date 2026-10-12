@@ -80,6 +80,13 @@
     # exhaustion requeues the eval instead of failing it terminally.
     # plan_conflict_requeue_delay_ms = 1000,
     #
+    # Group-commit keyed-instance operations (create, stop, start, destroy,
+    # suspend, resume, fork, edge ratification, snapshot reports): concurrent
+    # requests share one scheduler-lane write, each in its own savepoint so a
+    # failing one rolls back alone (docs/stateful-workloads.md). `false` gives
+    # every request its own write; only for comparison.
+    # instance_group_commit = true,
+    #
     # Preemption (docs/preemption-and-eviction.md). When a job cannot place
     # and its priority band outranks work that can be displaced, the planner
     # evicts the minimum set of lower-band allocations and places in the same

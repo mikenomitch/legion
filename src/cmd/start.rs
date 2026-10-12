@@ -115,6 +115,27 @@ pub fn config() -> Command {
                     "Host the manager should dial for task dispatch to this fleet \
                      (default: 127.0.0.1)",
                 ),
+        )
+        .arg(
+            Arg::new("sim-no-work-stream")
+                .long("sim-no-work-stream")
+                .action(ArgAction::SetTrue)
+                .requires("simulate")
+                .help(
+                    "Take work from the heartbeat's desired set instead of `StreamWork`, \
+                     the delivery a worker without the work stream gets",
+                ),
+        )
+        .arg(
+            Arg::new("sim-checkpoints")
+                .long("sim-checkpoints")
+                .action(ArgAction::SetTrue)
+                .requires("simulate")
+                .help(
+                    "Fake the checkpoint channel: advertise `checkpoint`, fingerprint as a \
+                     sandbox host, and answer every capture, delete, and restore as done, \
+                     so suspend, resume, and fork can be load tested",
+                ),
         );
 
     Command::new("start")
@@ -209,6 +230,9 @@ fn simulate_options(count: usize, arg_matches: &ArgMatches) -> R<SimulateOptions
             .get_one::<String>("advertise-host")
             .cloned()
             .unwrap_or(defaults.advertise_host),
+        checkpoints: arg_matches.get_flag("sim-checkpoints"),
+        observer: None,
+        work_stream: !arg_matches.get_flag("sim-no-work-stream"),
     })
 }
 
