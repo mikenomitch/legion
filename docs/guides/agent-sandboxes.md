@@ -175,7 +175,7 @@ registration.
     config = {
       image = "ghcr.io/acme/agent-base:2026-10",
       command = ["/usr/local/bin/harness"],
-      network = { mode = "tap", tap = "auto", bridge = "br0" },
+      network = { mode = "tap", bridge = "br0" },
       vcpus = 2,
     },
 
@@ -284,8 +284,8 @@ checkpoint.
 
 **`onResume`** runs in the guest after every memory restore, once the
 guest's hostname, clock, RNG, and identity have been refreshed. Use it to
-reconnect the harness to your platform, renew a DHCP lease, or drop leases the
-captured process held. It has 30 seconds.
+reconnect the harness to your platform, or drop leases the captured process
+held. The guest already has its new address by then. It has 30 seconds.
 
 **`durability = "local"`** keeps the checkpoint on the node that took it, so
 a resume runs there. It is the default, written out so a reader knows a node
@@ -318,40 +318,63 @@ section explains it.
 
 ### Networking
 
-`tap = "auto"` has the node create a TAP device for each instance and attach
-it to `br0`. The device is named `lgf` plus 12 hex characters of the
-instance id's hash, so `user-42` always asks for the same device. A resume
-recreates it under the name its checkpoint recorded, on the same bridge, and
-destroying the allocation deletes it. A fork of `user-42` gets its own `lgf`
-device on `br0`, the one it would boot on. Any number of auto-TAP sandboxes
-fit on a node, and every one can take memory checkpoints.
+`config.network = { mode = "tap", bridge = "br0" }` has the node create a TAP
+device for each instance and attach it to `br0`. The device is named `lgf`
+plus 12 hex characters of the instance id's hash, so `user-42` always asks
+for the same device. A resume recreates it under the name its checkpoint
+recorded, on the same bridge, and destroying the allocation deletes it. A
+fork of `user-42` gets its own `lgf` device on `br0`, the one it would boot
+on. Any number of TAP sandboxes fit on a node, and every one can take memory
+checkpoints.
 
-The bridge is yours: create `br0` on each sandbox node, route or NAT it, and
-run DHCP on it, since every sandbox boots from the same image. Each guest
-gets a MAC derived from its allocation id, so guests on one bridge never
-collide. The worker needs `CAP_NET_ADMIN` and the `ip` tool. Whatever
-filtering you want between sandboxes and the outside goes on the bridge.
+Legion addresses the guests. Each sandbox node's worker config gives `br0` a
+pool:
+
+```nickel
+# worker config, on every sandbox node
+sandbox = {
+  bridges = {
+    br0 = { subnet = "10.88.0.0/16", gateway = "10.88.0.1", range = "10.88.128.0/17" },
+  },
+},
+```
+
+Every guest boots with an address leased from `range`, and every restore and
+fork leases a fresh one that the guest applies before `onResume` runs. So
+the image needs no network configuration, three forks of `user-42` answer on
+three addresses, and a resume on the same node gets its old address back
+when it is free. The harness reads its address from `LEGION_GUEST_ADDR`, and
+your platform reads it from `legion instance get user-42 -j`
+(`guest_address`). The sandbox only places on nodes that declare `br0`. See
+[Addressing](../task-runtime-sandbox.md#addressing).
+
+The bridge is yours: create `br0` on each sandbox node with the gateway
+address, and route or NAT it. Each guest gets a MAC derived from its
+allocation id, so guests on one bridge never collide. The worker needs
+`CAP_NET_ADMIN` and the `ip` tool. Whatever filtering you want between
+sandboxes and the outside goes on the bridge.
 
 The options, side by side:
 
 | `network` | Guest gets | Memory checkpoints | Sandboxes per node |
 | --- | --- | --- | --- |
 | none (`config.network.mode = "none"`, the default) | Loopback only | Yes | Any number |
-| `config.network = { mode = "tap", tap = "auto", bridge = "br0" }` | A NIC on a TAP Legion creates per instance, on your bridge | Yes | Any number |
-| `config.network = { mode = "tap", tap = "tap0" }` | A NIC on a host TAP device you create | Yes | One per node. **Refused at submit** on a keyed task, so not for agent sandboxes |
-| `network = { mode = "gated", egress = { allow = [...] } }` | Egress through the node datapath, judged by policy | **No**, refused at submit | Any number |
+| `config.network = { mode = "tap", bridge = "br0" }` | A NIC on a TAP Legion creates per instance, on your bridge, with an address from the bridge's pool | Yes | Any number, up to the pool's size |
+| `network = { mode = "gated", egress = { allow = [...] } }` | No NIC. Egress through the node datapath, judged by policy | Yes (Firecracker 1.16.1 or later) | Any number |
 
-Gated networking is the one with per-sandbox egress policy in Legion, and it
-can't take a memory checkpoint yet because the guest's vsock datapath is part
-of its saved state. A gated sandbox can still suspend with
-`checkpoint = "disk"`, which keeps `/workspace` and boots fresh on resume. See
-[A spec is rejected at submit](#a-spec-is-rejected-at-submit) and
+Gated networking is the one with per-sandbox egress policy in Legion. It
+takes memory checkpoints like the others: every restore moves the guest onto
+its new allocation's own datapath socket, so a resumed sandbox runs under
+today's policy and each fork's traffic is its own. A memory checkpoint closes
+the guest's open connections (on Firecracker, a live snapshot or fork closes
+the running origin's too), so a harness should retry an interrupted model
+call. See [Gated sandboxes](../suspend-and-resume.md#gated-sandboxes) and
 [sandbox networking](../task-runtime-sandbox.md#networking).
 
-Pick by what the sandbox must keep. If a resumed sandbox must continue its
-running processes, use an auto TAP and enforce egress on the bridge. If
-egress must be judged per sandbox by Legion's policy, run it gated with disk
-checkpoints.
+Pick by what the sandbox needs from the network. If egress must be judged
+per sandbox by Legion's policy, run it gated. If the guest needs raw
+networking (a protocol the proxy can't carry, L2 adjacency, bulk
+throughput), use a TAP and enforce egress on the bridge.
 
 ## The platform's lifecycle
 
@@ -483,16 +506,11 @@ $ legion instance fork user-42 --count 3 --wait -j --idempotency-key fork-7f2
  "checkpoint_state":"local","deduplicated":false}}
 ```
 
-> **A static IP in the guest is copied to every fork.** Each fork gets its
-> own MAC and TAP device, but an address configured inside the guest comes
-> along, so three forks would answer on `user-42`'s IP on `br0`. Have the
-> image use DHCP, and renew the lease in `onResume`, before you fork
-> sandboxes with networking.
-
 The origin pauses while its memory is written (`pause_ms`, about 0.5 to 1
 second per GiB of guest memory on local NVMe), then keeps running. Each fork
 is a new keyed instance with its own id, its own copy of `/workspace`, its
-own MAC, RNG seed, and workload identity, and `onResume` runs in each one.
+own MAC, address, RNG seed, and workload identity, and `onResume` runs in
+each one.
 The fork ids derive from `user-42`, so they stay in your namespace under
 `requireId = true`. Forks run on the origin's node, because the checkpoint
 and the `/workspace` copies live there. Destroy the losers with `legion
@@ -867,10 +885,10 @@ next candidate.
 An instance stays awake while any listed signal fires. What each one sees on
 a microVM matters:
 
-| Signal | What it sees | On an auto-TAP microVM |
+| Signal | What it sees | On a TAP-wired microVM |
 | --- | --- | --- |
 | `network` | Bytes through the node datapath, plus bytes the guest sends on its own NIC | Bytes the guest sends on its TAP (`rx_bytes` of `/sys/class/net/lgf...`) |
-| `connections` | Open ingress connections through the datapath | Refused at submit. No datapath fronts the guest |
+| `connections` | Open connections through the datapath: ingress, and a gated sandbox's egress | Refused at submit. No datapath fronts the guest |
 | `cpu` | CPU at or above `cpuBelow` of the task's `cpu` | The VMM's CPU, which is the guest's |
 | `exec` | Open `exec` sessions and actions | Never fires. A microVM takes no exec sessions, so `job run` warns when it is listed |
 
@@ -882,15 +900,18 @@ failure modes follow:
 - **It never suspends.** Something in the guest keeps the CPU above
   `cpuBelow` (0.02 of `cpu`, never below 1% of a core), such as a file
   watcher, a language server reindexing, or a spinning harness. Or it keeps
-  sending: a heartbeat to your platform, an NTP client, frequent DHCP
-  renewals. Compare `instance get`'s idle window and `node usage`'s `CPU` and
+  sending: a heartbeat to your platform, an NTP client, a chatty service
+  discovery agent. Compare `instance get`'s idle window and `node usage`'s `CPU` and
   `IDLE` columns with what the guest runs, then quiet the process, raise
   `cpuBelow`, or drop `network` from `signals`.
 - **It suspends in the middle of a model call.** An agent harness waiting
   40 seconds on a model holds a mostly quiet HTTPS connection, sends almost
-  nothing, and uses almost no CPU, so the wait counts as quiet. No signal sees
-  an idle open connection from the guest, and `connections` is refused for
-  that reason rather than accepted and ignored. Set `after` longer than your
+  nothing, and uses almost no CPU, so the wait counts as quiet. On a TAP no
+  signal sees an idle open connection from the guest, and `connections` is
+  refused for that reason rather than accepted and ignored. On a gated
+  sandbox the call goes through the node's egress proxy, so add
+  `connections` and the open call keeps the sandbox awake (as would any
+  other connection it holds open). Otherwise set `after` longer than your
   longest model call, or leave `idle` off and suspend from your platform,
   which knows when a call is in flight.
 - **It suspends while someone is in a shell.** Not on a microVM: `legion
@@ -904,18 +925,20 @@ and a spec that lists it is refused:
 Error: jobspec failed validation: task "workspace": suspend.idle.signals "hint" is not
 implemented yet: the workload's own busy/idle signal ships in suspend plan Phase 8
 (remove "hint". To keep an instance awake through a quiet call, add "connections"
-(any open ingress connection through the node datapath counts as activity; a sandbox
-sees it only on gated networking)) [code=InvalidArgument]
+(any open connection through the node datapath, inbound or out through a gated task's
+egress proxy, counts as activity; a sandbox has one only on gated networking))
+[code=InvalidArgument]
 ```
 
 So does `connections` on this sandbox:
 
 ```text
 Error: jobspec failed validation: task "workspace": suspend.idle.signals "connections" counts
-open ingress connections through the node datapath, and this sandbox's traffic never crosses it
-(it is not network.mode = "gated", so clients reach the guest directly or not at all)
-(remove "connections". To keep a sandbox awake through a quiet model call, set idle.after
-longer than the call, or suspend from your platform, which knows when a call is in flight)
+open connections through the node datapath, and this sandbox's traffic never crosses it
+(it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
+(remove "connections", or run the sandbox gated, where a quiet model call through the egress
+proxy keeps it awake. Otherwise set idle.after longer than the call, or suspend from your
+platform, which knows when a call is in flight)
 [code=InvalidArgument]
 ```
 
@@ -932,43 +955,28 @@ suspend when idle
 
 ### A spec is rejected at submit
 
-Submit, `job validate`, and `job plan` refuse a spec that asks for memory
-checkpoints on a gated network:
+A gated sandbox with memory checkpoints validates. What the API refuses
+instead is a memory suspend, snapshot, or fork of a gated sandbox whose node
+runs a Firecracker too old to move the restored guest's vsock, before
+anything is captured:
 
 ```text
-$ legion job validate agents-gated.ncl
-Error: jobspec failed validation: task "workspace" asks for memory checkpoints, but
-sandbox memory checkpoints don't support gated networking yet (set snapshots.memory
-= false for disk-only snapshots, or drop network gating for this task) [code=InvalidArgument]
+$ legion instance suspend user-42 --checkpoint memory
+Error: instance user-42 is gated, and node w-03 runs Firecracker 1.15.0, which cannot move a
+restored guest's vsock to a new socket (that needs Firecracker 1.16.1 or later)
+Hint: upgrade Firecracker on the node, or use --checkpoint disk
 ```
 
-The spec asks twice, once in `snapshots` and once in `suspend`, and the hint
-names the first one it finds. Fixing that one surfaces the other:
-
-```text
-Error: jobspec failed validation: task "workspace" asks for memory checkpoints, but
-sandbox memory checkpoints don't support gated networking yet (set suspend.checkpoint
-= "disk" to suspend with a disk checkpoint, or drop network gating for this task)
-[code=InvalidArgument]
-```
-
-A gated sandbox with `snapshots.memory = false`, `suspend.checkpoint = "disk"`,
-and no `onResume` validates. It suspends by stopping and resumes by booting
-fresh on `/workspace`. When gating comes from a stored network policy rather
-than the spec, the sandbox launches without checkpoint support, and a memory
-suspend or snapshot fails with `FailedPrecondition` and the same hint.
-
-A fixed TAP device is refused too, because it fits one guest per node and a
-keyed task can put several on one node:
+A TAP device or MAC named by hand is refused too, because Legion creates a
+device per instance and derives every MAC:
 
 ```text
 $ legion job validate agents-tap0.ncl
-Error: jobspec failed validation: task "workspace" attaches its sandbox to the fixed TAP
-device "tap0" (config.network.tap), which serves one guest per node, but it is a keyed
-task (stateful.mode = "keyed"), so a second instance, a fork that boots cold, or a disk
-snapshot seed on the same node fails to boot
-Hint: set config.network = { mode = "tap", tap = "auto", bridge = "<the bridge tap0 is
-on>" }, so Legion creates a TAP per instance
+Error: jobspec failed validation: task workspace config invalid: config.network.tap is gone:
+Legion creates a TAP per instance on network.bridge and leases the guest an address from
+the bridge's pool
+Hint: Set bridge = "<the bridge tap0 was on>", and declare sandbox.bridges.<bridge> in the
+worker config (docs/task-runtime-sandbox.md, "Addressing")
 ```
 
 ## The macOS dev loop
@@ -1039,15 +1047,18 @@ tokens refresh through a read-only bind mount at `/legion/identity`). See
   only. See [The macOS dev loop](#the-macos-dev-loop).
 - **Linux verification is pending.** These features were built and tested
   on macOS, with the Linux-only parts (cgroups, the VMM checkpoint and restore
-  calls, the balloon, the guest's resume handler, auto TAPs and their
-  counters) unit-tested against fixtures. Some of that code has not yet run against a real kernel and VMM,
+  calls, the balloon, the guest's resume handler, TAP devices, their
+  counters, and guest addressing) unit-tested against fixtures. Some of that code has not yet run against a real kernel and VMM,
   so expect rough edges on your first Linux hosts.
-- **Gated networking and memory checkpoints don't fit together yet.** An
-  auto TAP does, with egress enforced on your bridge rather than by Legion's
-  policy. See [Networking](#networking).
-- **Idle detection on a microVM sees CPU and the bytes the guest sends**,
-  never an idle open connection, for the reasons in
+- **A memory checkpoint closes a gated sandbox's open connections.** On
+  Firecracker, a live snapshot or a fork closes the running origin's too.
+  Retry an interrupted model call. Gated memory checkpoints need Firecracker
+  1.16.1 or later. See [Networking](#networking).
+- **Idle detection on a TAP-wired microVM sees CPU and the bytes the guest
+  sends**, never an idle open connection, for the reasons in
   [An instance never goes idle](#an-instance-never-goes-idle-or-goes-idle-too-soon).
+  A gated sandbox's connections go through the egress proxy, so
+  `connections` sees them there.
   Activity is sampled every 10 seconds and swept every 15, so `after` is
   honored to within about 30 seconds.
 - **A checkpoint restores only on the same VMM version, CPU, and guest
@@ -1065,13 +1076,13 @@ tokens refresh through a read-only bind mount at `/legion/identity`). See
 - **The worker's task lock is held while the VMM writes guest memory.** For a
   guest of several GiB on slow disk, a suspend can delay that node's
   heartbeats.
-- **The resume handler is the worker's own binary**, copied into the guest. A
-  guest whose libc can't run it (a musl image with a glibc worker build)
-  restores without refreshing its identity, and init says so on the console.
+- **The resume handler is the static `legion-guest` binary** installed beside
+  the worker. A worker without it copies its own binary instead and warns at
+  start, and a guest whose libc can't run that (a musl image with a glibc
+  worker build) restores without refreshing its identity or address. See
+  [The guest agent](../task-runtime-sandbox.md#the-guest-agent).
 - **Fork and create-from-snapshot run on the snapshot's node** unless the
   checkpoint is published, which needs a task without `stateful.storage`.
-- **A static IP in the guest is copied to every fork.** Use DHCP, or renew
-  the address in `onResume`.
 
 The full list is in the
 [suspend and resume limitations](../suspend-and-resume.md#limitations),

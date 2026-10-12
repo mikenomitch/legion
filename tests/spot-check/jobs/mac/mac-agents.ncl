@@ -15,7 +15,6 @@
       runtime = "sandbox",
       stateful = {
         mode = "keyed",
-        idSource = "uuid",
         storage = { path = "/workspace", driver = "local-dir" },
       },
       config = {

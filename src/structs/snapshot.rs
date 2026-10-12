@@ -433,46 +433,6 @@ pub fn memory_checkpoint_ask(task: &crate::structs::TaskConfig) -> Option<Memory
     None
 }
 
-/// Whether the task's own declaration puts it on gated networking.
-///
-/// Only the declared mode is visible at submit time. A stored network policy
-/// can also force `gated`; that case is caught when a memory snapshot is
-/// requested (CreateSnapshot fails with the same hint) and at launch (the
-/// sandbox starts without checkpoint support and says so).
-pub fn task_declares_gated_network(task: &crate::structs::TaskConfig) -> bool {
-    task.network.as_ref().is_some_and(|network| {
-        crate::structs::network::resolve_network_mode(&network.mode, &task.runtime)
-            == crate::structs::netpolicy::MODE_GATED
-    })
-}
-
-/// The error for a memory checkpoint on gated networking, shared by job
-/// validation and CreateSnapshot so both say the same thing.
-pub fn gated_memory_checkpoint_error(task_name: &str, ask: Option<MemoryCheckpointAsk>) -> String {
-    let opt_out = ask
-        .map(|ask| ask.opt_out)
-        .unwrap_or("take a disk snapshot instead (--disk)");
-    format!(
-        "task {task_name:?} asks for memory checkpoints, but sandbox memory checkpoints don't \
-         support gated networking yet\nHint: {opt_out}, or drop network gating for this task"
-    )
-}
-
-/// Submit-time check: a `sandbox` task that asks for memory checkpoints must
-/// not declare gated networking. Returns the actionable error.
-pub fn validate_memory_checkpoint_network(task: &crate::structs::TaskConfig) -> Result<(), String> {
-    if task.runtime != "sandbox" {
-        return Ok(());
-    }
-    let Some(ask) = memory_checkpoint_ask(task) else {
-        return Ok(());
-    };
-    if task_declares_gated_network(task) {
-        return Err(gated_memory_checkpoint_error(&task.name, Some(ask)));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,60 +518,37 @@ mod tests {
         task
     }
 
+    /// Gated plan Phase 1: a gated sandbox that asks for memory checkpoints
+    /// is accepted and launched for them like any other sandbox, with the
+    /// resume watch that keeps its env tokens fresh.
     #[test]
-    fn a_gated_sandbox_that_asks_for_memory_checkpoints_is_refused_with_a_hint() {
+    fn a_gated_sandbox_that_asks_for_memory_checkpoints_is_launched_for_them() {
         let task = sandbox_task(Some("gated"), Some(SnapshotsConfig::default()));
-        let err = validate_memory_checkpoint_network(&task).unwrap_err();
-        assert!(
-            err.starts_with(
-                "task \"workspace\" asks for memory checkpoints, but sandbox memory checkpoints \
-                 don't support gated networking yet"
-            ),
-            "{err}"
+        assert!(crate::structs::network::task_runs_gated(&task, false));
+        assert_eq!(
+            memory_checkpoint_ask(&task).map(|ask| ask.field),
+            Some("snapshots")
         );
-        assert!(err.contains("Hint: set snapshots.memory = false"), "{err}");
-        assert!(err.contains("drop network gating"), "{err}");
-    }
+        assert!(task.sandbox_refreshes_env_tokens());
 
-    #[test]
-    fn a_gated_sandbox_that_suspends_to_memory_is_refused_with_a_hint() {
         let mut task = sandbox_task(Some("gated"), None);
         task.stateful =
             Some(serde_json::from_value(serde_json::json!({ "mode": "keyed" })).unwrap());
         task.suspend = Some(Default::default());
-        let err = validate_memory_checkpoint_network(&task).unwrap_err();
-        assert!(err.contains("don't support gated networking"), "{err}");
-        assert!(err.contains("suspend.checkpoint = \"disk\""), "{err}");
-        task.suspend = Some(crate::structs::suspend::SuspendConfig {
-            checkpoint: Some("disk".into()),
-            ..Default::default()
-        });
-        assert!(validate_memory_checkpoint_network(&task).is_ok());
-    }
-
-    #[test]
-    fn disk_only_snapshots_host_networking_and_other_runtimes_pass() {
-        let disk_only = SnapshotsConfig {
-            memory: Some(false),
-            ..Default::default()
-        };
-        assert!(
-            validate_memory_checkpoint_network(&sandbox_task(Some("gated"), Some(disk_only)))
-                .is_ok()
+        assert_eq!(crate::structs::suspend::validate_suspend(&task), Ok(()));
+        assert_eq!(
+            memory_checkpoint_ask(&task).map(|ask| ask.field),
+            Some("suspend")
         );
-        assert!(validate_memory_checkpoint_network(&sandbox_task(
-            Some("host"),
-            Some(SnapshotsConfig::default())
-        ))
-        .is_ok());
-        assert!(validate_memory_checkpoint_network(&sandbox_task(
-            None,
-            Some(SnapshotsConfig::default())
-        ))
-        .is_ok());
-        assert!(validate_memory_checkpoint_network(&sandbox_task(Some("gated"), None)).is_ok());
-        let mut exec = sandbox_task(Some("gated"), Some(SnapshotsConfig::default()));
-        exec.runtime = "exec".into();
-        assert!(validate_memory_checkpoint_network(&exec).is_ok());
+
+        let disk_only = sandbox_task(
+            Some("gated"),
+            Some(SnapshotsConfig {
+                memory: Some(false),
+                ..Default::default()
+            }),
+        );
+        assert!(memory_checkpoint_ask(&disk_only).is_none());
+        assert!(!disk_only.sandbox_refreshes_env_tokens());
     }
 }

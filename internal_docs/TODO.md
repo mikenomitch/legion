@@ -200,6 +200,7 @@ How to use it:
 | --- | --- | --- |
 | [#20](https://github.com/mikenomitch/legion/pull/20) | Operator UI gaps: instance and allocation pages, event filters by instance/allocation, KV values hidden until revealed, worker public addresses, stale rollouts cancel themselves | [plan](plans/operator-ui-gaps-plan.md) · [calls](calls/operator-ui-gaps-plan_calls.md) |
 | [#19](https://github.com/mikenomitch/legion/pull/19) | Task page tabs, guided template launch, Actions tab; template-launched jobs list their tasks again | UI only; [plan](plans/ui-task-and-template-redesign-plan.md) · [calls](calls/ui-task-and-template-redesign-plan_calls.md) |
+| [#24](https://github.com/mikenomitch/legion/pull/24) | Gated sandbox checkpoints Phases 1 to 4: gated memory checkpoints, `gated-default` deny, the static `legion-guest` agent, gated idle signals, Legion-addressed TAP guests (`tap`/`mac` removed) | Phase 0 (KVM) pending, so the gated-by-default flip is held; [plan](plans/gated-sandbox-checkpoints-plan.md) · [calls](calls/gated-sandbox-checkpoints-plan_calls.md) |
 | [#14](https://github.com/mikenomitch/legion/pull/14) | Live KV file updates (`onChange = "update"`) and KV-backed ingress certificates (`certFrom = { kv }`) | [plan](plans/kv-cert-delivery-plan.md) · [calls](calls/kv-cert-delivery-plan_calls.md) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
@@ -1738,7 +1739,8 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         and the UI terminal work unchanged. After gated plan Phases 0 and 1
         (without the vsock restore override, a vsock device on every microVM
         would break memory checkpoints of TAP and `none` sandboxes) and
-        worker-plane-auth Phase 1.
+        worker-plane-auth Phase 1. Gated Phase 1 is built (the override, and
+        the `legion-guest` agent crate to extend); Phase 0 is pending.
   - [ ] Phase 2: direct exec with `MintExecTicket` and a ticket class on the
         mTLS worker listener, `legion exec --direct`, async audit, revoked
         accessors on the heartbeat.
@@ -1746,35 +1748,65 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         with the scaling plan's wake on request), and exec into unnamed
         sessions after the scaling plan's Phase 6.
 - [ ] **Gated sandboxes by default, with memory checkpoints**:
-      [plan](plans/gated-sandbox-checkpoints-plan.md) (PLANNED) ·
-      [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Agent sandboxes
-      get Legion's egress policy and memory suspend, snapshots, and fork
-      together, and TAP stops being a footgun.
-  - [ ] Phase 0: boot a gated sandbox on a real VMM for the first time,
-        measure proxy throughput against a TAP, and prove Firecracker
-        `vsock_override` (1.16.1+) and the cloud-hypervisor `config.json`
-        rewrite. Gate for the rest.
-  - [ ] Phase 1: memory checkpoints of gated sandboxes (vsock retarget on
-        every restore, constant CID, agent drops relays on restore, the
-        Firecracker floor), and remove the submit refusal and every doc
-        that states it.
-  - [ ] Phase 2: `auto` resolves to `gated` for sandboxes on microVM nodes,
-        gated with no policy denies (`gated-default`, every runtime), a
-        resolver for every gated sandbox, lower-case proxy vars and
-        `NODE_USE_ENV_PROXY`, the static `legion-guest` agent.
-  - [ ] Phase 3: live egress bytes and open egress connections for the idle
-        policy.
-  - [ ] Phase 4: Legion addresses TAP guests from a per-bridge pool and
-        re-addresses on every restore and fork. Removes `tap` and `mac`, and
-        the "use DHCP in the guest" docs.
-  - [ ] Phase 5: ingress into gated sandboxes over host-initiated vsock.
+      [plan](plans/gated-sandbox-checkpoints-plan.md) (IN EXECUTION) ·
+      [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Phases 1 to 4
+      are built (see Done, Task runtimes) on a host without KVM, in PR
+      [#24](https://github.com/mikenomitch/legion/pull/24). What is left:
+  - [ ] Phase 0, the gate: boot a gated sandbox on a real VMM for the first
+        time. On a KVM host with Firecracker 1.16.1+, cloud-hypervisor v52+,
+        a kernel with `CONFIG_VIRTIO_VSOCKETS=y` and `CONFIG_IP_PNP=y`, and
+        the static guest binary:
+        `LEGION_SANDBOX_KERNEL=/var/lib/legion/kernels/vmlinux
+        LEGION_GUEST_BINARY=$PWD/target/x86_64-unknown-linux-musl/dist/legion-guest
+        cargo test --lib sandbox_gated_boots -- --ignored --nocapture
+        --test-threads 1` (G0.1), then the G0.2 throughput numbers. Full
+        steps in [verification § Gated sandboxes](suspend-resume-linux-verification.md#gated-sandboxes).
+  - [ ] Flip the Phase 2 default once G0.1 and G2.1 pass: set
+        `SANDBOX_GATED_BY_DEFAULT = true` in `src/structs/network.rs`, update
+        the public docs that say `auto` means `host` for sandboxes
+        (`docs/network-handlers.md`, `docs/task-runtime-sandbox.md`, the
+        agent sandboxes guide), and drop `LEGION_SANDBOX_GATED_DEFAULT`
+        ([calls entry 2](calls/gated-sandbox-checkpoints-plan_calls.md#2-the-flip-to-gated-by-default-is-built-but-held-closed-until-phase-0-passes)).
+  - [ ] Run the KVM checks for the built phases: G1.1 to G1.5 (gated memory
+        checkpoints on both VMMs), G2.1 (glibc and musl images), G3.1
+        (model-call wake), G4.1 (TAP re-addressing), and record them in the
+        verification doc.
+  - [ ] Phase 5: ingress into gated sandboxes over host-initiated vsock,
+        lifting the submit refusal of `network.ports` on a gated sandbox.
   - [ ] Found during the plan: gated `container` and `exec` tasks without
         upstreams get no VIP block and so no resolver
         ([plan §6.5](plans/gated-sandbox-checkpoints-plan.md#65-gated-is-the-sandbox-default-and-it-denies-by-default)).
-  - [ ] Found during the plan: the egress proxy records bytes only when a
-        splice ends, so the service graph and idle policy miss long streams
+        Gated sandboxes have one now. The container and `exec` half is
+        worker-plane-auth Phase 3's.
+  - [ ] Found during the plan: the egress proxy records service-graph
+        bytes only when a splice ends, so the graph misses long streams
         until they close (`src/worker/netd/proxy.rs` `splice`). Phase 3
-        fixes the idle half.
+        fixed the idle half (bytes are stamped as they move); the graph
+        half is open.
+  - [ ] Found while building: a gated resolver forwards queries while the
+        allocation's policy is still pending (the first heartbeat after
+        placement), a narrow DNS channel the proxy does not have
+        ([calls entry 15](calls/gated-sandbox-checkpoints-plan_calls.md#15-a-gated-resolver-forwards-while-the-allocations-policy-is-pending)).
+        Revisit if boot-time resolution failures turn out to be rare.
+  - [ ] Found while building: TAP guests are IPv4 only (`sandbox.bridges`
+        takes an IPv4 subnet), and a guest kernel without `CONFIG_IP_PNP`
+        boots with no address until its first restore
+        ([docs](../docs/task-runtime-sandbox.md#addressing)).
+  - [ ] Found while building: the UI does not show a TAP sandbox's guest
+        address (`InstanceInfo.guest_address`); the CLI and JSON do.
+- [ ] **The container runtime's `#[ignore]`d OCI tests fail under runc
+      1.5.1** on a cgroup v1 Linux host (2026-10-12, `LEGION_OCI_RUNTIME=runc
+      cargo test --lib oci_runtime -- --ignored`). `runs_container_and_captures_logs`,
+      `pins_a_container_to_its_assigned_cores`, and `exec_supports_a_tty_session`
+      pass. Failing: `stop_lets_a_trapping_container_drain` and
+      `stop_force_kills_at_the_deadline` call the plugin's `stop()`, which
+      is the hard `delete --force` teardown since graceful stop moved to
+      `stop_with` plus the worker's reaper, so the tests look stale.
+      `exec_runs_inside_the_container` (empty output),
+      `sees_task_dir_files_and_their_rewrites`, and
+      `enforces_a_declared_memory_limit` (cgroup v1) are unexplained. Rerun
+      on a cgroup v2 host with `youki`, then fix the tests or the runtime
+      (`src/task_plugins/container.rs`).
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Suspend, resume, fork, and oversubscription** (generic primitives
@@ -1794,7 +1826,9 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           [suspend-resume-linux-verification.md § Phase 1](suspend-resume-linux-verification.md#phase-1)
           (VMM in its allocation cgroup, `memory.max` = guest + overhead, the
           ~300 MiB `exec` usage check, the PSI and meminfo readers, teardown,
-          metrics). Built and unit-tested with fixtures on macOS only.
+          metrics). Built and unit-tested with fixtures on macOS only. The
+          meminfo and PSI readers pass on a Linux host (2026-10-12); the
+          cgroup v2 reader and the rest still need a cgroup v2 host.
     - [ ] Usage lives on the manager that received the heartbeat. With
           several managers, `GetNodeUsage` on another one reports
           `usage_reported: false`. Forward or replicate it beside liveness
@@ -1844,10 +1878,16 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           artifacts are served from it on the second allocation.
           [docs](../docs/artifacts.md#the-node-content-store) ·
           [calls 38, 72, 106, 107, 117](calls/suspend-resume-and-oversubscription-plan_calls.md#72-the-node-content-store-caches-only-digest-pinned-single-files)
-    - [ ] Run the Phase 3a Linux checks
+    - [x] Run the Phase 3a Linux checks
           ([§ Phase 3a](suspend-resume-linux-verification.md#phase-3a)): a
           cache hit on a Linux worker, and `minFreeDisk` against a real
-          filesystem's `statvfs`.
+          filesystem's `statvfs`. Both pass on a loop ext4 (2026-10-12); the
+          `minFreeDisk` refusal now names the free bytes it saw.
+    - [ ] On a small disk the default content budgets clamp above the
+          disk's size (1 GiB artifacts and 2 GiB snapshots on a 1.2 GB
+          filesystem); only `minFreeDisk` keeps the store inside it. Clamp
+          the defaults to the filesystem
+          ([§ 3a.2 results](suspend-resume-linux-verification.md#3a2-minfreedisk-on-a-real-filesystem)).
     - [x] Phase 3b and later: write snapshot parts into the store with
           `PutOptions::pin(PinOwner::snapshot(id))` and release them with
           `ContentStore::release_owner` when a snapshot is deleted (3c).
@@ -1924,11 +1964,12 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           [Linux verification plan](suspend-resume-linux-verification.md#phase-3b)
           (`sandbox_memory_checkpoint_round_trip_*` are `#[ignore]`d), and
           record restore latency per VMM.
-    - [ ] Memory checkpoints of gated sandboxes
+    - [x] Memory checkpoints of gated sandboxes
           ([call 55](calls/suspend-resume-and-oversubscription-plan_calls.md#55-gated-sandboxes-are-not-memory-checkpointable-yet)).
-          Now planned in [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md)
-          (Phase 1). The device-link dir is the wrong home for the socket,
-          since forks share it ([calls entry 3](calls/gated-sandbox-checkpoints-plan_calls.md#3-a-restore-retargets-the-vsock-socket-to-its-own-allocation-through-vmm-overrides-not-a-stable-path)).
+          Built in [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md)
+          Phase 1: every restore retargets the vsock to its own allocation's
+          socket ([calls entry 5](calls/gated-sandbox-checkpoints-plan_calls.md#5-a-restore-retargets-the-vsock-socket-to-its-own-allocation-through-vmm-overrides-not-a-stable-path)).
+          Its KVM checks are open under the gated plan.
     - [ ] Hashing a multi-GiB memory part adds seconds to a checkpoint (after
           the guest resumes, so not paused time). Let the content store hash
           on ingest instead of hashing twice.
@@ -2084,8 +2125,9 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           allowed, and the fixed-TAP disk-fork refusal remains only for jobs
           stored before the rule
           ([calls 135, 136](calls/suspend-resume-and-oversubscription-plan_calls.md#135-a-fixed-tap-is-refused-wherever-two-guests-could-share-a-node-not-removed),
-          [docs](../docs/task-runtime-sandbox.md#networking)). Removing fixed
-          TAPs altogether is the gated plan's Phase 4.
+          [docs](../docs/task-runtime-sandbox.md#networking)). Superseded:
+          the gated plan's Phase 4 removed fixed TAPs altogether, with these
+          refusals.
     - [x] A fork held the origin's pre-capture workload-identity token, good
           for one TTL. Fork and manual snapshot captures now raise the
           instance's identity epoch (`legion.io/epoch`), the `legion` auth
@@ -2372,14 +2414,16 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           clusters removed each other's containers (names now carry the
           node).
     - [ ] Run [§ Track 1](suspend-resume-linux-verification.md#track-1) on a
-          KVM host: auto TAPs on a bridge, TAP counters, an in-place identity
-          disk refresh in a running guest, and forks of an auto-TAP sandbox.
+          KVM host: per-instance TAPs on a bridge with a pool, TAP counters,
+          an in-place identity disk refresh in a running guest, and forks of
+          a TAP sandbox.
     - [ ] No signal keeps a TAP sandbox awake through a quiet outbound call
           (a harness waiting on a model). `connections` is refused there.
           The `hint` signal (Phase 8) is the real fix.
-    - [ ] Auto-TAP egress is whatever the operator enforces on the bridge.
-          Per-sandbox egress policy needs gated networking, which still
-          cannot take memory checkpoints (call 55).
+    - [x] Auto-TAP egress is whatever the operator enforces on the bridge.
+          Per-sandbox egress policy needs gated networking, which now takes
+          memory checkpoints (gated plan Phase 1), so agent sandboxes can
+          have both.
     - [ ] Dev mode (Apple `container`) does not mirror env-delivered tokens
           into `/legion/identity`, so env tokens there keep their boot value.
     - [ ] The `container stats` call runs synchronously on the heartbeat
@@ -3811,6 +3855,38 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Rename "task kind" → "task runtime"
       ([plan](plans/task-runtime-rename-plan.md), single-pass, no shim)
 - [x] A **noop** runtime ([docs](../docs/task-runtime-noop.md))
+- [x] **Gated sandboxes, Phases 1 to 4** of the
+      [gated sandbox checkpoints plan](plans/gated-sandbox-checkpoints-plan.md)
+      ([calls](calls/gated-sandbox-checkpoints-plan_calls.md)), built on a
+      host without KVM and tested against fake VMMs, Unix sockets standing
+      in for vsock, and a real network namespace for the guest's netlink.
+      Phase 0's boot test and the KVM checks are open above.
+  - [x] Phase 1: gated sandboxes take memory checkpoints (suspend,
+        snapshots, forks, publish). Every restore moves the guest's vsock
+        onto its own allocation's socket (Firecracker `vsock_override`, a
+        rewritten cloud-hypervisor `config.json`), the checkpoint records
+        its network shape, a gated-or-TAP mismatch is refused by name at
+        restore, the agent drops dead relays, the restore waits briefly for
+        the datapath, and Firecracker older than 1.16.1 is refused before
+        capture. [docs](../docs/suspend-and-resume.md#gated-sandboxes)
+  - [x] Phase 2 (all but the flip): `gated-default` deny on every gated
+        runtime, a resolver for every gated sandbox, lower-case proxy vars
+        and `NODE_USE_ENV_PROXY`, the static `legion-guest` agent (workspace
+        crate `guest/`), submit refusals for gated plus TAP and for ingress
+        ports on a gated sandbox, `net policy show` resolving `auto`, and the
+        shipped `configs/policies/agent-sandbox-egress.ncl`. The `auto` to
+        `gated` flip is built and held (open above).
+        [docs](../docs/network-handlers.md#default-deny)
+  - [x] Phase 3: `connections` counts open gated egress, and `network`
+        stamps bytes as they move, so a long quiet model call keeps a gated
+        sandbox awake. [docs](../docs/suspend-and-resume.md#what-each-signal-sees-on-a-sandbox)
+  - [x] Phase 4: Legion addresses TAP guests. Worker `sandbox.bridges`
+        pools, a per-allocation lease, `ip=` at boot, netlink re-addressing
+        and a fresh lease on every restore and fork, `LEGION_GUEST_ADDR`,
+        `instance get`'s `address:` line, the `sandbox.bridges` node
+        attribute and implicit constraint, and `config.network.tap` and
+        `mac` removed (disk forks of TAP sandboxes allowed).
+        [docs](../docs/task-runtime-sandbox.md#addressing)
 - [x] **Sandbox guest size follows `resources`** (`memoryMax`, else
       `memory`), so the scheduler's reservation and the VM's size can no
       longer drift apart

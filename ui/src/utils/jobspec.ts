@@ -190,17 +190,16 @@ const normalizeSnapshots = (value: unknown): JobTaskSnapshots | undefined => {
 
 /**
  * Whether the spec lets this task take a memory snapshot: a `sandbox` with a
- * `snapshots` block that does not turn memory off, and no gated networking.
- * Returns the reason when it cannot. The manager is the authority (a stored
- * network policy can gate a task the spec does not), so this only decides
- * what the UI offers.
+ * `snapshots` block that does not turn memory off. Returns the reason when it
+ * cannot. The manager is the authority (it also refuses a gated sandbox on a
+ * Firecracker too old to move the restored guest's vsock), so this only
+ * decides what the UI offers.
  */
 export const memorySnapshotBlocker = (task: JobTask | undefined): string | undefined => {
   if (!task) return 'The task is not in the current job spec'
   if (task.runtime !== 'sandbox') return `Memory snapshots need runtime "sandbox"; this task runs "${task.runtime}"`
   if (!task.snapshots) return 'Memory snapshots need a `snapshots` block on the task'
   if (!task.snapshots.memory) return 'The task sets snapshots.memory = false'
-  if (task.networkMode === 'gated') return 'Memory snapshots do not support gated networking yet'
   return undefined
 }
 

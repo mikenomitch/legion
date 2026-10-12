@@ -110,13 +110,10 @@ pub(super) fn suspend_memory_precondition(
             node_vmm.unwrap_or("no VMM")
         ));
     }
-    if crate::task_plugins::allocation_is_gated(allocation) {
-        return Some(format!(
-            "task {:?} asks for memory checkpoints, but sandbox memory checkpoints don't \
-             support gated networking yet\nHint: use --checkpoint disk, or drop network gating \
-             for this task",
-            task.name
-        ));
+    if let Some(refusal) =
+        gated_capture_refusal(task, allocation, node, &subject, "use --checkpoint disk")
+    {
+        return Some(refusal);
     }
     if crate::structs::snapshot::memory_checkpoint_ask(task).is_none() {
         return Some(format!(
@@ -127,6 +124,88 @@ pub(super) fn suspend_memory_precondition(
         ));
     }
     None
+}
+
+/// The VMM a sandbox task runs on `node`, and that VMM's version there: the
+/// task's own `hypervisor` when it names a VMM, else the node's default
+/// (`sandbox.vmm`). The version is the node's per-VMM attribute
+/// (`sandbox.vmm.<name>.version`), falling back to `sandbox.vmm.version`
+/// for the default.
+pub(super) fn sandbox_vmm_on_node(task: &TaskConfig, node: &Node) -> (String, Option<String>) {
+    use crate::structs::checkpoint::{
+        vmm_version_attr, ATTR_SANDBOX_VMM, ATTR_SANDBOX_VMM_VERSION,
+    };
+    let attr = |key: &str| {
+        node.fingerprint_attrs
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let default = attr(ATTR_SANDBOX_VMM).unwrap_or_default();
+    let vmm = match task
+        .config
+        .get("hypervisor")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("firecracker" | "fc") => "firecracker".to_string(),
+        Some("cloud-hypervisor" | "cloudhypervisor" | "ch") => "cloud-hypervisor".to_string(),
+        _ => default.clone(),
+    };
+    let version = attr(&vmm_version_attr(&vmm)).or_else(|| {
+        (vmm == default)
+            .then(|| attr(ATTR_SANDBOX_VMM_VERSION))
+            .flatten()
+    });
+    (vmm, version)
+}
+
+/// Why a memory capture of a gated sandbox's `allocation` would produce a
+/// checkpoint its node's VMM cannot restore: a Firecracker older than
+/// 1.16.1 cannot move the guest's vsock to the restoring allocation's
+/// socket (gated plan §6.2). Compat is an exact VMM version match, so this
+/// check at capture covers every later restore. `None` when it can.
+pub(super) fn gated_capture_refusal(
+    task: &TaskConfig,
+    allocation: &crate::structs::Allocation,
+    node: &Node,
+    subject: &str,
+    fix: &str,
+) -> Option<String> {
+    if !crate::task_plugins::allocation_is_gated(allocation) {
+        return None;
+    }
+    let (vmm, version) = sandbox_vmm_on_node(task, node);
+    crate::structs::fork::gated_memory_checkpoint_refusal(
+        subject,
+        &node.id,
+        &vmm,
+        version.as_deref(),
+        fix,
+    )
+}
+
+/// The note a live memory capture of `allocation` deserves, for the
+/// `notes` of CreateSnapshot and ForkInstance: Firecracker resets every open
+/// vsock connection at snapshot time, so a gated guest that keeps running
+/// loses its open connections (gated plan §6.3, calls entry 13).
+pub(super) fn gated_capture_note(
+    task: &TaskConfig,
+    allocation: &crate::structs::Allocation,
+    node: &Node,
+    instance_id: &str,
+) -> Option<String> {
+    if !crate::task_plugins::allocation_is_gated(allocation) {
+        return None;
+    }
+    let (vmm, _) = sandbox_vmm_on_node(task, node);
+    (vmm == "firecracker").then(|| {
+        format!(
+            "instance {instance_id} is gated on Firecracker, so this capture resets its open \
+             network connections (the guest keeps running)"
+        )
+    })
 }
 
 /// The checkpoint kind a suspend takes when the caller does not say: the

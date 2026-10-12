@@ -730,6 +730,10 @@ fn map_instance_info(
         pending_op,
         idle_since,
         idle_after_seconds,
+        // From the node's network status report, which the handlers
+        // attach ([`attach_guest_address`]).
+        guest_address: None,
+        guest_bridge: None,
     }
 }
 
@@ -795,6 +799,40 @@ fn idle_policy_unmeasured_detail(
          so the instance will not suspend when idle",
         idle.after.as_secs()
     ))
+}
+
+/// The `egress-unenforced` detail for an allocation of `task`: a sandbox
+/// whose `auto` network would be gated, running on a dev backend that has
+/// no vsock to the datapath (gated plan §6.6). `None` otherwise, and while
+/// the gated default is closed. Lookup failures degrade to no detail.
+fn egress_unenforced_detail(
+    store: &Store,
+    allocation: &crate::structs::Allocation,
+    task: &crate::structs::TaskConfig,
+) -> Option<String> {
+    if !store.sandbox_gated_default() || task.runtime != "sandbox" {
+        return None;
+    }
+    let node = store.get_node(&allocation.node_id).ok()?;
+    let node_vmm = node
+        .fingerprint_attrs
+        .get(crate::structs::checkpoint::ATTR_SANDBOX_VMM)
+        .and_then(Value::as_str);
+    crate::structs::network::egress_unenforced_detail(task, node_vmm, true)
+}
+
+/// [`egress_unenforced_detail`] for an instance's current allocation.
+fn instance_egress_unenforced_detail(store: &Store, instance: &Instance) -> Option<String> {
+    if !store.sandbox_gated_default() || instance.state != InstanceState::Active {
+        return None;
+    }
+    let allocation = store
+        .get_allocation_by_id(instance.current_alloc_id?)
+        .ok()??;
+    let task = store
+        .get_task_config_by_id(allocation.task_config_id)
+        .ok()??;
+    egress_unenforced_detail(store, &allocation, &task)
 }
 
 /// `pending-loss-confirmation` diagnostic for instance get/list: when an
@@ -4701,12 +4739,6 @@ impl Manager for ManagerDaemonService {
             inner.task_group.as_deref(),
             inner.task_name.as_deref(),
         )?;
-        // The submit-time fixed-TAP rule, asked of the count being set: a
-        // second guest on a fixed TAP fails to boot (docs/task-runtime-sandbox.md).
-        if let Some(count) = inner.count {
-            crate::structs::fork::validate_fixed_tap(task, count, false)
-                .map_err(Status::failed_precondition)?;
-        }
         let (task_group, task_name, spec_count) =
             (task.group.clone(), task.name.clone(), task.count.num);
         let job_config_id = config.id();
@@ -5677,6 +5709,7 @@ impl Manager for ManagerDaemonService {
             .store
             .instance_lineage_for_job(&inner.job_id)
             .map_err(|e| map_store_error("Error listing instances", e))?;
+        let addresses = guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner()));
         let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         let instances = self
             .store
@@ -5687,7 +5720,9 @@ impl Manager for ManagerDaemonService {
             .map(|instance| {
                 let state = suspend.remove(&instance.instance_id).unwrap_or_default();
                 let history = history.remove(&instance.instance_id).unwrap_or_default();
-                map_instance_info(&self.store, &usage, instance, state, history)
+                let mut info = map_instance_info(&self.store, &usage, instance, state, history);
+                attach_guest_address(&mut info, &addresses);
+                info
             })
             .collect();
 
@@ -5732,10 +5767,15 @@ impl Manager for ManagerDaemonService {
 
         let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         let idle_unmeasured = idle_policy_unmeasured_detail(&self.store, &usage, &instance);
+        let egress_unenforced = instance_egress_unenforced_detail(&self.store, &instance);
         let mut info = map_instance_info(&self.store, &usage, instance, suspend, history);
         drop(usage);
+        attach_guest_address(
+            &mut info,
+            &guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner())),
+        );
         if info.detail.is_none() {
-            info.detail = idle_unmeasured;
+            info.detail = idle_unmeasured.or(egress_unenforced);
         }
         Ok(Response::new(GetInstanceReply {
             instance: Some(info),
@@ -7985,17 +8025,23 @@ impl Manager for ManagerDaemonService {
             .as_ref()
             .map(|n| n.mode.clone())
             .unwrap_or_else(|| "auto".to_string());
-        let effective_mode = effective
-            .mode
-            .clone()
-            .unwrap_or_else(|| declared_mode.clone());
+        let effective_mode = effective.mode.clone().unwrap_or_else(|| {
+            crate::structs::network::resolve_network_mode_with(
+                &declared_mode,
+                &task.runtime,
+                &crate::structs::network::AutoModeFacts::for_task(&task),
+                self.store.sandbox_gated_default(),
+            )
+        });
         let node_status_json = self.net_status_for_task(&req.job_id, &task.name);
+        let notes = self.egress_unenforced_notes(&req.job_id, &task);
         Ok(Response::new(ShowNetPolicyReply {
             effective_json: serde_json::to_string(&effective).unwrap_or_default(),
             matched_policies: matched,
             declared_mode,
             effective_mode,
             node_status_json,
+            notes,
         }))
     }
 
@@ -8043,6 +8089,43 @@ impl Manager for ManagerDaemonService {
             path = Some(req.path.trim().to_string());
         }
         let Some(chain) = chain else {
+            // A gated task's egress that nothing covers is denied
+            // (`gated-default`), exactly as its datapath would.
+            let declared_mode = task
+                .network
+                .as_ref()
+                .map(|network| network.mode.as_str())
+                .unwrap_or(crate::structs::netpolicy::MODE_AUTO);
+            let mode = effective.mode.clone().unwrap_or_else(|| {
+                crate::structs::network::resolve_network_mode_with(
+                    declared_mode,
+                    &task.runtime,
+                    &crate::structs::network::AutoModeFacts::for_task(&task),
+                    self.store.sandbox_gated_default(),
+                )
+            });
+            if direction == "egress" && mode == crate::structs::netpolicy::MODE_GATED {
+                let destination = host
+                    .clone()
+                    .or_else(|| ip.map(|ip| ip.to_string()))
+                    .unwrap_or_else(|| target.clone());
+                let reason = format!(
+                    "task {} is gated and nothing allows {destination}",
+                    task.name
+                );
+                return Ok(Response::new(TestNetPolicyReply {
+                    verdict: "deny".into(),
+                    source: crate::structs::netpolicy::SOURCE_GATED_DEFAULT.into(),
+                    explanation: format!(
+                        "{target}: denied by {} — {reason}",
+                        crate::structs::netpolicy::SOURCE_GATED_DEFAULT
+                    ),
+                    reason,
+                    direction: direction.into(),
+                    protocol: String::new(),
+                    hint: crate::structs::netpolicy::gated_default_hint(&destination),
+                }));
+            }
             return Ok(Response::new(TestNetPolicyReply {
                 verdict: "allow".into(),
                 source: String::new(),
@@ -8052,6 +8135,7 @@ impl Manager for ManagerDaemonService {
                 explanation: format!(
                     "no {direction} policy applies to this task; everything is allowed"
                 ),
+                hint: String::new(),
             }));
         };
         let identity_str = req.identity.trim();
@@ -8125,6 +8209,7 @@ impl Manager for ManagerDaemonService {
             direction: direction.into(),
             protocol: chain.protocol.clone(),
             explanation,
+            hint: String::new(),
         }))
     }
 
@@ -10628,10 +10713,23 @@ impl ManagerDaemonService {
         desired: &[crate::structs::TaskAllocation],
     ) -> Vec<AllocNetPolicy> {
         use crate::structs::netpolicy::NetSelectorFacts;
+        // Gated by placement, which can resolve `auto` with no `network`
+        // block on the task at all (a default sandbox, gated plan Phase 2):
+        // the allocation's own network records it.
+        let placed_gated = |allocation: &crate::structs::TaskAllocation| {
+            allocation
+                .network
+                .contains(crate::structs::netpolicy::MODE_GATED)
+                && serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
+                    .is_ok_and(|placed| placed.is_gated())
+        };
         let any_inline = desired
             .iter()
             .any(|allocation| !allocation.task_network.trim().is_empty());
-        if self.net_policy_generation_cached() == 0 && !any_inline {
+        if self.net_policy_generation_cached() == 0
+            && !any_inline
+            && !desired.iter().any(placed_gated)
+        {
             return Vec::new();
         }
         // Stored policies once per heartbeat; the node's pool once, and only
@@ -10682,11 +10780,15 @@ impl ManagerDaemonService {
             };
             let (effective, _) = merge_net_policies(&stored, &facts, network.as_ref());
             // A gated allocation is told about an *empty* policy too, so the
-            // node can tell "known: nothing applies" (allow through the
-            // datapath) from "pending" (fail closed).
-            let gated = network
-                .as_ref()
-                .is_some_and(|n| n.mode == crate::structs::netpolicy::MODE_GATED)
+            // node can tell "known: nothing covers it" (`gated-default`) from
+            // "pending" (`policy-pending`). Gated by its declaration, by a
+            // `require` policy, or by placement resolving `auto` (a default
+            // sandbox, gated plan Phase 2), which the allocation's own
+            // network records.
+            let gated = placed_gated(allocation)
+                || network
+                    .as_ref()
+                    .is_some_and(|n| n.mode == crate::structs::netpolicy::MODE_GATED)
                 || effective.mode.as_deref() == Some(crate::structs::netpolicy::MODE_GATED);
             if effective.is_empty() && !gated {
                 continue;
@@ -10930,6 +11032,44 @@ impl ManagerDaemonService {
         edges.retain(|_, window| now - window.last_seen <= EDGE_WINDOW_MINUTES * 60);
     }
 
+    /// The `egress-unenforced` note for each running allocation of `task`
+    /// that lands on a dev backend while the gated default is open (gated
+    /// plan §6.6). Lookup failures degrade to no note.
+    fn egress_unenforced_notes(
+        &self,
+        job_id: &str,
+        task: &crate::structs::TaskConfig,
+    ) -> Vec<String> {
+        if !self.store.sandbox_gated_default() || task.runtime != "sandbox" {
+            return Vec::new();
+        }
+        let Ok(allocations) = self.store.allocs_for_job(job_id) else {
+            return Vec::new();
+        };
+        let mut notes = Vec::new();
+        for allocation in allocations {
+            let is_task = self
+                .store
+                .get_task_config_by_id(allocation.task_config_id)
+                .ok()
+                .flatten()
+                .is_some_and(|candidate| candidate.name == task.name);
+            if !is_task || allocation.status != crate::constants::ALLOCATION_STATUS_PLACED {
+                continue;
+            }
+            if let Some(note) = egress_unenforced_detail(&self.store, &allocation, task) {
+                let note = format!(
+                    "allocation {} on node {}: {note}",
+                    allocation.id, allocation.node_id
+                );
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
+            }
+        }
+        notes
+    }
+
     fn net_status_for_task(&self, job_id: &str, task_name: &str) -> Vec<String> {
         let Ok(allocations) = self.store.allocs_for_job(job_id) else {
             return Vec::new();
@@ -11143,7 +11283,39 @@ fn net_status_json(node_id: &str, status: &crate::structs::NetAllocStatus) -> Va
         "tlsReady": status.tls_ready,
         "tlsError": status.tls_error,
         "meshIdentity": status.mesh_identity,
+        "guestAddress": status.guest_address,
+        "guestBridge": status.guest_bridge,
     })
+}
+
+/// Every TAP sandbox guest address the nodes reported, by allocation id, as
+/// `(address, bridge)` (`NetAllocStatus.guest_address`).
+fn guest_addresses(
+    status: &HashMap<String, Vec<crate::structs::NetAllocStatus>>,
+) -> HashMap<i64, (String, String)> {
+    status
+        .values()
+        .flatten()
+        .filter(|entry| !entry.guest_address.is_empty())
+        .map(|entry| {
+            (
+                entry.allocation_id,
+                (entry.guest_address.clone(), entry.guest_bridge.clone()),
+            )
+        })
+        .collect()
+}
+
+/// Fill `info`'s guest address from the node reports, for its running
+/// allocation.
+fn attach_guest_address(info: &mut InstanceInfo, addresses: &HashMap<i64, (String, String)>) {
+    if let Some((address, bridge)) = info
+        .current_alloc_id
+        .and_then(|allocation_id| addresses.get(&allocation_id))
+    {
+        info.guest_address = Some(address.clone());
+        info.guest_bridge = Some(bridge.clone());
+    }
 }
 
 fn net_policy_to_proto(
@@ -11687,6 +11859,129 @@ mod tests {
             version: None,
         };
         store.handle_job_submit(&job, &[submission()])?;
+        Ok(())
+    }
+
+    /// Gated plan §6.7: the node's report of a TAP guest's leased address
+    /// reaches the instance serving that allocation, and no other.
+    #[test]
+    fn a_reported_guest_address_reaches_its_instance() {
+        let report = |allocation_id, address: &str| crate::structs::NetAllocStatus {
+            allocation_id,
+            mode: "host".into(),
+            guest_address: address.into(),
+            guest_bridge: if address.is_empty() { "" } else { "br0" }.into(),
+            ..Default::default()
+        };
+        let status = HashMap::from([(
+            "w-03".to_string(),
+            vec![report(7, "10.88.128.7"), report(8, "")],
+        )]);
+        let addresses = guest_addresses(&status);
+        let mut running = InstanceInfo {
+            current_alloc_id: Some(7),
+            ..Default::default()
+        };
+        attach_guest_address(&mut running, &addresses);
+        assert_eq!(running.guest_address.as_deref(), Some("10.88.128.7"));
+        assert_eq!(running.guest_bridge.as_deref(), Some("br0"));
+        for current_alloc_id in [Some(8), Some(9), None] {
+            let mut other = InstanceInfo {
+                current_alloc_id,
+                ..Default::default()
+            };
+            attach_guest_address(&mut other, &addresses);
+            assert_eq!(other.guest_address, None);
+        }
+    }
+
+    /// Gated plan Phase 2: an allocation placed gated by `auto` (a sandbox
+    /// that declares no `network` block) is told about its empty policy,
+    /// so its node denies with `gated-default` instead of waiting forever
+    /// on `policy-pending`, even on a cluster with no policy objects.
+    #[test]
+    fn a_placement_gated_allocation_gets_its_empty_policy() -> R<()> {
+        let manager = ManagerDaemonService::new(setup_store()?);
+        let placed = |allocation_id: i64, mode: &str| crate::structs::TaskAllocation {
+            allocation_id,
+            task_runtime: "sandbox".into(),
+            network: json!({ "mode": mode }).to_string(),
+            ..Default::default()
+        };
+        let assignments =
+            manager.build_net_policies("node-1", &[placed(7, "gated"), placed(8, "host")]);
+        assert_eq!(assignments.len(), 1, "{assignments:?}");
+        assert_eq!(assignments[0].allocation_id, 7);
+        assert!(!assignments[0].policy_hash.is_empty());
+        Ok(())
+    }
+
+    /// Gated plan §6.5: `net policy test` answers like the datapath. A gated
+    /// task that no egress chain covers is denied with `gated-default` and
+    /// the fix; a host task is allowed; and with the Phase 2 gate open, a
+    /// sandbox that declares nothing is gated by default too.
+    #[tokio::test]
+    async fn net_policy_test_reports_the_gated_default() -> R<()> {
+        let store = setup_store()?;
+        let job = |name: &str, runtime: &str, network: Option<Value>| -> R<JobConfig> {
+            let mut task = serde_json::json!({
+                "name": "workspace",
+                "runtime": runtime,
+                "config": { "image": "alpine", "command": ["sleep", "1"] },
+            });
+            if let Some(network) = network {
+                task["network"] = network;
+            }
+            Ok(JobConfig {
+                priority: Default::default(),
+                name: name.into(),
+                tasks: vec![serde_json::from_value(task)?],
+                rollout: None,
+                rollout_by_group: Default::default(),
+                version: None,
+            })
+        };
+        store.handle_job_submit(
+            &job("gated", "container", Some(json!({ "mode": "gated" })))?,
+            &[submission()],
+        )?;
+        store.handle_job_submit(&job("plain", "container", None)?, &[submission()])?;
+        store.handle_job_submit(&job("agents", "sandbox", None)?, &[submission()])?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let test = |job_id: &'static str| {
+            let manager = &manager;
+            async move {
+                manager
+                    .test_net_policy(Request::new(TestNetPolicyRequest {
+                        job_id: job_id.into(),
+                        to: "https://example.com".into(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .map(|reply| reply.into_inner())
+            }
+        };
+
+        let reply = test("gated").await?;
+        assert_eq!(reply.verdict, "deny");
+        assert_eq!(reply.source, "gated-default");
+        assert_eq!(
+            reply.reason,
+            "task workspace is gated and nothing allows example.com"
+        );
+        assert!(
+            reply
+                .hint
+                .contains("add \"example.com\" to network.egress.allow"),
+            "{}",
+            reply.hint
+        );
+        assert_eq!(test("plain").await?.verdict, "allow");
+
+        // The default sandbox: host until Phase 0 opens the gate.
+        assert_eq!(test("agents").await?.verdict, "allow");
+        store.set_sandbox_gated_default(true);
+        assert_eq!(test("agents").await?.source, "gated-default");
         Ok(())
     }
 

@@ -27,7 +27,7 @@ use crate::structs::netpolicy::{ConnectFacts, Verdict};
 use crate::structs::SVC_ZONE;
 use crate::worker::forwarder::ForwarderContext;
 use crate::worker::netd::metrics as net_metrics;
-use crate::worker::netd::policy::egress_connect_verdict;
+use crate::worker::netd::policy::{egress_connect_verdict, gated_egress_connect_verdict};
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -49,8 +49,10 @@ pub const DNS_PORT: u16 = 53;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsSpec {
     pub allocation_id: i64,
-    /// `127.42.b.1`.
-    pub resolver: Ipv4Addr,
+    /// `127.42.b.1`, the address a namespace or host resolver binds. `None`
+    /// for a gated sandbox without a VIP block, which serves only on
+    /// [`Self::unix`] and never binds an address.
+    pub resolver: Option<Ipv4Addr>,
     /// `<key>` → (VIP, canonical port).
     pub names: BTreeMap<String, (Ipv4Addr, u16)>,
     /// The gated namespace to bind inside, if any.
@@ -210,7 +212,13 @@ impl NetDns {
             }
             return;
         }
-        let addr = SocketAddr::new(IpAddr::V4(spec.resolver), DNS_PORT);
+        let Some(resolver) = spec.resolver else {
+            // Nothing to bind: a spec with neither an address nor a socket
+            // is never produced, but a resolver that cannot exist must not
+            // count as running.
+            return;
+        };
+        let addr = SocketAddr::new(IpAddr::V4(resolver), DNS_PORT);
         let udp = crate::worker::netd::netns::bind_udp(spec.netns.clone(), addr).await;
         let tcp = crate::worker::netd::netns::bind_tcp(spec.netns.clone(), addr).await;
         match (udp, tcp) {
@@ -553,12 +561,18 @@ async fn answer(resolver: &Arc<Resolver>, query: &[u8]) -> Option<Vec<u8>> {
         });
     }
 
-    // External: policy at resolution time, then forward.
-    let policy = resolver.context.policy_for(resolver.spec.allocation_id);
-    let judge = policy
-        .as_ref()
-        .and_then(|p| p.egress.as_ref())
-        .is_some_and(|chain| !chain.uses_cidr());
+    // External: policy at resolution time, then forward. A gated
+    // allocation's resolver (inside its namespace, or a sandbox's vsock
+    // socket) denies by default when no egress chain covers it, so a name
+    // nothing allows is NXDOMAIN in one round trip (`gated-default`).
+    let allocation_id = resolver.spec.allocation_id;
+    let policy = resolver.context.policy_for(allocation_id);
+    let gated = resolver.spec.netns.is_some() || resolver.spec.unix.is_some();
+    let chain = policy.as_ref().and_then(|p| p.egress.as_ref());
+    let judge = match chain {
+        Some(chain) => !chain.uses_cidr(),
+        None => gated && resolver.context.policy_known(allocation_id),
+    };
     if judge {
         let facts = ConnectFacts {
             host: Some(question.name.trim_end_matches('.')),
@@ -566,8 +580,12 @@ async fn answer(resolver: &Arc<Resolver>, query: &[u8]) -> Option<Vec<u8>> {
             port: 0,
             identity: None,
         };
-        if let Verdict::Deny { source, reason } = egress_connect_verdict(policy.as_deref(), &facts)
-        {
+        let verdict = if gated {
+            gated_egress_connect_verdict(policy.as_deref(), &facts)
+        } else {
+            egress_connect_verdict(policy.as_deref(), &facts)
+        };
+        if let Verdict::Deny { source, reason } = verdict {
             net_metrics::connection("egress", "dns", "deny");
             resolver.context.record_denial(
                 resolver.spec.allocation_id,
@@ -716,7 +734,7 @@ mod tests {
         let resolver = Arc::new(Resolver {
             spec: DnsSpec {
                 allocation_id: 3,
-                resolver: Ipv4Addr::new(127, 42, 9, 1),
+                resolver: Some(Ipv4Addr::new(127, 42, 9, 1)),
                 names: [("db".to_string(), (Ipv4Addr::new(127, 42, 9, 2), 5432))]
                     .into_iter()
                     .collect(),
@@ -761,5 +779,82 @@ mod tests {
                 .any(|d| d.protocol == "dns" && d.destination == "evil.example"),
             "{drained:?}"
         );
+    }
+
+    /// Gated plan §6.5: a gated sandbox's resolver with nothing covering its
+    /// egress answers every outside name NXDOMAIN in one round trip and
+    /// records a `gated-default` denial, while its own `*.svc.legion` zone
+    /// still resolves. A non-gated resolver with no policy still forwards.
+    #[tokio::test]
+    async fn a_gated_resolver_with_no_policy_denies_by_default() {
+        use crate::structs::netpolicy::{merge_policies, InlinePolicy};
+        use crate::structs::AllocNetPolicy;
+        use crate::worker::netd::{Denials, NetPolicyCache};
+        let stub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stub_addr = stub.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            loop {
+                let Ok((len, peer)) = stub.recv_from(&mut buf).await else {
+                    break;
+                };
+                let q = buf[..len].to_vec();
+                if let Some((_, question)) = parse_question(&q) {
+                    let response = build_response(&q, &question, 0, &[(TYPE_A, vec![9, 9, 9, 9])]);
+                    let _ = stub.send_to(&response, peer).await;
+                }
+            }
+        });
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        // Known and empty: the manager names the empty policy's hash.
+        let empty = merge_policies(&[], InlinePolicy::default());
+        let hash = empty.hash.clone();
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id: 3,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, empty).unwrap();
+        let context = Arc::new(ForwarderContext::new(cache, denials.clone()));
+        let resolver = |unix: Option<std::path::PathBuf>| {
+            Arc::new(Resolver {
+                spec: DnsSpec {
+                    allocation_id: 3,
+                    resolver: None,
+                    names: [("db".to_string(), (Ipv4Addr::new(127, 42, 9, 2), 5432))]
+                        .into_iter()
+                        .collect(),
+                    netns: None,
+                    unix,
+                },
+                context: context.clone(),
+                forwarders: vec![stub_addr],
+            })
+        };
+
+        let gated = resolver(Some("/allocs/3/.sandbox/vsock.sock_53".into()));
+        let r = answer(&gated, &query("pypi.org", TYPE_A)).await.unwrap();
+        assert_eq!(r[3] & 0x0F, RCODE_NXDOMAIN);
+        let drained = denials.drain();
+        assert!(
+            drained
+                .iter()
+                .any(|d| d.destination == "pypi.org" && d.source == "gated-default"),
+            "{drained:?}"
+        );
+        let r = answer(&gated, &query("db.svc.legion", TYPE_A))
+            .await
+            .unwrap();
+        assert_eq!(
+            &r[r.len() - 4..],
+            &[127, 42, 9, 2],
+            "the zone still resolves"
+        );
+
+        let cooperative = resolver(None);
+        let r = answer(&cooperative, &query("pypi.org", TYPE_A))
+            .await
+            .unwrap();
+        assert_eq!(&r[r.len() - 4..], &[9, 9, 9, 9]);
     }
 }

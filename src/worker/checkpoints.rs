@@ -1023,6 +1023,9 @@ pub fn resume_identity(
         // File-delivered tokens live under the task directory, which the
         // sandbox runtime reads when it writes the disk.
         files: Vec::new(),
+        // A TAP guest's address is leased by the sandbox runtime on the
+        // restoring node, from its bridge's pool.
+        guest_addr: None,
     }
 }
 

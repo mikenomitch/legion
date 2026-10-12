@@ -38,34 +38,36 @@ if [ -n "$data_disk" ]; then
 fi
 mkdir -p /data/redis /data/pipeline
 
-# --- a TAP device for the HTTP-reachable microVM test.
+# --- a bridge for the HTTP-reachable microVM test.
 #
-# Legion attaches a pre-created TAP but does not create one, address the
-# guest, or map ports into it (docs/task-runtime-sandbox.md, Networking). This
-# is the operator-side half: the guest gets 172.30.0.2, and host port 8090 is
-# forwarded to the guest's port 8080. It runs as a unit so it survives reboots.
-cat >/etc/systemd/system/sc-tap0.service <<'UNIT'
+# Legion creates a TAP per sandbox on br0 and leases the guest an address from
+# the worker config's sandbox.bridges.br0 pool (docs/task-runtime-sandbox.md,
+# Addressing). The pool there is the single address 172.30.0.2, so this is the
+# operator-side half: the bridge with its gateway address, NAT out, and host
+# port 8090 forwarded to the guest's port 8080. It runs as a unit so it
+# survives reboots.
+cat >/etc/systemd/system/sc-br0.service <<'UNIT'
 [Unit]
-Description=Spot-check TAP device for microVM sandboxes
+Description=Spot-check bridge for microVM sandboxes
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'ip link show tap0 >/dev/null 2>&1 || ip tuntap add dev tap0 mode tap'
-ExecStart=/bin/sh -c 'ip addr replace 172.30.0.1/24 dev tap0 && ip link set tap0 up'
+ExecStart=/bin/sh -c 'ip link show br0 >/dev/null 2>&1 || ip link add br0 type bridge'
+ExecStart=/bin/sh -c 'ip addr replace 172.30.0.1/24 dev br0 && ip link set br0 up'
 ExecStart=/sbin/sysctl -w net.ipv4.ip_forward=1
 ExecStart=/bin/sh -c 'iptables -t nat -C PREROUTING -p tcp --dport 8090 -j DNAT --to-destination 172.30.0.2:8080 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 8090 -j DNAT --to-destination 172.30.0.2:8080'
-ExecStart=/bin/sh -c 'iptables -t nat -C POSTROUTING -s 172.30.0.0/24 ! -o tap0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 172.30.0.0/24 ! -o tap0 -j MASQUERADE'
-ExecStart=/bin/sh -c 'iptables -C FORWARD -i tap0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap0 -j ACCEPT'
-ExecStart=/bin/sh -c 'iptables -C FORWARD -o tap0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o tap0 -j ACCEPT'
+ExecStart=/bin/sh -c 'iptables -t nat -C POSTROUTING -s 172.30.0.0/24 ! -o br0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 172.30.0.0/24 ! -o br0 -j MASQUERADE'
+ExecStart=/bin/sh -c 'iptables -C FORWARD -i br0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i br0 -j ACCEPT'
+ExecStart=/bin/sh -c 'iptables -C FORWARD -o br0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o br0 -j ACCEPT'
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
-systemctl enable --now sc-tap0.service
+systemctl enable --now sc-br0.service
 
 ls -l /dev/kvm
 echo "spot-check worker bootstrap done"

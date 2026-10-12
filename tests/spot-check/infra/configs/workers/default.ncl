@@ -17,4 +17,18 @@
         enabled = true,
         cgroupParent = "legion",
     },
+    # The bridge worker.sh builds for the HTTP-reachable microVM test, and the
+    # pool Legion leases its guest from (docs/task-runtime-sandbox.md,
+    # Addressing). One address, because the rig forwards host port 8090 to
+    # 172.30.0.2:8080 and the job runs one VM.
+    sandbox = {
+        bridges = {
+            br0 = {
+                subnet = "172.30.0.0/24",
+                gateway = "172.30.0.1",
+                range = "172.30.0.2/32",
+                dns = ["1.1.1.1"],
+            },
+        },
+    },
 }
