@@ -834,3 +834,50 @@ comparison build. Public write-up in [docs/benchmarks.md](../../docs/benchmarks.
 ~0.3 ms at every size, so the blocking-pool starvation is gone. The
 `plan` phase averages 26 ms per eval at 20k and 45 ms at 50k, far above
 `plan_and_apply` here, and is the open item in TODO.md.
+
+## Exec sessions: proxied vs direct (sandbox-exec Phase 0) — 2026-10-12
+
+`tests/exec_session_benchmark.rs`, release build, one 4-vCPU Xeon @ 2.8 GHz
+running the client, a manager, and a separate worker process (isolated
+ports). Each session runs `head -c 65536 /dev/zero` in an `exec` task and
+exits. "Open" is request sent to first output byte; for direct it includes
+the `MintExecTicket` call and a fresh TLS connection to the worker. Manager
+cost is the manager process alone: CPU from `/proc/<pid>/stat`, bytes from
+`/proc/<pid>/io` `rchar + wchar` (sockets and disk alike), per session.
+
+```bash
+LEGION_EXEC_BENCH_CONCURRENCY=1,10,100,500 \
+  cargo test --release --test exec_session_benchmark -- --ignored --nocapture
+```
+
+| Path | Sessions at once | Open p50 | Open p99 | Manager CPU / session | Manager bytes / session |
+| --- | --- | --- | --- | --- | --- |
+| proxied | 10 | 18.9 ms | 22.0 ms | 2.0 ms | 83 KB |
+| direct | 10 | 15.2 ms | 22.3 ms | < 1 ms (below the 10 ms clock tick) | 14 KB |
+| proxied | 100 | 84.3 ms | 153.5 ms | 0.80 ms | 70 KB |
+| direct | 100 | 212.7 ms | 226.7 ms | 0.40 ms | 2.0 KB |
+| proxied | 500 | 489 ms | 896 ms | 0.86 ms | 66 KB |
+| direct | 500 | 772 ms | 1,503 ms | 0.46 ms | 2.4 KB |
+
+Mint throughput: 3,859 tickets/s from 32 concurrent callers (one ES256
+signature and one read-model lookup each; the plan's target is 5,000/s per
+manager on the rig's control plane).
+
+What this shows and what it doesn't:
+
+- **Manager cost moves the way the plan expects.** A proxied session moves
+  every output byte through the manager (64 KiB payload, about 66-83 KB of
+  manager I/O per session); a direct one moves about 2 KB, the mint request
+  and reply. Manager CPU per session halves.
+- **Direct open latency is worse here, and the cause is the client, not the
+  path.** Every direct session opens its own TLS connection to the worker
+  (handshake plus ticket verification in `spawn_blocking`), and at 100+
+  concurrent sessions all of that shares four cores with the manager and the
+  worker. A platform that keeps one worker connection open per node pays the
+  handshake once.
+- **Not measured: 1,000 and 10,000 sessions, and the open-latency SLO from
+  the mint reply.** Simulated workers (`legion start worker --simulate N`) cannot run an
+  exec session, so the scale cells need real workers, and the plan's
+  ≤ 20 ms / ≤ 80 ms target is a same-AZ number for the AWS rig. Both are open
+  in TODO.md. The 1-session cells are omitted: their CPU is below the clock
+  tick and their bytes are dominated by heartbeats during the cell.

@@ -34,6 +34,7 @@ mod schema_docs;
 pub mod seccomp;
 pub mod userns;
 mod vmm_api;
+pub mod vsock_exec;
 
 pub use checkpoint::{AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport};
 pub use container::ContainerTaskPlugin;

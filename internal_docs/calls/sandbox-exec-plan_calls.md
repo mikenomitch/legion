@@ -475,3 +475,125 @@ signing tool.
 operator needs a way to test a key, and the end-to-end test needs one too.
 An MCP tool would mean handing a private key to the MCP server process,
 which defeats the point of a key that never leaves the platform.
+
+## 21. The vsock exec leg speaks a five-byte frame codec, not protobuf
+
+*Implementation (Phase 1), deviating from plan §6.1 and entry 8.*
+
+**Call.** The agent and the worker exchange `kind (u8) + length (u32 BE) +
+payload` frames (`legion_guest::exec`): hello, start (JSON), stdin, EOF,
+resize, stdout, stderr, exit, error. The worker translates them to and from
+the `ExecClientFrame` / `ExecServerFrame` protobufs at its `ExecSession`
+boundary, so nothing above the runtime changes.
+
+**Alternative.** The plan's length-delimited protobufs end to end.
+
+**Trade-off.** One more wire format, and a translation on the worker.
+
+**Why (simplicity).** `legion-guest` is deliberately tiny: a static musl
+binary with no async runtime that has to run on busybox. Prost and the
+generated types would be its biggest dependency by far, for nine message
+kinds. The hello still negotiates, as the gated plan requires, and the frame
+cap (1 MiB) is enforced before anything is allocated.
+
+## 22. Every microVM runs the agent; only a gated one runs the relays
+
+*Implementation (Phase 1).*
+
+**Call.** Every microVM gets the vsock device, the agent binary in its root
+disk, and `guest-agent` started by init. On a TAP or `none` sandbox it runs
+`--no-relay`: only the exec listener, no loopback proxy or resolver, and the
+node binds nothing the guest could dial. `/etc/resolv.conf` now follows the
+relay, not the agent, so a TAP guest keeps its bridge resolvers. Every
+restore passes the vsock override.
+
+```text
+legion: guest agent started (exec over vsock)
+```
+
+**Alternatives.** Exec only on gated sandboxes; an opt-in per task.
+
+**Trade-off.** The worker binary (or the static `legion-guest`, under 1 MB)
+is copied into every root disk, which costs the worker binary's size on
+nodes without the static build. A checkpoint captured before this change has
+no vsock device, so its restore's override fails; Legion has no installed
+base, so that is a dev-cluster wipe, not a migration.
+
+**Why (simplicity).** Exec that depends on the network mode is the hidden
+coupling entry 2 rejected. Keeping the relays gated-only keeps `none`'s
+promise: the guest initiates nothing to the host.
+
+## 23. A session runs through `/bin/sh` with the task's environment and working directory
+
+*Implementation (Phase 1).*
+
+**Call.** The agent runs `/bin/sh -c '. /legion/env; . /legion/resume.env;
+exec "$@"' argv...` as root, in the directory the worker records in
+`/legion/cwd` (the command's working directory), under a pty for `-t`. A
+closed connection kills the session's process group.
+
+**Alternatives.** `execve` the argv directly with an environment parsed in
+Rust; the user from the identity disk.
+
+**Trade-off.** An image without `/bin/sh` cannot take exec sessions (it
+cannot boot either: init is a shell script).
+
+**Why (simplicity).** The env file's format is shell, sourced by init; the
+same shell sourcing it means a session sees exactly what the command saw,
+including identity tokens refreshed after a restore. Root matches the
+plan's promise and `container exec`.
+
+## 24. A session cut by a suspend ends with a generic reason, not the instance's
+
+*Implementation (Phase 1), deviating from plan §6.1.*
+
+**Call.** A session whose connection closes without an exit frame ends with
+`session ended: the guest closed it without an exit status (a suspend or a
+restore resets open exec sessions)`.
+
+**Alternative.** The plan's `instance user-42 was suspended`.
+
+**Trade-off.** The message names the likely causes, not the one that
+happened.
+
+**Why (correctness).** The worker's session sees a closed vsock stream. It
+cannot tell a suspend from a guest crash or a VMM restart without asking the
+task manager across a lock it must not hold while pumping bytes, and a
+message that names the wrong cause is worse than one that names the
+candidates.
+
+## 25. The `exec` idle-signal refusal and warning are removed, not relaxed
+
+*Implementation (Phase 1).*
+
+**Call.** `suspend.idle.signals = ["exec"]` on a sandbox pinned to a VMM is
+accepted, and the default signal list draws no warning. The example job and
+the guide list `exec`.
+
+**Alternative.** Keep the warning for a guest whose agent might not run.
+
+**Trade-off.** None worth keeping: an agent that cannot run makes exec fail
+by name, and then the signal does not fire, which is what the warning said.
+
+**Why (simplicity).** The plan's Phase 1 says the `exec` signal works with no
+new code, because the worker already counts open sessions per allocation.
+
+## 26. Phase 0 is measured on one host at up to 500 sessions
+
+*Implementation (Phase 0), narrower than plan §10.*
+
+**Call.** `tests/exec_session_benchmark.rs` runs a manager and a separate
+worker on one machine and measures proxied and direct sessions at 1, 10,
+100, and 500, plus mint throughput. The numbers are in
+`benchmarks/scheduler/README.md`.
+
+**Alternative.** The plan's 1,000 and 10,000 concurrent sessions on
+simulated workers, on the AWS rig.
+
+**Trade-off.** No scale cell and no same-AZ latency SLO; those stay open in
+TODO.md.
+
+**Why.** Simulated workers cannot run exec sessions (`ExecTask` is
+unimplemented there), so the plan's matrix needs real workers on the rig,
+which this environment does not have. The harness is the same one the rig
+would run.

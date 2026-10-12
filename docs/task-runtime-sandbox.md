@@ -77,7 +77,8 @@ the kernel and disks, though, so the Legion-specific machinery does not apply:
   microVM.
 - Volumes must use filesystem mode (bind-mounted, like the container runtime).
   A block volume fails at start, because Legion has no VMM to attach it to.
-- Exec is available here (`container exec`), unlike the microVM path.
+- Exec is available here through `container exec`. A microVM takes exec
+  through its guest agent instead ([Exec](#exec)).
 
 Every dev-mode start logs a warning, so you won't mistake it for a microVM.
 File and tree artifacts are not copied into a dev-mode sandbox either. Only the
@@ -148,12 +149,17 @@ env values, since they can be secrets. The values are never logged or stored.
 
 ### The guest agent
 
-Some guests run a small Legion program next to the workload, copied into the
-root disk as `/legion/legion`:
+Every microVM runs a small Legion program next to the workload, copied into
+the root disk as `/legion/legion` and started by init (`guest-agent`):
 
-- **The gated datapath's relay** (`guest-agent`), on a gated sandbox. It
-  relays the guest's loopback proxy and resolver ports to the node over vsock
-  ([network-handlers.md](network-handlers.md#sandboxes)).
+- **The exec listener**, on every microVM. It takes `legion exec` and action
+  sessions on guest vsock port 1100 ([Exec](#exec)).
+- **The gated datapath's relay**, on a gated sandbox. It relays the guest's
+  loopback proxy and resolver ports to the node over vsock
+  ([network-handlers.md](network-handlers.md#sandboxes)). On a TAP or `none`
+  sandbox the agent runs `--no-relay`: no loopback listeners, and the node
+  binds nothing the guest could dial, so the guest still cannot reach the
+  host.
 - **The resume handler**, on a sandbox launched for memory checkpoints or
   with identity token files. It refreshes the guest's identity, RNG, clock,
   token files, and a TAP guest's address after a restore and runs `onResume`
@@ -161,7 +167,7 @@ root disk as `/legion/legion`:
   sandbox the relay runs it in the same process, so a restore also closes
   the relays the capture left dead.
 
-The program is `legion-guest`, a statically linked build of just these two
+The program is `legion-guest`, a statically linked build of just these
 jobs (under 1 MB), which runs on any image with `/bin/sh`: glibc, musl
 (`alpine:latest`), and busybox alike. Ship it with the worker:
 
@@ -174,8 +180,8 @@ jobs (under 1 MB), which runs on any image with `/bin/sh`: glibc, musl
 The fallback works only where the image's libc can run the worker binary (a
 glibc image close enough to the worker's build host). On a musl image it
 cannot, so init prints `legion: guest agent missing ...` or the binary fails
-to start. A gated guest then has no network at all (fail-closed), and a
-restored guest keeps its old identity. Installing `legion-guest` fixes both;
+to start. The guest then takes no exec sessions, a gated guest has no
+network at all (fail-closed), and a restored guest keeps its old identity. Installing `legion-guest` fixes both;
 the root disk rebuilds on the next start, because the binary is part of its
 fingerprint.
 
@@ -185,6 +191,46 @@ Build it for each architecture the workers run:
 rustup target add x86_64-unknown-linux-musl
 cargo build -p legion-guest --profile dist --target x86_64-unknown-linux-musl
 # target/x86_64-unknown-linux-musl/dist/legion-guest
+```
+
+### Exec
+
+`legion exec`, `legion action run`, the MCP exec tools, and the UI terminal
+reach a microVM the same way they reach a container. The worker connects to
+the VMM's vsock host socket (`<alloc>/.sandbox/vsock.sock`), sends
+`CONNECT 1100`, and the guest agent runs the command:
+
+```console
+$ legion exec --instance user-42 -it -- /bin/bash
+root@legion-sbx-88213:/workspace# exit 3
+$ echo $?
+3
+```
+
+- The command runs as root in the guest, in the task's environment
+  (`/legion/env`, and `/legion/resume.env` after a restore) and its working
+  directory, under a pty with `-t` or with separate stdout and stderr
+  without. The exit status is the process's own.
+- Closing the session, or the client vanishing, kills the session's whole
+  process group in the guest.
+- A memory capture resets open sessions. One that was open ends with
+  `session ended: the guest closed it without an exit status (a suspend or a
+  restore resets open exec sessions)`. After a resume the instance is a new
+  allocation, so `--instance` finds it.
+- An open session is the idle policy's `exec` signal: a sandbox someone is
+  working in is never suspended as idle
+  ([suspend-and-resume.md](suspend-and-resume.md#what-each-signal-sees-on-a-sandbox)).
+- The worker treats the agent as untrusted plumbing: frames are capped at 1
+  MiB, anything that is not a frame ends the session, and a guest runs at most
+  64 sessions at once.
+
+When the agent is not there (a guest restored from a checkpoint captured
+before exec support, or an image the agent binary cannot run on), the session
+fails by name:
+
+```text
+Error: sandbox exec needs the guest agent, which is not listening in this guest (the VMM closed the connection on CONNECT)
+Hint: the agent starts with the guest; a sandbox resumed from a checkpoint captured before exec support has none until its next cold boot, and an image the agent cannot run on (no static legion-guest on this worker) cannot take exec sessions
 ```
 
 ## Stateful Sandboxes
@@ -559,7 +605,7 @@ isolated filesystem cannot see the host task dir at all.
 | Memory / CPU limits, exclusive cores | ✅ with `resourceEnforcement.enabled` on Linux. The VMM runs in the allocation's worker cgroup, with `memory.max` = the [guest size](#guest-size) + the worker's `sandbox.vmmOverheadMiB` (default 64) and `memory.low` = `resources.memory`. `cpu` and `cores` govern the VMM's threads. See [resource-enforcement.md](resource-enforcement.md#sandbox-tasks). |
 | Measured usage | ✅ with enforcement on: memory, CPU, and idle time in `legion node usage` and `instance list` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
 | Artifacts | ✅ image, file, tree, layers |
-| Exec / interactive PTY | ❌ on the microVM path (needs a vsock guest agent). ✅ / ✅ in macOS dev mode. |
+| Exec / interactive PTY | ✅ / ✅ on the microVM path, through the guest agent over vsock ([Exec](#exec)). ✅ / ✅ in macOS dev mode. ❌ in Linux dev mode. |
 | Volumes | ✅ `block` on microVM backends, `filesystem` on dev backends |
 
 Sandbox exec is never host-level (`kind_is_host_level("sandbox") == false`), so
@@ -750,10 +796,12 @@ memory restore, since the device rides the snapshot.
 
 ## Current Scope and Limitations
 
-- **No exec into a running microVM.** That needs a vsock guest agent. The
-  runtime reports the capability as unsupported up front instead of failing
-  when a session opens.
-- **No signal delivery** into the guest, for the same reason. An env-delivered
+- **Exec on a real VMM is verified by unit tests only** in Legion's CI, which
+  has no KVM: the agent's listener and the worker's session run against each
+  other over Unix sockets. The KVM checks are listed in the sandbox-exec
+  plan.
+- **No signal delivery** into the guest: the agent takes exec sessions, not
+  signals. An env-delivered
   identity must use `changeMode = "restart"`.
 - **No virtio-fs.** A microVM sandbox uses block volumes only. A `filesystem`
   volume on a microVM backend fails at start. Filesystem-mode support via

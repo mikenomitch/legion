@@ -1796,15 +1796,46 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         into [worker-plane-auth §6.1](plans/worker-plane-auth-plan.md#61-the-worker-listener-is-mutual-tls-always)
         (2026-10-11), which added one dependency: ticket verifiers need the
         JWKS over TLS, so direct exec also waits on worker-plane-auth Phase 4.
-  - [ ] Phase 0: exec open latency and manager cost per proxied session at
-        100, 1,000, and 10,000 concurrent sessions.
-  - [ ] Phase 1: exec into Linux microVMs over vsock. Every microVM gets a
-        vsock device and the guest agent, and `legion exec`, actions, MCP,
-        and the UI terminal work unchanged. After gated plan Phases 0 and 1
-        (without the vsock restore override, a vsock device on every microVM
-        would break memory checkpoints of TAP and `none` sandboxes) and
-        worker-plane-auth Phase 1. Gated Phase 1 is built (the override, and
-        the `legion-guest` agent crate to extend); Phase 0 is pending.
+  - [x] Phase 0 (partly): `tests/exec_session_benchmark.rs` measures
+        proxied and direct sessions (open latency, manager CPU and bytes per
+        session) at 1 to 500 concurrent sessions on one host, plus mint
+        throughput. Numbers in
+        [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md#exec-sessions-proxied-vs-direct-sandbox-exec-phase-0--2026-10-12)
+        ([calls entry 26](calls/sandbox-exec-plan_calls.md#26-phase-0-is-measured-on-one-host-at-up-to-500-sessions)).
+  - [ ] Phase 0 at scale: 1,000 and 10,000 concurrent sessions, and the
+        ≤ 20 ms / ≤ 80 ms open latency from the mint reply, same AZ, on the
+        AWS rig with real workers (simulated workers cannot exec). Run
+        `LEGION_EXEC_BENCH_CONCURRENCY=1000,10000 cargo test --release --test
+        exec_session_benchmark -- --ignored --nocapture` against rig workers,
+        and add a mode that reuses one worker connection per node, since
+        direct opens here pay a TLS handshake each.
+  - [x] Phase 1: exec into Linux microVMs over vsock. Every microVM gets the
+        vsock device and the agent (`--no-relay` unless gated), the agent's
+        exec listener on port 1100 (pty or pipes, the task's env and working
+        directory, the process group killed on disconnect, 64 sessions),
+        `VsockExecSession` on the worker with the version hello and bounded
+        frames, `--instance` on `legion exec` / `legion action run` / MCP,
+        the `exec` idle signal on microVMs, and the generic ending for a
+        session cut by a suspend (calls 21 to 25). Docs:
+        [task-runtime-sandbox.md § Exec](../docs/task-runtime-sandbox.md#exec),
+        the runtime table in exec-and-actions.md, suspend-and-resume.md, the
+        agent sandboxes guide.
+  - [ ] Phase 1 on KVM (no KVM in CI): with Firecracker 1.17.0+ and
+        cloud-hypervisor, a vsock guest kernel, and the static guest build,
+        run `LEGION_SANDBOX_KERNEL=/var/lib/legion/kernels/vmlinux
+        LEGION_GUEST_BINARY=$PWD/target/x86_64-unknown-linux-musl/dist/legion-guest
+        cargo test --lib sandbox_exec_over_vsock -- --ignored --nocapture
+        --test-threads 1` (pipe and pty sessions, exit status, task env).
+        Then by hand: exec after a memory resume reaches the new allocation
+        with `--instance`, a session open across a suspend ends with the
+        reset reason, a `none` sandbox takes exec while the guest still
+        cannot dial the host, an open shell keeps an idle sandbox awake, and
+        an action runs from the UI terminal.
+  - [ ] Phase 1: a checkpoint captured before every microVM had a vsock
+        device cannot be restored now that every restore passes the vsock
+        override ([calls entry 22](calls/sandbox-exec-plan_calls.md#22-every-microvm-runs-the-agent-only-a-gated-one-runs-the-relays)).
+        Legion has no installed base; note it for anyone with dev
+        checkpoints.
   - [x] Phase 2: direct exec. `MintExecTicket` (no raft write, the same
         authorization as `ExecAllocation`), the `ticket` class on
         `ExecTask` behind the worker type's `exec = { direct = true }`,

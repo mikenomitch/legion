@@ -147,7 +147,7 @@ doesn't, `legion exec` fails fast with a clear error.
 | `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. Host-level, so it requires the `host` ACL grant. |
 | `container` (Apple `container`) | ✅ | ✅ | `container exec` inside the container's namespaces (sandboxed). |
 | `container` (youki / runc / crun) | ✅ | ✅ | `<runtime> exec` inside the container's namespaces (sandboxed). The process spec comes from the bundle Legion generated, so env, cwd, and user match the task. Only argv is replaced, and the exit status is the process's own. |
-| `sandbox` (microVM) | ❌ | ❌ | Not yet supported, because exec into a guest needs a vsock agent. Reports unsupported up front instead of failing at session open. |
+| `sandbox` (microVM) | ✅ | ✅ | Through the guest agent's vsock listener (port 1100), as root in the guest with the task's environment ([task-runtime-sandbox.md § Exec](task-runtime-sandbox.md#exec)). A suspend or restore ends open sessions. |
 | `sandbox` (macOS dev mode) | ✅ | ✅ | `container exec` into the sandbox's VM-backed container. |
 | `noop` / custom plugins | ❌ | ❌ | Opt in by implementing `exec_support()` + `exec()`. |
 
