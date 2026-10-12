@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sandbox Launcher</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+  <style>
+    :root { --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --line: #e7e5e4; --card: #fff; --accent: #4f46e5; --bad: #b91c1c; --ok: #15803d; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --line: #44403c; --card: #292524; --accent: #818cf8; --bad: #f87171; --ok: #4ade80; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+    main { max-width: 64rem; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
+    h1 { font-size: 1.4rem; margin: 0; }
+    .sub { color: var(--muted); font-size: .85rem; margin: .25rem 0 1.5rem; font-family: ui-monospace, monospace; }
+    form { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-bottom: 1.25rem; }
+    input, select, button { font: inherit; padding: .45rem .7rem; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); }
+    button { cursor: pointer; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+    th, td { text-align: left; padding: .55rem .7rem; border-bottom: 1px solid var(--line); vertical-align: middle; }
+    th { font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+    td.id { font-family: ui-monospace, monospace; font-size: .85rem; }
+    td.actions { display: flex; gap: .35rem; flex-wrap: wrap; }
+    .pill { font-size: .75rem; padding: .1rem .5rem; border-radius: 999px; border: 1px solid var(--line); }
+    .pill.running { color: var(--ok); border-color: currentColor; }
+    .empty { color: var(--muted); padding: 1rem; text-align: center; }
+    #panel { margin-top: 1.5rem; }
+    #panel h2 { font-size: 1rem; margin: 0 0 .5rem; display: flex; justify-content: space-between; align-items: center; }
+    #term { height: 24rem; background: #000; border-radius: 8px; padding: .5rem; }
+    #logs { white-space: pre-wrap; font: 12px/1.45 ui-monospace, monospace; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .75rem; max-height: 24rem; overflow: auto; margin: 0; }
+    #status { font-size: .85rem; color: var(--muted); min-height: 1.3rem; }
+    #status.err { color: var(--bad); }
+    @media (max-width: 40rem) { th:nth-child(3), td:nth-child(3) { display: none; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Sandbox Launcher</h1>
+  <p class="sub" id="where">connecting…</p>
+
+  <form id="create">
+    <select id="flavor" aria-label="Sandbox flavor">
+      <option value="box">box: gated container (exec works)</option>
+      <option value="vm">vm: microVM (logs only on Linux)</option>
+    </select>
+    <input id="name" placeholder="name (optional)" pattern="[a-z0-9-]*" aria-label="Sandbox name">
+    <button class="primary">Launch sandbox</button>
+  </form>
+  <p id="status"></p>
+
+  <table>
+    <thead><tr><th>Sandbox</th><th>Flavor</th><th>Allocation</th><th>State</th><th></th></tr></thead>
+    <tbody id="rows"><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
+  </table>
+
+  <section id="panel" hidden>
+    <h2><span id="panel-title"></span><button id="close">Close</button></h2>
+    <div id="term" hidden></div>
+    <pre id="logs" hidden></pre>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/protobufjs@7.4.0/dist/protobuf.min.js"></script>
+<script>
+// The exec bridge speaks the frames from proto/legion.proto, one protobuf
+// message per binary WebSocket message. These definitions mirror that file.
+const EXEC_PROTO = `
+syntax = "proto3";
+package legion;
+message ExecClientFrame { oneof frame { ExecStart start = 1; ExecInput stdin = 2; ExecResize resize = 3; ExecPing ping = 4; } }
+message ExecStart { int64 allocation_id = 1; string task_name = 2; repeated string command = 3; string action = 4;
+  map<string, string> action_params = 5; bool tty = 6; ExecWinsize winsize = 7; string bearer_token = 8; }
+message ExecInput { bytes data = 1; bool eof = 2; }
+message ExecWinsize { uint32 cols = 1; uint32 rows = 2; }
+message ExecResize { ExecWinsize winsize = 1; }
+message ExecPing {}
+message ExecServerFrame { oneof frame { ExecOutput stdout = 1; ExecOutput stderr = 2; ExecExit exit = 3; ExecPing pong = 4; ExecStarted started = 5; } }
+message ExecOutput { bytes data = 1; }
+message ExecExit { int32 code = 1; string message = 2; }
+message ExecStarted { string session_id = 1; }
+`;
+const root = protobuf.parse(EXEC_PROTO).root;
+const ClientFrame = root.lookupType("legion.ExecClientFrame");
+const ServerFrame = root.lookupType("legion.ExecServerFrame");
+
+const $ = (id) => document.getElementById(id);
+let config = {};
+let session = null; // { ws, term, ping }
+
+function status(text, isError = false) {
+  $("status").textContent = text;
+  $("status").className = isError ? "err" : "";
+}
+
+async function api(method, path, body) {
+  const res = await fetch(path, { method, headers: { "Content-Type": "application/json" }, body: body && JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || res.statusText);
+  return data;
+}
+
+// Proto-derived JSON from the CLI is snake_case; tolerate camelCase too.
+const field = (obj, snake, camel) => obj?.[snake] ?? obj?.[camel];
+
+async function refresh() {
+  const instances = await api("GET", "/api/sandboxes");
+  const rows = (instances || []).filter((i) => field(i, "state", "state") !== "destroyed");
+  if (!rows.length) {
+    $("rows").innerHTML = `<tr><td colspan="5" class="empty">No sandboxes yet. Launch one above.</td></tr>`;
+    return;
+  }
+  $("rows").replaceChildren(...rows.map((i) => {
+    const id = field(i, "instance_id", "instanceId");
+    const alloc = field(i, "current_alloc_id", "currentAllocId");
+    const state = field(i, "state", "state") || "?";
+    const flavor = i.task;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="id"></td><td></td><td class="id"></td><td><span class="pill"></span></td><td class="actions"></td>`;
+    tr.children[0].textContent = id;
+    tr.children[1].textContent = flavor;
+    tr.children[2].textContent = alloc || "—";
+    const pill = tr.querySelector(".pill");
+    pill.textContent = state;
+    if (alloc && state !== "stopped") pill.classList.add("running");
+    const actions = tr.children[4];
+    const button = (label, onClick, disabled = false) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.disabled = disabled;
+      b.onclick = onClick;
+      actions.append(b);
+    };
+    button("Terminal", () => openTerminal(id, alloc, flavor), !alloc);
+    button("Logs", () => showLogs(id), !alloc);
+    if (state === "stopped") button("Start", () => act("POST", `/api/sandboxes/${id}/start`, `Starting ${id}`));
+    else button("Stop", () => act("POST", `/api/sandboxes/${id}/stop`, `Stopping ${id}`));
+    button("Destroy", () => confirmDestroy(id));
+    return tr;
+  }));
+}
+
+async function act(method, path, message) {
+  status(message + "…");
+  try {
+    await api(method, path);
+    status(message + ": done");
+  } catch (err) {
+    status(err.message, true);
+  }
+  refresh().catch(() => {});
+}
+
+function confirmDestroy(id) {
+  // Inline confirmation instead of window.confirm.
+  status(`Destroying ${id} deletes its workspace forever. Click Destroy again within 5s to confirm.`, true);
+  if (confirmDestroy.pending === id) {
+    confirmDestroy.pending = null;
+    act("DELETE", `/api/sandboxes/${id}`, `Destroying ${id}`);
+    return;
+  }
+  confirmDestroy.pending = id;
+  setTimeout(() => { if (confirmDestroy.pending === id) confirmDestroy.pending = null; }, 5000);
+}
+
+function closePanel() {
+  if (session) {
+    clearInterval(session.ping);
+    session.ws.close();
+    session.term.dispose();
+    session = null;
+  }
+  $("panel").hidden = true;
+  $("term").hidden = true;
+  $("logs").hidden = true;
+  $("term").replaceChildren();
+}
+
+async function showLogs(id) {
+  closePanel();
+  $("panel").hidden = false;
+  $("panel-title").textContent = `Logs: ${id}`;
+  $("logs").hidden = false;
+  $("logs").textContent = "loading…";
+  try {
+    const allocs = await api("GET", `/api/sandboxes/${id}/logs`);
+    $("logs").textContent = allocs.map((a) => a.error || (a.streams || []).map((s) => s.content).join("")).join("\n") || "(empty)";
+  } catch (err) {
+    $("logs").textContent = err.message;
+  }
+}
+
+function openTerminal(id, alloc, flavor) {
+  closePanel();
+  $("panel").hidden = false;
+  $("panel-title").textContent = `Terminal: ${id} (allocation ${alloc})`;
+  $("term").hidden = false;
+
+  const term = new Terminal({ cursorBlink: true, fontSize: 13, convertEol: false });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open($("term"));
+  fit.fit();
+
+  const ws = new WebSocket(config.wsUrl);
+  ws.binaryType = "arraybuffer";
+  const send = (frame) => ws.readyState === WebSocket.OPEN && ws.send(ClientFrame.encode(ClientFrame.create(frame)).finish());
+  const encoder = new TextEncoder();
+
+  ws.onopen = () => {
+    send({ start: {
+      allocationId: Number(alloc),
+      command: ["/bin/bash"],
+      tty: true,
+      winsize: { cols: term.cols, rows: term.rows },
+      bearerToken: config.token,
+    } });
+    term.write(`\x1b[2mconnecting to ${id} through ${config.wsUrl}${flavor === "vm" ? " (microVM: expect 'unsupported' on Linux)" : ""}\x1b[0m\r\n`);
+  };
+  ws.onmessage = (event) => {
+    const frame = ServerFrame.decode(new Uint8Array(event.data));
+    if (frame.stdout) term.write(frame.stdout.data);
+    else if (frame.stderr) term.write(frame.stderr.data);
+    else if (frame.exit) term.write(`\r\n\x1b[33m[exited ${frame.exit.code}${frame.exit.message ? ": " + frame.exit.message : ""}]\x1b[0m\r\n`);
+  };
+  ws.onclose = (event) => term.write(`\r\n\x1b[2m[connection closed${event.reason ? ": " + event.reason : ""}]\x1b[0m\r\n`);
+  ws.onerror = () => term.write("\r\n\x1b[31m[websocket error: is the manager's exec port (gRPC port + 1) reachable?]\x1b[0m\r\n");
+
+  term.onData((data) => send({ stdin: { data: encoder.encode(data) } }));
+  term.onResize(({ cols, rows }) => send({ resize: { winsize: { cols, rows } } }));
+  window.onresize = () => fit.fit();
+  term.focus();
+
+  session = { ws, term, ping: setInterval(() => send({ ping: {} }), 20000) };
+}
+
+$("close").onclick = closePanel;
+
+$("create").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const flavor = $("flavor").value;
+  const id = $("name").value.trim();
+  status(`Launching a ${flavor} sandbox…`);
+  try {
+    const result = await api("POST", "/api/sandboxes", { flavor, id: id || undefined });
+    status(`Launched ${(result.instanceIds || []).join(", ")}. It appears below once placed.`);
+    $("name").value = "";
+  } catch (err) {
+    status(err.message, true);
+  }
+  refresh().catch(() => {});
+});
+
+(async () => {
+  config = await api("GET", "/api/config");
+  $("where").textContent = `job ${config.job} · manager ${config.manager} · exec ${config.wsUrl}`;
+  await refresh().catch((err) => status(err.message, true));
+  setInterval(() => refresh().catch(() => {}), 3000);
+})();
+</script>
+</body>
+</html>

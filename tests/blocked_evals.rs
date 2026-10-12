@@ -17,7 +17,7 @@ use legion::manager::daemon::resolve_claimed_eval;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::events::drafts;
-use legion::storage::store::{BlockedEval, EvalBatchLimits, EvalCompletion, Store};
+use legion::storage::store::{BlockedEval, ClaimScope, EvalBatchLimits, EvalCompletion, Store};
 use legion::structs::config::{ManagerConfigFull, PersistenceType};
 use legion::structs::job::{JobConfig, StatefulConfig, TaskConfig, TaskCount};
 use legion::structs::manager_server::Manager;
@@ -88,13 +88,13 @@ fn submit(store: &Store, job: &JobConfig) -> R<()> {
 }
 
 fn run_eval_worker(store: &Store) -> R<()> {
-    let mut batch = store.claim_evals(LIMITS)?;
+    let mut batch = store.claim_evals(LIMITS, ClaimScope::Any)?;
     while !batch.is_empty() {
         let completions = batch
             .iter()
             .map(|eval| (eval.id.clone(), resolve_claimed_eval(store, 0, eval)))
             .collect();
-        batch = store.complete_evals_and_claim_next(completions, LIMITS)?;
+        batch = store.complete_evals_and_claim_next(completions, LIMITS, ClaimScope::Any)?;
     }
     Ok(())
 }
@@ -208,7 +208,10 @@ fn a_job_blocked_on_a_pool_wakes_only_for_that_pool() -> R<()> {
     assert_eq!(blocked[0].key, "class:pool=agents");
     assert_eq!(blocked[0].job_id, JOB);
     let job = cluster.job_info()?;
-    assert_eq!(job.status, "blocked");
+    assert_eq!(
+        job.status, "running",
+        "user-1 runs, so the derived status stays running"
+    );
     let detail = job.blocked.context("the blocked block")?;
     assert_eq!(detail.key, "class:pool=agents");
     assert_eq!(detail.task, TASK);
@@ -241,7 +244,7 @@ fn a_job_blocked_on_a_pool_wakes_only_for_that_pool() -> R<()> {
     assert_eq!(cluster.settle()?, 1, "a node in its pool wakes it");
     assert!(placed(store, "user-2")?, "and it places there");
     assert!(cluster.blocked()?.is_empty());
-    assert_eq!(cluster.job_info()?.status, "done");
+    assert!(cluster.job_info()?.blocked.is_none());
     Ok(())
 }
 
@@ -292,6 +295,11 @@ fn an_escaped_job_wakes_on_any_node() -> R<()> {
     let blocked = cluster.blocked()?;
     assert_eq!(blocked.len(), 1);
     assert_eq!(blocked[0].key, "escaped");
+    assert_eq!(
+        cluster.job_info()?.status,
+        "blocked",
+        "nothing is live and the placement waits for room"
+    );
 
     join(store, "n-1", "default")?;
     assert_eq!(cluster.settle()?, 1);
@@ -317,7 +325,7 @@ fn an_unblock_during_the_running_eval_is_not_lost() -> R<()> {
     cluster.settle()?;
     create(store, "user-2")?;
 
-    let batch = store.claim_evals(LIMITS)?;
+    let batch = store.claim_evals(LIMITS, ClaimScope::Any)?;
     assert_eq!(batch.len(), 1);
     let eval = &batch[0];
     // The plan runs against the old picture and finds no room ...

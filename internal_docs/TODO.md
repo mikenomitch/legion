@@ -24,8 +24,9 @@ How to use it:
       the host network, so they reach the manager (ACLs off by default), the
       worker port, the cloud metadata service, and other allocations'
       datapath listeners. Found while preparing the pre-launch AWS spot
-      check, which is paused until Phase 1 lands. Its host-guard rows need
-      Phases 2 and 3. Plan:
+      check, which runs on a temporary shim
+      (`tests/spot-check/shims.patch`) until Phase 1 lands. Its host-guard
+      rows need Phases 2 and 3. Plan:
       [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (PLANNED)
       · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
       Phases in ship order, most dangerous gap first:
@@ -63,9 +64,42 @@ How to use it:
         says gated "cannot be bypassed" for `container` and `exec`, but the
         proxy reaches the host, and a root `exec` task can `setns` back out.
 
+- [ ] **Launch blockers from the AWS spot check (2026-10-11).** Each has
+      evidence and a root cause in
+      [launch-spot-check-findings.md](launch-spot-check-findings.md) (the IDs
+      below are that doc's); rerun with `tests/spot-check/smoke.sh`.
+  - [ ] **Batch tasks never finish (P0-2).** The worker rebuilds `TaskConfig`
+        without `lifecycle` or `restart`, so batch tasks restart forever after
+        exit 0 and jobspec restart policies are ignored.
+  - [ ] **Health checks never start for artifact-staged tasks (P0-3),** which
+        includes every container image under `containerImageDesugar`. The
+        staging thread calls `tokio::spawn` outside a runtime. Shimmed in
+        `tests/spot-check/shims.patch`, and the shim is likely the real fix.
+  - [ ] **DAG ordering is not enforced (P0-4).** The scheduler treats planned
+        batch deps as satisfied, and the worker has no gating.
+  - [ ] **One manager down strands every worker (P0-5).** Followers fail to
+        forward heartbeats in the `single` topology (lane mismatch), and
+        workers know one manager.
+  - [ ] **Recovered nodes stay unschedulable (P0-6)** until `node uncordon`.
+  - [ ] **Stock nginx and Postgres images fail in Linux containers (P0-7):**
+        minimal capabilities, ownership dropped on extraction, root-owned
+        stdout/stderr. The repo's `container-service.ncl`, `fullstack.ncl`,
+        and `postgres.ncl` cannot run on Linux.
+  - [ ] **Workers cannot restart after their join token expires (P0-8)**, which
+        conflicts with the docs' advice to keep join tokens short-lived.
+  - [ ] **P1s:** resource enforcement never turns on; static ports deadlock
+        placement, reschedules, and rollouts; reschedules exclude the only
+        viable node (and advise deleting healthy data); gated netns race;
+        orphaned tasks after a worker re-join; allocation id reuse;
+        misleading job status; failure causes buried.
+        Details in the findings doc.
+  - [ ] **P2s:** eleven papercuts (error mapping, `kv get` on a missing key,
+        README commands, follower write hints, startup log noise, and more).
+        Details in the findings doc.
+
 - [ ] **Pre-launch spot check findings (2026-10-11), from reading the code
-      while preparing the AWS run.** None of these block the worker-plane
-      work. Each is verified in source unless marked otherwise.
+      while preparing the AWS run.** Each is verified in source unless marked
+      otherwise.
   - [ ] **README says `legion start manager` works without a config file.**
         It does not. With no `-c`, it evaluates `./configs/manager.ncl`
         (`src/constants.rs:55`) and fails outside a repo checkout, so the
@@ -164,6 +198,8 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#20](https://github.com/mikenomitch/legion/pull/20) | Operator UI gaps: instance and allocation pages, event filters by instance/allocation, KV values hidden until revealed, worker public addresses, stale rollouts cancel themselves | [plan](plans/operator-ui-gaps-plan.md) · [calls](calls/operator-ui-gaps-plan_calls.md) |
+| [#19](https://github.com/mikenomitch/legion/pull/19) | Task page tabs, guided template launch, Actions tab; template-launched jobs list their tasks again | UI only; [plan](plans/ui-task-and-template-redesign-plan.md) · [calls](calls/ui-task-and-template-redesign-plan_calls.md) |
 | [#14](https://github.com/mikenomitch/legion/pull/14) | Live KV file updates (`onChange = "update"`) and KV-backed ingress certificates (`certFrom = { kv }`) | [plan](plans/kv-cert-delivery-plan.md) · [calls](calls/kv-cert-delivery-plan_calls.md) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
@@ -674,6 +710,44 @@ How to use it:
       candidate-starved; the plan carries one candidate per task and loses
       it to a concurrent apply. That points straight at striped disjoint
       candidate lists as the highest-value item of the four.
+- [ ] **Adaptive scheduler concurrency, phases 0/4/5.** The controller
+      shipped in `observe` (see Done below); what it left open is everything
+      that needs measurement — and the measurement it was planned against is
+      retracted ([aws-phase4-findings.md](aws-phase4-findings.md)), so the
+      first job is to find out whether a conflict-bound cell exists on the
+      current build at all —
+      [plan](plans/adaptive-scheduler-concurrency-plan.md).
+  - [ ] **Phase 0's matrix was never run**, so every constant in the
+        controller (`HIGH_WATERMARK = 0.20`, `LOW = 0.05`, the 4-tick probe
+        dwell) is a fitted starting value. Run the fixed-limit sweep over
+        `evalThreads ∈ {1,2,4,8,16,32}` at 1,000 and 5,000 nodes on a
+        workload candidate lists cannot absorb (coupled replicas on a tight
+        pool), recording conflict rate, fallback rate, candidate-rank
+        histogram, goodput and per-op lane wait, into
+        `benchmarks/scheduler/README.md` (plan §11, §16). Needs the native
+        submitter first — the current rig cannot outrun the scheduler.
+  - [ ] **Phase 4: flip the default to `enforce`.** Gated on §11's matrix
+        showing `enforce` beating the best static `evalThreads` on that
+        workload without regressing the uncontended one. Also rewrite the
+        `evalThreads` guidance in
+        [docs/scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md)
+        from conditional ("with this on, a ceiling") to unconditional.
+  - [ ] **The `pool` label on `legion_plan_apply_total`** (plan §7.7) is
+        deferred with Phase 0: a cardinality increase whose only consumer is
+        a per-pool controller, and the data that decides whether one gets
+        built ([calls #2](calls/adaptive-scheduler-concurrency-plan_calls.md)).
+  - [ ] **Phase 5 backlog**, each separately justified by Phase 0/2 data:
+        per-pool controllers (gated on §11.3's mixed-pool result — today one
+        saturated pool can throttle planning for every other), feeding the
+        fallback rate in as a secondary pressure signal, coupling the limit
+        to scheduler-lane pipeline wait as a second congestion signal, and
+        live reload of `adaptiveConcurrency` without a manager restart.
+  - [ ] **Only `job_stop` is exempt from throttling.** `rollout_tick` and
+        the four `node_*` kinds all reach the planner in this codebase, so
+        they hold a permit — a node-loss reschedule proceeds at the admitted
+        rate under sustained throttling. If that latency proves to matter,
+        the fix is a priority lane for recovery kinds, not widening the
+        exemption ([calls #1](calls/adaptive-scheduler-concurrency-plan_calls.md)).
 - [ ] **Cut the raft round trips per eval, or widen the lane pipeline.**
       Same run: the scheduler lane took 67,165 raft ops for ~10,700 evals
       (~6 per eval — `claim_eval`, the plan apply, `complete_eval_with_event`,
@@ -2835,6 +2909,15 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
 
 ## Job types
 
+- [ ] **Per-replica job outcomes.** The derived job status takes each task's
+      outcome from its `task_status` row, the last exit any replica reported,
+      so a `count = 3` batch task with one failed replica can read `complete`
+      ([plan §4](plans/job-status-plan.md#4-goals-and-non-goals),
+      [calls 4](calls/job-status-plan_calls.md#4-a-tasks-outcome-is-its-task_status-row-not-a-per-replica-count))
+- [ ] **Job status-change events.** The job status is derived on read, so
+      nothing emits `job.status_changed` when a job goes `running` →
+      `complete`; an agent has to poll `GetJobInfo`
+      ([plan](plans/job-status-plan.md))
 - [ ] **Sysbatch** — run once on every node
 - [ ] **System job** — N per X (1 per metal, 2 per region, …). Is this really a
       job type, or just a richer `count`? (`count: {num: 1, per: "id"}`
@@ -3148,10 +3231,6 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
         new checkpoint and whether the budget or the disk limits it, but
         GetNodeUsage carries only the `snapshots` class
         ([calls 8](calls/suspend-resume-ui-plan_calls.md#8-getnodecontent-reads-only-what-the-manager-already-holds))
-  - [ ] The Jobs index still lists a running job as `done`; only the job
-        page derives `running`
-        ([calls 9](calls/suspend-resume-ui-plan_calls.md#9-a-done-job-with-live-work-reads-running-derived-in-the-ui)).
-        A server-side status that reflects live work would fix both
   - [ ] `create --from-snapshot` from the UI needs an instance-create
         surface, which the UI does not have
         ([calls 15](calls/suspend-resume-ui-plan_calls.md#15-creating-instances-from-a-snapshot-stays-in-the-cli))
@@ -3179,6 +3258,55 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
       false drift ([calls entry 9](calls/ui-holistic-polish-plan_calls.md))
 - [ ] A toast primitive, should a feature need feedback away from the control
       that caused it; every message so far is an inline `Note`
+
+From [ui-task-and-template-redesign-plan.md](plans/ui-task-and-template-redesign-plan.md)
+(shipped; see Done):
+
+- [ ] A server-side action fan-out (an allocation list or selector on the
+      action RPC, one audit record, bounded concurrency). The Actions tab runs
+      on several instances as one browser session per allocation today
+      ([calls entry 3](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] Per-check, per-instance health results. `allocation_health` keeps one
+      healthy flag and status string per allocation, so the task Overview
+      can only show declared checks plus each instance's overall verdict
+- [ ] A restart counter per allocation. The task Overview counts
+      `allocation.failed` events from the job's last 200 instead, a floor on
+      a busy job ([calls entry 6](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] Queryable action/exec run history ("last run 3h ago by dana", re-run).
+      `exec_audit` is a tracing target today, not state
+- [ ] `PlanJobTemplate` — the template analogue of `legion job plan` — so the
+      guided launch's Review can say how many allocations a change replaces,
+      not just how the spec text changes
+      ([calls entry 1](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] A structured outcome on `RunJobTemplateReply` (created / updated with
+      rollout / unchanged); the Launch step reads it from the message text
+      today ([calls entry 8](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] Template-only tokens are denied `GetJobInfo` for a job that does not
+      exist yet (the request carries no template attribute), so their Review
+      cannot tell "creates" from "updates" and cannot follow the rollout
+      ([calls entry 10](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] `Store::get_submissions_for_config` has no `ORDER BY`; the UI now finds
+      the spec by name, but any other "first JSON submission" consumer has the
+      same latent bug ([calls entry 5](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] Template catalog and authoring views: usage counts, jobs behind the
+      latest version, version-to-version source diff
+
+Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
+
+- [ ] `LEGION_WORKER_PUBLIC_ADDRESS=auto`: detect the public address from
+      cloud metadata (EC2 IMDSv2, GCP, Azure) instead of the operator wiring a
+      `curl` into the start script
+      ([calls 5](calls/operator-ui-gaps-plan_calls.md#5-the-public-address-is-a-per-node-env-var-not-worker-type-config))
+- [ ] Manager reverse proxy so a browser can open a service on nodes with no
+      reachable ports ([plan](plans/manager-reverse-proxy-plan.md))
+- [ ] `GetAllocation` RPC (job-scoped) so the allocation page works for tokens
+      without `node:read`; today it reads the whole ledger
+      ([calls 4](calls/operator-ui-gaps-plan_calls.md#4-the-allocation-page-reads-the-ledger-instead-of-a-new-getallocation-rpc))
+- [ ] `legion kv get --json` omits `GetKvReply.references`; only the text
+      output prints `used by:`
+- [ ] The instance event filter scans the bounded journal with `json_extract`;
+      an indexed `scheduler_event.instance_id` column if the journal bound ever
+      grows ([calls 3](calls/operator-ui-gaps-plan_calls.md#3-the-instance-event-filter-reads-metadata-not-a-new-column))
 
 ## Cross-cutting
 
@@ -3650,6 +3778,30 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       [plan](plans/late-binding-plan-apply-plan.md),
       [docs/late-binding-plan-apply.md](../docs/late-binding-plan-apply.md).
       Phase 4 backlog and the capacity-exhaustion gap are open items above.
+- [x] **Adaptive scheduler concurrency** (phases 1–3) — the manager
+      measures its own plan-apply conflict rate and tunes how many evals it
+      will PLAN at once between a floor and `evalThreads`, so `evalThreads`
+      becomes a ceiling rather than a guess. AIMD on a smoothed conflict
+      rate (halve above 20%, add one back after 2s below 5%, integer limit,
+      dead band + refractory + asymmetric dwell, starts at the ceiling),
+      with a **goodput guard** that reverts a decrease which did not improve
+      placements/sec and says `SATURATED` — the answer there is nodes, not
+      patience. The actuator is an admission gate on planning
+      (`PlannerGate`: one permit per worker per batch, held across the
+      batched loop's fused settle-and-claim), never a resized worker pool; a
+      throttled worker narrows to `ClaimScope::NonPlanning` instead of
+      blocking so `job stop` never queues behind a congestion storm. Ships
+      `legion scheduler concurrency` + `GetSchedulerConcurrency` + the
+      read-only MCP tool, six metrics, and the
+      `scheduler.concurrency_adjusted` / `_saturated` events. **Default is
+      `observe`**: it computes and exports the limit it would enforce and
+      actuates nothing — and the plan's motivating "4 beats 16" measurement
+      was retracted after the feature was built, so `observe` is also the
+      only honest mode until a conflict-bound cell is measured on the
+      current build — [plan](plans/adaptive-scheduler-concurrency-plan.md),
+      [calls](calls/adaptive-scheduler-concurrency-plan_calls.md),
+      [docs/adaptive-scheduler-concurrency.md](../docs/adaptive-scheduler-concurrency.md).
+      Phase 0 (measurement) was skipped and phases 4–5 are open items above.
 
 ## Task runtimes
 
@@ -3996,6 +4148,12 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Actions: spec schema, `ListJobActions`, server-side render and param
       validation, the `action` ACL resource, `legion action list|run`
 - [x] Actions UI, MCP tools, and docs
+- [x] The exec WebSocket follows `server.tls`: with TLS on, it serves `wss://`
+      with the gRPC listener's certificate and key, so the UI terminal and
+      actions work against a TLS manager (they failed the handshake against a
+      plaintext listener before). Found while planning the manager reverse
+      proxy. [docs](../docs/exec-and-actions.md#how-it-works) ·
+      [UI docs](../docs/ui-architecture.md#exec--actions-interactive-terminal)
 
 ## Observability
 
@@ -4039,6 +4197,13 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] DAGs: `depends_on` with `start`/`complete`/`success` conditions, topological
       sort, cycle rejection, cross-group dependencies (so DAGs span machines) and
       group-bound sidecars
+- [x] Job status derived from the workload: `GetJobInfo`/`ListJobs` report
+      `running`, `pending`, `failed`, `scheduled`, `complete`, `suspended`,
+      `idle`, or `stopped` instead of the stored flag, which is now `active`
+      (was `done`, which read as "finished" beside a running service)
+      ([plan](plans/job-status-plan.md) ·
+      [docs](../docs/jobs-tasks-and-scheduling.md#job-status) ·
+      calls: [job-status-plan_calls.md](calls/job-status-plan_calls.md))
 
 ## Agent surfaces
 
@@ -4055,6 +4220,10 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 [docs](../docs/ui-architecture.md)
 
+- [x] The Jobs index and the job page show the same derived job status;
+      the page's client-side `running` workaround is gone
+      ([suspend-resume-ui calls 9](calls/suspend-resume-ui-plan_calls.md#9-a-done-job-with-live-work-reads-running-derived-in-the-ui),
+      [job-status plan](plans/job-status-plan.md))
 - [x] Keyboard navigation: ⌘K command palette, `j`/`k`/`o` index selection, `u`
       to go up a level
 - [x] Jump hints — hold ⌘ (Ctrl) to label index rows with digits and sidebar
@@ -4085,6 +4254,57 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       deferrals (created/updated on the job header, per-page last-column
       label) and the stale "gen has drifted" item — the client was already
       current, and CI now keeps it so.
+- [x] Task page tabs (Overview · Logs · Exec & actions · Spec, in the URL as
+      `?tab=` / `?alloc=`): health tiles, one Instances table replacing the
+      three lists of the same allocations, declared checks, recent events;
+      one exec panel behind a target picker instead of one per allocation
+      ([plan](plans/ui-task-and-template-redesign-plan.md),
+      [calls](calls/ui-task-and-template-redesign-plan_calls.md),
+      [docs](../docs/ui-architecture.md#task-page)). The deferrals are open
+      items above.
+- [x] Actions tab on the task page (replaces "Exec & actions"): the task's
+      actions as a list with **Open a shell** last; the chosen one as a typed
+      form (segmented / chips for enums, bounded ints, patterned and masked
+      strings, switches), the argv it renders to, run on one / all running /
+      unhealthy instances, and an exit code and output per instance, with the
+      equivalent `legion action run` line. `?tab=actions&action=<name>|shell`;
+      `?tab=exec` still works
+      ([plan §3](plans/ui-task-and-template-redesign-plan.md#3-actions-tab-phase-3),
+      [calls](calls/ui-task-and-template-redesign-plan_calls.md),
+      [docs](../docs/exec-and-actions.md)).
+- [x] Guided template launch: Variables → Review (creates vs updates, changed
+      values, rendered-spec diff against the running job) → Launch (rollout
+      progress, Copy as CLI); source and versions on their own tab
+      ([plan](plans/ui-task-and-template-redesign-plan.md),
+      [calls](calls/ui-task-and-template-redesign-plan_calls.md),
+      [docs](../docs/ui-architecture.md#job-templates)).
+- [x] Template-launched jobs listed no tasks on the job and task pages: the
+      UI took the first JSON submission as the spec, which for a template run
+      can be `template.variables.json`. It now prefers `job.rendered.json`
+      ([calls entry 5](calls/ui-task-and-template-redesign-plan_calls.md)).
+- [x] Operator UI gaps (2026-10-12, [#20](https://github.com/mikenomitch/legion/pull/20)):
+      tasks and per-task allocations no longer come up empty
+      (`GetJobSpecReply.rendered_jobspec`, `LedgerAllocation.task_name`);
+      instance page (`/jobs/:job/instances/:id`) and allocation page
+      (`/allocations/:id`) with event timelines from new `instance_id` /
+      `allocation_id` event filters (`legion events --instance/--allocation`,
+      MCP `legion_events`); the allocation page embeds the task page's
+      Actions panel for that one allocation; KV values hidden until revealed (`ListKv` returns no values unless
+      `include_values`, `GetKv.metadata_only`, `GetKvReply.references` for
+      "Used by"); `LEGION_WORKER_PUBLIC_ADDRESS` →
+      `ServiceEndpoint.public_address` for working endpoint links, private
+      addresses marked; service-graph boxes link to their pages; a rollout
+      whose target is no longer the latest config cancels itself instead of
+      retiring the newer allocations (the stuck `kv-demo` / undone scale);
+      the manager page renders its config instead of JSON, and the KV
+      encryption card moved to the KV page
+      ([plan](plans/operator-ui-gaps-plan.md),
+      [calls](calls/operator-ui-gaps-plan_calls.md),
+      docs: [event-stream](../docs/event-stream.md),
+      [kv-store](../docs/kv-store.md),
+      [service-discovery](../docs/service-discovery.md#public-addresses),
+      [rollouts](../docs/rollouts.md#a-newer-version-supersedes-a-running-rollout),
+      [ui-architecture](../docs/ui-architecture.md)).
 
 ## AWS rig: mitigations in place for the node-deregistration and plugin-build gaps
 

@@ -10,7 +10,7 @@ import { statusTone } from '../utils/status'
 // The order the status chips appear in: the states an operator acts on
 // first, then the quiet ones. Anything the manager emits that is not listed
 // still gets a chip, after these.
-const STATUS_ORDER = ['running', 'pending', 'failed', 'stopped', 'done', 'complete']
+const STATUS_ORDER = ['running', 'blocked', 'pending', 'failed', 'scheduled', 'complete', 'suspended', 'idle', 'stopped']
 
 function JobsContent() {
   const [search, setSearch] = createSignal('')

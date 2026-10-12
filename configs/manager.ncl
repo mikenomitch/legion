@@ -104,6 +104,32 @@
     #   victimExemptAge = "60s",
     # },
     #
+    # Adaptive scheduler concurrency
+    # (docs/adaptive-scheduler-concurrency.md). The manager measures its own
+    # plan-apply conflict rate and tunes how many evals it will PLAN at once,
+    # between `min` and `max`. Eval kinds that cannot conflict (today,
+    # `job_stop`) are never throttled. `evalThreads` stays the worker-pool
+    # size and becomes the ceiling the controller backs off from — only on
+    # evidence, and only in `enforce`.
+    #
+    # adaptiveConcurrency = {
+    #   # enforce — measure and actuate.
+    #   # observe  — measure, export what it WOULD do, actuate nothing. The
+    #   #            default, and the same evidence-before-action posture as
+    #   #            `preemption.mode`.
+    #   # off      — do not run the controller at all (today's behavior).
+    #   mode = "observe",
+    #   # Floor and ceiling on admitted planners. `max` defaults to
+    #   # `evalThreads` and can never exceed it; `min` must be at least 1.
+    #   # Setting `min` and `max` to the same value pins the limit.
+    #   min = 1,
+    #   # max = 16,
+    #   # Trip points on the conflict rate. The gap between them is the dead
+    #   # band that stops the controller hunting.
+    #   # highWatermark = 0.20,   # above this, halve the limit
+    #   # lowWatermark  = 0.05,   # below this for 2s, add one back
+    # },
+    #
     # Plan-path scale levers (docs/scheduler-and-eval-loop.md). Both are on
     # by default; the flags exist as escape hatches.
     # lazy_version_sample: RETIRED (no effect, warns once). Plans now take

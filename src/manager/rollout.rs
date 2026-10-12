@@ -199,6 +199,21 @@ pub fn handle_rollout_tick(eval: &Eval, store: &Store) -> R<String> {
         ));
     }
 
+    // A rollout drives the job toward its target, and treats every
+    // allocation on any other config as old. Once a newer config lands
+    // without superseding this rollout (a KV-triggered restart or in-place
+    // update re-renders the job without going through RunJob), ticking on
+    // would retire the newer allocations and then place nothing, because the
+    // scheduler skips a superseded config. So a rollout whose target is no
+    // longer the job's latest config ends here, and the latest config is
+    // rescheduled to re-place anything already retired.
+    let latest_config_id = store
+        .get_job_config_optional(&rollout.job_id)?
+        .map(|config| config.id());
+    if latest_config_id.as_deref() != Some(rollout.to_job_config_id.as_str()) {
+        return supersede_rollout(store, &rollout, latest_config_id.as_deref());
+    }
+
     let to_config = store
         .get_job_config_by_id(&rollout.to_job_config_id)
         .with_context(|| {
@@ -307,6 +322,44 @@ pub fn handle_rollout_tick(eval: &Eval, store: &Store) -> R<String> {
         "Rollout {} {}: {}",
         rollout.id, outcome.status, outcome.message
     ))
+}
+
+/// Ends a rollout whose target is no longer the job's latest config, the
+/// way RunJob ends one it supersedes, and releases what it was holding.
+fn supersede_rollout(store: &Store, rollout: &Rollout, latest: Option<&str>) -> R<String> {
+    let message = match latest {
+        Some(latest) => format!(
+            "Rollout superseded: job config {latest} replaced its target {}",
+            rollout.to_job_config_id
+        ),
+        None => "Rollout superseded: the job has no config".to_string(),
+    };
+    warn!(
+        rollout_id = rollout.id,
+        job_id = %rollout.job_id,
+        "{message}"
+    );
+    store.update_rollout_status(rollout.id, "cancelled", false, Some(&message))?;
+    let _ = store.append_rollout_event(
+        rollout.id,
+        &rollout.job_id,
+        None,
+        "warn",
+        &message,
+        Some(&json!({ "status": "cancelled", "reason": "superseded" }).to_string()),
+    );
+    // Deferred scale-ins waited on this rollout; they apply now.
+    store.apply_pending_scales_after_rollout(&rollout.job_id, &rollout.to_job_config_id)?;
+    if let Some(latest) = latest {
+        store.enqueue_eval(
+            "job_reschedule",
+            Some(&rollout.job_id),
+            Some(latest),
+            None,
+            Some(store.default_eval_priority),
+        )?;
+    }
+    Ok(format!("Rollout {} cancelled: {message}", rollout.id))
 }
 
 #[instrument(skip_all, fields(rollout_id, priority, groups = ?groups))]

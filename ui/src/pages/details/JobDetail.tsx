@@ -9,16 +9,29 @@ import type { InstanceRow } from '../../components/InstancesTable'
 import { PressureHistoryCard } from '../../components/PressureHistory'
 import SnapshotsPanel from '../../components/SnapshotsPanel'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
-import { GetLedgerReply, InstanceInfo } from '../../gen/legion_pb'
+import { InstanceInfo } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
+import { nodePublicAddress } from '../../utils/services'
 import { allows, jobScope } from '../../utils/acl'
 import { allocationHealthLabel, fetchAllocationRuntime, fetchTaskStatusByName, parseAllocNetwork } from '../../utils/allocations'
 import { formatDate, pluralize } from '../../utils/format'
-import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
+import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecFromReply, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
 import { stableList } from '../../utils/instances'
 import { bytesToMiB, fetchAllocationUsageByNode, formatIdle, formatMiB, reservationLabel } from '../../utils/usage'
+
+// What each derived job status means on this page (the badge's tooltip).
+const JOB_STATUS_HINTS: Record<string, string> = {
+  running: 'At least one allocation of this job is live.',
+  pending: 'Nothing is live yet: a task is waiting to be placed or for a dependency. The task cards show which.',
+  complete: 'Every task finished successfully and nothing is live.',
+  scheduled: 'A cron task finished its last run and is waiting for the next one.',
+  failed: 'A task failed, or a required KV key is missing, and nothing is live. The task cards and events show why.',
+  suspended: 'Every wanted instance is suspended. Start an instance to resume it.',
+  idle: 'No task wants an allocation: scaled to zero, or no keyed instances exist.',
+  stopped: 'Stopped. Run the job again to bring it back.',
+}
 
 function JobDetailContent() {
   const params = useParams()
@@ -40,7 +53,7 @@ function JobDetailContent() {
       managerClient.getJobInfo({ name: name }),
       // node:read garnish (allocation placement); job-scoped tokens
       // still get the rest of the page.
-      managerClient.getLedger({}).catch(() => new GetLedgerReply()),
+      managerClient.getLedger({}).catch(() => undefined),
       managerClient.listRollouts({ jobId: name, activeOnly: false, page: 1, pageSize: 200 }),
       managerClient.getJobSpec({ name: name }),
       managerClient.listJobSpecHistory({ name: name }),
@@ -63,13 +76,23 @@ function JobDetailContent() {
     ])
 
     const jobId = jobInfo.job?.id ?? name
-    const allocations = ledger.nodes.flatMap((node) =>
+    // Without node:read the ledger is unavailable, which is not the same as
+    // the job having no allocations: the card says which it is.
+    const ledgerDenied = ledger === undefined
+    // Port links use a node's public address when its worker declares one.
+    const publicAddresses = new Map(
+      (ledger?.nodes ?? []).flatMap((entry) => {
+        const address = nodePublicAddress(entry.node?.configAttrs)
+        return entry.node && address ? [[entry.node.id, address] as const] : []
+      }),
+    )
+    const allocations = (ledger?.nodes ?? []).flatMap((node) =>
       node.allocations.filter((allocation) => allocation.jobId === jobId),
     )
 
     const latestRollout = rollouts.rollouts[0]
     const rolloutStatus = latestRollout ? await managerClient.getRolloutStatus({ id: latestRollout.id }) : undefined
-    const specData = extractJobSpecData(spec.submissions)
+    const specData = extractJobSpecFromReply(spec)
 
     // Endpoints for this job's services, unhealthy included: an endpoint that
     // exists but is failing is exactly what someone is looking for here.
@@ -90,6 +113,8 @@ function JobDetailContent() {
       job: jobInfo.job,
       template: jobInfo.template,
       allocations,
+      ledgerDenied,
+      publicAddresses,
       rollouts: rollouts.rollouts,
       activeRollout: rollouts.rollouts.find((rollout) => !['completed', 'failed', 'cancelled', 'completed_incomplete'].includes(rollout.status.toLowerCase())),
       spec: spec.submissions,
@@ -182,16 +207,11 @@ function JobDetailContent() {
     }))
   })
 
-  // The manager stores `done` for every accepted job, running or not. A job
-  // with live allocations or active instances reads as running, so a keyed
-  // job with active instances never says DONE beside them.
-  const displayStatus = createMemo(() => {
-    const status = jobData()?.job?.status || 'unknown'
-    if (status.toLowerCase() !== 'done') return status
-    const liveAllocation = (jobData()?.allocations ?? []).some((allocation) => !['complete', 'failed'].includes(allocation.status.toLowerCase()))
-    const liveInstance = (instances() ?? []).some((instance) => ['active', 'pending', 'rescheduling'].includes(instance.state))
-    return liveAllocation || liveInstance ? 'running' : status
-  })
+  // The manager derives the status from the job's workload (see
+  // docs/jobs-tasks-and-scheduling.md#job-status). The hint says what each
+  // word means here, so `pending` and `idle` are not mistaken for faults.
+  const displayStatus = createMemo(() => jobData()?.job?.status || 'unknown')
+  const statusHint = createMemo(() => JOB_STATUS_HINTS[displayStatus().toLowerCase()])
 
   // The instances panel appears for jobs that declare stateful tasks, or that
   // have instance rows anyway (e.g. the spec failed to parse but the manager
@@ -214,10 +234,10 @@ function JobDetailContent() {
   })
 
   const mayWrite = () => allows('job', 'write', jobScope(jobName(), jobData()?.template?.name))
-  // Stop is offered while there is something to stop; destroy needs a
-  // stopped job first, which is why both live here. Note that `done` is the
-  // manager's word for "submission accepted and scheduled", not "finished".
-  const isStoppable = () => !['stopped', 'failed', 'destroyed'].includes((jobData()?.job?.status ?? '').toLowerCase())
+  // Stop is offered until the job is stopped; destroy needs a stopped job
+  // first, which is why both live here. `failed` and `complete` stay
+  // stoppable, because stopping is the step before destroying either.
+  const isStoppable = () => !['stopped', 'destroyed'].includes((jobData()?.job?.status ?? '').toLowerCase())
 
   const stopJob = async () => {
     try {
@@ -263,13 +283,7 @@ function JobDetailContent() {
               <>
                 <StatusBadge
                   status={displayStatus()}
-                  title={
-                    (jobData()!.job?.status ?? '').toLowerCase() === 'done'
-                      ? displayStatus() === 'running'
-                        ? 'Allocations or instances of this job are running. The manager records the job itself as "done", its word for an accepted job.'
-                        : 'Submitted and scheduled. "done" is the manager\'s word for an accepted job, not a finished one — see the task cards for what is running.'
-                      : undefined
-                  }
+                  title={statusHint()}
                 />
                 {/* The priority band decides what this job can displace and
                     what can displace it, so it belongs beside the status
@@ -510,13 +524,31 @@ function JobDetailContent() {
               <SectionCard title="Allocations" flush>
                 <Show
                   when={jobData()!.allocations.length > 0}
-                  fallback={<EmptyState icon="boxes" title="No allocations" body="The scheduler has not placed this job on any worker yet." />}
+                  fallback={
+                    <Show
+                      when={!jobData()!.ledgerDenied}
+                      fallback={<EmptyState icon="ban" title="Allocations hidden" body="Listing allocations needs node:read, which your token does not have." />}
+                    >
+                      <EmptyState
+                        icon="boxes"
+                        title="No allocations"
+                        body={
+                          jobData()!.activeRollout?.message
+                            ? `Rollout #${String(jobData()!.activeRollout!.id)}: ${jobData()!.activeRollout!.message}`
+                            : displayStatus() === 'stopped'
+                              ? 'The job is stopped.'
+                              : 'The scheduler has not placed this job on any worker. The Events page (filtered to this job) shows why.'
+                        }
+                      />
+                    </Show>
+                  }
                 >
                   <TableShell>
                     <table class={tableClass}>
                       <thead class={theadClass}>
                         <tr>
                           <th class={thClass}>ID</th>
+                          <th class={thClass}>Task</th>
                           <th class={thClass}>Instance</th>
                           <th class={thClass}>Status</th>
                           <th class={thClass}>Health</th>
@@ -534,10 +566,29 @@ function JobDetailContent() {
                             const usage = () => allocationUsage()?.get(Number(allocation.id))
                             return (
                             <tr class={trHoverClass}>
-                              <td class={tdClass + ' font-mono text-xs'}>#{String(allocation.id)}</td>
+                              <td class={tdClass + ' font-mono text-xs'}>
+                                <A class="font-semibold text-ink hover:text-brass-strong" href={`/allocations/${String(allocation.id)}`}>
+                                  #{String(allocation.id)}
+                                </A>
+                              </td>
+                              <td class={tdClass}>
+                                <Show when={allocation.taskName} fallback={<span class="text-faint">—</span>}>
+                                  <A
+                                    class="text-muted hover:text-brass-strong"
+                                    href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(allocation.taskName)}`}
+                                  >
+                                    {allocation.taskName}
+                                  </A>
+                                </Show>
+                              </td>
                               <td class={tdClass}>
                                 <Show when={allocation.instanceId} fallback={<span class="text-faint">—</span>}>
-                                  <MonoBadge title={`Stateful instance ${allocation.instanceId}`}>{allocation.instanceId}</MonoBadge>
+                                  <A
+                                    href={`/jobs/${encodeURIComponent(jobName())}/instances/${encodeURIComponent(allocation.instanceId!)}`}
+                                    title={`Stateful instance ${allocation.instanceId}`}
+                                  >
+                                    <MonoBadge class="hover:border-brass/50">{allocation.instanceId}</MonoBadge>
+                                  </A>
                                 </Show>
                               </td>
                               <td class={tdClass}><StatusBadge status={allocation.status} /></td>
@@ -545,7 +596,10 @@ function JobDetailContent() {
                                 <StatusBadge status={allocationHealthLabel(health())} title={health()?.status || undefined} />
                               </td>
                               <td class={tdClass}>
-                                <AllocationPorts network={parseAllocNetwork(allocation.network)} />
+                                <AllocationPorts
+                                  network={parseAllocNetwork(allocation.network)}
+                                  publicAddress={jobData()!.publicAddresses.get(allocation.nodeId)}
+                                />
                               </td>
                               <td class={tdClass + ' font-mono text-xs tabular-nums'}>
                                 <Show when={usage()} fallback={<span class="text-faint">-</span>}>

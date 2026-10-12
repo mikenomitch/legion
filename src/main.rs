@@ -34,6 +34,7 @@ fn cli() -> Command {
         .subcommand(cmd::snapshot::config())
         .subcommand(cmd::state::config())
         .subcommand(cmd::raft::config())
+        .subcommand(cmd::scheduler::config())
         .subcommand(cmd::acl::config())
         .subcommand(cmd::exec::config())
         .subcommand(cmd::action::config())
@@ -91,6 +92,7 @@ async fn main() -> R<()> {
         Some(("snapshot", sub_matches)) => cmd::snapshot::handle(sub_matches).await?,
         Some(("state", sub_matches)) => cmd::state::handle(sub_matches).await?,
         Some(("raft", sub_matches)) => cmd::raft::handle(sub_matches).await?,
+        Some(("scheduler", sub_matches)) => cmd::scheduler::handle(sub_matches).await?,
         Some(("acl", sub_matches)) => cmd::acl::handle(sub_matches).await?,
         Some(("exec", sub_matches)) => cmd::exec::handle(sub_matches).await?,
         Some(("action", sub_matches)) => cmd::action::handle(sub_matches).await?,

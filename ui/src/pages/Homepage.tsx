@@ -1,4 +1,5 @@
 import { A } from '@solidjs/router'
+import { LoginGate } from '../components/AccessGate'
 import { For, Show, createMemo, createResource } from 'solid-js'
 import { Badge, EmptyState, LoadingRows, MonoBadge, Note, RelativeTime, SectionCard, StatCard, StatusBadge, TableShell, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
@@ -9,7 +10,7 @@ import { retainOnError, swallowDenied, usePoll } from '../utils/polling'
 
 const eventTone = (level: string): Tone => (statusTone(level) === 'info' ? 'neutral' : statusTone(level))
 
-export default function Homepage() {
+function HomepageContent() {
   // Poll while the page is mounted so the dashboard stays live; the previous
   // value is kept during refetches so the tables never flash.
   const tick = usePoll()
@@ -315,5 +316,15 @@ export default function Homepage() {
         </div>
       </Show>
     </Show>
+  )
+}
+
+// Logged out on a cluster that enforces ACLs, every card here would be empty;
+// show the same log-in prompt as the other pages instead.
+export default function Homepage() {
+  return (
+    <LoginGate what="the overview">
+      <HomepageContent />
+    </LoginGate>
   )
 }

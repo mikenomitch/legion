@@ -120,6 +120,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("UpdateNodeDynamic", Plane::Protected("node:write")),
         ("GetManagerConfigs", Plane::Protected("operator:read")),
         ("GetObservability", Plane::Protected("operator:read")),
+        ("GetSchedulerConcurrency", Plane::Protected("operator:read")),
         ("GetRaftStatus", Plane::Protected("operator:read")),
         ("ListRaftHistory", Plane::Protected("operator:read")),
         ("IssueRaftCommand", Plane::Protected("operator:write")),
@@ -659,6 +660,10 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "GetSchedulerConcurrency" => svc
+            .get_scheduler_concurrency(req(GetSchedulerConcurrencyRequest {}, token))
+            .await
+            .map(|_| ()),
         "GetNode" => svc
             .get_node(req(GetNodeRequest { id: NODE_ID.into() }, token))
             .await
@@ -772,13 +777,17 @@ async fn call_endpoint(
             .await
             .map(|_| ()),
         "GetKv" => svc
-            .get_kv(req(GetKvRequest { key: KV_KEY.into() }, token))
+            .get_kv(req(GetKvRequest {
+                    key: KV_KEY.into(),
+                    ..Default::default()
+                }, token))
             .await
             .map(|_| ()),
         "ListKv" => svc
             .list_kv(req(
                 ListKvRequest {
                     prefix: String::new(),
+                    include_values: true,
                 },
                 token,
             ))
@@ -2345,6 +2354,7 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
         .get_kv(req(
             GetKvRequest {
                 key: "secret/hidden".into(),
+                ..Default::default()
             },
             Some(&secret),
         ))
@@ -2357,6 +2367,7 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
         .list_kv(req(
             ListKvRequest {
                 prefix: String::new(),
+                include_values: true,
             },
             Some(&secret),
         ))

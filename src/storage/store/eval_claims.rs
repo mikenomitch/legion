@@ -54,7 +54,7 @@ impl Store {
     /// Claim the next ready eval, if any (a batch of one).
     #[instrument(err, skip_all)]
     pub fn claim_eval(&self) -> R<Option<Eval>> {
-        Ok(self.claim_up_to(|_| 1)?.into_iter().next())
+        Ok(self.claim_up_to(|_| 1, ClaimScope::Any)?.into_iter().next())
     }
 
     /// Claim a fair-share batch of ready evals ([`EvalBatchLimits`]).
@@ -64,12 +64,18 @@ impl Store {
     /// exactly one eval. Ordering is preserved ACROSS the batch: the batch
     /// is the head of `priority DESC, id ASC`, so a lower-priority eval is
     /// only ever reached after every higher-priority one.
+    ///
+    /// `scope` narrows the claim to eval kinds that never invoke the planner
+    /// ([`ClaimScope::NonPlanning`]): what an eval worker the
+    /// adaptive-concurrency gate has throttled claims instead of blocking
+    /// (docs/adaptive-scheduler-concurrency.md). Ordering among the rows it
+    /// can see, and duplicate collapse, are identical.
     #[instrument(err, skip_all)]
-    pub fn claim_evals(&self, limits: EvalBatchLimits) -> R<Vec<Eval>> {
-        self.claim_up_to(|pending| limits.share_of(pending))
+    pub fn claim_evals(&self, limits: EvalBatchLimits, scope: ClaimScope) -> R<Vec<Eval>> {
+        self.claim_up_to(|pending| limits.share_of(pending), scope)
     }
 
-    fn claim_up_to(&self, take_for: impl FnOnce(i64) -> usize) -> R<Vec<Eval>> {
+    fn claim_up_to(&self, take_for: impl FnOnce(i64) -> usize, scope: ClaimScope) -> R<Vec<Eval>> {
         let started = Instant::now();
         let capacity_seq = self.capacity_seq();
         let mut claims = self.lock_eval_claims();
@@ -82,13 +88,26 @@ impl Store {
             return Ok(Vec::new());
         }
         let candidates: Vec<Eval> = {
-            let mut stmt = conn.prepare_cached(
+            // The non-planning kind list is a compile-time constant, never
+            // caller input, so it is built into the statement.
+            let kind_filter = match scope {
+                ClaimScope::Any => String::new(),
+                ClaimScope::NonPlanning => format!(
+                    " AND type IN ({})",
+                    crate::manager::concurrency::NON_PLANNING_EVAL_KINDS
+                        .iter()
+                        .map(|kind| format!("'{kind}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            let mut stmt = conn.prepare_cached(&format!(
                 "SELECT id, status, type, job_id, job_config_id, node_id, priority, ready_at
                  FROM eval
-                 WHERE status = 'pending' AND ready_at <= ?1
+                 WHERE status = 'pending' AND ready_at <= ?1{kind_filter}
                  ORDER BY priority DESC, id ASC
-                 LIMIT ?2;",
-            )?;
+                 LIMIT ?2;"
+            ))?;
             let rows = stmt.query_map(params![now, (take + claims.held.len()) as i64], |row| {
                 self.eval_from_row(row)
             })?;

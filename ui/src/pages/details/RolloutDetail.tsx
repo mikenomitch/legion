@@ -1,24 +1,15 @@
 import { A, useParams } from '@solidjs/router'
 import { GetLedgerReply } from '../../gen/legion_pb'
 import { AccessGate } from '../../components/AccessGate'
+import { AllocationLink } from '../../components/AllocationLink'
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { Badge, Button, ConfirmButton, Icon, Note, PageHeader, SectionCard, Spinner, StatusBadge, cx, inputClass, linkClass } from '../../components/ui'
 import { managerClient } from '../../grpcClient'
 import { allows, jobScope } from '../../utils/acl'
 import { formatDate } from '../../utils/format'
 import { retainOnError, usePoll } from '../../utils/polling'
+import { isRolloutDone } from '../../utils/status'
 import { artifactProgressPercent, parseArtifactStates } from '../../utils/jobspec'
-
-const isRolloutDone = (status: string) => {
-  const normalizedStatus = status.toLowerCase()
-  return (
-    normalizedStatus === 'completed'
-    || normalizedStatus === 'failed'
-    || normalizedStatus === 'done'
-    || normalizedStatus === 'cancelled'
-    || normalizedStatus === 'completed_incomplete'
-  )
-}
 
 const logLevelTone = (level: string) => {
   const normalized = level.toLowerCase()
@@ -164,16 +155,34 @@ function RolloutDetailContent() {
                           return (
                             <div class="rounded-lg border border-line bg-surface2/40 p-3">
                               <div class="flex flex-wrap items-center justify-between gap-2">
-                                <p class="font-mono text-sm font-semibold">#{String(allocation.allocationId)}</p>
+                                <AllocationLink id={allocation.allocationId} job={rollout().jobId} class="text-sm" />
                                 <StatusBadge status={allocation.status} />
                               </div>
                               <p class="mt-1 text-xs text-faint">
+                                <Show when={allocation.taskName}>
+                                  <A
+                                    class="text-muted hover:text-brass-strong"
+                                    href={`/jobs/${encodeURIComponent(rollout().jobId)}/tasks/${encodeURIComponent(allocation.taskName)}`}
+                                  >
+                                    {allocation.taskName}
+                                  </A>
+                                  {' · '}
+                                </Show>
                                 {allocation.role} · worker{' '}
                                 <A class="text-muted hover:text-brass-strong" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A>
                               </p>
                               <div class="mt-2 flex flex-wrap gap-1.5">
-                                <Badge tone={allocation.nodeHealthy ? 'ok' : 'danger'} dot>worker {allocation.nodeHealthy ? 'healthy' : 'unhealthy'}</Badge>
-                                <Badge tone={allocation.allocationHealthy ? 'ok' : 'danger'} dot>alloc {allocation.allocationHealthy ? 'healthy' : 'unhealthy'}</Badge>
+                                {/* Unset means no report yet, which is not the same as unhealthy. */}
+                                <Badge tone={allocation.nodeHealthy === undefined ? 'neutral' : allocation.nodeHealthy ? 'ok' : 'danger'} dot>
+                                  worker {allocation.nodeHealthy === undefined ? 'health unknown' : allocation.nodeHealthy ? 'healthy' : 'unhealthy'}
+                                </Badge>
+                                <Badge
+                                  tone={allocation.allocationHealthy === undefined ? 'warn' : allocation.allocationHealthy ? 'ok' : 'danger'}
+                                  title={allocation.allocationHealth || undefined}
+                                  dot
+                                >
+                                  alloc {allocation.allocationHealthy === undefined ? 'health unknown' : allocation.allocationHealthy ? 'healthy' : 'unhealthy'}
+                                </Badge>
                               </div>
                               <Show when={staging}>
                                 <div class="mt-2 border-t border-line pt-2 text-xs">

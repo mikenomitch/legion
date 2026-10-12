@@ -72,6 +72,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_node_usage` | no | One node's memory and CPU: capacity, reservations, and measured usage per allocation (current and peak memory, CPU, idle seconds). Also the node's oversubscription ratio and memory pressure status, and each allocation's place in the pressure order (`pressure_rank`, `pressure_steps`): which allocations a short node would stop first. Use it to compare reservations with real use before resizing a job ([resource-enforcement.md](resource-enforcement.md#memory-pressure)). |
 | `legion_node_usage_list` | no | Memory and CPU for many nodes in one call (`ListNodeUsage`): per node, capacity with the oversubscription ratio, reservations, measured use, and memory pressure status, plus CPU `cores` and `used_millicores` (filled even where the platform reports no clock speed). Per-allocation rows only with `include_allocations`. Empty `node_ids` means every node, up to 500. Use it to find tight or pressured nodes before drilling in with `legion_node_usage` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
 | `legion_node_content` | no | What one node holds for content locality: the content it advertises to the manager's location index (digest, bytes, holder count, and the snapshot and part role it belongs to), whether its worker can publish and checkpoint, and its snapshots with `parts_here` of `parts_total`. `index_reported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork ([artifacts.md](artifacts.md)). |
+| `legion_scheduler_concurrency` | no | How many evals the manager will plan at once, and why: the current limit against `evalThreads`, the plan-conflict and fallback rates, goodput, and a `state` of steady/throttled/probing/**saturated**. `throttled` means work will drain, so wait. `saturated` means the conflicts are capacity-driven, so ask for nodes rather than resubmitting ([adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md)). |
 | `legion_keyring_status` | no | KV encryption at rest on the answering manager ([kv-encryption.md](kv-encryption.md)): `state` (`unlocked`, `locked`, `pending_upgrade`, …), the root key provider and location, each data key with how many values it protects, plaintext rows, rewrap progress, and a one-line `hint` with the next step when something needs doing. |
 | `legion_keyring_rotate` | **yes** | Rotate the KV data key now. Values are re-encrypted in the background with no job restarts. Takes an optional `idempotency_key`. |
 | `legion_node_claims` | no | A node's live provisional (unratified) allocations, meaning work that started but is not yet confirmed ([edge-boot.md](edge-boot.md)). Tells "still booting" apart from "already confirmed". |
@@ -88,7 +89,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_net_ca_rotate` | **yes** | Replace the mesh CA. Every node re-issues its certificate on its next heartbeat, and peers on different CAs refuse each other until then. |
 | `legion_net_policy_apply` | **yes** | Create or replace a network policy object. `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
-| `legion_events` | no | List scheduler events. Poll with `after_id` to tail. |
+| `legion_events` | no | List scheduler events. Poll with `after_id` to tail. `instance_id` narrows to one stateful instance (its own events plus its allocations'), `allocation_id` to one allocation. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
 | `legion_state_query` | no | Read-only SQL against the state store. |
 | `legion_state_schema` | no | Describe state store tables. |
@@ -434,6 +435,10 @@ ways (see [Event Stream](event-stream.md)):
 ```bash
 # A window of recent history (oldest first), with filters:
 legion events list --kind eval --job demo --level warn --json
+
+# Everything about one sandbox instance, or one allocation:
+legion events list --instance box-KPI6u4fi8GmwSWCo --json
+legion events list --allocation 98 --json
 
 # Live tail over the StreamEvents gRPC stream; in JSON mode each line is a
 # complete { "ok": true, "data": <event> } envelope (NDJSON):

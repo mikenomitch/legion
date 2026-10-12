@@ -2,6 +2,7 @@ pub mod acl;
 pub mod auth_method;
 pub mod blocked;
 pub mod cadence;
+pub mod concurrency;
 pub mod daemon;
 pub mod dispatcher;
 pub mod edge_boot;

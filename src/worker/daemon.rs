@@ -80,6 +80,28 @@ fn worker_server_port() -> u64 {
         .unwrap_or(DEF_WORKER_SERVER_PORT)
 }
 
+/// Address clients outside the cluster's private network reach this node at,
+/// from `LEGION_WORKER_PUBLIC_ADDRESS` (a host name or IP, no scheme or
+/// port). Registered as the `publicAddress` config attribute; the manager
+/// puts it on service endpoints so links work from a browser. It never
+/// changes where the manager or other nodes dial (that stays the private
+/// `workerAddress`). See docs/service-discovery.md, "Public addresses".
+fn worker_public_address() -> Option<String> {
+    let value = std::env::var("LEGION_WORKER_PUBLIC_ADDRESS").ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.contains("://") || value.contains('/') {
+        warn!(
+            value,
+            "LEGION_WORKER_PUBLIC_ADDRESS must be a bare host name or IP; ignoring it"
+        );
+        return None;
+    }
+    Some(value.to_string())
+}
+
 /// Everything needed to (re-)register this worker with the manager.
 #[derive(Debug, Clone)]
 struct RegistrationPayload {
@@ -381,6 +403,9 @@ async fn run_worker_with_manager(
         "workerAddress".into(),
         Value::String(format!("http://{}:{}", DEF_MANAGER_HOSTNAME, server_port)),
     );
+    if let Some(public_address) = worker_public_address() {
+        config_attrs.insert("publicAddress".into(), Value::String(public_address));
+    }
     // The cadence this node will actually beat at, so the manager can derive
     // its lost window from it (`missedBeatsBeforeLost x this`) instead of
     // applying one global constant to a fleet with several cadences. Reported

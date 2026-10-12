@@ -1174,6 +1174,28 @@ service Manager {
   rpc GetObservability (GetObservabilityRequest)
     returns (GetObservabilityReply);
 
+  // Reports the adaptive scheduler-concurrency controller: how many evals this
+  // manager will PLAN at once right now, why, and whether the cluster's
+  // conflicts are concurrency-driven or capacity-driven.
+  //
+  // The question it answers is one no other endpoint does — "are placements
+  // slow because the scheduler is holding itself back, or because the cluster
+  // is full?" — and the two have opposite remedies ("wait" versus "add
+  // nodes"). Backs `legion scheduler concurrency`.
+  //
+  // Read-only and cheap: every field comes from a snapshot the controller
+  // already publishes each 500ms tick, so calling this costs no extra work on
+  // the plan path.
+  //
+  // Answer with care on a manager that does not lead the scheduler lane: it
+  // does no planning, so it reports zeros rather than a guess. Ask any manager
+  // and check `is_scheduler_lane_leader` in the reply.
+  //
+  // ACL: operator:read, unscoped (the report is cluster-wide).
+  // See docs/adaptive-scheduler-concurrency.md.
+  rpc GetSchedulerConcurrency (GetSchedulerConcurrencyRequest)
+    returns (GetSchedulerConcurrencyReply);
+
   // Returns the local manager's Raft control-plane status.
   //
   // This endpoint is available even before full Raft state replication is enabled,
@@ -2487,10 +2509,22 @@ message GetJobSpecByConfigRequest {
 
 // Reply payload for GetJobSpec.
 message GetJobSpecReply {
-  // Submissions associated with the latest job config.
-  //
-  // Field number intentionally remains `2` for compatibility.
+  // Source submissions associated with the job config, exactly as the
+  // submitter sent them (usually Nickel source, not JSON). Read these to show
+  // what was typed; read `rendered_jobspec` to learn what the job is.
   repeated Submission submissions = 2;
+
+  // The job config the manager stored, as a JSON object: `name`, `priority`,
+  // `version`, `rollout`/`rollout_by_group` when set, and `tasks` — each
+  // task in the same camelCase shape `RunJobRequest.parsed_jobspec` accepts
+  // (`group`, `runtime`, `lifecycle`, `count`, `dependsOn`, `config`,
+  // `resources`, `checks`, `network`, `service`, `stateful`, ...).
+  //
+  // This is the authoritative structure of the job whatever language it was
+  // written in, with scale overrides NOT applied (`count` is the spec's).
+  // Empty string only when the config could not be loaded, which the
+  // manager reports as an error instead.
+  string rendered_jobspec = 3;
 }
 
 // One job spec history entry.
@@ -4160,8 +4194,9 @@ message ListJobsRequest {
   // Default: `20`.
   optional uint32 page_size = 5;
 
-  // Keep only jobs whose status equals this value (case-insensitive, exact —
-  // `run` does not match `running`; use `query` for substring search).
+  // Keep only jobs whose derived status (see `Job.status`) equals this value
+  // (case-insensitive, exact — `run` does not match `running`; use `query`
+  // for substring search).
   // Applied after `query` and before paging, so `total_count` reflects the
   // filtered set. Omit or leave empty to return every status.
   optional string status = 6;
@@ -4175,14 +4210,38 @@ message Job {
   // Job name.
   string name = 2;
 
-  // Job status string.
+  // Job status, derived from the job's workload each time it is read. First
+  // match wins:
   //
-  // Current values written by manager include: done, stopped, failed.
+  // - `stopped`: `StopJob` stopped the job. `RunJob` brings it back.
+  // - `failed`: a required KV dependency vanished (`onDelete: fail`), or
+  //   nothing is live and a task's last run failed (it spent its restart and
+  //   move budgets, or exited unsuccessfully under a policy that does not
+  //   restart it).
+  // - `running`: at least one allocation of any version of the job is live
+  //   (placed and not yet terminal).
+  // - `blocked`: nothing is live, and the job's eval found no room for a
+  //   placement and waits for capacity that could help (docs/
+  //   scheduler-and-eval-loop.md, "Blocked evals"). It places on its own when
+  //   that capacity appears; `blocked` below says what it waits for. Takes
+  //   the place `pending` would have.
+  // - `pending`: nothing is live, and a task that wants an allocation has not
+  //   finished: it is waiting to be placed or waiting on a `dependsOn`
+  //   condition.
+  // - `scheduled`: nothing is live, nothing is pending, and a cron task
+  //   (`schedule`) finished its last run and waits for the next one.
+  // - `complete`: nothing is live, and every task that wants an allocation
+  //   finished successfully. A batch job reads this once it is done.
+  // - `suspended`: no task wants an allocation, and at least one keyed
+  //   instance is suspended.
+  // - `idle`: no task wants an allocation: every task is scaled to zero, or
+  //   a keyed task has no pending, active, or rescheduling instances.
   //
-  // `blocked` is reported (never stored) for a job that is neither stopped
-  // nor failed while its eval waits for capacity: a placement found no room
-  // and the job places on its own when capacity that could help appears.
-  // `blocked` below says what it waits for.
+  // Task outcomes come from the job's latest spec version; live allocations
+  // count from every version, so a job mid-rollout reads `running`. The
+  // state store's `job.status` column is not this value: it holds the
+  // lifecycle flag (`active`, `stopped`, `failed`) the derivation starts
+  // from.
   string status = 3;
 
   // Unix timestamp (seconds) when job was created. Immutable for the life of
@@ -4209,9 +4268,11 @@ message Job {
   // manager that predates bands.
   string priority = 6;
 
-  // Set while the job's eval is blocked on capacity (status `blocked`;
-  // docs/scheduler-and-eval-loop.md, "Blocked evals"). Unset otherwise,
-  // including for a stopped or failed job.
+  // Set while the job has an eval blocked on capacity
+  // (docs/scheduler-and-eval-loop.md, "Blocked evals"), whatever `status`
+  // reads: a job with a live allocation reads `running` and still says here
+  // what its other placements wait for; with nothing live it reads
+  // `blocked`. Unset for a job stopped or failed by its lifecycle.
   optional JobBlocked blocked = 7;
 }
 
@@ -6131,6 +6192,118 @@ message GetManagerConfigsReply {
   uint32 page_size = 4;
 }
 
+// Request payload for GetSchedulerConcurrency. No parameters: the controller
+// is per-manager and global, so there is nothing to scope the question to.
+message GetSchedulerConcurrencyRequest {}
+
+// Reply payload for GetSchedulerConcurrency — one manager's view of how much
+// planning it is admitting, and why.
+//
+// The controller measures its own plan-apply conflict rate and tunes how many
+// evals it will PLAN at once between `floor` and `ceiling` (AIMD: halve on
+// congestion, add one back after calm). The arithmetic behind every field is
+// published in docs/adaptive-scheduler-concurrency.md.
+message GetSchedulerConcurrencyReply {
+  // The controller's mode, as configured in
+  // `schedulerSettings.adaptiveConcurrency.mode`:
+  // - `enforce` — measure and actuate.
+  // - `observe` — measure and publish what it WOULD do, actuate nothing.
+  //   The default.
+  // - `off` — the controller does not run; `evalThreads` is the fixed planner
+  //   count, exactly as before this feature existed. Every numeric field below
+  //   is zero in this mode.
+  string mode = 1;
+
+  // Planners currently admitted. In `observe` mode this is the SHADOW limit —
+  // what the controller would be enforcing — which is what makes observe mode
+  // useful on its own.
+  uint32 limit = 2;
+
+  // Lower bound on `limit` (`adaptiveConcurrency.min`, 1 by default). Never 0:
+  // a floor of 0 is a stuck scheduler, not a throttled one.
+  uint32 floor = 3;
+
+  // Upper bound on `limit`. `adaptiveConcurrency.max` if set, otherwise
+  // `evalThreads`, and never above `evalThreads`.
+  uint32 ceiling = 4;
+
+  // The manager's configured `evalThreads`: the size of the worker pool, and
+  // the ceiling the controller works under. The controller never admits more
+  // planners than this and, in `enforce`, backs off below it on evidence.
+  uint32 eval_threads = 5;
+
+  // Admission permits held right now — eval workers currently inside a
+  // planning eval. 0 when the controller is off, which never consults the gate.
+  uint32 in_flight = 6;
+
+  // What the controller is doing:
+  // - `steady` — running at the ceiling; nothing is held back.
+  // - `throttled` — below the ceiling, and conflicts have not yet subsided.
+  // - `probing` — below the ceiling and accumulating calm ticks toward an
+  //   increase.
+  // - `saturated` — backing off did NOT improve goodput, so the conflicts are
+  //   capacity-driven rather than concurrency-driven. The remedy is nodes, not
+  //   patience, and the controller has stopped applying an actuator that
+  //   cannot help.
+  string state = 7;
+
+  // How long the controller has been in `state`, in seconds.
+  uint32 seconds_in_state = 8;
+
+  // Smoothed plan rejection rate, 0.0 to 1.0:
+  // `rejected / (applied + fallback + rejected)`. Plans that bound but slid
+  // down a candidate list count as PROGRESS, not as conflict — that is the
+  // point of late binding, and throttling to avoid absorbed races would be
+  // throttling to avoid the feature working.
+  double conflict_rate = 9;
+
+  // Smoothed fraction of plans that bound at a lower-ranked candidate: races
+  // ABSORBED by late binding. Reported for diagnosis and never fed into the
+  // controller's decision.
+  double fallback_rate = 10;
+
+  // Smoothed plans that actually placed, per second. This — not the conflict
+  // rate — is the objective; the conflict rate is only its fast leading
+  // indicator, and every decrease is verified against this before it is kept.
+  double goodput = 11;
+
+  // Raw plan outcomes in the most recent 500ms window, so the percentages
+  // above can be checked by hand.
+  uint32 window_applied = 12;
+  uint32 window_fallback = 13;
+  uint32 window_rejected = 14;
+
+  // The last limit change: `increase`, `decrease`, or `revert` (a decrease
+  // undone because it did not improve goodput). Empty if the controller has
+  // not moved the limit yet.
+  string last_adjustment_direction = 15;
+
+  // The limit before and after that change.
+  uint32 last_adjustment_from = 16;
+  uint32 last_adjustment_to = 17;
+
+  // How long ago it happened, in seconds.
+  uint32 last_adjustment_seconds_ago = 18;
+
+  // Relative change in goodput since that adjustment, as a fraction (0.18 =
+  // +18%). This is what says whether backing off actually bought anything.
+  double last_adjustment_goodput_delta = 19;
+
+  // Times a throttled worker claimed a non-planning eval (today: `job_stop`)
+  // instead of the queue head. This counts the one deviation from strict
+  // priority order the admission gate introduces: it is a cross-class
+  // inversion only, never within a class, and it exists so an operator's
+  // `job stop` during an incident does not queue behind the storm it is
+  // trying to end.
+  uint64 admission_skips = 20;
+
+  // Whether the manager that answered leads the scheduler lane, and therefore
+  // does the planning (always true outside raft mode and in `single`
+  // topology). When false, every number above is zero: a manager that does no
+  // planning reports nothing rather than guessing.
+  bool is_scheduler_lane_leader = 21;
+}
+
 // Request payload for GetObservability.
 message GetObservabilityRequest {
   // Maximum number of recent lines to return per stream.
@@ -6760,12 +6933,48 @@ message GetKvRequest {
   //
   // Must be non-empty.
   string key = 1;
+
+  // Return the entry without its value: `entry.value` is the empty string
+  // and the manager does not decrypt it. Everything else (type, version,
+  // timestamps, `encrypted`, and `GetKvReply.references`) is returned.
+  //
+  // For a client that shows a key's details and reveals the value only on
+  // request. Default `false`. Needs the same `kv:read` as a full read.
+  bool metadata_only = 2;
 }
 
 // Reply payload for GetKv.
 message GetKvReply {
   // Entry when found; unset when key does not exist.
   optional KvEntry entry = 1;
+
+  // Jobs whose current config reads this key: through a `$path/key`
+  // reference anywhere in the jobspec, or through a task's `kvInjections`
+  // (env vars and files rendered from KV). One entry per place the key is
+  // read, so a job that reads it twice appears twice with different
+  // `json_pointer`s.
+  //
+  // Recorded at submit time from the job's latest config; a job that stopped
+  // reading the key drops out when its next version is submitted. Only jobs
+  // the caller holds `job:read` on are listed, so the list can be shorter
+  // than the real set. Returned even when `entry` is unset, so a reference
+  // to a key that was deleted is still visible.
+  repeated KvJobReference references = 2;
+}
+
+// One place a job's config reads a KV key (GetKvReply.references).
+message KvJobReference {
+  // Job that reads the key.
+  string job_id = 1;
+
+  // Job config that recorded the reference (the job's latest version when
+  // it was submitted).
+  string job_config_id = 2;
+
+  // Where in the job config the key is read, as a JSON pointer: for example
+  // `/tasks/0/config/env/DB_PASSWORD` for a `$path/key` reference, or
+  // `/tasks/web/kvInjections/env/GREETING` for an injected env var.
+  string json_pointer = 3;
 }
 
 // Request payload for ListKv.
@@ -6774,6 +6983,16 @@ message ListKvRequest {
   //
   // Default empty string matches all keys.
   string prefix = 1;
+
+  // Return each entry's value. Default `false`: entries come back with
+  // `value` set to the empty string, and the manager never decrypts them.
+  //
+  // Listing is for browsing keys; reading a secret should be a deliberate
+  // act, so a listing does not ship every plaintext to whoever asks for the
+  // key names. Fetch one value with `GetKv`, or set this to `true` (as
+  // `legion kv list --values` does) to get them all. Every other field
+  // (type, version, timestamps, `encrypted`) is returned either way.
+  bool include_values = 2;
 }
 
 // Reply payload for ListKv.
@@ -7064,6 +7283,16 @@ message ServiceEndpoint {
   // PROXY protocol v2 TLV; a plain client dialing the port directly is
   // refused at the handshake.
   bool mesh_tls = 13;
+
+  // Public host name or IP of the endpoint's node, when its worker was
+  // started with `LEGION_WORKER_PUBLIC_ADDRESS`; empty otherwise.
+  //
+  // `address` is where the cluster reaches the endpoint (usually a private
+  // address); this is where a client outside the private network reaches
+  // the same `port`, for links in the UI and CLI. Display only: nothing in
+  // the cluster dials it, and it does not open the port — the node's
+  // firewall or security group must still allow the traffic.
+  string public_address = 14;
 }
 
 // Request payload for ListServiceEdges.
@@ -7351,6 +7580,14 @@ message LedgerAllocation {
   // stateless tasks. Full instance metadata (mode, state, slot index,
   // storage handle) is available via `GetInstance` / `ListInstances`.
   optional string instance_id = 9;
+
+  // Name of the task this allocation runs (the `name` of the task config
+  // named by `task_config_id`).
+  //
+  // Lets a client group a job's allocations by task without a second
+  // lookup. Empty only when the task config row is gone, which a live
+  // allocation never sees.
+  string task_name = 11;
 }
 
 // Request payload for UpdateNodeDynamic.
@@ -7465,6 +7702,35 @@ message ListEventsRequest {
 
   // Optional severity filter. Values: `info`, `warn`, `error`.
   optional string level = 6;
+
+  // Optional stateful instance filter: only events about this instance.
+  //
+  // An event is about an instance when its `metadata_json` names it — as
+  // `instanceId` (suspend, resume, restore, fork, snapshot, volume, and
+  // provisional-start events) or `instance_id` (`node.pressure`), as one of `instances` (the
+  // forks an `instance.forked` or `instance.fork_failed` created), or as one
+  // of `suspending` (the instances an `instance.make_room` suspended) — or
+  // when it is about an allocation that fulfilled the instance, matched the
+  // way `allocation_id` matches (so `allocation.placed`, `allocation.failed`,
+  // `allocation.stopping`, and the rest). The allocation match covers
+  // allocations the manager still has a row for; events about an allocation
+  // whose row has since been pruned match only through their metadata.
+  //
+  // Combines with the other filters (AND). Matched exactly; an unknown id
+  // simply matches nothing.
+  optional string instance_id = 7;
+
+  // Optional allocation filter: only events about this allocation.
+  //
+  // Matches `SchedulerEvent.allocation_id`, and also the batched events that
+  // cover several allocations and so leave that field unset: they list them
+  // in metadata as `placements[].allocationId` (`allocation.placed`) or
+  // `allocations[].allocationId` (`allocation.stopping`,
+  // `allocation.preempted`), or `victims[].allocationId`
+  // (`allocation.preempt_planned`). A batched event lists at most its first
+  // 20 allocations, so a batch of more than 20 matches only for those 20. `allocation.removed` events name no allocation ids and never
+  // match.
+  optional int64 allocation_id = 8;
 }
 
 // Reply payload for ListEvents.
@@ -7499,6 +7765,17 @@ message StreamEventsRequest {
 
   // Optional severity filter. Values: `info`, `warn`, `error`.
   optional string level = 5;
+
+  // Optional stateful instance filter. Same semantics as
+  // `ListEventsRequest.instance_id`, with one difference for live events:
+  // the allocation match is resolved against the instance's allocations when
+  // each event arrives, so an allocation placed after the stream opened is
+  // still matched.
+  optional string instance_id = 6;
+
+  // Optional allocation filter. Same semantics as
+  // `ListEventsRequest.allocation_id`.
+  optional int64 allocation_id = 7;
 }
 
 // Internal eval queue item.

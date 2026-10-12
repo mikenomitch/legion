@@ -25,6 +25,8 @@ mod fork_ops;
 mod group_commit;
 mod snapshot_ops;
 mod suspend_ops;
+// The job status GetJobInfo/ListJobs report, derived from the workload.
+mod job_status_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -32,6 +34,7 @@ use crate::storage::persistence::{
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
+pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
 pub use snapshot_ops::{
     DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
@@ -211,6 +214,22 @@ impl EvalBatchLimits {
     }
 }
 
+/// Which eval kinds a claim may take.
+///
+/// [`ClaimScope::NonPlanning`] is the adaptive-concurrency gate's escape
+/// hatch (docs/adaptive-scheduler-concurrency.md): an eval worker refused a
+/// planning permit keeps draining the kinds that cannot conflict —
+/// `crate::manager::concurrency::NON_PLANNING_EVAL_KINDS`, today just
+/// `job_stop` — instead of parking with the queue head in reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimScope {
+    /// Any pending eval, strict `priority DESC, id ASC`.
+    #[default]
+    Any,
+    /// Only kinds that never invoke the planner, same order among them.
+    NonPlanning,
+}
+
 /// RFC3339 with the subsecond field pinned to nine digits, so the rendered
 /// string sorts lexicographically in chronological order. Used for any
 /// timestamp SQL compares or orders by (see `Store::sortable_timestamp`).
@@ -229,6 +248,18 @@ fn parse_json_column<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&raw).map(Some).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(err))
     })
+}
+
+/// A node's `publicAddress` config attribute (`LEGION_WORKER_PUBLIC_ADDRESS`
+/// on the worker): where clients outside the private network reach it.
+fn node_public_address(config_attrs: &Value) -> Option<String> {
+    config_attrs
+        .as_object()?
+        .get("publicAddress")?
+        .as_str()
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .map(str::to_string)
 }
 
 /// Extract the host portion of a node's advertised `workerAddress` config
@@ -5370,6 +5401,12 @@ impl Store {
             crate::manager::telemetry::metrics()
                 .plan_apply_total
                 .inc(&["rejected"]);
+            // A race that was LOST. The adaptive-concurrency controller's
+            // whole input signal is this counter against the two below
+            // (docs/adaptive-scheduler-concurrency.md); mirroring it into a
+            // relaxed atomic here costs the apply path one add and saves
+            // plumbing outcomes back through the store.
+            crate::manager::concurrency::conflict_window().record_rejected();
             Ok((
                 PlanApplyOutcome::Rejected {
                     reason,
@@ -5884,6 +5921,17 @@ impl Store {
         metrics
             .plan_apply_total
             .inc(&[if fallbacks > 0 { "fallback" } else { "applied" }]);
+        // Both are PROGRESS as far as the concurrency controller is concerned:
+        // a race that cost a rank is a race that was absorbed, and throttling
+        // to avoid absorbed races would be throttling to avoid late binding
+        // working. The split is kept so the diagnostic can show the absorbed
+        // rate separately.
+        let window = crate::manager::concurrency::conflict_window();
+        if fallbacks > 0 {
+            window.record_fallback();
+        } else {
+            window.record_applied();
+        }
         if !preempted.victims.is_empty() {
             let metrics = crate::manager::telemetry::metrics();
             for (pool, band, count) in preempted.metric_rows {
@@ -8987,7 +9035,7 @@ impl Store {
         Ok(status)
     }
 
-    /// Clear a `failed` job status (back to `done`) when a KV-triggered
+    /// Clear a `failed` job status (back to `active`) when a KV-triggered
     /// restart or rollout actively recovers the job. No-op when the job is
     /// not currently failed. Returns whether a row was updated.
     #[instrument(err, skip(self))]
@@ -9001,14 +9049,14 @@ impl Store {
     fn clear_job_failed_status_apply(&self, job_id: &str) -> R<bool> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
-            "UPDATE job SET status = 'done', updated_at = ?2 \
+            "UPDATE job SET status = 'active', updated_at = ?2 \
              WHERE id = ?1 AND status = 'failed';",
             params![job_id, Self::now_unix()],
         )?;
         Ok(updated > 0)
     }
 
-    /// Clear a `stopped` job status (back to `done`) when the job is
+    /// Clear a `stopped` job status (back to `active`) when the job is
     /// resubmitted via RunJob. A resubmit revives the job, so the
     /// instance-management RPCs (CreateInstance/StartInstance), which reject
     /// stopped jobs, must accept it again. Stopped keyed instances
@@ -9026,7 +9074,7 @@ impl Store {
     fn clear_job_stopped_status_apply(&self, job_id: &str) -> R<bool> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
-            "UPDATE job SET status = 'done', updated_at = ?2 \
+            "UPDATE job SET status = 'active', updated_at = ?2 \
              WHERE id = ?1 AND status = 'stopped';",
             params![job_id, Self::now_unix()],
         )?;
@@ -10084,7 +10132,7 @@ impl Store {
                 let job_params = named_params! {
                     ":id": config.name,
                     ":name": config.name,
-                    ":status": "done",
+                    ":status": "active",
                     ":created_at": now,
                     ":updated_at": now,
                 };
@@ -11704,6 +11752,48 @@ impl Store {
         if let Some(level) = filter.level.as_deref() {
             clauses.push(format!("level = ?{}", params.len() + 1));
             params.push(Box::new(level.to_string()));
+        }
+        // Batched allocation events list their allocations in metadata
+        // instead of the column (`events::event_allocation_ids`). The path is
+        // built per array index against the whole document so a malformed
+        // entry reads as NULL rather than failing the query.
+        // `test` is the SQL that follows the listed id, e.g. `= ?3`.
+        let listed_allocation = |test: &str| {
+            crate::storage::events::ALLOCATION_LIST_META_KEYS
+                .iter()
+                .map(|key| {
+                    format!(
+                        "EXISTS (SELECT 1 FROM json_each(metadata_json, '$.{key}') AS entry
+                          WHERE json_extract(metadata_json, '$.{key}[' || entry.key || '].allocationId') {test})"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        };
+        if let Some(allocation_id) = filter.allocation_id {
+            let n = params.len() + 1;
+            clauses.push(format!(
+                "(allocation_id = ?{n} OR {})",
+                listed_allocation(&format!("= ?{n}"))
+            ));
+            params.push(Box::new(allocation_id));
+        }
+        if let Some(instance_id) = filter.instance_id.as_deref() {
+            // Mirrors `events::event_names_instance`, plus the allocations
+            // that fulfilled the instance. One bound parameter, reused.
+            let n = params.len() + 1;
+            clauses.push(format!(
+                "(json_extract(metadata_json, '$.instanceId') = ?{n}
+                  OR json_extract(metadata_json, '$.instance_id') = ?{n}
+                  OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.instances') WHERE value = ?{n})
+                  OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.suspending') WHERE value = ?{n})
+                  OR allocation_id IN (SELECT id FROM allocation WHERE instance_id = ?{n})
+                  OR {})",
+                listed_allocation(&format!(
+                    "IN (SELECT id FROM allocation WHERE instance_id = ?{n})"
+                ))
+            ));
+            params.push(Box::new(instance_id.to_string()));
         }
         let where_clause = if clauses.is_empty() {
             String::new()
@@ -13829,6 +13919,28 @@ impl Store {
             .collect())
     }
 
+    /// Task name per task config id, for the ids given. Ids with no row are
+    /// absent from the map.
+    #[instrument(err, skip_all)]
+    pub fn task_names_for_configs(&self, task_config_ids: &[i64]) -> R<HashMap<i64, String>> {
+        let mut ids = task_config_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id, name FROM task_config WHERE id IN ({placeholders});");
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(ids.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(Self::collect_rows(rows)?.into_iter().collect())
+    }
+
     /// The catalog projection behind [`Store::service_endpoints`], optionally
     /// narrowed to one service name (bound as `?1`).
     ///
@@ -13936,6 +14048,7 @@ impl Store {
                 .as_ref()
                 .and_then(|network| network.address.clone())
                 .or_else(|| node_config_attrs.as_ref().and_then(worker_address_host));
+            let public_address = node_config_attrs.as_ref().and_then(node_public_address);
 
             // Nodes report `active`/`ready` while alive; `lost` (or a missing
             // row) is the dead state. Endpoint liveness is leased on this.
@@ -13958,6 +14071,7 @@ impl Store {
                 allocation_id,
                 node_id,
                 address,
+                public_address,
                 port,
                 healthy,
                 health_status,
@@ -16399,9 +16513,10 @@ impl Store {
         &self,
         completions: Vec<(String, EvalCompletion)>,
         limits: EvalBatchLimits,
+        scope: ClaimScope,
     ) -> R<Vec<Eval>> {
         self.write_eval_completions(completions)?;
-        self.claim_evals(limits)
+        self.claim_evals(limits, scope)
     }
 
     /// Finish one handled eval AND claim its next one: the single-eval form
@@ -17591,20 +17706,55 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn get_kv(&self, key: &str) -> R<Option<KvEntry>> {
+        self.get_kv_raw(key)?
+            .map(|raw| self.kv_entry_from_raw(raw))
+            .transpose()
+    }
+
+    /// [`Store::get_kv`] without the value: the entry comes back with an
+    /// empty `value`, and nothing is decrypted.
+    #[instrument(err, skip_all)]
+    pub fn get_kv_metadata(&self, key: &str) -> R<Option<KvEntry>> {
+        Ok(self.get_kv_raw(key)?.map(|raw| KvEntry {
+            value: String::new(),
+            ..raw.entry
+        }))
+    }
+
+    fn get_kv_raw(&self, key: &str) -> R<Option<KvRaw>> {
         Self::ensure_kv_key(key)?;
-        let raw = {
-            let conn = self.read_connection()?;
-            conn.query_row(&format!("{KV_ENTRY_SELECT} WHERE key = ?;"), [key], |row| {
+        let conn = self.read_connection()?;
+        Ok(conn
+            .query_row(&format!("{KV_ENTRY_SELECT} WHERE key = ?;"), [key], |row| {
                 self.kv_raw_from_row(row)
             })
-            .optional()?
-        };
-
-        raw.map(|raw| self.kv_entry_from_raw(raw)).transpose()
+            .optional()?)
     }
 
     #[instrument(err, skip_all)]
     pub fn list_kv(&self, prefix: &str) -> R<Vec<KvEntry>> {
+        self.list_kv_raw(prefix)?
+            .into_iter()
+            .map(|raw| self.kv_entry_from_raw(raw))
+            .collect()
+    }
+
+    /// [`Store::list_kv`] without the values: every entry comes back with an
+    /// empty `value`, and nothing is decrypted, so browsing key names never
+    /// touches the keyring (and works while it is locked).
+    #[instrument(err, skip_all)]
+    pub fn list_kv_keys(&self, prefix: &str) -> R<Vec<KvEntry>> {
+        Ok(self
+            .list_kv_raw(prefix)?
+            .into_iter()
+            .map(|raw| KvEntry {
+                value: String::new(),
+                ..raw.entry
+            })
+            .collect())
+    }
+
+    fn list_kv_raw(&self, prefix: &str) -> R<Vec<KvRaw>> {
         let raws = {
             let conn = self.read_connection()?;
             let pattern = format!("{prefix}%");
@@ -17614,9 +17764,7 @@ impl Store {
             let rows = stmt.query_map([pattern], |row| self.kv_raw_from_row(row))?;
             Self::collect_rows(rows)?
         };
-        raws.into_iter()
-            .map(|raw| self.kv_entry_from_raw(raw))
-            .collect()
+        Ok(raws)
     }
 
     #[instrument(err, skip_all)]
@@ -22211,6 +22359,96 @@ mod tests {
         Ok(())
     }
 
+    /// The throttled worker's claim (docs/adaptive-scheduler-concurrency.md).
+    ///
+    /// It must skip every kind that can reach the planner — including the
+    /// higher-priority one at the head of the queue, which is the whole point
+    /// — while preserving `ORDER BY priority DESC, id ASC` among the rest, and
+    /// applying the same dedupe sweep and queue-depth gauge as an unscoped
+    /// claim.
+    #[test]
+    fn a_non_planning_claim_skips_planning_kinds_and_keeps_priority_order() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(&store, "job-a", vec![task("api")])?;
+        let cfg = Some(job_config_id.as_str());
+        let other_config_id = submit_job(&store, "job-b", vec![task("api")])?;
+        let other_cfg = Some(other_config_id.as_str());
+        let one_at_a_time = EvalBatchLimits { max: 1, workers: 1 };
+
+        // A high-priority planning eval at the head, a rollout tick (which
+        // also plans, through `handle_rollout_tick`), and two stops.
+        store.enqueue_eval("job_submit", Some("job-a"), cfg, None, Some(90))?;
+        store.enqueue_eval("rollout_tick", Some("job-a"), cfg, None, Some(80))?;
+        store.enqueue_eval("job_stop", Some("job-b"), other_cfg, None, Some(10))?;
+        store.enqueue_eval("job_stop", Some("job-a"), cfg, None, Some(50))?;
+
+        // Priority order among the claimable rows: the 50 before the 10.
+        let claimed = store.claim_evals(one_at_a_time, ClaimScope::NonPlanning)?;
+        let [stop] = claimed.as_slice() else {
+            panic!("expected exactly one stop, got {claimed:?}");
+        };
+        assert_eq!(
+            (stop.kind.as_str(), stop.job_id.as_str()),
+            ("job_stop", "job-a")
+        );
+        assert_eq!(stop.status, "in_flight");
+        store.complete_eval(&stop.id, true)?;
+
+        let claimed = store.claim_evals(one_at_a_time, ClaimScope::NonPlanning)?;
+        assert_eq!(claimed.len(), 1, "the second stop is claimable too");
+        assert_eq!(claimed[0].job_id, "job-b");
+        store.complete_eval(&claimed[0].id, true)?;
+
+        // The planning work is untouched and still in its original order.
+        assert!(
+            store
+                .claim_evals(one_at_a_time, ClaimScope::NonPlanning)?
+                .is_empty(),
+            "planning kinds are never handed to a throttled worker"
+        );
+        let pending: Vec<String> = store
+            .get_evals()?
+            .into_iter()
+            .filter(|eval| eval.status == "pending")
+            .map(|eval| eval.kind)
+            .collect();
+        assert_eq!(
+            pending,
+            vec!["job_submit".to_string(), "rollout_tick".to_string()]
+        );
+        let claimed = store.claim_eval()?.context("unthrottled claims the head")?;
+        assert_eq!(claimed.kind, "job_submit");
+
+        Ok(())
+    }
+
+    /// A throttled worker's claim collapses redundant work exactly as an
+    /// unthrottled one does — the sweep is shared, not duplicated.
+    #[test]
+    fn a_non_planning_claim_applies_the_same_dedupe_sweep() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(&store, "job-a", vec![task("api")])?;
+        let cfg = Some(job_config_id.as_str());
+
+        store.enqueue_eval("job_stop", Some("job-a"), cfg, None, Some(50))?;
+        store.enqueue_eval("job_stop", Some("job-a"), cfg, None, Some(50))?;
+
+        let claimed = store.claim_evals(
+            EvalBatchLimits { max: 1, workers: 1 },
+            ClaimScope::NonPlanning,
+        )?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].kind, "job_stop");
+        let pending = store
+            .get_evals()?
+            .into_iter()
+            .filter(|eval| eval.status == "pending")
+            .count();
+        assert_eq!(pending, 0, "the duplicate stop was collapsed");
+
+        Ok(())
+    }
+
     #[test]
     fn zero_delay_evals_are_immediately_claimable() -> R<()> {
         let store = setup_store()?;
@@ -25381,6 +25619,73 @@ mod tests {
         Ok(())
     }
 
+    /// The status GetJobInfo/ListJobs report follows the workload: a service
+    /// with a placed allocation is `running`, a batch job reads `pending`
+    /// until placed, `running` while its process runs, and `complete` once
+    /// it exits 0. The stored lifecycle column stays `active` throughout.
+    #[test]
+    fn derived_job_status_follows_the_workload_test() -> R<()> {
+        let store = setup_store()?;
+        let mut node = make_node_msg("node-a", "ready");
+        node.dynamic_attrs = json!({ "protocolVersion": 2 }).to_string();
+        store.insert_node(node)?;
+        let submit = |name: &str, lifecycle: TaskLifecycle| -> R<String> {
+            let job = JobConfig {
+                priority: Default::default(),
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: name.into(),
+                tasks: vec![TaskConfig {
+                    lifecycle,
+                    ..TaskConfig::new("main", "exec")
+                }],
+                version: None,
+            };
+            store.handle_job_submit(
+                &job,
+                &[Submission {
+                    path: "job.ncl".into(),
+                    content: name.into(),
+                    is_primary: true,
+                }],
+            )?;
+            Ok(store.get_job_config(name)?.id())
+        };
+        let status = |name: &str| -> R<String> { Ok(store.get_job_with_status(name)?.status) };
+
+        let web_config = submit("web", TaskLifecycle::Service)?;
+        let batch_config = submit("nightly", TaskLifecycle::Batch)?;
+        assert_eq!(status("web")?, "pending");
+        assert_eq!(status("nightly")?, "pending");
+
+        let scheduler = Scheduler::new(&store)?;
+        let web = scheduler.plan_and_apply(&web_config, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&web.allocations)?;
+        let batch = scheduler.plan_and_apply(&batch_config, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&batch.allocations)?;
+        assert_eq!(status("web")?, "running");
+        assert_eq!(status("nightly")?, "running");
+
+        store.complete_allocation(batch.allocations[0].id, true)?;
+        assert_eq!(status("nightly")?, "complete");
+        assert_eq!(status("web")?, "running");
+        assert_eq!(store.get_job("nightly")?.status, "active");
+
+        // The list read derives the same answer in one pass.
+        let listed: HashMap<String, String> = store
+            .get_jobs_with_status()?
+            .into_iter()
+            .map(|job| (job.name, job.status))
+            .collect();
+        assert_eq!(listed.get("web").map(String::as_str), Some("running"));
+        assert_eq!(listed.get("nightly").map(String::as_str), Some("complete"));
+
+        store.stop_job("web")?;
+        assert_eq!(status("web")?, "stopped");
+
+        Ok(())
+    }
+
     #[test]
     fn artifact_staging_transitions_emit_events_once() -> R<()> {
         let store = setup_store()?;
@@ -25823,6 +26128,118 @@ mod tests {
         let placed = &all[2];
         assert_eq!(placed.metadata_json, json!({ "count": 2 }).to_string());
 
+        Ok(())
+    }
+
+    #[test]
+    fn event_filter_by_instance_matches_metadata_and_allocations() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(usage_node_msg("node-a", "{}"))?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "inst".into(),
+            tasks: vec![TaskConfig::new("box", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[])?;
+        let job_config_id = store.get_job_config("inst")?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+        store.write_connection()?.execute(
+            "UPDATE allocation SET instance_id = 'box-1' WHERE id = ?1;",
+            [allocation.id],
+        )?;
+        store.refresh_read_model()?;
+
+        let emit = |kind: &str, meta: Value, allocation_id: Option<i64>| {
+            let mut draft = EventDraft::info(kind, kind).meta(meta);
+            if let Some(id) = allocation_id {
+                draft = draft.allocation(id);
+            }
+            store.emit_event(draft);
+        };
+        emit("instance.suspended", json!({ "instanceId": "box-1" }), None);
+        emit("node.pressure", json!({ "instance_id": "box-1" }), None);
+        emit(
+            "instance.forked",
+            json!({ "instanceId": "box-0", "instances": ["box-1"] }),
+            None,
+        );
+        emit("allocation.failed", json!({}), Some(allocation.id));
+        emit(
+            "allocation.placed",
+            json!({ "placements": [{ "allocationId": allocation.id + 500 }, { "allocationId": allocation.id }] }),
+            None,
+        );
+        emit("instance.suspended", json!({ "instanceId": "box-2" }), None);
+        emit("allocation.failed", json!({}), Some(allocation.id + 1000));
+        emit(
+            "allocation.stopping",
+            json!({ "allocations": [{ "allocationId": allocation.id + 1000 }, "malformed"] }),
+            None,
+        );
+
+        let filter = SchedulerEventFilter {
+            instance_id: Some("box-1".into()),
+            ..Default::default()
+        };
+        let kinds: Vec<String> = store
+            .list_scheduler_events(&filter)?
+            .into_iter()
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "instance.suspended",
+                "node.pressure",
+                "instance.forked",
+                "allocation.failed",
+                "allocation.placed"
+            ]
+        );
+
+        // The live-stream form agrees once it can resolve allocations.
+        let all = store.list_scheduler_events(&SchedulerEventFilter::default())?;
+        let streamed = all
+            .iter()
+            .filter(|event| {
+                filter.matches_with(event, |id| {
+                    (id == allocation.id).then(|| "box-1".to_string())
+                })
+            })
+            .count();
+        assert_eq!(streamed, 5);
+
+        // A batched event names its allocations in metadata, not the column.
+        let by_allocation = store.list_scheduler_events(&SchedulerEventFilter {
+            allocation_id: Some(allocation.id),
+            ..Default::default()
+        })?;
+        let kinds: Vec<&str> = by_allocation
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["allocation.failed", "allocation.placed"]);
+        let by_other = store.list_scheduler_events(&SchedulerEventFilter {
+            allocation_id: Some(allocation.id + 1000),
+            ..Default::default()
+        })?;
+        assert_eq!(by_other.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn list_kv_keys_omits_values() -> R<()> {
+        let store = setup_store()?;
+        store.put_kv("app/secret", "hunter2", KvValueType::String, None, None)?;
+        let keys = store.list_kv_keys("app/")?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "app/secret");
+        assert_eq!(keys[0].value, "");
+        assert_eq!(store.list_kv("app/")?[0].value, "hunter2");
         Ok(())
     }
 
@@ -27940,6 +28357,34 @@ mod tests {
         assert_eq!(endpoints[0].service, "web");
         // The corrupt row itself simply resolves to nothing.
         assert!(store.service_endpoints(Some("other"))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn service_endpoints_carry_the_node_public_address() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(NodeMsg {
+            config_attrs: json!({
+                "workerAddress": "http://10.0.0.7:4848",
+                "publicAddress": "203.0.113.7",
+            })
+            .to_string(),
+            ..make_node_msg("node-pub", "ready")
+        })?;
+        store.insert_node(make_node_msg("node-priv", "ready"))?;
+        submit_service_job(&store, "svc-pub", vec![service_task("web")])?;
+        let task_id = task_id_for(&store, "web", "svc-pub")?;
+        store.place_alloc("node-pub", task_id)?;
+        store.place_alloc("node-priv", task_id)?;
+
+        let mut endpoints = store.service_endpoints(Some("web"))?;
+        endpoints.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        assert_eq!(endpoints[0].node_id, "node-priv");
+        assert_eq!(endpoints[0].public_address, None);
+        assert_eq!(endpoints[1].node_id, "node-pub");
+        assert_eq!(endpoints[1].public_address.as_deref(), Some("203.0.113.7"));
+        // The in-cluster address is untouched: nothing dials the public one.
+        assert_eq!(endpoints[1].address.as_deref(), Some("10.0.0.7"));
         Ok(())
     }
 

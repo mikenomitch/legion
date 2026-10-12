@@ -21,6 +21,9 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Late-Binding Plan Apply](late-binding-plan-apply.md): ranked candidate
   lists with commit-time node choice, and the conflict-requeue backstop. Shows
   how concurrent submits stop fighting over one node.
+- [Adaptive Scheduler Concurrency](adaptive-scheduler-concurrency.md): the
+  manager measures its own plan-apply conflict rate and decides how many evals
+  it plans at once, so `evalThreads` becomes a ceiling instead of a guess.
 - [Jobs, Tasks, and Scheduling](jobs-tasks-and-scheduling.md): job spec shapes,
   placement semantics, and edge cases.
 - [State Store](state-store.md): manager and worker persistence.

@@ -1,4 +1,4 @@
-import { A } from '@solidjs/router'
+import { A, useNavigate } from '@solidjs/router'
 import { For, Show, createMemo, createSignal } from 'solid-js'
 import type { ServiceEdge } from '../gen/legion_pb'
 import { Badge, EmptyState, MonoBadge, TableShell, cx, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
@@ -47,6 +47,9 @@ type Node = { id: string; label: string; kind: 'service' | 'caller'; x: number; 
 // outgoing edges leave from there — the layout stays readable for the
 // dozens of services a cluster has, which is the audience of this view.
 export function ServiceGraphSvg(props: { edges: ServiceEdge[]; selected?: string; onSelect?: (key: string) => void }) {
+  const navigate = useNavigate()
+  const nodeHref = (node: Node) =>
+    node.kind === 'service' ? `/services/${encodeURIComponent(node.id)}` : `/jobs/${encodeURIComponent(node.id)}`
   const layout = createMemo(() => {
     const services = new Set<string>()
     const callers = new Set<string>()
@@ -55,7 +58,7 @@ export function ServiceGraphSvg(props: { edges: ServiceEdge[]; selected?: string
       const caller = edge.callerJob
       if (!services.has(caller)) callers.add(caller)
     }
-    const width = 720
+    const width = 880
     const rowH = 34
     const rows = Math.max(services.size, callers.size, 1)
     const height = Math.max(120, rows * rowH + 40)
@@ -74,7 +77,13 @@ export function ServiceGraphSvg(props: { edges: ServiceEdge[]; selected?: string
 
   return (
     <div class="overflow-x-auto">
-      <svg viewBox={`0 0 ${layout().width} ${layout().height}`} class="w-full min-w-[560px]" style={{ 'max-height': '520px' }}>
+      {/* Drawn at its natural size and never scaled up: stretched to a wide
+          card, the labels and nodes would grow with it (2×+ on a desktop). */}
+      <svg
+        viewBox={`0 0 ${layout().width} ${layout().height}`}
+        class="mx-auto block w-full min-w-[560px]"
+        style={{ 'max-width': `${layout().width}px`, 'max-height': '520px' }}
+      >
         <defs>
           <marker id="graph-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
@@ -128,17 +137,32 @@ export function ServiceGraphSvg(props: { edges: ServiceEdge[]; selected?: string
         </For>
         <For each={layout().nodes}>
           {(node) => (
-            <g>
+            // Each box opens what it names: a service its service page, a
+            // caller (a job) its job page.
+            <g
+              class="group cursor-pointer outline-none"
+              role="link"
+              tabindex="0"
+              aria-label={node.kind === 'service' ? `Service ${node.id}` : `Job ${node.id}`}
+              onClick={() => navigate(nodeHref(node))}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') navigate(nodeHref(node))
+              }}
+            >
+              <title>{node.kind === 'service' ? `Open service ${node.id}` : `Open job ${node.id}`}</title>
               <rect
                 x={node.x - 70}
                 y={node.y - 12}
                 width={140}
                 height={24}
                 rx={6}
-                class={cx('stroke-line', node.kind === 'service' ? 'fill-surface2' : 'fill-surface')}
+                class={cx(
+                  'stroke-line transition-colors group-hover:stroke-brass group-focus-visible:stroke-brass',
+                  node.kind === 'service' ? 'fill-surface2' : 'fill-surface',
+                )}
                 stroke-width={1}
               />
-              <text x={node.x} y={node.y + 4} text-anchor="middle" class="fill-ink font-mono" font-size="11">
+              <text x={node.x} y={node.y + 4} text-anchor="middle" class="fill-ink font-mono group-hover:fill-brass-strong" font-size="11">
                 {node.label.length > 20 ? `${node.label.slice(0, 19)}…` : node.label}
               </text>
             </g>

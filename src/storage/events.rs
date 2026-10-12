@@ -184,6 +184,65 @@ pub mod drafts {
         .meta(json!({ "requeued": requeued_evals }))
     }
 
+    /// `scheduler.concurrency_adjusted` — the adaptive concurrency controller
+    /// moved the number of planners it admits
+    /// (docs/adaptive-scheduler-concurrency.md).
+    ///
+    /// Emitted on the CHANGE, never per tick: a control loop that narrates
+    /// every 500ms tick is noise an operator learns to ignore.
+    pub fn scheduler_concurrency_adjusted(
+        direction: &str,
+        from: usize,
+        to: usize,
+        ceiling: usize,
+        conflict_rate: f64,
+        mode: &str,
+    ) -> EventDraft {
+        let shadow = if mode == "enforce" { "" } else { " (shadow)" };
+        EventDraft::info(
+            "scheduler.concurrency_adjusted",
+            format!(
+                "Admitted planners {from} -> {to} of {ceiling}{shadow}: conflict rate \
+                 {percent:.1}%",
+                percent = conflict_rate * 100.0,
+            ),
+        )
+        .meta(json!({
+            "direction": direction,
+            "from": from,
+            "to": to,
+            "ceiling": ceiling,
+            "conflictRate": conflict_rate,
+            "mode": mode,
+        }))
+    }
+
+    /// `scheduler.concurrency_saturated` — backing off did not improve
+    /// goodput, so the conflicts are capacity-driven rather than
+    /// concurrency-driven. The distinction matters because "add nodes" and
+    /// "wait" are very different responses, and no other signal separates
+    /// them.
+    pub fn scheduler_concurrency_saturated(
+        restored_to: usize,
+        goodput_before: f64,
+        goodput_after: f64,
+    ) -> EventDraft {
+        EventDraft::warn(
+            "scheduler.concurrency_saturated",
+            format!(
+                "Reducing scheduler concurrency did not improve goodput \
+                 ({goodput_before:.0} -> {goodput_after:.0} placements/sec); conflicts are \
+                 capacity-driven, not concurrency-driven. Restored the limit to \
+                 {restored_to} — add nodes rather than waiting"
+            ),
+        )
+        .meta(json!({
+            "restoredTo": restored_to,
+            "goodputBefore": goodput_before,
+            "goodputAfter": goodput_after,
+        }))
+    }
+
     /// `eval.enqueued` — an eval was added to the queue.
     pub fn eval_enqueued(eval: &Eval, delay: Duration) -> EventDraft {
         EventDraft::info(
@@ -1969,6 +2028,38 @@ impl EventRecorder<'_> {
         self.emit(drafts::scheduler_recovered(requeued_evals));
     }
 
+    pub fn scheduler_concurrency_adjusted(
+        self,
+        direction: &str,
+        from: usize,
+        to: usize,
+        ceiling: usize,
+        conflict_rate: f64,
+        mode: &str,
+    ) {
+        self.emit(drafts::scheduler_concurrency_adjusted(
+            direction,
+            from,
+            to,
+            ceiling,
+            conflict_rate,
+            mode,
+        ));
+    }
+
+    pub fn scheduler_concurrency_saturated(
+        self,
+        restored_to: usize,
+        goodput_before: f64,
+        goodput_after: f64,
+    ) {
+        self.emit(drafts::scheduler_concurrency_saturated(
+            restored_to,
+            goodput_before,
+            goodput_after,
+        ));
+    }
+
     pub fn allocations_removed_from_node(
         self,
         node_id: &str,
@@ -2395,6 +2486,64 @@ pub struct SchedulerEventFilter {
     pub job_id: Option<String>,
     pub node_id: Option<String>,
     pub level: Option<String>,
+    /// Stateful instance filter: events whose metadata names the instance,
+    /// or whose allocation fulfilled it (see [`event_names_instance`]).
+    pub instance_id: Option<String>,
+    /// Exact allocation ID filter.
+    pub allocation_id: Option<i64>,
+}
+
+/// Metadata keys that name the instance an event is about. `instance_id` is
+/// the `node.pressure` spelling (that event's metadata is snake_case
+/// throughout); everything else uses `instanceId`.
+const INSTANCE_ID_META_KEYS: [&str; 2] = ["instanceId", "instance_id"];
+/// Metadata arrays whose members are instances the event is also about: the
+/// forks of `instance.forked` / `instance.fork_failed`, and the instances an
+/// `instance.make_room` suspended.
+const INSTANCE_LIST_META_KEYS: [&str; 2] = ["instances", "suspending"];
+
+/// Whether an event's metadata names `instance_id`, as its subject or as one
+/// of the instances it lists. The SQL in `Store::list_scheduler_events`
+/// mirrors this.
+pub fn event_names_instance(metadata_json: &str, instance_id: &str) -> bool {
+    let Ok(Value::Object(meta)) = serde_json::from_str::<Value>(metadata_json) else {
+        return false;
+    };
+    INSTANCE_ID_META_KEYS
+        .iter()
+        .any(|key| meta.get(*key).and_then(Value::as_str) == Some(instance_id))
+        || INSTANCE_LIST_META_KEYS.iter().any(|key| {
+            meta.get(*key)
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(instance_id)))
+        })
+}
+
+/// Metadata arrays of `{ "allocationId": n, ... }` entries naming the
+/// allocations a batched event covers: `placements` on `allocation.placed`,
+/// `allocations` on `allocation.stopping` and `allocation.preempted`,
+/// `victims` on `allocation.preempt_planned`. Those events leave the
+/// `allocation_id` column unset (they cover several). `Store::
+/// list_scheduler_events` matches the same keys.
+pub const ALLOCATION_LIST_META_KEYS: [&str; 3] = ["placements", "allocations", "victims"];
+
+/// Every allocation an event is about: its `allocation_id` column plus the
+/// ids a batched event lists in its metadata. The SQL in
+/// `Store::list_scheduler_events` mirrors this.
+pub fn event_allocation_ids(event: &SchedulerEventRecord) -> Vec<i64> {
+    let mut ids: Vec<i64> = event.allocation_id.into_iter().collect();
+    if let Ok(Value::Object(meta)) = serde_json::from_str::<Value>(&event.metadata_json) {
+        for key in ALLOCATION_LIST_META_KEYS {
+            let entries = meta.get(key).and_then(Value::as_array);
+            ids.extend(
+                entries
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.get("allocationId").and_then(Value::as_i64)),
+            );
+        }
+    }
+    ids
 }
 
 impl SchedulerEventFilter {
@@ -2404,7 +2553,22 @@ impl SchedulerEventFilter {
 
     /// Whether a live event passes this filter. Mirrors the SQL applied by
     /// `Store::list_scheduler_events` so streamed and listed results agree.
+    ///
+    /// The instance filter's allocation half needs the store, so this form
+    /// matches an instance through event metadata only; the event stream
+    /// uses [`SchedulerEventFilter::matches_with`].
     pub fn matches(&self, event: &SchedulerEventRecord) -> bool {
+        self.matches_with(event, |_| None)
+    }
+
+    /// [`SchedulerEventFilter::matches`], resolving the instance an
+    /// allocation fulfilled through `allocation_instance` when the event's
+    /// metadata does not name the filtered instance itself.
+    pub fn matches_with(
+        &self,
+        event: &SchedulerEventRecord,
+        allocation_instance: impl Fn(i64) -> Option<String>,
+    ) -> bool {
         if let Some(after_id) = self.after_id {
             if event.id <= after_id {
                 return false;
@@ -2431,6 +2595,22 @@ impl SchedulerEventFilter {
         }
         if let Some(level) = self.level.as_deref() {
             if event.level != level {
+                return false;
+            }
+        }
+        if let Some(allocation_id) = self.allocation_id {
+            if !event_allocation_ids(event).contains(&allocation_id) {
+                return false;
+            }
+        }
+        if let Some(instance_id) = self.instance_id.as_deref() {
+            let named = event_names_instance(&event.metadata_json, instance_id);
+            let fulfilled = || {
+                event_allocation_ids(event)
+                    .into_iter()
+                    .any(|id| allocation_instance(id).is_some_and(|owner| owner == instance_id))
+            };
+            if !named && !fulfilled() {
                 return false;
             }
         }

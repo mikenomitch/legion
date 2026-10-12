@@ -753,7 +753,7 @@ fn enqueue_evals_creates_every_row_in_one_op() -> R<()> {
 /// batch to fill.
 #[test]
 fn claim_evals_of_one_matches_the_single_claim() -> R<()> {
-    use legion::storage::store::EvalBatchLimits;
+    use legion::storage::store::{ClaimScope, EvalBatchLimits};
 
     let store = setup_store()?;
     let limits = EvalBatchLimits {
@@ -762,16 +762,16 @@ fn claim_evals_of_one_matches_the_single_claim() -> R<()> {
     };
 
     // Empty queue: an empty batch, immediately — no waiting to fill.
-    assert!(store.claim_evals(limits)?.is_empty());
+    assert!(store.claim_evals(limits, ClaimScope::Any)?.is_empty());
 
     let enqueued = store.enqueue_eval("job_reschedule", Some("a"), Some("ac"), None, None)?;
-    let batch = store.claim_evals(limits)?;
+    let batch = store.claim_evals(limits, ClaimScope::Any)?;
     assert_eq!(batch.len(), 1, "a one-deep queue must yield a batch of one");
     assert_eq!(batch[0].id, enqueued.id);
     assert_eq!(batch[0].status, "in_flight");
 
     // And the queue is genuinely drained, not merely under-served.
-    assert!(store.claim_evals(limits)?.is_empty());
+    assert!(store.claim_evals(limits, ClaimScope::Any)?.is_empty());
     assert!(store.claim_eval()?.is_none());
     Ok(())
 }
@@ -782,7 +782,7 @@ fn claim_evals_of_one_matches_the_single_claim() -> R<()> {
 /// holds across successive single claims.
 #[test]
 fn claim_evals_preserves_priority_order_across_the_batch() -> R<()> {
-    use legion::storage::store::EvalBatchLimits;
+    use legion::storage::store::{ClaimScope, EvalBatchLimits};
 
     let store = setup_store()?;
     // Distinct jobs, so the claim's superseded-eval sweep (same kind + same
@@ -805,10 +805,13 @@ fn claim_evals_preserves_priority_order_across_the_batch() -> R<()> {
 
     // One worker, so the share is the whole queue: the batch sees every row
     // and any reordering would show up here.
-    let batch = store.claim_evals(EvalBatchLimits {
-        max: 16,
-        workers: 1,
-    })?;
+    let batch = store.claim_evals(
+        EvalBatchLimits {
+            max: 16,
+            workers: 1,
+        },
+        ClaimScope::Any,
+    )?;
     assert_eq!(batch.len(), 5);
 
     let priorities: Vec<i64> = batch.iter().map(|eval| eval.priority).collect();
@@ -835,7 +838,7 @@ fn claim_evals_preserves_priority_order_across_the_batch() -> R<()> {
 #[test]
 fn complete_evals_and_claim_next_settles_the_batch_and_claims_more() -> R<()> {
     use legion::storage::events::drafts;
-    use legion::storage::store::{EvalBatchLimits, EvalCompletion};
+    use legion::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion};
 
     let store = setup_store()?;
     let limits = EvalBatchLimits { max: 2, workers: 1 };
@@ -849,7 +852,7 @@ fn complete_evals_and_claim_next_settles_the_batch_and_claims_more() -> R<()> {
         )?;
     }
 
-    let first = store.claim_evals(limits)?;
+    let first = store.claim_evals(limits, ClaimScope::Any)?;
     assert_eq!(first.len(), 2, "max caps the batch at 2");
 
     let completions: Vec<(String, EvalCompletion)> = first
@@ -869,7 +872,7 @@ fn complete_evals_and_claim_next_settles_the_batch_and_claims_more() -> R<()> {
         })
         .collect();
 
-    let second = store.complete_evals_and_claim_next(completions, limits)?;
+    let second = store.complete_evals_and_claim_next(completions, limits, ClaimScope::Any)?;
     assert_eq!(
         second.len(),
         2,
@@ -908,7 +911,7 @@ fn complete_evals_and_claim_next_settles_the_batch_and_claims_more() -> R<()> {
         })
         .collect();
     assert!(store
-        .complete_evals_and_claim_next(completions, limits)?
+        .complete_evals_and_claim_next(completions, limits, ClaimScope::Any)?
         .is_empty());
     assert!(store.get_evals()?.is_empty());
     Ok(())
@@ -930,7 +933,7 @@ fn complete_evals_and_claim_next_settles_the_batch_and_claims_more() -> R<()> {
 #[test]
 fn an_unobserved_batch_member_stays_in_flight_and_is_recovered() -> R<()> {
     use legion::storage::events::drafts;
-    use legion::storage::store::{EvalBatchLimits, EvalCompletion};
+    use legion::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion};
 
     let store = setup_store()?;
     let limits = EvalBatchLimits { max: 8, workers: 1 };
@@ -944,7 +947,7 @@ fn an_unobserved_batch_member_stays_in_flight_and_is_recovered() -> R<()> {
         )?;
     }
 
-    let batch = store.claim_evals(limits)?;
+    let batch = store.claim_evals(limits, ClaimScope::Any)?;
     assert_eq!(batch.len(), 3);
     let casualty = batch[1].clone();
 
@@ -974,7 +977,7 @@ fn an_unobserved_batch_member_stays_in_flight_and_is_recovered() -> R<()> {
             },
         ),
     ];
-    let next = store.complete_evals_and_claim_next(completions, limits)?;
+    let next = store.complete_evals_and_claim_next(completions, limits, ClaimScope::Any)?;
     assert!(
         next.is_empty(),
         "the casualty is in flight, so nothing is claimable"
@@ -1003,7 +1006,7 @@ fn an_unobserved_batch_member_stays_in_flight_and_is_recovered() -> R<()> {
     // Recovery: the leadership-acquisition hook forgets the claim; the row
     // was never rewritten, so there is nothing to requeue in the store.
     assert_eq!(store.requeue_in_flight_evals()?, 0);
-    let recovered = store.claim_evals(limits)?;
+    let recovered = store.claim_evals(limits, ClaimScope::Any)?;
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].id, casualty.id);
     Ok(())

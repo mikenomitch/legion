@@ -24,7 +24,23 @@ export function AccessGate(props: { resource: AclResource; children: JSX.Element
   )
 }
 
-const DeniedCard = (props: { resource: AclResource }) => {
+/*
+ * For pages that span many resources (the overview), where no single
+ * `<resource>:read` decides access: a logged-out visitor to a cluster that
+ * enforces ACLs gets the same log-in card as every gated page, while a
+ * logged-in identity sees whatever its token can read, card by card.
+ */
+export function LoginGate(props: { what: string; children: JSX.Element }) {
+  return (
+    <Show when={!isAnonymous()} fallback={<DeniedCard what={props.what} />}>
+      {props.children}
+    </Show>
+  )
+}
+
+// `resource` for a page gated on one permission; `what` (e.g. "the overview")
+// for a LoginGate page, which is only ever shown to an anonymous visitor.
+const DeniedCard = (props: { resource?: AclResource; what?: string }) => {
   const identity = managerIdentity
 
   return (
@@ -49,11 +65,16 @@ const DeniedCard = (props: { resource: AclResource }) => {
               </>
             }
           >
-            <>
-              This cluster enforces ACLs, so{' '}
-              <code class="font-mono text-ink">{props.resource}:read</code> needs a logged-in
-              identity.
-            </>
+            <Show
+              when={props.resource}
+              fallback={<>This cluster enforces ACLs, so {props.what} needs a logged-in identity.</>}
+            >
+              <>
+                This cluster enforces ACLs, so{' '}
+                <code class="font-mono text-ink">{props.resource}:read</code> needs a logged-in
+                identity.
+              </>
+            </Show>
           </Show>
         </p>
         <div class="mt-5 flex items-center justify-center gap-4">
@@ -68,9 +89,11 @@ const DeniedCard = (props: { resource: AclResource }) => {
               Log in
             </Show>
           </A>
-          <A href="/" class={linkClass}>
-            Back to overview
-          </A>
+          <Show when={props.resource}>
+            <A href="/" class={linkClass}>
+              Back to overview
+            </A>
+          </Show>
         </div>
         <Show when={!isAnonymous() && (identity()?.policies.length ?? 0) > 0}>
           <p class="mt-4 text-2xs text-faint">

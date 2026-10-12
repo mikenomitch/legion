@@ -226,20 +226,26 @@ impl Store {
             .collect())
     }
 
-    /// Report `status: blocked` and what each job waits for on the jobs
-    /// that have a blocked eval and are neither stopped nor failed. A read
-    /// overlay: the job row keeps its stored status.
+    /// Say what each job with a blocked eval waits for (`Job.blocked`), on
+    /// jobs whose derived status (docs/jobs-tasks-and-scheduling.md) is not
+    /// `stopped`, and report `status: blocked` where the derivation said
+    /// `pending`: nothing of the job is live and its placement is waiting
+    /// for room rather than for a dependency. A job with live allocations
+    /// keeps `running` and still carries the block. A read overlay: nothing
+    /// is stored.
     pub fn overlay_blocked_jobs(&self, jobs: &mut [crate::structs::Job]) -> R<()> {
         let blocked = self.blocked_evals_by_job()?;
         if blocked.is_empty() {
             return Ok(());
         }
         for job in jobs {
-            if matches!(job.status.as_str(), "stopped" | "failed") {
+            if job.status == "stopped" {
                 continue;
             }
             if let Some(eval) = blocked.get(&job.id) {
-                job.status = "blocked".to_string();
+                if job.status == "pending" {
+                    job.status = "blocked".to_string();
+                }
                 job.blocked = Some(eval.to_job_blocked());
             }
         }

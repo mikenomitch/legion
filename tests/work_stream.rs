@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use legion::manager::daemon::resolve_claimed_eval;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
-use legion::storage::store::{EvalBatchLimits, Store};
+use legion::storage::store::{ClaimScope, EvalBatchLimits, Store};
 use legion::structs::config::{ManagerConfigFull, PersistenceType};
 use legion::structs::job::{JobConfig, StatefulConfig, TaskConfig};
 use legion::structs::manager_client::ManagerClient;
@@ -139,13 +139,13 @@ fn run_eval_worker(store: &Store) -> R<()> {
         max: 16,
         workers: 1,
     };
-    let mut batch = store.claim_evals(limits)?;
+    let mut batch = store.claim_evals(limits, ClaimScope::Any)?;
     while !batch.is_empty() {
         let completions = batch
             .iter()
             .map(|eval| (eval.id.clone(), resolve_claimed_eval(store, 0, eval)))
             .collect();
-        batch = store.complete_evals_and_claim_next(completions, limits)?;
+        batch = store.complete_evals_and_claim_next(completions, limits, ClaimScope::Any)?;
     }
     Ok(())
 }

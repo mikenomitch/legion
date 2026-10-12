@@ -80,7 +80,7 @@ export function SnapshotsTable(props: {
 }) {
   const columns = () => (props.actions ? 11 : 10)
   return (
-    <TableShell>
+    <TableShell class="relative">
       <table class={tableClass}>
         <thead class={theadClass}>
           <tr>

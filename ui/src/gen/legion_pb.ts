@@ -3250,13 +3250,29 @@ export class GetJobSpecByConfigRequest extends Message<GetJobSpecByConfigRequest
  */
 export class GetJobSpecReply extends Message<GetJobSpecReply> {
   /**
-   * Submissions associated with the latest job config.
-   *
-   * Field number intentionally remains `2` for compatibility.
+   * Source submissions associated with the job config, exactly as the
+   * submitter sent them (usually Nickel source, not JSON). Read these to show
+   * what was typed; read `rendered_jobspec` to learn what the job is.
    *
    * @generated from field: repeated legion.Submission submissions = 2;
    */
   submissions: Submission[] = [];
+
+  /**
+   * The job config the manager stored, as a JSON object: `name`, `priority`,
+   * `version`, `rollout`/`rollout_by_group` when set, and `tasks` — each
+   * task in the same camelCase shape `RunJobRequest.parsed_jobspec` accepts
+   * (`group`, `runtime`, `lifecycle`, `count`, `dependsOn`, `config`,
+   * `resources`, `checks`, `network`, `service`, `stateful`, ...).
+   *
+   * This is the authoritative structure of the job whatever language it was
+   * written in, with scale overrides NOT applied (`count` is the spec's).
+   * Empty string only when the config could not be loaded, which the
+   * manager reports as an error instead.
+   *
+   * @generated from field: string rendered_jobspec = 3;
+   */
+  renderedJobspec = "";
 
   constructor(data?: PartialMessage<GetJobSpecReply>) {
     super();
@@ -3267,6 +3283,7 @@ export class GetJobSpecReply extends Message<GetJobSpecReply> {
   static readonly typeName = "legion.GetJobSpecReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 2, name: "submissions", kind: "message", T: Submission, repeated: true },
+    { no: 3, name: "rendered_jobspec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobSpecReply {
@@ -8620,8 +8637,9 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
   pageSize?: number;
 
   /**
-   * Keep only jobs whose status equals this value (case-insensitive, exact —
-   * `run` does not match `running`; use `query` for substring search).
+   * Keep only jobs whose derived status (see `Job.status`) equals this value
+   * (case-insensitive, exact — `run` does not match `running`; use `query`
+   * for substring search).
    * Applied after `query` and before paging, so `total_count` reflects the
    * filtered set. Omit or leave empty to return every status.
    *
@@ -8683,14 +8701,38 @@ export class Job extends Message<Job> {
   name = "";
 
   /**
-   * Job status string.
+   * Job status, derived from the job's workload each time it is read. First
+   * match wins:
    *
-   * Current values written by manager include: done, stopped, failed.
+   * - `stopped`: `StopJob` stopped the job. `RunJob` brings it back.
+   * - `failed`: a required KV dependency vanished (`onDelete: fail`), or
+   *   nothing is live and a task's last run failed (it spent its restart and
+   *   move budgets, or exited unsuccessfully under a policy that does not
+   *   restart it).
+   * - `running`: at least one allocation of any version of the job is live
+   *   (placed and not yet terminal).
+   * - `blocked`: nothing is live, and the job's eval found no room for a
+   *   placement and waits for capacity that could help (docs/
+   *   scheduler-and-eval-loop.md, "Blocked evals"). It places on its own when
+   *   that capacity appears; `blocked` below says what it waits for. Takes
+   *   the place `pending` would have.
+   * - `pending`: nothing is live, and a task that wants an allocation has not
+   *   finished: it is waiting to be placed or waiting on a `dependsOn`
+   *   condition.
+   * - `scheduled`: nothing is live, nothing is pending, and a cron task
+   *   (`schedule`) finished its last run and waits for the next one.
+   * - `complete`: nothing is live, and every task that wants an allocation
+   *   finished successfully. A batch job reads this once it is done.
+   * - `suspended`: no task wants an allocation, and at least one keyed
+   *   instance is suspended.
+   * - `idle`: no task wants an allocation: every task is scaled to zero, or
+   *   a keyed task has no pending, active, or rescheduling instances.
    *
-   * `blocked` is reported (never stored) for a job that is neither stopped
-   * nor failed while its eval waits for capacity: a placement found no room
-   * and the job places on its own when capacity that could help appears.
-   * `blocked` below says what it waits for.
+   * Task outcomes come from the job's latest spec version; live allocations
+   * count from every version, so a job mid-rollout reads `running`. The
+   * state store's `job.status` column is not this value: it holds the
+   * lifecycle flag (`active`, `stopped`, `failed`) the derivation starts
+   * from.
    *
    * @generated from field: string status = 3;
    */
@@ -8733,9 +8775,11 @@ export class Job extends Message<Job> {
   priority = "";
 
   /**
-   * Set while the job's eval is blocked on capacity (status `blocked`;
-   * docs/scheduler-and-eval-loop.md, "Blocked evals"). Unset otherwise,
-   * including for a stopped or failed job.
+   * Set while the job has an eval blocked on capacity
+   * (docs/scheduler-and-eval-loop.md, "Blocked evals"), whatever `status`
+   * reads: a job with a live allocation reads `running` and still says here
+   * what its other placements wait for; with nothing live it reads
+   * `blocked`. Unset for a job stopped or failed by its lifecycle.
    *
    * @generated from field: optional legion.JobBlocked blocked = 7;
    */
@@ -14487,6 +14531,283 @@ export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
 }
 
 /**
+ * Request payload for GetSchedulerConcurrency. No parameters: the controller
+ * is per-manager and global, so there is nothing to scope the question to.
+ *
+ * @generated from message legion.GetSchedulerConcurrencyRequest
+ */
+export class GetSchedulerConcurrencyRequest extends Message<GetSchedulerConcurrencyRequest> {
+  constructor(data?: PartialMessage<GetSchedulerConcurrencyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetSchedulerConcurrencyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetSchedulerConcurrencyRequest {
+    return new GetSchedulerConcurrencyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetSchedulerConcurrencyRequest {
+    return new GetSchedulerConcurrencyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetSchedulerConcurrencyRequest {
+    return new GetSchedulerConcurrencyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetSchedulerConcurrencyRequest | PlainMessage<GetSchedulerConcurrencyRequest> | undefined, b: GetSchedulerConcurrencyRequest | PlainMessage<GetSchedulerConcurrencyRequest> | undefined): boolean {
+    return proto3.util.equals(GetSchedulerConcurrencyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetSchedulerConcurrency — one manager's view of how much
+ * planning it is admitting, and why.
+ *
+ * The controller measures its own plan-apply conflict rate and tunes how many
+ * evals it will PLAN at once between `floor` and `ceiling` (AIMD: halve on
+ * congestion, add one back after calm). The arithmetic behind every field is
+ * published in docs/adaptive-scheduler-concurrency.md.
+ *
+ * @generated from message legion.GetSchedulerConcurrencyReply
+ */
+export class GetSchedulerConcurrencyReply extends Message<GetSchedulerConcurrencyReply> {
+  /**
+   * The controller's mode, as configured in
+   * `schedulerSettings.adaptiveConcurrency.mode`:
+   * - `enforce` — measure and actuate.
+   * - `observe` — measure and publish what it WOULD do, actuate nothing.
+   *   The default.
+   * - `off` — the controller does not run; `evalThreads` is the fixed planner
+   *   count, exactly as before this feature existed. Every numeric field below
+   *   is zero in this mode.
+   *
+   * @generated from field: string mode = 1;
+   */
+  mode = "";
+
+  /**
+   * Planners currently admitted. In `observe` mode this is the SHADOW limit —
+   * what the controller would be enforcing — which is what makes observe mode
+   * useful on its own.
+   *
+   * @generated from field: uint32 limit = 2;
+   */
+  limit = 0;
+
+  /**
+   * Lower bound on `limit` (`adaptiveConcurrency.min`, 1 by default). Never 0:
+   * a floor of 0 is a stuck scheduler, not a throttled one.
+   *
+   * @generated from field: uint32 floor = 3;
+   */
+  floor = 0;
+
+  /**
+   * Upper bound on `limit`. `adaptiveConcurrency.max` if set, otherwise
+   * `evalThreads`, and never above `evalThreads`.
+   *
+   * @generated from field: uint32 ceiling = 4;
+   */
+  ceiling = 0;
+
+  /**
+   * The manager's configured `evalThreads`: the size of the worker pool, and
+   * the ceiling the controller works under. The controller never admits more
+   * planners than this and, in `enforce`, backs off below it on evidence.
+   *
+   * @generated from field: uint32 eval_threads = 5;
+   */
+  evalThreads = 0;
+
+  /**
+   * Admission permits held right now — eval workers currently inside a
+   * planning eval. 0 when the controller is off, which never consults the gate.
+   *
+   * @generated from field: uint32 in_flight = 6;
+   */
+  inFlight = 0;
+
+  /**
+   * What the controller is doing:
+   * - `steady` — running at the ceiling; nothing is held back.
+   * - `throttled` — below the ceiling, and conflicts have not yet subsided.
+   * - `probing` — below the ceiling and accumulating calm ticks toward an
+   *   increase.
+   * - `saturated` — backing off did NOT improve goodput, so the conflicts are
+   *   capacity-driven rather than concurrency-driven. The remedy is nodes, not
+   *   patience, and the controller has stopped applying an actuator that
+   *   cannot help.
+   *
+   * @generated from field: string state = 7;
+   */
+  state = "";
+
+  /**
+   * How long the controller has been in `state`, in seconds.
+   *
+   * @generated from field: uint32 seconds_in_state = 8;
+   */
+  secondsInState = 0;
+
+  /**
+   * Smoothed plan rejection rate, 0.0 to 1.0:
+   * `rejected / (applied + fallback + rejected)`. Plans that bound but slid
+   * down a candidate list count as PROGRESS, not as conflict — that is the
+   * point of late binding, and throttling to avoid absorbed races would be
+   * throttling to avoid the feature working.
+   *
+   * @generated from field: double conflict_rate = 9;
+   */
+  conflictRate = 0;
+
+  /**
+   * Smoothed fraction of plans that bound at a lower-ranked candidate: races
+   * ABSORBED by late binding. Reported for diagnosis and never fed into the
+   * controller's decision.
+   *
+   * @generated from field: double fallback_rate = 10;
+   */
+  fallbackRate = 0;
+
+  /**
+   * Smoothed plans that actually placed, per second. This — not the conflict
+   * rate — is the objective; the conflict rate is only its fast leading
+   * indicator, and every decrease is verified against this before it is kept.
+   *
+   * @generated from field: double goodput = 11;
+   */
+  goodput = 0;
+
+  /**
+   * Raw plan outcomes in the most recent 500ms window, so the percentages
+   * above can be checked by hand.
+   *
+   * @generated from field: uint32 window_applied = 12;
+   */
+  windowApplied = 0;
+
+  /**
+   * @generated from field: uint32 window_fallback = 13;
+   */
+  windowFallback = 0;
+
+  /**
+   * @generated from field: uint32 window_rejected = 14;
+   */
+  windowRejected = 0;
+
+  /**
+   * The last limit change: `increase`, `decrease`, or `revert` (a decrease
+   * undone because it did not improve goodput). Empty if the controller has
+   * not moved the limit yet.
+   *
+   * @generated from field: string last_adjustment_direction = 15;
+   */
+  lastAdjustmentDirection = "";
+
+  /**
+   * The limit before and after that change.
+   *
+   * @generated from field: uint32 last_adjustment_from = 16;
+   */
+  lastAdjustmentFrom = 0;
+
+  /**
+   * @generated from field: uint32 last_adjustment_to = 17;
+   */
+  lastAdjustmentTo = 0;
+
+  /**
+   * How long ago it happened, in seconds.
+   *
+   * @generated from field: uint32 last_adjustment_seconds_ago = 18;
+   */
+  lastAdjustmentSecondsAgo = 0;
+
+  /**
+   * Relative change in goodput since that adjustment, as a fraction (0.18 =
+   * +18%). This is what says whether backing off actually bought anything.
+   *
+   * @generated from field: double last_adjustment_goodput_delta = 19;
+   */
+  lastAdjustmentGoodputDelta = 0;
+
+  /**
+   * Times a throttled worker claimed a non-planning eval (today: `job_stop`)
+   * instead of the queue head. This counts the one deviation from strict
+   * priority order the admission gate introduces: it is a cross-class
+   * inversion only, never within a class, and it exists so an operator's
+   * `job stop` during an incident does not queue behind the storm it is
+   * trying to end.
+   *
+   * @generated from field: uint64 admission_skips = 20;
+   */
+  admissionSkips = protoInt64.zero;
+
+  /**
+   * Whether the manager that answered leads the scheduler lane, and therefore
+   * does the planning (always true outside raft mode and in `single`
+   * topology). When false, every number above is zero: a manager that does no
+   * planning reports nothing rather than guessing.
+   *
+   * @generated from field: bool is_scheduler_lane_leader = 21;
+   */
+  isSchedulerLaneLeader = false;
+
+  constructor(data?: PartialMessage<GetSchedulerConcurrencyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetSchedulerConcurrencyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "limit", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "floor", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "ceiling", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "eval_threads", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "in_flight", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "seconds_in_state", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 9, name: "conflict_rate", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 10, name: "fallback_rate", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 11, name: "goodput", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 12, name: "window_applied", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 13, name: "window_fallback", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 14, name: "window_rejected", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 15, name: "last_adjustment_direction", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "last_adjustment_from", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 17, name: "last_adjustment_to", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 18, name: "last_adjustment_seconds_ago", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 19, name: "last_adjustment_goodput_delta", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 20, name: "admission_skips", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 21, name: "is_scheduler_lane_leader", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetSchedulerConcurrencyReply {
+    return new GetSchedulerConcurrencyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetSchedulerConcurrencyReply {
+    return new GetSchedulerConcurrencyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetSchedulerConcurrencyReply {
+    return new GetSchedulerConcurrencyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetSchedulerConcurrencyReply | PlainMessage<GetSchedulerConcurrencyReply> | undefined, b: GetSchedulerConcurrencyReply | PlainMessage<GetSchedulerConcurrencyReply> | undefined): boolean {
+    return proto3.util.equals(GetSchedulerConcurrencyReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetObservability.
  *
  * @generated from message legion.GetObservabilityRequest
@@ -16706,6 +17027,18 @@ export class GetKvRequest extends Message<GetKvRequest> {
    */
   key = "";
 
+  /**
+   * Return the entry without its value: `entry.value` is the empty string
+   * and the manager does not decrypt it. Everything else (type, version,
+   * timestamps, `encrypted`, and `GetKvReply.references`) is returned.
+   *
+   * For a client that shows a key's details and reveals the value only on
+   * request. Default `false`. Needs the same `kv:read` as a full read.
+   *
+   * @generated from field: bool metadata_only = 2;
+   */
+  metadataOnly = false;
+
   constructor(data?: PartialMessage<GetKvRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -16715,6 +17048,7 @@ export class GetKvRequest extends Message<GetKvRequest> {
   static readonly typeName = "legion.GetKvRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "metadata_only", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetKvRequest {
@@ -16747,6 +17081,23 @@ export class GetKvReply extends Message<GetKvReply> {
    */
   entry?: KvEntry;
 
+  /**
+   * Jobs whose current config reads this key: through a `$path/key`
+   * reference anywhere in the jobspec, or through a task's `kvInjections`
+   * (env vars and files rendered from KV). One entry per place the key is
+   * read, so a job that reads it twice appears twice with different
+   * `json_pointer`s.
+   *
+   * Recorded at submit time from the job's latest config; a job that stopped
+   * reading the key drops out when its next version is submitted. Only jobs
+   * the caller holds `job:read` on are listed, so the list can be shorter
+   * than the real set. Returned even when `entry` is unset, so a reference
+   * to a key that was deleted is still visible.
+   *
+   * @generated from field: repeated legion.KvJobReference references = 2;
+   */
+  references: KvJobReference[] = [];
+
   constructor(data?: PartialMessage<GetKvReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -16756,6 +17107,7 @@ export class GetKvReply extends Message<GetKvReply> {
   static readonly typeName = "legion.GetKvReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "entry", kind: "message", T: KvEntry, opt: true },
+    { no: 2, name: "references", kind: "message", T: KvJobReference, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetKvReply {
@@ -16776,6 +17128,66 @@ export class GetKvReply extends Message<GetKvReply> {
 }
 
 /**
+ * One place a job's config reads a KV key (GetKvReply.references).
+ *
+ * @generated from message legion.KvJobReference
+ */
+export class KvJobReference extends Message<KvJobReference> {
+  /**
+   * Job that reads the key.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * Job config that recorded the reference (the job's latest version when
+   * it was submitted).
+   *
+   * @generated from field: string job_config_id = 2;
+   */
+  jobConfigId = "";
+
+  /**
+   * Where in the job config the key is read, as a JSON pointer: for example
+   * `/tasks/0/config/env/DB_PASSWORD` for a `$path/key` reference, or
+   * `/tasks/web/kvInjections/env/GREETING` for an injected env var.
+   *
+   * @generated from field: string json_pointer = 3;
+   */
+  jsonPointer = "";
+
+  constructor(data?: PartialMessage<KvJobReference>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.KvJobReference";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "json_pointer", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): KvJobReference {
+    return new KvJobReference().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): KvJobReference {
+    return new KvJobReference().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): KvJobReference {
+    return new KvJobReference().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: KvJobReference | PlainMessage<KvJobReference> | undefined, b: KvJobReference | PlainMessage<KvJobReference> | undefined): boolean {
+    return proto3.util.equals(KvJobReference, a, b);
+  }
+}
+
+/**
  * Request payload for ListKv.
  *
  * @generated from message legion.ListKvRequest
@@ -16790,6 +17202,20 @@ export class ListKvRequest extends Message<ListKvRequest> {
    */
   prefix = "";
 
+  /**
+   * Return each entry's value. Default `false`: entries come back with
+   * `value` set to the empty string, and the manager never decrypts them.
+   *
+   * Listing is for browsing keys; reading a secret should be a deliberate
+   * act, so a listing does not ship every plaintext to whoever asks for the
+   * key names. Fetch one value with `GetKv`, or set this to `true` (as
+   * `legion kv list --values` does) to get them all. Every other field
+   * (type, version, timestamps, `encrypted`) is returned either way.
+   *
+   * @generated from field: bool include_values = 2;
+   */
+  includeValues = false;
+
   constructor(data?: PartialMessage<ListKvRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -16799,6 +17225,7 @@ export class ListKvRequest extends Message<ListKvRequest> {
   static readonly typeName = "legion.ListKvRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "prefix", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "include_values", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListKvRequest {
@@ -17845,6 +18272,20 @@ export class ServiceEndpoint extends Message<ServiceEndpoint> {
    */
   meshTls = false;
 
+  /**
+   * Public host name or IP of the endpoint's node, when its worker was
+   * started with `LEGION_WORKER_PUBLIC_ADDRESS`; empty otherwise.
+   *
+   * `address` is where the cluster reaches the endpoint (usually a private
+   * address); this is where a client outside the private network reaches
+   * the same `port`, for links in the UI and CLI. Display only: nothing in
+   * the cluster dials it, and it does not open the port — the node's
+   * firewall or security group must still allow the traffic.
+   *
+   * @generated from field: string public_address = 14;
+   */
+  publicAddress = "";
+
   constructor(data?: PartialMessage<ServiceEndpoint>) {
     super();
     proto3.util.initPartial(data, this);
@@ -17866,6 +18307,7 @@ export class ServiceEndpoint extends Message<ServiceEndpoint> {
     { no: 11, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
     { no: 12, name: "port_label", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "mesh_tls", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 14, name: "public_address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceEndpoint {
@@ -19124,6 +19566,18 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
    */
   instanceId?: string;
 
+  /**
+   * Name of the task this allocation runs (the `name` of the task config
+   * named by `task_config_id`).
+   *
+   * Lets a client group a job's allocations by task without a second
+   * lookup. Empty only when the task config row is gone, which a live
+   * allocation never sees.
+   *
+   * @generated from field: string task_name = 11;
+   */
+  taskName = "";
+
   constructor(data?: PartialMessage<LedgerAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -19142,6 +19596,7 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
     { no: 10, name: "network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "artifact_states", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 9, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 11, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): LedgerAllocation {
@@ -19458,6 +19913,43 @@ export class ListEventsRequest extends Message<ListEventsRequest> {
    */
   level?: string;
 
+  /**
+   * Optional stateful instance filter: only events about this instance.
+   *
+   * An event is about an instance when its `metadata_json` names it — as
+   * `instanceId` (suspend, resume, restore, fork, snapshot, volume, and
+   * provisional-start events) or `instance_id` (`node.pressure`), as one of `instances` (the
+   * forks an `instance.forked` or `instance.fork_failed` created), or as one
+   * of `suspending` (the instances an `instance.make_room` suspended) — or
+   * when it is about an allocation that fulfilled the instance, matched the
+   * way `allocation_id` matches (so `allocation.placed`, `allocation.failed`,
+   * `allocation.stopping`, and the rest). The allocation match covers
+   * allocations the manager still has a row for; events about an allocation
+   * whose row has since been pruned match only through their metadata.
+   *
+   * Combines with the other filters (AND). Matched exactly; an unknown id
+   * simply matches nothing.
+   *
+   * @generated from field: optional string instance_id = 7;
+   */
+  instanceId?: string;
+
+  /**
+   * Optional allocation filter: only events about this allocation.
+   *
+   * Matches `SchedulerEvent.allocation_id`, and also the batched events that
+   * cover several allocations and so leave that field unset: they list them
+   * in metadata as `placements[].allocationId` (`allocation.placed`) or
+   * `allocations[].allocationId` (`allocation.stopping`,
+   * `allocation.preempted`), or `victims[].allocationId`
+   * (`allocation.preempt_planned`). A batched event lists at most its first
+   * 20 allocations, so a batch of more than 20 matches only for those 20. `allocation.removed` events name no allocation ids and never
+   * match.
+   *
+   * @generated from field: optional int64 allocation_id = 8;
+   */
+  allocationId?: bigint;
+
   constructor(data?: PartialMessage<ListEventsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -19472,6 +19964,8 @@ export class ListEventsRequest extends Message<ListEventsRequest> {
     { no: 4, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 5, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "level", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 8, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListEventsRequest {
@@ -19588,6 +20082,25 @@ export class StreamEventsRequest extends Message<StreamEventsRequest> {
    */
   level?: string;
 
+  /**
+   * Optional stateful instance filter. Same semantics as
+   * `ListEventsRequest.instance_id`, with one difference for live events:
+   * the allocation match is resolved against the instance's allocations when
+   * each event arrives, so an allocation placed after the stream opened is
+   * still matched.
+   *
+   * @generated from field: optional string instance_id = 6;
+   */
+  instanceId?: string;
+
+  /**
+   * Optional allocation filter. Same semantics as
+   * `ListEventsRequest.allocation_id`.
+   *
+   * @generated from field: optional int64 allocation_id = 7;
+   */
+  allocationId?: bigint;
+
   constructor(data?: PartialMessage<StreamEventsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -19601,6 +20114,8 @@ export class StreamEventsRequest extends Message<StreamEventsRequest> {
     { no: 3, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 4, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 5, name: "level", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamEventsRequest {

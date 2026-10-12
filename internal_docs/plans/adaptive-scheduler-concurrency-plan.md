@@ -1,17 +1,80 @@
 # Plan: Adaptive Scheduler Concurrency (Congestion Control for the Plan-Apply Path)
 
-> **Judgement calls:** [`calls/adaptive-scheduler-concurrency-plan_calls.md`](../calls/adaptive-scheduler-concurrency-plan_calls.md) *(not yet written — created with Phase 1)*
+> **Judgement calls:** [`calls/adaptive-scheduler-concurrency-plan_calls.md`](../calls/adaptive-scheduler-concurrency-plan_calls.md)
 
-**Status: PLANNED**
+**Status: IN EXECUTION** — Phases 1, 2 and 3 shipped (2026-08-04, rebased
+onto the batched eval loop 2026-08-05 and onto the audit-fix/mesh/KV-encryption
+main 2026-10-11). The public page is
+[`docs/adaptive-scheduler-concurrency.md`](../../docs/adaptive-scheduler-concurrency.md).
 
-Nothing here is built. Phase 0 is a measurement phase whose explicit
-purpose is to decide whether Phases 2–4 should exist at all — see
-§10, which argues that striped disjoint candidate lists
-([late-binding-plan-apply-plan.md §8 Phase 4](late-binding-plan-apply-plan.md))
-attack the cause of the measured conflict storm and should ship first.
+**Read §1 with [`aws-phase4-findings.md`](../aws-phase4-findings.md) next
+to it.** The throughput numbers in §1 — 4 planners beating 16, 354.6 vs
+310.4 alloc/sec — are retracted: the rig's submitter was capped and that
+build's eval notifier woke every worker on every change. On an uncontended
+cluster throughput now rises with `evalThreads` at every step measured
+(`docs/diagnosing-scheduler-performance.md`, "Corrected 2026-08-05"). The
+*rejection shares* in §1 were real for that build, and the two-pass bind
+has since removed the mechanism behind them. What survives of §1's argument
+is the OCC-thrashing theory and the case candidate lists cannot absorb —
+coupled replicas on a tight pool, a physically full pool — which is
+exactly what the goodput guard (§7.4) exists for. The consequences for
+what was built:
+
+- The controller **starts at the ceiling**, not at `min(ceiling, 4)`
+  (§7.3, §15). A cold start has no evidence to back off on, and starting
+  low would cost `(ceiling - 4) x 2s` of throttling for nothing on the
+  common case. Judgement call 2.
+- `HIGH_WATERMARK = 0.20` keeps its value but loses its "best measured
+  operating point" derivation; it is now justified against the
+  diagnosis guide's 5–20%/20%+ bands and marked fitted. Judgement call 6.
+- **Phase 4 is further away than it was.** The default flip needs the
+  §11 matrix on the current build, and that build has yet to show a
+  conflict-bound cell at all.
+
+What exists: the pure controller (`src/manager/concurrency.rs`) with its
+rule suite and the §11.1 replay; the `ConflictWindow` wired to both
+`legion_plan_apply_total` call sites; the 500 ms tick loop on the
+scheduler-lane leader; `GetSchedulerConcurrency` +
+`legion scheduler concurrency` + the MCP tool; the `PlannerGate` with
+per-worker, per-batch permits; `ClaimScope::NonPlanning` on the batch
+claim; and `mode = "enforce"`.
+
+**Not done, and why:**
+
+- **Phase 0 (measurement) was skipped**, and the measurement it would
+  have re-fitted against has since been retracted, so every constant is a
+  fitted starting value. Nothing downstream of Phase 0 was built.
+- **Phase 4 (default `enforce`) was not built.** Default is `observe`.
+- **The `pool` label on `legion_plan_apply_total` (§7.7) is deferred**
+  with Phase 0; its only consumer is a per-pool controller Phase 5 has
+  not justified.
+- One deviation from §7.2: only `job_stop` bypasses the gate, because in
+  this codebase `rollout_tick` and the `node_*` kinds all reach the
+  planner. Judgement call 1.
+
+**Plan-path cost (AGENTS.md before/after rule).** Measured on the
+pre-rebase base `8e90745`, `cargo bench --bench scheduler_bench --
+--exact "scheduler_speed/bin_pack/nodes_1000_allocs_1000"`, which drives
+`plan_and_apply` — the path that gained the two `ConflictWindow` atomic
+adds:
+
+| | mean | 95% CI |
+| --- | --- | --- |
+| base | 341.56 ms | [338.42, 344.93] |
+| this change | 343.06 ms | [338.26, 348.63] |
+
+Criterion: **no change in performance detected**, +0.44%
+[-1.28%, +2.15%], p = 0.64 — §8.6's "`observe` must be free", measured.
+The `enforce`-mode gate is not on this benchmark's path (it sits in the
+eval worker's batch loop, which the microbenchmark does not run); its
+cost is one relaxed load plus a CAS per batch.
+
 Deliberately out of scope from the outset: per-pool controllers, any
 change to `evalThreads` semantics, and any change to the plan-apply
-transaction itself.
+transaction itself. §10 still stands — striped disjoint candidate lists
+([late-binding-plan-apply-plan.md §8 Phase 4](late-binding-plan-apply-plan.md))
+attack the *cause* of the measured conflict storm, and this plan manages
+the symptom.
 
 ---
 
