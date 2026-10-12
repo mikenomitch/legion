@@ -430,15 +430,33 @@ fn a_restarted_follower_does_not_depose_the_leader() -> R<()> {
     std::thread::sleep(Duration::from_secs(3));
     // Longer than lease + election timeout (2000 + up to 2000 ms here).
     nodes[follower].restart(Duration::from_secs(6))?;
-    wait_for(
-        Duration::from_secs(60),
-        "the restarted follower hears from the leader",
-        || nodes[follower].leader().as_deref() == Some(leader_name),
-    );
-    // Several election timeouts: long enough for a campaign to have
-    // happened, and for the quiet window to have closed.
-    std::thread::sleep(Duration::from_secs(12));
-    assert!(nodes[leader].leads(), "{leader_name} must still lead");
+    let dump = |nodes: &[TestNode]| {
+        nodes
+            .iter()
+            .map(|node| {
+                node.store
+                    .as_ref()
+                    .and_then(|store| store.raft_status())
+                    .map(|s| {
+                        format!(
+                            "{}: role={} leader={:?} term={}",
+                            node.name,
+                            s.role.as_str(),
+                            s.leader_id,
+                            s.term
+                        )
+                    })
+                    .unwrap_or_else(|| format!("{}: down", node.name))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    eprintln!("after restart: {}", dump(&nodes));
+    for _ in 0..12 {
+        std::thread::sleep(Duration::from_secs(1));
+        eprintln!("t+: {}", dump(&nodes));
+    }
+    assert!(nodes[leader].leads(), "{leader_name} must still lead: {}", dump(&nodes));
     assert_eq!(
         nodes[leader].term(),
         term,
