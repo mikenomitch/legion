@@ -13,6 +13,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .type_attribute(".", "#[derive(serde::Deserialize, serde::Serialize)]")
         .type_attribute("Job", "#[derive(tabled::Tabled)]")
         .type_attribute("Submission", "#[derive(tabled::Tabled)]")
+        // A checkpoint part key must never reach a log line or a JSON dump:
+        // Debug is hand-written to redact it (src/structs/checkpoint.rs) and
+        // serde skips it.
+        .skip_debug("legion.CheckpointPartKey")
+        .field_attribute("legion.CheckpointPartKey.key", "#[serde(skip)]")
         .compile_protos(&[proto_file], &["."])
         .unwrap_or_else(|e| panic!("protobuf compile error: {e}"));
 

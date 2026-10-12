@@ -15,9 +15,20 @@ const OK = ['running', 'complete', 'done', 'healthy', 'ready', 'active', 'pass',
 // Whole words only — substrings would swallow "updating", "broken", "disabled", …
 const OK_WORDS = /\b(up|ok|enabled)\b/
 
+// Whole words the keyword lists would misread: "suspended" contains
+// "pend", but a suspended instance is parked on purpose, not waiting.
+const EXACT = new Map<string, Tone>([
+  ['suspended', 'accent'],
+  ['suspending', 'info'],
+  ['resuming', 'info'],
+  ['forking', 'info'],
+])
+
 export const statusTone = (status?: string | null): Tone => {
   const normalized = (status ?? '').toLowerCase().trim()
   if (!normalized) return 'neutral'
+  const exact = EXACT.get(normalized)
+  if (exact) return exact
   const match = (keywords: string[]) => keywords.some((keyword) => normalized.includes(keyword))
   // Order matters: danger > warn > info > ok, so "update failed" is red and
   // "updating" is blue rather than accidentally green.
@@ -64,3 +75,9 @@ export const noteToneClasses: Record<Tone, string> = {
   neutral: 'border-line bg-surface2 text-muted',
   accent: 'border-brass/30 bg-brass/5 text-brass-strong',
 }
+
+// Rollout states the engine never leaves. Pages that follow a rollout live
+// stop polling once it reaches one of these.
+const TERMINAL_ROLLOUT_STATUSES = new Set(['completed', 'failed', 'done', 'cancelled', 'completed_incomplete'])
+
+export const isRolloutDone = (status: string): boolean => TERMINAL_ROLLOUT_STATUSES.has(status.toLowerCase())

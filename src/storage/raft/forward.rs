@@ -84,6 +84,11 @@ pub(crate) enum ForwardableLaneWrite {
         allocation_id: i64,
         #[serde(default)]
         cause: StopCause,
+        /// The `last_stop` detail and hint (the memory pressure path). Absent
+        /// from a manager that predates it, which records the generic
+        /// sentence for `cause` instead.
+        #[serde(default)]
+        explanation: Option<crate::storage::store::StopExplanation>,
     },
     /// `Store::enqueue_eval_after_delay` — scheduler lane. Returns the
     /// enqueued eval.
@@ -119,6 +124,19 @@ pub(crate) enum ForwardableLaneWrite {
     /// `Store::complete_allocation` — scheduler lane. Returns the completed
     /// allocation, when one existed.
     CompleteAllocation { allocation_id: i64, success: bool },
+    /// `Store::apply_snapshot_report` — scheduler lane. Worker snapshot
+    /// reports ride heartbeats, which can land on any manager. Returns the
+    /// applied outcome, for the caller's events.
+    ApplySnapshotReport {
+        node_id: String,
+        report: crate::storage::store::SnapshotReportRecord,
+    },
+    /// `Store::begin_suspend` — scheduler lane. The idle sweep runs on the
+    /// manager that holds a node's usage report, which is whichever manager
+    /// the node heartbeats to. Returns the inserted snapshot row.
+    BeginSuspend {
+        new: crate::storage::store::NewSnapshot,
+    },
 }
 
 impl ForwardableLaneWrite {
@@ -139,7 +157,9 @@ impl ForwardableLaneWrite {
             | ForwardableLaneWrite::RecordVolumeMounted { .. }
             | ForwardableLaneWrite::RecordVolumeError { .. }
             | ForwardableLaneWrite::MarkVolumeDestroyed { .. }
-            | ForwardableLaneWrite::CompleteAllocation { .. } => Lane::Scheduler,
+            | ForwardableLaneWrite::CompleteAllocation { .. }
+            | ForwardableLaneWrite::ApplySnapshotReport { .. }
+            | ForwardableLaneWrite::BeginSuspend { .. } => Lane::Scheduler,
         }
     }
 
@@ -162,6 +182,8 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::RecordVolumeError { .. } => "record_volume_error",
             ForwardableLaneWrite::MarkVolumeDestroyed { .. } => "mark_volume_destroyed",
             ForwardableLaneWrite::CompleteAllocation { .. } => "complete_allocation",
+            ForwardableLaneWrite::ApplySnapshotReport { .. } => "apply_snapshot_report",
+            ForwardableLaneWrite::BeginSuspend { .. } => "begin_suspend",
         }
     }
 }
@@ -226,7 +248,8 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
         ForwardableLaneWrite::RemoveAllocationById {
             allocation_id,
             cause,
-        } => done(store.remove_allocation_by_id_local(allocation_id, cause)),
+            explanation,
+        } => done(store.remove_allocation_by_id_local(allocation_id, cause, explanation)),
         ForwardableLaneWrite::EnqueueEval {
             kind,
             job_id,
@@ -273,6 +296,10 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
             allocation_id,
             success,
         } => done(store.complete_allocation_local(allocation_id, success)),
+        ForwardableLaneWrite::ApplySnapshotReport { node_id, report } => {
+            done(store.apply_snapshot_report_local(&node_id, &report))
+        }
+        ForwardableLaneWrite::BeginSuspend { new } => done(store.begin_suspend_local(new)),
     }
 }
 
@@ -309,6 +336,7 @@ mod tests {
             ForwardableLaneWrite::RemoveAllocationById {
                 allocation_id: 7,
                 cause: StopCause::Unknown,
+                explanation: None,
             },
             ForwardableLaneWrite::EnqueueEval {
                 kind: "job_reschedule".into(),
@@ -336,6 +364,37 @@ mod tests {
             ForwardableLaneWrite::CompleteAllocation {
                 allocation_id: 9,
                 success: true,
+            },
+            ForwardableLaneWrite::ApplySnapshotReport {
+                node_id: "n1".into(),
+                report: crate::storage::store::SnapshotReportRecord {
+                    snapshot_id: "snap-1".into(),
+                    op: "capture".into(),
+                    ok: true,
+                    error: String::new(),
+                    manifest_json: "{}".into(),
+                    duration_ms: 1,
+                    total_bytes: 2,
+                    allocation_id: 3,
+                    pause_ms: 4,
+                    local_suspension: true,
+                },
+            },
+            ForwardableLaneWrite::BeginSuspend {
+                new: crate::storage::store::NewSnapshot {
+                    snapshot_id: "snap-2".into(),
+                    job_id: "job".into(),
+                    task_name: "task".into(),
+                    instance_id: "user-42".into(),
+                    name: None,
+                    kind: crate::structs::checkpoint::SnapshotKind::Memory,
+                    purpose: crate::structs::snapshot::SnapshotPurpose::Suspend,
+                    node_id: "n1".into(),
+                    allocation_id: 4,
+                    expires_at: None,
+                    suspend_reason: Some("idle".into()),
+                    durability: crate::structs::snapshot::SnapshotDurability::Local,
+                },
             },
         ];
         for op in ops {

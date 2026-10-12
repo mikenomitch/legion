@@ -436,7 +436,7 @@ mod tests {
                     .iter()
                     .find(|p| p.attributes.iter().any(|attr| attr.key == "outcome"))
                     .expect("labeled data point");
-                assert_eq!(point.time_unix_nano > 0, true);
+                assert!(point.time_unix_nano > 0);
             }
             other => panic!("counter must export as Sum, got {other:?}"),
         }

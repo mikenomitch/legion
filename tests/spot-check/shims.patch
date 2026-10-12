@@ -1,38 +1,8 @@
-diff --git a/src/task_plugins/sandbox.rs b/src/task_plugins/sandbox.rs
-index d5101382..f321d573 100644
---- a/src/task_plugins/sandbox.rs
-+++ b/src/task_plugins/sandbox.rs
-@@ -560,7 +560,10 @@ fn build_apple_launch(
-         args.push(format!("{key}={value}"));
-     }
-     args.push(config.image.clone());
--    args.push("--".to_string());
-+    // SPOT-CHECK SHIM, not for merge: Apple `container run` treats a `--`
-+    // after the image as the executable ("failed to find target executable
-+    // --"), which the container runtime already avoids (container.rs). The
-+    // real fix also needs a story for commands whose first token is a flag.
-     args.extend(config.command.clone());
-     args
- }
-@@ -1737,11 +1740,9 @@ mod tests {
-             "read-only volumes bind read-only"
-         );
-         assert!(args.contains(&"MODE=test".to_string()));
--        // `--` guards a command whose first token looks like a flag.
--        let sep = args.iter().position(|a| a == "--").expect("separator");
-+        // SPOT-CHECK SHIM: no `--` separator (see build_apple_args).
-         let image = args.iter().position(|a| a == "alpine").expect("image");
--        assert_eq!(sep, image + 1);
--        assert_eq!(args[sep + 1], "-l");
-+        assert_eq!(args[image + 1], "-l");
-         Ok(())
-     }
- 
 diff --git a/src/worker/daemon.rs b/src/worker/daemon.rs
-index 63dee8b2..21d625a5 100644
+index c535cdfe..f23e1a3c 100644
 --- a/src/worker/daemon.rs
 +++ b/src/worker/daemon.rs
-@@ -135,7 +135,15 @@ async fn run_worker_with_manager(
+@@ -152,7 +152,15 @@ async fn run_worker_with_manager(
      join_secret: Option<String>,
  ) -> R<()> {
      let server_port = worker_server_port();
@@ -49,7 +19,7 @@ index 63dee8b2..21d625a5 100644
  
      info!(%manager_addr, %worker_type, "Worker connecting to manager");
  
-@@ -314,7 +322,7 @@ async fn run_worker_with_manager(
+@@ -375,7 +383,7 @@ async fn run_worker_with_manager(
      }
      config_attrs.insert(
          "workerAddress".into(),
@@ -59,10 +29,10 @@ index 63dee8b2..21d625a5 100644
      // The cadence this node will actually beat at, so the manager can derive
      // its lost window from it (`missedBeatsBeforeLost x this`) instead of
 diff --git a/src/worker/task_manager.rs b/src/worker/task_manager.rs
-index afc74c81..2ac3c40e 100644
+index 7b32a369..c3c080c6 100644
 --- a/src/worker/task_manager.rs
 +++ b/src/worker/task_manager.rs
-@@ -3329,9 +3329,15 @@ fn spawn_provisional_staging_thread(
+@@ -4085,9 +4085,15 @@ fn spawn_provisional_staging_thread(
      let gate = job.gate;
      let manager_for_thread = manager.clone();
      let claim_for_thread = claim_id.clone();
@@ -76,9 +46,9 @@ index afc74c81..2ac3c40e 100644
          .spawn(move || {
 +            let _runtime = runtime.as_ref().map(|handle| handle.enter());
              let manager = manager_for_thread;
-             let result = job.stager.stage_task_artifacts(
-                 allocation_id,
-@@ -3376,9 +3382,15 @@ fn spawn_provisional_staging_thread(
+             let result = job.stage();
+ 
+@@ -4134,9 +4140,15 @@ fn spawn_provisional_staging_thread(
  fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob) {
      let allocation_id = job.allocation.id;
      let manager_for_thread = manager.clone();
@@ -92,5 +62,5 @@ index afc74c81..2ac3c40e 100644
          .spawn(move || {
 +            let _runtime = runtime.as_ref().map(|handle| handle.enter());
              let manager = manager_for_thread;
-             let result = job.stager.stage_task_artifacts(
-                 allocation_id,
+             let result = job.stage();
+ 

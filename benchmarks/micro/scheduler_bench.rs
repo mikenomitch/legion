@@ -7,7 +7,8 @@ use tempfile::{Builder, TempDir};
 use legion::manager::scheduler::{PlanMode, PlanTimings, Scheduler};
 use legion::storage::store::Store;
 use legion::structs::{
-    config::ManagerConfigFull, JobConfig, NodeMsg, Submission, TaskConfig, TaskCount,
+    config::ManagerConfigFull, ArtifactSpec, ContentLocation, ContentLocationReport, JobConfig,
+    NodeMsg, Submission, TaskConfig, TaskCount,
 };
 
 const SCALE_STEPS: &[usize] = &[10, 100, 1_000, 10_000, 100_000];
@@ -72,7 +73,9 @@ fn make_node_msg(id: &str, attrs: serde_json::Value) -> NodeMsg {
         availability: "available".into(),
         config_attrs: attrs.to_string(),
         fingerprint_attrs: default_fingerprint().to_string(),
-        dynamic_attrs: json!({}).to_string(),
+        // Workers that take checkpoints and fetch published ones, so the
+        // published restores below have candidates.
+        dynamic_attrs: json!({ "capabilities": ["checkpoint", "checkpoint-fetch"] }).to_string(),
         health_checks: "{}".into(),
         last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
         heartbeat_source: String::new(),
@@ -832,6 +835,407 @@ fn histogram_sums(family: &str) -> std::collections::HashMap<String, (f64, u64)>
     out
 }
 
+// ---------------------------------------------------------------------------
+// Content locality (suspend plan Phase 7)
+// ---------------------------------------------------------------------------
+//
+// The cost of the `locality` score term. `content_absent` plans tasks with no
+// digest-pinned artifacts, so the term is skipped (the baseline every
+// ordinary job pays). `content_present` gives each task two pinned artifacts
+// and seeds the location index so half the fleet holds one and a quarter the
+// other: one index lookup per task, one score read per candidate.
+
+const LOCALITY_NODE_STEPS: &[usize] = &[1_000, 5_000];
+const LOCALITY_TASKS: usize = 4;
+const LOCALITY_PER_TASK: u32 = 25;
+
+fn locality_digest(idx: usize) -> String {
+    format!("sha256:{:064x}", idx + 1)
+}
+
+fn make_locality_job(with_content: bool) -> JobConfig {
+    let tasks = (0..LOCALITY_TASKS)
+        .map(|idx| {
+            let artifacts = if with_content {
+                (0..2)
+                    .map(|n| ArtifactSpec {
+                        checksum: Some(locality_digest(n)),
+                        ..ArtifactSpec::from_source(format!("https://example.com/{idx}-{n}.bin"))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            TaskConfig {
+                count: TaskCount::new(LOCALITY_PER_TASK),
+                group: format!("group-{idx}"),
+                artifacts,
+                ..TaskConfig::new(format!("task-{idx}"), "noop")
+            }
+        })
+        .collect();
+    JobConfig {
+        priority: Default::default(),
+        name: format!("bench-locality-{with_content}"),
+        tasks,
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    }
+}
+
+fn seed_locality_index(store: &Store, node_count: usize) {
+    let now = std::time::Instant::now();
+    for idx in 0..node_count {
+        let mut added = Vec::new();
+        if idx % 2 == 0 {
+            added.push(ContentLocation {
+                digest: locality_digest(0),
+                bytes: 512 * 1024 * 1024,
+            });
+        }
+        if idx % 4 == 0 {
+            added.push(ContentLocation {
+                digest: locality_digest(1),
+                bytes: 64 * 1024 * 1024,
+            });
+        }
+        store.content_locations().ingest(
+            &format!("node-{idx}"),
+            &ContentLocationReport {
+                epoch: 1,
+                base_epoch: 0,
+                full: true,
+                added,
+                removed: Vec::new(),
+                snapshot_budget: None,
+            },
+            now,
+        );
+    }
+}
+
+fn locality_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("locality");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    for &node_count in LOCALITY_NODE_STEPS {
+        let (store, _dir) = setup_store("bin_pack").expect("store");
+        insert_uniform_nodes(&store, node_count).expect("nodes");
+        seed_locality_index(&store, node_count);
+        for (label, with_content) in [("content_absent", false), ("content_present", true)] {
+            let job = make_locality_job(with_content);
+            let job_id = submit_jobs(&store, std::slice::from_ref(&job))
+                .expect("job")
+                .pop()
+                .expect("one id");
+            group.bench_function(
+                BenchmarkId::new(label, format!("nodes_{node_count}")),
+                |b| {
+                    b.iter(|| {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        let plan = scheduler.plan_only(&job_id, PlanMode::Fresh).expect("plan");
+                        assert_eq!(plan.len(), LOCALITY_TASKS * LOCALITY_PER_TASK as usize);
+                        plan
+                    })
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Restore placement (suspend plan Phases 3c, 4, 7b)
+// ---------------------------------------------------------------------------
+//
+// The cost of placing keyed instances that restore from a snapshot.
+// `local_pinned` restores from `local` snapshots: each instance is pinned to
+// its snapshot's node and `compat` is checked there once. `published_floating`
+// restores from `published` snapshots: no pin, `compat` filters every
+// candidate, and the locality term scores the manifest parts (seeded on a
+// quarter of the fleet). Both plan RESTORE_INSTANCES placements.
+
+const RESTORE_NODE_STEPS: &[usize] = &[1_000, 5_000];
+const RESTORE_INSTANCES: usize = 25;
+const RESTORE_CPU_MODEL: &str = "6:106:6";
+
+fn restore_digest() -> String {
+    format!("sha256:{:064x}", 0xbeef)
+}
+
+fn insert_restore_nodes(store: &Store, node_count: usize) -> anyhow::Result<()> {
+    for idx in 0..node_count {
+        let mut node = make_node_msg(&format!("node-{idx}"), json!({ "tier": "default" }));
+        let mut fingerprint = default_fingerprint();
+        fingerprint["cpu.vendor"] = json!("GenuineIntel");
+        fingerprint["cpu.model"] = json!(RESTORE_CPU_MODEL);
+        fingerprint["sandbox.vmm"] = json!("firecracker");
+        fingerprint["sandbox.vmm.version"] = json!("1.7.0");
+        node.fingerprint_attrs = fingerprint.to_string();
+        store.insert_node(node)?;
+    }
+    Ok(())
+}
+
+fn restore_manifest(snapshot_id: &str, allocation_id: i64, published: bool) -> String {
+    json!({
+        "apiVersion": 1,
+        "id": snapshot_id,
+        "jobId": "bench-restore",
+        "task": "workspace",
+        "originAllocId": allocation_id,
+        "runtime": "sandbox",
+        "kind": "memory",
+        "createdAt": "2026-10-10T00:00:00Z",
+        "memory": [{
+            "role": "memory", "file": "memory", "digest": restore_digest(),
+            "size": 512 * 1024 * 1024,
+            "url": if published { Some("s3://bench/sha256/beef") } else { None },
+        }],
+        "compat": {
+            "vmm": { "type": "firecracker", "version": "1.7.0" },
+            "cpu": { "vendor": "GenuineIntel", "model": RESTORE_CPU_MODEL },
+        },
+    })
+    .to_string()
+}
+
+/// A store with RESTORE_INSTANCES keyed instances pending a restore from
+/// their own snapshot, `published` or `local`. Returns the job config id.
+fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::Result<String> {
+    use legion::storage::store::{NewSnapshot, SnapshotReportRecord};
+    use legion::structs::checkpoint::SnapshotKind;
+    use legion::structs::snapshot::{SnapshotDurability, SnapshotPurpose};
+
+    insert_restore_nodes(store, node_count)?;
+    let job = JobConfig {
+        priority: Default::default(),
+        name: "bench-restore".into(),
+        tasks: vec![TaskConfig {
+            stateful: Some(serde_json::from_value(json!({ "mode": "keyed" }))?),
+            ..TaskConfig::new("workspace", "noop")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    };
+    let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
+        .pop()
+        .expect("one id");
+    for idx in 0..RESTORE_INSTANCES {
+        store.create_keyed_instance(
+            "bench-restore",
+            "default",
+            "workspace",
+            Some(&format!("i-{idx}")),
+        )?;
+    }
+    Scheduler::new(store)?.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+    for idx in 0..RESTORE_INSTANCES {
+        let instance_id = format!("i-{idx}");
+        let instance = store.get_instance(&instance_id)?.expect("instance");
+        let allocation_id = instance.current_alloc_id.expect("placed");
+        let node_id = store
+            .get_allocation_by_id(allocation_id)?
+            .expect("allocation")
+            .node_id;
+        let snapshot_id = format!("snap-bench-{idx}");
+        store.create_snapshot(NewSnapshot {
+            snapshot_id: snapshot_id.clone(),
+            job_id: "bench-restore".into(),
+            task_name: "workspace".into(),
+            instance_id: instance_id.clone(),
+            name: None,
+            kind: SnapshotKind::Memory,
+            purpose: SnapshotPurpose::Manual,
+            node_id: node_id.clone(),
+            allocation_id,
+            expires_at: None,
+            suspend_reason: None,
+            durability: if published {
+                SnapshotDurability::Store
+            } else {
+                SnapshotDurability::Local
+            },
+        })?;
+        let report = |op: &str, published_manifest: bool| SnapshotReportRecord {
+            snapshot_id: snapshot_id.clone(),
+            op: op.into(),
+            ok: true,
+            error: String::new(),
+            manifest_json: restore_manifest(&snapshot_id, allocation_id, published_manifest),
+            duration_ms: 1,
+            total_bytes: 512 * 1024 * 1024,
+            allocation_id,
+            local_suspension: false,
+            pause_ms: 0,
+        };
+        store.apply_snapshot_report(&node_id, &report("capture", false))?;
+        if published {
+            store.apply_snapshot_report(&node_id, &report("publish", true))?;
+        }
+        store.restore_keyed_instance(&instance_id, &snapshot_id)?;
+    }
+    if published {
+        let now = std::time::Instant::now();
+        for idx in (0..node_count).step_by(4) {
+            store.content_locations().ingest(
+                &format!("node-{idx}"),
+                &ContentLocationReport {
+                    epoch: 1,
+                    base_epoch: 0,
+                    full: true,
+                    added: vec![ContentLocation {
+                        digest: restore_digest(),
+                        bytes: 512 * 1024 * 1024,
+                    }],
+                    removed: Vec::new(),
+                    snapshot_budget: None,
+                },
+                now,
+            );
+        }
+    }
+    Ok(job_config_id)
+}
+
+fn restore_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("restore");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    for &node_count in RESTORE_NODE_STEPS {
+        for (label, published) in [("local_pinned", false), ("published_floating", true)] {
+            let (store, _dir) = setup_store("bin_pack").expect("store");
+            let job_config_id = setup_restores(&store, node_count, published).expect("restores");
+            group.bench_function(
+                BenchmarkId::new(label, format!("nodes_{node_count}")),
+                |b| {
+                    b.iter(|| {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        let plan = scheduler
+                            .plan_only(&job_config_id, PlanMode::Fresh)
+                            .expect("plan");
+                        assert_eq!(plan.len(), RESTORE_INSTANCES);
+                        plan
+                    })
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot budget (capacity for resumes)
+// ---------------------------------------------------------------------------
+//
+// The cost of the `snapshots` budget placement filter: new keyed instances of
+// a task with a memory-checkpoint `suspend` block skip nodes whose budget has
+// no room for one more checkpoint. `unreported` is the common case (no node
+// has reported a budget, so the filter reads the index and keeps every
+// node). `half_full` has every node reporting, with every other node full.
+
+const BUDGET_NODE_STEPS: &[usize] = &[1_000, 5_000];
+const BUDGET_INSTANCES: usize = 25;
+
+fn setup_budget_placements(
+    store: &Store,
+    node_count: usize,
+    half_full: bool,
+) -> anyhow::Result<String> {
+    use legion::structs::SnapshotBudget;
+    insert_restore_nodes(store, node_count)?;
+    let job = JobConfig {
+        priority: Default::default(),
+        name: "bench-budget".into(),
+        tasks: vec![TaskConfig {
+            stateful: Some(serde_json::from_value(json!({ "mode": "keyed" }))?),
+            suspend: Some(serde_json::from_value(json!({ "checkpoint": "memory" }))?),
+            resources: json!({ "memory": 512 }),
+            ..TaskConfig::new("workspace", "noop")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    };
+    let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
+        .pop()
+        .expect("one id");
+    for idx in 0..BUDGET_INSTANCES {
+        store.create_keyed_instance(
+            "bench-budget",
+            "default",
+            "workspace",
+            Some(&format!("i-{idx}")),
+        )?;
+    }
+    if half_full {
+        let now = std::time::Instant::now();
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for idx in 0..node_count {
+            store.content_locations().ingest(
+                &format!("node-{idx}"),
+                &ContentLocationReport {
+                    epoch: 1,
+                    base_epoch: 0,
+                    full: true,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    snapshot_budget: Some(SnapshotBudget {
+                        budget_bytes: 50 * GIB,
+                        used_bytes: 50 * GIB,
+                        pinned_bytes: if idx % 2 == 0 { 50 * GIB } else { 10 * GIB },
+                        // Every node reports its disk, so the disk half of
+                        // the room check runs too.
+                        disk_free_bytes: Some(400 * GIB),
+                        min_free_disk_bytes: 5 * GIB,
+                        reclaimable_bytes: 0,
+                    }),
+                },
+                now,
+            );
+        }
+    }
+    Ok(job_config_id)
+}
+
+fn snapshot_budget_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("snapshot_budget");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    for &node_count in BUDGET_NODE_STEPS {
+        for (label, half_full) in [("unreported", false), ("half_full", true)] {
+            let (store, _dir) = setup_store("bin_pack").expect("store");
+            let job_config_id =
+                setup_budget_placements(&store, node_count, half_full).expect("placements");
+            group.bench_function(
+                BenchmarkId::new(label, format!("nodes_{node_count}")),
+                |b| {
+                    b.iter(|| {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        let plan = scheduler
+                            .plan_only(&job_config_id, PlanMode::Fresh)
+                            .expect("plan");
+                        assert_eq!(plan.len(), BUDGET_INSTANCES);
+                        plan
+                    })
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 /// Mean per-phase microseconds over every plan a cell measured, in the
 /// order the phases run.
 fn print_phase_means(cell: &str, samples: &[PlanTimings]) {
@@ -864,6 +1268,9 @@ criterion_group!(
     scheduler_speed_benchmark,
     candidate_construction_benchmark,
     plan_under_fill_benchmark,
-    plan_fleet_scaling_benchmark
+    plan_fleet_scaling_benchmark,
+    locality_benchmark,
+    restore_benchmark,
+    snapshot_budget_benchmark
 );
 criterion_main!(benches);

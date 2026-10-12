@@ -153,14 +153,28 @@ pub fn json_flag() -> Arg {
         .action(ArgAction::SetTrue)
 }
 
+/// Split a server message into its text and the actionable hint it carries
+/// on a final `\nHint: ...` line, when it carries one. Servers put a hint in
+/// the message when the fix is specific to the failure (for example
+/// "use --disk"), which beats the generic per-code hint.
+pub fn split_hint(message: &str) -> (&str, Option<&str>) {
+    match message.split_once("\nHint: ") {
+        Some((text, hint)) => (text.trim(), Some(hint.trim())),
+        None => (message, None),
+    }
+}
+
 pub fn friendly_status(action: &str, status: Status) -> anyhow::Error {
     let code = status.code();
-    let message = status.message().trim();
+    let (message, server_hint) = split_hint(status.message().trim());
     let mut description = if message.is_empty() {
         action.to_string()
     } else {
         format!("{action}: {message}")
     };
+    if let Some(hint) = server_hint {
+        return anyhow!("{description} [code={code}]\nHint: {hint}");
+    }
 
     let hint = match code {
         Code::Unavailable => Some("manager unavailable; check LEGION_ADDR or start the manager"),
@@ -183,4 +197,94 @@ pub fn friendly_status(action: &str, status: Status) -> anyhow::Error {
     description.push_str(&format!(" [code={code}]"));
 
     anyhow!(description)
+}
+
+/// Usage columns shared by `legion node usage` and `legion instance list`
+/// (docs/resource-enforcement.md, "Measuring usage").
+pub mod usage_display {
+    use crate::structs::AllocationUsage;
+
+    /// Seconds of inactivity below which an allocation reads as active: one
+    /// report interval, so "idle" never flickers between reports.
+    const IDLE_AFTER_SECONDS: i64 = 10;
+
+    /// Bytes as whole MiB.
+    pub fn mib(bytes: u64) -> String {
+        (bytes / (1024 * 1024)).to_string()
+    }
+
+    /// Thousandths of a core as cores with two decimals.
+    pub fn cores(millicores: u64) -> String {
+        format!("{:.2}", millicores as f64 / 1000.0)
+    }
+
+    /// An idle span as `2m41s`, or `-` when active within the last interval.
+    pub fn idle(seconds: i64) -> String {
+        if seconds < IDLE_AFTER_SECONDS {
+            return "-".into();
+        }
+        let (hours, minutes, secs) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+        if hours > 0 {
+            format!("{hours}h{minutes}m")
+        } else if minutes > 0 {
+            format!("{minutes}m{secs}s")
+        } else {
+            format!("{secs}s")
+        }
+    }
+
+    /// `(used MiB, cpu cores, idle)` for a table row, dashes when unmeasured.
+    /// `now_unix` is the reader's clock, so idle keeps counting for a report
+    /// that is a few seconds old.
+    pub fn columns(usage: Option<&AllocationUsage>, now_unix: i64) -> (String, String, String) {
+        match usage {
+            // With an idle policy, "idle" is what the policy counts (its
+            // signals), so the column matches what the idle sweep acts on.
+            Some(usage) => (
+                mib(usage.memory_current_bytes),
+                cores(usage.cpu_millicores),
+                idle(
+                    now_unix
+                        - if usage.idle_since_unix > 0 {
+                            usage.idle_since_unix
+                        } else {
+                            usage.last_activity_unix
+                        },
+                ),
+            ),
+            None => ("-".into(), "-".into(), "-".into()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn idle_spans_read_like_durations() {
+            assert_eq!(idle(0), "-");
+            assert_eq!(idle(9), "-");
+            assert_eq!(idle(42), "42s");
+            assert_eq!(idle(161), "2m41s");
+            assert_eq!(idle(7260), "2h1m");
+        }
+
+        #[test]
+        fn unmeasured_rows_are_dashes() {
+            assert_eq!(
+                columns(None, 0),
+                ("-".to_string(), "-".to_string(), "-".to_string())
+            );
+            let usage = AllocationUsage {
+                memory_current_bytes: 1830 * 1024 * 1024,
+                cpu_millicores: 250,
+                last_activity_unix: 100,
+                ..Default::default()
+            };
+            assert_eq!(
+                columns(Some(&usage), 261),
+                ("1830".to_string(), "0.25".to_string(), "2m41s".to_string())
+            );
+        }
+    }
 }

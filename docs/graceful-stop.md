@@ -180,6 +180,7 @@ the allocation.
 | `node_lost` | The node was removed or declared lost, clearing its allocations. |
 | `scale_in` | Surplus after `legion job scale` lowered the task's count ([autoscaling.md](autoscaling.md)). Unlike `update`, no new job config version is involved. |
 | `preempted` | Displaced to make room for higher-priority work ([preemption-and-eviction.md](preemption-and-eviction.md)). Includes a `preemptor` in the stop notice. |
+| `node_pressure` | The node ran short of memory and its memory pressure response stopped this task, because it was bursting above its reservation (`evict-bursting`) or the node oversubscribes memory (`evict-reserved`). The worker writes this cause into the stop notice itself. See [resource-enforcement.md](resource-enforcement.md#memory-pressure). |
 | `unknown` | No cause was recorded. See [Delivery guarantees](#delivery-guarantees). |
 
 `unknown` is a normal value, not just an error case. It most often comes from

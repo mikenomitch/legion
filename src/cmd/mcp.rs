@@ -37,8 +37,11 @@ use crate::structs::{
     PlanJobRequest, QueryStateStoreRequest, RenderJobTemplateRequest, ReplaceInstanceRequest,
     ResolveServiceRequest, RotateMeshCaRequest, RunJobRequest, RunJobTemplateRequest,
     SetNodeAvailabilityRequest, ShowNetPolicyRequest, StartInstanceRequest, StopInstanceRequest,
-    StopJobRequest, TestNetPolicyRequest, UpsertJobTemplateRequest, UpsertNetPolicyRequest,
+    StopJobRequest, SuspendInstanceRequest, TestNetPolicyRequest, UpsertJobTemplateRequest,
+    UpsertNetPolicyRequest,
 };
+// Phase 6 (fork and named snapshots).
+use crate::structs::{ForkInstanceRequest, SetSnapshotAliasRequest};
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -190,7 +193,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_list",
-            description: "List a job's stateful instances (slot and keyed, including terminated tombstones).",
+            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `cold_boot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`cold_boot.reason` says why).",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -204,7 +207,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_get",
-            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle). Also reports a live PROVISIONAL claim when a node has started this instance but the placement is not durable yet (docs/edge-boot.md) — do not build on a provisional instance, it may still be killed.",
+            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle). For suspend: `checkpoint_id`, `suspend_reason` (manual, idle, or pressure), and, while the task's suspend.idle policy is watching a running instance, `idle_since` and `idle_after_seconds`. `cold_boot` (snapshot_id, reason, at) is set when the last resume or restore failed and the instance booted fresh on its volume under onRestoreFailure = \"cold\": its running processes and memory are gone, so do not assume a resumed session survived. Also reports a live PROVISIONAL claim when a node has started this instance but the placement is not durable yet (docs/edge-boot.md) — do not build on a provisional instance, it may still be killed.",
             input_schema: || json!({
                 "type": "object",
                 "properties": { "instance_id": { "type": "string", "description": "Instance id." } },
@@ -262,6 +265,112 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: true,
         },
         ToolDef {
+            name: "legion_snapshot_list",
+            description: "List snapshots of instances, newest first (docs/suspend-and-resume.md). Every filter is optional. `state` is capturing, local (captured; bytes on `nodeId`), published (in the content store; restores on any compatible node and survives its node), failed (`error` says why), deleting, or lost (its node was removed).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Filter by job." },
+                    "instance_id": { "type": "string", "description": "Filter by the instance it was taken from." },
+                    "state": { "type": "string", "description": "Filter by state: capturing, local, published, failed, deleting, lost." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_snapshot_get",
+            description: "Inspect one snapshot by id (or by name with job_id), including its manifest: memory parts, volume snapshot refs, and the compat block (VMM and CPU) that a restore is placed against.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "snapshot": { "type": "string", "description": "Snapshot id, or a snapshot name when job_id is given." },
+                    "job_id": { "type": "string", "description": "Job the named snapshot belongs to." }
+                },
+                "required": ["snapshot"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_snapshot_create",
+            description: "Snapshot a running instance. kind `disk` (default) copies its stateful.storage volume; kind `memory` also captures guest memory so a restore resumes running processes (sandbox tasks on Firecracker or cloud-hypervisor with a `snapshots` block only). Returns at once in state `capturing`; poll legion_snapshot_get until `local` or `failed`. A memory snapshot contains the workload's in-memory secrets. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Instance to snapshot." },
+                    "kind": { "type": "string", "enum": ["disk", "memory"], "description": "Default disk." },
+                    "name": { "type": "string", "description": "Optional name, unique within the job." },
+                    "publish": { "type": "boolean", "description": "Publish it to the node's contentStore once captured (state local -> published), so it restores on any compatible node and survives the node. Memory snapshots of sandboxes without stateful.storage only. Default false." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the first snapshot." }
+                },
+                "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_snapshot_delete",
+            description: "Delete a snapshot. Its node reclaims the bytes on its next heartbeat. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "snapshot_id": { "type": "string", "description": "Snapshot id." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the first result." }
+                },
+                "required": ["snapshot_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_snapshot_alias_set",
+            description: "Point a snapshot name at a local or published manual snapshot of the same job, creating or moving the name (a golden snapshot is used by name: legion_instance_create with from_snapshot = the name). Repointing never touches the old snapshot. Mutating; needs snapshot:write.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Job the name belongs to." },
+                    "name": { "type": "string", "description": "The name ([A-Za-z0-9._-]{1,64}, not starting with snap-)." },
+                    "snapshot": { "type": "string", "description": "Snapshot id, or another name of the job." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key." }
+                },
+                "required": ["job_id", "name", "snapshot"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_snapshot_restore",
+            description: "Roll a keyed instance back to one of its own snapshots, in place: its allocation is replaced by one started from the snapshot on the node that holds it. Placement fails with a named reason when the node's CPU or VMM no longer matches a memory snapshot. The outcome arrives as a `snapshot.restored` or `snapshot.restore_failed` event; a failed restore boots the instance cold on its retained storage. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Keyed instance to roll back." },
+                    "snapshot": { "type": "string", "description": "Snapshot id or name." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the first result." }
+                },
+                "required": ["instance_id", "snapshot"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_snapshot_warm",
+            description: "Pre-fetch a published snapshot's parts onto every available node that matches the constraints and could restore it, so a later resume, restore, or fork there starts from local bytes and placement prefers those nodes. Best effort and idempotent: nodes that already hold the parts are skipped, and outcomes arrive as `snapshot.warmed` / `snapshot.warm_failed` events. Only a `published` snapshot can be warmed. Triggers downloads on the selected nodes, so it is gated like a mutating tool.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "snapshot": { "type": "string", "description": "Snapshot id, or a snapshot name when job_id is given." },
+                    "job_id": { "type": "string", "description": "Job the named snapshot belongs to." },
+                    "constraints": { "type": "array", "items": { "type": "string" }, "description": "Node attribute filters, each key=value (for example region=us-west). Empty warms every compatible node." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the first reply." }
+                },
+                "required": ["snapshot"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
             name: "legion_node_list",
             description: "List worker nodes and their health. Each node carries `heartbeat_source`: `live` means the answering manager observed the beat itself, `checkpoint` means the timestamp comes from a periodic replicated checkpoint and is up to `liveness.checkpointInterval` (30s) behind, empty means none has been observed. The node's `status` is exact either way (docs/node-liveness.md).",
             input_schema: empty_schema,
@@ -270,6 +379,51 @@ fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             name: "legion_node_cadence",
             description: "Report whether the fleet is sustaining its heartbeat cadence. Returns the freshness ratio (1.0 = every node checked in on time; false node loss begins at served_interval/lost_window, 0.20 at the defaults), the per-fleet lost window, the sustainable node count for this control plane, and the `heartbeatSeconds` value to set if the fleet is falling behind. Read this before concluding that nodes have died: a low ratio means the control plane is behind, not that the machines are gone (docs/heartbeat-cadence-and-scale.md).",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_usage",
+            description: "Show one node's memory and CPU: schedulable capacity, the sum of reservations placed on it, and what its allocations actually use, per allocation (memory_current_bytes, memory_peak_bytes, memory_anon_bytes, cpu_millicores, idle_seconds). Usage comes from cgroup reports that workers with resourceEnforcement.enabled send every 10 seconds; `usage_reported: false` means none reached this manager, and `report_age_seconds` well above 10 means the node stopped reporting. Each allocation also carries `band`, `memory_max_mib`, and its place in the node's memory pressure order (`pressure_rank`, 1 = acted on first, 0 = never; `pressure_steps`, e.g. [\"reclaim\", \"evict-bursting\"], or [\"reclaim\", \"suspend\"] for a task that sets suspend.onPressure, which is suspended with its state instead of stopped), and `memory` carries `oversubscribe_ratio` and `pressure_response` (whether the node is under pressure now). Use it to compare reservations with real use before resizing a job, and to see which allocations a short node would stop first (docs/resource-enforcement.md).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "Node to inspect." }
+                },
+                "required": ["node_id"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_usage_list",
+            description: "Show memory and CPU for many nodes in one call: per node, schedulable capacity (with `oversubscribe_ratio`), the sum of reservations, measured use, `usage_reported`, and `memory.pressure_response` (whether the node is under memory pressure now). CPU carries `cores` and `used_millicores`, which are filled even on nodes that report no clock speed. Per-allocation rows are omitted unless `include_allocations` is true. Empty `node_ids` means every node (up to 500; `truncated` says when there were more). Use it to find tight or pressured nodes before drilling in with legion_node_usage (docs/resource-enforcement.md).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_ids": { "type": "array", "items": { "type": "string" }, "description": "Nodes to report on; omit for every node." },
+                    "include_allocations": { "type": "boolean", "description": "Also return each node's per-allocation rows. Default false." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_content",
+            description: "Show what one node holds for content locality: the content its worker advertises to the manager's location index (digest, bytes, how many nodes hold it, and the snapshot and part role it belongs to when known), whether the worker can publish and checkpoint, and the node's snapshots (captured there, or published elsewhere with parts fetched or warmed there) with `parts_here`/`parts_total`. `index_reported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork (docs/artifacts.md, \"Content locality\").",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "Node to inspect." }
+                },
+                "required": ["node_id"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_scheduler_concurrency",
+            description: "Report how many evals the manager will PLAN at once, and why. Returns the current limit against its floor/ceiling (`evalThreads`), the smoothed plan-conflict rate, the fallback rate (races absorbed by candidate lists — these are successes, not failures), goodput in placements/sec, and a `state` of steady|throttled|probing|saturated. Read this before concluding that a cluster is slow or full: `throttled` means the scheduler is deliberately admitting fewer planners and work will drain, while `saturated` means backing off did NOT help and the conflicts are capacity-driven — the answer there is more nodes, not waiting or resubmitting (docs/adaptive-scheduler-concurrency.md).",
             input_schema: empty_schema,
             mutates: false,
         },
@@ -696,6 +850,7 @@ fn tool_defs() -> Vec<ToolDef> {
                     "instance_id": { "type": "string", "description": "Explicit instance key ([A-Za-z0-9._-]{1,128}); server-minted when omitted." },
                     "instance_ids": { "type": "array", "items": { "type": "string" }, "description": "Batch of explicit instance keys, created atomically (all-or-nothing). Mutually exclusive with instance_id." },
                     "count": { "type": "integer", "minimum": 1, "description": "Create this many additional server-minted instances (atomic with instance_ids)." },
+                    "from_snapshot": { "type": "string", "description": "Restore the new instance(s) from this snapshot of the job (an id or a name) instead of booting empty. Each gets its own copy of the snapshot's volume and its own identity, on the snapshot's node; at most 64 per call. Needs snapshot:read." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["job_id"],
@@ -719,12 +874,45 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_start",
-            description: "Start (resume) a stopped keyed-mode instance: re-place it with the same id and retained storage handle. The owning job must be running. Mutating.",
+            description: "Start a stopped keyed-mode instance (re-place it with the same id and retained storage handle), or resume a suspended one from its checkpoint (cold=true discards the checkpoint and boots fresh). The owning job must be running. Returns at once; poll legion_instance_get for state=active and no pending_op, then check `cold_boot`: when set, the restore failed and the instance booted fresh (onRestoreFailure = \"cold\", the default), losing its running processes. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "instance_id": { "type": "string", "description": "Instance id to start." },
+                    "cold": { "type": "boolean", "description": "Suspended instances only: discard the checkpoint and boot fresh. Default false." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_instance_suspend",
+            description: "Suspend a keyed-mode instance: the node checkpoints the running allocation (memory for a sandbox launched for checkpoints, else disk), stops it, and frees its reservation. The instance becomes `suspended`; legion_instance_start resumes it. A failed capture leaves it running (see detail on legion_instance_get). Returns at once; poll legion_instance_get for state=suspended. Mutating; a memory checkpoint also needs snapshot:write.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Instance id to suspend." },
+                    "checkpoint": { "type": "string", "enum": ["memory", "disk"], "description": "Checkpoint kind; default the task's suspend.checkpoint, else the best the instance can take." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_instance_fork",
+            description: "Fork a running keyed-mode instance into `count` new instances (docs/suspend-and-resume.md, \"Fork\"). The origin is checkpointed live and keeps running (a memory checkpoint pauses it for `pause_ms`). Each fork is a new instance `<origin>-f<n>` with its own cloned volume and its own identity (allocation id, hostname, token, entropy, MAC/TAP), pinned to the origin's node, or with spread=true each on its own node once the checkpoint is published. Returns the fork ids at once; poll legion_snapshot_get on `snapshot` for state=local (forks released for placement; published for a spread fork) or failed (origin keeps running, forks terminated). Retry-safe with idempotency_key. Mutating; needs job:write and snapshot:write.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Active keyed instance to fork." },
+                    "count": { "type": "integer", "minimum": 1, "maximum": 64, "description": "How many forks (default 1)." },
+                    "checkpoint": { "type": "string", "enum": ["memory", "disk"], "description": "Default memory when the origin can take one, else disk." },
+                    "spread": { "type": "boolean", "description": "Place each fork on its own node. Takes a memory checkpoint, publishes it to the origin node's contentStore, and places the forks once it is published. Needs an instance with no stateful.storage volume." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the first call's forks and creates nothing." }
                 },
                 "required": ["instance_id"],
                 "additionalProperties": false
@@ -981,6 +1169,48 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.get_heartbeat_cadence(crate::structs::GetHeartbeatCadenceRequest {})).await
         }
+        "legion_node_usage" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing string argument: node_id".to_string())?
+                .to_string();
+            let mut client = connect().await?;
+            grpc(client.get_node_usage(crate::structs::GetNodeUsageRequest { node_id })).await
+        }
+        "legion_node_usage_list" => {
+            let node_ids = args
+                .get("node_ids")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let include_allocations = args
+                .get("include_allocations")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(
+                client.list_node_usage(crate::structs::ListNodeUsageRequest {
+                    node_ids,
+                    include_allocations,
+                }),
+            )
+            .await
+        }
+        "legion_node_content" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing string argument: node_id".to_string())?
+                .to_string();
+            let mut client = connect().await?;
+            grpc(client.get_node_content(crate::structs::GetNodeContentRequest { node_id })).await
+        }
         "legion_keyring_status" => {
             let mut client = connect().await?;
             grpc(client.get_keyring_status(crate::structs::GetKeyringStatusRequest {})).await
@@ -990,6 +1220,13 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.rotate_data_key(crate::structs::RotateDataKeyRequest { idempotency_key }))
                 .await
+        }
+        "legion_scheduler_concurrency" => {
+            let mut client = connect().await?;
+            grpc(
+                client.get_scheduler_concurrency(crate::structs::GetSchedulerConcurrencyRequest {}),
+            )
+            .await
         }
         "legion_node_drain" => {
             let node_id = str_arg(&args, "node_id")?;
@@ -1165,6 +1402,87 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             }))
             .await
         }
+        "legion_snapshot_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_snapshots(crate::structs::ListSnapshotsRequest {
+                job_id: opt_str_arg(&args, "job_id"),
+                instance_id: opt_str_arg(&args, "instance_id"),
+                state: opt_str_arg(&args, "state"),
+            }))
+            .await
+        }
+        "legion_snapshot_get" => {
+            let snapshot = str_arg(&args, "snapshot")?;
+            let mut client = connect().await?;
+            grpc(client.get_snapshot(crate::structs::GetSnapshotRequest {
+                snapshot,
+                job_id: opt_str_arg(&args, "job_id"),
+            }))
+            .await
+        }
+        "legion_snapshot_create" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let mut client = connect().await?;
+            grpc(
+                client.create_snapshot(crate::structs::CreateSnapshotRequest {
+                    instance_id,
+                    kind: opt_str_arg(&args, "kind").unwrap_or_else(|| "disk".into()),
+                    name: opt_str_arg(&args, "name"),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                    publish: args
+                        .get("publish")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                }),
+            )
+            .await
+        }
+        "legion_snapshot_warm" => {
+            let snapshot = str_arg(&args, "snapshot")?;
+            let constraints: Vec<String> = args
+                .get("constraints")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut client = connect().await?;
+            grpc(client.warm_snapshot(crate::structs::WarmSnapshotRequest {
+                snapshot,
+                job_id: opt_str_arg(&args, "job_id"),
+                constraints,
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            }))
+            .await
+        }
+        "legion_snapshot_delete" => {
+            let snapshot_id = str_arg(&args, "snapshot_id")?;
+            let mut client = connect().await?;
+            grpc(
+                client.delete_snapshot(crate::structs::DeleteSnapshotRequest {
+                    snapshot_id,
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_snapshot_restore" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let snapshot = str_arg(&args, "snapshot")?;
+            let mut client = connect().await?;
+            grpc(
+                client.restore_instance(crate::structs::RestoreInstanceRequest {
+                    instance_id,
+                    snapshot,
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
         "legion_instance_create" => {
             let job_id = str_arg(&args, "job_id")?;
             let group = opt_str_arg(&args, "group");
@@ -1183,6 +1501,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 .unwrap_or_default();
             let count = args.get("count").and_then(Value::as_u64).unwrap_or(0) as u32;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let from_snapshot = opt_str_arg(&args, "from_snapshot");
             let mut client = connect().await?;
             // instance_ids/count select the atomic batch RPC; a lone
             // instance_id keeps the single-create semantics (incl. server
@@ -1202,6 +1521,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     instance_ids,
                     count,
                     idempotency_key,
+                    from_snapshot,
                 }))
                 .await
             } else {
@@ -1211,6 +1531,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     task,
                     instance_id,
                     idempotency_key,
+                    from_snapshot,
                 }))
                 .await
             }
@@ -1228,10 +1549,54 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_instance_start" => {
             let instance_id = str_arg(&args, "instance_id")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let cold = args
+                .get("cold")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
             let mut client = connect().await?;
             grpc(client.start_instance(StartInstanceRequest {
                 instance_id,
                 idempotency_key,
+                cold,
+            }))
+            .await
+        }
+        "legion_instance_suspend" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let checkpoint = opt_str_arg(&args, "checkpoint");
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.suspend_instance(SuspendInstanceRequest {
+                instance_id,
+                checkpoint,
+                idempotency_key,
+            }))
+            .await
+        }
+        "legion_instance_fork" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let count = args.get("count").and_then(Value::as_u64).unwrap_or(1) as u32;
+            let spread = args.get("spread").and_then(Value::as_bool).unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.fork_instance(ForkInstanceRequest {
+                instance_id,
+                count,
+                spread,
+                checkpoint: opt_str_arg(&args, "checkpoint"),
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            }))
+            .await
+        }
+        "legion_snapshot_alias_set" => {
+            let job_id = str_arg(&args, "job_id")?;
+            let name = str_arg(&args, "name")?;
+            let snapshot = str_arg(&args, "snapshot")?;
+            let mut client = connect().await?;
+            grpc(client.set_snapshot_alias(SetSnapshotAliasRequest {
+                job_id,
+                name,
+                snapshot,
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
             }))
             .await
         }

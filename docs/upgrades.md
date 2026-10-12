@@ -151,6 +151,74 @@ Neither the `boot` ACL resource nor the `edgeBoot` config blocks need a
 coordinated upgrade. Both are off by default, and a manager that does not
 know them ignores them.
 
+## Snapshots under skew
+
+[Snapshots](suspend-and-resume.md) are gated on a worker **capability**, not
+on the protocol version. A worker that predates them does not list
+`checkpoint` in its registration, so the manager never sends it checkpoint
+work, and `legion snapshot create` against one of its instances fails with
+`FailedPrecondition` naming the worker's version. Upgrade the worker and the
+same command works. An old manager rejects the snapshot RPCs as unknown, and
+old workers ignore the new heartbeat fields.
+
+Two upgrades change what a snapshot can do afterwards:
+
+- **A VMM upgrade on a node** strands its memory snapshots: a memory snapshot
+  resumes only on the VMM version it was taken on, and placement refuses a
+  restore with `sandbox.vmm.<name>.version is ..., the checkpoint needs ...`.
+  Take a fresh snapshot after the upgrade, or restart instances cold. Disk
+  snapshots are unaffected.
+- **Downgrading a manager** below the snapshot schema leaves `snapshot` rows
+  and the `instance.restore_from` column it does not read. Let pending
+  restores finish before downgrading.
+
+## Suspend under skew
+
+[Suspend](suspend-and-resume.md) rides the same `checkpoint` capability as
+snapshots. `legion instance suspend` against an instance on an older worker
+fails with `FailedPrecondition` naming the worker's version, and the manager
+never sends such a worker suspend work or a resume's restore payload.
+
+- **Resume or stop suspended instances before a manager downgrade.**
+  `suspended` is a new instance state. A manager that predates it reads an
+  instance state it does not know, and a suspended instance's checkpoint is
+  invisible to it. Run `legion instance list <job>` per job, then `instance
+  start` (resume) or `instance stop` (discard the checkpoint) every
+  suspended instance first.
+- **Drain suspended instances off a node before upgrading its VMM.** A memory
+  checkpoint restores only on the VMM version it was taken on. After a VMM
+  upgrade, a resume of an older checkpoint fails placement on the `compat`
+  check, and `onRestoreFailure` decides: `cold` boots it fresh on its
+  retained storage after `resumeTimeout`, `fail` leaves it suspended. Resume
+  the node's suspended instances before the upgrade (and suspend them again
+  after it if you want), or accept the cold boot.
+- **The allocation table is rebuilt once** on the upgrade that adds suspend,
+  so allocation ids are never reused afterwards. The rebuild copies every
+  row and runs in the migration, before the manager serves requests.
+
+## Durable checkpoints under skew
+
+Publishing (`suspend.durability = "store"`, `snapshot create --publish`) is
+gated on a second worker capability, `content-publish`, which a worker lists
+only when its `contentStore` is configured and usable. A store suspend on a
+node without it fails with `FailedPrecondition` naming the node, before
+anything is captured.
+
+- **Upgrade workers before you rely on cross-node resume.** A worker that
+  predates published snapshots cannot fetch a part from the store before a
+  restore: it fails the restore (`... is missing or corrupt in this node's
+  content store`), and `onRestoreFailure` decides what happens. Placement
+  does not yet know which workers can fetch, so a mixed fleet can place a
+  published resume on an old worker.
+- **Downgrading a manager** leaves the `snapshot.durability` and
+  `published_at` columns it does not read, and it reads a `published`
+  snapshot's state as unknown. Resume, or stop, instances with published
+  checkpoints first.
+- **A VMM upgrade strands published memory checkpoints too.** A published
+  checkpoint resumes on any node with the VMM version and CPU it was taken
+  on, so upgrading the whole fleet's VMM leaves it nowhere to run. Upgrade a
+  subset first, or resume the instances before the last old node goes.
+
 ## Task-plugin ABI
 
 Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by

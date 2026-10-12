@@ -1,11 +1,12 @@
 use crate::prelude::*;
 
+use crate::manager::concurrency::{is_planning_kind, PlannerPermit};
 use crate::manager::oidc_http::OidcHttpLayer;
 use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
 use crate::storage::events::drafts;
 use crate::storage::persistence::PersistenceRole;
-use crate::storage::store::{EvalBatchLimits, EvalCompletion, Store};
+use crate::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion, Store};
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, NodeMsg,
     Submission, TaskConfig, TlsConfigFull, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
@@ -29,6 +30,11 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 // Safety cap for empty queues so idle workers can still periodically re-check state.
 const IDLE_WAIT_CAP: Duration = Duration::from_secs(300);
+// How long a throttled eval worker with no non-planning work parks before
+// re-checking the admission gate. Short, because the thing it is waiting for
+// is a permit rather than a timer, and `Notify::notify_waiters` stores no
+// permit for a release that lands between the claim attempt and the wait.
+const THROTTLED_GATE_POLL: Duration = Duration::from_millis(100);
 // Exponential backoff is reserved for true error paths (claim failures).
 const ERROR_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -129,6 +135,15 @@ pub async fn run_manager_with(
         full_config.heartbeat.parsed_min_interval()
             * full_config.heartbeat.missed_beats_before_lost.max(1),
     )?;
+    // Adaptive scheduler concurrency, validated HERE rather than inside its
+    // own loop: that loop's error is swallowed by the `join!` below, so a
+    // mistyped `mode = "enforc"` would silently leave the controller off
+    // while the operator believed they had turned it on
+    // (docs/adaptive-scheduler-concurrency.md).
+    let adaptive_concurrency =
+        crate::manager::concurrency::AdaptiveConcurrencySettings::from_scheduler_settings(
+            full_config.scheduler_settings.as_ref(),
+        )?;
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
     // A restore is an explicit operator action with the operator present:
@@ -234,6 +249,7 @@ pub async fn run_manager_with(
     let store_for_keyring = store.clone();
 
     let store_for_shutdown = store.clone();
+    let store_copy_c = store.clone();
 
     // Workload identity (OIDC issuer): only constructed when enabled. The
     // signing keys are restored from (or first-boot persisted to) the store,
@@ -287,6 +303,7 @@ pub async fn run_manager_with(
                         state,
                         full_config.workload_identity.control_plane_bindings.clone(),
                         authenticator.login_ttl,
+                        store.clone(),
                     ),
                 ))
                 .context("failed to register the control-plane identity auth method")?;
@@ -497,6 +514,9 @@ pub async fn run_manager_with(
         }
     };
 
+    // The idle sweep reads the usage table heartbeats fill, so it shares
+    // the service's handle.
+    let usage_for_idle_sweep = manager_node.usage_handle();
     let manager_service = ManagerServer::new(manager_node);
     // Browser origins (docs/ui-architecture.md): loopback plus
     // `server.allowedOrigins`. The guard refuses everything else before any
@@ -550,8 +570,15 @@ pub async fn run_manager_with(
             heartbeat: full_config.heartbeat.clone(),
             liveness: full_config.liveness.clone(),
             manager_node_id: manager_node_id.clone(),
+            idle_sweep: Some(IdleSweepConfig {
+                usage: usage_for_idle_sweep,
+                interval: full_config.suspend.idle_sweep_interval(),
+                make_room: full_config.suspend.make_room,
+            }),
         },
     );
+    let concurrency_fut =
+        start_concurrency_controller(store_copy_c, full_config.eval_threads, adaptive_concurrency);
     let eval_loop_fut = start_eval_loop(store_copy_b, full_config.eval_threads);
     let manager_host = resolve_manager_host(&full_config.server.host);
     let manager_addr = format!("http://{}:{}", manager_host, full_config.server.port);
@@ -578,9 +605,10 @@ pub async fn run_manager_with(
     // The background loops run as one task the daemon can abort: without an
     // API and raft transport they must not keep acting on the cluster.
     let background = tokio::spawn(async move {
-        let (checker, evals, worker, rotation, keyring) = join!(
+        let (checker, evals, concurrency, worker, rotation, keyring) = join!(
             node_checker_fut,
             eval_loop_fut,
+            concurrency_fut,
             worker_fut,
             rotation_fut,
             keyring_fut
@@ -588,6 +616,7 @@ pub async fn run_manager_with(
         for (name, result) in [
             ("node status checker", checker),
             ("eval loop", evals),
+            ("adaptive scheduler concurrency", concurrency),
             ("in-process worker", worker),
             ("workload identity rotation", rotation),
             ("keyring maintenance", keyring),
@@ -1098,7 +1127,26 @@ pub struct LivenessCheckerConfig {
     pub liveness: crate::structs::LivenessConfigFull,
     /// This manager's own id, as the digest identifies its sender.
     pub manager_node_id: String,
+    /// The idle sweep (docs/suspend-and-resume.md, "Idle policy"). `None`
+    /// turns it off (embedded uses with no heartbeat service).
+    pub idle_sweep: Option<IdleSweepConfig>,
 }
+
+/// What the idle sweep needs: the usage table heartbeats fill, and how
+/// often to look (manager `suspend.idleSweep`).
+#[derive(Debug, Clone)]
+pub struct IdleSweepConfig {
+    pub usage: Arc<Mutex<crate::manager::usage::UsageTable>>,
+    pub interval: Duration,
+    /// Also run the make-room sweep (manager `suspend.makeRoom`, docs/
+    /// suspend-and-resume.md "Capacity for resumes"), which reads the same
+    /// usage reports to find the quietest instances.
+    pub make_room: bool,
+}
+
+/// How often the make-room sweep looks for resumes waiting on a full node.
+/// One indexed read when nothing is resuming.
+const MAKE_ROOM_EVERY: Duration = Duration::from_secs(5);
 
 /// The interval this manager currently serves, and the ladder state behind it.
 ///
@@ -1153,6 +1201,12 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
     // engine, is the steady state.
     let mut last_divergent_regen: Option<std::time::Instant> = None;
     let mut last_kv_sweep: Option<std::time::Instant> = None;
+    // Automatic suspend: its own cadence (default 15s), independent of the
+    // status checker's, and its memory of what it already tried.
+    let mut last_idle_sweep: Option<std::time::Instant> = None;
+    let mut idle_sweeper = crate::manager::server::IdleSweeper::default();
+    let mut last_make_room: Option<std::time::Instant> = None;
+    let mut make_room_state = crate::manager::server::MakeRoomState::default();
     loop {
         // Leader-only actions (raft mode, per lane): only the STATUS-lane
         // leader may mark nodes lost / sweep health orphans; non-leaders
@@ -1542,6 +1596,34 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                     }
                 }
                 Err(err) => warn!(error = ?err, "Failed reaping orphaned volumes"),
+            }
+            // `snapshots.ttl`: expired snapshots move to `deleting`, and their
+            // nodes reclaim the bytes on the next heartbeat (see
+            // docs/suspend-and-resume.md). A read-only check when nothing is
+            // due.
+            crate::manager::server::expire_snapshots(&store);
+            // Resumes whose checkpoint was lost with its node, or that waited
+            // out `suspend.resumeTimeout`, settle per `onRestoreFailure`. One
+            // indexed read when nothing is resuming.
+            crate::manager::server::settle_stalled_resumes(&store);
+        }
+
+        // Idle sweep: suspend instances quiet past their task's
+        // `suspend.idle.after`. Not leader-gated: the usage it reads lives
+        // on whichever manager the nodes heartbeat to, and `begin_suspend`
+        // forwards to the scheduler-lane leader. An in-memory scan when
+        // nothing is due.
+        if let Some(idle) = config.idle_sweep.as_ref() {
+            if last_idle_sweep.is_none_or(|at| at.elapsed() >= idle.interval) {
+                last_idle_sweep = Some(std::time::Instant::now());
+                crate::manager::server::idle_sweep(&store, &idle.usage, &mut idle_sweeper);
+            }
+            // Make room for resumes pinned to a full node. Not leader-gated
+            // for the same reason as the idle sweep: the usage lives here,
+            // and the suspends and evals it starts forward to the leader.
+            if idle.make_room && last_make_room.is_none_or(|at| at.elapsed() >= MAKE_ROOM_EVERY) {
+                last_make_room = Some(std::time::Instant::now());
+                crate::manager::server::make_room_sweep(&store, &idle.usage, &mut make_room_state);
             }
         }
 
@@ -1941,6 +2023,202 @@ fn write_lost_windows(store: &Store, updates: Vec<(String, i64)>, widening: bool
     }
 }
 
+/// The adaptive scheduler-concurrency control loop
+/// (docs/adaptive-scheduler-concurrency.md).
+///
+/// Copies the heartbeat-cadence shape exactly: the decision is a pure function
+/// ([`crate::manager::concurrency::advance`]) and this loop only collects the
+/// snapshot and applies the verdict.
+///
+/// **Scheduler-lane-leader-only**, for the same reason the eval workers are: a
+/// follower does no planning, so its window is empty and its state would be
+/// noise. State resets on leadership acquisition — a new leader starts at the
+/// startup limit and re-derives within ~2s, which is cheaper than replicating
+/// controller state at one op per tick.
+#[instrument(err, skip_all)]
+async fn start_concurrency_controller(
+    store: Store,
+    eval_threads: usize,
+    settings: crate::manager::concurrency::AdaptiveConcurrencySettings,
+) -> R<()> {
+    use crate::manager::concurrency::{
+        self, AdjustmentDirection, ConcurrencyMode, ConcurrencyReport, ConcurrencyState, TickInput,
+    };
+
+    // Published before the first tick so eval workers take the right path from
+    // their very first claim.
+    concurrency::gate().set_mode(settings.mode);
+    if settings.mode == ConcurrencyMode::Off {
+        info!(
+            eval_threads,
+            "Adaptive scheduler concurrency is off; evalThreads is the fixed planner count"
+        );
+        return Ok(());
+    }
+
+    let (floor, ceiling) = settings.bounds(eval_threads);
+    let gate = concurrency::gate();
+    let mut state = ConcurrencyState::new(ceiling);
+    gate.set_limit(state.limit);
+    info!(
+        mode = settings.mode.as_str(),
+        floor,
+        ceiling,
+        eval_threads,
+        starting_limit = state.limit,
+        "Adaptive scheduler concurrency started"
+    );
+
+    let mut ticker = tokio::time::interval(concurrency::TICK_PERIOD);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_tick = std::time::Instant::now();
+    let mut was_leader = false;
+    loop {
+        ticker.tick().await;
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(last_tick);
+        last_tick = now;
+
+        if !store.is_raft_leader(crate::storage::Lane::Scheduler) {
+            if was_leader {
+                info!("Scheduler-lane leadership lost; concurrency controller idling");
+                concurrency::clear_report();
+                was_leader = false;
+            }
+            // Discard whatever landed in the window: it describes a stint that
+            // is over, and carrying it into the next one would decide on it.
+            concurrency::conflict_window().drain();
+            continue;
+        }
+        if !was_leader {
+            info!("Scheduler-lane leadership acquired; concurrency controller resuming");
+            state = ConcurrencyState::new(ceiling);
+            gate.set_limit(state.limit);
+            concurrency::conflict_window().drain();
+            was_leader = true;
+            continue;
+        }
+
+        let counts = concurrency::conflict_window().drain();
+        let input = TickInput {
+            applied: counts.applied,
+            fallback: counts.fallback,
+            rejected: counts.rejected,
+            elapsed,
+            floor,
+            ceiling,
+            tuning: settings.tuning(),
+        };
+        let next = concurrency::advance(&state, &input);
+
+        // `enforce` publishes the limit into the gate; `observe` computes the
+        // identical value and publishes it as a shadow, which is what makes
+        // observe mode useful on its own.
+        if settings.mode == ConcurrencyMode::Enforce && next.limit != state.limit {
+            gate.set_limit(next.limit);
+        }
+
+        let just_adjusted = next
+            .last_adjustment
+            .filter(|adjustment| adjustment.ticks_ago == 0);
+        if let Some(adjustment) = just_adjusted {
+            // At `info` only on change; the per-tick line below is `debug`.
+            info!(
+                direction = adjustment.direction.as_str(),
+                from = adjustment.from,
+                to = adjustment.to,
+                ceiling,
+                mode = settings.mode.as_str(),
+                conflict_rate = adjustment.conflict_rate,
+                goodput = next.ewma_goodput.unwrap_or(0.0),
+                "Adjusted admitted planners"
+            );
+            crate::manager::telemetry::metrics()
+                .scheduler_concurrency_adjustments_total
+                .inc(&[adjustment.direction.as_str()]);
+            store.events().scheduler_concurrency_adjusted(
+                adjustment.direction.as_str(),
+                adjustment.from,
+                adjustment.to,
+                ceiling,
+                adjustment.conflict_rate,
+                settings.mode.as_str(),
+            );
+            if adjustment.direction == AdjustmentDirection::Revert {
+                warn!(
+                    restored_to = adjustment.to,
+                    goodput_before = adjustment.goodput_before,
+                    goodput_after = next.ewma_goodput.unwrap_or(0.0),
+                    "Reducing scheduler concurrency did not improve goodput; conflicts are \
+                     capacity-driven, not concurrency-driven — add nodes"
+                );
+                store.events().scheduler_concurrency_saturated(
+                    adjustment.to,
+                    adjustment.goodput_before,
+                    next.ewma_goodput.unwrap_or(0.0),
+                );
+            }
+        } else {
+            debug!(
+                limit = next.limit,
+                state = next.state.as_str(),
+                conflict_rate = next.ewma_conflict.unwrap_or(0.0),
+                applied = counts.applied,
+                fallback = counts.fallback,
+                rejected = counts.rejected,
+                "Scheduler concurrency tick"
+            );
+        }
+
+        publish_concurrency_metrics(&next);
+        concurrency::publish_report(ConcurrencyReport {
+            mode: settings.mode,
+            limit: next.limit,
+            floor,
+            ceiling,
+            eval_threads,
+            in_flight: gate.in_flight(),
+            state: next.state,
+            seconds_in_state: next.seconds_in_state(),
+            conflict_rate: next.ewma_conflict,
+            fallback_rate: next.ewma_fallback,
+            goodput: next.ewma_goodput,
+            window: counts,
+            last_adjustment: next.last_adjustment,
+            admission_skips: concurrency::admission_skips(),
+        });
+        state = next;
+    }
+}
+
+fn publish_concurrency_metrics(state: &crate::manager::concurrency::ConcurrencyState) {
+    use crate::manager::concurrency::{self, ControllerState};
+    let metrics = crate::manager::telemetry::metrics();
+    metrics.scheduler_concurrency_limit.set(state.limit as i64);
+    metrics
+        .scheduler_concurrency_in_flight
+        .set(concurrency::gate().in_flight() as i64);
+    for candidate in [
+        ControllerState::Steady,
+        ControllerState::Throttled,
+        ControllerState::Probing,
+        ControllerState::Saturated,
+    ] {
+        metrics
+            .scheduler_concurrency_state
+            .set(&[candidate.as_str()], i64::from(candidate == state.state));
+    }
+    metrics
+        .scheduler_concurrency_conflict_rate
+        .set(state.ewma_conflict.unwrap_or(0.0));
+    metrics
+        .scheduler_concurrency_fallback_rate
+        .set(state.ewma_fallback.unwrap_or(0.0));
+    metrics
+        .scheduler_concurrency_goodput
+        .set(state.ewma_goodput.unwrap_or(0.0));
+}
+
 #[instrument(err, skip_all)]
 async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     let max_threads = max_threads.max(1);
@@ -2252,14 +2530,37 @@ async fn eval_worker_loop(
             info!(worker_id, "Raft leadership acquired; eval worker resuming");
             was_leader = true;
         }
+        // Admission control for PLANNING (docs/adaptive-scheduler-concurrency.md).
+        //
+        // A permit is held PER WORKER, PER BATCH. A worker takes its batch
+        // through the handlers one eval at a time, so one permit per worker
+        // is exactly one concurrent planner: the limit counts workers inside
+        // planning work, not evals. The permit spans the whole batch,
+        // including every `plan_with_conflict_retries` backoff sleep — a
+        // retrying planner still counts against the budget, because its next
+        // attempt is precisely the arrival the controller is spacing out.
+        //
+        // The gate is asked at every batch boundary, so a lowered limit lands
+        // on the next batch with no thread churn: the worker pool is never
+        // resized, only how many of its members may plan at once.
         let claim_started = std::time::Instant::now();
-        // A batch carried over by the previous `complete_evals_and_claim_next`
-        // was already paid for by that round, so only a claim that actually
-        // hit the store is metered below.
         let carried_ahead = !claimed_ahead.is_empty();
-        let batch = if carried_ahead {
-            std::mem::take(&mut claimed_ahead)
+        let (batch, mut permit, throttled) = if carried_ahead {
+            // Already ours, claimed by the previous round's fused
+            // settle-and-claim (and already metered by that round). If any of
+            // it plans, WAIT for a permit rather than run over the limit: the
+            // rows are `in_flight` to us either way, and parking here holds
+            // them exactly as the queue would have.
+            let batch = std::mem::take(&mut claimed_ahead);
+            let permit = if batch.iter().any(|eval| is_planning_kind(&eval.kind)) {
+                wait_for_permit(worker_id).await
+            } else {
+                None
+            };
+            (batch, permit, false)
         } else {
+            let admission = crate::manager::concurrency::gate().admit();
+            let throttled = admission.is_throttled();
             // On the blocking pool, like the handler below: a claim is a
             // scheduler-lane quorum round, and running it inline here
             // parked a tokio runtime worker for the whole round trip.
@@ -2267,16 +2568,17 @@ async fn eval_worker_loop(
             // matter how high `evalThreads` goes, so at high thread counts
             // the claims themselves were what serialized the loop.
             let store_for_claim = store.clone();
-            let claimed =
-                tokio::task::spawn_blocking(move || store_for_claim.claim_evals(batch_limits))
-                    .await
-                    .unwrap_or_else(|join_error| {
-                        Err(anyhow::anyhow!("eval claim task failed: {join_error:?}"))
-                    });
+            let claimed = tokio::task::spawn_blocking(move || {
+                claim_eval_batch(&store_for_claim, throttled, batch_limits)
+            })
+            .await
+            .unwrap_or_else(|join_error| {
+                Err(anyhow::anyhow!("eval claim task failed: {join_error:?}"))
+            });
             crate::manager::telemetry::metrics()
                 .eval_queue_round_seconds
                 .observe(&["claim"], claim_started.elapsed().as_secs_f64());
-            match claimed {
+            let batch = match claimed {
                 Ok(batch) => batch,
                 Err(e) => {
                     error!(
@@ -2289,33 +2591,43 @@ async fn eval_worker_loop(
                     error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
                     continue;
                 }
-            }
-        };
-        // An empty claim yields an empty changeset, which skips the raft
-        // entry — but it still pays the capture (a savepoint on the write
-        // connection) and the wake that produced it, so the empty share is
-        // the cost of waking a worker for nothing — the thundering-herd
-        // signal this counter exists for.
-        // Batching does not change what a tick means here: it is still one
-        // round, so `claimed` counts rounds that found work rather than
-        // evals. That is deliberate — dividing `evals_processed_total` by
-        // this counter is exactly the evals-per-round ratio batching is
-        // meant to raise, and there is no other way to see it.
-        if !carried_ahead {
+            };
+            // An empty claim yields an empty changeset, which skips the raft
+            // entry — but it still pays the capture (a savepoint on the write
+            // connection) and the wake that produced it, so the empty share is
+            // the cost of waking a worker for nothing — the thundering-herd
+            // signal this counter exists for.
+            // Batching does not change what a tick means here: it is still one
+            // round, so `claimed` counts rounds that found work rather than
+            // evals. That is deliberate — dividing `evals_processed_total` by
+            // this counter is exactly the evals-per-round ratio batching is
+            // meant to raise, and there is no other way to see it.
             crate::manager::telemetry::metrics()
                 .eval_claim_total
                 .inc(&[if batch.is_empty() { "empty" } else { "claimed" }]);
-        }
+            (batch, admission.into_permit(), throttled)
+        };
 
         if batch.is_empty() {
+            // Nothing to hold the budget for.
+            drop(permit);
             debug!(
                 worker_id,
+                throttled,
                 claim_eval_ms = claim_started.elapsed().as_millis() as u64,
                 "No eval claimed; worker entering wait path"
             );
-            // Queue is empty (or only delayed work exists), so park until notified or due.
-            wait_for_next_eval(&store, &notifier, worker_id).await;
+            // Queue is empty (or only delayed work exists), so park until
+            // notified or due — plus, when throttled, until a permit frees up,
+            // so a worker holding no work reacts to the gate opening as fast as
+            // it reacts to new work arriving.
+            wait_for_next_eval(&store, &notifier, worker_id, throttled).await;
             continue;
+        }
+        // A batch of nothing but stops needs no slot: hand it back before the
+        // handlers run so a planner can have it.
+        if !batch.iter().any(|eval| is_planning_kind(&eval.kind)) {
+            permit = None;
         }
 
         error_backoff = ERROR_BACKOFF_MIN;
@@ -2403,7 +2715,9 @@ async fn eval_worker_loop(
 
         // One scheduler-lane round settles the whole batch and claims the
         // next one, instead of two rounds per eval. On the blocking pool
-        // for the same reason as the claim above.
+        // for the same reason as the claim above. A worker the gate refused
+        // claims narrowly again here — the same kinds it was allowed this
+        // round — and re-asks the gate at the top of the next.
         //
         // The terminal write is RETRIED (bounded) before the completions
         // are dropped: a transient write error on a leader that never
@@ -2414,6 +2728,7 @@ async fn eval_worker_loop(
         // worker's time; giving up still leaves the batch recoverable by
         // the existing paths, and a leadership loss fails fast on its
         // first attempt (the retries hit the same typed rejection).
+        let scope = claim_scope(throttled);
         let settled = completions.len();
         let mut settle_attempts = 0;
         loop {
@@ -2421,8 +2736,11 @@ async fn eval_worker_loop(
             let completions_for_attempt = completions.clone();
             let settle_started = std::time::Instant::now();
             let outcome = tokio::task::spawn_blocking(move || {
-                store_for_settle
-                    .complete_evals_and_claim_next(completions_for_attempt, batch_limits)
+                store_for_settle.complete_evals_and_claim_next(
+                    completions_for_attempt,
+                    batch_limits,
+                    scope,
+                )
             })
             .await
             .unwrap_or_else(|join_error| {
@@ -2433,6 +2751,7 @@ async fn eval_worker_loop(
                 .observe(&["settle"], settle_started.elapsed().as_secs_f64());
             match outcome {
                 Ok(next) => {
+                    note_narrow_claim(scope, &next);
                     claimed_ahead = next;
                     error_backoff = ERROR_BACKOFF_MIN;
                     break;
@@ -2460,10 +2779,74 @@ async fn eval_worker_loop(
                 }
             }
         }
+        // The permit ends with the batch; a carried-ahead batch asks again.
+        drop(permit);
     }
 }
 
-async fn wait_for_next_eval(store: &Store, notifier: &Notify, worker_id: usize) {
+/// The scope a worker may claim in, given what the gate told it.
+fn claim_scope(throttled: bool) -> ClaimScope {
+    if throttled {
+        ClaimScope::NonPlanning
+    } else {
+        ClaimScope::Any
+    }
+}
+
+/// Count the evals a throttled worker took instead of the queue head
+/// (`legion_scheduler_admission_skips_total`, plan §8.2). The one deviation
+/// from strict queue order the admission gate introduces — a cross-class
+/// inversion, never one within a class — and it must never be silent.
+fn note_narrow_claim(scope: ClaimScope, batch: &[Eval]) {
+    if scope == ClaimScope::NonPlanning && !batch.is_empty() {
+        crate::manager::concurrency::record_admission_skips(batch.len() as u64);
+    }
+}
+
+/// The claim a worker makes given what the gate told it: the queue head when
+/// admitted, only kinds that cannot conflict when throttled.
+///
+/// Public because admission is only meaningful end to end:
+/// `tests/adaptive_scheduler_concurrency.rs` drives this function rather than
+/// testing a copy of it.
+pub fn claim_eval_batch(store: &Store, throttled: bool, limits: EvalBatchLimits) -> R<Vec<Eval>> {
+    let scope = claim_scope(throttled);
+    let batch = store.claim_evals(limits, scope)?;
+    note_narrow_claim(scope, &batch);
+    Ok(batch)
+}
+
+/// Wait until the gate admits this worker, for a batch it already holds.
+///
+/// `None` when the controller is not enforcing — there is nothing to hold.
+/// The poll cap exists because `Notify::notify_waiters` stores no permit: a
+/// release that lands between the refusal and the wait would otherwise be
+/// missed until the next one.
+async fn wait_for_permit(worker_id: usize) -> Option<PlannerPermit> {
+    use crate::manager::concurrency::{self, Admission};
+    let mut logged = false;
+    loop {
+        match concurrency::gate().admit() {
+            Admission::Granted(permit) => return Some(permit),
+            Admission::Unrestricted => return None,
+            Admission::Throttled => {
+                if !logged {
+                    debug!(
+                        worker_id,
+                        "Holding a claimed batch that plans; waiting for a planning permit"
+                    );
+                    logged = true;
+                }
+                tokio::select! {
+                    _ = concurrency::gate().released() => {}
+                    _ = tokio::time::sleep(THROTTLED_GATE_POLL) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_next_eval(store: &Store, notifier: &Notify, worker_id: usize, throttled: bool) {
     // Compute the shortest meaningful sleep: until next delayed eval is ready,
     // or a long idle cap when the queue has no pending rows.
     let wait_for = match store.next_pending_eval_delay() {
@@ -2478,7 +2861,37 @@ async fn wait_for_next_eval(store: &Store, notifier: &Notify, worker_id: usize) 
         }
     };
 
-    if wait_for.is_zero() {
+    // A throttled worker that found no non-planning work is usually waiting on
+    // the GATE, not on the clock — the queue head is claimable right now, it
+    // just is not admissible. Returning here would spin, so the wait is capped
+    // rather than skipped, and the gate's release is added to the wakeup set.
+    // The cap matters because `notify_waiters` stores no permit: a release
+    // between the claim attempt and the wait would otherwise be missed.
+    let wait_for = if throttled {
+        if wait_for.is_zero() {
+            THROTTLED_GATE_POLL
+        } else {
+            wait_for.min(THROTTLED_GATE_POLL)
+        }
+    } else if wait_for.is_zero() {
+        return;
+    } else {
+        wait_for
+    };
+
+    if throttled {
+        debug!(
+            worker_id,
+            ?wait_for,
+            "Planning is throttled and no non-planning eval is ready; waiting on the gate"
+        );
+        // Race wake events against timeout so workers react quickly to new
+        // work — or to the gate opening — without busy polling.
+        tokio::select! {
+            _ = notifier.notified() => {}
+            _ = crate::manager::concurrency::gate().released() => {}
+            _ = tokio::time::sleep(wait_for) => {}
+        }
         return;
     }
 
@@ -2493,6 +2906,397 @@ async fn wait_for_next_eval(store: &Store, notifier: &Notify, worker_id: usize) 
         _ = notifier.notified() => {}
         _ = tokio::time::sleep(wait_for) => {}
     }
+}
+
+/// Per-eval NotRaftLeader release counts, kept in-process only: the eval
+/// table has no attempt column, and durability is not needed — the count
+/// only shapes the retry delay, and resetting to the base after a restart
+/// or failover is the right behavior (new leadership is exactly the
+/// condition the backoff waits for). Entries are dropped when the eval
+/// completes or fails terminally; entries stranded by a leadership move
+/// (the eval finishes on another node) are bounded by the size guard in
+/// [`not_leader_retry_delay`].
+static EVAL_NOT_LEADER_ATTEMPTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, u32>>,
+> = std::sync::OnceLock::new();
+
+fn eval_not_leader_attempts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    EVAL_NOT_LEADER_ATTEMPTS.get_or_init(Default::default)
+}
+
+fn clear_not_leader_attempts(eval_id: &str) {
+    let mut attempts = eval_not_leader_attempts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    attempts.remove(eval_id);
+}
+
+/// Exponential backoff + jitter for foreign-lane NotRaftLeader releases:
+/// 5s, 10s, 20s, 40s, then capped at 60s, plus up to 1s of jitter so a
+/// batch of split-parked evals doesn't thunder back on one tick. Records
+/// the attempt as a side effect.
+fn not_leader_retry_delay(eval_id: &str) -> Duration {
+    let attempt = {
+        let mut attempts = eval_not_leader_attempts()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Stale entries (evals finished by another leader after a
+        // failover) never see the completion-path removal; clearing the
+        // whole map at an absurd size costs at most one backoff reset per
+        // stranded eval.
+        if attempts.len() > 10_000 {
+            attempts.clear();
+        }
+        let entry = attempts.entry(eval_id.to_owned()).or_insert(0);
+        let current = *entry;
+        *entry = entry.saturating_add(1);
+        current
+    };
+    let base_ms = EVAL_NOT_LEADER_RETRY_DELAY.as_millis() as u64;
+    let capped_ms = base_ms
+        .saturating_mul(1u64 << attempt.min(10))
+        .min(EVAL_NOT_LEADER_RETRY_MAX_DELAY.as_millis() as u64);
+    let jitter_ms = rand::thread_rng().gen_range(0..=EVAL_NOT_LEADER_RETRY_JITTER_MS);
+    Duration::from_millis(capped_ms + jitter_ms)
+}
+
+/// Handle one claimed eval and settle its row: complete on success, release
+/// for retry on foreign-lane rejections and plan-conflict exhaustion, fail
+/// terminally otherwise. Public so integration tests (the plan-contention
+/// harness) can drive the real worker logic, requeue backstop included.
+/// Handle a claimed eval and write its outcome immediately, as its own
+/// scheduler-lane op.
+///
+/// The eval worker loop uses [`resolve_claimed_eval`] instead, so it can
+/// fuse this write with the next claim. This wrapper stays for callers
+/// that handle a single eval outside the loop (tests, and any one-shot
+/// path), where there is no following claim to fuse with.
+pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
+    let completion = resolve_claimed_eval(store, worker_id, eval);
+    if let Err(e) = store.apply_eval_completion_standalone(&eval.id, completion) {
+        error!(worker_id, "Error writing eval {} outcome: {:?}", eval.id, e);
+    }
+}
+
+/// Run a claimed eval and decide how it should be written back, WITHOUT
+/// writing it.
+///
+/// Splitting the decision from the write is what lets the caller fuse the
+/// terminal write with the next claim into one scheduler-lane round
+/// (`Store::complete_and_claim_next`). The AWS phase-3 campaign measured
+/// the scheduler lane, not the planner, as the throughput ceiling, and
+/// claim+complete were two of the ~4 rounds every eval spent there.
+pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> EvalCompletion {
+    let started = std::time::Instant::now();
+    info!(
+        worker_id,
+        eval_id = %eval.id,
+        kind = %eval.kind,
+        "Dispatching claimed eval"
+    );
+    let result = eval.handle(store);
+    crate::manager::telemetry::metrics()
+        .evals_processed_total
+        .inc(&[&eval.kind, if result.is_ok() { "ok" } else { "error" }]);
+    match result {
+        Ok(message) => {
+            info!(
+                worker_id,
+                eval_id = %eval.id,
+                kind = %eval.kind,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Eval {} handled successfully: {}", eval.id, message
+            );
+            clear_not_leader_attempts(&eval.id);
+            EvalCompletion::Finished {
+                succeeded: true,
+                event: drafts::eval_completed(eval, &message, started.elapsed()),
+            }
+        }
+        // A NotRaftLeader rejection means a cross-lane half of the eval's
+        // work hit a lane this node does not lead (divergent per-lane
+        // leadership under `lanes` topology) — the eval itself is fine and
+        // MUST run again, or acknowledged work is silently dropped (failed
+        // evals are never retried). Release it back to pending with a delay
+        // instead of terminally failing it.
+        Err(e) if error_is_not_raft_leader(&e) => {
+            let retry_delay = not_leader_retry_delay(&eval.id);
+            warn!(
+                worker_id,
+                eval_id = %eval.id,
+                kind = %eval.kind,
+                retry_delay_ms = retry_delay.as_millis() as u64,
+                "Eval hit a foreign-lane leader rejection; releasing for retry: {e:#}"
+            );
+            EvalCompletion::Released {
+                delay: retry_delay,
+                event: None,
+            }
+        }
+        // Plan-conflict exhaustion is transient by definition: the plan lost
+        // optimistic-concurrency races, not validity. Terminally failing the
+        // eval here is how acknowledged work used to vanish (failed evals are
+        // never retried — a submit that lost `plan_conflict_max_retries`
+        // races silently never placed), so release it back to pending with a
+        // jittered delay instead. The requeue rides one scheduler-lane op
+        // with its `eval.requeued` event, so saturation shows as visibly
+        // waiting work (docs/late-binding-plan-apply.md).
+        Err(e) if Eval::error_is_plan_conflict(&e) => {
+            let delay = Eval::plan_conflict_requeue_delay(store);
+            warn!(
+                worker_id,
+                eval_id = %eval.id,
+                kind = %eval.kind,
+                delay_ms = delay.as_millis() as u64,
+                "Eval exhausted plan-conflict retries; requeueing: {e:#}"
+            );
+            crate::manager::telemetry::metrics()
+                .eval_conflict_requeues_total
+                .inc();
+            EvalCompletion::Released {
+                delay,
+                event: Some(drafts::eval_requeued(eval, &e, delay)),
+            }
+        }
+        Err(e) => {
+            error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
+            clear_not_leader_attempts(&eval.id);
+            EvalCompletion::Finished {
+                succeeded: false,
+                event: drafts::eval_failed(eval, &e, started.elapsed()),
+            }
+        }
+    }
+}
+
+/// Whether an eval-handler error is (or wraps) a raft `NotRaftLeader`
+/// rejection — the divergent-lane-leadership case `handle_claimed_eval`
+/// retries instead of terminally failing.
+fn error_is_not_raft_leader(error: &anyhow::Error) -> bool {
+    crate::storage::raft::driver::NotRaftLeader::in_chain(error)
+}
+
+#[instrument(err, skip_all)]
+fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
+    let rendered = crate::config_lang::eval_file(config_path).map_err(|e| {
+        let err = e.context(format!("Error parsing worker config at path {config_path}"));
+        error!("{err}");
+        err
+    })?;
+
+    let config: WorkerConfigAlt = serde_json::from_str(&rendered)
+        .with_context(|| format!("Error parsing worker config at path {config_path}"))?;
+
+    Ok(config)
+}
+
+#[instrument(err, skip_all)]
+async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
+    let worker_conf_path = config.with_defaults().worker_config_path.clone();
+    let sub_paths = fs::read_dir(worker_conf_path)?;
+
+    for path in sub_paths {
+        let path = path.unwrap().path();
+        // Only the two configuration extensions. The directory is a normal
+        // one an operator edits, so it collects `README.md` files and editor
+        // swap files, and neither should be fed to a config parser.
+        if !crate::config_lang::is_config_file(&path) {
+            debug!(path = %path.display(), "skipping non-config file in worker config directory");
+            continue;
+        }
+        let path_str = path.to_str().unwrap();
+        let wcp = parse_worker_config(path_str)?;
+
+        let af = wcp.additional_node_checks.unwrap_or([].to_vec());
+        let attrs = wcp.attributes.unwrap_or(HashMap::new());
+        let resources = wcp
+            .resources
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_else(|| "{}".to_string());
+        let reserved_resources = wcp
+            .reserved_resources
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_else(|| "{}".to_string());
+
+        // Fail fast on malformed fetch and content settings (bad humantime /
+        // byte-size strings) at manager startup, not on the worker.
+        if let Some(config) = wcp.artifacts.as_ref() {
+            config
+                .fetch_with_defaults()
+                .with_context(|| format!("invalid artifacts config in worker config {path_str}"))?;
+        }
+        if let Some(content) = wcp.content.as_ref() {
+            content
+                .resolve()
+                .with_context(|| format!("invalid content config in worker config {path_str}"))?;
+        }
+        if let Some(target) = wcp.content_store.as_ref() {
+            target.validate().with_context(|| {
+                format!("invalid contentStore config in worker config {path_str}")
+            })?;
+        }
+        // The top-level `content` and `contentStore` blocks ride in the
+        // artifacts payload (see `WorkerArtifactsPayload`).
+        let artifacts =
+            if wcp.artifacts.is_none() && wcp.content.is_none() && wcp.content_store.is_none() {
+                String::new()
+            } else {
+                serde_json::to_string(&crate::structs::WorkerArtifactsPayload {
+                    artifacts: wcp.artifacts.clone().unwrap_or_default(),
+                    content: wcp.content.clone(),
+                    content_store: wcp.content_store.clone(),
+                })?
+            };
+
+        // Host volumes are validated here so a typo (a relative path) fails at
+        // manager startup rather than at a task's first mount.
+        let host_volumes = match wcp.host_volumes.as_ref() {
+            None => String::new(),
+            Some(volumes) => {
+                for (name, volume) in volumes {
+                    // Exactly one of path/device: a path serves filesystem
+                    // claims, a device serves block claims, and an entry with
+                    // both would be ambiguous about which a claim gets.
+                    match (volume.path.trim().is_empty(), volume.device.as_deref()) {
+                        (true, None) => bail!(
+                            "worker config {path_str}: hostVolumes.{name} needs a `path` \
+                             (filesystem) or a `device` (block)"
+                        ),
+                        (false, Some(_)) => bail!(
+                            "worker config {path_str}: hostVolumes.{name} declares both `path` \
+                             and `device`; declare two entries if you mean both"
+                        ),
+                        (false, None) if !volume.path.starts_with('/') => bail!(
+                            "worker config {path_str}: hostVolumes.{name}.path must be absolute, \
+                             got {:?}",
+                            volume.path
+                        ),
+                        (true, Some(device)) if !device.starts_with('/') => bail!(
+                            "worker config {path_str}: hostVolumes.{name}.device must be \
+                             absolute, got {device:?}"
+                        ),
+                        _ => {}
+                    }
+                    if volume.create && volume.device.is_some() {
+                        bail!(
+                            "worker config {path_str}: hostVolumes.{name} sets `create` on a \
+                             `device` entry; Legion never creates or formats devices"
+                        );
+                    }
+                }
+                serde_json::to_string(volumes)?
+            }
+        };
+
+        // Enforcement settings ride as JSON, like artifacts and host volumes.
+        // An absent block still sends the defaults, so the worker gets the
+        // type's `sandbox` settings and enforcement stays on.
+        let resource_enforcement = {
+            let mut enforcement = wcp.resource_enforcement.clone().unwrap_or_default();
+            if enforcement.cgroup_parent.trim().is_empty() {
+                bail!(
+                    "worker config {path_str}: resourceEnforcement.cgroupParent must not be empty"
+                );
+            }
+            if enforcement.cgroup_parent.starts_with('/') {
+                bail!(
+                    "worker config {path_str}: resourceEnforcement.cgroupParent is relative to \
+                     /sys/fs/cgroup, got {:?}",
+                    enforcement.cgroup_parent
+                );
+            }
+            enforcement
+                .validate()
+                .with_context(|| format!("invalid worker config {path_str}"))?;
+            if let Some(sandbox) = wcp.sandbox.as_ref() {
+                if sandbox.vmm_overhead_mib == Some(0) {
+                    bail!(
+                        "worker config {path_str}: sandbox.vmmOverheadMiB must be at least 1; a \
+                         VMM process always needs some memory of its own"
+                    );
+                }
+                enforcement.sandbox = Some(sandbox.clone());
+            }
+            serde_json::to_string(&enforcement)?
+        };
+
+        // Edge-boot settings ride as JSON too. Absent means "no edge starts",
+        // which is the default and the thing an operator has to opt out of.
+        let edge_boot = match wcp.edge_boot.as_ref() {
+            None => String::new(),
+            Some(block) => serde_json::to_string(&block.with_defaults())?,
+        };
+
+        if let Some(seconds) = wcp.heartbeat_seconds {
+            // The clamp widened from 1..=30 the moment the lost window began
+            // moving with the cadence (heartbeat-cadence plan §7). Under the
+            // old fixed 10s window every value above 3 traded detection margin
+            // for load; now `missedBeatsBeforeLost x heartbeatSeconds` IS the
+            // window, so a slow worker type is a supported configuration
+            // rather than a trap.
+            if !(1..=MAX_WORKER_HEARTBEAT_SECONDS).contains(&seconds) {
+                bail!(
+                    "worker config {path_str}: heartbeatSeconds must be between 1 and \
+                     {MAX_WORKER_HEARTBEAT_SECONDS}, got {seconds}"
+                );
+            }
+            let missed = config
+                .with_defaults()
+                .heartbeat
+                .missed_beats_before_lost
+                .max(1);
+            let window = u64::from(seconds) * u64::from(missed);
+            // The §1 hazard, caught at config load rather than discovered as
+            // spontaneous stateful task death: a worker kills its own stateful
+            // tasks after `selfTerminateAfter` without manager contact, so a
+            // lost window at or past that fence means a HEALTHY worker
+            // self-fences between beats.
+            let self_terminate = crate::structs::job::DEFAULT_SELF_TERMINATE_AFTER.as_secs();
+            if window >= self_terminate {
+                bail!(
+                    "worker config {path_str}: heartbeatSeconds {seconds} x \
+                     missedBeatsBeforeLost {missed} is a {window}s lost window, at or past the \
+                     {self_terminate}s stateful self-fence (stateful.onLost.selfTerminateAfter). \
+                     A healthy worker would kill its own stateful tasks between beats. Lower \
+                     heartbeatSeconds, lower missedBeatsBeforeLost, or raise \
+                     selfTerminateAfter on the jobs that run here \
+                     (docs/heartbeat-cadence-and-scale.md)"
+                );
+            }
+            info!(
+                worker_type = %wcp.worker_type,
+                heartbeat_seconds = seconds,
+                lost_window_seconds = window,
+                missed_beats = missed,
+                "Worker type heartbeat cadence: real node failures on this worker type take \
+                 up to the lost window to detect"
+            );
+        }
+
+        let wc = WorkerConfigMsg {
+            name: wcp.worker_type.clone(),
+            pool: wcp.pool.unwrap_or("default".into()),
+            additional_node_checks: af,
+            attributes: attrs,
+            name_prefix: wcp.name_prefix,
+            resources,
+            reserved_resources,
+            max_allocations: wcp.max_allocations,
+            artifacts,
+            host_volumes,
+            heartbeat_seconds: wcp.heartbeat_seconds,
+            resource_enforcement,
+            edge_boot,
+        };
+
+        store.insert_worker_type(&wc)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2510,6 +3314,25 @@ mod tests {
             "exec": { "enabled": false },
             "telemetry": { "enabled": false },
         }))?)
+    }
+
+    /// The shipped worker config documents the content defaults without
+    /// overriding them: its budgets stay unset, so the clamped default
+    /// shares apply (an explicit "20%" would drop the clamp).
+    #[test]
+    fn the_default_worker_config_keeps_the_default_content_budgets_test() -> R<()> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/configs/workers/default.ncl");
+        let config = parse_worker_config(path)?;
+        let settings = config
+            .content
+            .context("content block")?
+            .resolve()?
+            .context("enabled")?;
+        assert_eq!(
+            settings.budgets,
+            crate::content_store::ContentBudgetSpecs::default()
+        );
+        Ok(())
     }
 
     /// M2 regression: a manager whose gRPC listener cannot bind must exit
@@ -2981,6 +3804,7 @@ mod tests {
                 heartbeat,
                 liveness: crate::structs::LivenessConfigFull::default(),
                 manager_node_id: "test-manager".into(),
+                idle_sweep: None,
             },
         ));
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3023,7 +3847,7 @@ mod tests {
         let wait_task = tokio::spawn({
             let store = store.clone();
             let notifier = notifier.clone();
-            async move { wait_for_next_eval(&store, &notifier, 0).await }
+            async move { wait_for_next_eval(&store, &notifier, 0, false).await }
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3050,7 +3874,7 @@ mod tests {
         )?;
 
         let start = tokio::time::Instant::now();
-        wait_for_next_eval(&store, &notifier, 0).await;
+        wait_for_next_eval(&store, &notifier, 0, false).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -3121,366 +3945,4 @@ mod tests {
 
         Ok(())
     }
-}
-
-/// Per-eval NotRaftLeader release counts, kept in-process only: the eval
-/// table has no attempt column, and durability is not needed — the count
-/// only shapes the retry delay, and resetting to the base after a restart
-/// or failover is the right behavior (new leadership is exactly the
-/// condition the backoff waits for). Entries are dropped when the eval
-/// completes or fails terminally; entries stranded by a leadership move
-/// (the eval finishes on another node) are bounded by the size guard in
-/// [`not_leader_retry_delay`].
-static EVAL_NOT_LEADER_ATTEMPTS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, u32>>,
-> = std::sync::OnceLock::new();
-
-fn eval_not_leader_attempts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
-    EVAL_NOT_LEADER_ATTEMPTS.get_or_init(Default::default)
-}
-
-fn clear_not_leader_attempts(eval_id: &str) {
-    let mut attempts = eval_not_leader_attempts()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    attempts.remove(eval_id);
-}
-
-/// Exponential backoff + jitter for foreign-lane NotRaftLeader releases:
-/// 5s, 10s, 20s, 40s, then capped at 60s, plus up to 1s of jitter so a
-/// batch of split-parked evals doesn't thunder back on one tick. Records
-/// the attempt as a side effect.
-fn not_leader_retry_delay(eval_id: &str) -> Duration {
-    let attempt = {
-        let mut attempts = eval_not_leader_attempts()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Stale entries (evals finished by another leader after a
-        // failover) never see the completion-path removal; clearing the
-        // whole map at an absurd size costs at most one backoff reset per
-        // stranded eval.
-        if attempts.len() > 10_000 {
-            attempts.clear();
-        }
-        let entry = attempts.entry(eval_id.to_owned()).or_insert(0);
-        let current = *entry;
-        *entry = entry.saturating_add(1);
-        current
-    };
-    let base_ms = EVAL_NOT_LEADER_RETRY_DELAY.as_millis() as u64;
-    let capped_ms = base_ms
-        .saturating_mul(1u64 << attempt.min(10))
-        .min(EVAL_NOT_LEADER_RETRY_MAX_DELAY.as_millis() as u64);
-    let jitter_ms = rand::thread_rng().gen_range(0..=EVAL_NOT_LEADER_RETRY_JITTER_MS);
-    Duration::from_millis(capped_ms + jitter_ms)
-}
-
-/// Handle one claimed eval and settle its row: complete on success, release
-/// for retry on foreign-lane rejections and plan-conflict exhaustion, fail
-/// terminally otherwise. Public so integration tests (the plan-contention
-/// harness) can drive the real worker logic, requeue backstop included.
-/// Handle a claimed eval and write its outcome immediately, as its own
-/// scheduler-lane op.
-///
-/// The eval worker loop uses [`resolve_claimed_eval`] instead, so it can
-/// fuse this write with the next claim. This wrapper stays for callers
-/// that handle a single eval outside the loop (tests, and any one-shot
-/// path), where there is no following claim to fuse with.
-pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
-    let completion = resolve_claimed_eval(store, worker_id, eval);
-    if let Err(e) = store.apply_eval_completion_standalone(&eval.id, completion) {
-        error!(worker_id, "Error writing eval {} outcome: {:?}", eval.id, e);
-    }
-}
-
-/// Run a claimed eval and decide how it should be written back, WITHOUT
-/// writing it.
-///
-/// Splitting the decision from the write is what lets the caller fuse the
-/// terminal write with the next claim into one scheduler-lane round
-/// (`Store::complete_and_claim_next`). The AWS phase-3 campaign measured
-/// the scheduler lane, not the planner, as the throughput ceiling, and
-/// claim+complete were two of the ~4 rounds every eval spent there.
-pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> EvalCompletion {
-    let started = std::time::Instant::now();
-    info!(
-        worker_id,
-        eval_id = %eval.id,
-        kind = %eval.kind,
-        "Dispatching claimed eval"
-    );
-    let result = eval.handle(store);
-    crate::manager::telemetry::metrics()
-        .evals_processed_total
-        .inc(&[&eval.kind, if result.is_ok() { "ok" } else { "error" }]);
-    match result {
-        Ok(message) => {
-            info!(
-                worker_id,
-                eval_id = %eval.id,
-                kind = %eval.kind,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "Eval {} handled successfully: {}", eval.id, message
-            );
-            clear_not_leader_attempts(&eval.id);
-            EvalCompletion::Finished {
-                succeeded: true,
-                event: drafts::eval_completed(eval, &message, started.elapsed()),
-            }
-        }
-        // A NotRaftLeader rejection means a cross-lane half of the eval's
-        // work hit a lane this node does not lead (divergent per-lane
-        // leadership under `lanes` topology) — the eval itself is fine and
-        // MUST run again, or acknowledged work is silently dropped (failed
-        // evals are never retried). Release it back to pending with a delay
-        // instead of terminally failing it.
-        Err(e) if error_is_not_raft_leader(&e) => {
-            let retry_delay = not_leader_retry_delay(&eval.id);
-            warn!(
-                worker_id,
-                eval_id = %eval.id,
-                kind = %eval.kind,
-                retry_delay_ms = retry_delay.as_millis() as u64,
-                "Eval hit a foreign-lane leader rejection; releasing for retry: {e:#}"
-            );
-            EvalCompletion::Released {
-                delay: retry_delay,
-                event: None,
-            }
-        }
-        // Plan-conflict exhaustion is transient by definition: the plan lost
-        // optimistic-concurrency races, not validity. Terminally failing the
-        // eval here is how acknowledged work used to vanish (failed evals are
-        // never retried — a submit that lost `plan_conflict_max_retries`
-        // races silently never placed), so release it back to pending with a
-        // jittered delay instead. The requeue rides one scheduler-lane op
-        // with its `eval.requeued` event, so saturation shows as visibly
-        // waiting work (docs/late-binding-plan-apply.md).
-        Err(e) if Eval::error_is_plan_conflict(&e) => {
-            let delay = Eval::plan_conflict_requeue_delay(store);
-            warn!(
-                worker_id,
-                eval_id = %eval.id,
-                kind = %eval.kind,
-                delay_ms = delay.as_millis() as u64,
-                "Eval exhausted plan-conflict retries; requeueing: {e:#}"
-            );
-            crate::manager::telemetry::metrics()
-                .eval_conflict_requeues_total
-                .inc();
-            EvalCompletion::Released {
-                delay,
-                event: Some(drafts::eval_requeued(eval, &e, delay)),
-            }
-        }
-        Err(e) => {
-            error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
-            clear_not_leader_attempts(&eval.id);
-            EvalCompletion::Finished {
-                succeeded: false,
-                event: drafts::eval_failed(eval, &e, started.elapsed()),
-            }
-        }
-    }
-}
-
-/// Whether an eval-handler error is (or wraps) a raft `NotRaftLeader`
-/// rejection — the divergent-lane-leadership case `handle_claimed_eval`
-/// retries instead of terminally failing.
-fn error_is_not_raft_leader(error: &anyhow::Error) -> bool {
-    crate::storage::raft::driver::NotRaftLeader::in_chain(error)
-}
-
-#[instrument(err, skip_all)]
-fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
-    let rendered = crate::config_lang::eval_file(config_path).map_err(|e| {
-        let err = e.context(format!("Error parsing worker config at path {config_path}"));
-        error!("{err}");
-        err
-    })?;
-
-    let config: WorkerConfigAlt = serde_json::from_str(&rendered)
-        .with_context(|| format!("Error parsing worker config at path {config_path}"))?;
-
-    Ok(config)
-}
-
-#[instrument(err, skip_all)]
-async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
-    let worker_conf_path = config.with_defaults().worker_config_path.clone();
-    let sub_paths = fs::read_dir(worker_conf_path)?;
-
-    for path in sub_paths {
-        let path = path.unwrap().path();
-        // Only the two configuration extensions. The directory is a normal
-        // one an operator edits, so it collects `README.md` files and editor
-        // swap files, and neither should be fed to a config parser.
-        if !crate::config_lang::is_config_file(&path) {
-            debug!(path = %path.display(), "skipping non-config file in worker config directory");
-            continue;
-        }
-        let path_str = path.to_str().unwrap();
-        let wcp = parse_worker_config(path_str)?;
-
-        let af = wcp.additional_node_checks.unwrap_or([].to_vec());
-        let attrs = wcp.attributes.unwrap_or(HashMap::new());
-        let resources = wcp
-            .resources
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?
-            .unwrap_or_else(|| "{}".to_string());
-        let reserved_resources = wcp
-            .reserved_resources
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?
-            .unwrap_or_else(|| "{}".to_string());
-
-        let artifacts = match wcp.artifacts.as_ref() {
-            None => String::new(),
-            Some(config) => {
-                // Fail fast on malformed fetch settings (bad humantime /
-                // byte-size strings) at manager startup, not on the worker.
-                config.fetch_with_defaults().with_context(|| {
-                    format!("invalid artifacts config in worker config {path_str}")
-                })?;
-                serde_json::to_string(config)?
-            }
-        };
-
-        // Host volumes are validated here so a typo (a relative path) fails at
-        // manager startup rather than at a task's first mount.
-        let host_volumes = match wcp.host_volumes.as_ref() {
-            None => String::new(),
-            Some(volumes) => {
-                for (name, volume) in volumes {
-                    // Exactly one of path/device: a path serves filesystem
-                    // claims, a device serves block claims, and an entry with
-                    // both would be ambiguous about which a claim gets.
-                    match (volume.path.trim().is_empty(), volume.device.as_deref()) {
-                        (true, None) => bail!(
-                            "worker config {path_str}: hostVolumes.{name} needs a `path` \
-                             (filesystem) or a `device` (block)"
-                        ),
-                        (false, Some(_)) => bail!(
-                            "worker config {path_str}: hostVolumes.{name} declares both `path` \
-                             and `device`; declare two entries if you mean both"
-                        ),
-                        (false, None) if !volume.path.starts_with('/') => bail!(
-                            "worker config {path_str}: hostVolumes.{name}.path must be absolute, \
-                             got {:?}",
-                            volume.path
-                        ),
-                        (true, Some(device)) if !device.starts_with('/') => bail!(
-                            "worker config {path_str}: hostVolumes.{name}.device must be \
-                             absolute, got {device:?}"
-                        ),
-                        _ => {}
-                    }
-                    if volume.create && volume.device.is_some() {
-                        bail!(
-                            "worker config {path_str}: hostVolumes.{name} sets `create` on a \
-                             `device` entry; Legion never creates or formats devices"
-                        );
-                    }
-                }
-                serde_json::to_string(volumes)?
-            }
-        };
-
-        // Enforcement settings ride as JSON, like artifacts and host volumes.
-        let resource_enforcement = match wcp.resource_enforcement.as_ref() {
-            None => String::new(),
-            Some(enforcement) => {
-                if enforcement.cgroup_parent.trim().is_empty() {
-                    bail!(
-                        "worker config {path_str}: resourceEnforcement.cgroupParent must not be \
-                         empty"
-                    );
-                }
-                if enforcement.cgroup_parent.starts_with('/') {
-                    bail!(
-                        "worker config {path_str}: resourceEnforcement.cgroupParent is relative \
-                         to /sys/fs/cgroup, got {:?}",
-                        enforcement.cgroup_parent
-                    );
-                }
-                serde_json::to_string(enforcement)?
-            }
-        };
-
-        // Edge-boot settings ride as JSON too. Absent means "no edge starts",
-        // which is the default and the thing an operator has to opt out of.
-        let edge_boot = match wcp.edge_boot.as_ref() {
-            None => String::new(),
-            Some(block) => serde_json::to_string(&block.with_defaults())?,
-        };
-
-        if let Some(seconds) = wcp.heartbeat_seconds {
-            // The clamp widened from 1..=30 the moment the lost window began
-            // moving with the cadence (heartbeat-cadence plan §7). Under the
-            // old fixed 10s window every value above 3 traded detection margin
-            // for load; now `missedBeatsBeforeLost x heartbeatSeconds` IS the
-            // window, so a slow worker type is a supported configuration
-            // rather than a trap.
-            if !(1..=MAX_WORKER_HEARTBEAT_SECONDS).contains(&seconds) {
-                bail!(
-                    "worker config {path_str}: heartbeatSeconds must be between 1 and \
-                     {MAX_WORKER_HEARTBEAT_SECONDS}, got {seconds}"
-                );
-            }
-            let missed = config
-                .with_defaults()
-                .heartbeat
-                .missed_beats_before_lost
-                .max(1);
-            let window = u64::from(seconds) * u64::from(missed);
-            // The §1 hazard, caught at config load rather than discovered as
-            // spontaneous stateful task death: a worker kills its own stateful
-            // tasks after `selfTerminateAfter` without manager contact, so a
-            // lost window at or past that fence means a HEALTHY worker
-            // self-fences between beats.
-            let self_terminate = crate::structs::job::DEFAULT_SELF_TERMINATE_AFTER.as_secs();
-            if window >= self_terminate {
-                bail!(
-                    "worker config {path_str}: heartbeatSeconds {seconds} x \
-                     missedBeatsBeforeLost {missed} is a {window}s lost window, at or past the \
-                     {self_terminate}s stateful self-fence (stateful.onLost.selfTerminateAfter). \
-                     A healthy worker would kill its own stateful tasks between beats. Lower \
-                     heartbeatSeconds, lower missedBeatsBeforeLost, or raise \
-                     selfTerminateAfter on the jobs that run here \
-                     (docs/heartbeat-cadence-and-scale.md)"
-                );
-            }
-            info!(
-                worker_type = %wcp.worker_type,
-                heartbeat_seconds = seconds,
-                lost_window_seconds = window,
-                missed_beats = missed,
-                "Worker type heartbeat cadence: real node failures on this worker type take \
-                 up to the lost window to detect"
-            );
-        }
-
-        let wc = WorkerConfigMsg {
-            name: wcp.worker_type.clone(),
-            pool: wcp.pool.unwrap_or("default".into()),
-            additional_node_checks: af,
-            attributes: attrs,
-            name_prefix: wcp.name_prefix,
-            resources,
-            reserved_resources,
-            max_allocations: wcp.max_allocations,
-            artifacts,
-            host_volumes,
-            heartbeat_seconds: wcp.heartbeat_seconds,
-            resource_enforcement,
-            edge_boot,
-        };
-
-        store.insert_worker_type(&wc)?;
-    }
-
-    Ok(())
 }

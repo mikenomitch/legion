@@ -20,6 +20,16 @@ pub enum ArtifactState {
     Failed,
 }
 
+/// Whether a cacheable artifact came from the node content store.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ArtifactCacheOutcome {
+    /// Staged from the node content store; nothing was fetched.
+    Hit,
+    /// Fetched from origin and written into the node content store.
+    Miss,
+}
+
 /// One artifact's staging state as reported through heartbeats. Sources are
 /// redacted and errors name auth *sources* (KV paths, identity names) —
 /// never credential values.
@@ -43,6 +53,10 @@ pub struct ArtifactStatus {
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set only for artifacts the node content store can serve (a
+    /// `checksum` on an `http(s)`, `s3`, or `file` source).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<ArtifactCacheOutcome>,
 }
 
 impl ArtifactStatus {

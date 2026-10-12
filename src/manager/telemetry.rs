@@ -55,6 +55,35 @@ const DURATION_BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Bucket bounds (seconds) for suspend and resume, which run from tens of
+/// milliseconds (a disk suspend, a small restore) to a minute (a multi-GiB
+/// memory capture on slow disk).
+const CHECKPOINT_DURATION_BUCKETS: &[f64] = &[
+    0.025, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// Bucket bounds (seconds) for publishing a checkpoint to a content store
+/// (Phase 7b): an upload of a multi-GiB memory file over a WAN runs to
+/// minutes, a re-publish of bytes the store already holds to milliseconds.
+const CHECKPOINT_PUBLISH_BUCKETS: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+];
+
+/// Bucket bounds (bytes) for checkpoint sizes: 1 MiB to 64 GiB.
+const CHECKPOINT_BYTES_BUCKETS: &[f64] = &[
+    1_048_576.0,
+    16_777_216.0,
+    134_217_728.0,
+    268_435_456.0,
+    536_870_912.0,
+    1_073_741_824.0,
+    2_147_483_648.0,
+    4_294_967_296.0,
+    8_589_934_592.0,
+    17_179_869_184.0,
+    68_719_476_736.0,
+];
+
 /// Bucket bounds (seconds) for runtime-scheduling delay, which is
 /// microseconds on a healthy runtime — [`DURATION_BUCKETS`] would put every
 /// healthy sample in one bucket and lose the signal.
@@ -719,6 +748,22 @@ pub struct Metrics {
     pub scheduler_plan_bind_pass: Arc<CounterVec>,
     /// `legion_eval_conflict_requeues_total`
     pub eval_conflict_requeues_total: Arc<Counter>,
+    /// `legion_scheduler_concurrency_limit`
+    pub scheduler_concurrency_limit: Arc<Gauge>,
+    /// `legion_scheduler_concurrency_in_flight`
+    pub scheduler_concurrency_in_flight: Arc<Gauge>,
+    /// `legion_scheduler_concurrency_state{state}`
+    pub scheduler_concurrency_state: Arc<GaugeVec>,
+    /// `legion_scheduler_concurrency_conflict_rate`
+    pub scheduler_concurrency_conflict_rate: Arc<FloatGauge>,
+    /// `legion_scheduler_concurrency_fallback_rate`
+    pub scheduler_concurrency_fallback_rate: Arc<FloatGauge>,
+    /// `legion_scheduler_concurrency_goodput`
+    pub scheduler_concurrency_goodput: Arc<FloatGauge>,
+    /// `legion_scheduler_concurrency_adjustments_total{direction}`
+    pub scheduler_concurrency_adjustments_total: Arc<CounterVec>,
+    /// `legion_scheduler_admission_skips_total`
+    pub scheduler_admission_skips_total: Arc<Counter>,
     /// `legion_preemptions_total{pool,band}` — victims actually evicted.
     pub preemptions_total: Arc<CounterVec>,
     /// `legion_preemption_plans_total{outcome}` — preemption passes that
@@ -730,6 +775,43 @@ pub struct Metrics {
     pub nodes: Arc<GaugeVec>,
     /// `legion_read_model_nodes{set}`
     pub read_model_nodes: Arc<GaugeVec>,
+    /// `legion_node_memory_physical_bytes{node}` (docs/metrics.md, "Node usage")
+    pub node_memory_physical_bytes: Arc<GaugeVec>,
+    /// `legion_node_memory_available_bytes{node}` (docs/metrics.md, "Node usage")
+    pub node_memory_available_bytes: Arc<GaugeVec>,
+    /// `legion_node_memory_used_bytes{node}` (docs/metrics.md, "Node usage")
+    pub node_memory_used_bytes: Arc<GaugeVec>,
+    /// `legion_node_cpu_used_millicores{node}` (docs/metrics.md, "Node usage")
+    pub node_cpu_used_millicores: Arc<GaugeVec>,
+    /// `legion_node_pressure_actions_total{node,step}` (docs/metrics.md,
+    /// "Node usage")
+    pub node_pressure_actions_total: Arc<CounterVec>,
+    /// `legion_instance_suspend_seconds{kind}` (docs/metrics.md, "Suspend and
+    /// resume")
+    pub instance_suspend_seconds: Arc<HistogramVec>,
+    /// `legion_instance_suspends_total{reason}` (docs/metrics.md, "Suspend
+    /// and resume")
+    pub instance_suspends_total: Arc<CounterVec>,
+    /// `legion_idle_sweep_suspends_total{outcome}` (docs/metrics.md, "Suspend
+    /// and resume")
+    pub idle_sweep_suspends_total: Arc<CounterVec>,
+    /// `legion_make_room_suspends_total{outcome}` (docs/metrics.md, "Suspend
+    /// and resume")
+    pub make_room_suspends_total: Arc<CounterVec>,
+    /// `legion_instance_resume_seconds{kind}` (docs/metrics.md, "Suspend and
+    /// resume")
+    pub instance_resume_seconds: Arc<HistogramVec>,
+    /// `legion_checkpoint_bytes{kind}` (docs/metrics.md, "Suspend and resume")
+    pub checkpoint_bytes: Arc<HistogramVec>,
+    /// `legion_checkpoint_publish_bytes{kind}` (docs/metrics.md, "Suspend and
+    /// resume"; Phase 7b)
+    pub checkpoint_publish_bytes: Arc<HistogramVec>,
+    /// `legion_checkpoint_publish_seconds{kind}` (docs/metrics.md, "Suspend
+    /// and resume"; Phase 7b)
+    pub checkpoint_publish_seconds: Arc<HistogramVec>,
+    /// `legion_checkpoint_publish_total{outcome}` (docs/metrics.md, "Suspend
+    /// and resume"; Phase 7b)
+    pub checkpoint_publish_total: Arc<CounterVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
     /// `legion_store_write_lock_wait_seconds`
@@ -786,6 +868,8 @@ pub struct Metrics {
     pub raft_pipeline_depth: Arc<GaugeVec>,
     /// `legion_scheduler_index_queries_total{index,outcome}`
     pub scheduler_index_queries_total: Arc<CounterVec>,
+    /// `legion_scheduler_locality_placements_total{outcome}`
+    pub scheduler_locality_placements_total: Arc<CounterVec>,
     /// `legion_scheduler_index_candidates{index}`
     pub scheduler_index_candidates: Arc<HistogramVec>,
     /// `legion_scheduler_index_shadow_total{index,result}`
@@ -938,6 +1022,74 @@ impl Metrics {
             },
             cell: CounterCell::default(),
         });
+        // Adaptive scheduler concurrency
+        // (docs/adaptive-scheduler-concurrency.md). All of these are
+        // scheduler-lane-leader-only: a follower does no planning, so its
+        // window is empty and its state would be noise.
+        let scheduler_concurrency_limit = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_limit",
+                help: "Planners the adaptive concurrency controller currently admits. In `observe` mode this is the SHADOW limit — what the controller would enforce — which is what makes observe mode useful on its own.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let scheduler_concurrency_in_flight = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_in_flight",
+                help: "Admission permits currently held by eval workers running a planning eval. 0 when the controller is off, which does not consult the gate at all.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let scheduler_concurrency_state = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_state",
+                help: "1 on the controller's current state, 0 on the others: `steady` (running at the ceiling), `throttled` (backed off), `probing` (calm, climbing back), `saturated` (backing off did not improve goodput, so the conflicts are capacity-driven and the actuator has stopped being applied).",
+                labels: &["state"],
+            },
+            series: Series::new(),
+        });
+        let scheduler_concurrency_conflict_rate = Arc::new(FloatGauge {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_conflict_rate",
+                help: "Smoothed plan rejection rate the controller is deciding on: rejected / (applied + fallback + rejected). Fallbacks count as progress, not as conflict.",
+                labels: &[],
+            },
+            bits: AtomicU64::new(0),
+        });
+        let scheduler_concurrency_fallback_rate = Arc::new(FloatGauge {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_fallback_rate",
+                help: "Smoothed fraction of plans that bound but slid down a candidate list — races ABSORBED by late binding. Reported for diagnosis; never fed into the controller's decision.",
+                labels: &[],
+            },
+            bits: AtomicU64::new(0),
+        });
+        let scheduler_concurrency_goodput = Arc::new(FloatGauge {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_goodput",
+                help: "Smoothed plans that actually placed, per second. The objective the controller is guarding; conflict rate is only its leading indicator.",
+                labels: &[],
+            },
+            bits: AtomicU64::new(0),
+        });
+        let scheduler_concurrency_adjustments_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_adjustments_total",
+                help: "Limit changes the controller made, by direction: `increase`, `decrease`, or `revert` (a decrease undone because it did not improve goodput). A sustained two-value sawtooth here is hunting, which is a failure and not a cosmetic issue.",
+                labels: &["direction"],
+            },
+            series: Series::new(),
+        });
+        let scheduler_admission_skips_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_scheduler_admission_skips_total",
+                help: "Times a throttled eval worker claimed a non-planning eval (today: `job_stop`) instead of the queue head. This counts the one cross-class priority inversion the admission gate introduces.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
         let preemptions_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_preemptions_total",
@@ -967,6 +1119,123 @@ impl Metrics {
                 name: "legion_nodes",
                 help: "Registered worker nodes, by status.",
                 labels: &["status"],
+            },
+            series: Series::new(),
+        });
+        let node_memory_physical_bytes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_node_memory_physical_bytes",
+                help: "Physical memory (MemTotal) on a node, from its latest usage report. Reported by workers with resourceEnforcement.enabled; 0 once a node stops reporting.",
+                labels: &["node"],
+            },
+            series: Series::new(),
+        });
+        let node_memory_available_bytes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_node_memory_available_bytes",
+                help: "MemAvailable on a node, from its latest usage report: the kernel's estimate of memory new work can use without swapping. The number to alert on for a node running short.",
+                labels: &["node"],
+            },
+            series: Series::new(),
+        });
+        let node_memory_used_bytes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_node_memory_used_bytes",
+                help: "Sum of memory.current over a node's governed allocations, from its latest usage report. Compare with reservations from `legion node usage`.",
+                labels: &["node"],
+            },
+            series: Series::new(),
+        });
+        let node_pressure_actions_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_node_pressure_actions_total",
+                help: "Actions a node's memory pressure response reported, by step (reclaim|suspend|evict-bursting|evict-reserved). Counted when the heartbeat carrying them reaches this manager.",
+                labels: &["node", "step"],
+            },
+            series: Series::new(),
+        });
+        let instance_suspend_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_instance_suspend_seconds",
+                help: "How long a successful suspend's capture took on the node, from the checkpoint request to the stopped task, by checkpoint kind (memory|disk). Observed when the worker's report reaches this manager.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: CHECKPOINT_DURATION_BUCKETS,
+        });
+        let instance_suspends_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_instance_suspends_total",
+                help: "Suspends applied, by reason: manual (SuspendInstance), idle (the task's suspend.idle policy), or pressure (a node's suspend pressure step). Counted when the node's capture report reaches this manager.",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let idle_sweep_suspends_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_idle_sweep_suspends_total",
+                help: "Suspends the idle sweep tried to start, by outcome: started, or skipped (the instance changed, an operation was in flight, or its node cannot checkpoint).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let make_room_suspends_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_make_room_suspends_total",
+                help: "Suspends the manager started to make room for a resume waiting on its checkpoint's node, by outcome: started, failed (the suspend could not start), or no_room (suspending every eligible instance would not have made room, so none was suspended).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let instance_resume_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_instance_resume_seconds",
+                help: "How long a successful resume's restore took on the node, from starting the allocation to the running task, by checkpoint kind (memory|disk). Placement time is not included.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: CHECKPOINT_DURATION_BUCKETS,
+        });
+        let checkpoint_bytes = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_checkpoint_bytes",
+                help: "Size of each captured checkpoint (snapshots and suspends), by kind (memory|disk). A disk checkpoint taken by suspend retains its volume in place and reports 0.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: CHECKPOINT_BYTES_BUCKETS,
+        });
+        let checkpoint_publish_bytes = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_checkpoint_publish_bytes",
+                help: "Bytes a node uploaded to its contentStore to publish one checkpoint (durability = \"store\"), by kind (memory|disk). 0 when the store already held every part.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: CHECKPOINT_BYTES_BUCKETS,
+        });
+        let checkpoint_publish_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_checkpoint_publish_seconds",
+                help: "How long a node took to publish one checkpoint to its contentStore, by kind (memory|disk). Observed when the successful publish report reaches this manager.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: CHECKPOINT_PUBLISH_BUCKETS,
+        });
+        let checkpoint_publish_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_checkpoint_publish_total",
+                help: "Checkpoint publishes reported by nodes, by outcome (published|retrying|failed). A failed publish leaves the snapshot local to its node; retrying means the manager asks the node again after a backoff.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let node_cpu_used_millicores = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_node_cpu_used_millicores",
+                help: "CPU used by a node's governed allocations over the last report interval, in thousandths of a core.",
+                labels: &["node"],
             },
             series: Series::new(),
         });
@@ -1077,7 +1346,7 @@ impl Metrics {
         let keyring_keys = Arc::new(GaugeVec {
             meta: FamilyMeta {
                 name: "legion_keyring_keys",
-                help: "Data keys in the KV keyring by state (active|retired). More than one for longer than a rewrap means a retired key still has values under it.",
+                help: "Keys in the KV keyring by state (active|retired data keys, checkpoint for the key that seals published checkpoints). A retired key for longer than a rewrap means values still sit under it.",
                 labels: &["state"],
             },
             series: Series::new(),
@@ -1211,6 +1480,14 @@ impl Metrics {
                 name: "legion_scheduler_index_queries_total",
                 help: "Scheduling-index candidate queries, by index and outcome (used|shadow|fell_back|refilled|unusable).",
                 labels: &["index", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let scheduler_locality_placements_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_locality_placements_total",
+                help: "Placements whose task had a content set, by how much of it the chosen node already held (warm = all, partial = some, cold = none). Hit ratio = warm / total.",
+                labels: &["outcome"],
             },
             series: Series::new(),
         });
@@ -1448,11 +1725,33 @@ impl Metrics {
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&node_memory_physical_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&node_memory_available_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&node_memory_used_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&node_cpu_used_millicores) as Arc<dyn RenderMetric>,
+            Arc::clone(&node_pressure_actions_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&instance_suspend_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&instance_suspends_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&idle_sweep_suspends_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&make_room_suspends_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&instance_resume_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&checkpoint_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&checkpoint_publish_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&checkpoint_publish_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&checkpoint_publish_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_handle_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&dispatch_send_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_limit) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_in_flight) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_state) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_conflict_rate) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_fallback_rate) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_goodput) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_adjustments_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_admission_skips_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemption_plans_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemptions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
@@ -1478,6 +1777,7 @@ impl Metrics {
             Arc::clone(&scheduler_index_candidates) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_locality_placements_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_bind_pass) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_candidate_rank) as Arc<dyn RenderMetric>,
@@ -1508,11 +1808,33 @@ impl Metrics {
             scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
+            scheduler_concurrency_limit,
+            scheduler_concurrency_in_flight,
+            scheduler_concurrency_state,
+            scheduler_concurrency_conflict_rate,
+            scheduler_concurrency_fallback_rate,
+            scheduler_concurrency_goodput,
+            scheduler_concurrency_adjustments_total,
+            scheduler_admission_skips_total,
             preemptions_total,
             preemption_plans_total,
             heartbeats_total,
             nodes,
             read_model_nodes,
+            node_memory_physical_bytes,
+            node_memory_available_bytes,
+            node_memory_used_bytes,
+            node_cpu_used_millicores,
+            node_pressure_actions_total,
+            instance_suspend_seconds,
+            instance_suspends_total,
+            idle_sweep_suspends_total,
+            make_room_suspends_total,
+            instance_resume_seconds,
+            checkpoint_bytes,
+            checkpoint_publish_bytes,
+            checkpoint_publish_seconds,
+            checkpoint_publish_total,
             allocations,
             store_write_lock_wait_seconds,
             store_read_lock_wait_seconds,
@@ -1541,6 +1863,7 @@ impl Metrics {
             raft_pipeline_wait_seconds,
             raft_pipeline_depth,
             scheduler_index_queries_total,
+            scheduler_locality_placements_total,
             scheduler_index_candidates,
             scheduler_index_shadow_total,
             scheduler_index_maintenance_seconds,
@@ -1627,6 +1950,9 @@ pub struct WorkerMetrics {
     pub allocations_running: Arc<Gauge>,
     /// `legion_worker_allocation_failures_reported_total`
     pub allocation_failures_reported_total: Arc<Counter>,
+    /// `legion_worker_pressure_actions_total{step}` — actions this node's
+    /// memory pressure response took (docs/resource-enforcement.md).
+    pub pressure_actions_total: Arc<CounterVec>,
     /// `legion_provisional_starts_total{origin,gate}` — provisional
     /// allocations admitted on this node (docs/edge-boot.md).
     pub provisional_starts_total: Arc<CounterVec>,
@@ -1765,6 +2091,14 @@ impl WorkerMetrics {
             },
             cell: GaugeCell::default(),
         });
+        let pressure_actions_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_pressure_actions_total",
+                help: "Actions this node's memory pressure response took, by step (reclaim|evict-bursting|evict-reserved).",
+                labels: &["step"],
+            },
+            series: Series::new(),
+        });
         let simulated_registrations_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_worker_simulated_registrations_total",
@@ -1830,6 +2164,7 @@ impl WorkerMetrics {
             Arc::clone(&provisional_ratify_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_refused_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&pressure_actions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes_target) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_registrations_total) as Arc<dyn RenderMetric>,
@@ -1840,6 +2175,7 @@ impl WorkerMetrics {
             heartbeat_duration_seconds,
             allocations_running,
             allocation_failures_reported_total,
+            pressure_actions_total,
             provisional_starts_total,
             provisional_refused_total,
             provisional_killed_total,
@@ -2814,6 +3150,11 @@ mod tests {
             "legion_grpc_requests_total",
             "legion_heartbeats_total",
             "legion_nodes",
+            "legion_node_memory_physical_bytes",
+            "legion_node_memory_available_bytes",
+            "legion_node_memory_used_bytes",
+            "legion_node_cpu_used_millicores",
+            "legion_node_pressure_actions_total",
             "legion_plan_apply_total",
             "legion_raft_pipeline_depth",
             "legion_raft_pipeline_wait_seconds",

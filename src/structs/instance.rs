@@ -78,6 +78,12 @@ pub enum InstanceState {
     /// by the scheduler; StartInstance moves it back to `Pending`. Unlike
     /// `Terminated` this is fully reversible.
     Stopped,
+    /// Keyed only: checkpointed and stopped by SuspendInstance. Like
+    /// `Stopped` it holds no allocation (unless `suspend.reserve` keeps its
+    /// reservation) and does not count toward desired. Unlike `Stopped`, its
+    /// `checkpoint_id` names a snapshot, and StartInstance restores from it
+    /// instead of cold-booting (see docs/suspend-and-resume.md).
+    Suspended,
     /// No longer desired (scaled in, job stopped, or destroyed). Slot-mode
     /// rows are retained so a later scale-out re-materializes the same id and
     /// reattaches the retained storage handle; keyed-mode rows are retained
@@ -92,6 +98,7 @@ impl InstanceState {
             InstanceState::Active => "active",
             InstanceState::Rescheduling => "rescheduling",
             InstanceState::Stopped => "stopped",
+            InstanceState::Suspended => "suspended",
             InstanceState::Terminated => "terminated",
         }
     }
@@ -112,6 +119,7 @@ impl std::str::FromStr for InstanceState {
             "active" => Ok(InstanceState::Active),
             "rescheduling" => Ok(InstanceState::Rescheduling),
             "stopped" => Ok(InstanceState::Stopped),
+            "suspended" => Ok(InstanceState::Suspended),
             "terminated" => Ok(InstanceState::Terminated),
             other => Err(format!("Unknown instance state {other}")),
         }
@@ -148,6 +156,83 @@ pub struct Instance {
     pub created_at: String,
     /// RFC 3339 timestamp of the last state/binding change.
     pub updated_at: String,
+    /// The snapshot this instance is restoring from (RestoreInstance), until
+    /// its node reports the outcome. Written only by the snapshot restore
+    /// ops, never by a generic upsert (see `INSTANCE_SELECT_ATTRS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_from: Option<String>,
+    /// The workload-identity epoch its tokens carry (`legion.io/epoch`).
+    /// Raised when a fork or snapshot of the instance is captured, so
+    /// Legion's own verifiers refuse the tokens copied into the checkpoint
+    /// (docs/workload-identity.md, "Forks and snapshots"). Written only by
+    /// the capture ops, never by a generic upsert.
+    #[serde(default)]
+    pub identity_epoch: u64,
+}
+
+/// Why an instance's last allocation stopped (`instance.last_stop`, JSON).
+/// Served as `InstanceInfo.last_stop`, so "stopped by node pressure" reads
+/// on the instance row without `operator:read` on events (suspend/resume UI
+/// plan §7.3).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceLastStop {
+    /// Stop-cause wire form ([`crate::structs::stop::StopCause::as_str`]).
+    pub cause: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hint: String,
+    /// Unix seconds.
+    pub at: i64,
+    pub allocation_id: i64,
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preemptor_job: String,
+}
+
+impl InstanceLastStop {
+    /// The record for a stop the manager decided, with a sentence built from
+    /// the cause. The pressure path replaces `detail` and `hint` with the
+    /// worker's own words.
+    pub fn from_cause(
+        cause: crate::structs::stop::StopCause,
+        allocation_id: i64,
+        node_id: &str,
+        preemptor_job: Option<&str>,
+        at: i64,
+    ) -> Self {
+        use crate::structs::stop::StopCause;
+        let detail = match cause {
+            StopCause::Stop => "Stopped by a user (instance stop or job stop).".to_string(),
+            StopCause::Update => "Replaced by a newer job config.".to_string(),
+            StopCause::Drain => format!("Moved off node {node_id}, which is draining."),
+            StopCause::Reschedule => "Rescheduled by the manager.".to_string(),
+            StopCause::Destroy => "Destroyed.".to_string(),
+            StopCause::NodeLost => format!("Node {node_id} was lost or removed."),
+            StopCause::ScaleIn => "Removed by a scale-in.".to_string(),
+            StopCause::Preempted => match preemptor_job {
+                Some(job) if !job.is_empty() => {
+                    format!("Preempted to make room for higher-priority job {job}.")
+                }
+                _ => "Preempted to make room for higher-priority work.".to_string(),
+            },
+            StopCause::NodePressure => {
+                format!("Stopped by node {node_id}'s memory pressure response.")
+            }
+            StopCause::Restore => "Replaced to roll back to a snapshot.".to_string(),
+            StopCause::Suspended => "Suspended with its state checkpointed.".to_string(),
+            StopCause::Unknown => "Stopped.".to_string(),
+        };
+        Self {
+            cause: cause.as_str().to_string(),
+            detail,
+            hint: String::new(),
+            at,
+            allocation_id,
+            node_id: node_id.to_string(),
+            preemptor_job: preemptor_job.unwrap_or_default().to_string(),
+        }
+    }
 }
 
 /// Deterministic slot-mode instance id: `{job_id}-{group}-{slot}`.
@@ -242,6 +327,7 @@ mod tests {
             InstanceState::Active,
             InstanceState::Rescheduling,
             InstanceState::Stopped,
+            InstanceState::Suspended,
             InstanceState::Terminated,
         ] {
             let json = serde_json::to_string(&state)?;

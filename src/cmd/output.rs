@@ -69,7 +69,7 @@ impl CliError {
     /// retryable classification derived from the status code.
     pub fn from_status(action: &str, status: &Status) -> Self {
         let code = status.code();
-        let message = status.message().trim();
+        let (message, server_hint) = crate::cmd::helpers::split_hint(status.message().trim());
         let message = if message.is_empty() {
             action.to_string()
         } else {
@@ -79,7 +79,9 @@ impl CliError {
         CliError {
             code: code_name(code).to_string(),
             message,
-            hint: hint_for(code).map(str::to_string),
+            hint: server_hint
+                .map(str::to_string)
+                .or_else(|| hint_for(code).map(str::to_string)),
             retryable: is_retryable(code),
         }
     }
@@ -202,6 +204,22 @@ pub fn fail_local(format: OutputFormat, error: CliError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_hint_replaces_the_generic_one() {
+        let status = Status::failed_precondition(
+            "task \"workspace\" asks for memory checkpoints, but sandbox memory checkpoints \
+             don't support gated networking yet\nHint: use --disk",
+        );
+        let err = CliError::from_status("create snapshot", &status);
+        assert_eq!(err.hint.as_deref(), Some("use --disk"));
+        assert!(!err.message.contains("Hint:"), "{}", err.message);
+        assert!(
+            err.message.ends_with("gated networking yet"),
+            "{}",
+            err.message
+        );
+    }
 
     #[test]
     fn classifies_retryable_codes() {

@@ -145,7 +145,9 @@ fn rotation_and_rewrap_replicate_through_raft() -> R<()> {
     let run = store.run_rewrap(false)?;
     assert_eq!(run.rewrapped, 1);
     assert_eq!(run.collected_keys, vec![first]);
-    assert_eq!(store.list_keyring_rows()?.len(), 1);
+    // The active data key and the checkpoint key, which rotation never
+    // touches.
+    assert_eq!(store.list_keyring_rows()?.len(), 2);
 
     // A restart on the same data dir replays or re-installs the keyring rows
     // and unwraps them with the file: the value is still readable.

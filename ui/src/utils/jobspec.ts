@@ -9,7 +9,7 @@ export type JobTaskDependency = {
 // Parsed `stateful` block from a task spec (see docs/stateful-workloads.md).
 export type JobTaskStateful = {
   mode: string
-  idSource?: string
+  requireId?: boolean
   storagePath?: string
 }
 
@@ -69,8 +69,34 @@ export type JobTaskService = {
   meta: Record<string, string>
 }
 
+// The task's `count`: a plain number, or `{ num, per }` — `num` instances per
+// distinct value of a node attribute, so the total depends on the cluster.
+export type JobTaskCount = {
+  num: number
+  per?: string
+}
+
+// The task's `resources` block, in the units the jobspec uses: `cpus` in
+// cores, `memory` and `memoryMax` in MiB (docs/resource-enforcement.md).
+// Every field is optional because the manager fills defaults at submit.
+export type JobTaskResources = {
+  cpus?: number
+  memory?: number
+  memoryMax?: number
+}
+
+// The task's `snapshots` block (docs/suspend-and-resume.md). Its presence is
+// what opts a sandbox into memory snapshots, so the block itself matters, not
+// only its fields.
+export type JobTaskSnapshots = {
+  ttl?: string
+  keep?: number
+  memory: boolean
+}
+
 export type JobTask = {
   name: string
+  count?: JobTaskCount
   runtime: string
   lifecycle: string
   group: string
@@ -82,6 +108,18 @@ export type JobTask = {
   networkMode?: string
   ports: JobTaskPort[]
   service?: JobTaskService
+  resources?: JobTaskResources
+  snapshots?: JobTaskSnapshots
+  actions: JobTaskAction[]
+}
+
+// What the jobspec declares about an action beyond `ListJobActions`: the argv
+// template the manager renders (`${param.<name>}` placeholders) and the
+// optional wall-clock cap. Shown as a preview; the manager does the rendering.
+export type JobTaskAction = {
+  name: string
+  command: string[]
+  timeout?: string
 }
 
 export type JobSpecData = {
@@ -120,9 +158,50 @@ const normalizeStateful = (value: unknown): JobTaskStateful | undefined => {
   const storage = raw.storage && typeof raw.storage === 'object' ? (raw.storage as Record<string, unknown>) : undefined
   return {
     mode,
-    idSource: readTaskString(raw.idSource) || undefined,
+    requireId: raw.requireId === true || undefined,
     storagePath: storage ? readTaskString(storage.path) || undefined : undefined,
   }
+}
+
+const readNumber = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) ? value : undefined
+
+const normalizeResources = (value: unknown): JobTaskResources | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  const resources = {
+    cpus: readNumber(raw.cpus),
+    memory: readNumber(raw.memory),
+    memoryMax: readNumber(raw.memoryMax),
+  }
+  return Object.values(resources).some((entry) => entry !== undefined) ? resources : undefined
+}
+
+const normalizeSnapshots = (value: unknown): JobTaskSnapshots | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  return {
+    ttl: readTaskString(raw.ttl) || undefined,
+    keep: readNumber(raw.keep),
+    // `memory` defaults to true once the block is declared.
+    memory: raw.memory !== false,
+  }
+}
+
+/**
+ * Whether the spec lets this task take a memory snapshot: a `sandbox` with a
+ * `snapshots` block that does not turn memory off, and no gated networking.
+ * Returns the reason when it cannot. The manager is the authority (a stored
+ * network policy can gate a task the spec does not), so this only decides
+ * what the UI offers.
+ */
+export const memorySnapshotBlocker = (task: JobTask | undefined): string | undefined => {
+  if (!task) return 'The task is not in the current job spec'
+  if (task.runtime !== 'sandbox') return `Memory snapshots need runtime "sandbox"; this task runs "${task.runtime}"`
+  if (!task.snapshots) return 'Memory snapshots need a `snapshots` block on the task'
+  if (!task.snapshots.memory) return 'The task sets snapshots.memory = false'
+  if (task.networkMode === 'gated') return 'Memory snapshots do not support gated networking yet'
+  return undefined
 }
 
 // Derives a display label for an artifact's auth: the KV path or identity
@@ -270,6 +349,26 @@ const normalizeService = (value: unknown): JobTaskService | undefined => {
   }
 }
 
+const normalizeCount = (value: unknown): JobTaskCount | undefined => {
+  if (typeof value === 'number' && Number.isFinite(value)) return { num: value }
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  if (typeof raw.num !== 'number' || !Number.isFinite(raw.num)) return undefined
+  return { num: raw.num, per: readTaskString(raw.per) || undefined }
+}
+
+const normalizeAction = (value: unknown): JobTaskAction | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const name = readTaskString(raw.name)
+  if (!name || !Array.isArray(raw.command)) return null
+  return {
+    name,
+    command: raw.command.map((part) => String(part)),
+    timeout: readTaskString(raw.timeout) || undefined,
+  }
+}
+
 const normalizeTask = (value: unknown): JobTask | null => {
   if (!value || typeof value !== 'object') return null
   const raw = value as Record<string, unknown>
@@ -299,6 +398,7 @@ const normalizeTask = (value: unknown): JobTask | null => {
 
   return {
     name,
+    count: normalizeCount(raw.count),
     runtime: readTaskString(raw.runtime, 'unknown'),
     lifecycle: readTaskString(raw.lifecycle, 'service'),
     group: readTaskString(raw.group, 'default'),
@@ -310,15 +410,27 @@ const normalizeTask = (value: unknown): JobTask | null => {
     networkMode: network ? readTaskString(network.mode) || undefined : undefined,
     ports,
     service: normalizeService(raw.service),
+    resources: normalizeResources(raw.resources),
+    snapshots: normalizeSnapshots(raw.snapshots),
+    actions: (Array.isArray(raw.actions) ? raw.actions : [])
+      .map((action) => normalizeAction(action))
+      .filter((action): action is JobTaskAction => Boolean(action)),
   }
 }
+
+// Every submission gets the rendered spec under this path (submit_rendered_job
+// in src/manager/server.rs); it is the one submission that is always the spec.
+export const RENDERED_SPEC_SUBMISSION = 'job.rendered.json'
 
 const parseSubmissionContent = (content: string): JobSpecData | null => {
   try {
     const parsed = JSON.parse(content) as unknown
     if (!parsed || typeof parsed !== 'object') return null
     const raw = parsed as Record<string, unknown>
-    const tasksRaw = Array.isArray(raw.tasks) ? raw.tasks : []
+    // Other JSON rides along with a spec — a template run records its
+    // variables as `template.variables.json` — and is not a spec.
+    if (!Array.isArray(raw.tasks)) return null
+    const tasksRaw = raw.tasks
     const tasks = tasksRaw
       .map((task) => normalizeTask(task))
       .filter((task): task is JobTask => Boolean(task))
@@ -332,7 +444,12 @@ const parseSubmissionContent = (content: string): JobSpecData | null => {
   }
 }
 
+// Submissions come back in no particular order (the store query has no ORDER
+// BY), so the rendered spec is preferred by name rather than by position.
 export const extractJobSpecData = (submissions: readonly Submission[]): JobSpecData | null => {
+  const rendered = submissions.find((submission) => submission.path === RENDERED_SPEC_SUBMISSION)
+  const fromRendered = rendered ? parseSubmissionContent(rendered.content) : null
+  if (fromRendered) return fromRendered
   for (const submission of submissions) {
     const parsed = parseSubmissionContent(submission.content)
     if (parsed) return parsed

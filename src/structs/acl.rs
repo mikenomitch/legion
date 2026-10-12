@@ -58,6 +58,14 @@ pub enum AclResource {
     /// scope with the `pools` / `namespaces` selectors, which match a
     /// policy's own selector.
     Net,
+    /// Snapshots of instances (`legion snapshot`, docs/suspend-and-resume.md):
+    /// `read` lists and fetches them and restores an instance from one,
+    /// `write` captures and deletes them. Scope with the job-name and
+    /// namespace selectors, like `job` rules. Separate from `job` because a
+    /// memory snapshot holds everything the workload had in memory, secrets
+    /// included: `snapshot:write` on a job is equivalent to reading its
+    /// in-memory secrets, which `job:write` alone should not grant.
+    Snapshot,
 }
 
 impl AclResource {
@@ -75,13 +83,14 @@ impl AclResource {
             AclResource::Scale => "scale",
             AclResource::Boot => "boot",
             AclResource::Net => "net",
+            AclResource::Snapshot => "snapshot",
         }
     }
 
     pub fn all() -> &'static [&'static str] {
         &[
             "job", "node", "kv", "state", "operator", "acl", "exec", "action", "template", "scale",
-            "boot", "net",
+            "boot", "net", "snapshot",
         ]
     }
 }
@@ -110,7 +119,7 @@ impl AclAction {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AclRule {
     /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`,
-    /// `exec`, `action`, `template`, `scale`, `boot`, `*`.
+    /// `exec`, `action`, `template`, `scale`, `boot`, `net`, `snapshot`, `*`.
     pub resources: Vec<String>,
     /// Actions: `read`, `write`, `*`.
     pub actions: Vec<String>,

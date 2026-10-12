@@ -176,18 +176,16 @@ service Manager {
   // created through this RPC is the task's desired allocation count (zero
   // instances = zero allocations).
   //
-  // Id assignment: the target task's `stateful.idSource` declares the default
-  // source. With `idSource: "caller"` the request must supply `instance_id`;
-  // with `idSource: "uuid"` (or unset) the server mints an id when
-  // `instance_id` is absent. A caller-supplied `instance_id` is always
-  // accepted when valid, regardless of `idSource` — the setting picks the
-  // default, it does not forbid explicit keys.
+  // Id assignment: when `instance_id` is absent the server mints an id,
+  // unless the target task sets `stateful.requireId: true`, which rejects
+  // the request instead. A caller-supplied `instance_id` is always accepted
+  // when valid.
   //
   // Errors:
   // - NotFound: the job does not exist.
   // - InvalidArgument: no keyed task matches `group`/`task`, the match is
   //   ambiguous, the id has an invalid charset (must match
-  //   `[A-Za-z0-9._-]{1,128}`), or `idSource: "caller"` and no id was given.
+  //   `[A-Za-z0-9._-]{1,128}`), or `requireId: true` and no id was given.
   // - AlreadyExists: the id collides with ANY existing instance row of the
   //   job — including Stopped instances and Terminated tombstones — or
   //   structurally aliases the reserved slot-id pattern
@@ -197,6 +195,10 @@ service Manager {
   //   owns its id, and a destroyed id can never be created again for the
   //   lifetime of the job (the never-recycle guarantee; destroying the whole
   //   job clears its instance history — see DestroyJob).
+  //
+  // `from_snapshot` restores the new instance from a snapshot
+  // instead of booting it empty. See `CreateInstances` for the contract,
+  // which is the same for one instance.
   rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceReply);
 
   // Creates several keyed-mode stateful instances in one atomic call and
@@ -214,12 +216,11 @@ service Manager {
   // `CreateInstance`: filters may be omitted when the job has exactly one
   // keyed task; ambiguity is rejected, never guessed.
   //
-  // Interaction with `stateful.idSource`:
-  // - `idSource: "caller"` requires every id to be caller-supplied, so
-  //   `count > 0` (server minting) contradicts the policy and is rejected
-  //   with InvalidArgument.
-  // - `idSource: "uuid"` (or unset) accepts any mix of explicit ids and
-  //   minted ids.
+  // Interaction with `stateful.requireId`:
+  // - `requireId: true` requires every id to be caller-supplied, so
+  //   `count > 0` (server minting) contradicts it and is rejected with
+  //   InvalidArgument.
+  // - Without it, any mix of explicit ids and minted ids is accepted.
   //
   // Errors:
   // - NotFound: the job does not exist.
@@ -229,10 +230,35 @@ service Manager {
   //   ambiguous; `instance_ids` is empty AND `count` is 0 (nothing to
   //   create); an id has an invalid charset (must match
   //   `[A-Za-z0-9._-]{1,128}`, the offending id is named); or the task
-  //   declares `idSource: "caller"` and `count > 0`.
+  //   sets `requireId: true` and `count > 0`.
   // - AlreadyExists: an id (named in the message) collides with an existing
   //   instance row — including duplicates within the request itself, Stopped
   //   instances, and Terminated tombstones. Nothing is created.
+  //
+  // Restoring from a snapshot (docs/suspend-and-resume.md, "Create from a
+  // snapshot"): with `from_snapshot` set to a snapshot id or
+  // a name of the job (see SetSnapshotAlias), every created instance starts
+  // from that snapshot instead of booting empty. Each gets its own clone of
+  // the snapshot's volume (the volume driver's `clone` op) and its own
+  // identity (allocation id, hostname, workload-identity token, fresh
+  // entropy, and for a memory snapshot of a TAP-wired sandbox its own MAC
+  // and TAP device). A `local` snapshot pins the instances to its node and
+  // is checked against its `compat` there. A `published` one places each
+  // instance on any node whose worker can fetch it and whose fingerprint
+  // passes its `compat`. Either way one call creates at most 64 instances.
+  // A restore that fails on the node follows `suspend.onRestoreFailure`
+  // like a fork does (see ForkInstance). The snapshot itself is untouched
+  // and can seed any number of later creates.
+  //
+  // `from_snapshot` also needs `snapshot:read` on the job (restoring reads
+  // the snapshot), and adds these errors:
+  // - NotFound: no snapshot with that id or name in the job.
+  // - InvalidArgument: the snapshot was taken from another task, or more
+  //   than 64 instances were asked for.
+  // - FailedPrecondition: the snapshot is not `local` or `published`, is a
+  //   suspend or fork checkpoint (owned by an instance, not a seed; take a
+  //   manual snapshot), or is a memory snapshot and the task now declares
+  //   gated networking.
   rpc CreateInstances (CreateInstancesRequest) returns (CreateInstancesReply);
 
   // Destroys a keyed-mode instance: stops its current allocation, drops its
@@ -252,7 +278,9 @@ service Manager {
   // call is safe to retry even without an idempotency key.
   //
   // Destroy also applies to Stopped instances: the row transitions
-  // stopped -> terminated and its retained storage handle is dropped.
+  // stopped -> terminated and its retained storage handle is dropped. It
+  // applies to Suspended instances the same way, and their suspend
+  // checkpoint is reclaimed on its node.
   //
   // Errors:
   // - NotFound: no instance row with this id exists.
@@ -277,6 +305,10 @@ service Manager {
   // resubmits / config updates / reschedules will not resurrect it. Only an
   // explicit `StartInstance` does.
   //
+  // A `suspended` instance can be stopped too: its checkpoint is discarded
+  // (and any held reservation released), and the next `StartInstance` boots
+  // it cold.
+  //
   // Stopping an already-stopped instance succeeds as a no-op, so the call is
   // safe to retry even without an idempotency key.
   //
@@ -289,12 +321,36 @@ service Manager {
   //   started, or re-created.
   rpc StopInstance (StopInstanceRequest) returns (StopInstanceReply);
 
-  // Starts (resumes) a stopped keyed-mode instance.
+  // Starts a stopped keyed-mode instance, or resumes a suspended one.
   //
-  // The instance transitions `stopped -> pending` and a placement evaluation
-  // is enqueued (exactly like `CreateInstance` does), so the scheduler
-  // places a new allocation bound to the same instance id and its RETAINED
-  // storage handle — the revived workload is *the same* logical instance.
+  // A `stopped` instance transitions `stopped -> pending` and a placement
+  // evaluation is enqueued (exactly like `CreateInstance` does), so the
+  // scheduler places a new allocation bound to the same instance id and its
+  // RETAINED storage handle — the revived workload is *the same* logical
+  // instance, booted cold.
+  //
+  // A `suspended` instance resumes from its checkpoint
+  // (docs/suspend-and-resume.md): it transitions `suspended -> pending` with
+  // its checkpoint as the restore source, and placement pins it to the node
+  // that holds the checkpoint (`durability = "local"`), checking the
+  // manifest's `compat` there. The node restores instead of booting: a
+  // memory checkpoint resumes the guest where it was, with a refreshed
+  // identity (a new allocation id and a newly issued workload-identity
+  // token naming it); a disk checkpoint boots fresh on the retained volume.
+  // The reply returns once the resume is queued. `instance.resumed` (or
+  // `instance.restore_failed`) reports the outcome, and `instance get` shows
+  // `last_restore_ms`. A held reservation (`suspend.reserve`) is released in
+  // the same transaction, so the restore lands on the capacity it held.
+  //
+  // When the checkpoint cannot be used (it was lost with its node, or its
+  // capture failed), `suspend.onRestoreFailure` decides: `cold` (default)
+  // boots fresh on the retained storage and emits `instance.restore_failed`;
+  // `fail` leaves the instance `suspended` and returns FailedPrecondition
+  // with the reason, which also lands in the instance's `detail`. A resume
+  // that waits longer than `suspend.resumeTimeout` (default 30s) for its
+  // checkpoint's node also boots cold under `onRestoreFailure = "cold"`.
+  // `cold = true` discards the checkpoint and boots fresh: the responder's
+  // escape hatch.
   //
   // Starting an instance that is already live (pending, active, or
   // rescheduling) succeeds as a no-op, so the call is safe to retry even
@@ -305,9 +361,158 @@ service Manager {
   // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
   //   by the scheduler via `count.num`, not this API).
   // - FailedPrecondition: the instance is Terminated (destroyed ids are
-  //   tombstoned forever — create a NEW id instead), or the owning job is
-  //   stopped (run the job first; a stopped job schedules nothing).
+  //   tombstoned forever — create a NEW id instead), the owning job is
+  //   stopped (run the job first; a stopped job schedules nothing), or a
+  //   suspended instance's checkpoint is unusable under
+  //   `onRestoreFailure = "fail"` (retry with `cold = true`).
   rpc StartInstance (StartInstanceRequest) returns (StartInstanceReply);
+
+  // Suspends a keyed-mode instance: checkpoint it, stop it, and release its
+  // reservation (docs/suspend-and-resume.md).
+  //
+  // The manager records a `purpose = suspend` snapshot and asks the
+  // instance's node, on its next heartbeat, to capture the running
+  // allocation and leave it stopped. A memory checkpoint pauses the guest,
+  // writes its memory and device state into the node content store, and
+  // only then stops the VMM. A disk checkpoint stops the task and retains
+  // its volume in place (no copy is made). When the node reports success,
+  // one transaction deletes the allocation (freeing its reservation, which
+  // `legion node usage` shows), sets the instance `suspended` with
+  // `checkpoint_id`, and emits `instance.suspended` and `allocation.removed`
+  // with `cause = suspended`. With `suspend.reserve = true` the allocation
+  // row stays, holding the reservation, and is never dispatched.
+  //
+  // A suspend never stops a workload it failed to capture: on a capture
+  // failure the instance stays `active`, its allocation keeps running, and
+  // `instance.suspend_failed` carries the node's error. The reply returns
+  // once the suspend is queued; poll GetInstance (or `legion instance
+  // suspend --wait`) for `state = suspended`.
+  //
+  // Suspended instances hold no allocation, do not count toward desired,
+  // survive a job stop, and keep their checkpoint until they resume
+  // successfully, are stopped, or are destroyed. Suspend checkpoints are
+  // never subject to `snapshots.ttl` or `snapshots.keep`.
+  //
+  // ACLs: `job:write` on the instance's job, plus `snapshot:write` when the
+  // checkpoint is `memory` (a memory checkpoint holds everything the
+  // workload had in RAM, including secrets).
+  //
+  // Mutating and retry-safe: pass `idempotency_key`, and a retry returns
+  // the first call's result with `deduplicated = true`. Suspending an
+  // instance that is already suspended, or already being suspended, is a
+  // no-op that names the existing checkpoint.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - InvalidArgument: the instance is slot-mode, `checkpoint` is not
+  //   `memory` or `disk`, or the task is not a keyed stateful task.
+  // - FailedPrecondition: the instance has no running allocation (it is
+  //   pending, rescheduling, stopped, or terminated); its node runs a worker
+  //   without the `checkpoint` capability (the message names the worker
+  //   version: upgrade it); a memory checkpoint was asked of a runtime that
+  //   supports disk only (`Hint: use --checkpoint disk`), of a gated
+  //   sandbox, or of a sandbox not launched for memory checkpoints.
+  //   With `suspend.durability = "store"`, the instance's data is
+  //   on a node-local volume (`local-dir`, or a driver advertising
+  //   `nodeLocal`), or its node's worker has no `contentStore` (it does not
+  //   advertise the `content-publish` capability).
+  //
+  // With `suspend.durability = "store"`, the suspend completes exactly
+  // as above (the instance is `suspended` once the checkpoint is on the
+  // node), and the node then publishes the checkpoint to its
+  // `contentStore`. When the upload finishes the snapshot is `published`
+  // (`snapshot.published`), a resume can run on any compatible node, and
+  // node loss no longer loses it. A failed upload leaves it `local`, with
+  // the reason in the snapshot's `error` and `snapshot.publish_failed`, and
+  // the manager asks the node to publish again after one minute, then five
+  // (three attempts in all).
+  rpc SuspendInstance (SuspendInstanceRequest) returns (SuspendInstanceReply);
+
+  // Fork and named snapshots ----------------------------------------------
+
+  // Forks a running keyed instance into `count` new instances
+  // (docs/suspend-and-resume.md, "Fork").
+  //
+  // The origin is checkpointed live: a memory checkpoint pauses the guest
+  // only while its memory and disks are captured (`pause_ms`), then it
+  // resumes; a disk checkpoint copies the instance volume while the task
+  // keeps running (crash-consistent, like pulling the power cord). The
+  // origin keeps its allocation, id, storage, and identity throughout.
+  //
+  // Each fork is a NEW keyed instance of the origin's task, created by this
+  // call and returned in `instances`:
+  // - Its id is `<origin>-f<n>`, with `n` the lowest number whose id has
+  //   never existed (ids are never recycled). An origin id too long to
+  //   suffix gets server-minted ids instead.
+  // - Its storage is a clone of the origin's volume at the checkpoint, made
+  //   with the volume driver's `clone` op (a reflink or a sparse copy on
+  //   `local-dir`), so a write in one fork is never seen by another or by
+  //   the origin.
+  // - Its identity is its own: a new allocation id, hostname, and workload
+  //   identity token, fresh entropy, and for a memory fork of a sandbox
+  //   wired to a TAP device, its own MAC address and TAP device.
+  //
+  // Forks wait in `pending` (`pending_op = forking`) until the checkpoint
+  // lands. Then `instance.forked` is emitted and they are placed. By default
+  // the checkpoint is node-local, so every fork is pinned to the origin's
+  // node, and a fork that does not fit there waits for room like any pending
+  // placement. A failed capture leaves the origin running, terminates the
+  // forks with the reason in their `detail`, and emits
+  // `instance.fork_failed`.
+  //
+  // With `spread = true` the checkpoint is published (`durability =
+  // store`) to the origin node's `contentStore`, and the forks wait for the
+  // publish rather than the capture. Each fork is then placed on a
+  // compatible node that none of its siblings runs on (any node whose
+  // worker can fetch published snapshots, whose fingerprint passes the
+  // checkpoint's `compat`), fetches the parts there, and restores. The
+  // origin's node may take one fork. A fork with no such node left waits,
+  // like a `distinct` placement. A publish that fails for good (after the
+  // manager's retries) terminates the forks with the reason and emits
+  // `instance.fork_failed`; the origin keeps running. A fork whose restore fails on the node follows
+  // the task's `suspend.onRestoreFailure`: `cold` (default) boots it fresh
+  // on its cloned volume, `fail` stops it. Either way
+  // `instance.restore_failed` names the reason.
+  //
+  // Forks of one memory checkpoint on one node map the same memory file
+  // copy-on-write (Firecracker), so unmodified pages are shared. Each fork
+  // is still charged its full memory reservation.
+  //
+  // The fork checkpoint (`purpose = fork`) is reclaimed once every fork has
+  // restored from it (for a spread fork, the origin node's copy; the
+  // published parts stay in the content store, which Legion never deletes
+  // from). It is never subject to `snapshots.ttl` or `snapshots.keep`. A
+  // fork stopped before it restored keeps its checkpoint, and restores from
+  // it when started.
+  //
+  // ACLs: `job:write` and `snapshot:write` on the origin's job (a fork reads
+  // everything the origin held in memory).
+  //
+  // Mutating and retry-safe: pass `idempotency_key`, and a retry returns the
+  // first call's forks with `deduplicated = true` instead of creating more.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - InvalidArgument: the instance is slot-mode, `count` is above 64, or
+  //   `checkpoint` is not `memory` or `disk`.
+  // - FailedPrecondition, each with a message naming the fix:
+  //   - the origin has no running allocation, is being suspended or resumed,
+  //     or its job is stopped;
+  //   - its node runs a worker without the `checkpoint` capability;
+  //   - a disk fork of an instance with no `stateful.storage` volume, or one
+  //     whose volume driver lacks the `snapshot` or `clone` op (so `exec`
+  //     and `container` tasks without a snapshot-capable volume cannot fork);
+  //   - a memory fork of a task that cannot take one (not a sandbox, not
+  //     launched for memory checkpoints, or gated networking), or of a
+  //     Firecracker sandbox wired to a TAP device on Firecracker older than
+  //     1.12, which cannot move a restored NIC to a new TAP device;
+  //   - a disk fork of a sandbox wired to a TAP device: every fork would
+  //     boot on the TAP device the origin holds;
+  //   - `spread = true` with a disk checkpoint, with an instance that has a
+  //     `stateful.storage` volume (forks clone it on the origin's node, so
+  //     a fork elsewhere could not get its copy), or on a node whose worker
+  //     has no `contentStore` to publish to.
+  rpc ForkInstance (ForkInstanceRequest) returns (ForkInstanceReply);
 
   // Operator override for the node-loss confirmation gate (the K8s analog is
   // force-deleting a pod stuck on a lost node): immediately frees a stateful
@@ -346,6 +551,212 @@ service Manager {
   // Errors:
   // - NotFound: no instance row with this id exists.
   rpc GetInstance (GetInstanceRequest) returns (GetInstanceReply);
+
+  // === SNAPSHOTS (see docs/suspend-and-resume.md) ===
+
+  // Captures a point-in-time snapshot of an instance's running allocation.
+  //
+  // A snapshot is either:
+  // - `disk`: a copy of the instance's `stateful.storage` volume, taken with
+  //   the volume driver's `snapshot` op. Works for every runtime whose
+  //   instance volume uses a driver that advertises `snapshot` (the built-in
+  //   `local-dir` does). The task keeps running, so the copy is
+  //   crash-consistent, like pulling the power cord.
+  // - `memory`: the guest's memory and device state plus its root disk and
+  //   instance volume, captured while the guest is paused. Only `sandbox`
+  //   tasks on Firecracker or cloud-hypervisor support it, and only when the
+  //   task declares a `snapshots` block (which launches the sandbox ready
+  //   for checkpoints). The guest resumes as soon as the capture finishes.
+  //
+  // The call returns as soon as the snapshot row exists, in state
+  // `capturing`. The instance's node takes the snapshot on its next
+  // heartbeat and reports back, which moves it to `local` (success, the
+  // bytes live on that node) or `failed` (with `error`). Poll GetSnapshot,
+  // or use `legion snapshot create --wait`, to wait for the outcome.
+  //
+  // A snapshot is local to the node that captured it: restoring it pins the
+  // instance to that node, and losing the node loses the snapshot. With
+  // `publish` the node also uploads it to its `contentStore` once
+  // captured, and the snapshot moves `local -> published`: it then restores
+  // on any compatible node and survives the node. Expiry follows the task's
+  // `snapshots { ttl, keep }` block.
+  //
+  // Requires `snapshot:write` on the instance's job. A memory snapshot holds
+  // everything the workload had in memory, secrets included, so granting
+  // `snapshot:write` on a job is equivalent to granting read access to its
+  // in-memory secrets (docs/auth-and-acls.md).
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - InvalidArgument: `kind` is not `memory` or `disk`, or `name` has an
+  //   invalid charset (must match `[A-Za-z0-9._-]{1,64}`).
+  // - FailedPrecondition, each with a message naming the fix:
+  //   - the instance has no running allocation (it is pending, stopped, or
+  //     terminated);
+  //   - the instance's node runs a worker that does not advertise the
+  //     `checkpoint` capability (the message names the worker version;
+  //     upgrade the worker);
+  //   - `memory` was asked for a task that cannot take one: not a `sandbox`
+  //     task, no `snapshots` block, `snapshots.memory = false`, or gated
+  //     networking (which memory checkpoints do not support yet);
+  //   - `disk` was asked for an instance with no `stateful.storage` volume;
+  //   - a snapshot of this instance is already being captured.
+  // - AlreadyExists: `name` is already used by another snapshot of the job.
+  rpc CreateSnapshot (CreateSnapshotRequest) returns (CreateSnapshotReply);
+
+  // Lists snapshots, newest first, optionally filtered by job, instance, or
+  // state. Includes `failed` rows (until they expire) so a failed capture
+  // stays diagnosable. Rows the caller has no `snapshot:read` on are left
+  // out rather than failing the call.
+  rpc ListSnapshots (ListSnapshotsRequest) returns (ListSnapshotsReply);
+
+  // Returns one snapshot by id, including its manifest.
+  //
+  // Requires `snapshot:read` on the snapshot's job.
+  //
+  // Errors:
+  // - NotFound: no snapshot with this id exists (or it was deleted).
+  rpc GetSnapshot (GetSnapshotRequest) returns (GetSnapshotReply);
+
+  // Deletes a snapshot.
+  //
+  // The row moves to `deleting` and the owning node reclaims the bytes on its
+  // next heartbeat: it releases the snapshot's pins in the node content store
+  // (memory parts) and runs the volume driver's `snapshot-delete` op (disk
+  // part). The row is removed, and `snapshot.deleted` emitted, once the node
+  // confirms. A snapshot whose node no longer exists is removed at once,
+  // since there is nothing left to reclaim.
+  //
+  // Deleting a snapshot that is already `deleting` succeeds as a no-op.
+  // A snapshot an instance is currently restoring from cannot be deleted
+  // until the restore reports back.
+  //
+  // Requires `snapshot:write` on the snapshot's job.
+  //
+  // Errors:
+  // - NotFound: no snapshot with this id exists.
+  // - FailedPrecondition: the snapshot is still `capturing`, or an instance
+  //   is restoring from it right now.
+  rpc DeleteSnapshot (DeleteSnapshotRequest) returns (DeleteSnapshotReply);
+
+  // Rolls a keyed instance back to one of its own snapshots, in place.
+  //
+  // The instance keeps its id and storage handle. Its current allocation is
+  // stopped (stop notice cause `restore`), the instance moves to `pending`
+  // with the snapshot recorded as its restore source, and a placement
+  // evaluation is enqueued. The scheduler places the replacement:
+  //
+  // - **Pinned to the snapshot's node.** A `local` snapshot exists on one
+  //   node only, so the replacement can only run there. When that node is
+  //   down or full, the instance waits in `pending` with the reason in the
+  //   placement diagnostic.
+  // - **Checked for compatibility.** A memory snapshot records the VMM and
+  //   CPU it was taken on (`compat` in the manifest). A node whose
+  //   `sandbox.vmm.<name>.version`, `cpu.vendor`, `cpu.model`, or
+  //   `cpu.features` differ is rejected, and the diagnostic names the
+  //   attribute and both values (for example
+  //   `cpu.model is "6:143:8", the checkpoint needs "6:106:6"`).
+  //
+  // The node then restores the instance volume from the snapshot's disk
+  // part, and for a memory snapshot loads the guest's memory instead of
+  // booting it. The worker reports the outcome, which emits
+  // `snapshot.restored` or `snapshot.restore_failed`. A failed restore fails
+  // the allocation with the worker's error, and the normal restart and
+  // reschedule path then boots the instance cold on its retained storage.
+  //
+  // Restoring uses the instance's current job config (network policy,
+  // mounts, identity), never values from the snapshot.
+  //
+  // Requires `snapshot:read` on the snapshot's job (reading the snapshot is
+  // what a restore does) and `job:write` (it replaces an allocation).
+  //
+  // Errors:
+  // - NotFound: the instance or the snapshot does not exist.
+  // - InvalidArgument: the snapshot belongs to a different instance (to
+  //   start a new instance from it, use CreateInstance(s) `from_snapshot`;
+  //   to copy a running instance, use ForkInstance), or the instance is
+  //   slot-mode (slot lifecycles are owned by the scheduler).
+  // - FailedPrecondition: the instance is stopped or terminated, its job is
+  //   stopped, or the snapshot is not `local` or `published` (still
+  //   capturing, failed, deleting, or lost with its node).
+  //
+  // A `published` snapshot is not pinned: the replacement is
+  // placed on any node whose fingerprint passes the manifest's `compat`,
+  // preferring nodes that already hold its parts (the `locality` score), and
+  // that node fetches the parts from the content store before restoring.
+  rpc RestoreInstance (RestoreInstanceRequest) returns (RestoreInstanceReply);
+
+  // Points a snapshot name (an alias) at a snapshot of the same job,
+  // creating the name or moving it.
+  //
+  // A name is how a golden snapshot is used: `CreateInstance(s)` with
+  // `from_snapshot = "<name>"` restores new instances from whatever the
+  // name points at right now, so a weekly rebuild takes a new snapshot and
+  // repoints the name, and every create after that uses it. Repointing never
+  // touches the snapshot it moves away from, and instances already restoring
+  // from it are unaffected.
+  //
+  // Names are unique within a job and share the namespace of
+  // `CreateSnapshot`'s `name` (`[A-Za-z0-9._-]{1,64}`, not starting with
+  // `snap-`). Only a `local` or `published` `manual` snapshot can be named:
+  // a suspend checkpoint belongs to its instance and a fork checkpoint to
+  // its forks, and both are reclaimed when they are spent. Deleting a
+  // snapshot removes the names pointing at it. Instances created from a
+  // `published` snapshot may run on any compatible node.
+  //
+  // Requires `snapshot:write` on the job.
+  //
+  // Mutating and retry-safe: pass `idempotency_key`. Pointing a name at the
+  // snapshot it already names is a no-op.
+  //
+  // Errors:
+  // - NotFound: the snapshot does not exist.
+  // - InvalidArgument: the name has an invalid charset, or the snapshot
+  //   belongs to another job.
+  // - FailedPrecondition: the snapshot is not `local`, or its purpose is not
+  //   `manual`.
+  rpc SetSnapshotAlias (SetSnapshotAliasRequest) returns (SetSnapshotAliasReply);
+
+  // Removes a snapshot name. The snapshot itself is untouched.
+  //
+  // Requires `snapshot:write` on the job. Removing a name that does not
+  // exist succeeds as a no-op, so the call is safe to retry.
+  rpc DeleteSnapshotAlias (DeleteSnapshotAliasRequest) returns (DeleteSnapshotAliasReply);
+
+  // Pre-fetches a published snapshot's parts onto matching nodes, so a later
+  // resume, restore, or fork there starts from local bytes
+  // (docs/suspend-and-resume.md, "Warming nodes"). This is the artifact
+  // cache plan's warm operation applied to a snapshot.
+  //
+  // The manager picks every available node that matches `constraints` (node
+  // attributes, the same `key = value` matching a jobspec `constraint`
+  // block uses; empty matches every node) and whose fingerprint passes the
+  // manifest's `compat` (a node that could never restore the snapshot is
+  // not warmed). Each picked node gets a `warm` checkpoint request on its
+  // next heartbeat. The node fetches each part it does not already hold
+  // from its published URL through its ordinary artifact fetcher, verifies
+  // the digest, and stores it unpinned in its content store, where the
+  // location index advertises it and the `locality` score then prefers the
+  // node. The reply returns as soon as the requests are queued.
+  //
+  // Warming is best effort and never blocks placement. A node that cannot
+  // fetch (no access to the store, a full content store) reports why in the
+  // `snapshot.warm_failed` event and is simply not warm. Warmed parts are
+  // ordinary cache entries: LRU and the content store's idle TTL can evict
+  // them. Warming the same snapshot again is a no-op on nodes that already
+  // hold the parts or already have a warm queued, so the call is idempotent
+  // by nature. Queued warms live in the memory of the manager that accepted
+  // the call and are lost if it restarts before the nodes heartbeat.
+  //
+  // Requires `snapshot:read` on the snapshot's job (warming only reads it).
+  //
+  // Errors:
+  // - NotFound: no snapshot with this id (or name within `job_id`).
+  // - InvalidArgument: a constraint is not `key=value`.
+  // - FailedPrecondition: the snapshot is not `published` (a `local`
+  //   snapshot exists on one node only; publish it with `durability =
+  //   "store"` or `snapshot create --publish`), or no available node matches.
+  rpc WarmSnapshot (WarmSnapshotRequest) returns (WarmSnapshotReply);
 
   // === VOLUMES (see docs/volumes.md) ===
 
@@ -414,7 +825,12 @@ service Manager {
   // scheduling record (region, job, group, task, node, alloc, and the stable
   // instance/slot for stateful tasks) and applies the audience, TTL, subject
   // template, and extra claims of the *named identity in the stored task
-  // spec*. Nothing security-relevant is read from the request, so a
+  // spec*. A stateful task's token also carries `legion.io/epoch`, its
+  // instance's current identity epoch: a fork or snapshot capture raises it,
+  // and Legion's own verifiers (the `legion` auth method) refuse tokens from
+  // earlier epochs, since copies of them sit in the checkpoint (see
+  // `TaskAllocation.identity_epoch` and docs/workload-identity.md, "Forks and
+  // snapshots"). Nothing security-relevant is read from the request, so a
   // compromised worker can only obtain tokens for allocations placed on it,
   // scoped to audiences the spec already declared.
   //
@@ -551,6 +967,91 @@ service Manager {
   rpc GetHeartbeatCadence (GetHeartbeatCadenceRequest)
     returns (GetHeartbeatCadenceReply);
 
+  // Reports one node's memory and CPU: what it has, what the scheduler has
+  // reserved on it, and what its allocations actually use, per allocation.
+  //
+  // Capacity and reservations come from the state store. Usage comes from
+  // the node's own cgroup measurements, which workers with
+  // `resourceEnforcement.enabled` send on the heartbeat every 10 seconds.
+  // The manager keeps usage in memory only and never writes it to the state
+  // store, so a manager restart or failover shows no usage until the next
+  // report arrives, and a manager that did not receive this node's
+  // heartbeats has none to show (`usage_reported` is false). Usage is
+  // never a scheduling input: placement still packs on reservations.
+  //
+  // Allocations on runtimes the worker does not govern (`noop`, third-party
+  // plugins that have not adopted enforcement) and on workers with
+  // enforcement off are listed with their reservation and no usage.
+  //
+  // Backs `legion node usage <node>` and the `legion_node_usage` MCP tool.
+  //
+  // Errors:
+  // - NotFound: no node with `node_id` is registered.
+  // - PermissionDenied: the caller lacks node:read on the node's pool.
+  //
+  // ACL: node:read, scoped to the node's pool (checked unscoped before the
+  // lookup, so a caller with no node access cannot probe which nodes exist).
+  // See docs/resource-enforcement.md, "Measuring usage".
+  rpc GetNodeUsage (GetNodeUsageRequest) returns (GetNodeUsageReply);
+
+  // Reports capacity, reservations, and measured usage for many nodes in one
+  // call: the batch form of GetNodeUsage, for fleet views such as the
+  // workers index and `legion node usage` with no node.
+  //
+  // Each entry is exactly the GetNodeUsage reply for that node, built from
+  // the same state and the same in-memory usage table, so the two never
+  // disagree. Per-allocation rows are left out unless `include_allocations`
+  // is set, which keeps a 100-node reply small: a fleet view needs the
+  // per-node totals (`memory`, `cpu`, `usage_reported`, the pressure
+  // response), not every allocation.
+  //
+  // `node_ids` empty means every registered node, ordered by node id, capped
+  // at 500 nodes (the reply's `truncated` says when the cap cut it short).
+  // Unknown ids are left out of the reply rather than failing the call, so
+  // a list built from a page that has since changed still answers.
+  //
+  // Usage is held in the memory of the manager that received each node's
+  // heartbeats: a node whose heartbeats go to another manager, or that has
+  // not reported since this manager started, has `usage_reported = false`,
+  // exactly as in GetNodeUsage.
+  //
+  // ACL: node:read. Gated unscoped first (`AclScope::any()`), then each node
+  // is filtered by its pool, so a pool-scoped token sees only its pools'
+  // nodes and never learns that others exist.
+  //
+  // Errors:
+  // - InvalidArgument: more than 500 `node_ids`.
+  // - PermissionDenied: the caller has no node:read at all.
+  rpc ListNodeUsage (ListNodeUsageRequest) returns (ListNodeUsageReply);
+
+  // Reports what one node holds for content locality: the content its worker
+  // advertises to the manager's location index (digest and bytes per entry),
+  // which snapshot each entry belongs to when the manager knows, and the
+  // node's snapshots with their published state and how many of their parts
+  // the node holds right now.
+  //
+  // This is the read side of the location index the scheduler's `locality`
+  // score uses (docs/artifacts.md, "Content locality"): the same data, so an
+  // operator can see why a placement preferred a node. It is leader-local
+  // soft state, never persisted or replicated: a manager that just started,
+  // took over, or does not receive this node's heartbeats has no entries for
+  // it, and says so with `index_reported = false`. Only entries of at least
+  // 1 MiB are advertised, so small artifacts never appear.
+  //
+  // The content store's byte budgets and per-class totals are not part of
+  // this reply: the index carries digests, not classes.
+  //
+  // ACL: node:read, scoped to the node's pool (checked unscoped before the
+  // lookup, so a caller with no node access cannot probe which nodes exist).
+  // Snapshot rows are filtered by `snapshot:read` on their job and left out
+  // when the caller lacks it; content entries that belong to a snapshot the
+  // caller cannot read keep their digest and bytes but lose the snapshot id.
+  //
+  // Errors:
+  // - NotFound: no node with `node_id` is registered.
+  // - PermissionDenied: the caller lacks node:read on the node's pool.
+  rpc GetNodeContent (GetNodeContentRequest) returns (GetNodeContentReply);
+
   // Proxies a restart request to a worker node.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 
@@ -624,6 +1125,28 @@ service Manager {
   // Returns observability status and recent manager-side logs/traces.
   rpc GetObservability (GetObservabilityRequest)
     returns (GetObservabilityReply);
+
+  // Reports the adaptive scheduler-concurrency controller: how many evals this
+  // manager will PLAN at once right now, why, and whether the cluster's
+  // conflicts are concurrency-driven or capacity-driven.
+  //
+  // The question it answers is one no other endpoint does — "are placements
+  // slow because the scheduler is holding itself back, or because the cluster
+  // is full?" — and the two have opposite remedies ("wait" versus "add
+  // nodes"). Backs `legion scheduler concurrency`.
+  //
+  // Read-only and cheap: every field comes from a snapshot the controller
+  // already publishes each 500ms tick, so calling this costs no extra work on
+  // the plan path.
+  //
+  // Answer with care on a manager that does not lead the scheduler lane: it
+  // does no planning, so it reports zeros rather than a guess. Ask any manager
+  // and check `is_scheduler_lane_leader` in the reply.
+  //
+  // ACL: operator:read, unscoped (the report is cluster-wide).
+  // See docs/adaptive-scheduler-concurrency.md.
+  rpc GetSchedulerConcurrency (GetSchedulerConcurrencyRequest)
+    returns (GetSchedulerConcurrencyReply);
 
   // Returns the local manager's Raft control-plane status.
   //
@@ -1122,7 +1645,17 @@ message WorkerConfig {
   //          "maxArtifactSize":"50GiB","allowedSchemes":["https","s3",
   //          "oci","git","file"]}}`.
   //
-  // Default: empty string (worker applies conservative built-in defaults).
+  // The worker config's top-level `content` block (the node content store,
+  // see docs/artifacts.md) rides in this payload under a `content` key:
+  // `{"content":{"enabled":true,"budgets":{"artifacts":"10%",
+  //   "snapshots":"50GiB"},"ttl":"72h","minFreeDisk":"5GiB"}}`. A budget
+  // is a fixed size or a share of the filesystem holding the store, which
+  // the worker sizes when it starts. Absent budgets take the defaults: 10%
+  // clamped to 1..20 GiB for artifacts, 20% clamped to 2..200 GiB for
+  // snapshots.
+  //
+  // Default: empty string (worker applies conservative built-in defaults,
+  // including an enabled content store).
   string artifacts = 9;
 
   // JSON-encoded host volumes this worker offers to jobs (see
@@ -1250,6 +1783,20 @@ message WorkerRegisterRequest {
   //
   // Default: `0` (see above).
   uint32 protocol_version = 8;
+
+  // Optional features this worker implements, beyond what its protocol
+  // version implies. Recorded into the node's `dynamic_attrs`
+  // (`capabilities`). The manager sends feature-specific work only to
+  // workers that list the feature, and refuses the request that would need
+  // it otherwise with FailedPrecondition naming the worker's version.
+  //
+  // Known values:
+  // - `checkpoint`: the worker takes and reclaims snapshots
+  //   (`HeartbeatReply.checkpoint_requests`) and starts allocations from
+  //   `TaskAllocation.restore`.
+  //
+  // Default: empty (a worker that predates capabilities).
+  repeated string capabilities = 9;
 }
 
 // Reply payload for WorkerRegister.
@@ -2259,15 +2806,19 @@ message CreateInstanceRequest {
   //
   // Must match `[A-Za-z0-9._-]{1,128}` and must not collide with any
   // existing instance id of any job — including Terminated tombstones
-  // (destroyed ids are never reusable). Required when the task declares
-  // `stateful.idSource: "caller"`; optional otherwise (the server mints an
-  // id when absent). A valid explicit key is always honored regardless of
-  // `idSource`.
+  // (destroyed ids are never reusable). Required when the task sets
+  // `stateful.requireId: true`. Optional otherwise (the server mints an id
+  // when absent). A valid explicit key is always honored.
   optional string instance_id = 4;
 
   // Optional idempotency key. See `RunJobRequest.idempotency_key`. The
   // recorded replay carries the originally created instance id.
   optional string idempotency_key = 5;
+
+  // Restore the new instance from this snapshot (an id, or a name of the
+  // job) instead of booting it empty. Needs `snapshot:read` on the job. See
+  // `CreateInstances` for the full contract.
+  optional string from_snapshot = 6;
 }
 
 // Reply payload for CreateInstance.
@@ -2280,6 +2831,11 @@ message CreateInstanceReply {
   // True when replayed from a recorded result for the request's
   // `idempotency_key` rather than applied fresh.
   bool deduplicated = 2;
+
+  // The snapshot id the instance restores from, resolved from
+  // `from_snapshot` (a name resolves to the snapshot it named at call
+  // time). Empty when the instance boots empty.
+  string restoring_from = 3;
 }
 
 // Request payload for CreateInstances (atomic batch create).
@@ -2304,14 +2860,19 @@ message CreateInstancesRequest {
   repeated string instance_ids = 4;
 
   // Number of additional server-minted instances to create on top of
-  // `instance_ids`. Rejected (InvalidArgument) when the task declares
-  // `stateful.idSource: "caller"`, which requires caller-supplied ids. At
+  // `instance_ids`. Rejected (InvalidArgument) when the task sets
+  // `stateful.requireId: true`, which requires caller-supplied ids. At
   // least one of `instance_ids` / `count` must be non-empty/non-zero.
   uint32 count = 5;
 
   // Optional idempotency key. See `RunJobRequest.idempotency_key`. The
   // recorded replay carries the originally created instance ids.
   optional string idempotency_key = 6;
+
+  // Restore every created instance from this snapshot (an id, or a name of
+  // the job) instead of booting it empty. Needs `snapshot:read` on the job,
+  // and caps the batch at 64 instances. See the RPC comment.
+  optional string from_snapshot = 7;
 }
 
 // Reply payload for CreateInstances.
@@ -2324,6 +2885,10 @@ message CreateInstancesReply {
   // True when replayed from a recorded result for the request's
   // `idempotency_key` rather than applied fresh.
   bool deduplicated = 2;
+
+  // The snapshot id every instance restores from, resolved from
+  // `from_snapshot`. Empty when the instances boot empty.
+  string restoring_from = 3;
 }
 
 // Request payload for DestroyInstance.
@@ -2381,6 +2946,11 @@ message StartInstanceRequest {
 
   // Optional idempotency key. See `RunJobRequest.idempotency_key`.
   optional string idempotency_key = 2;
+
+  // Suspended instances only: discard the checkpoint and boot fresh on the
+  // retained storage instead of restoring. Ignored for a stopped instance,
+  // which always boots fresh. Default false.
+  bool cold = 3;
 }
 
 // Reply payload for StartInstance.
@@ -2392,11 +2962,135 @@ message StartInstanceReply {
   //  placement by this request.
   // - `"Instance <id> already running"` — no-op on a live
   //  (pending/active/rescheduling) instance.
+  // - `"Resuming instance <id> from <snapshot> on <node>"` — a suspended
+  //  instance queued to restore from its checkpoint.
+  // - `"Started instance <id> cold ..."` — a suspended instance booting
+  //  fresh (`cold = true`, or an unusable checkpoint under
+  //  `onRestoreFailure = "cold"`, with the reason).
   string message = 1;
 
   // True when replayed from a recorded result for the request's
   // `idempotency_key` rather than applied fresh.
   bool deduplicated = 2;
+
+  // The checkpoint a suspended instance is resuming from. Empty when the
+  // instance boots cold (a stopped instance, `cold = true`, or an unusable
+  // checkpoint).
+  string resuming_from = 3;
+
+  // The node holding that checkpoint, where the restore is pinned. Empty
+  // when `resuming_from` is, and when the checkpoint is `published`, which
+  // restores on any compatible node.
+  string node_id = 4;
+}
+
+// Request payload for SuspendInstance.
+message SuspendInstanceRequest {
+  // Stable id of the keyed-mode instance to suspend. It must be `active`
+  // (have a running allocation).
+  string instance_id = 1;
+
+  // `memory` or `disk`; empty uses the task's `suspend.checkpoint`, else
+  // the best the instance can take: memory for a sandbox launched for
+  // memory checkpoints, disk otherwise. `memory` also needs `snapshot:write`.
+  optional string checkpoint = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for SuspendInstance.
+message SuspendInstanceReply {
+  // Human-readable status: `"Suspending instance <id> (<kind> checkpoint
+  // <snapshot> on <node>)"`, `"Instance <id> already suspended (<snapshot>)"`,
+  // or `"Instance <id> is already being suspended (<snapshot>)"`.
+  string message = 1;
+
+  // The suspend checkpoint's snapshot id (`snap-...`). Follow it with
+  // GetSnapshot, or watch the instance's `checkpoint_id`.
+  string snapshot_id = 2;
+
+  // `memory` or `disk`: the checkpoint kind this suspend takes.
+  string kind = 3;
+
+  // The node capturing the checkpoint, where its local copy stays.
+  string node_id = 4;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 5;
+
+  // The task's `suspend.durability`: `local` (the checkpoint stays on
+  // `node_id`, and a resume is pinned there) or `store` (once captured, the
+  // node also publishes it to its `contentStore`; the snapshot moves to
+  // `published`, emits `snapshot.published`, and can resume on any
+  // compatible node).
+  string durability = 6;
+}
+
+// Fork ---------------------------------------------------------------------
+
+// Request payload for ForkInstance.
+message ForkInstanceRequest {
+  // Stable id of the keyed-mode instance to fork. It must be `active` (have
+  // a running allocation), and it keeps running.
+  string instance_id = 1;
+
+  // How many forks to create, 1 to 64. 0 means 1.
+  uint32 count = 2;
+
+  // Place the forks on distinct nodes. The fork takes a memory checkpoint,
+  // publishes it to the origin node's `contentStore` (`durability =
+  // store`), and places each fork, once the publish lands, on a compatible
+  // node none of its siblings runs on. Needs an instance without a
+  // `stateful.storage` volume, on a worker with a `contentStore`. See
+  // ForkInstance.
+  bool spread = 3;
+
+  // `memory` or `disk`; empty takes a memory checkpoint when the origin can
+  // (a sandbox launched for memory checkpoints on Firecracker or
+  // cloud-hypervisor), else a disk checkpoint of its instance volume. A
+  // disk fork boots each fork fresh on its cloned volume.
+  optional string checkpoint = 4;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`. A retry
+  // with the same key returns the first call's forks and creates nothing.
+  optional string idempotency_key = 5;
+}
+
+// Reply payload for ForkInstance.
+message ForkInstanceReply {
+  // The forked instance.
+  string origin = 1;
+
+  // The fork checkpoint's snapshot id (`snap-...`, `purpose = fork`). Follow
+  // it with GetSnapshot: `state = local` means the capture landed and the
+  // forks are being placed (for a spread fork, `published`).
+  string snapshot = 2;
+
+  // How long the origin was paused for the capture, in milliseconds, once
+  // the capture has landed. 0 while it is still capturing, and for a disk
+  // fork, which does not pause the origin. `legion instance fork --wait`
+  // waits for the capture and fills it in.
+  uint64 pause_ms = 3;
+
+  // The new instances' ids, in creation order.
+  repeated string instances = 4;
+
+  // `memory` or `disk`: the checkpoint kind the fork takes.
+  string kind = 5;
+
+  // The node holding the checkpoint: where every fork runs, unless
+  // `durability` is `store`.
+  string node_id = 6;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 7;
+
+  // `local`: the forks run on `node_id`. `store` (a spread fork): the
+  // checkpoint is published first, and each fork runs on its own node.
+  string durability = 8;
 }
 
 // Request payload for ReplaceInstance.
@@ -2450,8 +3144,10 @@ message InstanceInfo {
   // its allocation; a replacement will re-bind the same id and storage),
   // `stopped` (keyed only: paused via StopInstance or a job stop; row and
   // storage handle retained, id still owned, revivable via StartInstance),
-  // or `terminated` (slot scale-in / keyed destroy / job destroy; rows
-  // retained — keyed tombstones forever).
+  // `suspended` (keyed only: checkpointed by SuspendInstance; holds no
+  // allocation, does not count toward desired, and StartInstance restores it
+  // from `checkpoint_id`), or `terminated` (slot scale-in / keyed destroy /
+  // job destroy; rows retained — keyed tombstones forever).
   string state = 6;
 
   // Ordinal slot index `0..count.num-1`; present only in slot mode.
@@ -2475,7 +3171,7 @@ message InstanceInfo {
   string updated_at = 11;
 
   // Diagnostic detail explaining a non-obvious lifecycle situation; unset in
-  // the common case. Two producers, and they never apply at once:
+  // the common case. Three producers:
   //
   // - `pending-loss-confirmation: ...` — the instance's current allocation
   //   sits on a `lost` node and the manager is waiting out
@@ -2489,7 +3185,160 @@ message InstanceInfo {
   //   data. It waits for that node rather than starting on empty storage;
   //   `legion volume delete --force <id>` abandons the data and frees the
   //   instance to place elsewhere. See docs/volumes.md.
+  //
+  // - The last suspend or restore failure (`suspend failed: ...`, `restore
+  //   from <snapshot> failed, booted cold: ...`, `... the instance stays
+  //   suspended (onRestoreFailure = "fail")`), until the next successful
+  //   suspend or resume clears it. See docs/suspend-and-resume.md.
   optional string detail = 12;
+
+  // Measured usage of the instance's current allocation, from the latest
+  // report its node sent (see GetNodeUsage). Absent when the instance has no
+  // allocation, its runtime is not governed, its worker has enforcement off,
+  // or this manager has not received a report for it since it started.
+  optional AllocationUsage usage = 13;
+
+  // The snapshot this instance is restoring from (RestoreInstance or a
+  // resume), until its node reports the restore's outcome. Absent otherwise.
+  optional string restore_snapshot_id = 14;
+
+  // Suspend and resume (docs/suspend-and-resume.md) ---------------------
+
+  // The suspend checkpoint (`snap-...`) a resume restores from. Set while
+  // the instance is `suspended` and while a resume is in flight.
+  optional string checkpoint_id = 15;
+
+  // That checkpoint's kind: `memory` or `disk`.
+  optional string checkpoint_kind = 16;
+
+  // Where the checkpoint is meant to live, from the task's
+  // `suspend.durability`: `local` (on `checkpoint_node_id` only) or `store`
+  // (also published to that node's `contentStore`; see
+  // `checkpoint_state`).
+  optional string checkpoint_durability = 17;
+
+  // The node holding the checkpoint. A resume is pinned to it.
+  optional string checkpoint_node_id = 18;
+
+  // RFC 3339 time of the last successful suspend.
+  optional string suspended_at = 19;
+
+  // Why the instance is (or was last) suspended: `manual` (SuspendInstance),
+  // `idle` (the task's `suspend.idle` policy: quiet for `idle.after`), or
+  // `pressure` (the node's memory pressure response took the `suspend` step
+  // because the task sets `suspend.onPressure = true`). While a suspend is in
+  // flight it names the reason of that suspend.
+  optional string suspend_reason = 20;
+
+  // The snapshot the instance last resumed or restored from.
+  optional string restored_from_snapshot_id = 21;
+
+  // How long the last restore took on the node, in milliseconds.
+  optional uint64 last_restore_ms = 22;
+
+  // How long the last suspend's capture took on the node, in milliseconds.
+  optional uint64 last_suspend_ms = 23;
+
+  // The checkpoint's size in bytes (0 for a disk checkpoint, whose volume
+  // stays in place).
+  optional uint64 checkpoint_bytes = 24;
+
+  // An operation in flight: `suspending` (capture requested, not yet
+  // reported), `resuming` (restore requested, not yet reported), or
+  // `forking` (a fork waiting for its origin's checkpoint to land;
+  // it is not placed until then).
+  optional string pending_op = 25;
+
+  // Automatic suspend (docs/suspend-and-resume.md, "Idle policy").
+
+  // RFC 3339 time since which the running allocation has been quiet by the
+  // signals its task's `suspend.idle.signals` counts. Unset when the task has
+  // no idle policy, when the instance is not running, or when its node sends
+  // no usage reports (a worker without `resourceEnforcement.enabled`, where
+  // the idle policy cannot act; `detail` says so).
+  optional string idle_since = 26;
+
+  // The task's `suspend.idle.after`, in seconds: the idle sweep suspends the
+  // instance once `idle_since` is this far in the past. Unset when the task
+  // has no idle policy.
+  optional uint64 idle_after_seconds = 27;
+
+  // The checkpoint snapshot's state: `local` (on `checkpoint_node_id` only;
+  // a resume is pinned there) or `published` (in the content store; a
+  // resume goes to any compatible node). A `store`-durability checkpoint is
+  // `local` until its upload finishes. See `checkpoint_durability`.
+  optional string checkpoint_state = 28;
+
+  // Why the instance's last allocation stopped: the cause, a detail
+  // sentence, a hint when there is something to change, and when. Recorded
+  // by the manager in the same transaction that removes the allocation, so
+  // it survives the allocation row and needs no `operator:read` on events
+  // (job:read on the instance is enough). For a memory pressure eviction it
+  // carries the worker's detail and hint, the same text as the
+  // `node.pressure` event. Unset for an instance whose allocation has never
+  // stopped, and for stops recorded by a manager that predates the field.
+  // Replaced by each later stop, so a rollout after a pressure eviction
+  // shows `update`.
+  optional InstanceStop last_stop = 29;
+
+  // Which checkpoints the instance can take right now: memory, disk,
+  // published, and spread, each with the reason when not. Computed by the
+  // manager from the running allocation, its node, and the task, with the
+  // same checks CreateSnapshot, SuspendInstance, and ForkInstance apply
+  // (including a stored network policy that gates the task, which the job
+  // spec cannot show). Set only while the instance is `active` with a
+  // running allocation; unset otherwise, since nothing can be checkpointed.
+  optional CheckpointSupport checkpoint_support = 30;
+
+  // The instance this one was forked from (ForkInstance), kept for the
+  // instance's lifetime so fork lineage survives the fork checkpoint being
+  // reclaimed. Unset for instances not created by a fork.
+  optional string forked_from = 31;
+
+  // MiB of memory a suspended instance keeps charged to its node, so a
+  // resume finds room: its job's `suspend.reserve` share of its
+  // reservation, applied when the suspend landed. Unset when the instance holds nothing (the default)
+  // or is not suspended. With `reserve = true` this is the whole
+  // reservation.
+  optional double held_memory_mib = 32;
+
+  // CPU (MHz) the suspended instance keeps charged to its node, the same
+  // way as `held_memory_mib`. Exclusive cores are held only with a full
+  // hold, and are not counted here.
+  optional double held_cpu_mhz = 33;
+
+  // Set when the instance's last resume or restore could not restore its
+  // checkpoint and `suspend.onRestoreFailure = "cold"` (the default) booted
+  // it fresh on its retained storage instead. The workload's running
+  // processes and memory are gone, though its volume is intact. Covers a
+  // resume (StartInstance) whose restore failed on the node, whose
+  // checkpoint was lost or failed, or that waited past `resumeTimeout`, a
+  // fork or `from_snapshot` create whose restore failed, and a
+  // RestoreInstance rollback whose restore failed.
+  //
+  // Persisted on the instance, unlike the `instance.restore_failed` event,
+  // and kept until the next resume or restore starts, so a client that
+  // checks later still sees it. An explicit `StartInstance { cold: true }`
+  // clears it and sets nothing, since that cold boot was asked for. Unset
+  // otherwise. See docs/suspend-and-resume.md, "When a resume cannot
+  // restore".
+  optional InstanceColdBoot cold_boot = 34;
+}
+
+// A cold boot that replaced a restore (InstanceInfo.cold_boot).
+message InstanceColdBoot {
+  // The snapshot the instance was restoring from: its suspend checkpoint, a
+  // fork checkpoint, or the snapshot a rollback or `from_snapshot` create
+  // named.
+  string snapshot_id = 1;
+
+  // Why the restore did not happen: the node's restore error, or the
+  // manager's reason (`checkpoint ... is lost (its node is gone)`, `the
+  // resume could not be placed ... within resumeTimeout (30s)`).
+  string reason = 2;
+
+  // RFC 3339 time the manager chose the cold boot.
+  string at = 3;
 }
 
 // Request payload for ListInstances.
@@ -2536,6 +3385,524 @@ message GetInstanceReply {
 
   // Node holding that claim. Empty when `provisional` is unset.
   string provisional_node_id = 3;
+}
+
+// One snapshot (see docs/suspend-and-resume.md): a point-in-time capture of
+// an instance, recorded by the manager and stored on the node that took it.
+message SnapshotInfo {
+  // Snapshot id (`snap-<hex>`), unique within the cluster and never reused.
+  string snapshot_id = 1;
+
+  // Owning job name.
+  string job_id = 2;
+
+  // Task the snapshot was taken from.
+  string task = 3;
+
+  // Instance the snapshot was taken from.
+  string instance_id = 4;
+
+  // Optional operator-chosen name, unique within the job. Empty when the
+  // snapshot was created without `--name`.
+  string name = 5;
+
+  // `memory` (guest memory, device state, root disk, and instance volume) or
+  // `disk` (the instance volume only).
+  string kind = 6;
+
+  // Why the snapshot exists: `manual` (CreateSnapshot), `suspend` (an
+  // instance's suspend checkpoint, SuspendInstance), or `fork` (a fork
+  // checkpoint, ForkInstance, reclaimed once every fork has restored).
+  string purpose = 7;
+
+  // Lifecycle state:
+  // - `capturing`: the row exists and the node has been asked to capture.
+  // - `local`: captured; the bytes live on `node_id`.
+  // - `published`: captured and uploaded to the capturing node's
+  //   `contentStore`. Any compatible node restores it, and it survives the
+  //   loss of `node_id`.
+  // - `failed`: the node could not capture it; `error` says why. Failed rows
+  //   expire like any other.
+  // - `deleting`: DeleteSnapshot (or expiry) asked the node to reclaim it.
+  // - `lost`: its node was removed from the cluster, taking the bytes with
+  //   it.
+  string state = 8;
+
+  // Node holding the snapshot's bytes.
+  string node_id = 9;
+
+  // Allocation the snapshot was captured from.
+  int64 allocation_id = 10;
+
+  // Total bytes captured: memory parts plus the volume copy, as the node
+  // reported them. Zero until the capture finishes.
+  uint64 total_bytes = 11;
+
+  // How long the capture took on the node, in milliseconds. For a memory
+  // snapshot this includes the paused window. Zero until it finishes.
+  uint64 duration_ms = 12;
+
+  // Why the capture or the reclaim failed. Empty otherwise.
+  string error = 13;
+
+  // RFC3339 creation timestamp.
+  string created_at = 14;
+
+  // RFC3339 time after which the snapshot is deleted automatically, from the
+  // task's `snapshots.ttl`. Empty when it never expires on its own.
+  string expires_at = 15;
+
+  // The snapshot manifest as JSON, once captured: the memory parts with
+  // their digests and sizes, the volume snapshot refs, and the `compat`
+  // block (VMM type and version, guest shape, CPU vendor, model, and feature
+  // digest) that placement checks a restore against. Empty while
+  // `capturing`. Returned by GetSnapshot only; ListSnapshots leaves it empty
+  // to keep list replies small.
+  string manifest_json = 16;
+
+  // How long the workload was paused for the capture, in milliseconds.
+  // Only a live memory capture pauses (manual or fork); 0 for a disk
+  // capture, which never pauses, and until the capture finishes.
+  uint64 pause_ms = 17;
+
+  // Every name (SetSnapshotAlias, or `CreateSnapshot.name`) that points at
+  // this snapshot right now.
+  repeated string aliases = 18;
+
+  // `local` (stays on `node_id`) or `store` (published once captured: the
+  // state moves `local -> published`, and the manifest's memory parts gain
+  // a `url` each). A `store` snapshot whose upload failed stays `local`
+  // with the reason in `error` (`publish attempt N of 3 failed, retrying
+  // in ...` while the manager retries, `publish failed after 3 attempts`
+  // once it gives up), and keeps working from its node.
+  string durability = 19;
+
+  // RFC3339 time the upload finished. Empty unless `published`.
+  string published_at = 20;
+
+  // Which nodes hold the snapshot's memory parts right now, from this
+  // manager's content location index: the capturing node while it keeps
+  // them, plus every node that fetched or warmed a `published` snapshot.
+  // Returned by GetSnapshot only (ListSnapshots leaves it empty), and empty
+  // for a disk snapshot, whose volume copy lives in the volume driver, and
+  // on a manager that holds no content reports (it just started or took
+  // over). Best effort: the index is soft state, refreshed every heartbeat.
+  repeated SnapshotHolder holders = 21;
+}
+
+// Request payload for CreateSnapshot.
+message CreateSnapshotRequest {
+  // Instance to snapshot. Its current allocation must be running.
+  string instance_id = 1;
+
+  // `disk` (default when empty) or `memory`.
+  string kind = 2;
+
+  // Optional name, unique within the job, `[A-Za-z0-9._-]{1,64}`.
+  optional string name = 3;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`. A retry
+  // with the same key returns the snapshot the first call created.
+  optional string idempotency_key = 4;
+
+  // Publish the snapshot to the node's `contentStore` once captured
+  // (`durability = "store"`), so it restores on any compatible node and
+  // survives the node. Only a snapshot made entirely of content-store parts
+  // can be published: a memory snapshot of a sandbox with no
+  // `stateful.storage` volume. A volume snapshot lives in its driver on one
+  // node, so `publish` with a disk snapshot, or with an instance that has a
+  // volume, is FailedPrecondition. So is a node whose worker has no
+  // `contentStore` configured (it does not advertise the `content-publish`
+  // capability). Default false.
+  bool publish = 5;
+}
+
+// Reply payload for CreateSnapshot.
+message CreateSnapshotReply {
+  // The new snapshot, in state `capturing`.
+  SnapshotInfo snapshot = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh. The snapshot is then the one
+  // the original call created, in whatever state it has reached since.
+  bool deduplicated = 2;
+}
+
+// Request payload for ListSnapshots.
+message ListSnapshotsRequest {
+  // Optional exact-match job filter.
+  optional string job_id = 1;
+
+  // Optional exact-match instance filter.
+  optional string instance_id = 2;
+
+  // Optional exact-match state filter (`capturing`, `local`, `published`,
+  // `failed`, `deleting`, `lost`).
+  optional string state = 3;
+}
+
+// Reply payload for ListSnapshots.
+message ListSnapshotsReply {
+  // Matching snapshots, newest first, without `manifest_json`.
+  repeated SnapshotInfo snapshots = 1;
+}
+
+// Request payload for GetSnapshot.
+message GetSnapshotRequest {
+  // Snapshot id, or a snapshot name. A name must be qualified with
+  // `job_id`, since names are unique only within a job.
+  string snapshot = 1;
+
+  // Job the named snapshot belongs to. Ignored when `snapshot` is an id.
+  optional string job_id = 2;
+}
+
+// Reply payload for GetSnapshot.
+message GetSnapshotReply {
+  // The snapshot, with `manifest_json`.
+  SnapshotInfo snapshot = 1;
+}
+
+// Request payload for DeleteSnapshot.
+message DeleteSnapshotRequest {
+  // Snapshot id to delete.
+  string snapshot_id = 1;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for DeleteSnapshot.
+message DeleteSnapshotReply {
+  // Human-readable status message.
+  //
+  // Current manager reply values:
+  // - `"Deleting snapshot <id>"` — the node reclaims it on its next heartbeat.
+  // - `"Deleted snapshot <id>"` — removed at once (its node is gone).
+  // - `"Snapshot <id> already deleting"` — no-op.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Request payload for RestoreInstance.
+message RestoreInstanceRequest {
+  // Keyed instance to roll back.
+  string instance_id = 1;
+
+  // Snapshot to roll back to: an id, or a name of a snapshot of this
+  // instance's job.
+  string snapshot = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for RestoreInstance.
+message RestoreInstanceReply {
+  // Human-readable status message.
+  //
+  // Current manager reply value:
+  // - `"Restoring instance <id> from snapshot <snapshot>"`.
+  string message = 1;
+
+  // The snapshot the instance is restoring from (resolved from a name, when
+  // one was given).
+  string snapshot_id = 2;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 3;
+}
+
+// Named snapshots ----------------------------------------------------------
+
+// Request payload for SetSnapshotAlias.
+message SetSnapshotAliasRequest {
+  // Job the name belongs to.
+  string job_id = 1;
+
+  // The name, `[A-Za-z0-9._-]{1,64}`, not starting with `snap-`.
+  string name = 2;
+
+  // The snapshot to point it at: an id, or another name of the same job.
+  string snapshot = 3;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 4;
+}
+
+// Reply payload for SetSnapshotAlias.
+message SetSnapshotAliasReply {
+  // Human-readable status: `"Pointed <name> at <snapshot>"`, `"Moved <name>
+  // from <old> to <snapshot>"`, or `"<name> already points at <snapshot>"`.
+  string message = 1;
+
+  // The snapshot id the name now points at.
+  string snapshot_id = 2;
+
+  // The snapshot id it pointed at before. Empty when the name is new.
+  string previous_snapshot_id = 3;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 4;
+}
+
+// Request payload for DeleteSnapshotAlias.
+message DeleteSnapshotAliasRequest {
+  // Job the name belongs to.
+  string job_id = 1;
+
+  // The name to remove.
+  string name = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for DeleteSnapshotAlias.
+message DeleteSnapshotAliasReply {
+  // Human-readable status: `"Removed <name> (it pointed at <snapshot>)"` or
+  // `"No snapshot name <name> in job <job>"`.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Snapshot warming ---------------------------------------------------------
+
+// Request payload for WarmSnapshot.
+message WarmSnapshotRequest {
+  // Snapshot id, or a snapshot name qualified with `job_id`.
+  string snapshot = 1;
+
+  // Job the named snapshot belongs to. Ignored when `snapshot` is an id.
+  optional string job_id = 2;
+
+  // Node attribute constraints, each `key=value` (for example
+  // `region=us-west`, `pool=gpu`), all of which a node must match. Keys are
+  // node attributes as a jobspec `constraint` block names them. Empty warms
+  // every available node that can restore the snapshot.
+  repeated string constraints = 3;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`. Warming
+  // is idempotent by nature (a node that holds the parts, or has a warm
+  // queued, is skipped), so the key only replays the first reply.
+  optional string idempotency_key = 4;
+}
+
+// Reply payload for WarmSnapshot.
+message WarmSnapshotReply {
+  // The snapshot being warmed (resolved from a name, when one was given).
+  string snapshot_id = 1;
+
+  // Nodes asked to fetch the parts on their next heartbeat.
+  repeated string nodes = 2;
+
+  // Matching nodes skipped because they already hold every part.
+  repeated string already_warm = 3;
+
+  // Matching nodes skipped because their fingerprint fails the manifest's
+  // `compat` (they could never restore this memory snapshot), each as
+  // `<node>: <reason>`.
+  repeated string incompatible = 4;
+
+  // Human-readable summary: `"Warming snapshot <id> on <n> node(s)"`.
+  string message = 5;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 6;
+}
+
+// Work a manager asks a worker to do on a snapshot, delivered in
+// `HeartbeatReply.checkpoint_requests`.
+//
+// This is the manager-to-worker half of the checkpoint channel. The manager
+// re-sends every request on every heartbeat until the worker's matching
+// `SnapshotReport` has been applied, so a worker that restarts, or a report
+// lost to a failed heartbeat, simply retries. Workers deduplicate by
+// `snapshot_id` and `op`: a request for work already done re-sends the
+// recorded report instead of redoing it.
+//
+// The manager only sends requests to a worker that advertised the
+// `checkpoint` capability at registration.
+message CheckpointRequest {
+  // Snapshot the work is for. Also the content-store pin owner and the
+  // volume snapshot id on the node.
+  string snapshot_id = 1;
+
+  // `capture`, `delete`, `publish`, or `warm`. Workers treat an unknown op
+  // as an error and report it, so a newer manager's op is never silently
+  // dropped.
+  //
+  // `publish` seals every memory part named by `manifest_json` with its key
+  // from `part_keys`, uploads it to the worker's `contentStore`, and reports
+  // the manifest with each part's `url` and `keyId` filled in. `warm`
+  // fetches the parts named by `manifest_json` from their URLs, opens them
+  // with their keys, and stores them in the node content store.
+  string op = 2;
+
+  // `capture`: the running allocation to capture. Unset for `delete`.
+  int64 allocation_id = 3;
+
+  // `capture`: `memory` or `disk`.
+  string kind = 4;
+
+  // `capture`: what the allocation does once captured. `resume` (keep
+  // running, which manual snapshots and forks send) or `stop` (suspend).
+  string then = 5;
+
+  // `capture`: `manual`, `suspend`, or `fork`. Informational on the worker.
+  string purpose = 6;
+
+  // `delete`: the manifest JSON the capture reported, so the worker can
+  // release the right content-store pins and volume snapshots. Empty when the
+  // capture never finished, in which case the worker reclaims by snapshot id
+  // alone. `publish`: the manifest to publish. `warm`: the published
+  // manifest, whose parts carry their URLs.
+  string manifest_json = 7;
+
+  // `publish` and `warm`: one key per memory part of `manifest_json`, which
+  // the worker seals each part with before it uploads it, or opens each
+  // fetched part with (docs/suspend-and-resume.md, "Security"). The manager
+  // derives them from the cluster's checkpoint key and sends them only with
+  // the work it chose to send this worker. Empty for `capture` and `delete`,
+  // and when the manager could not derive them (see `part_key_error`).
+  repeated CheckpointPartKey part_keys = 8;
+
+  // Why `part_keys` is empty or incomplete: the keyring is locked on the
+  // manager, the cluster has no checkpoint key yet, or a part names a key
+  // the cluster no longer has. The worker fails the work with this message.
+  // Empty when every key is present.
+  string part_key_error = 9;
+}
+
+// The key for one published checkpoint part. A worker receives it with the
+// publish, warm, or restore work that needs it and keeps it in memory only.
+// The generated Rust type redacts `key` from Debug output and never
+// serializes it.
+message CheckpointPartKey {
+  // `sha256:<hex>` of the part's plaintext, as in the manifest.
+  string digest = 1;
+
+  // The checkpoint key this part key is derived from (`ck_…`), recorded in
+  // the published manifest as the part's `keyId`.
+  string key_id = 2;
+
+  // 32 bytes. Derives both the AES-256-GCM key the part is sealed under and
+  // the name of the sealed object in the content store.
+  bytes key = 3;
+}
+
+// The outcome of one piece of checkpoint work, reported by a worker in
+// `HeartbeatRequest.snapshot_reports` (the worker-to-manager half of the
+// checkpoint channel).
+message SnapshotReport {
+  // Snapshot the outcome is for.
+  string snapshot_id = 1;
+
+  // `capture`, `delete`, `restore`, `publish`, or `warm`.
+  string op = 2;
+
+  // Whether the work succeeded.
+  bool ok = 3;
+
+  // Why it failed. Empty on success.
+  string error = 4;
+
+  // `capture`: the manifest JSON (memory parts with digests, volume refs,
+  // `compat`). `publish`: the same manifest with each memory part's `url`
+  // set. Empty for other ops or on failure.
+  string manifest_json = 5;
+
+  // `capture`, `restore`, `publish`, and `warm`: wall time on the worker,
+  // in milliseconds.
+  uint64 duration_ms = 6;
+
+  // `capture`: total bytes captured. `publish` and `warm`: bytes actually
+  // moved (0 when the destination already held every part). Zero otherwise.
+  uint64 total_bytes = 7;
+
+  // `capture`: the allocation captured. `restore`: the allocation that was
+  // started from the snapshot.
+  int64 allocation_id = 8;
+
+  // A `capture` the worker took on its own, with no CheckpointRequest: the
+  // memory pressure response's `suspend` step checkpointed and stopped the
+  // allocation (its task sets `suspend.onPressure = true`), and
+  // `snapshot_id` is an id the worker minted. The manager has no snapshot
+  // row for it, so it inserts one (`purpose = suspend`, `state = local`) and
+  // applies the same suspend transaction a SuspendInstance capture does, with
+  // `suspend_reason = pressure`. When the instance has moved on (stopped,
+  // destroyed, or rescheduled while the node was out of contact), the row is
+  // inserted as `deleting` instead, and the node reclaims the checkpoint.
+  // The worker re-sends the report on every heartbeat until the manager
+  // drops the allocation from its desired set, so a report lost to a failed
+  // heartbeat or a manager failover still lands. Only successful captures
+  // are reported this way: a failed one resumes the task and reports
+  // nothing.
+  bool local_suspension = 9;
+
+  // `capture`: how long the workload was paused, in milliseconds (a live
+  // memory capture only; 0 otherwise). Older workers leave it 0.
+  uint64 pause_ms = 10;
+}
+
+// A snapshot an allocation should start from instead of booting, attached
+// to `TaskAllocation.restore` while its instance is restoring.
+message SnapshotRestore {
+  // The snapshot to restore.
+  string snapshot_id = 1;
+
+  // `memory` or `disk`.
+  string kind = 2;
+
+  // The snapshot manifest JSON. The worker restores the volume refs it names
+  // with the driver's `restore` op before mounting, and for a memory
+  // snapshot loads the memory parts (looked up by digest in the node content
+  // store) instead of calling the runtime's `start`. A part missing from the
+  // node content store that carries a `url` (a published snapshot) is
+  // fetched first, through the worker's artifact fetchers, opened with its
+  // key from `part_keys`, verified against its digest, and stored in the
+  // content store. The allocation shows `staging artifacts` meanwhile.
+  string manifest_json = 3;
+
+  // The task's `suspend.onResume` argv. After a memory restore the guest
+  // agent runs it once the guest's identity is refreshed (new allocation id,
+  // hostname, workload-identity token, reseeded RNG, resynced clock). Empty
+  // when the task declares none; ignored for a disk restore, which boots
+  // fresh and runs the task's own startup instead.
+  repeated string on_resume = 4;
+
+  // The allocation restores into a NEW instance, not the one the snapshot
+  // was taken from (ForkInstance, or CreateInstance(s) `from_snapshot`).
+  // The worker then clones the snapshot's volumes into the allocation's own
+  // instance volumes (the driver's `clone` op) instead of rolling them back,
+  // and for a memory restore gives the guest a new MAC and, when its NIC is
+  // wired to a TAP device, a TAP device of its own.
+  bool fork = 5;
+
+  // The instance the allocation serves. The guest's identity refresh
+  // re-exports it as `LEGION_INSTANCE_ID`, which a fork must change.
+  string instance_id = 6;
+
+  // One key per published memory part of `manifest_json`, to open the
+  // sealed parts this worker has to fetch. Only a part missing from the
+  // node content store needs its key, so a restore on the node that holds
+  // every part succeeds without them. Empty for a snapshot that was never
+  // published.
+  repeated CheckpointPartKey part_keys = 7;
+
+  // Why `part_keys` is empty or incomplete (a locked keyring on the
+  // manager, or a part sealed under a key the cluster no longer has). A
+  // restore that has to fetch such a part fails with this message.
+  string part_key_error = 8;
 }
 
 // === VOLUME MESSAGES (see docs/volumes.md) ===
@@ -3073,6 +4440,317 @@ message HeartbeatRequest {
   // by the manager into per-(caller, service) windows for ListServiceEdges.
   // Restored on a failed heartbeat like every other report on this request.
   repeated NetEdgeSample net_edges = 10;
+
+  // Measured memory and CPU for this node and its governed allocations
+  // (docs/resource-enforcement.md, "Measuring usage"). Sent only by workers
+  // with `resourceEnforcement.enabled`, and only on the heartbeat that falls
+  // due after each 10-second report interval, so most heartbeats carry
+  // nothing here. The manager keeps the latest report per node in memory and
+  // never writes it to the state store.
+  //
+  // Absent on every heartbeat from a worker that predates usage reporting,
+  // which the manager treats exactly like a worker with enforcement off.
+  optional UsageReport usage = 11;
+
+  // What the node's memory pressure response did since the last successful
+  // heartbeat (docs/resource-enforcement.md, "Memory pressure"). The worker
+  // acts first, because waiting on the manager while a node runs out of
+  // memory would be wrong, and reports here afterwards. Restored and re-sent
+  // on a failed heartbeat, like every other report on this request.
+  //
+  // The manager turns each entry into a `node.pressure` event. For the
+  // eviction steps it also removes the allocation with
+  // `cause = node_pressure` and asks the scheduler to replace it, exactly as
+  // for any other platform-initiated stop. An entry naming an allocation the
+  // manager does not place on this node is logged and ignored.
+  //
+  // Empty on every heartbeat of a node that was never short of memory, and
+  // from every worker that predates the pressure response.
+  repeated PressureAction pressure_actions = 12;
+
+  // Outcomes of checkpoint work since the last heartbeat (see
+  // `CheckpointRequest` for the channel's contract): a capture's manifest or
+  // error, a delete's confirmation, and whether an allocation started from a
+  // `TaskAllocation.restore` payload succeeded. Re-sent by the worker
+  // whenever the manager re-sends the request it answers, and restored on a
+  // failed heartbeat like every other report on this request.
+  //
+  // Default: empty list.
+  repeated SnapshotReport snapshot_reports = 13;
+  // Content locality: what this node's content store holds, for the manager's location index
+  // (docs/artifacts.md, "Content locality"). The scheduler's `locality`
+  // score term reads that index to prefer nodes that already hold a
+  // placement's bytes.
+  //
+  // Sent on every heartbeat by workers that support it. The first report a
+  // worker process sends is a full set; after that each report is a delta
+  // against the epoch the manager last acknowledged, and an unchanged store
+  // sends an empty delta whose `epoch` equals its `base_epoch`. A manager
+  // that cannot apply a report (it has no state for the node after a
+  // restart or failover, or the epochs disagree after a lost reply) sets
+  // `HeartbeatReply.content_resync`, and the worker answers with a full set
+  // on its next heartbeat.
+  //
+  // Absent from workers that predate content locality. The manager treats
+  // such a node as holding nothing, so it scores 0 on locality.
+  optional ContentLocationReport content_locations = 14;
+}
+
+// Content locality. One heartbeat's content advertisement. See
+// `HeartbeatRequest.content_locations` for the protocol.
+message ContentLocationReport {
+  // The worker's content epoch after this report. A worker process starts
+  // at 0 and its first (full) report carries epoch 1. Each delta that
+  // changes something carries `base_epoch + 1`, and an unchanged probe
+  // carries `base_epoch`.
+  uint64 epoch = 1;
+
+  // The epoch this delta applies on top of. The manager applies the delta
+  // only when it holds exactly this epoch for the node. Ignored when `full`.
+  uint64 base_epoch = 2;
+
+  // True when `added` is the node's entire advertised set, replacing
+  // whatever the manager held. `removed` is empty on a full report.
+  bool full = 3;
+
+  // Content added since `base_epoch` (or the whole set when `full`). Only
+  // entries of at least 1 MiB are advertised: smaller content downloads in
+  // well under a heartbeat and is not worth steering placement for. The
+  // manager drops smaller entries a worker sends anyway.
+  repeated ContentLocation added = 4;
+
+  // Digests (`sha256:<hex>`) removed since `base_epoch`: evicted, expired,
+  // or dropped as corrupt.
+  repeated string removed = 5;
+
+  // The store's `snapshots` budget class and the free space on its disk,
+  // sent on every report whatever its epoch outcome, so the manager can show
+  // checkpoint headroom and keep new memory-checkpoint instances off a node
+  // with no room for their checkpoint (see `SnapshotBudget`).
+  optional SnapshotBudget snapshot_budget = 6;
+}
+
+// Content locality. One piece of content a node holds.
+message ContentLocation {
+  // Content digest, `sha256:<hex>`, as the node content store keys it. For
+  // a digest-pinned artifact this is the artifact's `checksum`.
+  string digest = 1;
+
+  // Size in bytes.
+  uint64 bytes = 2;
+}
+
+// One action the memory pressure response took on one allocation.
+message PressureAction {
+  // The allocation acted on.
+  int64 allocation_id = 1;
+
+  // Owning job, so the event names it without a lookup.
+  string job_id = 2;
+
+  // Which step acted: `reclaim` (asked the kernel to reclaim the
+  // allocation's memory above its reservation, or inflated a sandbox's
+  // balloon by that much, nothing stopped), `suspend` (checkpointed and
+  // stopped an instance whose task sets `suspend.onPressure = true`; the
+  // instance is `suspended` and resumes later), `evict-bursting` (stopped an
+  // allocation using more than its reservation), or `evict-reserved`
+  // (stopped an allocation within its reservation, only on nodes with
+  // `oversubscribe.memory` above 1).
+  string step = 3;
+
+  // Bytes the action freed: measured for `reclaim` (`memory.current` before
+  // minus after), and the allocation's `memory.current` for an eviction,
+  // which is what stopping it gives back.
+  uint64 freed_bytes = 4;
+
+  // The allocation's `memory.current` when the step chose it.
+  uint64 used_bytes = 5;
+
+  // The allocation's reservation (`resources.memory`) in bytes.
+  uint64 reserved_bytes = 6;
+
+  // Node `MemAvailable` when the step ran.
+  uint64 available_bytes = 7;
+
+  // The `minFree` threshold in force, in bytes.
+  uint64 min_free_bytes = 8;
+
+  // Node-wide PSI `some avg10` when the step ran, in percent. Zero when the
+  // kernel has no PSI.
+  double stall_percent = 9;
+
+  // The `maxStall` threshold in force, in percent.
+  double max_stall_percent = 10;
+
+  // One sentence naming the step and the numbers, e.g. "evicted by
+  // evict-bursting on w-03: using 1.9 GiB of a 400 MiB reservation while
+  // free memory was 1.1 GiB (threshold 2 GiB)". Shown as the event message.
+  string detail = 11;
+
+  // What the job author can change so it does not happen again. Empty for
+  // `reclaim`, which stops nothing.
+  string hint = 12;
+
+  // When the step ran, in Unix milliseconds.
+  int64 at_unix_ms = 13;
+
+  // `suspend` only: the checkpoint the worker minted. The same id arrives in
+  // `SnapshotReport.snapshot_id` with `local_suspension = true`, and becomes
+  // the instance's `checkpoint_id`.
+  string snapshot_id = 14;
+}
+
+// The state of one node's memory pressure response, as its worker reports it
+// with usage. Absent from workers that predate the response.
+message MemoryPressureStatus {
+  // Whether the response is on. On by default whenever
+  // `resourceEnforcement.enabled` is, unless the worker type sets
+  // `memoryPressure.enabled = false` or the node has no `/proc/meminfo` to
+  // watch (a non-Linux worker).
+  bool enabled = 1;
+
+  // Whether a trigger is firing right now: free memory below `minFree`,
+  // or stall above `maxStall`.
+  bool under_pressure = 2;
+
+  // `minFree` resolved for this node, in bytes. Default 5% of node memory,
+  // at least 256 MiB and at most 4 GiB.
+  uint64 min_free_bytes = 3;
+
+  // `maxStall` in percent. Default 10.
+  double max_stall_percent = 4;
+
+  // `settle` in seconds. Default 5.
+  uint64 settle_seconds = 5;
+
+  // The steps this node may take, in the order it takes them. `suspend` is
+  // accepted in config but takes no action yet, and `evict-reserved` is
+  // listed only when `oversubscribe.memory` is above 1, because it never
+  // runs otherwise.
+  repeated string steps = 6;
+}
+
+// One usage report: a point-in-time sample of a node and every allocation
+// the worker governs (see HeartbeatRequest.usage).
+message UsageReport {
+  // When the worker took the sample, in Unix milliseconds. Lets a reader
+  // tell a fresh report from one that is a few intervals old.
+  int64 sampled_at_unix_ms = 1;
+
+  // One entry per allocation running in a worker-owned cgroup: `exec`,
+  // `container`, and `sandbox` tasks on a worker with enforcement on.
+  // Allocations on ungoverned runtimes are absent.
+  repeated AllocationUsage allocations = 2;
+
+  // Node-wide memory as the kernel reports it. Absent when the worker could
+  // not read it (a non-Linux worker).
+  optional NodeMemoryUsage node_memory = 3;
+
+  // The node's memory pressure response: whether it is on, its thresholds,
+  // and whether it is acting now. Absent from workers that predate it.
+  optional MemoryPressureStatus pressure = 4;
+}
+
+// Measured usage of one allocation, read from its cgroup v2 files.
+//
+// Byte and microsecond counters are the kernel's own numbers. They count
+// everything in the allocation's cgroup: for a `sandbox` task that is the
+// VMM process, so guest memory the VMM has touched counts as used even if
+// the guest has since freed it.
+message AllocationUsage {
+  // The allocation measured.
+  int64 allocation_id = 1;
+
+  // `memory.current`: every byte charged to the cgroup right now, page
+  // cache included. This is what the cgroup's `memory.max` is compared to.
+  uint64 memory_current_bytes = 2;
+
+  // Highest `memory.current` seen since the allocation started. Read from
+  // `memory.peak` on kernels that have it (5.19 and later), otherwise the
+  // highest value this worker has sampled, which can miss short spikes
+  // between samples.
+  uint64 memory_peak_bytes = 3;
+
+  // `anon` from `memory.stat`: anonymous memory (heap, stack, guest RAM).
+  // Unlike page cache, the kernel cannot drop it without swap, so it is the
+  // part of `memory_current_bytes` that only stopping or checkpointing the
+  // task would give back.
+  uint64 memory_anon_bytes = 4;
+
+  // `usage_usec` from `cpu.stat`: total CPU time used since the cgroup was
+  // created, in microseconds. Monotonic; take differences between reports
+  // for a rate.
+  uint64 cpu_usage_usec = 5;
+
+  // Average CPU use over the last report interval, in thousandths of a CPU
+  // (1000 = one full core). Zero on the first report for an allocation,
+  // which has no previous sample to compare against.
+  uint64 cpu_millicores = 6;
+
+  // `some avg10` from the cgroup's `memory.pressure`: the percentage of the
+  // last 10 seconds in which at least one task in the allocation was stalled
+  // waiting on memory (0.0 to 100.0). Zero when the kernel has no PSI
+  // support.
+  double psi_memory_some_avg10 = 7;
+
+  // Unix seconds of the last observed activity: the most recent report
+  // interval in which the allocation used at least 1% of a CPU, moved
+  // traffic through the node datapath (connections it dialed, or ingress
+  // connections to its ports), or had an exec session open. Starts at the
+  // time the worker first measured the allocation, so a task that never does
+  // anything reports its first sample time.
+  int64 last_activity_unix = 8;
+
+  // This allocation's place in the node's pressure order: 1 is the first
+  // allocation the memory pressure response would act on if the node ran
+  // short right now, 2 the next, and so on. 0 when no step would ever act on
+  // it (within its reservation on a node without oversubscription, a
+  // `critical` task within its reservation, or node-pinned storage that is
+  // not bursting) or when the response is off. Computed by the worker from
+  // the same function that drives the response, on every report.
+  uint32 pressure_rank = 9;
+
+  // The steps that would act on this allocation, in the order they would
+  // run, e.g. ["reclaim", "evict-bursting"], or ["reclaim", "suspend"] for a
+  // task that sets `suspend.onPressure = true` (a suspended allocation is
+  // gone, so no later step reaches it). Empty when `pressure_rank` is 0.
+  repeated string pressure_steps = 10;
+
+  // Automatic suspend.
+
+  // Unix seconds since which the allocation has been quiet by the signals
+  // its task's `suspend.idle.signals` counts (`network`, `connections`,
+  // `cpu`, `exec`). 0 when the task has no idle policy. Starts at the first
+  // sample, so an allocation is never idle for longer than it has run. The
+  // manager's idle sweep suspends the instance once it is `idle_after_seconds`
+  // in the past.
+  int64 idle_since_unix = 11;
+
+  // The task's `suspend.idle.after` in seconds, carried from the allocation's
+  // own task config so the manager's sweep needs no store read. 0 when the
+  // task has no idle policy.
+  uint64 idle_after_seconds = 12;
+}
+
+// Node-wide memory, from the kernel's view of the whole machine rather than
+// any one cgroup.
+message NodeMemoryUsage {
+  // `MemTotal` from /proc/meminfo: physical memory the kernel manages.
+  uint64 total_bytes = 1;
+
+  // `MemAvailable` from /proc/meminfo: the kernel's estimate of memory that
+  // can be handed to new work without swapping, reclaimable cache included.
+  // The number to watch for "is this node running short".
+  uint64 available_bytes = 2;
+
+  // `some avg10` from /proc/pressure/memory: the percentage of the last 10
+  // seconds in which at least one task on the node was stalled waiting on
+  // memory (0.0 to 100.0).
+  double psi_some_avg10 = 3;
+
+  // Whether the kernel exposes pressure stall information. When false,
+  // `psi_some_avg10` is meaningless rather than zero.
+  bool psi_available = 4;
 }
 
 // One edge sample: an allocation talking to a service through its datapath
@@ -3224,6 +4902,24 @@ message HeartbeatReply {
   // keeps the last known good policy (fail-static). Empty on clusters with
   // no stored policy and no task declaring one — the zero-cost path.
   repeated AllocNetPolicy net_policies = 8;
+
+  // Checkpoint work for this node: snapshots to capture from a running
+  // allocation and snapshots to reclaim (see `CheckpointRequest`). Re-sent
+  // every heartbeat until the worker's `SnapshotReport` for it has been
+  // applied. Sent only to workers that advertised the `checkpoint`
+  // capability at registration.
+  //
+  // Default: empty list. Costs one indexed lookup per heartbeat.
+  repeated CheckpointRequest checkpoint_requests = 9;
+  // Content locality: true when this manager could not apply the heartbeat's
+  // `content_locations` report: it holds no state for the node (it just
+  // started or just became leader) or the report's `base_epoch` does not
+  // match what it holds. The worker sends a full content report on its next
+  // heartbeat. Until it lands, the node scores 0 on locality, which costs
+  // placement quality for one heartbeat and never correctness.
+  //
+  // Default: false. Never set for a heartbeat that carried no report.
+  bool content_resync = 10;
 }
 
 // Why one allocation is being stopped.
@@ -3250,6 +4946,8 @@ message StopNotice {
   //   (docs/preemption-and-eviction.md).
   // - `scale_in` — the task's count was lowered by `legion job scale` and
   //   this allocation was surplus.
+  // - `restore` — the allocation's instance is being rolled back to a
+  //   snapshot (RestoreInstance); a replacement restores from it.
   //
   // Workers treat an unrecognized value as `unknown` and stop the allocation
   // anyway, so the manager may add causes without a coordinated upgrade.
@@ -3442,7 +5140,10 @@ message AllocationHealth {
   // States progress `pending` -> `fetching` -> `verifying` -> `staged`,
   // or end in `failed`. Sources are redacted (no userinfo or query secrets)
   // and errors reference auth *sources* (KV path or identity name), never
-  // credential values.
+  // credential values. A row also carries `"cache":"hit"` when the artifact
+  // was staged from the node content store, or `"cache":"miss"` when it was
+  // fetched and stored there. `cache` is absent for artifacts the store
+  // cannot serve (no `checksum`, or a source that is not a single file).
   //
   // Unset when the task declares no artifacts.
   optional string artifact_states = 4;
@@ -3527,6 +5228,471 @@ message NodeMsg {
   // Additive: a client built before this field ignores it and sees exactly
   // today's `last_heartbeat`. See docs/node-liveness.md.
   string heartbeat_source = 10;
+}
+
+// Request payload for GetNodeUsage.
+message GetNodeUsageRequest {
+  // The node to report on.
+  string node_id = 1;
+}
+
+// Reply payload for GetNodeUsage: one node's capacity, reservations, and
+// measured usage.
+//
+// How the node responds to memory pressure lives on `memory` (its
+// oversubscription ratio and response status) and on each
+// `NodeAllocationUsage` (its place in the pressure order), not in a separate
+// list.
+message GetNodeUsageReply {
+  // The node reported on.
+  string node_id = 1;
+
+  // Node status (`ready`, `lost`, ...), as in GetNode.
+  string status = 2;
+
+  // Whether this manager holds a usage report for the node. False when the
+  // node's worker has enforcement off, predates usage reporting, has not
+  // reported since this manager started, or sends its heartbeats to another
+  // manager. Capacity and reservations are filled in either way.
+  bool usage_reported = 3;
+
+  // When the worker took the sample behind this reply, in Unix
+  // milliseconds. Zero when `usage_reported` is false.
+  int64 sampled_at_unix_ms = 4;
+
+  // Seconds between the sample and this reply. Reports arrive every 10
+  // seconds, so a value well above that means the node stopped reporting.
+  int64 report_age_seconds = 5;
+
+  // Memory: capacity, reservations, use, and pressure.
+  NodeResourceUsage memory = 6;
+
+  // CPU: capacity, reservations, and use.
+  NodeResourceUsage cpu = 7;
+
+  // One entry per allocation the scheduler has placed on the node, ordered
+  // by allocation id.
+  repeated NodeAllocationUsage allocations = 8;
+
+  // Capacity for resumes: suspended instances whose checkpoint is on this
+  // node, what they keep charged, and the node's `snapshots` content budget
+  // their checkpoints fill.
+  SuspendedCapacity suspended = 9;
+}
+
+// Suspended instances on one node, as `legion node usage` prints
+// them: "suspended: 3 instances, 768 MiB held". A suspended instance counts
+// here when its checkpoint is local to this node (captured here and not
+// published), or when it holds capacity here. A published checkpoint
+// (`suspend.durability = "store"`) belongs to no node: its parts live in the
+// `contentStore`, and the copy on the node that captured it is an ordinary
+// cache entry (see docs/suspend-and-resume.md, "Capacity for resumes").
+message SuspendedCapacity {
+  // Suspended instances whose checkpoint is local to this node, plus any
+  // others that hold capacity here.
+  uint32 instances = 1;
+
+  // Of those, how many keep a charge on the node (a held allocation row,
+  // from the job's `suspend.reserve`). Their
+  // rows also appear in `GetNodeUsageReply.allocations` with
+  // `suspended = true`, and their held amounts are already part of the
+  // reply's `memory.reserved` and `cpu.reserved`.
+  uint32 holding = 2;
+
+  // Memory (MiB) the holding instances keep charged.
+  double held_memory_mib = 3;
+
+  // CPU (MHz) the holding instances keep charged.
+  double held_cpu_mhz = 4;
+
+  // Bytes of the local (unpublished) checkpoints counted in `instances`,
+  // from the manager's snapshot records. Memory checkpoints are stored in
+  // the node's content store under the `snapshots` budget, pinned. Disk
+  // checkpoints of node-local volumes are retained in place and report 0.
+  uint64 checkpoint_bytes = 5;
+
+  // The node's `snapshots` content budget and content-disk free space as
+  // its worker last reported them. Unset when the worker has no content
+  // store or no heartbeat has reached this manager since it started.
+  optional SnapshotBudget snapshot_budget = 6;
+}
+
+// A node content store's `snapshots` budget class
+// (`content.budgets.snapshots`), which holds memory checkpoints, and the
+// disk it lives on. Workers report it on every heartbeat with a content
+// report.
+//
+// The room a new checkpoint can use on the node, which the scheduler checks
+// before placing a new instance of a task that suspends to memory, is the
+// smaller of two numbers:
+//
+// - the budget's room: `budget_bytes - pinned_bytes`, since unpinned
+//   checkpoint parts are evicted to make room within the budget;
+// - the disk's room: `disk_free_bytes + reclaimable_bytes -
+//   min_free_disk_bytes`, since the store evicts unpinned content of any
+//   class before it lets the disk drop below `content.minFreeDisk`, and
+//   refuses the write after that.
+//
+// When that room is smaller than a task's expected checkpoint, the scheduler
+// does not place new instances of the task on the node. Without
+// `disk_free_bytes` only the budget is checked.
+message SnapshotBudget {
+  // The budget in bytes, as the worker sized it at start. A share budget
+  // (`"20%"`, and the default) is already resolved against the size of the
+  // filesystem holding the store.
+  uint64 budget_bytes = 1;
+
+  // Bytes the class holds now.
+  uint64 used_bytes = 2;
+
+  // Bytes of the class pinned by a live owner: the checkpoint of a
+  // suspended instance or a snapshot that has not been published.
+  // Published checkpoints are not pinned on their node (their parts live in
+  // the `contentStore`), so their bytes count in `used_bytes` but not here.
+  // Pinned content is never evicted.
+  uint64 pinned_bytes = 3;
+
+  // Free bytes on the filesystem holding the node content store, as
+  // available to an unprivileged process (`statvfs` `f_bavail`), read when
+  // the report was built. Unset when the platform cannot say, and then only
+  // the budget limits placement.
+  optional uint64 disk_free_bytes = 4;
+
+  // The worker's `content.minFreeDisk` in bytes: the free space the store
+  // keeps on that filesystem. 0 when the floor is off.
+  uint64 min_free_disk_bytes = 5;
+
+  // Bytes of unpinned content in the store, across every class (cached
+  // artifacts, published or fetched checkpoint parts). The store evicts
+  // them before it lets the disk drop below `min_free_disk_bytes`, so they
+  // count as room on the disk. An evicted blob that a running task still
+  // holds open (a hard link into a restored allocation) frees no space, so
+  // this can overstate the room slightly.
+  uint64 reclaimable_bytes = 6;
+}
+
+// One resource on one node. Memory is in MiB and bytes, CPU in MHz, matching
+// how jobs declare them.
+message NodeResourceUsage {
+  // Schedulable capacity: the node's fingerprinted amount minus its
+  // worker-type `reservedResources`. MiB for memory, MHz for CPU.
+  double capacity = 1;
+
+  // Sum of the reservations of every allocation placed on the node, in the
+  // same unit as `capacity`. This is what the scheduler packs against.
+  double reserved = 2;
+
+  // Measured use, in the same unit as `capacity`: the sum of
+  // `memory_current_bytes` (memory) or `cpu_millicores` converted to MHz at
+  // the node's MHz-per-core (CPU) over governed allocations. Zero when no
+  // usage has been reported. Allocations on ungoverned runtimes are not
+  // counted, so this can understate a mixed node.
+  double used = 3;
+
+  // Memory only: physical memory (`MemTotal`) in bytes, before
+  // `reservedResources`. Zero for CPU, or when not reported.
+  uint64 physical_bytes = 4;
+
+  // Memory only: `MemAvailable` in bytes. Zero for CPU, or when not
+  // reported.
+  uint64 available_bytes = 5;
+
+  // Memory only: node-wide PSI `some avg10`, in percent. Zero for CPU, or
+  // when not reported.
+  double pressure_some_avg10 = 6;
+
+  // Memory only: whether `pressure_some_avg10` was measured.
+  bool pressure_available = 7;
+
+  // The node's oversubscription ratio for this resource
+  // (`resourceEnforcement.oversubscribe.memory` / `.cpu` on its worker
+  // type), 1.0 when off. Already folded into `capacity`: physical capacity
+  // after `reservedResources` is `capacity / oversubscribe_ratio`.
+  double oversubscribe_ratio = 8;
+
+  // Memory only: the node's memory pressure response, from its latest usage
+  // report. Absent for CPU, for unreported nodes, and from workers that
+  // predate the response.
+  optional MemoryPressureStatus pressure_response = 9;
+
+  // CPU only: the node's fingerprinted core count, 0 when unknown. Set even
+  // when the platform reports no usable clock speed (Apple Silicon), where
+  // `capacity` in MHz is 0 and cores are the only honest figure.
+  double cores = 10;
+
+  // CPU only: measured use in thousandths of a core, summed over governed
+  // allocations (1000 = one full core). Unlike `used`, this needs no
+  // MHz-per-core figure, so it is filled on nodes that report no clock
+  // speed. Zero when no usage has been reported.
+  uint64 used_millicores = 11;
+}
+
+// One allocation on a node, with its reservation and measured usage.
+message NodeAllocationUsage {
+  // The allocation.
+  int64 allocation_id = 1;
+
+  // Owning job.
+  string job_id = 2;
+
+  // The stateful instance the allocation fulfills, when there is one.
+  optional string instance_id = 3;
+
+  // Reserved memory, in MiB: the task's `resources.memory` after defaults.
+  double reserved_memory_mib = 4;
+
+  // Reserved CPU, in MHz: the task's `resources.cpu` after defaults.
+  double reserved_cpu_mhz = 5;
+
+  // The latest measured usage, when the node reported it for this
+  // allocation. Absent for ungoverned runtimes and unreported nodes.
+  optional AllocationUsage usage = 6;
+
+  // Seconds since `usage.last_activity_unix`, measured at the sample time.
+  // Zero when the allocation was active in the last report interval, or when
+  // there is no usage.
+  int64 idle_seconds = 7;
+
+  // The burst ceiling, in MiB: the task's `resources.memoryMax`. Zero when
+  // the task sets none, which means the reservation is the limit.
+  double memory_max_mib = 8;
+
+  // The owning job's priority band (`critical` .. `background`). The
+  // pressure order acts on lower bands first.
+  string band = 9;
+
+  // The allocation's place in the node's pressure order, copied from
+  // `usage.pressure_rank`: 1 is acted on first. 0 when nothing would act on
+  // it, or when the node reported no order. Backs the "UNDER PRESSURE, IN
+  // ORDER" table of `legion node usage`.
+  uint32 pressure_rank = 10;
+
+  // The steps that would act on it, in order, copied from
+  // `usage.pressure_steps`.
+  repeated string pressure_steps = 11;
+
+  // True when this row is a suspended instance's held charge (status
+  // `suspended`), not running work. Its `reserved_*` figures are the held
+  // share, and it has no `usage`.
+  bool suspended = 12;
+}
+
+// Request payload for ListNodeUsage.
+message ListNodeUsageRequest {
+  // The nodes to report on. Empty means every registered node (up to 500,
+  // ordered by node id). At most 500 ids. Unknown ids, and nodes in pools
+  // the caller cannot read, are left out of the reply.
+  repeated string node_ids = 1;
+
+  // Also fill each entry's per-allocation rows (`allocations`). Default
+  // false: fleet views need the per-node totals only.
+  bool include_allocations = 2;
+}
+
+// Reply payload for ListNodeUsage.
+message ListNodeUsageReply {
+  // One GetNodeUsage reply per node, in the order of `node_ids` (or by node
+  // id when it was empty). `allocations` is empty unless
+  // `include_allocations` was set; the totals in `memory` and `cpu` always
+  // count every allocation.
+  repeated GetNodeUsageReply nodes = 1;
+
+  // True when `node_ids` was empty and the fleet has more than 500 nodes, so
+  // the reply stops at the first 500 by node id. Ask for the rest by id.
+  bool truncated = 2;
+}
+
+// Request payload for GetNodeContent.
+message GetNodeContentRequest {
+  // The node to report on.
+  string node_id = 1;
+}
+
+// Reply payload for GetNodeContent: what one node holds, as this manager's
+// content location index and snapshot table know it.
+message GetNodeContentReply {
+  // The node reported on.
+  string node_id = 1;
+
+  // Whether this manager holds a content report for the node. False when the
+  // node's worker has no content store, predates content reports, has not
+  // reported since this manager started (the next heartbeat asks it for a
+  // full report), or sends its heartbeats to another manager. `entries` is
+  // empty when false, and the scheduler scores the node 0 on locality.
+  bool index_reported = 2;
+
+  // The worker's content epoch this manager last applied. It moves by one
+  // every time the node's advertised set changes. 0 when not reported.
+  uint64 epoch = 3;
+
+  // Every piece of content the node advertises, largest first. Only entries
+  // of at least 1 MiB are advertised.
+  repeated NodeContentEntry entries = 4;
+
+  // Sum of `entries[].bytes`.
+  uint64 advertised_bytes = 5;
+
+  // Whether the node's worker can publish snapshots to a shared store (it
+  // advertises the `content-publish` capability, because its worker type
+  // sets `contentStore { url }`). Without it, a `durability = "store"`
+  // suspend, a spread fork, or `snapshot create --publish` refuses this
+  // node.
+  bool can_publish = 6;
+
+  // Whether the node's worker can capture snapshots at all (the
+  // `checkpoint` capability).
+  bool can_checkpoint = 7;
+
+  // Snapshots related to this node, newest first: every snapshot captured
+  // here that still exists (any state but `lost`), plus every `published`
+  // snapshot captured elsewhere that this node holds at least one part of
+  // (fetched for a restore or a fork, or warmed by WarmSnapshot). Rows on
+  // jobs the caller has no `snapshot:read` on are left out.
+  repeated NodeSnapshotContent snapshots = 8;
+}
+
+// One piece of content a node advertises.
+message NodeContentEntry {
+  // Content digest, `sha256:<hex>`.
+  string digest = 1;
+
+  // Size in bytes.
+  uint64 bytes = 2;
+
+  // The snapshot this digest is a part of, when it is a memory part of a
+  // snapshot this manager knows (and the caller may read). Empty for
+  // artifacts and for parts of snapshots that no longer exist.
+  string snapshot_id = 3;
+
+  // The part's role in that snapshot (`memory`, `vm-state`, `rootfs`, ...).
+  // Empty when `snapshot_id` is.
+  string role = 4;
+
+  // How many nodes in the index advertise this digest, this one included.
+  uint32 holders = 5;
+}
+
+// One snapshot, as it relates to one node.
+message NodeSnapshotContent {
+  // The snapshot (as ListSnapshots returns it: no manifest).
+  SnapshotInfo snapshot = 1;
+
+  // True when this node captured the snapshot (`snapshot.node_id`). A
+  // `local` snapshot lives only on its capturing node.
+  bool captured_here = 2;
+
+  // How many of the snapshot's memory parts this node advertises right now.
+  // A disk snapshot has no memory parts (its volume copy lives in the volume
+  // driver, not the content store), so both counts are 0.
+  uint32 parts_here = 3;
+
+  // How many memory parts the snapshot has.
+  uint32 parts_total = 4;
+
+  // Bytes of those parts this node holds.
+  uint64 bytes_here = 5;
+}
+
+// One node holding a snapshot's parts (SnapshotInfo.holders).
+message SnapshotHolder {
+  // The node.
+  string node_id = 1;
+
+  // How many of the snapshot's memory parts the node advertises.
+  uint32 parts_here = 2;
+
+  // How many memory parts the snapshot has.
+  uint32 parts_total = 3;
+
+  // Bytes of those parts the node holds.
+  uint64 bytes_here = 4;
+
+  // True for the node that captured the snapshot.
+  bool captured_here = 5;
+}
+
+// Why an instance's last allocation stopped (InstanceInfo.last_stop).
+message InstanceStop {
+  // The stop cause, in the vocabulary of stop notices
+  // (docs/graceful-stop.md): `stop`, `update`, `drain`, `reschedule`,
+  // `destroy`, `node_lost`, `scale_in`, `preempted`, `node_pressure`,
+  // `restore`, `suspended`.
+  string cause = 1;
+
+  // A sentence saying what happened. For `node_pressure` this is the
+  // worker's own detail sentence, with the step and the numbers (the same
+  // text as the `node.pressure` event). Otherwise a sentence built from the
+  // cause.
+  string detail = 2;
+
+  // What the reader can change, when there is something: for
+  // `node_pressure`, the worker's hint (for example "raise
+  // resources.memory toward real usage"). Empty otherwise.
+  string hint = 3;
+
+  // RFC 3339 time the manager recorded the stop.
+  string at = 4;
+
+  // The allocation that stopped.
+  int64 allocation_id = 5;
+
+  // The node it ran on.
+  string node_id = 6;
+
+  // For `preempted`: the job that took the capacity.
+  string preemptor_job = 7;
+}
+
+// Which checkpoints a running instance can take right now
+// (InstanceInfo.checkpoint_support), computed by the manager with the same
+// checks CreateSnapshot, SuspendInstance, and ForkInstance apply, including
+// what the job spec cannot show: the node's worker version and VMM, its
+// volume driver's ops, and a stored network policy that gates the task.
+// Each `*_blocker` is the FailedPrecondition message that RPC would return
+// (with its `Hint:` line), so a client can show it without calling. The
+// checks are the ones that depend on the instance, its node, and its task;
+// ACLs are not part of it.
+message CheckpointSupport {
+  // CreateSnapshot `kind = memory` would be accepted.
+  bool snapshot_memory = 1;
+  string snapshot_memory_blocker = 2;
+
+  // CreateSnapshot `kind = disk` would be accepted.
+  bool snapshot_disk = 3;
+  string snapshot_disk_blocker = 4;
+
+  // SuspendInstance `checkpoint = memory` would be accepted. A disk suspend
+  // leaves the volume in place and needs nothing beyond a keyed instance on
+  // a worker that can checkpoint, so it has no field of its own: see
+  // `suspend_default`.
+  bool suspend_memory = 5;
+  string suspend_memory_blocker = 6;
+
+  // The kind SuspendInstance takes with no `checkpoint`: the task's
+  // `suspend.checkpoint`, else memory when possible, else disk. Empty when
+  // the instance cannot be suspended at all (slot mode, or a worker without
+  // the `checkpoint` capability); `suspend_blocker` says why.
+  string suspend_default = 7;
+  string suspend_blocker = 8;
+
+  // ForkInstance `checkpoint = memory` would be accepted.
+  bool fork_memory = 9;
+  string fork_memory_blocker = 10;
+
+  // ForkInstance `checkpoint = disk` would be accepted.
+  bool fork_disk = 11;
+  string fork_disk_blocker = 12;
+
+  // ForkInstance `spread = true` would be accepted: a memory fork whose
+  // checkpoint can be published (no node-local volume, and a worker with a
+  // `contentStore`).
+  bool spread = 13;
+  string spread_blocker = 14;
+
+  // CreateSnapshot `publish = true` with a memory snapshot would be
+  // accepted.
+  bool publish = 15;
+  string publish_blocker = 16;
 }
 
 // Request payload for GetHeartbeatCadence. No parameters: the report is
@@ -3788,6 +5954,118 @@ message GetManagerConfigsReply {
 
   // Page size used to produce this reply.
   uint32 page_size = 4;
+}
+
+// Request payload for GetSchedulerConcurrency. No parameters: the controller
+// is per-manager and global, so there is nothing to scope the question to.
+message GetSchedulerConcurrencyRequest {}
+
+// Reply payload for GetSchedulerConcurrency — one manager's view of how much
+// planning it is admitting, and why.
+//
+// The controller measures its own plan-apply conflict rate and tunes how many
+// evals it will PLAN at once between `floor` and `ceiling` (AIMD: halve on
+// congestion, add one back after calm). The arithmetic behind every field is
+// published in docs/adaptive-scheduler-concurrency.md.
+message GetSchedulerConcurrencyReply {
+  // The controller's mode, as configured in
+  // `schedulerSettings.adaptiveConcurrency.mode`:
+  // - `enforce` — measure and actuate.
+  // - `observe` — measure and publish what it WOULD do, actuate nothing.
+  //   The default.
+  // - `off` — the controller does not run; `evalThreads` is the fixed planner
+  //   count, exactly as before this feature existed. Every numeric field below
+  //   is zero in this mode.
+  string mode = 1;
+
+  // Planners currently admitted. In `observe` mode this is the SHADOW limit —
+  // what the controller would be enforcing — which is what makes observe mode
+  // useful on its own.
+  uint32 limit = 2;
+
+  // Lower bound on `limit` (`adaptiveConcurrency.min`, 1 by default). Never 0:
+  // a floor of 0 is a stuck scheduler, not a throttled one.
+  uint32 floor = 3;
+
+  // Upper bound on `limit`. `adaptiveConcurrency.max` if set, otherwise
+  // `evalThreads`, and never above `evalThreads`.
+  uint32 ceiling = 4;
+
+  // The manager's configured `evalThreads`: the size of the worker pool, and
+  // the ceiling the controller works under. The controller never admits more
+  // planners than this and, in `enforce`, backs off below it on evidence.
+  uint32 eval_threads = 5;
+
+  // Admission permits held right now — eval workers currently inside a
+  // planning eval. 0 when the controller is off, which never consults the gate.
+  uint32 in_flight = 6;
+
+  // What the controller is doing:
+  // - `steady` — running at the ceiling; nothing is held back.
+  // - `throttled` — below the ceiling, and conflicts have not yet subsided.
+  // - `probing` — below the ceiling and accumulating calm ticks toward an
+  //   increase.
+  // - `saturated` — backing off did NOT improve goodput, so the conflicts are
+  //   capacity-driven rather than concurrency-driven. The remedy is nodes, not
+  //   patience, and the controller has stopped applying an actuator that
+  //   cannot help.
+  string state = 7;
+
+  // How long the controller has been in `state`, in seconds.
+  uint32 seconds_in_state = 8;
+
+  // Smoothed plan rejection rate, 0.0 to 1.0:
+  // `rejected / (applied + fallback + rejected)`. Plans that bound but slid
+  // down a candidate list count as PROGRESS, not as conflict — that is the
+  // point of late binding, and throttling to avoid absorbed races would be
+  // throttling to avoid the feature working.
+  double conflict_rate = 9;
+
+  // Smoothed fraction of plans that bound at a lower-ranked candidate: races
+  // ABSORBED by late binding. Reported for diagnosis and never fed into the
+  // controller's decision.
+  double fallback_rate = 10;
+
+  // Smoothed plans that actually placed, per second. This — not the conflict
+  // rate — is the objective; the conflict rate is only its fast leading
+  // indicator, and every decrease is verified against this before it is kept.
+  double goodput = 11;
+
+  // Raw plan outcomes in the most recent 500ms window, so the percentages
+  // above can be checked by hand.
+  uint32 window_applied = 12;
+  uint32 window_fallback = 13;
+  uint32 window_rejected = 14;
+
+  // The last limit change: `increase`, `decrease`, or `revert` (a decrease
+  // undone because it did not improve goodput). Empty if the controller has
+  // not moved the limit yet.
+  string last_adjustment_direction = 15;
+
+  // The limit before and after that change.
+  uint32 last_adjustment_from = 16;
+  uint32 last_adjustment_to = 17;
+
+  // How long ago it happened, in seconds.
+  uint32 last_adjustment_seconds_ago = 18;
+
+  // Relative change in goodput since that adjustment, as a fraction (0.18 =
+  // +18%). This is what says whether backing off actually bought anything.
+  double last_adjustment_goodput_delta = 19;
+
+  // Times a throttled worker claimed a non-planning eval (today: `job_stop`)
+  // instead of the queue head. This counts the one deviation from strict
+  // priority order the admission gate introduces: it is a cross-class
+  // inversion only, never within a class, and it exists so an operator's
+  // `job stop` during an incident does not queue behind the storm it is
+  // trying to end.
+  uint64 admission_skips = 20;
+
+  // Whether the manager that answered leads the scheduler lane, and therefore
+  // does the planning (always true outside raft mode and in `single`
+  // topology). When false, every number above is zero: a manager that does no
+  // planning reports nothing rather than guessing.
+  bool is_scheduler_lane_leader = 21;
 }
 
 // Request payload for GetObservability.
@@ -4102,16 +6380,22 @@ message GetStateBackupReply {
 // manager that answers.
 message GetKeyringStatusRequest {}
 
-// One data key in the KV keyring (see GetKeyringStatusReply).
+// One key in the KV keyring (see GetKeyringStatusReply): a data key, or
+// the checkpoint key.
 message KeyringKeyInfo {
-  // Data key id (`dk_…`). Values reference it in `kv_entry.enc_key_id`.
+  // Data key id (`dk_…`), which values reference in `kv_entry.enc_key_id`,
+  // or checkpoint key id (`ck_…`), which published checkpoint manifests
+  // reference as each part's `keyId`.
   string key_id = 1;
 
-  // `active` (encrypts new writes) or `retired` (still decrypts what it
-  // protected until the rewrap converts those values).
+  // `active` (encrypts new writes), `retired` (still decrypts what it
+  // protected until the rewrap converts those values), or `checkpoint` (the
+  // key published checkpoint parts are sealed under; it never seals a KV
+  // value, never rotates with the data keys, and is never collected).
   string state = 2;
 
-  // Cipher this key is used with (`aes-256-gcm`).
+  // `aes-256-gcm` for a data key, `hkdf-sha256` for the checkpoint key
+  // (each part's AES-256-GCM key is derived from it).
   string algorithm = 3;
 
   // Unix seconds the key was created.
@@ -5634,6 +7918,48 @@ message TaskAllocation {
   // reads `mode` and `labels` from it; the rules themselves arrive merged
   // with stored policies via `HeartbeatReply.net_policies`.
   string task_network = 20;
+
+  // The owning job config's priority band (`critical`, `high`, `elevated`,
+  // `normal`, `low`, `background`). The worker's memory pressure response
+  // orders its candidates by band, lowest first
+  // (docs/resource-enforcement.md, "Memory pressure"). Empty from a manager
+  // that predates the field, which the worker reads as `normal`.
+  string priority_band = 21;
+  // Start this allocation from a snapshot instead of booting it. Set while
+  // the allocation's instance is restoring (RestoreInstance), and cleared by
+  // the manager once the worker reports the restore's outcome in
+  // `HeartbeatRequest.snapshot_reports`.
+  //
+  // Absent for every ordinary allocation.
+  optional SnapshotRestore restore = 22;
+
+  // The task's `suspend` block as JSON (docs/suspend-and-resume.md). The
+  // worker reads its idle policy (`suspend.idle`) to report idle-since with
+  // usage, `suspend.onPressure` to let its memory pressure response suspend
+  // the instance, and whether it asks for memory checkpoints, which decides
+  // how a sandbox launches (an identity disk, device links, a VMM API
+  // socket). Empty when the task declares no `suspend`, so jobs without one
+  // stay byte-identical on the wire. A worker that predates the field
+  // ignores it, and a manager that predates it leaves it empty: such a node
+  // reports no idle time and launches no sandbox ready for checkpoints.
+  string task_suspend = 23;
+  // The task's `snapshots` block as JSON (docs/suspend-and-resume.md,
+  // "Snapshots"). A sandbox that opts into memory snapshots launches ready
+  // for them. Empty when the task declares no `snapshots`.
+  string task_snapshots = 24;
+
+  // The allocation's instance's identity epoch (docs/workload-identity.md,
+  // "Forks and snapshots"). The manager moves an instance to a new epoch
+  // when a fork or snapshot of it is captured, and from then on refuses its
+  // workload-identity tokens from earlier epochs, since copies of them sit
+  // in the checkpoint. A worker that sees this value rise re-issues the
+  // allocation's tokens at once, rather than at its next refresh, so the
+  // running instance holds a current token again within a heartbeat.
+  //
+  // 0 for an allocation without an instance, and for an instance never
+  // forked or snapshotted. A worker that predates the field ignores it and
+  // refreshes on its normal schedule.
+  uint64 identity_epoch = 25;
 }
 
 // Request payload for PostWork.

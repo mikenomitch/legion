@@ -51,7 +51,6 @@ import Rollouts from './pages/Rollouts'
 import Services from './pages/Services'
 import Network from './pages/Network'
 import Volumes from './pages/Volumes'
-import TestingUtils from './pages/TestingUtils'
 import Raft from './pages/Raft'
 import Templates from './pages/Templates'
 import TemplateDetail from './pages/details/TemplateDetail'
@@ -62,6 +61,8 @@ import TemplateDetail from './pages/details/TemplateDetail'
 const ApiExplorer = lazyPage(() => import('./pages/ApiExplorer'))
 const StateExplorer = lazyPage(() => import('./pages/StateExplorer'))
 const Observability = lazyPage(() => import('./pages/Observability'))
+// Component fixtures: unlisted, and kept out of the main bundle.
+const TestingUtils = lazyPage(() => import('./pages/TestingUtils'))
 
 type SidebarItem = {
   kind: 'item'
@@ -261,7 +262,7 @@ const Layout = (props: RouteSectionProps) => {
           { kind: 'item', label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Every job on the cluster and its health.', icon: 'layers' },
           { kind: 'item', label: 'Templates', path: '/templates', title: 'Templates', copy: 'Reusable job templates with guided parameters.', icon: 'layoutTemplate' },
           { kind: 'item', label: 'Services', path: '/services', title: 'Services', copy: 'Discoverable endpoints and their health.', icon: 'radio' },
-          { kind: 'item', label: 'Network', path: '/network', title: 'Network', copy: 'Egress and ingress policy, upstreams, and handlers.', icon: 'shieldCheck' },
+          { kind: 'item', label: 'Network', path: '/network', title: 'Network', copy: 'Who calls whom on the datapath, and the egress and ingress policy that decides it.', icon: 'shieldCheck' },
           { kind: 'item', label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Version rollouts and their progress.', icon: 'rocket' },
           { kind: 'item', label: 'Volumes', path: '/volumes', title: 'Volumes', copy: 'Persistent storage behind stateful tasks.', icon: 'hardDrive' },
         ],
@@ -549,7 +550,7 @@ const Layout = (props: RouteSectionProps) => {
       return
     }
     if (commandPaletteOpen()) {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+      if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'k') {
         event.preventDefault()
         closeCommandPalette()
         return
@@ -580,7 +581,9 @@ const Layout = (props: RouteSectionProps) => {
       return
     }
 
-    if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'k') return
+    // Plain ⌘K only: ⌘⇧K is the Workers jump chord (sidebar items carry Shift),
+    // and matching it here opened the palette, which then swallowed the jump.
+    if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.key.toLowerCase() !== 'k') return
 
     event.preventDefault()
     setShortcutsOpen(false)
@@ -768,6 +771,10 @@ const Layout = (props: RouteSectionProps) => {
     return !isKnownSection(segments[0])
   }
 
+  // Unlisted pages that render their own PageHeader (the /testing fixtures);
+  // the generic header would name the first nav item instead.
+  const isUnlistedPage = () => location.pathname.replace(/\/+$/, '') === '/testing'
+
   const NavLink = (itemProps: { item: SidebarItem }) => (
     <A
       href={itemProps.item.path}
@@ -847,7 +854,9 @@ const Layout = (props: RouteSectionProps) => {
               <Icon name="x" size={16} />
             </button>
           </div>
-          <nav class={cx('flex-1 space-y-4 overflow-y-auto pb-4', isNavCollapsed() ? 'px-2' : 'px-2.5')}>
+          {/* pt-1: the focus ring draws 3px outside a link, and this scroll box
+              would otherwise clip it off the top of the first item. */}
+          <nav class={cx('flex-1 space-y-4 overflow-y-auto pb-4 pt-1', isNavCollapsed() ? 'px-2' : 'px-2.5')}>
             <For each={navItems()}>
               {(entry) => (
                 <Show
@@ -1109,7 +1118,7 @@ const Layout = (props: RouteSectionProps) => {
             </div>
           </Show>
           <main class="flex-1 min-w-0 px-4 py-6 md:px-8">
-            <Show when={!isDetailRoute() && !isUnknownRoute()}>
+            <Show when={!isDetailRoute() && !isUnknownRoute() && !isUnlistedPage()}>
               <PageHeader title={pageMeta().title} subtitle={pageMeta().subtitle} />
             </Show>
             <ConnectionGate>

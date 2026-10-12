@@ -19,6 +19,7 @@
 //! §3.1 / network-handlers-plan §7.8): policy in, telemetry out, capture
 //! setup and teardown. Nothing here reaches into the heartbeat loop.
 
+pub mod activity;
 pub mod dns;
 pub mod graph;
 pub mod guest_agent;

@@ -100,6 +100,12 @@ pub struct ResourceAssignment {
     /// mirroring the macOS guest-sizing rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit_bytes: Option<u64>,
+    /// Protected memory in bytes (`memory.low`), from declared `memory`: the
+    /// reservation. Differs from `memory_limit_bytes` only when the task
+    /// declares a larger `memoryMax`. `None` on assignments persisted before
+    /// this field existed, and when the task declared no memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_low_bytes: Option<u64>,
 }
 
 impl ResourceAssignment {
@@ -112,7 +118,10 @@ impl ResourceAssignment {
     /// lives in the hierarchy, so reserved cores are off-limits to it and its
     /// process tree is reapable) but carries no limits of its own.
     pub fn is_unlimited(&self) -> bool {
-        self.cores.is_none() && self.cpu_weight.is_none() && self.memory_limit_bytes.is_none()
+        self.cores.is_none()
+            && self.cpu_weight.is_none()
+            && self.memory_limit_bytes.is_none()
+            && self.memory_low_bytes.is_none()
     }
 }
 
@@ -174,6 +183,7 @@ mod tests {
             cores: Some(vec![3, 7]),
             cpu_weight: None,
             memory_limit_bytes: Some(268_435_456),
+            memory_low_bytes: None,
         };
         let encoded = serde_json::to_string(&assignment)?;
         assert_eq!(
@@ -199,6 +209,7 @@ mod tests {
             cores: None,
             cpu_weight: None,
             memory_limit_bytes: None,
+            memory_low_bytes: None,
         };
         assert!(assignment.is_unlimited());
         assert_eq!(Slice::Share.dir_name(), "share");

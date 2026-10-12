@@ -7,6 +7,11 @@ import { debounced } from '../utils/debounce'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
 import type { Tone } from '../utils/status'
 
+/** Data keys only: the keyring also lists the checkpoint key, which seals published checkpoints. */
+function dataKeyCount(keys: { state: string }[]): number {
+  return keys.filter((key) => key.state !== 'checkpoint').length
+}
+
 /** Tone for a keyring state (docs/kv-encryption.md): locked is the one that pages someone. */
 function keyringTone(state?: string): Tone {
   switch (state) {
@@ -54,8 +59,10 @@ function KeyringCard() {
               <span class="font-mono">{s().rootKeyId || '(no key material)'}</span> at <span class="font-mono">{s().rootKeyLocation}</span>
             </p>
             <p>
-              {Number(s().encryptedRows)} encrypted, {Number(s().plaintextRows)} plaintext · {s().keys.length} data key
-              {s().keys.length === 1 ? '' : 's'} · rotates every {s().dataKeyRotationAge}
+              {Number(s().encryptedRows)} encrypted, {Number(s().plaintextRows)} plaintext · {dataKeyCount(s().keys)} data key
+              {dataKeyCount(s().keys) === 1 ? '' : 's'} · rotates every {s().dataKeyRotationAge}
+              {/* The checkpoint key seals published checkpoints, not KV values. */}
+              <Show when={s().keys.some((key) => key.state === 'checkpoint')}> · checkpoint key</Show>
               <Show when={s().rewrap?.running}> · rewrap running ({Number(s().rewrap!.pending)} pending)</Show>
             </p>
             <Show when={s().hint}>

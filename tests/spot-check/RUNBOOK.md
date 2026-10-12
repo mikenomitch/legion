@@ -274,7 +274,6 @@ macOS sandbox VM.
 - Run `02-exec.ncl` without `count=1` once to see P1-2: two replicas on one
   static port wedge the scheduler, and the job says `done` with nothing
   running. `legion job scale hello-exec --task web --count 1` recovers it.
-- The macOS sandbox only starts with the P1-6 shim.
 - Apple `container` needs at least 200 MiB per task (P2-6).
 - Also try the README quickstart in an empty directory outside the repo.
   It fails today (P2-1).

@@ -55,7 +55,7 @@ export function ServiceGraphSvg(props: { edges: ServiceEdge[]; selected?: string
       const caller = edge.callerJob
       if (!services.has(caller)) callers.add(caller)
     }
-    const width = 720
+    const width = 880
     const rowH = 34
     const rows = Math.max(services.size, callers.size, 1)
     const height = Math.max(120, rows * rowH + 40)
@@ -74,7 +74,13 @@ export function ServiceGraphSvg(props: { edges: ServiceEdge[]; selected?: string
 
   return (
     <div class="overflow-x-auto">
-      <svg viewBox={`0 0 ${layout().width} ${layout().height}`} class="w-full min-w-[560px]" style={{ 'max-height': '520px' }}>
+      {/* Drawn at its natural size and never scaled up: stretched to a wide
+          card, the labels and nodes would grow with it (2×+ on a desktop). */}
+      <svg
+        viewBox={`0 0 ${layout().width} ${layout().height}`}
+        class="mx-auto block w-full min-w-[560px]"
+        style={{ 'max-width': `${layout().width}px`, 'max-height': '520px' }}
+      >
         <defs>
           <marker id="graph-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />

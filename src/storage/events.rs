@@ -184,6 +184,65 @@ pub mod drafts {
         .meta(json!({ "requeued": requeued_evals }))
     }
 
+    /// `scheduler.concurrency_adjusted` — the adaptive concurrency controller
+    /// moved the number of planners it admits
+    /// (docs/adaptive-scheduler-concurrency.md).
+    ///
+    /// Emitted on the CHANGE, never per tick: a control loop that narrates
+    /// every 500ms tick is noise an operator learns to ignore.
+    pub fn scheduler_concurrency_adjusted(
+        direction: &str,
+        from: usize,
+        to: usize,
+        ceiling: usize,
+        conflict_rate: f64,
+        mode: &str,
+    ) -> EventDraft {
+        let shadow = if mode == "enforce" { "" } else { " (shadow)" };
+        EventDraft::info(
+            "scheduler.concurrency_adjusted",
+            format!(
+                "Admitted planners {from} -> {to} of {ceiling}{shadow}: conflict rate \
+                 {percent:.1}%",
+                percent = conflict_rate * 100.0,
+            ),
+        )
+        .meta(json!({
+            "direction": direction,
+            "from": from,
+            "to": to,
+            "ceiling": ceiling,
+            "conflictRate": conflict_rate,
+            "mode": mode,
+        }))
+    }
+
+    /// `scheduler.concurrency_saturated` — backing off did not improve
+    /// goodput, so the conflicts are capacity-driven rather than
+    /// concurrency-driven. The distinction matters because "add nodes" and
+    /// "wait" are very different responses, and no other signal separates
+    /// them.
+    pub fn scheduler_concurrency_saturated(
+        restored_to: usize,
+        goodput_before: f64,
+        goodput_after: f64,
+    ) -> EventDraft {
+        EventDraft::warn(
+            "scheduler.concurrency_saturated",
+            format!(
+                "Reducing scheduler concurrency did not improve goodput \
+                 ({goodput_before:.0} -> {goodput_after:.0} placements/sec); conflicts are \
+                 capacity-driven, not concurrency-driven. Restored the limit to \
+                 {restored_to} — add nodes rather than waiting"
+            ),
+        )
+        .meta(json!({
+            "restoredTo": restored_to,
+            "goodputBefore": goodput_before,
+            "goodputAfter": goodput_after,
+        }))
+    }
+
     /// `eval.enqueued` — an eval was added to the queue.
     pub fn eval_enqueued(eval: &Eval, delay: Duration) -> EventDraft {
         EventDraft::info(
@@ -1066,6 +1125,65 @@ pub mod drafts {
         }))
     }
 
+    /// `node.pressure` — a node's memory pressure response acted on one
+    /// allocation (docs/resource-enforcement.md, "Memory pressure"). Warn for
+    /// the eviction steps, info for `reclaim`, which stops nothing. The
+    /// message is the worker's detail sentence, which names the step and the
+    /// numbers.
+    pub fn node_pressure(
+        node_id: &str,
+        action: &crate::structs::PressureAction,
+        instance_id: Option<&str>,
+    ) -> EventDraft {
+        let message = if action.detail.is_empty() {
+            format!(
+                "{} acted on allocation {} on node {node_id}",
+                action.step, action.allocation_id
+            )
+        } else {
+            format!("Allocation {}: {}", action.allocation_id, action.detail)
+        };
+        let draft = if action.step == "reclaim" {
+            EventDraft::info("node.pressure", message)
+        } else {
+            EventDraft::warn("node.pressure", message)
+        };
+        let mut draft = draft.node(node_id).allocation(action.allocation_id);
+        if !action.job_id.is_empty() {
+            draft = draft.job(&action.job_id);
+        }
+        let mut meta = json!({
+            "step": action.step,
+            "freed_bytes": action.freed_bytes,
+            "used_bytes": action.used_bytes,
+            "reserved_bytes": action.reserved_bytes,
+            "available_bytes": action.available_bytes,
+            "min_free_bytes": action.min_free_bytes,
+            "stall_percent": action.stall_percent,
+            "max_stall_percent": action.max_stall_percent,
+            "detail": action.detail,
+        });
+        match action.step.as_str() {
+            "reclaim" => {}
+            // A suspended instance is not evicted: it keeps its state and
+            // resumes, so the allocation's cause is `suspended`.
+            "suspend" => {
+                meta["cause"] = json!(StopCause::Suspended.as_str());
+                meta["snapshot_id"] = json!(action.snapshot_id);
+            }
+            _ => meta["cause"] = json!(StopCause::NodePressure.as_str()),
+        }
+        if !action.hint.is_empty() {
+            meta["hint"] = json!(action.hint);
+        }
+        // The stateful instance acted on, so a reader can tie the event to an
+        // instance row after its allocation row is gone.
+        if let Some(instance_id) = instance_id {
+            meta["instance_id"] = json!(instance_id);
+        }
+        draft.meta(meta)
+    }
+
     /// A network policy object was created or replaced.
     pub fn net_policy_applied(
         name: &str,
@@ -1172,6 +1290,457 @@ pub mod drafts {
         )
         .node(node_id)
         .meta(json!({ "volumeId": volume_id, "driver": driver }))
+    }
+
+    /// Shared scopes and metadata for the `snapshot.*` kinds.
+    fn snapshot_draft(
+        draft: EventDraft,
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+    ) -> EventDraft {
+        let mut draft = draft.job(&snapshot.job_id).meta(json!({
+            "snapshotId": snapshot.snapshot_id,
+            "instanceId": snapshot.instance_id,
+            "task": snapshot.task_name,
+            "kind": snapshot.kind.as_str(),
+            "purpose": snapshot.purpose.as_str(),
+            "name": snapshot.name,
+            "totalBytes": snapshot.total_bytes,
+            "durationMs": snapshot.duration_ms,
+            "error": snapshot.error,
+            "state": snapshot.state.as_str(),
+            "durability": snapshot.durability.as_str(),
+        }));
+        if let Some(node_id) = snapshot.node_id.as_deref() {
+            draft = draft.node(node_id);
+        }
+        if let Some(allocation_id) = snapshot.allocation_id {
+            draft = draft.allocation(allocation_id);
+        }
+        draft
+    }
+
+    /// `snapshot.created` — a node finished capturing a snapshot, which is
+    /// now `local` (docs/suspend-and-resume.md).
+    pub fn snapshot_created(snapshot: &crate::structs::snapshot::SnapshotRecord) -> EventDraft {
+        snapshot_draft(
+            EventDraft::info(
+                "snapshot.created",
+                format!(
+                    "Snapshot {} ({}) of instance {} captured on {}: {} bytes in {} ms",
+                    snapshot.snapshot_id,
+                    snapshot.kind.as_str(),
+                    snapshot.instance_id.as_deref().unwrap_or("-"),
+                    snapshot.node_id.as_deref().unwrap_or("-"),
+                    snapshot.total_bytes,
+                    snapshot.duration_ms
+                ),
+            ),
+            snapshot,
+        )
+    }
+
+    /// `snapshot.failed` — a node could not capture a snapshot. The
+    /// allocation it was taken from keeps running.
+    pub fn snapshot_failed(snapshot: &crate::structs::snapshot::SnapshotRecord) -> EventDraft {
+        snapshot_draft(
+            EventDraft::warn(
+                "snapshot.failed",
+                format!(
+                    "Snapshot {} of instance {} failed: {}",
+                    snapshot.snapshot_id,
+                    snapshot.instance_id.as_deref().unwrap_or("-"),
+                    snapshot.error.as_deref().unwrap_or("unknown error")
+                ),
+            ),
+            snapshot,
+        )
+    }
+
+    /// `snapshot.published` — a `durability = "store"` snapshot's parts are
+    /// all in the content store: it restores on any compatible node and
+    /// survives its node (docs/suspend-and-resume.md).
+    pub fn snapshot_published(
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+        uploaded_bytes: u64,
+        publish_ms: u64,
+    ) -> EventDraft {
+        let draft = snapshot_draft(
+            EventDraft::info(
+                "snapshot.published",
+                format!(
+                    "Snapshot {} of instance {} published from {}: {} bytes uploaded in {} ms",
+                    snapshot.snapshot_id,
+                    snapshot.instance_id.as_deref().unwrap_or("-"),
+                    snapshot.node_id.as_deref().unwrap_or("-"),
+                    uploaded_bytes,
+                    publish_ms
+                ),
+            ),
+            snapshot,
+        );
+        let mut meta = draft.metadata.clone();
+        if let Some(object) = meta.as_object_mut() {
+            object.insert("uploadedBytes".into(), json!(uploaded_bytes));
+            object.insert("publishMs".into(), json!(publish_ms));
+        }
+        draft.meta(meta)
+    }
+
+    /// `snapshot.publish_failed` — a `durability = "store"` snapshot could
+    /// not be published (no `contentStore` on its node, or the store refused
+    /// the upload). It stays `local` and keeps working from its node.
+    pub fn snapshot_publish_failed(
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+    ) -> EventDraft {
+        snapshot_draft(
+            EventDraft::warn(
+                "snapshot.publish_failed",
+                format!(
+                    "Snapshot {} of instance {} could not be published from {}, and stays \
+                     local to that node: {}",
+                    snapshot.snapshot_id,
+                    snapshot.instance_id.as_deref().unwrap_or("-"),
+                    snapshot.node_id.as_deref().unwrap_or("-"),
+                    snapshot.error.as_deref().unwrap_or("unknown error")
+                ),
+            ),
+            snapshot,
+        )
+    }
+
+    /// `snapshot.warmed` / `snapshot.warm_failed` — a node finished, or
+    /// failed, pre-fetching a published snapshot's parts (WarmSnapshot).
+    pub fn snapshot_warm(
+        snapshot_id: &str,
+        job_id: Option<&str>,
+        node_id: &str,
+        ok: bool,
+        fetched_bytes: u64,
+        duration_ms: u64,
+        error: &str,
+    ) -> EventDraft {
+        let draft = if ok {
+            EventDraft::info(
+                "snapshot.warmed",
+                format!(
+                    "Node {node_id} holds snapshot {snapshot_id}'s parts: {fetched_bytes} bytes \
+                     fetched in {duration_ms} ms"
+                ),
+            )
+        } else {
+            EventDraft::warn(
+                "snapshot.warm_failed",
+                format!("Node {node_id} could not warm snapshot {snapshot_id}: {error}"),
+            )
+        };
+        let mut draft = draft.node(node_id).meta(json!({
+            "snapshotId": snapshot_id,
+            "fetchedBytes": fetched_bytes,
+            "durationMs": duration_ms,
+            "error": if ok { None } else { Some(error) },
+        }));
+        if let Some(job_id) = job_id {
+            draft = draft.job(job_id);
+        }
+        draft
+    }
+
+    /// `snapshot.deleted` — a snapshot's row is gone: its node reclaimed the
+    /// bytes, or there was nothing left to reclaim. Covers DeleteSnapshot,
+    /// `snapshots.ttl` and `snapshots.keep` expiry, and job destroy alike.
+    pub fn snapshot_deleted(snapshot: &crate::structs::snapshot::SnapshotRecord) -> EventDraft {
+        snapshot_draft(
+            EventDraft::info(
+                "snapshot.deleted",
+                format!(
+                    "Snapshot {} of instance {} deleted",
+                    snapshot.snapshot_id,
+                    snapshot.instance_id.as_deref().unwrap_or("-")
+                ),
+            ),
+            snapshot,
+        )
+    }
+
+    /// `snapshot.restored` / `snapshot.restore_failed` — an allocation
+    /// started from a snapshot (RestoreInstance), or failed to. A failed
+    /// restore fails the allocation, and the error names the cause (for
+    /// example `restore needs TAP device tap7: ...`).
+    pub fn snapshot_restore(
+        snapshot_id: &str,
+        job_id: &str,
+        instance_id: Option<&str>,
+        node_id: &str,
+        allocation_id: i64,
+        ok: bool,
+        error: &str,
+    ) -> EventDraft {
+        let draft = if ok {
+            EventDraft::info(
+                "snapshot.restored",
+                format!(
+                    "Instance {} restored from snapshot {snapshot_id} as allocation {allocation_id}",
+                    instance_id.unwrap_or("-")
+                ),
+            )
+        } else {
+            EventDraft::warn(
+                "snapshot.restore_failed",
+                format!(
+                    "Instance {} failed to restore from snapshot {snapshot_id}: {error}",
+                    instance_id.unwrap_or("-")
+                ),
+            )
+        };
+        draft
+            .job(job_id)
+            .node(node_id)
+            .allocation(allocation_id)
+            .meta(json!({
+                "snapshotId": snapshot_id,
+                "instanceId": instance_id,
+                "error": if ok { Value::Null } else { json!(error) },
+            }))
+    }
+
+    /// `instance.suspended` — a suspend's capture landed and the instance is
+    /// `suspended`, holding no allocation (or, with `suspend.reserve`, only
+    /// its reservation). docs/suspend-and-resume.md.
+    pub fn instance_suspended(
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+        instance_id: &str,
+        reserved: bool,
+        reason: &str,
+    ) -> EventDraft {
+        let why = match reason {
+            crate::structs::suspend::SUSPEND_REASON_IDLE => " (idle)",
+            crate::structs::suspend::SUSPEND_REASON_PRESSURE => " (node memory pressure)",
+            crate::structs::suspend::SUSPEND_REASON_MAKE_ROOM => " (making room for a resume)",
+            _ => "",
+        };
+        let mut draft = snapshot_draft(
+            EventDraft::info(
+                "instance.suspended",
+                format!(
+                    "Instance {instance_id} suspended{why} to {} checkpoint {} on {}: {} bytes in \
+                     {} ms{}",
+                    snapshot.kind.as_str(),
+                    snapshot.snapshot_id,
+                    snapshot.node_id.as_deref().unwrap_or("-"),
+                    snapshot.total_bytes,
+                    snapshot.duration_ms,
+                    if reserved { ", reservation held" } else { "" }
+                ),
+            ),
+            snapshot,
+        );
+        if let Some(meta) = draft.metadata.as_object_mut() {
+            meta.insert("reserved".into(), json!(reserved));
+            meta.insert("reason".into(), json!(reason));
+        }
+        draft
+    }
+
+    /// `instance.make_room` — a resume waiting on its checkpoint's node did
+    /// not fit, so the manager started suspends of idle suspendable
+    /// instances there (manager `suspend.makeRoom`). Each suspend then lands
+    /// as `instance.suspended` with reason `make_room`.
+    pub fn instance_make_room(
+        job_id: &str,
+        instance_id: &str,
+        node_id: &str,
+        suspending: &[String],
+    ) -> EventDraft {
+        EventDraft::info(
+            "instance.make_room",
+            format!(
+                "Resume of instance {instance_id} does not fit on {node_id}; suspending {} to \
+                 make room: {}",
+                suspending.len(),
+                suspending.join(", ")
+            ),
+        )
+        .job(job_id)
+        .node(node_id)
+        .meta(json!({
+            "instanceId": instance_id,
+            "suspending": suspending,
+        }))
+    }
+
+    /// `instance.suspend_failed` — the node could not capture the instance.
+    /// The allocation keeps running: a suspend never stops a workload it
+    /// failed to capture.
+    pub fn instance_suspend_failed(
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+    ) -> EventDraft {
+        snapshot_draft(
+            EventDraft::warn(
+                "instance.suspend_failed",
+                format!(
+                    "Instance {} could not be suspended and keeps running: {}",
+                    snapshot.instance_id.as_deref().unwrap_or("-"),
+                    snapshot.error.as_deref().unwrap_or("unknown error")
+                ),
+            ),
+            snapshot,
+        )
+    }
+
+    /// `instance.resumed` — a suspended instance restored from its
+    /// checkpoint as a new allocation.
+    pub fn instance_resumed(
+        snapshot_id: &str,
+        job_id: &str,
+        instance_id: &str,
+        node_id: &str,
+        allocation_id: i64,
+        restore_ms: u64,
+    ) -> EventDraft {
+        EventDraft::info(
+            "instance.resumed",
+            format!(
+                "Instance {instance_id} resumed from {snapshot_id} as allocation {allocation_id} \
+                 on {node_id} ({restore_ms} ms)"
+            ),
+        )
+        .job(job_id)
+        .node(node_id)
+        .allocation(allocation_id)
+        .meta(json!({
+            "instanceId": instance_id,
+            "snapshotId": snapshot_id,
+            "restoreMs": restore_ms,
+        }))
+    }
+
+    /// `instance.restore_failed` — a resume could not restore its
+    /// checkpoint. `outcome` is `cold` (booted fresh on the retained
+    /// storage) or `suspended` (`onRestoreFailure = "fail"`).
+    pub fn instance_restore_failed(
+        snapshot_id: &str,
+        job_id: &str,
+        instance_id: &str,
+        node_id: Option<&str>,
+        allocation_id: Option<i64>,
+        reason: &str,
+        cold: bool,
+    ) -> EventDraft {
+        let mut draft = EventDraft::warn(
+            "instance.restore_failed",
+            format!(
+                "Instance {instance_id} could not restore checkpoint {snapshot_id} and {}: {reason}",
+                if cold {
+                    "booted cold on its retained storage"
+                } else {
+                    "stays suspended"
+                }
+            ),
+        )
+        .job(job_id)
+        .meta(json!({
+            "instanceId": instance_id,
+            "snapshotId": snapshot_id,
+            "error": reason,
+            "outcome": if cold { "cold" } else { "suspended" },
+        }));
+        if let Some(node_id) = node_id {
+            draft = draft.node(node_id);
+        }
+        if let Some(allocation_id) = allocation_id {
+            draft = draft.allocation(allocation_id);
+        }
+        draft
+    }
+
+    /// `instance.forked` (Phase 6) — a fork's checkpoint landed and its
+    /// forks are being placed. The origin kept running.
+    pub fn instance_forked(
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+        origin: &str,
+        instances: &[String],
+    ) -> EventDraft {
+        let mut draft = snapshot_draft(
+            EventDraft::info(
+                "instance.forked",
+                format!(
+                    "Instance {origin} forked into {} ({} checkpoint {} on {}, paused {} ms)",
+                    instances.join(", "),
+                    snapshot.kind.as_str(),
+                    snapshot.snapshot_id,
+                    snapshot.node_id.as_deref().unwrap_or("-"),
+                    snapshot.pause_ms
+                ),
+            ),
+            snapshot,
+        );
+        if let Some(meta) = draft.metadata.as_object_mut() {
+            meta.insert("origin".into(), json!(origin));
+            meta.insert("instances".into(), json!(instances));
+            meta.insert("pauseMs".into(), json!(snapshot.pause_ms));
+        }
+        draft
+    }
+
+    /// `instance.fork_failed` (Phase 6) — the node could not capture the
+    /// origin. The origin keeps running; the forks that waited on the
+    /// checkpoint are terminated.
+    pub fn instance_fork_failed(
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+        instances: &[String],
+    ) -> EventDraft {
+        let mut draft = snapshot_draft(
+            EventDraft::warn(
+                "instance.fork_failed",
+                format!(
+                    "Instance {} could not be forked and keeps running; forks {} were \
+                     terminated: {}",
+                    snapshot.instance_id.as_deref().unwrap_or("-"),
+                    instances.join(", "),
+                    snapshot.error.as_deref().unwrap_or("unknown error")
+                ),
+            ),
+            snapshot,
+        );
+        if let Some(meta) = draft.metadata.as_object_mut() {
+            meta.insert("instances".into(), json!(instances));
+        }
+        draft
+    }
+
+    /// `instance.restore_failed` for a NEW instance (Phase 6: a fork or a
+    /// `from_snapshot` create) that could not restore its snapshot. It boots
+    /// cold on its own storage, or is stopped under `onRestoreFailure =
+    /// "fail"`.
+    pub fn new_instance_restore_failed(
+        snapshot_id: &str,
+        job_id: &str,
+        instance_id: &str,
+        node_id: &str,
+        allocation_id: i64,
+        reason: &str,
+        cold: bool,
+    ) -> EventDraft {
+        EventDraft::warn(
+            "instance.restore_failed",
+            format!(
+                "Instance {instance_id} could not restore snapshot {snapshot_id} and {}: {reason}",
+                if cold {
+                    "booted cold on its own storage"
+                } else {
+                    "was stopped"
+                }
+            ),
+        )
+        .job(job_id)
+        .node(node_id)
+        .allocation(allocation_id)
+        .meta(json!({
+            "instanceId": instance_id,
+            "snapshotId": snapshot_id,
+            "error": reason,
+            "outcome": if cold { "cold" } else { "stopped" },
+        }))
     }
 
     /// `artifact.pinned` — mutable references were pinned to digests at
@@ -1416,6 +1985,38 @@ impl EventRecorder<'_> {
         self.emit(drafts::scheduler_recovered(requeued_evals));
     }
 
+    pub fn scheduler_concurrency_adjusted(
+        self,
+        direction: &str,
+        from: usize,
+        to: usize,
+        ceiling: usize,
+        conflict_rate: f64,
+        mode: &str,
+    ) {
+        self.emit(drafts::scheduler_concurrency_adjusted(
+            direction,
+            from,
+            to,
+            ceiling,
+            conflict_rate,
+            mode,
+        ));
+    }
+
+    pub fn scheduler_concurrency_saturated(
+        self,
+        restored_to: usize,
+        goodput_before: f64,
+        goodput_after: f64,
+    ) {
+        self.emit(drafts::scheduler_concurrency_saturated(
+            restored_to,
+            goodput_before,
+            goodput_after,
+        ));
+    }
+
     pub fn allocations_removed_from_node(
         self,
         node_id: &str,
@@ -1604,6 +2205,15 @@ impl EventRecorder<'_> {
         self.emit(drafts::net_denied(node_id, denial));
     }
 
+    pub fn node_pressure(
+        self,
+        node_id: &str,
+        action: &crate::structs::PressureAction,
+        instance_id: Option<&str>,
+    ) {
+        self.emit(drafts::node_pressure(node_id, action, instance_id));
+    }
+
     pub fn net_policy_applied(self, name: &str, enforcement: &str, priority: i64, affected: usize) {
         self.emit(drafts::net_policy_applied(
             name,
@@ -1631,6 +2241,193 @@ impl EventRecorder<'_> {
 
     pub fn volume_destroyed(self, volume_id: &str, driver: &str, node_id: &str) {
         self.emit(drafts::volume_destroyed(volume_id, driver, node_id));
+    }
+
+    pub fn snapshot_created(self, snapshot: &crate::structs::snapshot::SnapshotRecord) {
+        self.emit(drafts::snapshot_created(snapshot));
+    }
+
+    pub fn snapshot_failed(self, snapshot: &crate::structs::snapshot::SnapshotRecord) {
+        self.emit(drafts::snapshot_failed(snapshot));
+    }
+
+    pub fn snapshot_deleted(self, snapshot: &crate::structs::snapshot::SnapshotRecord) {
+        self.emit(drafts::snapshot_deleted(snapshot));
+    }
+
+    pub fn snapshot_published(
+        self,
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+        uploaded_bytes: u64,
+        publish_ms: u64,
+    ) {
+        self.emit(drafts::snapshot_published(
+            snapshot,
+            uploaded_bytes,
+            publish_ms,
+        ));
+    }
+
+    pub fn snapshot_publish_failed(self, snapshot: &crate::structs::snapshot::SnapshotRecord) {
+        self.emit(drafts::snapshot_publish_failed(snapshot));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapshot_warm(
+        self,
+        snapshot_id: &str,
+        job_id: Option<&str>,
+        node_id: &str,
+        ok: bool,
+        fetched_bytes: u64,
+        duration_ms: u64,
+        error: &str,
+    ) {
+        self.emit(drafts::snapshot_warm(
+            snapshot_id,
+            job_id,
+            node_id,
+            ok,
+            fetched_bytes,
+            duration_ms,
+            error,
+        ));
+    }
+
+    pub fn instance_suspended(
+        self,
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+        instance_id: &str,
+        reserved: bool,
+        reason: &str,
+    ) {
+        self.emit(drafts::instance_suspended(
+            snapshot,
+            instance_id,
+            reserved,
+            reason,
+        ));
+    }
+
+    pub fn instance_make_room(
+        self,
+        job_id: &str,
+        instance_id: &str,
+        node_id: &str,
+        suspending: &[String],
+    ) {
+        self.emit(drafts::instance_make_room(
+            job_id,
+            instance_id,
+            node_id,
+            suspending,
+        ));
+    }
+
+    pub fn instance_suspend_failed(self, snapshot: &crate::structs::snapshot::SnapshotRecord) {
+        self.emit(drafts::instance_suspend_failed(snapshot));
+    }
+
+    pub fn instance_resumed(
+        self,
+        snapshot_id: &str,
+        job_id: &str,
+        instance_id: &str,
+        node_id: &str,
+        allocation_id: i64,
+        restore_ms: u64,
+    ) {
+        self.emit(drafts::instance_resumed(
+            snapshot_id,
+            job_id,
+            instance_id,
+            node_id,
+            allocation_id,
+            restore_ms,
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn instance_restore_failed(
+        self,
+        snapshot_id: &str,
+        job_id: &str,
+        instance_id: &str,
+        node_id: Option<&str>,
+        allocation_id: Option<i64>,
+        reason: &str,
+        cold: bool,
+    ) {
+        self.emit(drafts::instance_restore_failed(
+            snapshot_id,
+            job_id,
+            instance_id,
+            node_id,
+            allocation_id,
+            reason,
+            cold,
+        ));
+    }
+
+    pub fn instance_forked(
+        self,
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+        origin: &str,
+        instances: &[String],
+    ) {
+        self.emit(drafts::instance_forked(snapshot, origin, instances));
+    }
+
+    pub fn instance_fork_failed(
+        self,
+        snapshot: &crate::structs::snapshot::SnapshotRecord,
+        instances: &[String],
+    ) {
+        self.emit(drafts::instance_fork_failed(snapshot, instances));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_instance_restore_failed(
+        self,
+        snapshot_id: &str,
+        job_id: &str,
+        instance_id: &str,
+        node_id: &str,
+        allocation_id: i64,
+        reason: &str,
+        cold: bool,
+    ) {
+        self.emit(drafts::new_instance_restore_failed(
+            snapshot_id,
+            job_id,
+            instance_id,
+            node_id,
+            allocation_id,
+            reason,
+            cold,
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapshot_restore(
+        self,
+        snapshot_id: &str,
+        job_id: &str,
+        instance_id: Option<&str>,
+        node_id: &str,
+        allocation_id: i64,
+        ok: bool,
+        error: &str,
+    ) {
+        self.emit(drafts::snapshot_restore(
+            snapshot_id,
+            job_id,
+            instance_id,
+            node_id,
+            allocation_id,
+            ok,
+            error,
+        ));
     }
 }
 

@@ -775,6 +775,8 @@ async fn register_sim_node_inner(client: &ManagerClient<Channel>, node: &SimNode
         join_token: node.credentials.join_secret().cloned(),
         build_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: PROTOCOL_VERSION,
+        // A simulated node runs nothing it could checkpoint.
+        capabilities: Vec::new(),
     });
     let reply = client.clone().worker_register(req).await?.into_inner();
     node.credentials.store_node_token(reply.node_token);
@@ -792,6 +794,9 @@ async fn heartbeat_sim_node(
     let acked = node.acked_ids(ready_after);
     fleet.record_reported_allocations(node, acked.len());
     let req = node.credentials.attach(Request::new(HeartbeatRequest {
+        // Simulated nodes have no content store to advertise.
+        content_locations: None,
+        pressure_actions: Vec::new(),
         net_denials: Vec::new(),
         net_status: Vec::new(),
         net_edges: Vec::new(),
@@ -806,6 +811,10 @@ async fn heartbeat_sim_node(
         volume_reports: Vec::new(),
         // Simulated nodes run no processes, so nothing ever terminates.
         terminated_allocations: Vec::new(),
+        // Nor do they have cgroups to measure.
+        usage: None,
+        // Nor anything to checkpoint.
+        snapshot_reports: Vec::new(),
     }));
     let reply = client.clone().heartbeat(req).await?.into_inner();
     let desired: Vec<i64> = reply

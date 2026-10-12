@@ -4,7 +4,8 @@
 
 > [!NOTE]
 > Legion is an experimental personal project, built largely by AI agents.
-> Expect bugs and breaking changes. See [Status](#status) before you use it.
+> Expect bugs, breaking changes, and known security issues. See
+> [Status](#status) before you use it.
 
 Legion runs your containers, binaries, and microVM sandboxes across a fleet of machines.
 You describe a job, and Legion decides where it runs, starts it, keeps it
@@ -217,7 +218,9 @@ See [Testing and Benchmarks](docs/testing-and-benchmarks.md) for more details.
   no extra round trips.
 - **Any kind of workload.** Long-running services, batch jobs, sidecars, and
   [stateful workloads](docs/stateful-workloads.md) with stable identity,
-  [volumes](docs/volumes.md), and fencing.
+  [volumes](docs/volumes.md), fencing, and
+  [suspend and resume](docs/suspend-and-resume.md) (by hand, when idle, or
+  under memory pressure) with snapshots you can roll an instance back to.
 - **A built-in DAG system.** Tasks declare `dependsOn` to form a
   [dependency graph](docs/jobs-tasks-and-scheduling.md), gated on another
   task starting, completing, or succeeding. Dependencies can span groups
@@ -246,6 +249,14 @@ they should. Legion handles all three.
 - **Simple egress control.** [Network handlers](docs/network-handlers.md)
   give each task its own egress allowlist and proxy middleware, so you
   can customize what traffic is allowed or inject secrets safely.
+- **Agent sandboxes that park when idle.** A sandbox
+  [suspends](docs/suspend-and-resume.md) to a memory checkpoint after a few
+  quiet minutes, frees its reservation (or keeps a share, so the resume
+  finds room), and resumes in place with its processes intact. `memoryMax` and an
+  [oversubscription ratio](docs/resource-enforcement.md#oversubscription)
+  pack the active ones tighter, and fork copies a running sandbox for an
+  agent to explore from. See the
+  [agent sandboxes guide](docs/guides/agent-sandboxes.md).
 
 ### DevEx for humans and agents
 
@@ -289,16 +300,45 @@ but the networking stack/mesh, various runtimes, and sandboxing primitives have 
 The [docs](docs/README.md) should state what is and is not implemented for
 each feature.
 
+### Known security issues
+
+Don't run Legion where untrusted workloads share a host with other work, or
+on a network you don't trust. Known gaps:
+
+- **The worker API authenticates no one.** It listens only on loopback, but
+  any process on the same host, including an `exec` task or a host-network
+  container, can run commands in other allocations on that node. The
+  [worker-plane auth plan](internal_docs/plans/worker-plane-auth-plan.md)
+  fixes this.
+- **Linux containers and `exec` tasks share the host's network by default**,
+  so they can reach the worker and manager ports, the cloud metadata service,
+  and anything else on the host. With ACLs off (the default), the manager's
+  port is full control of the cluster. `gated` mode doesn't help yet, because
+  its egress proxy still dials loopback and link-local addresses for the
+  task. Don't run untrusted code in them yet. The
+  [same plan](internal_docs/plans/worker-plane-auth-plan.md) covers it.
+- **The worker-to-manager channel is plaintext.**
+- **Workers on other hosts can't serve exec, logs, or the service mesh yet**,
+  because they advertise a loopback address. Covered by the same plan.
+
 ### What's next
 
 Open work lives in the [to-do list](internal_docs/TODO.md), with design plans
 in [`internal_docs/plans/`](internal_docs/plans/). A few things I'd like to
 add:
 
+- **Faster sandbox wake-ups**: wake on connect, lazy memory restore, and diff
+  snapshots on top of [suspend and resume](docs/suspend-and-resume.md).
+- **Sandbox scaling to very large session counts**: ephemeral sessions,
+  node-reported state, idle sessions in object storage that wake on
+  request, and sequenced delivery of work, so raft holds only what must be
+  durable ([plan](internal_docs/plans/sandbox-scaling-plan.md)).
+- **Exec into microVM sandboxes**, and exec sessions that skip the manager
+  ([plan](internal_docs/plans/sandbox-exec-plan.md)).
 - **Built-in ingress gateway, autoscaler, cert-manager, and GitOps tools**, or
   a more omakase starting experience.
 - **Resource registry for sharing and pulling jobs, templates, and plugins.**
-- - **Sharded scheduler**, so placement throughput scales past a single
+- **Sharded scheduler**, so placement throughput scales past a single
   Raft cluster.
 - **Submission middleware**, so you can modify or gate job submissions.
 - **Something akin to Kubernetes controllers**, so you can extend Legion with
@@ -315,15 +355,18 @@ start:
 - **Concepts:** [Managers and Workers](docs/architecture-managers-workers.md) ·
   [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md) ·
   [Configuration Language](docs/configuration-language.md) ·
-  [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
+  [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md) ·
+  [Adaptive Scheduler Concurrency](docs/adaptive-scheduler-concurrency.md)
 - **Running workloads:** [Task Runtimes](docs/task-runtime-plugins.md) ·
   [Artifacts](docs/artifacts.md) · [Rollouts](docs/rollouts.md) ·
   [Scaling Jobs](docs/autoscaling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
-  [Resource Enforcement](docs/resource-enforcement.md)
+  [Resource Enforcement](docs/resource-enforcement.md) ·
+  [Suspend and Resume](docs/suspend-and-resume.md)
 - **Guides:** [Running Postgres](docs/guides/postgres.md) ·
   [Running Redis](docs/guides/redis.md) ·
-  [Serving TLS Certificates from KV](docs/guides/tls-certificates.md)
+  [Serving TLS Certificates from KV](docs/guides/tls-certificates.md) ·
+  [Running Agent Sandboxes](docs/guides/agent-sandboxes.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md)

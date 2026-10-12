@@ -4,9 +4,13 @@ use crate::prelude::*;
 use libloading::{Library, Symbol};
 
 mod node_checkers;
+pub(crate) use node_checkers::checkpoint_compat::local_cpu_attrs;
 
 use crate::util::plugin_root_dir;
-use node_checkers::{ArchNodeChecker, DiskChecker, KitchenSinkNodeChecker, OSNodeChecker};
+use node_checkers::{
+    ArchNodeChecker, CheckpointCompatNodeChecker, DiskChecker, KitchenSinkNodeChecker,
+    OSNodeChecker,
+};
 
 // NOTE: Improve current fingerprinters:
 // Network - speed, IP addresses, etc
@@ -26,6 +30,7 @@ pub fn fingerprint_node(additional_node_checks: Vec<String>) -> Map<String, Valu
         Box::new(ArchNodeChecker {}),
         Box::new(OSNodeChecker {}),
         Box::new(KitchenSinkNodeChecker {}),
+        Box::new(CheckpointCompatNodeChecker {}),
     ];
 
     let mut ret = Map::new();

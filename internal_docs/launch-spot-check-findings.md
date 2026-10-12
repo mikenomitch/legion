@@ -51,7 +51,7 @@ what a first external user will do.
   survived `--force-reschedule`.
 - **macOS local development.** Exec, Apple `container` with a locally built
   image, exec into it, KV live updates, and a dev-mode sandbox with exec
-  through the launcher's browser terminal (after the P1-6 shim).
+  through the launcher's browser terminal (with the P1-6 fix).
 
 ## P0
 
@@ -236,10 +236,11 @@ the TAP device.
 
 ### P1-6. macOS sandboxes do not start
 
-*Shimmed.* Dev mode passes a `--` after the image
-(`src/task_plugins/sandbox.rs:563`), which Apple `container` runs as the
+*Fixed on main* after the run, so `shims.patch` no longer carries it. Dev
+mode passed a `--` after the image (`src/task_plugins/sandbox.rs:563` at the
+time), which Apple `container` runs as the
 command: `failed to find target executable --`. The container runtime avoids
-exactly this, and its test asserts no separator. After the shim, exec into a
+exactly this, and its test asserts no separator. With the fix, exec into a
 macOS sandbox works end to end, including from the launcher's browser
 terminal.
 

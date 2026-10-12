@@ -7,18 +7,8 @@ import { managerClient } from '../../grpcClient'
 import { allows, jobScope } from '../../utils/acl'
 import { formatDate } from '../../utils/format'
 import { retainOnError, usePoll } from '../../utils/polling'
+import { isRolloutDone } from '../../utils/status'
 import { artifactProgressPercent, parseArtifactStates } from '../../utils/jobspec'
-
-const isRolloutDone = (status: string) => {
-  const normalizedStatus = status.toLowerCase()
-  return (
-    normalizedStatus === 'completed'
-    || normalizedStatus === 'failed'
-    || normalizedStatus === 'done'
-    || normalizedStatus === 'cancelled'
-    || normalizedStatus === 'completed_incomplete'
-  )
-}
 
 const logLevelTone = (level: string) => {
   const normalized = level.toLowerCase()

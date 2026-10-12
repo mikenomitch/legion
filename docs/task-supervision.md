@@ -154,12 +154,13 @@ With this on, a Linux worker partitions the node into `legion/share` and
 | `resources.cores` (whole CPUs) | exclusive pinned CPUs (`cpuset.cpus`), removed from every other governed task's set |
 | `resources.cpu` (MHz, alias `cpus`) | proportional `cpu.weight` under contention |
 
-Enforcement is off by default. Many jobs set `resources` as scheduling
-estimates, and turning an estimate into `memory.max` during an upgrade would
-OOM-kill workloads that were running fine. A node that opts in but can't
-enforce (no cgroup v2, no usable CPU fingerprint) logs a warning at startup and
-runs tasks unconfined. Legion won't refuse to run a workload because it can't
-enforce limits.
+Enforcement is on by default, so declare `resources.memory` as what the task
+really needs: a task that uses more is OOM-killed. Set
+`resourceEnforcement.enabled = false` on a worker type to treat `resources` as
+scheduling estimates only. A node that can't enforce (no cgroup v2, no write
+access to its cgroup parent, no usable CPU fingerprint) logs a warning at
+startup and runs tasks unconfined. Legion won't refuse to run a workload
+because it can't enforce limits.
 
 An explicit `config.cgroup` on an `exec` task opts out. It tells Legion to join
 a cgroup you already created and limited, so Legion doesn't manage one

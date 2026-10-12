@@ -22,7 +22,7 @@ five public IPv4 addresses. Workers use
 [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html),
 so microVM sandboxes get `/dev/kvm` without bare metal.
 
-**Temporary shims.** The rig needs three not-for-merge source patches, kept
+**Temporary shims.** The rig needs two not-for-merge source patches, kept
 in [`shims.patch`](shims.patch) rather than in `src/`. Apply them before
 building the Linux binary, and only while the real fixes are missing
 (`git apply --check` fails once the code they touch has changed, which is
@@ -34,8 +34,6 @@ the cue to check whether each one is still needed). Each hunk is marked
   The worker API stays unauthenticated, so the rig only opens port 4848 to
   the managers' security group. The real fix is
   [worker-plane-auth-plan.md](../../internal_docs/plans/worker-plane-auth-plan.md).
-- **macOS sandbox argv** (`src/task_plugins/sandbox.rs`): drops a `--` that
-  Apple `container` took as the command.
 - **Health checks after artifact staging** (`src/worker/task_manager.rs`):
   the staging thread enters the Tokio runtime, so tasks whose images go
   through the artifact pipeline get health checks instead of a panic.

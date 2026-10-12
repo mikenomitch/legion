@@ -150,6 +150,14 @@ pub const INSTANCE_ATTRS: &str = r#"
 instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at
 "#;
 
+/// [`INSTANCE_ATTRS`] plus the columns no generic upsert writes:
+/// `restore_from` is set and cleared only by the snapshot restore ops, and
+/// `identity_epoch` only by a fork or snapshot capture, so an upsert of an
+/// instance (a re-bind, a reschedule) can never drop either.
+pub const INSTANCE_SELECT_ATTRS: &str = r#"
+instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at, restore_from, identity_epoch
+"#;
+
 pub const INSTANCE_ATTRS_VALS: &str = r#"
 :instance_id, :job_id, :group_name, :task_name, :mode, :state, :slot_index, :current_alloc_id, :storage_handle, :created_at, :updated_at
 "#;
@@ -161,14 +169,14 @@ job_id = :job_id, group_name = :group_name, task_name = :task_name, mode = :mode
 lazy_static! {
     pub static ref GET_INSTANCE: String = format!(
         r#"
-    SELECT {INSTANCE_ATTRS}
+    SELECT {INSTANCE_SELECT_ATTRS}
     FROM instance
     WHERE instance_id = ?;
     "#
     );
     pub static ref GET_INSTANCES_FOR_JOB: String = format!(
         r#"
-    SELECT {INSTANCE_ATTRS}
+    SELECT {INSTANCE_SELECT_ATTRS}
     FROM instance
     WHERE job_id = ?
     ORDER BY group_name ASC, slot_index ASC, instance_id ASC;
@@ -179,7 +187,7 @@ lazy_static! {
     INSERT INTO instance ({INSTANCE_ATTRS})
     VALUES ({INSTANCE_ATTRS_VALS})
     ON CONFLICT(instance_id) DO UPDATE SET {INSTANCE_PARAM_SET}
-    RETURNING {INSTANCE_ATTRS};
+    RETURNING {INSTANCE_SELECT_ATTRS};
     "#
     );
 }
@@ -333,11 +341,11 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start
+id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start
+name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
@@ -345,7 +353,7 @@ name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, co
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect, :restart, :stop, :disruption, :speculative_start
+:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect, :restart, :stop, :disruption, :speculative_start, :snapshots, :suspend
 "#;
 
 lazy_static! {
@@ -552,6 +560,42 @@ lazy_static! {
     VALUES ({EVAL_ATTRS_VALS});
     "#
     );
+    /// Claim the head of the queue: strict `priority DESC, id ASC` over every
+    /// claimable row.
+    pub static ref CLAIM_EVAL: String = claim_eval_sql("");
+    /// Claim the head of the queue among eval kinds that never invoke the
+    /// planner, for a worker the adaptive-concurrency gate has throttled
+    /// (docs/adaptive-scheduler-concurrency.md). Identical in every other
+    /// respect, so ordering among the rows it CAN see is unchanged.
+    ///
+    /// The kind list comes from a compile-time constant in
+    /// `manager::concurrency`, never from caller input, so it is built into
+    /// the statement rather than bound.
+    pub static ref CLAIM_NON_PLANNING_EVAL: String = {
+        let kinds = crate::manager::concurrency::NON_PLANNING_EVAL_KINDS
+            .iter()
+            .map(|kind| format!("'{kind}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        claim_eval_sql(&format!(" AND type IN ({kinds})"))
+    };
+}
+
+fn claim_eval_sql(kind_filter: &str) -> String {
+    format!(
+        r#"
+    UPDATE eval
+    SET status = 'in_flight'
+    WHERE id = (
+        SELECT id
+        FROM eval
+        WHERE status = 'pending' AND ready_at <= :now{kind_filter}
+        ORDER BY priority DESC, id ASC
+        LIMIT 1
+    )
+    RETURNING {EVAL_ATTRS};
+    "#
+    )
 }
 
 //

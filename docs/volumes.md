@@ -212,6 +212,10 @@ privileges and no loop device. Block mode is advertised only on nodes with the
 matching `mkfs` on `PATH`. Elsewhere the driver reports filesystem mode only
 and says why.
 
+`local-dir` implements the optional `snapshot`, `restore`, `clone`, and
+`snapshot-delete` ops in both modes. See
+[Snapshot, restore, and clone](#snapshot-restore-and-clone).
+
 ### `host`
 
 Claims a path the operator declared in the worker config. It does no
@@ -609,15 +613,71 @@ on worker restarts and partial failures, so "already done" counts as success.
 | `unmount` | Release the mount. The data survives |
 | `destroy` | Delete the volume and its data |
 
-`create`, `attach`, `detach`, `snapshot`, `restore`, `clone`, and `expand` are
-**reserved names**. A driver may advertise them in `capabilities.ops`, and
-Legion will dispatch them when those features land, without an ABI break.
+Four more operations are **optional**. A driver that implements one lists it
+in `capabilities.ops`, and Legion only dispatches an optional op to a driver
+that lists it. They must be idempotent too.
 
-`clone` makes a new volume that starts as a copy-on-write copy of an existing
-one. Forking a workload needs it. The backends that can clone instantly
-(reflink/`FICLONE`, `zfs clone`, dm-thin, EBS-from-snapshot) are the ones that
-make forking practical, so the name is reserved now to avoid an ABI break
-later.
+| Op | Purpose |
+| --- | --- |
+| `snapshot` | Capture the volume as the snapshot named by `snapshot.id`. Return the snapshot ref |
+| `restore` | Replace the volume's contents with `snapshot`. The snapshot survives |
+| `clone` | Create `volume` as a new copy of `snapshot` |
+| `snapshot-delete` | Delete `snapshot` |
+
+`create`, `attach`, `detach`, and `expand` are **reserved names**. A driver may
+advertise them, and Legion will dispatch them when those features land, without
+an ABI break.
+
+### Snapshot, restore, and clone
+
+A snapshot is a copy of a volume that is independent of it from then on:
+destroying the volume keeps its snapshots, and restoring or cloning leaves the
+snapshot in place. Checkpoints use these ops for their disk half
+([task-runtime-sandbox.md](task-runtime-sandbox.md#checkpoints)).
+
+The caller picks the snapshot id and passes it in the request's `snapshot`
+field. That makes `snapshot` idempotent: a retry after a lost reply finds the
+finished snapshot and returns it instead of taking a second one. `restore`,
+`clone`, and `snapshot-delete` take the ref a previous `snapshot` returned:
+
+```nickel
+# stdin for: zfs restore (snapshot is what `zfs snapshot` printed)
+{
+  "apiVersion" = 1,
+  "op" = "restore",
+  "volume" = { "id" = "vol-9f2c…", "name" = "data", "driver" = "zfs", "attrs" = {}, "readOnly" = false },
+  "snapshot" = {
+    "id" = "snap-7f3a91",
+    "volumeId" = "vol-9f2c…",
+    "driver" = "zfs",
+    "mode" = "filesystem",
+    "attrs" = { "dataset" = "tank/legion/vol-9f2c@snap-7f3a91" },
+    "size" = 1073741824
+  },
+  # params, instance, allocId, node as for mount
+}
+```
+
+The caller stops writing to the volume before `snapshot`, and unmounts it
+before `restore`. A snapshot of a volume under write is only crash-consistent.
+
+`local-dir` keeps snapshots beside its volumes, at
+`<volume dir>/../local-dir-snapshots/<snapshot_id>/`:
+
+- **Filesystem mode** copies the directory tree. **Block mode** copies the disk
+  image.
+- The copy is a reflink (`FICLONE` on btrfs and XFS, `clonefile` on APFS)
+  where the filesystem supports one, so it is instant and shares blocks until
+  either side writes. Elsewhere it is a sparse copy, so the cost is the bytes
+  actually written, not the volume's size. The snapshot ref records which one
+  happened in `attrs.method` (`reflink` or `copy`).
+- Every op builds under a temporary name and renames into place, so a crash
+  never leaves a half-written snapshot, volume, or clone.
+- `restore` swaps the whole volume: files created after the snapshot are gone
+  afterward, not merged.
+- `clone` into a volume id that already exists succeeds without copying,
+  because only a finished clone can exist under that id.
+- Snapshots live on the node that took them, like the volume.
 
 ### The request
 
@@ -680,11 +740,18 @@ Volume driver conformance: example (filesystem mode)
   ✓ unmount                  released
   ✓ unmount.idempotent       second unmount succeeded
   ✓ persistence              data survived unmount/remount
+  - snapshot                 driver does not advertise `snapshot` in capabilities.ops
   ✓ destroy                  removed
   ✓ destroy.idempotent       second destroy succeeded
 
 PASS — example honors the volume contract.
 ```
+
+A driver that advertises `snapshot` also gets the snapshot checks: snapshot,
+snapshot again to the same id, mutate the volume, `restore` twice and compare
+with the snapshot-time content, `clone` twice into a new volume and compare,
+and `snapshot-delete` twice. Each optional op the driver does not advertise is
+reported as skipped.
 
 The suite needs no manager and exits non-zero on failure, so you can run it in
 CI. Pass driver params with `-p key=value` (`legion volume driver test nfs -p
@@ -713,8 +780,12 @@ restart.
 
 ## What v1 does not do
 
-- **Snapshots, clones, expansion.** Named in the contract and reserved in
-  `capabilities.ops`, but no built-in driver implements them yet.
+- **Expansion.** `expand` is a reserved name in the contract, and no driver
+  implements it.
+- **Snapshots of anything but the instance volume.** `legion snapshot`
+  ([suspend and resume](suspend-and-resume.md)) snapshots and restores an
+  instance's `stateful.storage` volume with these ops. Shared `volumes = [...]`
+  claims are never snapshotted, and nothing calls `clone` yet.
 - **Multi-writer volumes.** `accessModes` is reported and recorded, but
   anything other than single-writer is rejected for instance storage. Several
   tasks *can* share a `host` volume read-only, since it has no per-instance

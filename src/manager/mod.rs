@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod auth_method;
 pub mod cadence;
+pub mod concurrency;
 pub mod daemon;
 pub mod dispatcher;
 pub mod edge_boot;
@@ -15,4 +16,5 @@ pub mod rollout_strategy;
 pub mod scheduler;
 pub mod server;
 pub mod telemetry;
+pub mod usage;
 pub mod workload_identity;

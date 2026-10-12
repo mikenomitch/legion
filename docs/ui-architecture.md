@@ -70,7 +70,7 @@ Routes in `App.tsx`:
 - `/manager` (+ `/manager/:id`)
 - `/raft`, `/events`, `/kv`, `/access`, `/api`, `/state-explorer`,
   `/observability` (shown only when the manager reports o11y enabled),
-  `/testing`
+  `/testing` (unlisted component fixtures, see below)
 - anything else renders a not-found card naming the path
 
 A shared layout provides the grouped sidebar nav, a slim topbar
@@ -214,7 +214,10 @@ the Access page reports it instead.
 - `Nodes.tsx`: the worker index. Status is the node's liveness
   (`active`/`lost`/…). The health-check summary has its own column, a badge
   marks any availability other than `available`, and the last column is
-  labelled Heartbeat because that is what it shows.
+  labelled Heartbeat because that is what it shows. A "Memory used /
+  reserved" column shows two thin bars per node from `GetNodeUsage`, the
+  oversubscription ratio, and a red dot while the node is under memory
+  pressure (see [Usage, pressure, and snapshots](#usage-pressure-and-snapshots)).
 - `Jobs.tsx`: job list and on-demand spec retrieval, with status chips above
   the table. The chips come from `ListJobsReply.status_counts`, which the
   server counts over the whole query-matched set before the status filter.
@@ -240,21 +243,27 @@ the Access page reports it instead.
     whole card is hidden when `GetJobScaleStatus` is denied.
   - marks stateful tasks with a "stateful · slot/keyed" badge (plus storage
     path). For jobs with stateful tasks or live `ListInstances` rows, it
-    renders a polled read-only Instances panel (id, mode, color-coded state,
-    slot, current allocation, storage handle, created). Keyed instance
-    create/destroy is CLI-only (`legion instance ...`). The UI does not
-    mutate instances.
-- `pages/details/TaskDetail.tsx`: definition, volumes, artifacts, discovery,
-  health, runtime allocations, exec, logs. The header badge is the same live
-  per-task status the job page's task cards show
-  (`utils/allocations.ts` `fetchTaskStatusByName`), so the two pages agree.
+    renders a polled Instances panel (`components/InstancesTable.tsx`: id,
+    mode, color-coded state, slot, current allocation, memory, CPU, idle,
+    storage handle, created) and a Snapshots card
+    (`components/SnapshotsPanel.tsx`). Keyed instance create/destroy is
+    CLI-only (`legion instance ...`). The only instance mutation in the UI is
+    restoring one from a snapshot.
+  - shows a "Memory pressure" card, beside "Preemption history", when a
+    node's pressure response acted on this job's allocations, and Memory and
+    Idle columns on the allocation table.
+- `pages/details/TaskDetail.tsx`: four tabs, polled as one resource. See
+  [Task page](#task-page). The header badge is the same live per-task status
+  the job page's task cards show (`utils/allocations.ts`
+  `fetchTaskStatusByName`), so the two pages agree.
 - `pages/details/NodeDetail.tsx` → `components/NodeDeepView.tsx`: the worker
   page, polled. The header has **Cordon** / **Drain** (two-step confirm)
   while the node is available and **Uncordon** while it is drained. These
   call the `SetNodeAvailability` RPC behind `legion node cordon|drain|uncordon`
   ([node availability](jobs-tasks-and-scheduling.md)) and are gated by
   `node:write` on the node's pool. The RPC's reply shows under the header,
-  along with a note explaining a drained node.
+  along with a note explaining a drained node. The Usage card and the node's
+  "Memory pressure" card are described below.
 - `Services.tsx`: the discovery catalog (`ListServices`) with healthy/total
   counts. `pages/details/ServiceDetail.tsx` resolves endpoints
   (`ResolveService`, unhealthy included) and renders the same layered
@@ -270,16 +279,26 @@ the Access page reports it instead.
 - `Rollouts.tsx`: rollout list, per-group status, event logs, manual advance
   action. The detail page polls at the live cadence.
 - `Events.tsx`: live scheduler event feed with filtering and pause/resume.
-  The job and node chips on each row link to their pages.
+  The job and node chips on each row link to their pages. Expanded
+  `node.pressure` rows show the detail and hint as labeled lines, and
+  `snapshot.*` rows show snapshot, instance, kind, size, and error, above
+  the raw JSON.
 - `KeyValue.tsx`: key tree browser and CRUD/patch editor.
 - `Manager.tsx`: manager config snapshots.
 - `Raft.tsx`: under Cluster navigation. Polled consensus status, recent raft
   history, and operator commands (election, failover, membership, and join
-  tokens).
+  tokens). Commands that act on another manager (Transfer Leader, Add Voter,
+  Add Learner, Remove Member) open an inline target form, with known peer
+  ids suggested, instead of sharing one always-visible field. Transfer Leader
+  is disabled while this manager is the only settled voter.
 - `components/LogViewer.tsx`: the live task log tail, with stream and
   allocation filters and **Find in logs** (case-insensitive, hits
   highlighted, "N of M lines match").
-- `TestingUtils.tsx`: an empty placeholder page with no features.
+- `TestingUtils.tsx`: unlisted (`/testing`), lazy-loaded. Renders the
+  usage, pressure, instance (suspended, idle countdown, last stop, forks),
+  snapshot (published, named, fork and suspend checkpoints), and content
+  locality components from fixtures in `ui/src/fixtures/`, for shapes a dev
+  cluster cannot produce. Nothing on it calls the manager.
 
 ## Service Discovery
 
@@ -314,24 +333,171 @@ Storage shows up wherever you'd ask "where is my data"
 - **Worker detail**: volumes materialized on that host, with a note that
   draining or losing the node strands the node-local ones.
 
+## Task Page
+
+`/jobs/:id/tasks/:taskName` answers "is this task healthy, and if not, which
+instance and why" first, and keeps configuration on its own tab. The header
+carries the live status, an `N/M healthy` badge, and **Logs** / **Open shell**
+buttons.
+
+| Tab | Contents |
+| --- | --- |
+| **Overview** | Tiles for instances (running, or running / desired when the task has a plain count — a `job scale` override wins over the spec), health, endpoints (when the task declares a service), and failures in the last 24h. One **Instances** table: allocation, node, status, health with the reported reason, ports, artifact progress, and per-row **Logs** / **Shell** buttons; unhealthy rows sort first. **Health checks** (declared) beside **Recent events**. |
+| **Logs** | The live log viewer for this task's allocations. With more than one allocation in view it has an allocation picker. |
+| **Actions** | The task's declared actions as a list, the chosen one as a typed form with the argv it will run, a target (one instance, all running, or only the unhealthy ones), and an exit code and output per instance. **Open a shell** is the last list entry. The tab stays mounted once opened, so a shell or a running action survives switching to Logs and back. See [Exec & Actions](#exec--actions-interactive-terminal). |
+| **Spec** | Definition (including declared resources: cpus, memory reservation, memoryMax), service & ports with live endpoints, volumes, declared artifacts, and the effective network policy. |
+
+The tab is in the URL: `?tab=overview|logs|actions|spec` (default
+`overview`; an unknown value falls back to it, and `exec`, the tab's former
+id, opens Actions). `?alloc=<allocation id>` picks the allocation the Logs and
+Actions tabs start on, and `?action=<name>|shell` picks the Actions list
+entry. A row's **Logs** / **Shell** buttons set them, so a link can land on
+one allocation's logs (`/jobs/web/tasks/api?tab=logs&alloc=4219`) or a shell
+in it (`?tab=actions&action=shell&alloc=4219`). Tab changes replace the history
+entry rather than adding one.
+
+The page degrades per permission rather than failing: events (and the
+failures tile) need `operator:read`, which `ListEvents` requires; the desired
+count needs `scale:read`; matching events to this task needs `state:read`;
+allocation placement needs `node:read`. Without one, that piece says it is
+unavailable or falls back.
+
+Known limits:
+
+- **Health is one verdict per allocation.** The store keeps one healthy flag
+  and status string per allocation, not each check's last result, so the
+  Overview lists the declared checks and each instance's overall health.
+- **Failures are counted from events.** There is no restart counter; the tile
+  counts `allocation.failed` events for this task's task configs among the
+  job's last 200 events, and shows `N+` when that window is shorter than a
+  day.
+
+## Usage, pressure, and snapshots
+
+Measured usage, the memory pressure response
+([resource-enforcement.md](resource-enforcement.md)), suspend, resume, fork,
+and snapshots ([suspend-and-resume.md](suspend-and-resume.md)), and content
+locality ([artifacts.md](artifacts.md)) appear on the pages where their
+questions get asked. `utils/usage.ts`, `utils/instances.ts`,
+`utils/snapshots.ts`, and `utils/events.ts` hold the pure helpers, so the
+pages and the fixtures share one vocabulary.
+
+- **Worker page, Usage card** (`components/NodeUsagePanel.tsx`), from
+  `GetNodeUsage`: memory and CPU capacity with the `×ratio` when
+  oversubscribed, reserved (percent of what the scheduler packs against) and
+  used (percent of physical) bars, the pressure status (`ok`, `under
+  pressure`, `response off`, `status unknown`, `not reported`), every
+  allocation's res/max, used, peak, CPU, and idle, and the "Under pressure,
+  in order" list with a chip per step (`suspend` included). It matches
+  `legion node usage`. A node that reports cores but no clock speed (Apple
+  Silicon) shows `10 cores` and measures CPU use in cores. The old
+  reservation-only card stays for custom resources, and for the whole page
+  when the manager has no `GetNodeUsage` or the caller lacks `node:read`.
+- **Worker page, Content and locality card**
+  (`components/NodeContentCard.tsx`), from `GetNodeContent`: whether the
+  worker can checkpoint and publish, the snapshots captured here or fetched
+  or warmed here with their parts held, and every advertised digest with the
+  snapshot and role it belongs to and how many nodes hold it. When the
+  manager holds no content report for the node, the card says why.
+- **Workers index, Memory column**, from one `ListNodeUsage` call per poll
+  (one `GetNodeUsage` per row against a manager without it).
+- **Memory pressure cards** (`components/PressureHistory.tsx`) read
+  `node.pressure` events (job page by job, worker page by node) and put each
+  action's detail and hint on their own lines, with the instance when the
+  event names one. They need `operator:read`, like every event view, and are
+  hidden when empty.
+- **Instances card** on the job page (`components/InstancesPanel.tsx` and
+  `components/InstancesTable.tsx`): a state filter, and per instance its
+  state (`suspended` has its own accent tone, with the suspend reason and
+  any operation in flight), memory and CPU, idle time with a live countdown
+  to the idle suspend, the checkpoint (kind, local or published, size, node,
+  age) with the last suspend and restore durations, fork lineage, storage,
+  and why the platform last stopped it (`last_stop`, with the hint). Keyed
+  instances get Suspend (with a kind menu when both kinds are possible),
+  Resume, Resume cold, and Fork (count 1 to 10, and spread only when the
+  manager allows it), each a two-step confirm. Rows are keyed by instance
+  id and cells read their row through an accessor, so an armed confirm
+  survives every poll.
+- **Snapshots card** on the job page: kind, purpose, state, durability,
+  node, size, created, and expiry per snapshot, with names shown and
+  removable, and a row expansion that loads the manifest, pause time, fork
+  lineage, and which nodes hold the parts (`GetSnapshot`). Take snapshot
+  (with publish when the manager allows it; memory is a two-step confirm
+  because it pauses the guest), Restore (two-step, `local` or `published`
+  manual snapshots of keyed, running instances), Name, Warm (published
+  snapshots), and Delete (two-step).
+- **Eligibility.** Every Suspend, Fork, spread, and memory snapshot control
+  reads `InstanceInfo.checkpoint_support`, which the manager computes with
+  the same checks the RPCs apply, and shows its blocker message as the
+  tooltip. Against a manager without the field the UI falls back to the job
+  spec.
+- **Job status.** The manager stores `done` for every accepted job. The job
+  page shows `running` while any allocation or instance of the job is live.
+- **Events.** `snapshot` and `instance` are filter categories, and their
+  expanded rows show the snapshot, instance, kind, size, durations, forks,
+  and error above the raw JSON.
+- **Tolerance.** Every field the manager may not send renders as `-` or a
+  named state rather than an error. Unknown snapshot states and purposes
+  render as plain badges. Each new RPC treats `Unimplemented` and a denied
+  permission as "no card".
+
+Known limitations:
+
+- Pressure history comes from the bounded event journal and needs
+  `operator:read`. A job-scoped token sees no Memory pressure card, though
+  each instance row still shows its own last stop.
+- The Jobs index lists the stored status, so a running job reads `done`
+  there.
+- Instances, including from a snapshot (`legion instance create
+  --from-snapshot`), are created and destroyed from the CLI only.
+- The content card shows no content store budgets: `GetNodeContent` reads
+  the location index, which carries digests and sizes but not classes.
+- A macOS worker reports no usage, so the idle countdown and populated usage
+  are only visible on Linux workers with enforcement on, and on `/testing`.
+
 ## Job Templates
 
 `/templates` lists the cluster's [job templates](job-templates.md).
-`/templates/:name` is where you use a template:
+`/templates/:name` has two tabs, **Launch** and **Source**.
 
-- The run form is generated from the template's declared variables: text
-  inputs, textareas, number fields, toggles, `<select>`s, option chips for
-  `multi_select`, and a JSON editor for `json` variables. Form state is a
-  single `Record<string, unknown>` seeded from the declared defaults. It is
-  converted to typed JSON only at submit.
-- **Preview rendered spec** calls `RenderJobTemplate`, the same render the
-  submit does, so what you see is what gets submitted. Editing any value
-  invalidates a stale preview.
-- Submitting links straight to the created job. That job's page shows a
-  `template: <name> v<N>` badge linking back to the template version that
-  made it.
-- The source editor (new template, new version) renders only for identities
-  holding `template:write`.
+**Launch** is a three-step guided launch:
+
+1. **Variables.** A form generated from the template's declared variables:
+   text inputs, textareas, number fields, toggles, `<select>`s, option chips
+   for `multi_select`, and a JSON editor for `json` variables, plus the version
+   picker. Form state is a single `Record<string, unknown>` seeded from the
+   declared defaults, converted to typed JSON only when sent. **Next: review**
+   calls `RenderJobTemplate`; a render error stays on this step.
+2. **Review.** Says whether the launch **creates a new job** or **updates the
+   running job** (naming the template and version it was last launched from).
+   A values table shows what will be sent, and — when the job's current config
+   came from this same template — marks values that changed since that launch
+   (`was 1`) and keys that are new. Below it, a unified diff of the job's
+   recorded rendered spec (`job.rendered.json`) against the new render, keys
+   sorted so ordering is not a change; a new job, or a job with no JSON spec
+   recorded, gets the full rendered spec instead. Editing any value or
+   switching version sends you back to step 1.
+3. **Launch.** Calls `RunJobTemplate` with exactly the reviewed values and
+   version, then follows the rollout it started (matched on the new config
+   id) with per-group progress until it settles. **Copy as CLI** copies the
+   equivalent `legion template run <name> --version <N> --var …/--var-json …`
+   command, version pinned.
+
+The created job's page shows a `template: <name> v<N>` badge linking back to
+the template version that made it.
+
+**Source** shows the selected version's Nickel source and the version list.
+The publish editor (new version) renders only for identities holding
+`template:write`; the header's **New version** button opens it.
+
+Known limits:
+
+- The Review diff is of rendered specs. It does not say how many allocations
+  a change replaces or whether it fits; use `legion job plan` for that.
+- A token that may only launch through templates is denied `GetJobInfo` even
+  for a job that does not exist yet, so its Review says it cannot tell whether
+  the job exists, and it cannot follow the rollout.
+- The diff is skipped (full spec shown) above 20,000 lines.
 
 ## ACL-Aware Rendering
 
@@ -350,11 +516,16 @@ same rule that a selector never matches a request without that attribute.
   login link (anonymous) or a switch-identity link (authenticated). The gate
   lives at the page level because wrapping the router's outlet in any
   conditional captures it once, which freezes navigation while the URL keeps
-  changing.
+  changing. The Overview spans every resource, so it gates differently: with
+  ACLs enforced, an anonymous visitor gets the same log-in card (`LoginGate`)
+  and a logged-in identity sees each card it can read.
 - **Mutating controls** (stop/destroy job, scale, cordon/drain/uncordon,
   rollout advance/stop, KV save/delete/patch, raft commands, saved-query
-  writes, exec and actions, template publish/delete) render disabled with a
-  title explaining why.
+  writes, exec and actions, template publish/delete, snapshot
+  create/delete/restore) render disabled with a title explaining why. The
+  Snapshots card is hidden without `snapshot:read` on the job. Take snapshot
+  and Delete need `snapshot:write`, and Restore needs `snapshot:read` and
+  `job:write`.
 - **Access page** shows admin tabs only with `acl:read` (worker join needs
   `node:read`).
 
@@ -435,16 +606,42 @@ committed files differ, so a proto change cannot merge without its client.
 ## Exec & Actions (interactive terminal)
 
 The task detail page (`pages/details/JobDetail.tsx` → `TaskDetail.tsx`) has an
-**Exec & Actions** section listing this task's running allocations. These are
-the job's allocations from `GetLedger`, narrowed to the ones that run the
-page's task. The ledger carries only `task_config_id`, so the task name comes
-from the state-store lookup that also carries allocation health. A token
-without `state:read` cannot make that mapping. In that case the section lists
-every running allocation of the job (the manager still rejects an exec whose
-allocation runs a different task). Each listed allocation gets an
-`AllocationExecPanel` with a command launcher (interactive-tty toggle). For
-tasks that declare actions, it also shows action forms generated from the
-parameter schema (`ListJobActions`, filtered to this task).
+**Actions** tab (`components/TaskActions.tsx`). Its targets are the job's
+allocations from `GetLedger`, narrowed to the ones that run the page's task.
+The ledger carries only `task_config_id`, so the task name comes from the
+state-store lookup that also carries allocation health. A token without
+`state:read` cannot make that mapping. In that case every running allocation
+of the job is offered (the manager still rejects an exec whose allocation runs
+a different task).
+
+The left list is the task's actions (`ListJobActions`, filtered to this task)
+plus **Open a shell**. The chosen action shows:
+
+- **Parameters**, one control per declared type: an `enum` of up to four
+  values is a segmented control, five or more a chip group; `int` and
+  `string` are text inputs checked as you type against `min`/`max` and
+  `pattern` (the same rules as `ActionParam::validate_value`); a `sensitive`
+  string is masked; `bool` is a switch. A required empty value, or any value
+  that fails its check, disables **Run** with the reason under the field.
+  Empty optional values are left out, so the manager applies the default.
+- **Runs**: the action's `command` from the jobspec with the current values
+  substituted for `${param.<name>}` (sensitive values masked). The manager
+  still renders the real argv; this is a preview.
+- **Run on**: one instance (chips with health dots; default the URL's
+  `alloc`, else the first unhealthy, else the first), all running, or only the
+  unhealthy ones. A `tty` action runs in one instance only.
+- **Run**, and under it the equivalent `legion action run <job> <action>
+  --alloc <id> --param k=v` line (`***` for sensitive values).
+- **Result**: one row per instance with its exit code, duration, last line,
+  and output (stderr tinted), opened automatically for a failure or a single
+  target.
+
+Running on several instances opens one exec session per allocation, all at
+once; there is no multi-allocation RPC. A `tty` action, and the shell entry
+(command plus an *Interactive (tty)* toggle), open an xterm.js terminal. The
+action list, form values, and results are kept while you switch actions, and
+open sessions close when you leave the page. There is no run history: results
+live in the page.
 
 Exec is the one part of the UI that does not use gRPC-Web, because browsers
 cannot do bidirectional streaming over it. `ui/src/lib/execSocket.ts` opens a

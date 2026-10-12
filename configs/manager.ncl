@@ -44,8 +44,30 @@
   #   # Cap on concurrent unratified claims per node.
   #   maxProvisionalPerNode = 32,
   # },
+  # Automatic suspend (docs/suspend-and-resume.md, "Idle policy"). The idle
+  # sweep reads the usage reports workers send every 10s and suspends
+  # instances quiet past their task's `suspend.idle.after`. It reads no
+  # store state until it has something to suspend.
+  # suspend = {
+  #   idleSweep = "15s",
+  #   # When a resume waits on its checkpoint's node because the node is
+  #   # full, suspend the most idle suspendable instances there until it
+  #   # fits (docs/suspend-and-resume.md, "Capacity for resumes").
+  #   makeRoom = true,
+  # },
   schedulerSettings = {
     plan_conflict_max_retries = 3,
+    # Score weights (docs/jobs-tasks-and-scheduling.md, "Score weights"). The
+    # values below are the defaults. `spread` and `bin_pack` follow the
+    # scheduling policy.
+    # weights = {
+    #   affinities = 1.0,
+    #   automatic_anti_affinity = 0.2,
+    #   # Prefer nodes whose content store already holds a placement's
+    #   # digest-pinned artifacts. 0 turns it off (docs/artifacts.md,
+    #   # "Content locality").
+    #   locality = 1.0,
+    # },
     # Late-binding plan apply (docs/late-binding-plan-apply.md): ranked
     # candidates per placement; the apply binds the first candidate whose
     # node epoch is unchanged, so concurrent submits cost a fallback rank
@@ -80,6 +102,32 @@
     #   # thrash guard there is: without it a plan can undo the placement a
     #   # previous plan made seconds earlier.
     #   victimExemptAge = "60s",
+    # },
+    #
+    # Adaptive scheduler concurrency
+    # (docs/adaptive-scheduler-concurrency.md). The manager measures its own
+    # plan-apply conflict rate and tunes how many evals it will PLAN at once,
+    # between `min` and `max`. Eval kinds that cannot conflict (today,
+    # `job_stop`) are never throttled. `evalThreads` stays the worker-pool
+    # size and becomes the ceiling the controller backs off from — only on
+    # evidence, and only in `enforce`.
+    #
+    # adaptiveConcurrency = {
+    #   # enforce — measure and actuate.
+    #   # observe  — measure, export what it WOULD do, actuate nothing. The
+    #   #            default, and the same evidence-before-action posture as
+    #   #            `preemption.mode`.
+    #   # off      — do not run the controller at all (today's behavior).
+    #   mode = "observe",
+    #   # Floor and ceiling on admitted planners. `max` defaults to
+    #   # `evalThreads` and can never exceed it; `min` must be at least 1.
+    #   # Setting `min` and `max` to the same value pins the limit.
+    #   min = 1,
+    #   # max = 16,
+    #   # Trip points on the conflict rate. The gap between them is the dead
+    #   # band that stops the controller hunting.
+    #   # highWatermark = 0.20,   # above this, halve the limit
+    #   # lowWatermark  = 0.05,   # below this for 2s, add one back
     # },
     #
     # Plan-path scale levers (docs/scheduler-and-eval-loop.md). Both are on
