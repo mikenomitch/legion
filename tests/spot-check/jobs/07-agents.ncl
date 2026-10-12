@@ -26,7 +26,6 @@ let images = (import "lib/images.ncl") vars in
       runtime = "sandbox",
       stateful = {
         mode = "keyed",
-        idSource = "uuid",
         storage = { path = "/workspace", mode = "block", params = { size = "1G" } },
       },
       config = {
@@ -46,7 +45,6 @@ let images = (import "lib/images.ncl") vars in
       runtime = "container",
       stateful = {
         mode = "keyed",
-        idSource = "uuid",
         storage = { path = "/workspace", driver = "local-dir", params = { size = "1G" } },
       },
       config = {
