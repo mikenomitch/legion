@@ -869,6 +869,47 @@
             config = {
                 command = ["sleep", "600"],
             },
+            # Idle sessions (docs/session-mode.md, "Idle sessions"): a
+            # session task may suspend on its own node. The node captures
+            # the checkpoint, frees the session's share of the envelope, and
+            # resumes it there on `legion instance start <id>`, with no raft
+            # entry at any step. Every keyed `suspend` field applies except
+            # `reserve` (the envelope is the reservation). This exec task
+            # suspends to disk, which keeps nothing but the session's id and
+            # spec: a resume boots it fresh under the same id. A `sandbox`
+            # session keeps its memory.
+            suspend = {
+                # "local": the checkpoint stays on this session's node and is
+                # lost with it. ("store", publishing it to the contentStore
+                # so it resumes anywhere, is not available for unpromoted
+                # sessions yet.)
+                durability = "local",
+                # Suspend a session automatically once quiet (needs
+                # resourceEnforcement on the worker). Decided on the node.
+                idle = { after = "5m" },
+                # How long the node keeps a suspended session's checkpoint
+                # before it evicts it, and then how long it remembers the
+                # eviction so the session answers `evicted` rather than
+                # `not found`. Default "24h", at least "1m". Session tasks
+                # only. Disk pressure (content.minFreeDisk) can evict
+                # earlier, oldest first.
+                keepFor = "24h",
+                # What a gracefully stopping worker (SIGTERM, an upgrade)
+                # does with running sessions: "keep" (default) leaves them
+                # running for the restarted worker to re-adopt;
+                # "checkpoint" checkpoints each one first, within the
+                # worker's edgeBoot.stopCheckpointTimeout, so a session
+                # whose process did not survive is restored on this node.
+                # Session tasks only.
+                onWorkerStop = "checkpoint",
+                # Checkpoint each running session this often without
+                # stopping it, replacing the previous checkpoint. Off by
+                # default; a full memory image per session per interval, at
+                # least "1m". Needs a memory checkpoint (runtime = "sandbox"),
+                # so this exec task leaves it out (job validation refuses it
+                # here). Session tasks only.
+                # checkpointEvery = "10m",
+            },
             # One session's size, in the envelope's units.
             resources = {
                 cpu = 250,

@@ -409,13 +409,10 @@ pub fn validate_session_task(task: &TaskConfig) -> R<()> {
         let resolved = suspend
             .resolve()
             .map_err(|err| anyhow!("task {name}: {err}"))?;
-        if resolved.durability != crate::structs::snapshot::SnapshotDurability::Store {
-            bail!(
-                "task {name} is a session task and sets suspend with durability = \"local\". A \
-                 promoted session's node is wherever its envelope had room, so its checkpoint \
-                 must be published\nHint: set suspend.durability = \"store\""
-            );
-        }
+        // `durability = "local"` is valid (session durability plan §6.6): an
+        // unpromoted session sleeps on its own node, pinned until
+        // `suspend.keepFor`, and a promoted one is a keyed instance whose
+        // local checkpoint resumes on its node like any other.
         if resolved.reserve != crate::structs::suspend::SuspendReserve::NONE {
             bail!(
                 "task {name} is a session task and sets suspend.reserve. The envelope is the \
@@ -567,6 +564,27 @@ mod session_test {
         });
         let err = validate_session_task(&task).expect_err("no cpu");
         assert!(err.to_string().contains("does not set cpu"), "{err}");
+        Ok(())
+    }
+
+    /// Session durability plan §6.6: a session may sleep on its own node.
+    #[test]
+    fn a_session_may_suspend_locally_but_not_reserve_test() -> R<()> {
+        let mut config = job(vec![session_task()]);
+        normalize_session_tasks(&mut config)?;
+        let mut task = config.tasks[0].clone();
+        task.suspend = Some(serde_json::from_value(json!({
+            "durability": "local",
+            "idle": { "after": "3m" },
+            "keepFor": "2h",
+            "onWorkerStop": "checkpoint",
+        }))?);
+        validate_session_task(&task)?;
+        crate::structs::suspend::validate_suspend(&task).map_err(|err| anyhow!(err))?;
+
+        task.suspend = Some(serde_json::from_value(json!({ "reserve": 0.5 }))?);
+        let err = validate_session_task(&task).expect_err("reserve");
+        assert!(err.to_string().contains("envelope is the"), "{err}");
         Ok(())
     }
 
