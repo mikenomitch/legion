@@ -955,7 +955,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_action_run",
-            description: "Run a declared action against a running allocation and return its combined output and exit code. One-shot (no interactive tty). Mutating.",
+            description: "Run a declared action against a running allocation and return `exitCode`, `stdout`, `stderr`, and `message`. One-shot (no interactive tty). Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -971,7 +971,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_exec_run",
-            description: "Run a one-shot command inside a running allocation and return its stdout, stderr, and exit code. No interactive tty. Mutating; requires exec:write.",
+            description: "Run a one-shot command inside a running allocation and return `exitCode`, `stdout`, `stderr`, and `message`. No interactive tty. Mutating; requires exec:write.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -2025,7 +2025,7 @@ async fn run_exec_oneshot(
     }
 
     Ok(json!({
-        "exit_code": exit_code,
+        "exitCode": exit_code,
         "stdout": String::from_utf8_lossy(&stdout),
         "stderr": String::from_utf8_lossy(&stderr),
         "message": exit_message,
