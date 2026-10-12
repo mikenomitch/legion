@@ -227,9 +227,20 @@ impl Store {
              VALUES (1, ?1, ?2, ?3);",
             params![candidate.cert_pem, candidate.key_pem, candidate.created_at],
         )?;
-        drop(conn);
-        self.mesh_ca()?
-            .ok_or_else(|| anyhow::anyhow!("mesh CA row missing after insert"))
+        // Read back on the write connection: inside a raft apply the insert
+        // is not committed yet, so a pooled read connection cannot see it.
+        conn.query_row(
+            "SELECT cert_pem, key_pem, created_at FROM net_mesh_ca WHERE id = 1;",
+            [],
+            |row| {
+                Ok(MeshCa {
+                    cert_pem: row.get(0)?,
+                    key_pem: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            },
+        )
+        .map_err(Into::into)
     }
 
     /// Replace the mesh CA. Every node re-issues its certificate on its
