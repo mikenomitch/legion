@@ -21,8 +21,8 @@ capture mutex. Control and status stay in `store.sqlite`; read connections
 the one shared file and called the scaling "near-linear until aggregate
 local write work saturates one core", deferring per-file partitioning to a
 v2/v3 fork. Re-reading the pipeline showed the cycle is strictly serial per
-group — capture, `block_on(client_write)`, reply (`src/storage/raft/driver.rs:1696`,
-`:1795`) — with both capture and apply under the process-global mutex
+group — capture, `block_on(client_write)`, reply (`src/storage/raft/driver.rs:1965`,
+`:2064`) — with both capture and apply under the process-global mutex
 (`src/storage/raft/capture.rs:230`, `:760`). N groups over one file overlap
 only the quorum round-trip, and after the batching work the local body of a
 batch (~20 ms at depth, phase 5) dwarfs a same-AZ round-trip (1–3 ms). The
@@ -53,7 +53,7 @@ be multiplied is the SQLite writer, and SQLite is single-writer *per file*
 (TiKV's shared-engine multi-raft scales only because RocksDB is
 multi-writer). Per-file shards also delete revision 1's biggest new
 mechanism — row-scoped snapshot dump/install — because the whole-file
-`VACUUM INTO` path already exists (`driver.rs:3260`), and they make
+`VACUUM INTO` path already exists (`driver.rs:3578`), and they make
 ownership *physical*: a shard's connection cannot reach another shard's
 rows, so the guard stays table-granular and the only new check is routing.
 Fewer new mechanisms for a real multiplier is the better trade.
@@ -190,7 +190,7 @@ vertical lanes per feature only widen.
 **Call.** No method graduates until Phase 0 names the bottleneck *per
 fleet-size regime*. Revision 2 made Phase 0 cheap: the capture-vs-propose
 split is already metered (`legion_raft_capture_seconds` /
-`legion_raft_propose_apply_seconds`, `src/manager/telemetry.rs:859`), plus
+`legion_raft_propose_apply_seconds`, `src/manager/telemetry.rs:872`), plus
 one in-process micro-benchmark of N pipelines over one file versus N files.
 Revision 3 makes it cheaper again: the native submitter shipped, the
 October campaigns measured the ceiling from 1k to 50k nodes, and
