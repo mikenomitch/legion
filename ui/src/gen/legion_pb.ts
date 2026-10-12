@@ -6001,6 +6001,31 @@ export class InstanceInfo extends Message<InstanceInfo> {
    */
   guestBridge?: string;
 
+  /**
+   * Where the instance's current allocation serves each of its declared
+   * `network.ports`: the node's advertised address and the advertised
+   * (host) port, the same pair the service catalog publishes. Empty while
+   * the instance has no allocation (pending, suspended, stopped) and on
+   * rows placed before the node advertised an address. Set by GetInstance
+   * only; ListInstances leaves it empty. `legion start gateway` dials the
+   * entry named by `wake.port` (docs/gateway.md).
+   *
+   * @generated from field: repeated legion.InstanceEndpoint endpoints = 37;
+   */
+  endpoints: InstanceEndpoint[] = [];
+
+  /**
+   * The task's `suspend.wake` block, when it declares one: the instance
+   * accepts wake on request through `legion start gateway`, which resumes
+   * it when a request arrives while it is suspended and holds the request
+   * until the instance serves. Unset means the gateway refuses to route to
+   * this instance. Resolved from the newest config of the instance's job
+   * and task. Set by GetInstance only.
+   *
+   * @generated from field: optional legion.InstanceWake wake = 38;
+   */
+  wake?: InstanceWake;
+
   constructor(data?: PartialMessage<InstanceInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6045,6 +6070,8 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 34, name: "cold_boot", kind: "message", T: InstanceColdBoot, opt: true },
     { no: 35, name: "guest_address", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 36, name: "guest_bridge", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 37, name: "endpoints", kind: "message", T: InstanceEndpoint, repeated: true },
+    { no: 38, name: "wake", kind: "message", T: InstanceWake, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
@@ -6061,6 +6088,116 @@ export class InstanceInfo extends Message<InstanceInfo> {
 
   static equals(a: InstanceInfo | PlainMessage<InstanceInfo> | undefined, b: InstanceInfo | PlainMessage<InstanceInfo> | undefined): boolean {
     return proto3.util.equals(InstanceInfo, a, b);
+  }
+}
+
+/**
+ * One served port of an instance (InstanceInfo.endpoints).
+ *
+ * @generated from message legion.InstanceEndpoint
+ */
+export class InstanceEndpoint extends Message<InstanceEndpoint> {
+  /**
+   * The port's label in the task's `network.ports` (`http`).
+   *
+   * @generated from field: string port = 1;
+   */
+  port = "";
+
+  /**
+   * The node's advertised address (an IP or hostname). Empty when the node
+   * advertises none.
+   *
+   * @generated from field: string address = 2;
+   */
+  address = "";
+
+  /**
+   * The advertised port number: what the catalog, health checks, and the
+   * gateway dial. With an ingress chain this is the datapath's port in front
+   * of the task, so the chain applies to gateway traffic too.
+   *
+   * @generated from field: uint32 number = 3;
+   */
+  number = 0;
+
+  constructor(data?: PartialMessage<InstanceEndpoint>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InstanceEndpoint";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "port", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "number", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceEndpoint {
+    return new InstanceEndpoint().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InstanceEndpoint {
+    return new InstanceEndpoint().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InstanceEndpoint {
+    return new InstanceEndpoint().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InstanceEndpoint | PlainMessage<InstanceEndpoint> | undefined, b: InstanceEndpoint | PlainMessage<InstanceEndpoint> | undefined): boolean {
+    return proto3.util.equals(InstanceEndpoint, a, b);
+  }
+}
+
+/**
+ * The resolved `suspend.wake` block of an instance's task.
+ *
+ * @generated from message legion.InstanceWake
+ */
+export class InstanceWake extends Message<InstanceWake> {
+  /**
+   * The `network.ports` label requests are sent to.
+   *
+   * @generated from field: string port = 1;
+   */
+  port = "";
+
+  /**
+   * How long a gateway holds a request while the instance resumes before it
+   * answers `503` with `Retry-After`, in milliseconds. Defaults to 30000.
+   *
+   * @generated from field: uint64 timeout_ms = 2;
+   */
+  timeoutMs = protoInt64.zero;
+
+  constructor(data?: PartialMessage<InstanceWake>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InstanceWake";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "port", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "timeout_ms", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceWake {
+    return new InstanceWake().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InstanceWake {
+    return new InstanceWake().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InstanceWake {
+    return new InstanceWake().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InstanceWake | PlainMessage<InstanceWake> | undefined, b: InstanceWake | PlainMessage<InstanceWake> | undefined): boolean {
+    return proto3.util.equals(InstanceWake, a, b);
   }
 }
 
