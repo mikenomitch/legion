@@ -1,0 +1,96 @@
+diff --git a/src/task_plugins/sandbox.rs b/src/task_plugins/sandbox.rs
+index d5101382..f321d573 100644
+--- a/src/task_plugins/sandbox.rs
++++ b/src/task_plugins/sandbox.rs
+@@ -560,7 +560,10 @@ fn build_apple_launch(
+         args.push(format!("{key}={value}"));
+     }
+     args.push(config.image.clone());
+-    args.push("--".to_string());
++    // SPOT-CHECK SHIM, not for merge: Apple `container run` treats a `--`
++    // after the image as the executable ("failed to find target executable
++    // --"), which the container runtime already avoids (container.rs). The
++    // real fix also needs a story for commands whose first token is a flag.
+     args.extend(config.command.clone());
+     args
+ }
+@@ -1737,11 +1740,9 @@ mod tests {
+             "read-only volumes bind read-only"
+         );
+         assert!(args.contains(&"MODE=test".to_string()));
+-        // `--` guards a command whose first token looks like a flag.
+-        let sep = args.iter().position(|a| a == "--").expect("separator");
++        // SPOT-CHECK SHIM: no `--` separator (see build_apple_args).
+         let image = args.iter().position(|a| a == "alpine").expect("image");
+-        assert_eq!(sep, image + 1);
+-        assert_eq!(args[sep + 1], "-l");
++        assert_eq!(args[image + 1], "-l");
+         Ok(())
+     }
+ 
+diff --git a/src/worker/daemon.rs b/src/worker/daemon.rs
+index 63dee8b2..21d625a5 100644
+--- a/src/worker/daemon.rs
++++ b/src/worker/daemon.rs
+@@ -135,7 +135,15 @@ async fn run_worker_with_manager(
+     join_secret: Option<String>,
+ ) -> R<()> {
+     let server_port = worker_server_port();
+-    let addr = format!("{DEF_MANAGER_HOSTNAME}:{server_port}").parse()?;
++    // SPOT-CHECK SHIM, not for merge: lets a worker on another host be
++    // dialed by the managers. The listener is still unauthenticated, so the
++    // spot-check rig limits 4848 to the managers' security group. The real
++    // fix is internal_docs/plans/worker-plane-auth-plan.md.
++    let bind_host =
++        std::env::var("LEGION_WORKER_HOST").unwrap_or_else(|_| DEF_MANAGER_HOSTNAME.to_string());
++    let advertise_host = std::env::var("LEGION_WORKER_ADVERTISE_ADDR")
++        .unwrap_or_else(|_| DEF_MANAGER_HOSTNAME.to_string());
++    let addr = format!("{bind_host}:{server_port}").parse()?;
+ 
+     info!(%manager_addr, %worker_type, "Worker connecting to manager");
+ 
+@@ -314,7 +322,7 @@ async fn run_worker_with_manager(
+     }
+     config_attrs.insert(
+         "workerAddress".into(),
+-        Value::String(format!("http://{}:{}", DEF_MANAGER_HOSTNAME, server_port)),
++        Value::String(format!("http://{}:{}", advertise_host, server_port)),
+     );
+     // The cadence this node will actually beat at, so the manager can derive
+     // its lost window from it (`missedBeatsBeforeLost x this`) instead of
+diff --git a/src/worker/task_manager.rs b/src/worker/task_manager.rs
+index afc74c81..2ac3c40e 100644
+--- a/src/worker/task_manager.rs
++++ b/src/worker/task_manager.rs
+@@ -3329,9 +3329,15 @@ fn spawn_provisional_staging_thread(
+     let gate = job.gate;
+     let manager_for_thread = manager.clone();
+     let claim_for_thread = claim_id.clone();
++    // SPOT-CHECK SHIM, not for merge as-is: staging runs on a plain OS thread,
++    // and the health monitor it starts afterwards calls tokio::spawn, which
++    // panics outside a runtime ("there is no reactor running"). Carry the
++    // runtime into the thread so artifact-staged tasks get health checks.
++    let runtime = tokio::runtime::Handle::try_current().ok();
+     let spawned = std::thread::Builder::new()
+         .name(format!("provisional-staging-{allocation_id}"))
+         .spawn(move || {
++            let _runtime = runtime.as_ref().map(|handle| handle.enter());
+             let manager = manager_for_thread;
+             let result = job.stager.stage_task_artifacts(
+                 allocation_id,
+@@ -3376,9 +3382,15 @@ fn spawn_provisional_staging_thread(
+ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob) {
+     let allocation_id = job.allocation.id;
+     let manager_for_thread = manager.clone();
++    // SPOT-CHECK SHIM, not for merge as-is: staging runs on a plain OS thread,
++    // and the health monitor it starts afterwards calls tokio::spawn, which
++    // panics outside a runtime ("there is no reactor running"). Carry the
++    // runtime into the thread so artifact-staged tasks get health checks.
++    let runtime = tokio::runtime::Handle::try_current().ok();
+     let spawned = std::thread::Builder::new()
+         .name(format!("artifact-staging-{allocation_id}"))
+         .spawn(move || {
++            let _runtime = runtime.as_ref().map(|handle| handle.enter());
+             let manager = manager_for_thread;
+             let result = job.stager.stage_task_artifacts(
+                 allocation_id,

@@ -20,13 +20,46 @@ How to use it:
       `http://127.0.0.1:4848` (`src/worker/daemon.rs:137-138`, `:315-318`).
       Opening the port is not the fix, because `PostWork`, `ExecTask`,
       `GetTaskLogs`, and `RestartWorker` authenticate nobody. Found while
-      preparing the pre-launch AWS spot check, which is paused until this
-      lands. Plan: [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md)
+      preparing the pre-launch AWS spot check, which ran on a temporary shim
+      (`tests/spot-check/shims.patch`). Plan: [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md)
       (PLANNED) · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
 
+- [ ] **Launch blockers from the AWS spot check (2026-10-11).** Each has
+      evidence and a root cause in
+      [launch-spot-check-findings.md](launch-spot-check-findings.md) (the IDs
+      below are that doc's); rerun with `tests/spot-check/smoke.sh`.
+  - [ ] **Batch tasks never finish (P0-2).** The worker rebuilds `TaskConfig`
+        without `lifecycle` or `restart`, so batch tasks restart forever after
+        exit 0 and jobspec restart policies are ignored.
+  - [ ] **Health checks never start for artifact-staged tasks (P0-3),** which
+        includes every container image under `containerImageDesugar`. The
+        staging thread calls `tokio::spawn` outside a runtime. Shimmed in
+        `tests/spot-check/shims.patch`, and the shim is likely the real fix.
+  - [ ] **DAG ordering is not enforced (P0-4).** The scheduler treats planned
+        batch deps as satisfied, and the worker has no gating.
+  - [ ] **One manager down strands every worker (P0-5).** Followers fail to
+        forward heartbeats in the `single` topology (lane mismatch), and
+        workers know one manager.
+  - [ ] **Recovered nodes stay unschedulable (P0-6)** until `node uncordon`.
+  - [ ] **Stock nginx and Postgres images fail in Linux containers (P0-7):**
+        minimal capabilities, ownership dropped on extraction, root-owned
+        stdout/stderr. The repo's `container-service.ncl`, `fullstack.ncl`,
+        and `postgres.ncl` cannot run on Linux.
+  - [ ] **Workers cannot restart after their join token expires (P0-8)**, which
+        conflicts with the docs' advice to keep join tokens short-lived.
+  - [ ] **P1s:** resource enforcement never turns on; static ports deadlock
+        placement, reschedules, and rollouts; reschedules exclude the only
+        viable node (and advise deleting healthy data); gated netns race;
+        orphaned tasks after a worker re-join; macOS sandbox `--` (shimmed);
+        allocation id reuse; misleading job status; failure causes buried.
+        Details in the findings doc.
+  - [ ] **P2s:** eleven papercuts (error mapping, `kv get` on a missing key,
+        README commands, follower write hints, startup log noise, and more).
+        Details in the findings doc.
+
 - [ ] **Pre-launch spot check findings (2026-10-11), from reading the code
-      while preparing the AWS run.** None of these block the worker-plane
-      work. Each is verified in source unless marked otherwise.
+      while preparing the AWS run.** Each is verified in source unless marked
+      otherwise.
   - [ ] **README says `legion start manager` works without a config file.**
         It does not. With no `-c`, it evaluates `./configs/manager.ncl`
         (`src/constants.rs:55`) and fails outside a repo checkout, so the
