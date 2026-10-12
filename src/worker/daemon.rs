@@ -191,7 +191,7 @@ struct RegistrationPayload {
 /// What this worker advertises at registration: it always takes
 /// checkpoints and fetches published snapshot parts it does not hold, and it
 /// publishes snapshot parts when a `contentStore` is configured (and usable).
-fn worker_capabilities(publishing: bool) -> Vec<String> {
+fn worker_capabilities(publishing: bool, edge_sessions: bool) -> Vec<String> {
     let mut capabilities = vec![
         crate::structs::snapshot::CHECKPOINT_CAPABILITY.to_string(),
         crate::structs::snapshot::CHECKPOINT_FETCH_CAPABILITY.to_string(),
@@ -206,6 +206,12 @@ fn worker_capabilities(publishing: bool) -> Vec<String> {
     ];
     if publishing {
         capabilities.push(crate::structs::snapshot::CONTENT_PUBLISH_CAPABILITY.to_string());
+    }
+    // Serves `Worker.StartSession` on a session ticket
+    // (`edgeBoot.acceptClaims`). `ListSessionNodes` reports a node without
+    // it as not accepting edge starts.
+    if edge_sessions {
+        capabilities.push(crate::structs::session::EDGE_SESSIONS_CAPABILITY.to_string());
     }
     capabilities
 }
@@ -666,6 +672,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 .expect("task manager")
                 .content_publishing()
                 .is_some(),
+            edge_boot_config.accept_claims,
         ),
     };
     let reported_managers = register_self(client.clone(), &registration, &credentials).await?;
@@ -4313,7 +4320,7 @@ mod tests {
                 config_attrs: "{}".into(),
                 fingerprint_attrs: "{}".into(),
                 health_checks: "[]".into(),
-                capabilities: worker_capabilities(false),
+                capabilities: worker_capabilities(false, false),
             },
             Arc::new(UpstreamForwarder::new()),
             Duration::from_secs(WORKER_HEARTBEAT_DURATION_SEC),

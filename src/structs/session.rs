@@ -39,6 +39,10 @@ use std::collections::BTreeMap;
 /// constraint, so one is never placed on a worker that predates sessions.
 pub const SESSIONS_CAPABILITY: &str = "sessions";
 
+/// A node that starts sessions on a session ticket (`Worker.StartSession`),
+/// advertised when `edgeBoot.acceptClaims` is on.
+pub const EDGE_SESSIONS_CAPABILITY: &str = "edge-sessions";
+
 /// The built-in runtime of a generated envelope task. It starts nothing:
 /// the allocation is a reservation. Reserved, so a jobspec cannot declare a
 /// task on it.

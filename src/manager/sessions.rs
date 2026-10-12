@@ -587,6 +587,106 @@ fn rank(view: &RoomView, needs: &BTreeMap<String, f64>) -> Vec<String> {
     ranked.into_iter().map(|(_, node_id)| node_id).collect()
 }
 
+/// Every node holding an envelope for a session task, for an edge picker
+/// (`Manager.ListSessionNodes`). Read from the store's envelope rows and
+/// node rows plus the session index's usage; no node is called.
+pub async fn session_nodes(
+    store: &Store,
+    job_id: &str,
+    task: &TaskConfig,
+) -> Result<Vec<crate::structs::SessionNode>, Status> {
+    let envelopes = placed_envelopes(store, job_id, &task.name)
+        .map_err(|err| Status::internal(format!("failed to read envelopes: {err:#}")))?;
+    let usage = query(
+        store,
+        QuerySessionsRequest {
+            job_id: job_id.to_string(),
+            task_name: task.name.clone(),
+            usage_only: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .usage;
+    let needs = resource_amounts(&task.resources);
+    let mut nodes: Vec<crate::structs::SessionNode> = envelopes
+        .into_iter()
+        .map(|envelope| {
+            let node = store.get_node(&envelope.node_id).ok();
+            let used = usage.get(&envelope.node_id);
+            let room: BTreeMap<String, f64> = envelope
+                .room
+                .iter()
+                .map(|(name, amount)| {
+                    let taken = used
+                        .and_then(|used| used.amounts.get(name))
+                        .copied()
+                        .unwrap_or(0.0);
+                    (name.clone(), (amount - taken).max(0.0))
+                })
+                .collect();
+            let weight = fits(&room, &needs);
+            let address = node
+                .as_ref()
+                .and_then(crate::manager::worker_plane::worker_address)
+                .unwrap_or_default();
+            let reason = match &node {
+                None => "lost",
+                Some(node) if node.status == "lost" => "lost",
+                Some(node) if node.status != "ready" => "down",
+                Some(node) if node.availability == "draining" || node.availability == "drained" => {
+                    "draining"
+                }
+                Some(node) if node.availability != "available" => "ineligible",
+                Some(_) if address.is_empty() => "no-address",
+                Some(node)
+                    if !crate::structs::snapshot::node_advertises(
+                        node,
+                        crate::structs::session::EDGE_SESSIONS_CAPABILITY,
+                    ) =>
+                {
+                    "no-edge-sessions"
+                }
+                Some(_) if weight == 0 => "full",
+                Some(_) => "",
+            };
+            crate::structs::SessionNode {
+                tag: crate::structs::node_tag(&envelope.node_id),
+                node_id: envelope.node_id,
+                address,
+                accepting: reason.is_empty(),
+                reason: reason.to_string(),
+                room: serde_json::to_string(&room).unwrap_or_else(|_| "{}".into()),
+                weight,
+                sessions: used.map(|used| used.sessions).unwrap_or(0),
+            }
+        })
+        .collect();
+    nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    Ok(nodes)
+}
+
+/// How many sessions needing `needs` fit in `room`. A resource the session
+/// does not size does not bound it; a session that sizes nothing fits
+/// without bound (reported as `u32::MAX`).
+fn fits(room: &BTreeMap<String, f64>, needs: &BTreeMap<String, f64>) -> u32 {
+    let mut fit = f64::INFINITY;
+    for (name, need) in needs {
+        if *need <= 0.0 {
+            continue;
+        }
+        let Some(left) = room.get(name) else {
+            continue;
+        };
+        fit = fit.min((left / need + 1e-9).floor());
+    }
+    if fit.is_infinite() {
+        u32::MAX
+    } else {
+        fit.clamp(0.0, u32::MAX as f64) as u32
+    }
+}
+
 /// A session the router started (or found running, for a retried
 /// idempotent create).
 #[derive(Debug, Clone)]
@@ -983,5 +1083,15 @@ mod sessions_test {
             rank(&view, &needs),
             vec!["idle".to_string(), "busy".to_string()]
         );
+    }
+
+    #[test]
+    fn the_node_list_weighs_room_in_sessions_of_the_task_size_test() {
+        let room = BTreeMap::from([("cpu".to_string(), 2100.0), ("memory".to_string(), 512.0)]);
+        let needs = BTreeMap::from([("cpu".to_string(), 500.0), ("memory".to_string(), 128.0)]);
+        assert_eq!(fits(&room, &needs), 4);
+        let tight = BTreeMap::from([("cpu".to_string(), 499.0)]);
+        assert_eq!(fits(&tight, &needs), 0);
+        assert_eq!(fits(&room, &BTreeMap::new()), u32::MAX);
     }
 }

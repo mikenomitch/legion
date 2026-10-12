@@ -37,6 +37,60 @@ impl RecordedPromotion {
 }
 
 impl ManagerDaemonService {
+    /// ListSessionNodes: the nodes an edge picker may start sessions on.
+    pub(super) async fn list_session_nodes_rpc(
+        &self,
+        request: Request<crate::structs::ListSessionNodesRequest>,
+    ) -> Result<Response<crate::structs::ListSessionNodesReply>, Status> {
+        let ident = self.authenticate_acl(&request)?;
+        let request = request.into_inner();
+        if request.job_id.trim().is_empty() {
+            return Err(Status::invalid_argument("job_id is required"));
+        }
+        acl::enforce(
+            &ident,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::job(&request.job_id),
+        )?;
+        let config = self
+            .store
+            .get_job_config(&request.job_id)
+            .map_err(|_| Status::not_found(format!("job {} not found", request.job_id)))?;
+        let session_tasks: Vec<&TaskConfig> = config
+            .tasks
+            .iter()
+            .filter(|task| crate::structs::session::is_session_task(task))
+            .collect();
+        let task = match request.task_name.as_str() {
+            "" if session_tasks.len() == 1 => session_tasks[0],
+            "" => {
+                return Err(Status::failed_precondition(format!(
+                    "job {} has {} session tasks; name one with task_name",
+                    request.job_id,
+                    session_tasks.len()
+                )))
+            }
+            name => session_tasks
+                .iter()
+                .find(|task| task.name == name)
+                .copied()
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "job {} has no session task {name}",
+                        request.job_id
+                    ))
+                })?,
+        };
+        let nodes = sessions::session_nodes(&self.store, &request.job_id, task).await?;
+        Ok(Response::new(crate::structs::ListSessionNodesReply {
+            job_id: request.job_id,
+            task_name: task.name.clone(),
+            nodes,
+            as_of: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        }))
+    }
+
     /// CreateInstance without an id on a session task: start an unnamed
     /// session through the router. Writes nothing to the replicated store;
     /// an idempotency key derives the id instead of recording it.

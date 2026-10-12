@@ -6648,6 +6648,13 @@ impl Manager for ManagerDaemonService {
         self.promote_instance_rpc(request).await
     }
 
+    async fn list_session_nodes(
+        &self,
+        request: Request<crate::structs::ListSessionNodesRequest>,
+    ) -> Result<Response<crate::structs::ListSessionNodesReply>, Status> {
+        self.list_session_nodes_rpc(request).await
+    }
+
     // === SNAPSHOTS (docs/suspend-and-resume.md) ===
     // The handlers live in `snapshot_rpcs`; each enforces `snapshot` ACLs
     // itself (coarse `AclScope::any()` first, the job scope after lookup).

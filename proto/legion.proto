@@ -659,6 +659,31 @@ service Manager {
   // - FailedPrecondition: the session's job config no longer has its task.
   rpc PromoteInstance (PromoteInstanceRequest) returns (PromoteInstanceReply);
 
+  // Lists every node that holds an envelope for a session task, for a
+  // picker (Envoy, HAProxy, or a platform's own code) that starts sessions
+  // at the nodes directly with a session ticket (`Worker.StartSession`,
+  // docs/session-mode.md, "Starting at the edge").
+  //
+  // Answered from this manager's own state: the envelope allocations and
+  // node rows in the replicated store, plus the session index's usage. No
+  // node is called and nothing is written, so a picker can poll it every
+  // few seconds from any manager. It is advisory: a stale entry costs a
+  // refusal or a connect timeout and a hop to the next node, never a wrong
+  // start, because each node admits or refuses on its own.
+  //
+  // Every node with an envelope is listed, accepting or not, so a picker
+  // can keep its `tag -> address` map (for routing an existing session by
+  // its id) apart from its ring (accepting nodes only).
+  //
+  // ACL: `job:read` on the job.
+  //
+  // Errors:
+  // - InvalidArgument: no `job_id`.
+  // - NotFound: no such job.
+  // - FailedPrecondition: `task_name` names no session task of the job, or
+  //   the job has more than one session task and `task_name` is empty.
+  rpc ListSessionNodes (ListSessionNodesRequest) returns (ListSessionNodesReply);
+
   // === SNAPSHOTS (see docs/suspend-and-resume.md) ===
 
   // Captures a point-in-time snapshot of an instance's running allocation.
@@ -3929,6 +3954,57 @@ message InstanceColdBoot {
 }
 
 // Request payload for ListInstances.
+// Request for `Manager.ListSessionNodes`.
+message ListSessionNodesRequest {
+  // The job. Required.
+  string job_id = 1;
+  // The session task. Optional when the job has exactly one.
+  string task_name = 2;
+}
+
+// One node holding an envelope for the session task.
+message SessionNode {
+  // The node id.
+  string node_id = 1;
+  // The node's worker-plane address (`https://host:4848`), where
+  // `Worker.StartSession`, `GetSession`, and `StopSession` are served.
+  // Empty when the node has not advertised one.
+  string address = 2;
+  // The node's tag: the 8 characters a session id minted on this node
+  // carries before its final `.` (`workspace-q4n7c2rd.01J...`). A picker
+  // maps a session id's tag to this node to route requests for it.
+  string tag = 3;
+  // Whether a picker should send new edge starts here: the node is ready,
+  // available (not draining or ineligible), has an address, advertises the
+  // `edge-sessions` capability, and its envelope has room for one more
+  // session of this task.
+  bool accepting = 4;
+  // Why `accepting` is false: `lost`, `down`, `draining`, `ineligible`,
+  // `no-address`, `no-edge-sessions` (the node does not serve
+  // `StartSession`: `edgeBoot.acceptClaims` is off), or `full`. Empty when
+  // accepting.
+  string reason = 5;
+  // The envelope's room left, as a JSON object of amounts (`{"cpu":21500,
+  // "memory":44032}`), from the last reports plus this manager's own
+  // recent starts.
+  string room = 6;
+  // How many more sessions of this task's size fit in `room`: a weight for
+  // weighted balancers. 0 when full.
+  uint32 weight = 7;
+  // Sessions the node last reported for this task.
+  uint32 sessions = 8;
+}
+
+// Reply for `Manager.ListSessionNodes`.
+message ListSessionNodesReply {
+  string job_id = 1;
+  string task_name = 2;
+  // One entry per node with an envelope, sorted by node id.
+  repeated SessionNode nodes = 3;
+  // When the list was read, RFC 3339.
+  string as_of = 4;
+}
+
 message ListInstancesRequest {
   // Job name whose instances to list.
   string job_id = 1;

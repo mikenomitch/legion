@@ -868,6 +868,20 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: true,
         },
         ToolDef {
+            name: "legion_session_nodes",
+            description: "List the nodes that hold an envelope for a session task (stateful.mode = \"session\"): each node's worker address, its node tag (the 8 characters a session id minted there carries before its final '.'), whether it accepts edge starts and why not (lost, down, draining, ineligible, no-address, no-edge-sessions, full), the room left, a weight in sessions of the task's size, and its session count. Use it to build a picker's ring (accepting nodes) and its tag-to-address map (all nodes) for starting sessions at the edge with a session ticket. Answered from the manager's own state; advisory. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "The job." },
+                    "task": { "type": "string", "description": "The session task. Optional when the job has one." }
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_instance_promote",
             description: "Promote a running session (mode=session, durable=false) to a keyed instance in place: one raft entry writes its row and an allocation the node adopts it as, so nothing restarts. From then on it is listed exactly, rescheduled on node loss, and can be suspended or forked. new_id names it (refused when the task sets stateful.promote.onName = false); omit it to keep the session id. A repeat reports the same instance with deduplicated=true. Mutating.",
             input_schema: || json!({
@@ -1719,6 +1733,18 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 }))
                 .await
             }
+        }
+        "legion_session_nodes" => {
+            let job_id = str_arg(&args, "job_id")?;
+            let task_name = opt_str_arg(&args, "task").unwrap_or_default();
+            let mut client = connect().await?;
+            grpc(
+                client.list_session_nodes(crate::structs::ListSessionNodesRequest {
+                    job_id,
+                    task_name,
+                }),
+            )
+            .await
         }
         "legion_instance_promote" => {
             let instance_id = str_arg(&args, "instance_id")?;
