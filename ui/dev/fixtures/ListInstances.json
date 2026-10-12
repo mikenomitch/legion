@@ -1,0 +1,30 @@
+{
+  "method": "ListInstances",
+  "recordedAt": "2026-10-10T23:45:44.824Z",
+  "entries": [
+    {
+      "request": {
+        "jobId": "edge-proxy"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "jobId": "checkout"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "jobId": "nightly-report"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "jobId": "search-indexer"
+      },
+      "response": {}
+    }
+  ]
+}

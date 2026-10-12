@@ -1,0 +1,76 @@
+{
+  "method": "ListVolumes",
+  "recordedAt": "2026-10-10T23:45:54.598Z",
+  "entries": [
+    {
+      "request": {
+        "jobId": "edge-proxy"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "jobId": "checkout"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "jobId": "nightly-report"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "jobId": "search-indexer"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "nodeId": "euw1-edge-02"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "nodeId": "use1-batch-02"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "nodeId": "use1-web-03"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "nodeId": "use1-batch-01"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "nodeId": "use1-web-01"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "nodeId": "euw1-edge-01"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "nodeId": "use1-web-02"
+      },
+      "response": {}
+    },
+    {
+      "request": {},
+      "response": {}
+    }
+  ]
+}

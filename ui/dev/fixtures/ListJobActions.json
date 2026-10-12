@@ -1,0 +1,30 @@
+{
+  "method": "ListJobActions",
+  "recordedAt": "2026-10-10T23:45:54.633Z",
+  "entries": [
+    {
+      "request": {
+        "job": "edge-proxy"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "job": "checkout"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "job": "nightly-report"
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "job": "search-indexer"
+      },
+      "response": {}
+    }
+  ]
+}

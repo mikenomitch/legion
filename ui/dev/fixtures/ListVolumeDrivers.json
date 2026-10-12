@@ -1,0 +1,173 @@
+{
+  "method": "ListVolumeDrivers",
+  "recordedAt": "2026-10-10T23:44:31.025Z",
+  "entries": [
+    {
+      "request": {},
+      "response": {
+        "drivers": [
+          {
+            "name": "example",
+            "nodeLocal": true,
+            "accessModes": [
+              "single-writer"
+            ],
+            "optionalParams": [
+              "mode"
+            ],
+            "detail": "Reference exec driver: a directory per volume. Copy me.",
+            "nodes": [
+              "euw1-edge-01",
+              "euw1-edge-02",
+              "use1-batch-01",
+              "use1-batch-02",
+              "use1-web-01",
+              "use1-web-02",
+              "use1-web-03"
+            ],
+            "availableNodes": [
+              "euw1-edge-01",
+              "use1-batch-01",
+              "use1-batch-02",
+              "use1-web-01",
+              "use1-web-02",
+              "use1-web-03"
+            ],
+            "volumeModes": [
+              "filesystem"
+            ]
+          },
+          {
+            "name": "host",
+            "nodeLocal": true,
+            "accessModes": [
+              "single-writer",
+              "multi-reader"
+            ],
+            "requiredParams": [
+              "name"
+            ],
+            "optionalParams": [
+              "readOnly"
+            ],
+            "detail": "no hostVolumes declared in this worker's config; add `hostVolumes: { <name>: { path: '/…' } }` to use this driver",
+            "nodes": [
+              "euw1-edge-01",
+              "euw1-edge-02",
+              "use1-batch-01",
+              "use1-batch-02",
+              "use1-web-01",
+              "use1-web-02",
+              "use1-web-03"
+            ],
+            "volumeModes": [
+              "filesystem"
+            ]
+          },
+          {
+            "name": "local-dir",
+            "nodeLocal": true,
+            "accessModes": [
+              "single-writer"
+            ],
+            "optionalParams": [
+              "size",
+              "mode",
+              "fs"
+            ],
+            "detail": "Directory (or a disk image in block mode) on the worker's disk. Survives restarts; pins the instance to this node.",
+            "nodes": [
+              "euw1-edge-01",
+              "euw1-edge-02",
+              "use1-batch-01",
+              "use1-batch-02",
+              "use1-web-01",
+              "use1-web-02",
+              "use1-web-03"
+            ],
+            "availableNodes": [
+              "euw1-edge-01",
+              "use1-batch-01",
+              "use1-batch-02",
+              "use1-web-01",
+              "use1-web-02",
+              "use1-web-03"
+            ],
+            "volumeModes": [
+              "filesystem",
+              "block"
+            ]
+          },
+          {
+            "name": "nfs",
+            "accessModes": [
+              "single-writer"
+            ],
+            "requiredParams": [
+              "server",
+              "export"
+            ],
+            "optionalParams": [
+              "subdir",
+              "options"
+            ],
+            "detail": "NFS export mounted per volume. Not node-local: instances reschedule anywhere that can reach the server.",
+            "nodes": [
+              "euw1-edge-01",
+              "euw1-edge-02",
+              "use1-batch-01",
+              "use1-batch-02",
+              "use1-web-01",
+              "use1-web-02",
+              "use1-web-03"
+            ],
+            "availableNodes": [
+              "euw1-edge-01",
+              "use1-batch-01",
+              "use1-batch-02",
+              "use1-web-01",
+              "use1-web-02",
+              "use1-web-03"
+            ],
+            "volumeModes": [
+              "filesystem"
+            ]
+          },
+          {
+            "name": "tmpfs",
+            "nodeLocal": true,
+            "ephemeral": true,
+            "accessModes": [
+              "single-writer"
+            ],
+            "optionalParams": [
+              "size",
+              "mode"
+            ],
+            "detail": "RAM-backed scratch space, wiped on unmount. Not valid for stateful.storage.",
+            "nodes": [
+              "euw1-edge-01",
+              "euw1-edge-02",
+              "use1-batch-01",
+              "use1-batch-02",
+              "use1-web-01",
+              "use1-web-02",
+              "use1-web-03"
+            ],
+            "availableNodes": [
+              "euw1-edge-01",
+              "use1-batch-01",
+              "use1-batch-02",
+              "use1-web-01",
+              "use1-web-02",
+              "use1-web-03"
+            ],
+            "volumeModes": [
+              "filesystem"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

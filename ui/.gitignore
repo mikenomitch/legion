@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Design lab screenshots (npm run lab:shots)
+.lab-shots

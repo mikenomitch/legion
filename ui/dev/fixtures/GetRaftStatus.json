@@ -1,0 +1,15 @@
+{
+  "method": "GetRaftStatus",
+  "recordedAt": "2026-10-10T23:44:36.760Z",
+  "entries": [
+    {
+      "request": {},
+      "response": {
+        "status": {
+          "backend": "local_disk",
+          "role": "standby"
+        }
+      }
+    }
+  ]
+}

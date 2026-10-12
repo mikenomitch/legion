@@ -1,0 +1,2171 @@
+{
+  "method": "ListEvents",
+  "recordedAt": "2026-10-10T23:45:44.820Z",
+  "entries": [
+    {
+      "request": {
+        "limit": 20,
+        "kind": "allocation.preempted",
+        "jobId": "edge-proxy"
+      },
+      "response": {
+        "latestId": "3757416762696250392"
+      }
+    },
+    {
+      "request": {
+        "limit": 20,
+        "kind": "allocation.preempted",
+        "jobId": "checkout"
+      },
+      "response": {
+        "latestId": "3757416762696250392"
+      }
+    },
+    {
+      "request": {
+        "limit": 20,
+        "kind": "allocation.preempted",
+        "jobId": "nightly-report"
+      },
+      "response": {
+        "latestId": "3757416762696250392"
+      }
+    },
+    {
+      "request": {
+        "limit": 20,
+        "kind": "allocation.preempted",
+        "jobId": "search-indexer"
+      },
+      "response": {
+        "latestId": "3757416694182294520"
+      }
+    },
+    {
+      "request": {
+        "limit": 200
+      },
+      "response": {
+        "events": [
+          {
+            "id": "3757414108234493368",
+            "kind": "allocation.stopping",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Stopping 9 allocation(s) for job checkout (stop), up to 30s grace",
+            "metadataJson": "{\"allocations\":[{\"allocationId\":57,\"graceSeconds\":30,\"nodeId\":\"use1-web-03\",\"taskConfigId\":17},{\"allocationId\":58,\"graceSeconds\":30,\"nodeId\":\"use1-web-03\",\"taskConfigId\":17},{\"allocationId\":59,\"graceSeconds\":30,\"nodeId\":\"use1-web-03\",\"taskConfigId\":17},{\"allocationId\":51,\"graceSeconds\":30,\"nodeId\":\"use1-web-03\",\"taskConfigId\":20},{\"allocationId\":52,\"graceSeconds\":30,\"nodeId\":\"use1-web-03\",\"taskConfigId\":20},{\"allocationId\":53,\"graceSeconds\":30,\"nodeId\":\"use1-web-03\",\"taskConfigId\":20},{\"allocationId\":54,\"graceSeconds\":30,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":21},{\"allocationId\":55,\"graceSeconds\":30,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":21},{\"allocationId\":61,\"graceSeconds\":30,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":22}],\"cause\":\"stop\",\"count\":9,\"maxGraceSeconds\":30}",
+            "createdAt": "2026-10-10T23:24:25.562163976Z"
+          },
+          {
+            "id": "3757414108234493376",
+            "kind": "allocation.removed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Removed 9 allocation(s) for job checkout",
+            "metadataJson": "{\"cause\":\"stop\",\"count\":9}",
+            "createdAt": "2026-10-10T23:24:25.562385892Z"
+          },
+          {
+            "id": "3757414108238687688",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "436",
+            "message": "Eval 436 (job_stop) completed: Job checkout stopped",
+            "metadataJson": "{\"elapsedMs\":2,\"evalKind\":\"job_stop\"}",
+            "createdAt": "2026-10-10T23:24:25.564184665Z"
+          },
+          {
+            "id": "3757414111170506192",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "8",
+            "message": "Group workers waiting for placement capacity",
+            "metadataJson": "{\"details\":{\"incomplete\":false,\"nextDelayMs\":2000,\"status\":\"running\"},\"groupName\":null}",
+            "createdAt": "2026-10-10T23:24:26.962939803Z"
+          },
+          {
+            "id": "3757414111172603352",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "437",
+            "message": "Eval 437 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:24:26.963492299Z"
+          },
+          {
+            "id": "3757414111174700512",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "435",
+            "message": "Eval 435 (rollout_tick) completed: Rollout 8 running: Group workers waiting for placement capacity",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:24:26.964239638Z"
+          },
+          {
+            "id": "3757414115381587432",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "438",
+            "message": "Eval 438 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:24:28.970498543Z"
+          },
+          {
+            "id": "3757414115383684592",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "437",
+            "message": "Eval 437 (rollout_tick) completed: Rollout 8 running: Group workers waiting for placement capacity",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:24:28.971324356Z"
+          },
+          {
+            "id": "3757414119590571512",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "439",
+            "message": "Eval 439 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:24:30.977258517Z"
+          },
+          {
+            "id": "3757414119592668672",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "438",
+            "message": "Eval 438 (rollout_tick) completed: Rollout 8 running: Group workers waiting for placement capacity",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:24:30.978239251Z"
+          },
+          {
+            "id": "3757414121494785544",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "evalId": "440",
+            "message": "Eval 440 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:24:31.885836729Z"
+          },
+          {
+            "id": "3757414121509465616",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":26,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:24:31.892460587Z"
+          },
+          {
+            "id": "3757414121513659928",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "evalId": "440",
+            "message": "Eval 440 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:24:31.894971037Z"
+          },
+          {
+            "id": "3757414123799555616",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "441",
+            "message": "Eval 441 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:24:32.984300135Z"
+          },
+          {
+            "id": "3757414123803749928",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "439",
+            "message": "Eval 439 (rollout_tick) completed: Rollout 8 running: Group workers waiting for placement capacity",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:24:32.985137186Z"
+          },
+          {
+            "id": "3757414128010636848",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "442",
+            "message": "Eval 442 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:24:34.992792852Z"
+          },
+          {
+            "id": "3757414128012734008",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "441",
+            "message": "Eval 441 (rollout_tick) completed: Rollout 8 running: Group workers waiting for placement capacity",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:24:34.993807433Z"
+          },
+          {
+            "id": "3757414128482496064",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "evalId": "443",
+            "message": "Eval 443 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:24:35.217167784Z"
+          },
+          {
+            "id": "3757414128492981832",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":27,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:24:35.222299421Z"
+          },
+          {
+            "id": "3757414128497176144",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "evalId": "443",
+            "message": "Eval 443 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:24:35.224747694Z"
+          },
+          {
+            "id": "3757414132228009560",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "444",
+            "message": "Eval 444 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:24:37.003290078Z"
+          },
+          {
+            "id": "3757414132230106720",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "442",
+            "message": "Eval 442 (rollout_tick) completed: Rollout 8 running: Group workers waiting for placement capacity",
+            "metadataJson": "{\"elapsedMs\":6,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:24:37.004362092Z"
+          },
+          {
+            "id": "3757414136436993640",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "445",
+            "message": "Eval 445 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:24:39.01068802Z"
+          },
+          {
+            "id": "3757414136439090800",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "444",
+            "message": "Eval 444 (rollout_tick) completed: Rollout 8 running: Group workers waiting for placement capacity",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:24:39.01167029Z"
+          },
+          {
+            "id": "3757414139744202360",
+            "kind": "job.destroyed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Job checkout destroyed",
+            "metadataJson": "{}",
+            "createdAt": "2026-10-10T23:24:40.587695371Z"
+          },
+          {
+            "id": "3757414140645977728",
+            "kind": "eval.failed",
+            "level": "error",
+            "jobId": "checkout",
+            "evalId": "445",
+            "message": "Eval 445 (rollout_tick) failed: No rollout found for job config checkout-5",
+            "metadataJson": "{\"elapsedMs\":2,\"error\":\"No rollout found for job config checkout-5\",\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:24:41.017636286Z"
+          },
+          {
+            "id": "3757414152991911560",
+            "kind": "job.submitted",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Job checkout submitted (version 1)",
+            "metadataJson": "{\"jobConfigId\":\"checkout-1\",\"tasks\":3,\"version\":1}",
+            "createdAt": "2026-10-10T23:24:46.904883225Z"
+          },
+          {
+            "id": "3757414152998203024",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "446",
+            "message": "Eval 446 (job_submit) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_submit\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:24:46.90758446Z"
+          },
+          {
+            "id": "3757414153017077400",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Placed 6 allocation(s) for job checkout",
+            "metadataJson": "{\"count\":6,\"fallbacks\":0,\"jobConfigId\":\"checkout-1\",\"placements\":[{\"allocationId\":28,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":29,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":30,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":31,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15},{\"allocationId\":32,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15},{\"allocationId\":33,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":16}]}",
+            "createdAt": "2026-10-10T23:24:46.916004104Z"
+          },
+          {
+            "id": "3757414153025466016",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "446",
+            "message": "Eval 446 (job_submit) completed: Job checkout submitted with 6 placements",
+            "metadataJson": "{\"elapsedMs\":9,\"evalKind\":\"job_submit\"}",
+            "createdAt": "2026-10-10T23:24:46.920824332Z"
+          },
+          {
+            "id": "3757414321418383016",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "allocationId": "26",
+            "message": "Allocation 26 failed on node use1-web-02: exited with status 0",
+            "metadataJson": "{\"jobConfigId\":\"nightly-report-2\",\"reason\":\"exited with status 0\",\"taskConfigId\":12}",
+            "createdAt": "2026-10-10T23:26:07.216779546Z"
+          },
+          {
+            "id": "3757414326252318384",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "allocationId": "27",
+            "message": "Allocation 27 failed on node use1-batch-02: exited with status 1",
+            "metadataJson": "{\"jobConfigId\":\"search-indexer-2\",\"reason\":\"exited with status 1\",\"taskConfigId\":11}",
+            "createdAt": "2026-10-10T23:26:09.521657125Z"
+          },
+          {
+            "id": "3757414384341331640",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "447",
+            "message": "Eval 447 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:26:37.220722573Z"
+          },
+          {
+            "id": "3757414384353914560",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":34,\"candidateRank\":0,\"nodeId\":\"use1-web-03\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:26:37.226831021Z"
+          },
+          {
+            "id": "3757414384360206024",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "447",
+            "message": "Eval 447 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:26:37.229427703Z"
+          },
+          {
+            "id": "3757414386811776720",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "checkout",
+            "nodeId": "use1-batch-02",
+            "allocationId": "33",
+            "message": "Allocation 33 failed on node use1-batch-02: health check failed: http check returned 404 Not Found",
+            "metadataJson": "{\"jobConfigId\":\"checkout-1\",\"reason\":\"health check failed: http check returned 404 Not Found\",\"taskConfigId\":16}",
+            "createdAt": "2026-10-10T23:26:38.39799076Z"
+          },
+          {
+            "id": "3757414389173169880",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "448",
+            "message": "Eval 448 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:26:39.524398371Z"
+          },
+          {
+            "id": "3757414389183655648",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":35,\"candidateRank\":0,\"nodeId\":\"use1-batch-01\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:26:39.529877692Z"
+          },
+          {
+            "id": "3757414389189947112",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "448",
+            "message": "Eval 448 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:26:39.532224696Z"
+          },
+          {
+            "id": "3757414427978870512",
+            "kind": "job.stopped",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Job checkout stopped",
+            "metadataJson": "{}",
+            "createdAt": "2026-10-10T23:26:58.028345172Z"
+          },
+          {
+            "id": "3757414427978870520",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "449",
+            "message": "Eval 449 (job_stop) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_stop\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:26:58.028674834Z"
+          },
+          {
+            "id": "3757414427987259136",
+            "kind": "allocation.stopping",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Stopping 5 allocation(s) for job checkout (stop), up to 30s grace",
+            "metadataJson": "{\"allocations\":[{\"allocationId\":28,\"graceSeconds\":30,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":29,\"graceSeconds\":30,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":30,\"graceSeconds\":30,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":31,\"graceSeconds\":30,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15},{\"allocationId\":32,\"graceSeconds\":30,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15}],\"cause\":\"stop\",\"count\":5,\"maxGraceSeconds\":30}",
+            "createdAt": "2026-10-10T23:26:58.032202215Z"
+          },
+          {
+            "id": "3757414427987259144",
+            "kind": "allocation.removed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Removed 5 allocation(s) for job checkout",
+            "metadataJson": "{\"cause\":\"stop\",\"count\":5}",
+            "createdAt": "2026-10-10T23:26:58.032392407Z"
+          },
+          {
+            "id": "3757414427993550608",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "449",
+            "message": "Eval 449 (job_stop) completed: Job checkout stopped",
+            "metadataJson": "{\"elapsedMs\":3,\"evalKind\":\"job_stop\"}",
+            "createdAt": "2026-10-10T23:26:58.035096959Z"
+          },
+          {
+            "id": "3757414449007013656",
+            "kind": "job.destroyed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Job checkout destroyed",
+            "metadataJson": "{}",
+            "createdAt": "2026-10-10T23:27:08.055468428Z"
+          },
+          {
+            "id": "3757414449734725408",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "nodeId": "use1-batch-02",
+            "evalId": "450",
+            "message": "Eval 450 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:27:08.402124259Z"
+          },
+          {
+            "id": "3757414449741016872",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "nodeId": "use1-batch-02",
+            "evalId": "450",
+            "message": "Eval 450 (job_reschedule) completed: Job checkout rescheduled with 0 placements",
+            "metadataJson": "{\"elapsedMs\":0,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:27:08.405609153Z"
+          },
+          {
+            "id": "3757414459715071792",
+            "kind": "job.submitted",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Job checkout submitted (version 1)",
+            "metadataJson": "{\"jobConfigId\":\"checkout-1\",\"tasks\":3,\"version\":1}",
+            "createdAt": "2026-10-10T23:27:13.161852511Z"
+          },
+          {
+            "id": "3757414459721363256",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "451",
+            "message": "Eval 451 (job_submit) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_submit\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:27:13.16416909Z"
+          },
+          {
+            "id": "3757414459738140480",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Placed 6 allocation(s) for job checkout",
+            "metadataJson": "{\"count\":6,\"fallbacks\":0,\"jobConfigId\":\"checkout-1\",\"placements\":[{\"allocationId\":36,\"candidateRank\":0,\"nodeId\":\"use1-web-03\",\"taskConfigId\":14},{\"allocationId\":37,\"candidateRank\":0,\"nodeId\":\"use1-web-03\",\"taskConfigId\":14},{\"allocationId\":38,\"candidateRank\":0,\"nodeId\":\"use1-web-03\",\"taskConfigId\":14},{\"allocationId\":39,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15},{\"allocationId\":40,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15},{\"allocationId\":41,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":16}]}",
+            "createdAt": "2026-10-10T23:27:13.172495274Z"
+          },
+          {
+            "id": "3757414459744431944",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "451",
+            "message": "Eval 451 (job_submit) completed: Job checkout submitted with 6 placements",
+            "metadataJson": "{\"elapsedMs\":8,\"evalKind\":\"job_submit\"}",
+            "createdAt": "2026-10-10T23:27:13.17564018Z"
+          },
+          {
+            "id": "3757414585634369360",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "allocationId": "35",
+            "message": "Allocation 35 failed on node use1-batch-01: exited with status 1",
+            "metadataJson": "{\"jobConfigId\":\"search-indexer-2\",\"reason\":\"exited with status 1\",\"taskConfigId\":11}",
+            "createdAt": "2026-10-10T23:28:13.204801381Z"
+          },
+          {
+            "id": "3757414586286583640",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "allocationId": "34",
+            "message": "Allocation 34 failed on node use1-web-03: exited with status 0",
+            "metadataJson": "{\"jobConfigId\":\"nightly-report-2\",\"reason\":\"exited with status 0\",\"taskConfigId\":12}",
+            "createdAt": "2026-10-10T23:28:13.515238391Z"
+          },
+          {
+            "id": "3757414648555220832",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "evalId": "452",
+            "message": "Eval 452 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:28:43.207820449Z"
+          },
+          {
+            "id": "3757414648569900904",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":42,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:28:43.21399883Z"
+          },
+          {
+            "id": "3757414648576192368",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "evalId": "452",
+            "message": "Eval 452 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":6,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:28:43.217123619Z"
+          },
+          {
+            "id": "3757414649211629432",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "evalId": "453",
+            "message": "Eval 453 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:28:43.520650436Z"
+          },
+          {
+            "id": "3757414649222115200",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":43,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:28:43.524983949Z"
+          },
+          {
+            "id": "3757414649226309512",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "evalId": "453",
+            "message": "Eval 453 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:28:43.527256558Z"
+          },
+          {
+            "id": "3757414690760404880",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "checkout",
+            "nodeId": "use1-batch-02",
+            "allocationId": "41",
+            "message": "Allocation 41 failed on node use1-batch-02: health check failed: http check returned 404 Not Found",
+            "metadataJson": "{\"jobConfigId\":\"checkout-1\",\"reason\":\"health check failed: http check returned 404 Not Found\",\"taskConfigId\":16}",
+            "createdAt": "2026-10-10T23:29:03.332804155Z"
+          },
+          {
+            "id": "3757414737969393560",
+            "kind": "job.stopped",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Job checkout stopped",
+            "metadataJson": "{}",
+            "createdAt": "2026-10-10T23:29:25.843575684Z"
+          },
+          {
+            "id": "3757414737969393568",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "454",
+            "message": "Eval 454 (job_stop) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_stop\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:29:25.843922651Z"
+          },
+          {
+            "id": "3757414737977782184",
+            "kind": "allocation.stopping",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Stopping 5 allocation(s) for job checkout (stop), up to 30s grace",
+            "metadataJson": "{\"allocations\":[{\"allocationId\":36,\"graceSeconds\":30,\"nodeId\":\"use1-web-03\",\"taskConfigId\":14},{\"allocationId\":37,\"graceSeconds\":30,\"nodeId\":\"use1-web-03\",\"taskConfigId\":14},{\"allocationId\":38,\"graceSeconds\":30,\"nodeId\":\"use1-web-03\",\"taskConfigId\":14},{\"allocationId\":39,\"graceSeconds\":30,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15},{\"allocationId\":40,\"graceSeconds\":30,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15}],\"cause\":\"stop\",\"count\":5,\"maxGraceSeconds\":30}",
+            "createdAt": "2026-10-10T23:29:25.847030911Z"
+          },
+          {
+            "id": "3757414737977782192",
+            "kind": "allocation.removed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Removed 5 allocation(s) for job checkout",
+            "metadataJson": "{\"cause\":\"stop\",\"count\":5}",
+            "createdAt": "2026-10-10T23:29:25.847227387Z"
+          },
+          {
+            "id": "3757414737981976504",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "454",
+            "message": "Eval 454 (job_stop) completed: Job checkout stopped",
+            "metadataJson": "{\"elapsedMs\":2,\"evalKind\":\"job_stop\"}",
+            "createdAt": "2026-10-10T23:29:25.849095044Z"
+          },
+          {
+            "id": "3757414753685450688",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "nodeId": "use1-batch-02",
+            "evalId": "455",
+            "message": "Eval 455 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:29:33.337407691Z"
+          },
+          {
+            "id": "3757414753693839304",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "nodeId": "use1-batch-02",
+            "evalId": "455",
+            "message": "Eval 455 (job_reschedule) completed: Job checkout rescheduled with 0 placements",
+            "metadataJson": "{\"elapsedMs\":0,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:29:33.3411028Z"
+          },
+          {
+            "id": "3757414758999633872",
+            "kind": "job.destroyed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Job checkout destroyed",
+            "metadataJson": "{}",
+            "createdAt": "2026-10-10T23:29:35.871806188Z"
+          },
+          {
+            "id": "3757414769695109080",
+            "kind": "job.submitted",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Job checkout submitted (version 1)",
+            "metadataJson": "{\"jobConfigId\":\"checkout-1\",\"tasks\":3,\"version\":1}",
+            "createdAt": "2026-10-10T23:29:40.971931436Z"
+          },
+          {
+            "id": "3757414769701400544",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "456",
+            "message": "Eval 456 (job_submit) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_submit\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:29:40.974196926Z"
+          },
+          {
+            "id": "3757414769713983464",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Placed 6 allocation(s) for job checkout",
+            "metadataJson": "{\"count\":6,\"fallbacks\":0,\"jobConfigId\":\"checkout-1\",\"placements\":[{\"allocationId\":44,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":45,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":46,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":47,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15},{\"allocationId\":48,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15},{\"allocationId\":49,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":16}]}",
+            "createdAt": "2026-10-10T23:29:40.980645986Z"
+          },
+          {
+            "id": "3757414769720274928",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "456",
+            "message": "Eval 456 (job_submit) completed: Job checkout submitted with 6 placements",
+            "metadataJson": "{\"elapsedMs\":7,\"evalKind\":\"job_submit\"}",
+            "createdAt": "2026-10-10T23:29:40.98387054Z"
+          },
+          {
+            "id": "3757414848699019256",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "allocationId": "43",
+            "message": "Allocation 43 failed on node use1-web-02: exited with status 0",
+            "metadataJson": "{\"jobConfigId\":\"nightly-report-2\",\"reason\":\"exited with status 0\",\"taskConfigId\":12}",
+            "createdAt": "2026-10-10T23:30:18.643324508Z"
+          },
+          {
+            "id": "3757414864176001024",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "allocationId": "42",
+            "message": "Allocation 42 failed on node use1-batch-02: exited with status 1",
+            "metadataJson": "{\"jobConfigId\":\"search-indexer-2\",\"reason\":\"exited with status 1\",\"taskConfigId\":11}",
+            "createdAt": "2026-10-10T23:30:26.022959461Z"
+          },
+          {
+            "id": "3757414911619870728",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "457",
+            "message": "Eval 457 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:30:48.646762116Z"
+          },
+          {
+            "id": "3757414911632453648",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":50,\"candidateRank\":0,\"nodeId\":\"use1-web-03\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:30:48.652666063Z"
+          },
+          {
+            "id": "3757414911638745112",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "457",
+            "message": "Eval 457 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":6,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:30:48.655652054Z"
+          },
+          {
+            "id": "3757414927096852512",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "458",
+            "message": "Eval 458 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:30:56.026740832Z"
+          },
+          {
+            "id": "3757414927107338280",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":51,\"candidateRank\":0,\"nodeId\":\"use1-batch-01\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:30:56.031490464Z"
+          },
+          {
+            "id": "3757414927111532592",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "458",
+            "message": "Eval 458 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:30:56.033818777Z"
+          },
+          {
+            "id": "3757415110465531960",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "allocationId": "50",
+            "message": "Allocation 50 failed on node use1-web-03: exited with status 0",
+            "metadataJson": "{\"jobConfigId\":\"nightly-report-2\",\"reason\":\"exited with status 0\",\"taskConfigId\":12}",
+            "createdAt": "2026-10-10T23:32:23.463620308Z"
+          },
+          {
+            "id": "3757415126099800128",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "allocationId": "51",
+            "message": "Allocation 51 failed on node use1-batch-01: exited with status 1",
+            "metadataJson": "{\"jobConfigId\":\"search-indexer-2\",\"reason\":\"exited with status 1\",\"taskConfigId\":11}",
+            "createdAt": "2026-10-10T23:32:30.918576093Z"
+          },
+          {
+            "id": "3757415173386383432",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "evalId": "459",
+            "message": "Eval 459 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:32:53.466177471Z"
+          },
+          {
+            "id": "3757415173401063504",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":50,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:32:53.473737713Z"
+          },
+          {
+            "id": "3757415173409452120",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "evalId": "459",
+            "message": "Eval 459 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":8,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:32:53.477163268Z"
+          },
+          {
+            "id": "3757415189020651616",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "evalId": "460",
+            "message": "Eval 460 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:33:00.921043174Z"
+          },
+          {
+            "id": "3757415189033234536",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":51,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:33:00.927589839Z"
+          },
+          {
+            "id": "3757415189039526000",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "evalId": "460",
+            "message": "Eval 460 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":6,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:33:00.930270179Z"
+          },
+          {
+            "id": "3757415373647622264",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "allocationId": "50",
+            "message": "Allocation 50 failed on node use1-web-02: exited with status 0",
+            "metadataJson": "{\"jobConfigId\":\"nightly-report-2\",\"reason\":\"exited with status 0\",\"taskConfigId\":12}",
+            "createdAt": "2026-10-10T23:34:28.958297371Z"
+          },
+          {
+            "id": "3757415388512235648",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "allocationId": "51",
+            "message": "Allocation 51 failed on node use1-batch-02: exited with status 1",
+            "metadataJson": "{\"jobConfigId\":\"search-indexer-2\",\"reason\":\"exited with status 1\",\"taskConfigId\":11}",
+            "createdAt": "2026-10-10T23:34:36.046396547Z"
+          },
+          {
+            "id": "3757415404997947528",
+            "kind": "job.updated",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Job checkout updated (version 2)",
+            "metadataJson": "{\"jobConfigId\":\"checkout-2\",\"tasks\":3,\"version\":2}",
+            "createdAt": "2026-10-10T23:34:43.907401038Z"
+          },
+          {
+            "id": "3757415405006336144",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "9",
+            "message": "Rollout started",
+            "metadataJson": "{\"details\":{\"progression\":null,\"status\":\"pending\"},\"groupName\":null}",
+            "createdAt": "2026-10-10T23:34:43.911003692Z"
+          },
+          {
+            "id": "3757415405006336152",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "461",
+            "message": "Eval 461 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:43.911320019Z"
+          },
+          {
+            "id": "3757415405021016224",
+            "kind": "allocation.stopping",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Stopping 3 allocation(s) for job checkout (update), up to 30s grace",
+            "metadataJson": "{\"allocations\":[{\"allocationId\":44,\"graceSeconds\":30,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":45,\"graceSeconds\":30,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14},{\"allocationId\":46,\"graceSeconds\":30,\"nodeId\":\"use1-web-02\",\"taskConfigId\":14}],\"cause\":\"update\",\"count\":3,\"maxGraceSeconds\":30}",
+            "createdAt": "2026-10-10T23:34:43.918767808Z"
+          },
+          {
+            "id": "3757415405025210536",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "9",
+            "message": "Group api retired 3 old allocations",
+            "metadataJson": "{\"details\":{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"},\"groupName\":\"api\"}",
+            "createdAt": "2026-10-10T23:34:43.920356794Z"
+          },
+          {
+            "id": "3757415405027307696",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "462",
+            "message": "Eval 462 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:43.921205113Z"
+          },
+          {
+            "id": "3757415405029404856",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "461",
+            "message": "Eval 461 (rollout_tick) completed: Rollout 9 running: Group api retired 3 old allocations",
+            "metadataJson": "{\"elapsedMs\":8,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:43.922286133Z"
+          },
+          {
+            "id": "3757415405044084928",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Placed 3 allocation(s) for job checkout",
+            "metadataJson": "{\"count\":3,\"fallbacks\":0,\"jobConfigId\":\"checkout-2\",\"placements\":[{\"allocationId\":50,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":17},{\"allocationId\":51,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":17},{\"allocationId\":52,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":17}]}",
+            "createdAt": "2026-10-10T23:34:43.929623649Z"
+          },
+          {
+            "id": "3757415405050376392",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "9",
+            "message": "Group api placed 3 replacement allocations",
+            "metadataJson": "{\"details\":{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"},\"groupName\":\"api\"}",
+            "createdAt": "2026-10-10T23:34:43.932483514Z"
+          },
+          {
+            "id": "3757415405052473552",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "463",
+            "message": "Eval 463 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:43.932998166Z"
+          },
+          {
+            "id": "3757415405052473560",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "462",
+            "message": "Eval 462 (rollout_tick) completed: Rollout 9 running: Group api placed 3 replacement allocations",
+            "metadataJson": "{\"elapsedMs\":10,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:43.933972032Z"
+          },
+          {
+            "id": "3757415405062959328",
+            "kind": "allocation.stopping",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Stopping 1 allocation(s) for job checkout (update), up to 30s grace",
+            "metadataJson": "{\"allocations\":[{\"allocationId\":49,\"graceSeconds\":30,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":16}],\"cause\":\"update\",\"count\":1,\"maxGraceSeconds\":30}",
+            "createdAt": "2026-10-10T23:34:43.938240257Z"
+          },
+          {
+            "id": "3757415405065056488",
+            "kind": "allocation.stopping",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Stopping 2 allocation(s) for job checkout (update), up to 30s grace",
+            "metadataJson": "{\"allocations\":[{\"allocationId\":47,\"graceSeconds\":30,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15},{\"allocationId\":48,\"graceSeconds\":30,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":15}],\"cause\":\"update\",\"count\":2,\"maxGraceSeconds\":30}",
+            "createdAt": "2026-10-10T23:34:43.939362807Z"
+          },
+          {
+            "id": "3757415405067153648",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "9",
+            "message": "Group workers retired 3 old allocations",
+            "metadataJson": "{\"details\":{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"},\"groupName\":\"workers\"}",
+            "createdAt": "2026-10-10T23:34:43.940421574Z"
+          },
+          {
+            "id": "3757415405069250808",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "464",
+            "message": "Eval 464 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:43.940993417Z"
+          },
+          {
+            "id": "3757415405086028032",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "463",
+            "message": "Eval 463 (rollout_tick) completed: Rollout 9 running: Group workers retired 3 old allocations",
+            "metadataJson": "{\"elapsedMs\":8,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:43.949614859Z"
+          },
+          {
+            "id": "3757415405102805256",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "checkout",
+            "message": "Placed 3 allocation(s) for job checkout",
+            "metadataJson": "{\"count\":3,\"fallbacks\":0,\"jobConfigId\":\"checkout-2\",\"placements\":[{\"allocationId\":53,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":18},{\"allocationId\":54,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":18},{\"allocationId\":55,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":19}]}",
+            "createdAt": "2026-10-10T23:34:43.957173155Z"
+          },
+          {
+            "id": "3757415405109096720",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "9",
+            "message": "Group workers placed 3 replacement allocations",
+            "metadataJson": "{\"details\":{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"},\"groupName\":\"workers\"}",
+            "createdAt": "2026-10-10T23:34:43.960971915Z"
+          },
+          {
+            "id": "3757415405113291032",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "465",
+            "message": "Eval 465 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:43.962601093Z"
+          },
+          {
+            "id": "3757415405119582496",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "464",
+            "message": "Eval 464 (rollout_tick) completed: Rollout 9 running: Group workers placed 3 replacement allocations",
+            "metadataJson": "{\"elapsedMs\":21,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:43.965483197Z"
+          },
+          {
+            "id": "3757415405125873960",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "9",
+            "message": "Group workers waiting for healthy window",
+            "metadataJson": "{\"details\":{\"incomplete\":false,\"nextDelayMs\":2000,\"status\":\"running\"},\"groupName\":null}",
+            "createdAt": "2026-10-10T23:34:43.968827624Z"
+          },
+          {
+            "id": "3757415405127971120",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "466",
+            "message": "Eval 466 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:43.969297319Z"
+          },
+          {
+            "id": "3757415405161525560",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "465",
+            "message": "Eval 465 (rollout_tick) completed: Rollout 9 running: Group workers waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":13,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:43.985651693Z"
+          },
+          {
+            "id": "3757415409334858048",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "9",
+            "message": "Group workers advanced to step 1",
+            "metadataJson": "{\"details\":{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"},\"groupName\":\"workers\"}",
+            "createdAt": "2026-10-10T23:34:45.975134071Z"
+          },
+          {
+            "id": "3757415409334858056",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "467",
+            "message": "Eval 467 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:45.975644722Z"
+          },
+          {
+            "id": "3757415409336955216",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "466",
+            "message": "Eval 466 (rollout_tick) completed: Rollout 9 running: Group workers advanced to step 1",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:45.976595473Z"
+          },
+          {
+            "id": "3757415409345343832",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "9",
+            "message": "Group api waiting for healthy window",
+            "metadataJson": "{\"details\":{\"incomplete\":false,\"nextDelayMs\":2000,\"status\":\"running\"},\"groupName\":null}",
+            "createdAt": "2026-10-10T23:34:45.980491023Z"
+          },
+          {
+            "id": "3757415409345343840",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "468",
+            "message": "Eval 468 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:45.980968353Z"
+          },
+          {
+            "id": "3757415409347441000",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "467",
+            "message": "Eval 467 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:45.981762864Z"
+          },
+          {
+            "id": "3757415413556425072",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "469",
+            "message": "Eval 469 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:47.988340917Z"
+          },
+          {
+            "id": "3757415413558522232",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "468",
+            "message": "Eval 468 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:47.989199072Z"
+          },
+          {
+            "id": "3757415417773797760",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "470",
+            "message": "Eval 470 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:49.999579166Z"
+          },
+          {
+            "id": "3757415417777992072",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "469",
+            "message": "Eval 469 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":7,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:50.001288198Z"
+          },
+          {
+            "id": "3757415421980684688",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "471",
+            "message": "Eval 471 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:52.005597892Z"
+          },
+          {
+            "id": "3757415421982781848",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "470",
+            "message": "Eval 470 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:52.006462665Z"
+          },
+          {
+            "id": "3757415426187571616",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "472",
+            "message": "Eval 472 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:54.011887383Z"
+          },
+          {
+            "id": "3757415426189668776",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "471",
+            "message": "Eval 471 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:54.012633419Z"
+          },
+          {
+            "id": "3757415430398652848",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "473",
+            "message": "Eval 473 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:56.019123228Z"
+          },
+          {
+            "id": "3757415430400750008",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "472",
+            "message": "Eval 472 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:56.020063919Z"
+          },
+          {
+            "id": "3757415434607636928",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "474",
+            "message": "Eval 474 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:58.026033511Z"
+          },
+          {
+            "id": "3757415434607636936",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "473",
+            "message": "Eval 473 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:34:58.026814083Z"
+          },
+          {
+            "id": "3757415436572668368",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "475",
+            "message": "Eval 475 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:34:58.963501634Z"
+          },
+          {
+            "id": "3757415436583154136",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":56,\"candidateRank\":0,\"nodeId\":\"use1-web-03\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:34:58.968748564Z"
+          },
+          {
+            "id": "3757415436589445600",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "475",
+            "message": "Eval 475 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:34:58.97119179Z"
+          },
+          {
+            "id": "3757415438816621032",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "476",
+            "message": "Eval 476 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:00.033472591Z"
+          },
+          {
+            "id": "3757415438818718192",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "474",
+            "message": "Eval 474 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:00.034314379Z"
+          },
+          {
+            "id": "3757415443023507960",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "477",
+            "message": "Eval 477 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:02.039602001Z"
+          },
+          {
+            "id": "3757415443025605120",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "476",
+            "message": "Eval 476 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:02.040446592Z"
+          },
+          {
+            "id": "3757415447230394888",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "478",
+            "message": "Eval 478 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:04.045675921Z"
+          },
+          {
+            "id": "3757415447232492048",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "477",
+            "message": "Eval 477 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:04.0466852Z"
+          },
+          {
+            "id": "3757415451435184664",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "479",
+            "message": "Eval 479 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:06.05006099Z"
+          },
+          {
+            "id": "3757415451441476128",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "480",
+            "message": "Eval 480 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:06.053330799Z"
+          },
+          {
+            "id": "3757415451443573288",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "478",
+            "message": "Eval 478 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:06.054179643Z"
+          },
+          {
+            "id": "3757415451447767600",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":57,\"candidateRank\":0,\"nodeId\":\"use1-batch-01\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:35:06.056279844Z"
+          },
+          {
+            "id": "3757415451454059064",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "479",
+            "message": "Eval 479 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":7,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:35:06.059813005Z"
+          },
+          {
+            "id": "3757415455648363072",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "481",
+            "message": "Eval 481 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:08.059533468Z"
+          },
+          {
+            "id": "3757415455650460232",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "480",
+            "message": "Eval 480 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":3,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:08.060252047Z"
+          },
+          {
+            "id": "3757415459855250000",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "482",
+            "message": "Eval 482 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:10.065844015Z"
+          },
+          {
+            "id": "3757415459857347160",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "481",
+            "message": "Eval 481 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:10.066738895Z"
+          },
+          {
+            "id": "3757415464064234080",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "483",
+            "message": "Eval 483 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:12.072971298Z"
+          },
+          {
+            "id": "3757415464068428392",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "482",
+            "message": "Eval 482 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:12.074100092Z"
+          },
+          {
+            "id": "3757415468275315312",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "484",
+            "message": "Eval 484 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:14.080590236Z"
+          },
+          {
+            "id": "3757415468277412472",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "483",
+            "message": "Eval 483 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:14.081564072Z"
+          },
+          {
+            "id": "3757415472482202240",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "485",
+            "message": "Eval 485 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:16.0865535Z"
+          },
+          {
+            "id": "3757415472484299400",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "484",
+            "message": "Eval 484 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:16.08746868Z"
+          },
+          {
+            "id": "3757415476689089168",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "486",
+            "message": "Eval 486 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:18.092562531Z"
+          },
+          {
+            "id": "3757415476691186328",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "485",
+            "message": "Eval 485 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":3,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:18.093337208Z"
+          },
+          {
+            "id": "3757415480895976096",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "487",
+            "message": "Eval 487 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:20.098188548Z"
+          },
+          {
+            "id": "3757415480898073256",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "486",
+            "message": "Eval 486 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":4,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:20.098982697Z"
+          },
+          {
+            "id": "3757415485102863024",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "488",
+            "message": "Eval 488 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:22.104684578Z"
+          },
+          {
+            "id": "3757415485104960184",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "487",
+            "message": "Eval 487 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":3,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:22.105493622Z"
+          },
+          {
+            "id": "3757415489313944256",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "489",
+            "message": "Eval 489 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":2000,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:24.112477263Z"
+          },
+          {
+            "id": "3757415489316041416",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "488",
+            "message": "Eval 488 (rollout_tick) completed: Rollout 9 running: Group api waiting for healthy window",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:24.113258429Z"
+          },
+          {
+            "id": "3757415493525025488",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "9",
+            "message": "Group api advanced to step 1",
+            "metadataJson": "{\"details\":{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"},\"groupName\":\"api\"}",
+            "createdAt": "2026-10-10T23:35:26.120115818Z"
+          },
+          {
+            "id": "3757415493525025496",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "490",
+            "message": "Eval 490 (rollout_tick) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"rollout_tick\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:35:26.120791438Z"
+          },
+          {
+            "id": "3757415493531316960",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "489",
+            "message": "Eval 489 (rollout_tick) completed: Rollout 9 running: Group api advanced to step 1",
+            "metadataJson": "{\"elapsedMs\":8,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:26.123780209Z"
+          },
+          {
+            "id": "3757415493543899880",
+            "kind": "rollout.event",
+            "level": "info",
+            "jobId": "checkout",
+            "rolloutId": "9",
+            "message": "Rollout completed",
+            "metadataJson": "{\"details\":{\"incomplete\":false,\"nextDelayMs\":null,\"status\":\"completed\"},\"groupName\":null}",
+            "createdAt": "2026-10-10T23:35:26.129427731Z"
+          },
+          {
+            "id": "3757415493545997040",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "checkout",
+            "evalId": "490",
+            "message": "Eval 490 (rollout_tick) completed: Rollout 9 completed: Rollout completed",
+            "metadataJson": "{\"elapsedMs\":6,\"evalKind\":\"rollout_tick\"}",
+            "createdAt": "2026-10-10T23:35:26.130820153Z"
+          },
+          {
+            "id": "3757415636045378296",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "allocationId": "56",
+            "message": "Allocation 56 failed on node use1-web-03: exited with status 0",
+            "metadataJson": "{\"jobConfigId\":\"nightly-report-2\",\"reason\":\"exited with status 0\",\"taskConfigId\":12}",
+            "createdAt": "2026-10-10T23:36:34.07930297Z"
+          },
+          {
+            "id": "3757415651023237888",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "allocationId": "57",
+            "message": "Allocation 57 failed on node use1-batch-01: exited with status 1",
+            "metadataJson": "{\"jobConfigId\":\"search-indexer-2\",\"reason\":\"exited with status 1\",\"taskConfigId\":11}",
+            "createdAt": "2026-10-10T23:36:41.221729097Z"
+          },
+          {
+            "id": "3757415698964132616",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "evalId": "491",
+            "message": "Eval 491 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:37:04.081722325Z"
+          },
+          {
+            "id": "3757415698974618384",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":56,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:37:04.086864108Z"
+          },
+          {
+            "id": "3757415698980909848",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "evalId": "491",
+            "message": "Eval 491 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:37:04.089553295Z"
+          },
+          {
+            "id": "3757415713944089376",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "evalId": "492",
+            "message": "Eval 492 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:37:11.224729598Z"
+          },
+          {
+            "id": "3757415713956672296",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":57,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:37:11.23041446Z"
+          },
+          {
+            "id": "3757415713962963760",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "evalId": "492",
+            "message": "Eval 492 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":6,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:37:11.233221882Z"
+          },
+          {
+            "id": "3757415900276044600",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "allocationId": "56",
+            "message": "Allocation 56 failed on node use1-web-02: exited with status 0",
+            "metadataJson": "{\"jobConfigId\":\"nightly-report-2\",\"reason\":\"exited with status 0\",\"taskConfigId\":12}",
+            "createdAt": "2026-10-10T23:38:40.074598922Z"
+          },
+          {
+            "id": "3757415963198993216",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "493",
+            "message": "Eval 493 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:39:10.078801921Z"
+          },
+          {
+            "id": "3757415963211576136",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":58,\"candidateRank\":0,\"nodeId\":\"use1-web-03\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:39:10.084802839Z"
+          },
+          {
+            "id": "3757415963217867600",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "493",
+            "message": "Eval 493 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:39:10.087208781Z"
+          },
+          {
+            "id": "3757415976161489752",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "allocationId": "57",
+            "message": "Allocation 57 failed on node use1-batch-02: exited with status 1",
+            "metadataJson": "{\"jobConfigId\":\"search-indexer-2\",\"reason\":\"exited with status 1\",\"taskConfigId\":11}",
+            "createdAt": "2026-10-10T23:39:16.259838922Z"
+          },
+          {
+            "id": "3757416039084438368",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "494",
+            "message": "Eval 494 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:39:46.263692798Z"
+          },
+          {
+            "id": "3757416039099118440",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":59,\"candidateRank\":0,\"nodeId\":\"use1-batch-01\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:39:46.270618504Z"
+          },
+          {
+            "id": "3757416039105409904",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "494",
+            "message": "Eval 494 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":6,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:39:46.273683135Z"
+          },
+          {
+            "id": "3757416166165558136",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "allocationId": "58",
+            "message": "Allocation 58 failed on node use1-web-03: exited with status 0",
+            "metadataJson": "{\"jobConfigId\":\"nightly-report-2\",\"reason\":\"exited with status 0\",\"taskConfigId\":12}",
+            "createdAt": "2026-10-10T23:40:46.860866833Z"
+          },
+          {
+            "id": "3757416229086409600",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "evalId": "495",
+            "message": "Eval 495 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:41:16.863736841Z"
+          },
+          {
+            "id": "3757416229098992520",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":60,\"candidateRank\":0,\"nodeId\":\"use1-web-02\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:41:16.86972484Z"
+          },
+          {
+            "id": "3757416229105283984",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-03",
+            "evalId": "495",
+            "message": "Eval 495 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:41:16.872191371Z"
+          },
+          {
+            "id": "3757416238951412632",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "allocationId": "59",
+            "message": "Allocation 59 failed on node use1-batch-01: exited with status 1",
+            "metadataJson": "{\"jobConfigId\":\"search-indexer-2\",\"reason\":\"exited with status 1\",\"taskConfigId\":11}",
+            "createdAt": "2026-10-10T23:41:21.567872038Z"
+          },
+          {
+            "id": "3757416301874361248",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "evalId": "496",
+            "message": "Eval 496 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:41:51.571206589Z"
+          },
+          {
+            "id": "3757416301889041320",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":61,\"candidateRank\":0,\"nodeId\":\"use1-batch-02\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:41:51.578832062Z"
+          },
+          {
+            "id": "3757416301897429936",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-01",
+            "evalId": "496",
+            "message": "Eval 496 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":7,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:41:51.582039911Z"
+          },
+          {
+            "id": "3757416429693678520",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "allocationId": "60",
+            "message": "Allocation 60 failed on node use1-web-02: exited with status 0",
+            "metadataJson": "{\"jobConfigId\":\"nightly-report-2\",\"reason\":\"exited with status 0\",\"taskConfigId\":12}",
+            "createdAt": "2026-10-10T23:42:52.520279255Z"
+          },
+          {
+            "id": "3757416492616627136",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "497",
+            "message": "Eval 497 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:43:22.524373619Z"
+          },
+          {
+            "id": "3757416492627112904",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":62,\"candidateRank\":0,\"nodeId\":\"use1-web-03\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:43:22.529203665Z"
+          },
+          {
+            "id": "3757416492631307216",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "497",
+            "message": "Eval 497 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:43:22.531734336Z"
+          },
+          {
+            "id": "3757416501051372504",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "allocationId": "61",
+            "message": "Allocation 61 failed on node use1-batch-02: exited with status 1",
+            "metadataJson": "{\"jobConfigId\":\"search-indexer-2\",\"reason\":\"exited with status 1\",\"taskConfigId\":11}",
+            "createdAt": "2026-10-10T23:43:26.546348997Z"
+          },
+          {
+            "id": "3757416563972223968",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "498",
+            "message": "Eval 498 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:43:56.549614981Z"
+          },
+          {
+            "id": "3757416563984806888",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":63,\"candidateRank\":0,\"nodeId\":\"use1-batch-01\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:43:56.555027518Z"
+          },
+          {
+            "id": "3757416563989001200",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "498",
+            "message": "Eval 498 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":6,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:43:56.557855526Z"
+          }
+        ],
+        "latestId": "3757416563989001200"
+      }
+    },
+    {
+      "request": {
+        "limit": 8
+      },
+      "response": {
+        "events": [
+          {
+            "id": "3757416429693678520",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "allocationId": "60",
+            "message": "Allocation 60 failed on node use1-web-02: exited with status 0",
+            "metadataJson": "{\"jobConfigId\":\"nightly-report-2\",\"reason\":\"exited with status 0\",\"taskConfigId\":12}",
+            "createdAt": "2026-10-10T23:42:52.520279255Z"
+          },
+          {
+            "id": "3757416492616627136",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "497",
+            "message": "Eval 497 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:43:22.524373619Z"
+          },
+          {
+            "id": "3757416492627112904",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "message": "Placed 1 allocation(s) for job nightly-report",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"nightly-report-2\",\"placements\":[{\"allocationId\":62,\"candidateRank\":0,\"nodeId\":\"use1-web-03\",\"taskConfigId\":12}]}",
+            "createdAt": "2026-10-10T23:43:22.529203665Z"
+          },
+          {
+            "id": "3757416492631307216",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "nightly-report",
+            "nodeId": "use1-web-02",
+            "evalId": "497",
+            "message": "Eval 497 (job_reschedule) completed: Job nightly-report rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":5,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:43:22.531734336Z"
+          },
+          {
+            "id": "3757416501051372504",
+            "kind": "allocation.failed",
+            "level": "warn",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "allocationId": "61",
+            "message": "Allocation 61 failed on node use1-batch-02: exited with status 1",
+            "metadataJson": "{\"jobConfigId\":\"search-indexer-2\",\"reason\":\"exited with status 1\",\"taskConfigId\":11}",
+            "createdAt": "2026-10-10T23:43:26.546348997Z"
+          },
+          {
+            "id": "3757416563972223968",
+            "kind": "eval.enqueued",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "498",
+            "message": "Eval 498 (job_reschedule) enqueued",
+            "metadataJson": "{\"delayMs\":0,\"evalKind\":\"job_reschedule\",\"priority\":50}",
+            "createdAt": "2026-10-10T23:43:56.549614981Z"
+          },
+          {
+            "id": "3757416563984806888",
+            "kind": "allocation.placed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "message": "Placed 1 allocation(s) for job search-indexer",
+            "metadataJson": "{\"count\":1,\"fallbacks\":0,\"jobConfigId\":\"search-indexer-2\",\"placements\":[{\"allocationId\":63,\"candidateRank\":0,\"nodeId\":\"use1-batch-01\",\"taskConfigId\":11}]}",
+            "createdAt": "2026-10-10T23:43:56.555027518Z"
+          },
+          {
+            "id": "3757416563989001200",
+            "kind": "eval.completed",
+            "level": "info",
+            "jobId": "search-indexer",
+            "nodeId": "use1-batch-02",
+            "evalId": "498",
+            "message": "Eval 498 (job_reschedule) completed: Job search-indexer rescheduled with 1 placements",
+            "metadataJson": "{\"elapsedMs\":6,\"evalKind\":\"job_reschedule\"}",
+            "createdAt": "2026-10-10T23:43:56.557855526Z"
+          }
+        ],
+        "latestId": "3757416563989001200"
+      }
+    }
+  ]
+}

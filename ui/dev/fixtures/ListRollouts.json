@@ -1,0 +1,219 @@
+{
+  "method": "ListRollouts",
+  "recordedAt": "2026-10-10T23:45:54.577Z",
+  "entries": [
+    {
+      "request": {
+        "jobId": "edge-proxy",
+        "page": 1,
+        "pageSize": 200
+      },
+      "response": {
+        "rollouts": [
+          {
+            "id": "5",
+            "jobId": "edge-proxy",
+            "fromJobConfigId": "edge-proxy-2",
+            "toJobConfigId": "edge-proxy-3",
+            "status": "completed",
+            "message": "Rollout completed",
+            "strategy": "default",
+            "configJson": "{\"rollout\":null,\"rolloutByGroup\":{},\"runtime\":{\"groups\":{\"default\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T23:09:23.759828318Z\"}}}}",
+            "createdAt": "2026-10-10T23:09:17.722508788Z",
+            "updatedAt": "2026-10-10T23:09:23.768447106Z",
+            "completedAt": "2026-10-10T23:09:23.768447106Z"
+          },
+          {
+            "id": "2",
+            "jobId": "edge-proxy",
+            "fromJobConfigId": "edge-proxy-1",
+            "toJobConfigId": "edge-proxy-2",
+            "status": "completed",
+            "message": "Rollout completed",
+            "strategy": "default",
+            "configJson": "{\"rollout\":null,\"rolloutByGroup\":{},\"runtime\":{\"groups\":{\"default\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T22:55:00.750156123Z\"}}}}",
+            "createdAt": "2026-10-10T22:54:54.702739828Z",
+            "updatedAt": "2026-10-10T22:55:00.760243823Z",
+            "completedAt": "2026-10-10T22:55:00.760243823Z"
+          }
+        ],
+        "totalCount": 2,
+        "page": 1,
+        "pageSize": 100
+      }
+    },
+    {
+      "request": {
+        "jobId": "checkout",
+        "page": 1,
+        "pageSize": 200
+      },
+      "response": {
+        "rollouts": [
+          {
+            "id": "9",
+            "jobId": "checkout",
+            "fromJobConfigId": "checkout-1",
+            "toJobConfigId": "checkout-2",
+            "status": "completed",
+            "message": "Rollout completed",
+            "strategy": "default",
+            "configJson": "{\"rollout\":null,\"rolloutByGroup\":{},\"runtime\":{\"groups\":{\"api\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T23:35:26.116260282Z\"},\"workers\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T23:34:45.973028723Z\"}}}}",
+            "createdAt": "2026-10-10T23:34:43.910514899Z",
+            "updatedAt": "2026-10-10T23:35:26.129939247Z",
+            "completedAt": "2026-10-10T23:35:26.129939247Z"
+          }
+        ],
+        "totalCount": 1,
+        "page": 1,
+        "pageSize": 100
+      }
+    },
+    {
+      "request": {
+        "jobId": "nightly-report",
+        "page": 1,
+        "pageSize": 200
+      },
+      "response": {
+        "rollouts": [
+          {
+            "id": "4",
+            "jobId": "nightly-report",
+            "fromJobConfigId": "nightly-report-1",
+            "toJobConfigId": "nightly-report-2",
+            "status": "completed",
+            "message": "Rollout completed",
+            "strategy": "default",
+            "configJson": "{\"rollout\":null,\"rolloutByGroup\":{},\"runtime\":{\"groups\":{\"default\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T22:56:35.36189592Z\"}}}}",
+            "createdAt": "2026-10-10T22:54:54.994824248Z",
+            "updatedAt": "2026-10-10T22:56:35.36865628Z",
+            "completedAt": "2026-10-10T22:56:35.36865628Z"
+          }
+        ],
+        "totalCount": 1,
+        "page": 1,
+        "pageSize": 100
+      }
+    },
+    {
+      "request": {
+        "jobId": "search-indexer",
+        "page": 1,
+        "pageSize": 200
+      },
+      "response": {
+        "rollouts": [
+          {
+            "id": "3",
+            "jobId": "search-indexer",
+            "fromJobConfigId": "search-indexer-1",
+            "toJobConfigId": "search-indexer-2",
+            "status": "completed",
+            "message": "Rollout completed",
+            "strategy": "default",
+            "configJson": "{\"rollout\":null,\"rolloutByGroup\":{},\"runtime\":{\"groups\":{\"default\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T22:54:56.886465726Z\"}}}}",
+            "createdAt": "2026-10-10T22:54:54.859513924Z",
+            "updatedAt": "2026-10-10T22:54:56.892699906Z",
+            "completedAt": "2026-10-10T22:54:56.892699906Z"
+          }
+        ],
+        "totalCount": 1,
+        "page": 1,
+        "pageSize": 100
+      }
+    },
+    {
+      "request": {
+        "query": "",
+        "sortBy": "updated_at",
+        "sortOrder": "desc",
+        "page": 1,
+        "pageSize": 20
+      },
+      "response": {
+        "rollouts": [
+          {
+            "id": "9",
+            "jobId": "checkout",
+            "fromJobConfigId": "checkout-1",
+            "toJobConfigId": "checkout-2",
+            "status": "completed",
+            "message": "Rollout completed",
+            "strategy": "default",
+            "configJson": "{\"rollout\":null,\"rolloutByGroup\":{},\"runtime\":{\"groups\":{\"api\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T23:35:26.116260282Z\"},\"workers\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T23:34:45.973028723Z\"}}}}",
+            "createdAt": "2026-10-10T23:34:43.910514899Z",
+            "updatedAt": "2026-10-10T23:35:26.129939247Z",
+            "completedAt": "2026-10-10T23:35:26.129939247Z"
+          },
+          {
+            "id": "5",
+            "jobId": "edge-proxy",
+            "fromJobConfigId": "edge-proxy-2",
+            "toJobConfigId": "edge-proxy-3",
+            "status": "completed",
+            "message": "Rollout completed",
+            "strategy": "default",
+            "configJson": "{\"rollout\":null,\"rolloutByGroup\":{},\"runtime\":{\"groups\":{\"default\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T23:09:23.759828318Z\"}}}}",
+            "createdAt": "2026-10-10T23:09:17.722508788Z",
+            "updatedAt": "2026-10-10T23:09:23.768447106Z",
+            "completedAt": "2026-10-10T23:09:23.768447106Z"
+          },
+          {
+            "id": "4",
+            "jobId": "nightly-report",
+            "fromJobConfigId": "nightly-report-1",
+            "toJobConfigId": "nightly-report-2",
+            "status": "completed",
+            "message": "Rollout completed",
+            "strategy": "default",
+            "configJson": "{\"rollout\":null,\"rolloutByGroup\":{},\"runtime\":{\"groups\":{\"default\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T22:56:35.36189592Z\"}}}}",
+            "createdAt": "2026-10-10T22:54:54.994824248Z",
+            "updatedAt": "2026-10-10T22:56:35.36865628Z",
+            "completedAt": "2026-10-10T22:56:35.36865628Z"
+          },
+          {
+            "id": "2",
+            "jobId": "edge-proxy",
+            "fromJobConfigId": "edge-proxy-1",
+            "toJobConfigId": "edge-proxy-2",
+            "status": "completed",
+            "message": "Rollout completed",
+            "strategy": "default",
+            "configJson": "{\"rollout\":null,\"rolloutByGroup\":{},\"runtime\":{\"groups\":{\"default\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T22:55:00.750156123Z\"}}}}",
+            "createdAt": "2026-10-10T22:54:54.702739828Z",
+            "updatedAt": "2026-10-10T22:55:00.760243823Z",
+            "completedAt": "2026-10-10T22:55:00.760243823Z"
+          },
+          {
+            "id": "3",
+            "jobId": "search-indexer",
+            "fromJobConfigId": "search-indexer-1",
+            "toJobConfigId": "search-indexer-2",
+            "status": "completed",
+            "message": "Rollout completed",
+            "strategy": "default",
+            "configJson": "{\"rollout\":null,\"rolloutByGroup\":{},\"runtime\":{\"groups\":{\"default\":{\"stepIndex\":1,\"pendingManualAdvances\":0,\"lastStepCompletedAt\":\"2026-10-10T22:54:56.886465726Z\"}}}}",
+            "createdAt": "2026-10-10T22:54:54.859513924Z",
+            "updatedAt": "2026-10-10T22:54:56.892699906Z",
+            "completedAt": "2026-10-10T22:54:56.892699906Z"
+          }
+        ],
+        "totalCount": 5,
+        "page": 1,
+        "pageSize": 20
+      }
+    },
+    {
+      "request": {
+        "activeOnly": true,
+        "page": 1,
+        "pageSize": 20
+      },
+      "response": {
+        "page": 1,
+        "pageSize": 20
+      }
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "method": "GetManagerConfigs",
+  "recordedAt": "2026-10-10T23:46:06.258Z",
+  "entries": [
+    {
+      "request": {
+        "query": "127.0.0.1:4747",
+        "page": 1,
+        "pageSize": 1
+      },
+      "response": {
+        "configs": [
+          {
+            "nodeId": "127.0.0.1:4747",
+            "configJson": "{\n  \"server\": {\n    \"port\": 4747,\n    \"insecurePort\": 4748,\n    \"host\": \"127.0.0.1\",\n    \"advertiseAddr\": null,\n    \"tls\": {\n      \"enabled\": false,\n      \"certPath\": \"\",\n      \"keyPath\": \"\"\n    },\n    \"allowedOrigins\": []\n  },\n  \"storePath\": \"/var/lib/legion\",\n  \"workerConfigPath\": \"/etc/legion/workers/\",\n  \"workerCheckSeconds\": 2,\n  \"evalThreads\": 4,\n  \"schedulingPolicy\": \"bin_pack\",\n  \"defaultPriority\": 50,\n  \"rolloutRetentionDays\": 30,\n  \"kvDebounceMs\": 500,\n  \"schedulerSettings\": {\n    \"plan_conflict_max_retries\": 3\n  },\n  \"taskResourceDefaults\": null,\n  \"customResources\": null,\n  \"persistence\": {\n    \"type\": \"local_disk\",\n    \"streaming\": {\n      \"replicaUrl\": \"\",\n      \"syncInterval\": \"1s\",\n      \"lease\": {\n        \"provider\": \"none\",\n        \"key\": \"leases/default/primary.json\",\n        \"ttlSeconds\": 15,\n        \"renewIntervalSeconds\": 5,\n        \"objectStorage\": {\n          \"bucket\": \"\",\n          \"region\": \"auto\",\n          \"endpoint\": null,\n          \"accessKeyId\": null,\n          \"secretAccessKey\": null\n        }\n      }\n    },\n    \"raft\": {\n      \"nodeId\": \"mgr-a\",\n      \"bootstrap\": true,\n      \"peers\": [\n        \"mgr-a\",\n        \"mgr-b\",\n        \"mgr-c\"\n      ],\n      \"joinTokenTtlSeconds\": 900,\n      \"dataDir\": \"/var/lib/legion/raft\",\n      \"topology\": \"single\",\n      \"advertiseAddr\": null,\n      \"clusterSecret\": null,\n      \"joinToken\": null,\n      \"expectedVoters\": null,\n      \"snapshotEntries\": 10000,\n      \"forceNewCluster\": false,\n      \"heartbeatIntervalMs\": 250,\n      \"electionTimeoutMinMs\": 600,\n      \"electionTimeoutMaxMs\": 1200\n    }\n  },\n  \"workloadIdentity\": {\n    \"enabled\": false,\n    \"issuer\": null,\n    \"jwksPath\": \"/.well-known/jwks.json\",\n    \"signingAlg\": \"ES256\",\n    \"defaultTtl\": \"15m\",\n    \"rotationAge\": \"24h\",\n    \"subTemplate\": \"{region}:{job}:{group}:{task}\",\n    \"nodeIdentities\": [],\n    \"controlPlaneBindings\": []\n  },\n  \"acl\": {\n    \"enabled\": false,\n    \"auditOnly\": false,\n    \"loginTtl\": \"24h\",\n    \"tokenMaxTtl\": null,\n    \"authMethods\": [],\n    \"jwksRefreshInterval\": \"5m\"\n  },\n  \"artifacts\": {\n    \"allowedSchemes\": [\n      \"https\",\n      \"s3\",\n      \"oci\",\n      \"git\",\n      \"file\"\n    ],\n    \"auth\": [],\n    \"containerImageDesugar\": false\n  },\n  \"exec\": {\n    \"enabled\": true\n  },\n  \"telemetry\": {\n    \"enabled\": true,\n    \"port\": null\n  },\n  \"edgeBoot\": {\n    \"enabled\": false,\n    \"defaultTicketTtl\": \"5m\",\n    \"maxTicketTtl\": \"1h\",\n    \"maxProvisionalPerNode\": 32\n  },\n  \"heartbeat\": {\n    \"adaptive\": true,\n    \"targetRatePerSecond\": 2500.0,\n    \"minInterval\": \"2s\",\n    \"maxInterval\": \"120s\",\n    \"missedBeatsBeforeLost\": 5,\n    \"headroom\": 2.0\n  },\n  \"liveness\": {\n    \"batchWindow\": \"0ms\",\n    \"failoverGrace\": \"60s\",\n    \"digestInterval\": \"1s\",\n    \"peerDigestGrace\": \"30s\",\n    \"checkpointInterval\": \"30s\"\n  },\n  \"encryption\": {\n    \"enabled\": true,\n    \"rootKey\": {\n      \"provider\": \"file\",\n      \"path\": null,\n      \"var\": \"LEGION_ROOT_KEY\",\n      \"command\": [],\n      \"timeout\": \"10s\"\n    },\n    \"dataKeyRotationAge\": \"720h\"\n  }\n}",
+            "updatedAt": "2026-10-10 22:53:46 +00:00:00"
+          }
+        ],
+        "totalCount": 1,
+        "page": 1,
+        "pageSize": 1
+      }
+    },
+    {
+      "request": {
+        "query": "",
+        "sortBy": "updated_at",
+        "sortOrder": "desc",
+        "page": 1,
+        "pageSize": 20
+      },
+      "response": {
+        "configs": [
+          {
+            "nodeId": "127.0.0.1:4747",
+            "configJson": "{\n  \"server\": {\n    \"port\": 4747,\n    \"insecurePort\": 4748,\n    \"host\": \"127.0.0.1\",\n    \"advertiseAddr\": null,\n    \"tls\": {\n      \"enabled\": false,\n      \"certPath\": \"\",\n      \"keyPath\": \"\"\n    },\n    \"allowedOrigins\": []\n  },\n  \"storePath\": \"/var/lib/legion\",\n  \"workerConfigPath\": \"/etc/legion/workers/\",\n  \"workerCheckSeconds\": 2,\n  \"evalThreads\": 4,\n  \"schedulingPolicy\": \"bin_pack\",\n  \"defaultPriority\": 50,\n  \"rolloutRetentionDays\": 30,\n  \"kvDebounceMs\": 500,\n  \"schedulerSettings\": {\n    \"plan_conflict_max_retries\": 3\n  },\n  \"taskResourceDefaults\": null,\n  \"customResources\": null,\n  \"persistence\": {\n    \"type\": \"local_disk\",\n    \"streaming\": {\n      \"replicaUrl\": \"\",\n      \"syncInterval\": \"1s\",\n      \"lease\": {\n        \"provider\": \"none\",\n        \"key\": \"leases/default/primary.json\",\n        \"ttlSeconds\": 15,\n        \"renewIntervalSeconds\": 5,\n        \"objectStorage\": {\n          \"bucket\": \"\",\n          \"region\": \"auto\",\n          \"endpoint\": null,\n          \"accessKeyId\": null,\n          \"secretAccessKey\": null\n        }\n      }\n    },\n    \"raft\": {\n      \"nodeId\": \"mgr-a\",\n      \"bootstrap\": true,\n      \"peers\": [\n        \"mgr-a\",\n        \"mgr-b\",\n        \"mgr-c\"\n      ],\n      \"joinTokenTtlSeconds\": 900,\n      \"dataDir\": \"/var/lib/legion/raft\",\n      \"topology\": \"single\",\n      \"advertiseAddr\": null,\n      \"clusterSecret\": null,\n      \"joinToken\": null,\n      \"expectedVoters\": null,\n      \"snapshotEntries\": 10000,\n      \"forceNewCluster\": false,\n      \"heartbeatIntervalMs\": 250,\n      \"electionTimeoutMinMs\": 600,\n      \"electionTimeoutMaxMs\": 1200\n    }\n  },\n  \"workloadIdentity\": {\n    \"enabled\": false,\n    \"issuer\": null,\n    \"jwksPath\": \"/.well-known/jwks.json\",\n    \"signingAlg\": \"ES256\",\n    \"defaultTtl\": \"15m\",\n    \"rotationAge\": \"24h\",\n    \"subTemplate\": \"{region}:{job}:{group}:{task}\",\n    \"nodeIdentities\": [],\n    \"controlPlaneBindings\": []\n  },\n  \"acl\": {\n    \"enabled\": false,\n    \"auditOnly\": false,\n    \"loginTtl\": \"24h\",\n    \"tokenMaxTtl\": null,\n    \"authMethods\": [],\n    \"jwksRefreshInterval\": \"5m\"\n  },\n  \"artifacts\": {\n    \"allowedSchemes\": [\n      \"https\",\n      \"s3\",\n      \"oci\",\n      \"git\",\n      \"file\"\n    ],\n    \"auth\": [],\n    \"containerImageDesugar\": false\n  },\n  \"exec\": {\n    \"enabled\": true\n  },\n  \"telemetry\": {\n    \"enabled\": true,\n    \"port\": null\n  },\n  \"edgeBoot\": {\n    \"enabled\": false,\n    \"defaultTicketTtl\": \"5m\",\n    \"maxTicketTtl\": \"1h\",\n    \"maxProvisionalPerNode\": 32\n  },\n  \"heartbeat\": {\n    \"adaptive\": true,\n    \"targetRatePerSecond\": 2500.0,\n    \"minInterval\": \"2s\",\n    \"maxInterval\": \"120s\",\n    \"missedBeatsBeforeLost\": 5,\n    \"headroom\": 2.0\n  },\n  \"liveness\": {\n    \"batchWindow\": \"0ms\",\n    \"failoverGrace\": \"60s\",\n    \"digestInterval\": \"1s\",\n    \"peerDigestGrace\": \"30s\",\n    \"checkpointInterval\": \"30s\"\n  },\n  \"encryption\": {\n    \"enabled\": true,\n    \"rootKey\": {\n      \"provider\": \"file\",\n      \"path\": null,\n      \"var\": \"LEGION_ROOT_KEY\",\n      \"command\": [],\n      \"timeout\": \"10s\"\n    },\n    \"dataKeyRotationAge\": \"720h\"\n  }\n}",
+            "updatedAt": "2026-10-10 22:53:46 +00:00:00"
+          }
+        ],
+        "totalCount": 1,
+        "page": 1,
+        "pageSize": 20
+      }
+    }
+  ]
+}

@@ -786,6 +786,8 @@ const Layout = (props: RouteSectionProps) => {
       onMouseLeave={hideNavTooltip}
       onFocus={(event) => showNavTooltip(event.currentTarget, itemProps.item.label)}
       onBlur={hideNavTooltip}
+      data-ui="nav-item"
+      data-active={isActiveNavPath(itemProps.item.path) ? 'true' : undefined}
       class={cx(
         'group relative flex items-center rounded-md py-1.5 text-sm transition-colors',
         isNavCollapsed() ? 'justify-center px-2' : 'gap-2.5 px-2.5',
@@ -832,7 +834,7 @@ const Layout = (props: RouteSectionProps) => {
                 <BrandMark class="h-[18px] w-[18px]" />
               </span>
               <Show when={!isNavCollapsed()}>
-                <span class="font-display text-sm font-bold uppercase tracking-[0.28em] text-ink">Legion</span>
+                <span data-ui="brand" class="font-display text-sm font-bold uppercase tracking-[0.28em] text-ink">Legion</span>
               </Show>
             </A>
             <button
@@ -873,7 +875,7 @@ const Layout = (props: RouteSectionProps) => {
                       when={!isNavCollapsed()}
                       fallback={<div class="mx-auto mb-2 h-px w-6 bg-line" />}
                     >
-                      <p class="eyebrow px-2.5 pb-1.5">{(entry as SidebarSection).heading}</p>
+                      <p data-ui="nav-heading" class="eyebrow px-2.5 pb-1.5">{(entry as SidebarSection).heading}</p>
                     </Show>
                     <div class="space-y-0.5">
                       <For each={(entry as SidebarSection).items}>
@@ -985,7 +987,7 @@ const Layout = (props: RouteSectionProps) => {
               </Button>
             </div>
           </Show>
-          <div class="sticky top-0 z-20 flex h-12 items-center gap-3 border-b border-line bg-canvas/85 px-4 backdrop-blur md:px-6">
+          <div data-ui="topbar" class="sticky top-0 z-20 flex h-12 items-center gap-3 border-b border-line bg-canvas/85 px-4 backdrop-blur md:px-6">
             <button
               type="button"
               class="rounded-md p-1.5 text-muted hover:bg-surface2 md:hidden"
@@ -1120,7 +1122,7 @@ const Layout = (props: RouteSectionProps) => {
               </div>
             </div>
           </Show>
-          <main class="flex-1 min-w-0 px-4 py-6 md:px-8">
+          <main data-ui="main" class="flex-1 min-w-0 px-4 py-6 md:px-8">
             <Show when={!isDetailRoute() && !isUnknownRoute() && !isUnlistedPage()}>
               <PageHeader title={pageMeta().title} subtitle={pageMeta().subtitle} />
             </Show>

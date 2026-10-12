@@ -1,0 +1,87 @@
+{
+  "method": "ListJobSpecHistory",
+  "recordedAt": "2026-10-10T23:45:44.809Z",
+  "entries": [
+    {
+      "request": {
+        "name": "edge-proxy"
+      },
+      "response": {
+        "items": [
+          {
+            "configId": "edge-proxy-3",
+            "createdAt": "2026-10-10 23:09:17.719114357+00:00",
+            "version": "3"
+          },
+          {
+            "configId": "edge-proxy-2",
+            "createdAt": "2026-10-10 22:54:54.699355261+00:00",
+            "version": "2"
+          },
+          {
+            "configId": "edge-proxy-1",
+            "createdAt": "2026-10-10 22:54:29.295407866+00:00",
+            "version": "1"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "name": "checkout"
+      },
+      "response": {
+        "items": [
+          {
+            "configId": "checkout-2",
+            "createdAt": "2026-10-10 23:34:43.905612191+00:00",
+            "version": "2"
+          },
+          {
+            "configId": "checkout-1",
+            "createdAt": "2026-10-10 23:29:40.970384107+00:00",
+            "version": "1"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "name": "nightly-report"
+      },
+      "response": {
+        "items": [
+          {
+            "configId": "nightly-report-2",
+            "createdAt": "2026-10-10 22:54:54.991882499+00:00",
+            "version": "2"
+          },
+          {
+            "configId": "nightly-report-1",
+            "createdAt": "2026-10-10 22:54:29.544973075+00:00",
+            "version": "1"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "name": "search-indexer"
+      },
+      "response": {
+        "items": [
+          {
+            "configId": "search-indexer-2",
+            "createdAt": "2026-10-10 22:54:54.854315348+00:00",
+            "version": "2"
+          },
+          {
+            "configId": "search-indexer-1",
+            "createdAt": "2026-10-10 22:54:29.425997178+00:00",
+            "version": "1"
+          }
+        ]
+      }
+    }
+  ]
+}

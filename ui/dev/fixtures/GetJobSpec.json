@@ -1,0 +1,78 @@
+{
+  "method": "GetJobSpec",
+  "recordedAt": "2026-10-10T23:45:54.583Z",
+  "entries": [
+    {
+      "request": {
+        "name": "edge-proxy"
+      },
+      "response": {
+        "submissions": [
+          {
+            "path": "edge-proxy.ncl",
+            "content": "{\n  name = \"edge-proxy\",\n  tasks = [\n    {\n      name = \"proxy\",\n      runtime = \"exec\",\n      lifecycle = \"service\",\n      config = { command = [\"sh\", \"-c\", \"exec python3 -u -m http.server $LEGION_PORT_HTTP\"] },\n      network = { ports = [{ name = \"http\", static = 18080 }] },\n      service = { name = \"edge\", port = \"http\", tags = [\"edge\"] },\n      checks = [{ type = \"health\", kind = \"tcp\", port = \"http\", every = \"5s\", timeout = \"2s\", unhealthy_after_count = 2 }],\n      resources = { cpus = 0.2, memory = 128 },\n      permit = [{ key = \"pool\", operator = \"equal\", value = \"edge\" }],\n    },\n  ],\n}\n",
+            "isPrimary": true
+          },
+          {
+            "path": "job.rendered.json",
+            "content": "{\n  \"name\": \"edge-proxy\",\n  \"tasks\": [\n    {\n      \"checks\": [\n        {\n          \"every\": \"5s\",\n          \"kind\": \"tcp\",\n          \"port\": \"http\",\n          \"timeout\": \"2s\",\n          \"type\": \"health\",\n          \"unhealthy_after_count\": 2\n        }\n      ],\n      \"config\": {\n        \"command\": [\n          \"sh\",\n          \"-c\",\n          \"exec python3 -u -m http.server $LEGION_PORT_HTTP\"\n        ]\n      },\n      \"lifecycle\": \"service\",\n      \"name\": \"proxy\",\n      \"network\": {\n        \"ports\": [\n          {\n            \"name\": \"http\",\n            \"static\": 18080\n          }\n        ]\n      },\n      \"permit\": [\n        {\n          \"key\": \"pool\",\n          \"operator\": \"equal\",\n          \"value\": \"edge\"\n        }\n      ],\n      \"resources\": {\n        \"cpus\": 0.2,\n        \"memory\": 128\n      },\n      \"runtime\": \"exec\",\n      \"service\": {\n        \"name\": \"edge\",\n        \"port\": \"http\",\n        \"tags\": [\n          \"edge\"\n        ]\n      }\n    }\n  ]\n}"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "name": "checkout"
+      },
+      "response": {
+        "submissions": [
+          {
+            "path": "checkout.ncl",
+            "content": "{\n  name = \"checkout\",\n  tasks = [\n    {\n      name = \"api\",\n      group = \"api\",\n      count = 3,\n      runtime = \"exec\",\n      lifecycle = \"service\",\n      config = {\n        command = [\"sh\", \"-c\", \"echo \\\"checkout-api listening on :$LEGION_PORT_HTTP\\\"; exec python3 -u -m http.server $LEGION_PORT_HTTP\"],\n        env = { RELEASE = \"2026.10.2\" },\n      },\n      network = { ports = [{ name = \"http\" }] },\n      service = { name = \"checkout-api\", port = \"http\", tags = [\"v2\", \"public\"], meta = { protocol = \"http\" } },\n      checks = [\n        { type = \"health\", kind = \"http\", path = \"/\", port = \"http\", every = \"5s\", timeout = \"2s\", unhealthy_after_count = 2 },\n      ],\n      resources = { cpus = 0.25, memory = 256 },\n      permit = [{ key = \"pool\", operator = \"equal\", value = \"general\" }],\n    },\n    {\n      name = \"queue-worker\",\n      group = \"workers\",\n      count = 2,\n      runtime = \"exec\",\n      lifecycle = \"service\",\n      config = {\n        command = [\"sh\", \"-c\", \"i=0; while true; do i=$((i+1)); echo \\\"level=info msg=\\\\\\\"processed order batch\\\\\\\" batch=$i orders=12 took=340ms\\\"; sleep 2; done\"],\n      },\n      resources = { cpus = 0.5, memory = 512 },\n      permit = [{ key = \"pool\", operator = \"equal\", value = \"batch\" }],\n    },\n    {\n      name = \"cache-warmer\",\n      group = \"workers\",\n      runtime = \"exec\",\n      lifecycle = \"service\",\n      config = {\n        command = [\"sh\", \"-c\", \"echo 'warming 4096 keys from orders-db'; echo 'warn: redis upstream slow (p99 2.4s), retrying' >&2; exec sleep 86400\"],\n      },\n      resources = { cpus = 0.1, memory = 128 },\n      permit = [{ key = \"pool\", operator = \"equal\", value = \"batch\" }],\n    },\n  ],\n}\n",
+            "isPrimary": true
+          },
+          {
+            "path": "job.rendered.json",
+            "content": "{\n  \"name\": \"checkout\",\n  \"tasks\": [\n    {\n      \"checks\": [\n        {\n          \"every\": \"5s\",\n          \"kind\": \"http\",\n          \"path\": \"/\",\n          \"port\": \"http\",\n          \"timeout\": \"2s\",\n          \"type\": \"health\",\n          \"unhealthy_after_count\": 2\n        }\n      ],\n      \"config\": {\n        \"command\": [\n          \"sh\",\n          \"-c\",\n          \"echo \\\"checkout-api listening on :$LEGION_PORT_HTTP\\\"; exec python3 -u -m http.server $LEGION_PORT_HTTP\"\n        ],\n        \"env\": {\n          \"RELEASE\": \"2026.10.2\"\n        }\n      },\n      \"count\": 3,\n      \"group\": \"api\",\n      \"lifecycle\": \"service\",\n      \"name\": \"api\",\n      \"network\": {\n        \"ports\": [\n          {\n            \"name\": \"http\"\n          }\n        ]\n      },\n      \"permit\": [\n        {\n          \"key\": \"pool\",\n          \"operator\": \"equal\",\n          \"value\": \"general\"\n        }\n      ],\n      \"resources\": {\n        \"cpus\": 0.25,\n        \"memory\": 256\n      },\n      \"runtime\": \"exec\",\n      \"service\": {\n        \"meta\": {\n          \"protocol\": \"http\"\n        },\n        \"name\": \"checkout-api\",\n        \"port\": \"http\",\n        \"tags\": [\n          \"v2\",\n          \"public\"\n        ]\n      }\n    },\n    {\n      \"config\": {\n        \"command\": [\n          \"sh\",\n          \"-c\",\n          \"i=0; while true; do i=$((i+1)); echo \\\"level=info msg=\\\\\\\"processed order batch\\\\\\\" batch=$i orders=12 took=340ms\\\"; sleep 2; done\"\n        ]\n      },\n      \"count\": 2,\n      \"group\": \"workers\",\n      \"lifecycle\": \"service\",\n      \"name\": \"queue-worker\",\n      \"permit\": [\n        {\n          \"key\": \"pool\",\n          \"operator\": \"equal\",\n          \"value\": \"batch\"\n        }\n      ],\n      \"resources\": {\n        \"cpus\": 0.5,\n        \"memory\": 512\n      },\n      \"runtime\": \"exec\"\n    },\n    {\n      \"config\": {\n        \"command\": [\n          \"sh\",\n          \"-c\",\n          \"echo 'warming 4096 keys from orders-db'; echo 'warn: redis upstream slow (p99 2.4s), retrying' >&2; exec sleep 86400\"\n        ]\n      },\n      \"group\": \"workers\",\n      \"lifecycle\": \"service\",\n      \"name\": \"cache-warmer\",\n      \"permit\": [\n        {\n          \"key\": \"pool\",\n          \"operator\": \"equal\",\n          \"value\": \"batch\"\n        }\n      ],\n      \"resources\": {\n        \"cpus\": 0.1,\n        \"memory\": 128\n      },\n      \"runtime\": \"exec\"\n    }\n  ]\n}"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "name": "nightly-report"
+      },
+      "response": {
+        "submissions": [
+          {
+            "path": "nightly-report.ncl",
+            "content": "{\n  name = \"nightly-report\",\n  tasks = [\n    {\n      name = \"report\",\n      runtime = \"exec\",\n      lifecycle = \"batch\",\n      config = { command = [\"sh\", \"-c\", \"echo 'rendered 1,204 rows'; sleep 1\"] },\n      resources = { cpus = 0.1, memory = 64 },\n      permit = [{ key = \"pool\", operator = \"equal\", value = \"general\" }],\n    },\n  ],\n}\n",
+            "isPrimary": true
+          },
+          {
+            "path": "job.rendered.json",
+            "content": "{\n  \"name\": \"nightly-report\",\n  \"tasks\": [\n    {\n      \"config\": {\n        \"command\": [\n          \"sh\",\n          \"-c\",\n          \"echo 'rendered 1,204 rows'; sleep 1\"\n        ]\n      },\n      \"lifecycle\": \"batch\",\n      \"name\": \"report\",\n      \"permit\": [\n        {\n          \"key\": \"pool\",\n          \"operator\": \"equal\",\n          \"value\": \"general\"\n        }\n      ],\n      \"resources\": {\n        \"cpus\": 0.1,\n        \"memory\": 64\n      },\n      \"runtime\": \"exec\"\n    }\n  ]\n}"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "name": "search-indexer"
+      },
+      "response": {
+        "submissions": [
+          {
+            "path": "search-indexer.ncl",
+            "content": "{\n  name = \"search-indexer\",\n  tasks = [\n    {\n      name = \"indexer\",\n      count = 2,\n      runtime = \"exec\",\n      lifecycle = \"service\",\n      config = { command = [\"sh\", \"-c\", \"echo 'indexing shard'; sleep 600\"] },\n      resources = { cpus = 0.5, memory = 768 },\n      permit = [{ key = \"pool\", operator = \"equal\", value = \"batch\" }],\n    },\n    {\n      name = \"compactor\",\n      runtime = \"exec\",\n      lifecycle = \"service\",\n      config = { command = [\"sh\", \"-c\", \"echo 'error: segment store unreachable' >&2; exit 1\"] },\n      restart = { policy = \"always\", delay = \"5s\" },\n      resources = { cpus = 0.25, memory = 256 },\n      permit = [{ key = \"pool\", operator = \"equal\", value = \"batch\" }],\n    },\n  ],\n}\n",
+            "isPrimary": true
+          },
+          {
+            "path": "job.rendered.json",
+            "content": "{\n  \"name\": \"search-indexer\",\n  \"tasks\": [\n    {\n      \"config\": {\n        \"command\": [\n          \"sh\",\n          \"-c\",\n          \"echo 'indexing shard'; sleep 600\"\n        ]\n      },\n      \"count\": 2,\n      \"lifecycle\": \"service\",\n      \"name\": \"indexer\",\n      \"permit\": [\n        {\n          \"key\": \"pool\",\n          \"operator\": \"equal\",\n          \"value\": \"batch\"\n        }\n      ],\n      \"resources\": {\n        \"cpus\": 0.5,\n        \"memory\": 768\n      },\n      \"runtime\": \"exec\"\n    },\n    {\n      \"config\": {\n        \"command\": [\n          \"sh\",\n          \"-c\",\n          \"echo 'error: segment store unreachable' >&2; exit 1\"\n        ]\n      },\n      \"lifecycle\": \"service\",\n      \"name\": \"compactor\",\n      \"permit\": [\n        {\n          \"key\": \"pool\",\n          \"operator\": \"equal\",\n          \"value\": \"batch\"\n        }\n      ],\n      \"resources\": {\n        \"cpus\": 0.25,\n        \"memory\": 256\n      },\n      \"restart\": {\n        \"delay\": \"5s\",\n        \"policy\": \"always\"\n      },\n      \"runtime\": \"exec\"\n    }\n  ]\n}"
+          }
+        ]
+      }
+    }
+  ]
+}

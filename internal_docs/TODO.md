@@ -3663,6 +3663,36 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       an indexed `scheduler_event.instance_id` column if the journal bound ever
       grows ([calls 3](calls/operator-ui-gaps-plan_calls.md#3-the-instance-event-filter-reads-metadata-not-a-new-column))
 
+From [ui-theme-lab-plan.md](plans/ui-theme-lab-plan.md):
+
+- [ ] Theme picker (maintainer is building it): ship Swiss as the default
+      and offer the round-three palettes (7, light/dark) and tweaks (6 axes)
+      from `ui/src/themes/swiss.ts`. Move the Swiss family + "Swiss picker"
+      rules from `themes.css` and the palette tokens into production CSS,
+      load only the typefaces the picker offers, and apply the stored
+      `{ palette, mode, tweaks }` before first paint to avoid a flash
+      ([plan round three](plans/ui-theme-lab-plan.md#round-three-swiss-as-palettes--tweaks),
+      [calls entry 2](calls/ui-theme-lab-plan_calls.md)).
+- [ ] The black-rail tweak barely shows in dark palettes whose page is
+      already near-black; the active item carries it. Consider lifting the
+      page or tinting the rail for those palettes.
+- [ ] Ship the pick as the default (plan phase 3):
+      paste its tokens into `index.css`, fold its `themes.css` rules into the
+      components, design its second mode, re-run `npm run lab:contrast`, and
+      update the Design System section of `docs/ui-architecture.md`. Then
+      decide whether the lab stays.
+- [ ] The shipped light theme's faint text (`--c-faint` #807a6e) is 4.26:1 on
+      surfaces and 3.94:1 on the canvas, under WCAG AA's 4.5:1. It carries
+      timestamps, hints and descriptions. Darken it (or fold it into the phase
+      3 pick); `npm run lab:contrast` reports it.
+- [ ] Lab fixtures (`ui/dev/fixtures/`) are one recording; re-record with
+      `npm run lab:record` + `lab:crawl` after proto changes, or new fields
+      will be missing from fake data.
+- [ ] `tsconfig.node.json` (vite.config.ts and `ui/dev/`) is never
+      typechecked: it has no Node types or `lib`, and neither `npm run
+      typecheck` nor CI builds the reference. Add `@types/node` and a
+      `tsc -p tsconfig.node.json` step.
+
 ## Cross-cutting
 
 - [ ] **Ship a Nickel contract library for the jobspec.** `legion job schema`
@@ -4829,6 +4859,20 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       [service-discovery](../docs/service-discovery.md#public-addresses),
       [rollouts](../docs/rollouts.md#a-newer-version-supersedes-a-running-rollout),
       [ui-architecture](../docs/ui-architecture.md)).
+
+- [x] Theme lab (2026-10-10): fonts, radius, shadows and status palettes
+      became CSS variables (no visual change) with `data-ui` structure hooks;
+      twenty candidate themes; a dev-only theme studio (`npm run lab`) with
+      presets, live contrast, CSS/JSON export and saved presets; recorded
+      fake data (`lab:record`, `lab:crawl`) served when no manager answers;
+      `lab:shots` and `lab:contrast`. Round two (2026-10-11): Forge Light,
+      Swiss Dark and five riffs each for Command Post, Forge and Swiss.
+      Round three (2026-10-11): Swiss as palettes × tweaks with a Picker
+      section in the studio
+      ([plan](plans/ui-theme-lab-plan.md),
+      [calls](calls/ui-theme-lab-plan_calls.md),
+      [docs](../docs/ui-architecture.md#design-lab-and-theme-studio-dev-server-only)).
+      Shipping the pick is open above.
 
 ## AWS rig: mitigations in place for the node-deregistration and plugin-build gaps
 

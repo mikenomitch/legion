@@ -1,0 +1,98 @@
+{
+  "method": "ResolveService",
+  "recordedAt": "2026-10-10T23:45:54.620Z",
+  "entries": [
+    {
+      "request": {
+        "service": "edge",
+        "includeUnhealthy": true
+      },
+      "response": {
+        "endpoints": [
+          {
+            "service": "edge",
+            "jobId": "edge-proxy",
+            "taskName": "proxy",
+            "allocationId": "25",
+            "nodeId": "euw1-edge-01",
+            "address": "127.0.0.1",
+            "port": 18080,
+            "healthy": true,
+            "healthStatus": "TCP Check http passed",
+            "tags": [
+              "edge"
+            ],
+            "portLabel": "http"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "service": "checkout-api",
+        "includeUnhealthy": true
+      },
+      "response": {
+        "endpoints": [
+          {
+            "service": "checkout-api",
+            "jobId": "checkout",
+            "taskName": "api",
+            "allocationId": "50",
+            "nodeId": "use1-web-02",
+            "address": "127.0.0.1",
+            "port": 20000,
+            "healthy": true,
+            "healthStatus": "HTTP Check / passed",
+            "tags": [
+              "v2",
+              "public"
+            ],
+            "meta": {
+              "protocol": "http"
+            },
+            "portLabel": "http"
+          },
+          {
+            "service": "checkout-api",
+            "jobId": "checkout",
+            "taskName": "api",
+            "allocationId": "51",
+            "nodeId": "use1-web-02",
+            "address": "127.0.0.1",
+            "port": 20001,
+            "healthy": true,
+            "healthStatus": "HTTP Check / passed",
+            "tags": [
+              "v2",
+              "public"
+            ],
+            "meta": {
+              "protocol": "http"
+            },
+            "portLabel": "http"
+          },
+          {
+            "service": "checkout-api",
+            "jobId": "checkout",
+            "taskName": "api",
+            "allocationId": "52",
+            "nodeId": "use1-web-02",
+            "address": "127.0.0.1",
+            "port": 20002,
+            "healthy": true,
+            "healthStatus": "HTTP Check / passed",
+            "tags": [
+              "v2",
+              "public"
+            ],
+            "meta": {
+              "protocol": "http"
+            },
+            "portLabel": "http"
+          }
+        ]
+      }
+    }
+  ]
+}

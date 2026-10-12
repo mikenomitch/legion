@@ -119,6 +119,8 @@ export function Badge(props: BadgeProps) {
   return (
     <span
       title={props.title}
+      data-ui="badge"
+      data-tone={props.tone ?? 'neutral'}
       class={cx(
         'inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-2xs font-medium',
         props.mono && 'font-mono',
@@ -191,7 +193,7 @@ export function JumpHint(props: { keys?: string; class?: string }) {
 
 export function Card(props: { children: JSX.Element; class?: string; pad?: boolean }) {
   return (
-    <section class={cx('rounded-lg border border-line bg-surface shadow-card', props.pad !== false && 'p-4', props.class)}>
+    <section data-ui="card" class={cx('rounded-lg border border-line bg-surface shadow-card', props.pad !== false && 'p-4', props.class)}>
       {props.children}
     </section>
   )
@@ -209,12 +211,12 @@ type SectionCardProps = {
 
 export function SectionCard(props: SectionCardProps) {
   return (
-    <section class={cx('overflow-hidden rounded-lg border border-line bg-surface shadow-card', props.class)}>
+    <section data-ui="card" class={cx('overflow-hidden rounded-lg border border-line bg-surface shadow-card', props.class)}>
       <Show when={props.title || props.actions || props.description}>
-        <header class="flex min-h-[44px] flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b border-line px-4 py-2">
+        <header data-ui="card-header" class="flex min-h-[44px] flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b border-line px-4 py-2">
           <div class="min-w-0">
             <Show when={props.title}>
-              <h3 class="eyebrow !text-muted">{props.title}</h3>
+              <h3 data-ui="card-title" class="eyebrow !text-muted">{props.title}</h3>
             </Show>
             <Show when={props.description}>
               <p class="mt-0.5 text-xs text-faint">{props.description}</p>
@@ -241,13 +243,13 @@ type PageHeaderProps = {
 
 export function PageHeader(props: PageHeaderProps) {
   return (
-    <header class={cx('mb-5 flex flex-wrap items-end justify-between gap-x-6 gap-y-3', props.class)}>
+    <header data-ui="page-header" class={cx('mb-5 flex flex-wrap items-end justify-between gap-x-6 gap-y-3', props.class)}>
       <div class="min-w-0">
         <Show when={props.eyebrow}>
           <p class="eyebrow mb-1">{props.eyebrow}</p>
         </Show>
         <div class="flex flex-wrap items-center gap-3">
-          <h1 class="truncate font-display text-xl font-semibold tracking-tight text-ink md:text-2xl">{props.title}</h1>
+          <h1 data-ui="page-title" class="truncate font-display text-xl font-semibold tracking-tight text-ink md:text-2xl">{props.title}</h1>
           {props.badges}
         </div>
         <Show when={props.subtitle}>
@@ -281,9 +283,9 @@ export function StatCard(props: { label: string; value: JSX.Element; hint?: JSX.
   return (
     <Show
       when={props.href}
-      fallback={<div class="rounded-lg border border-line bg-surface p-3.5 shadow-card">{body}</div>}
+      fallback={<div data-ui="stat" class="rounded-lg border border-line bg-surface p-3.5 shadow-card">{body}</div>}
     >
-      <A href={props.href!} class="block rounded-lg border border-line bg-surface p-3.5 shadow-card transition-colors hover:border-line-strong hover:bg-surface2/60">
+      <A href={props.href!} data-ui="stat" class="block rounded-lg border border-line bg-surface p-3.5 shadow-card transition-colors hover:border-line-strong hover:bg-surface2/60">
         {body}
       </A>
     </Show>
@@ -370,7 +372,7 @@ export function Tabs(props: { tabs: readonly TabItem[]; active: string; onChange
     buttons?.[next]?.focus()
   }
   return (
-    <div ref={listRef} class={cx('flex items-center gap-1 overflow-x-auto border-b border-line', props.class)} role="tablist">
+    <div ref={listRef} data-ui="tabs" class={cx('flex items-center gap-1 overflow-x-auto border-b border-line', props.class)} role="tablist">
       {props.tabs.map((tab, index) => (
         <button
           type="button"
@@ -432,6 +434,8 @@ export function Button(props: ButtonProps) {
     <button
       type="button"
       {...rest}
+      data-ui="button"
+      data-variant={local.variant ?? 'subtle'}
       class={cx(
         'inline-flex items-center justify-center rounded-md font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45',
         buttonVariantClasses[local.variant ?? 'subtle'],
