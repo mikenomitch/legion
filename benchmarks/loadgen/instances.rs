@@ -69,6 +69,17 @@ pub struct InstancesOptions {
     pub stage_timeout: Duration,
     pub submit_job: bool,
     pub quiet: bool,
+    /// Host the manager dials for `PostWork` to the embedded fleet. Only a
+    /// worker off the work stream is pushed to, so this matters only while
+    /// a stream is down; on the AWS rig it is the loadgen box's private IP.
+    pub advertise_host: String,
+    /// Node-id prefix for the embedded fleet. A campaign running several
+    /// cells passes a fixed one so every cell re-registers the same nodes
+    /// instead of leaving the previous cell's to go lost.
+    pub sim_name_prefix: String,
+    /// `node_profiles` JSON for the embedded fleet (the benchmark scenario
+    /// schema); `None` is the simulator's single default profile.
+    pub sim_profiles: Option<String>,
 }
 
 /// What the run saw for one instance, filled in by the event stream and the
@@ -253,6 +264,7 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
                 job_id: Some(job),
                 node_id: None,
                 level: None,
+                ..Default::default()
             }))
             .await
             .context("opening StreamEvents")?
@@ -306,10 +318,11 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
             opts.join_secret.clone(),
             SimulateOptions {
                 count: opts.simulate,
-                name_prefix: format!("lg-{}", std::process::id()),
+                profiles_path: opts.sim_profiles.clone(),
+                name_prefix: opts.sim_name_prefix.clone(),
                 ready_after: opts.ready_after,
                 register_rate: 1000.0,
-                advertise_host: "127.0.0.1".into(),
+                advertise_host: opts.advertise_host.clone(),
                 checkpoints: true,
                 observer: Some(observer),
                 ..Default::default()
@@ -339,6 +352,7 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
     }
 
     let completed = Arc::new(AtomicU64::new(0));
+    let running = Arc::new(Running::default());
     let started = Instant::now();
     let progress = if opts.quiet {
         None
@@ -365,12 +379,13 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
             let observed = observed.clone();
             let opts = opts.clone();
             let completed = completed.clone();
+            let running = running.clone();
             async move {
                 if opts.rate > 0.0 {
                     let due = started + Duration::from_secs_f64(index as f64 / opts.rate);
                     tokio::time::sleep_until(due.into()).await;
                 }
-                let outcome = session(&mut client, &observed, &opts)
+                let outcome = session(&mut client, &observed, &opts, &running)
                     .await
                     .map_err(|err| format!("{err:#}"));
                 completed.fetch_add(1, Ordering::Relaxed);
@@ -421,6 +436,7 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
         "concurrency": opts.concurrency,
         "simulated_nodes": opts.simulate,
         "hold_ms": ms(opts.hold),
+        "peak_running": running.peak.load(Ordering::Relaxed),
         "stages": {
             "create_rpc": column(&|t| Some(t.create_rpc)),
             "placement": column(&|t| t.placement),
@@ -436,10 +452,30 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
 }
 
 /// One session, start to finish.
+/// Sessions between "running" and their suspend, and the most there ever
+/// were at once: the resident count a density cell holds.
+#[derive(Default)]
+struct Running {
+    now: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl Running {
+    fn enter(&self) {
+        let now = self.now.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+    }
+
+    fn leave(&self) {
+        self.now.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn session(
     client: &mut AuthedManagerClient,
     observed: &Observed,
     opts: &InstancesOptions,
+    running: &Running,
 ) -> Result<SessionTimes> {
     let mut times = SessionTimes::default();
 
@@ -466,9 +502,11 @@ async fn session(
         times.dispatch = Some(ms(received.saturating_duration_since(placed)));
     }
 
+    running.enter();
     if !opts.hold.is_zero() {
         tokio::time::sleep(opts.hold).await;
     }
+    running.leave();
 
     let suspend_sent = Instant::now();
     client

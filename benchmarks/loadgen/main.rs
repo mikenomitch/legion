@@ -178,22 +178,47 @@ fn main() -> Result<()> {
 async fn run_instances(matches: &clap::ArgMatches) -> Result<()> {
     let duration =
         |name: &str| -> Duration { Duration::from_millis(*matches.get_one::<u64>(name).unwrap()) };
+    // `--join-token` carries the worker type and secret a cluster that
+    // checks join tokens wants from the embedded fleet (and the manager
+    // address, used when neither `--manager` nor LEGION_ADDR names one).
+    let token = matches
+        .get_one::<String>("join-token")
+        .map(|raw| legion::structs::token::JoinToken::decode(raw))
+        .transpose()
+        .context("--join-token")?;
+    let manager = matches
+        .get_one::<String>("manager")
+        .cloned()
+        .or_else(|| std::env::var("LEGION_ADDR").ok())
+        .or_else(|| token.as_ref().map(|token| token.addr.clone()))
+        .unwrap_or_else(|| legion::prelude::DEF_MANAGER_ADDRESS.to_string());
     let opts = instances::InstancesOptions {
-        manager: std::env::var("LEGION_ADDR")
-            .unwrap_or_else(|_| legion::prelude::DEF_MANAGER_ADDRESS.to_string()),
+        manager,
         job: matches.get_one::<String>("job").unwrap().clone(),
         sessions: *matches.get_one::<usize>("sessions").unwrap(),
         rate: *matches.get_one::<f64>("rate").unwrap(),
         concurrency: *matches.get_one::<usize>("concurrency").unwrap(),
         connections: *matches.get_one::<usize>("connections").unwrap(),
         simulate: *matches.get_one::<usize>("simulate").unwrap(),
-        worker_type: matches.get_one::<String>("worker-type").unwrap().clone(),
-        join_secret: matches.get_one::<String>("join-secret").cloned(),
+        worker_type: token
+            .as_ref()
+            .map(|token| token.worker_type.clone())
+            .unwrap_or_else(|| matches.get_one::<String>("worker-type").unwrap().clone()),
+        join_secret: token
+            .as_ref()
+            .map(|token| token.secret.clone())
+            .or_else(|| matches.get_one::<String>("join-secret").cloned()),
         hold: duration("hold-ms"),
         ready_after: duration("ready-after-ms"),
         stage_timeout: duration("stage-timeout-ms"),
         submit_job: !matches.get_flag("no-submit"),
         quiet: matches.get_flag("quiet"),
+        advertise_host: matches.get_one::<String>("advertise-host").unwrap().clone(),
+        sim_name_prefix: matches
+            .get_one::<String>("sim-name-prefix")
+            .cloned()
+            .unwrap_or_else(|| format!("lg-{}", std::process::id())),
+        sim_profiles: matches.get_one::<String>("sim-profiles").cloned(),
     };
     let summary = instances::run(opts).await?;
     let rendered = serde_json::to_string_pretty(&summary)?;
@@ -283,6 +308,29 @@ fn cli() -> Command {
                 .long("join-secret")
                 .help("instances mode: join token secret, when the cluster enforces ACLs"),
         )
+        .arg(Arg::new("join-token").long("join-token").help(
+            "instances mode: a `legion join-token create` token for the embedded \
+                     fleet (sets its worker type and secret; overrides --worker-type and \
+                     --join-secret)",
+        ))
+        .arg(
+            Arg::new("advertise-host")
+                .long("advertise-host")
+                .default_value("127.0.0.1")
+                .help(
+                    "instances mode: host the manager dials to push work to the embedded \
+                     fleet (only used for a node whose work stream is down)",
+                ),
+        )
+        .arg(Arg::new("sim-name-prefix").long("sim-name-prefix").help(
+            "instances mode: node-id prefix for the embedded fleet (default \
+                     lg-<pid>); keep it fixed across runs against one cluster so each run \
+                     re-registers the same nodes",
+        ))
+        .arg(Arg::new("sim-profiles").long("sim-profiles").help(
+            "instances mode: node_profiles JSON for the embedded fleet (the \
+                     benchmark scenario schema); default one 4-CPU, 32 GiB profile",
+        ))
         .arg(
             Arg::new("hold-ms")
                 .long("hold-ms")
