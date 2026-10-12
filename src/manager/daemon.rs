@@ -586,7 +586,7 @@ pub async fn run_manager_with(
     }
     let api_listener = tokio::net::TcpListener::bind(addr)
         .await
-        .with_context(|| format!("failed to bind the manager API on {addr}"))?;
+        .with_context(|| format!("manager gRPC server on {addr} failed to bind"))?;
     let api_incoming = manager_incoming(&store_for_api, api_listener, operator_tls)?;
     let server_builder = Server::builder();
 

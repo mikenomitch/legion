@@ -506,8 +506,17 @@ pub fn run_provider_command(command: &[String], request: &Value, timeout: Durati
         .with_context(|| format!("failed starting root key provider `{program}`"))?;
     {
         let mut stdin = child.stdin.take().context("provider stdin unavailable")?;
-        stdin.write_all(request.to_string().as_bytes())?;
-        stdin.write_all(b"\n")?;
+        // A provider that exits without reading its request closes the pipe
+        // first; its exit status below is the error worth reporting, not
+        // the broken pipe.
+        let written = stdin
+            .write_all(request.to_string().as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"));
+        match written {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     let mut stdout = child.stdout.take().context("provider stdout unavailable")?;
     let mut stderr = child.stderr.take().context("provider stderr unavailable")?;
