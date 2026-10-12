@@ -2705,8 +2705,10 @@ async fn upstream_credential_needs_kv_read_on_the_path() -> R<()> {
         let jobspec = serde_json::json!({
             "name": "agent",
             "task": {
-                "runtime": "exec",
-                "config": { "command": ["sleep", "30"] },
+                // A container, not `exec`: submitting a host-level task
+                // needs `host = true`, which is not what this test is about.
+                "runtime": "container",
+                "config": { "image": "alpine", "command": ["sleep", "30"] },
                 "connect": {
                     "upstreams": [{
                         "name": "openai",
