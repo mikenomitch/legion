@@ -1,10 +1,9 @@
-use crate::prelude::*;
-
 use crate::manager::blocked::PlacementBlocked;
 use crate::manager::concurrency::{is_planning_kind, PlannerPermit};
 use crate::manager::oidc_http::OidcHttpLayer;
 use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
+use crate::prelude::*;
 use crate::storage::events::drafts;
 use crate::storage::persistence::PersistenceRole;
 use crate::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion, Store};
@@ -26,6 +25,9 @@ use tokio::task::JoinSet;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+
+/// Largest request the manager's gRPC service decodes.
+pub const MANAGER_MAX_DECODE_BYTES: usize = 64 * 1024 * 1024;
 
 // Fallback poll interval used only when delay calculation fails.
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -602,7 +604,11 @@ pub async fn run_manager_with(
     // The idle sweep reads the usage table heartbeats fill, so it shares
     // the service's handle.
     let usage_for_idle_sweep = manager_node.usage_handle();
-    let manager_service = ManagerServer::new(manager_node);
+    // A worker's full session report carries every session it holds (about
+    // 200 bytes each); tonic's 4 MiB default would cap a node near 20,000
+    // sessions. 64 MiB covers about 300,000 (session durability plan §6.5).
+    let manager_service =
+        ManagerServer::new(manager_node).max_decoding_message_size(MANAGER_MAX_DECODE_BYTES);
     // Browser origins (docs/ui-architecture.md): loopback plus
     // `server.allowedOrigins`. The guard refuses everything else before any
     // handler runs; CORS only echoes the allowed origin back.

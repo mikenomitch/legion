@@ -158,3 +158,8 @@ mod tests {
         );
     }
 }
+
+/// Wall-clock now, in unix milliseconds.
+pub fn now_unix_ms() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+}

@@ -70,6 +70,10 @@ pub struct SessionClaim {
     /// When the manager's router issued the session, unix milliseconds. Of
     /// two copies of one session id, the later is stopped.
     pub lease_issued_at_unix_ms: i64,
+    /// The session's generation (session durability plan §6.7): 1 at
+    /// start, one more for every resume that claims its manifest. Of two
+    /// copies of one session id, the higher generation survives.
+    pub generation: u64,
 }
 
 impl ClaimRecord {
@@ -578,6 +582,7 @@ mod claims_test {
         restored.local_key = -40;
         restored.session = Some(SessionClaim {
             lease_issued_at_unix_ms: 1,
+            generation: 1,
         });
         restored.resources = serde_json::json!({ "cpu": 250 });
         let stored = table.insert_restored(restored)?;
@@ -663,6 +668,7 @@ mod claims_test {
         session.lease_deadline = Instant::now() - Duration::from_secs(1);
         session.session = Some(SessionClaim {
             lease_issued_at_unix_ms: 1,
+            generation: 1,
         });
         let session = table.insert(session)?;
         table.insert(record("clm_b", "user-2"))?;

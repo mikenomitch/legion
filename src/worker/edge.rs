@@ -59,6 +59,7 @@ pub fn record_from_payload(
             .as_ref()
             .map(|start| crate::worker::claims::SessionClaim {
                 lease_issued_at_unix_ms: start.lease_issued_at_unix_ms,
+                generation: 1,
             }),
     }
 }

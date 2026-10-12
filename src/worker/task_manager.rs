@@ -604,6 +604,15 @@ pub struct WorkerTaskManager {
     /// Sessions whose envelope is gone from this node, by claim id, with
     /// when that was first seen. Ended after [`SESSION_ORPHAN_GRACE`].
     orphaned_sessions: HashMap<String, std::time::Instant>,
+    /// The node's session log (`sessions.db`), opened on first use. `None`
+    /// until then, and for good if it cannot be opened (sessions then run
+    /// without surviving a worker restart, and a warning says so).
+    session_log: Option<crate::worker::session_log::SessionLog>,
+    session_log_unavailable: bool,
+    /// Sessions on this node that run nothing: suspended to a local
+    /// checkpoint, or evicted and remembered for `suspend.keepFor`. Keyed by
+    /// session id; mirrored in the session log.
+    idle_sessions: HashMap<String, crate::worker::session_log::PersistedSession>,
 }
 
 impl Default for WorkerTaskManager {
@@ -677,6 +686,9 @@ impl WorkerTaskManager {
             next_launch_generation: 0,
             checkpoints: Default::default(),
             orphaned_sessions: HashMap::new(),
+            session_log: None,
+            session_log_unavailable: false,
+            idle_sessions: HashMap::new(),
         }
     }
 
@@ -3019,7 +3031,11 @@ impl WorkerTaskManager {
             .ratify(claim_id, allocation_id)
             .context("claim vanished during ratification")?;
         // Persist now that the work has an id the cluster agrees on: a
-        // restart from here must restore it, not orphan it.
+        // restart from here must restore it, not orphan it. A promoted
+        // session moves from the session log to the state file.
+        if claim.is_session() {
+            self.unlog_session(&claim.instance_id);
+        }
         self.persist_state();
         info!(
             claim_id,
@@ -3044,6 +3060,9 @@ impl WorkerTaskManager {
         let claim = self.claims.remove(claim_id)?;
         self.ledger.release_hold(claim_id);
         self.orphaned_sessions.remove(claim_id);
+        if claim.is_session() && !claim.is_ratified() {
+            self.unlog_session(&claim.instance_id);
+        }
         if claim.is_session() {
             // Ending a session is routine (a stop, a refused start, a
             // duplicate), not a failure.
@@ -3238,6 +3257,7 @@ impl WorkerTaskManager {
                 // report to the manager as a failed allocation: it never had
                 // one.
                 self.claims.remove(&claim.claim_id);
+                self.unlog_session(&claim.instance_id);
                 self.orphaned_sessions.remove(&claim.claim_id);
                 self.failed.retain(|failure| failure.allocation_id != local);
                 self.terminated_reports
@@ -4147,12 +4167,17 @@ impl WorkerTaskManager {
                 // A promoted session keeps counting against its envelope.
                 session: in_envelope.then_some(crate::worker::claims::SessionClaim {
                     lease_issued_at_unix_ms: 0,
+                    generation: 1,
                 }),
             };
             if let Err(err) = self.claims.insert_restored(record) {
                 warn!(external_id, error = ?err, "Failed to restore provisional allocation alias");
             }
         }
+
+        // Sessions come back from the session log (plan §6.2), under the
+        // local keys their processes run with.
+        restored.extend(self.restore_sessions());
 
         // One mask write for the whole restored set, after every
         // reservation is back in the allocator's view.
@@ -4194,21 +4219,262 @@ impl WorkerTaskManager {
         Ok(restored)
     }
 
+    /// Re-adopt the sessions the previous worker process left running.
+    ///
+    /// Each running row whose process is still the one it started (same
+    /// pid, same start time) becomes a live session claim again; a row whose
+    /// process is gone is dropped, and the rest of its process group killed
+    /// so nothing unmanaged keeps its ports. Suspended and evicted rows are
+    /// kept as they are: they run nothing. Returns the re-adopted sessions,
+    /// for their health monitors.
+    fn restore_sessions(&mut self) -> Vec<(Allocation, TaskConfig)> {
+        let path = self.state_store.sessions_db_path();
+        let rows = match crate::worker::session_log::SessionLog::load(&path) {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(path = %path.display(), error = ?err, "Cannot read the session log; no sessions restored");
+                return Vec::new();
+            }
+        };
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        // Never reissue a key the log names, live or not: an ended session's
+        // directories and logs may still be on disk under it.
+        self.claims
+            .reserve_below(rows.iter().map(|row| row.local_key));
+        let mut restored = Vec::new();
+        let mut dropped = Vec::new();
+        let mut kept_idle = 0usize;
+        for row in rows {
+            if row.state != crate::worker::session_log::SessionLogState::Running {
+                kept_idle += 1;
+                self.idle_sessions.insert(row.session_id.clone(), row);
+                continue;
+            }
+            let Some(mut process) = row.process.clone() else {
+                dropped.push(row.session_id.clone());
+                continue;
+            };
+            let Some(pid) = process.pid else {
+                dropped.push(row.session_id.clone());
+                continue;
+            };
+            match persisted_process_identity(&process, pid) {
+                PersistedProcess::Live { started } => process.pid_start_time = Some(started),
+                PersistedProcess::Dead => {
+                    let killed = crate::worker::state::kill_orphaned_task_group(pid);
+                    info!(
+                        session_id = %row.session_id,
+                        pid,
+                        killed_orphans = killed,
+                        "Session ended while the worker was down"
+                    );
+                    dropped.push(row.session_id.clone());
+                    continue;
+                }
+                PersistedProcess::Recycled => {
+                    dropped.push(row.session_id.clone());
+                    continue;
+                }
+            }
+            let claim = ClaimRecord {
+                claim_id: row.claim_id.clone(),
+                local_key: row.local_key,
+                gate: Gate::parse(&row.gate).unwrap_or(Gate::Serve),
+                stage: ClaimStage::Serving,
+                lease_deadline: std::time::Instant::now(),
+                lease_deadline_unix: 0,
+                job_id: row.job_id.clone(),
+                job_config_id: row.job_config_id.clone(),
+                task_name: row.task_name.clone(),
+                instance_id: row.session_id.clone(),
+                resources: row.resources.clone(),
+                origin: row.origin.clone(),
+                on_refused: OnRefused::parse(&row.on_refused).unwrap_or(OnRefused::Stop),
+                ticket_jti: row.ticket_jti.clone(),
+                allocation_id: None,
+                session: Some(crate::worker::claims::SessionClaim {
+                    lease_issued_at_unix_ms: row.lease_issued_at_unix_ms,
+                    generation: row.generation,
+                }),
+            };
+            if let Err(err) = self.claims.insert_restored(claim) {
+                warn!(session_id = %row.session_id, error = ?err, "Cannot re-adopt session");
+                continue;
+            }
+            let local_key = row.local_key;
+            let alloc_dir = self.alloc_dir(local_key);
+            let task_dir = alloc_dir.join(&process.task.name);
+            let mut instance = TaskInstance {
+                pid: Some(pid),
+                log_dir: Some(self.state_store.allocation_log_dir(local_key)),
+                ..TaskInstance::default()
+            };
+            instance
+                .extra_env
+                .insert("LEGION_ALLOC_DIR".into(), alloc_dir.display().to_string());
+            instance
+                .extra_env
+                .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
+            instance.alloc_dir = Some(alloc_dir);
+            instance.task_dir = Some(task_dir);
+            if let Some(assignment) = process.resource_assignment.as_ref() {
+                self.resources.restore(local_key, assignment);
+                instance.resource_assignment = Some(assignment.clone());
+            }
+            self.instances.insert(local_key, instance);
+            self.allocations
+                .insert(local_key, process.allocation.clone());
+            self.task_configs.insert(local_key, process.task.clone());
+            self.set_allocation_health(local_key, false, "restored");
+            restored.push((process.allocation, process.task));
+        }
+        info!(
+            readopted = restored.len(),
+            ended = dropped.len(),
+            idle = kept_idle,
+            "Restored sessions from the session log"
+        );
+        if !dropped.is_empty() {
+            if let Some(log) = self.session_log() {
+                for session_id in &dropped {
+                    log.delete(session_id);
+                }
+            }
+        }
+        restored
+    }
+
     /// [`Self::persist_state`], skipped for an unratified provisional start.
     ///
     /// Such a start is never written to the state file (see below), so
     /// rewriting and fsyncing the whole file for it bought nothing and cost a
     /// synchronous disk flush on every session start, under this lock
     /// (session durability plan §6.1).
-    fn persist_state_unless_provisional(&self, local_key: i64) {
-        if self
-            .claims
-            .by_local_key(local_key)
-            .is_some_and(|claim| !claim.is_ratified())
+    ///
+    /// A session goes to the session log instead (plan §6.2): one row,
+    /// group-committed off the start path.
+    fn persist_state_unless_provisional(&mut self, local_key: i64) {
+        let Some(claim) = self.claims.by_local_key(local_key) else {
+            self.persist_state();
+            return;
+        };
+        if claim.is_ratified() {
+            self.persist_state();
+        } else if claim.is_session() {
+            self.log_running_session(local_key);
+        }
+    }
+
+    /// The session log, opened on first use.
+    fn session_log(&mut self) -> Option<crate::worker::session_log::SessionLog> {
+        if self.session_log.is_none() && !self.session_log_unavailable {
+            let path = self.state_store.sessions_db_path();
+            match crate::worker::session_log::SessionLog::open(&path) {
+                Ok(log) => self.session_log = Some(log),
+                Err(err) => {
+                    warn!(
+                        path = %path.display(),
+                        error = ?err,
+                        "Cannot open the session log; sessions on this node will not survive a worker restart"
+                    );
+                    self.session_log_unavailable = true;
+                }
+            }
+        }
+        self.session_log.clone()
+    }
+
+    /// The row the session log keeps for a session claim, in `state`.
+    fn session_row(
+        &self,
+        claim: &ClaimRecord,
+        state: crate::worker::session_log::SessionLogState,
+    ) -> crate::worker::session_log::PersistedSession {
+        let local_key = claim.local_key;
+        let process = (state == crate::worker::session_log::SessionLogState::Running)
+            .then(|| {
+                let allocation = self.allocations.get(&local_key)?;
+                let task = self.task_configs.get(&local_key)?;
+                let instance = self.instances.get(&local_key)?;
+                let pid = instance.pid;
+                Some(PersistedAllocation {
+                    allocation: allocation.clone(),
+                    task: task.clone(),
+                    pid,
+                    pid_start_time: pid.and_then(process_start_time),
+                    resource_assignment: instance.resource_assignment.clone(),
+                    self_terminate_after_secs: None,
+                    volumes: Vec::new(),
+                    external_id: None,
+                    in_envelope: true,
+                    stopping: None,
+                })
+            })
+            .flatten();
+        crate::worker::session_log::PersistedSession {
+            session_id: claim.instance_id.clone(),
+            claim_id: claim.claim_id.clone(),
+            local_key,
+            job_id: claim.job_id.clone(),
+            job_config_id: claim.job_config_id.clone(),
+            task_name: claim.task_name.clone(),
+            resources: claim.resources.clone(),
+            gate: claim.gate.as_str().to_string(),
+            origin: claim.origin.clone(),
+            on_refused: claim.on_refused.as_str().to_string(),
+            ticket_jti: claim.ticket_jti.clone(),
+            lease_issued_at_unix_ms: claim
+                .session
+                .map(|session| session.lease_issued_at_unix_ms)
+                .unwrap_or_default(),
+            generation: claim.session.map(|session| session.generation).unwrap_or(1),
+            state,
+            process,
+            checkpoint: None,
+            evicted_reason: String::new(),
+            updated_at_unix_ms: crate::util::now_unix_ms(),
+        }
+    }
+
+    /// Record a running session in the session log.
+    fn log_running_session(&mut self, local_key: i64) {
+        let Some(claim) = self.claims.by_local_key(local_key).cloned() else {
+            return;
+        };
+        let row = self.session_row(&claim, crate::worker::session_log::SessionLogState::Running);
+        if row
+            .process
+            .as_ref()
+            .and_then(|process| process.pid)
+            .is_none()
         {
+            // A runtime that tracks no process cannot be re-adopted.
             return;
         }
-        self.persist_state();
+        if let Some(log) = self.session_log() {
+            log.put(row);
+        }
+    }
+
+    /// Forget a session in the session log.
+    fn unlog_session(&mut self, session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        if let Some(log) = self.session_log() {
+            log.delete(session_id);
+        }
+    }
+
+    /// Wait for the session log to commit what it was handed. A gracefully
+    /// stopping worker calls this last.
+    pub fn sync_session_log(&self, timeout: std::time::Duration) -> bool {
+        self.session_log
+            .as_ref()
+            .map(|log| log.sync(timeout))
+            .unwrap_or(true)
     }
 
     fn persist_state(&self) {
@@ -6343,6 +6609,7 @@ mod tests {
             resources: json!({ "cpu": 500, "memory": 256 }),
             session: Some(crate::worker::claims::SessionClaim {
                 lease_issued_at_unix_ms: 1_000,
+                generation: 1,
             }),
             ..claim_record("", session_id, Gate::Serve)
         }
@@ -6441,6 +6708,71 @@ mod tests {
         for claim in &claims {
             guard.kill_claim(&claim.claim_id, "test over");
         }
+        Ok(())
+    }
+
+    /// Session durability plan §6.2: sessions outlive the worker process.
+    /// A restarted worker re-adopts the ones still running under the same
+    /// local key, and forgets the ones whose process ended meanwhile.
+    #[test]
+    fn a_restarted_worker_readopts_its_running_sessions_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let (kept, ended) = {
+            let mut manager = manager_in(&temp_dir);
+            manager.begin_task_allocation(&envelope_payload(100))?;
+            let kept = start_session(&mut manager, "workspace-kept")?;
+            let ended = start_session(&mut manager, "workspace-ended")?;
+            assert!(manager.sync_session_log(Duration::from_secs(5)));
+            // The old worker exits without stopping anything; one session's
+            // process dies while it is down.
+            let pid = manager.instances[&ended.local_key].pid.expect("pid");
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while process_start_time(pid).is_some() && std::time::Instant::now() < deadline {
+                let mut status = 0;
+                unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::mem::forget(manager);
+            (kept, ended)
+        };
+
+        let mut restarted = manager_in(&temp_dir);
+        restarted.restore_allocations()?;
+        let claim = restarted
+            .claims
+            .get(&kept.claim_id)
+            .cloned()
+            .expect("the live session is re-adopted");
+        assert_eq!(claim.local_key, kept.local_key, "same key, same process");
+        assert!(restarted.claims.get(&ended.claim_id).is_none());
+        assert_eq!(
+            restarted
+                .claims
+                .session_usage("agent-sandboxes", "workspace")
+                .get("cpu"),
+            Some(&500.0),
+            "the re-adopted session still holds its envelope share"
+        );
+        // A fresh claim never reuses a restored key.
+        restarted.begin_task_allocation(&envelope_payload(100))?;
+        let fresh = start_session(&mut restarted, "workspace-new")?;
+        assert!(fresh.local_key < kept.local_key.min(ended.local_key));
+        let ids: Vec<_> = restarted
+            .session_statuses()
+            .into_iter()
+            .map(|status| status.session_id)
+            .collect();
+        assert_eq!(ids, vec!["workspace-kept", "workspace-new"]);
+        assert!(restarted.sync_session_log(Duration::from_secs(5)));
+        let logged: Vec<_> =
+            crate::worker::session_log::SessionLog::load(&temp_dir.path().join("sessions.db"))?
+                .into_iter()
+                .map(|row| row.session_id)
+                .collect();
+        assert_eq!(logged, vec!["workspace-kept", "workspace-new"]);
+        restarted.kill_claim(&kept.claim_id, "test over");
+        restarted.kill_claim(&fresh.claim_id, "test over");
         Ok(())
     }
 
