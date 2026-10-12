@@ -71,7 +71,7 @@ sandbox's life costs:
 | Suspend | 2 | the suspend, then the checkpoint report that stops the allocation |
 | Resume | 3 | the resume, its placement, and the restore report |
 | Fork (two copies) | 4 | the fork, its checkpoint, and the two placements |
-| Destroy | 1 | the allocation removal and the tombstone, in one write |
+| Destroy | 1 | the allocation removal and the tombstone (or, for an id Legion minted, the row's deletion), in one write |
 | **Create → place → suspend → resume → destroy** | **8** | the five lifecycle steps; the same with idempotency keys on every call |
 
 Heartbeats and forks are listed beside the lifecycle, not in its total. A
@@ -121,6 +121,41 @@ node (a destroy, a suspend). A node joining another pool wakes nothing.
 
 The full model is in
 [Blocked evals](scheduler-and-eval-loop.md#blocked-evals).
+
+## How big the store gets
+
+Every manager holds the whole replicated store, and a manager that joins, or
+a follower that falls behind, receives all of it as a snapshot. So the
+number that limits how many sandboxes a cluster can have is what each one
+leaves in the store, and the table below is what Legion keeps for each
+state. Sizes are from `tests/instance_scale_measure.rs`.
+
+| Sandbox | What the replicated store keeps |
+| --- | --- |
+| Pending keyed instance | An instance row, about 216 bytes |
+| Running keyed instance | The row plus its allocation, about 231 bytes more |
+| Suspended keyed instance | The row plus its checkpoint record, about 1.45 KB more |
+| Suspended, `suspend.archive = "slim"` | The instance row only, naming the archive manifest in the bucket |
+| Suspended, `suspend.archive = "manifestOnly"`, id minted by Legion | Nothing: the [archive manifest](suspend-and-resume.md#archiving-idle-instances) in the bucket is its record |
+| Destroyed, id you chose | A `terminated` tombstone, so the id is never reused |
+| Destroyed, id minted by Legion | Nothing: the id is 130 random bits ([Id rules](stateful-workloads.md#id-rules)) |
+| Running [session](session-mode.md) | Nothing: its node runs it and the managers index it in memory |
+
+Two of those rows are what makes a store grow without bound: tombstones,
+which accumulate with every sandbox ever destroyed, and checkpoint records,
+which accumulate with every sandbox parked. A platform that lets Legion
+mint ids and archives idle sandboxes with `manifestOnly` keeps a store the
+size of its *running* set: 100,000 minted sandboxes created and destroyed
+around 1,000 live ones leave exactly 1,000 rows.
+
+The other limit is the start rate. Every keyed start is a write to the
+replicated log, whose scheduler lane commits one entry at a time; that
+bounds keyed sandboxes at about 50 full lifecycles a second on a 4-vCPU
+reference host ([Limits](#limits-to-know-about)). A session start skips
+the log, so session starts are bound by the managers' routing and the
+nodes, not by the lane: one manager on the same host started about 970
+sessions a second across 16 nodes, with no replicated write
+([Session mode](session-mode.md)).
 
 ## Measuring it on your hardware
 
@@ -175,4 +210,5 @@ runtime's own boot or restore time for the end-to-end figure.
   Below that, a create is running in about 12 ms at p50 and 70 ms at p99;
   past it, requests queue and latency grows. More managers add replicas,
   not lanes, so they do not raise the ceiling. Measure your own hardware
-  with the tools [above](#measuring-it-on-your-hardware).
+  with the tools [above](#measuring-it-on-your-hardware). Unnamed
+  [sessions](session-mode.md) do not use the lane to start or stop.

@@ -266,17 +266,31 @@ they should. Legion handles all three.
   pack the active ones tighter, and fork copies a running sandbox for an
   agent to explore from. See the
   [agent sandboxes guide](docs/guides/agent-sandboxes.md).
-- **Sandboxes that scale.** Every sandbox is a durable, named instance:
-  it survives node loss, suspends and resumes, forks, and its id is never
+- **Sandboxes that scale.** A keyed sandbox is a durable instance: it
+  survives node loss, suspends and resumes, forks, and its id is never
   reused. A full lifecycle (create, run, suspend, resume, destroy) costs the
   control plane 8 replicated writes, down from 22. Concurrent creates and
   suspends share a single write, so the cost per sandbox falls under load.
   See [Sandboxes at scale](docs/sandboxes-at-scale.md).
-- **Sessions that write nothing.** For sandboxes that are disposable,
-  [session mode](docs/session-mode.md) starts them straight onto a node's
-  reserved room with no replicated write at all, lists them from what the
-  nodes report, and promotes any one to a durable instance without
-  restarting it.
+- **A control plane the size of what's live, not of history.** Every
+  manager keeps the whole replicated store, so its size is what a new
+  manager has to copy and what every snapshot carries. A sandbox whose id
+  Legion minted leaves nothing behind when it is destroyed: its id is 130
+  random bits, so it is never handed out again without a tombstone to
+  enforce it. An idle sandbox can
+  [archive](docs/suspend-and-resume.md#archiving-idle-instances) its
+  checkpoint record to the object store beside its memory snapshot, so a
+  million parked sandboxes cost a small row each, or nothing at all.
+- **Sessions that write nothing.** Durable records have a price: every
+  keyed start goes through the replicated log, which caps the start rate
+  (about 50 lifecycles a second on a 4-core manager). For sandboxes that
+  are disposable, [session mode](docs/session-mode.md) takes the log off
+  the start path. The job reserves room on each node up front, any manager
+  sends a start straight to a node with room, and the nodes report what
+  they run, so a start or stop is zero replicated writes. The same 4-core
+  manager starts about 970 sessions a second, and start capacity grows with
+  the nodes rather than with the log. A session that turns out to matter
+  is promoted to a durable instance in one write, without restarting.
 - **Work lands in one round trip.** Each node holds one stream to its
   manager, so a placement reaches it as soon as it commits, at any
   heartbeat interval. A node running 10,000 sandboxes sends a heartbeat of a

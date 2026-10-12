@@ -5,7 +5,9 @@
 **Status: IN EXECUTION** (written 2026-10-11; Phases 0–3 shipped
 2026-10-12; Phases 4–6 shipped 2026-10-12). Phase 0's measurements, their
 method, and each shipped phase's result against its target are in
-[§14](#14-results-phases-0-3) and [§16](#16-results-phases-4-6). Phases 7
+[§14](#14-results-phases-0-3) and [§16](#16-results-phases-4-6); session
+starts ran at about 970 a second with no raft entry, against the keyed
+lane's 52 lifecycles (§16.3). Phases 7
 and later are planned and unchanged by the measurements except where §14
 and §16 say so. Phase 6 shipped running sessions and promotion only:
 suspending an unpromoted session to a manifest (§6.5), workload identity
@@ -1867,3 +1869,77 @@ sessions use it or not.
 > session that turns out to matter can be promoted to a keyed instance
 > without stopping it. The trade-offs are in
 > [Session mode](../session-mode.md).
+
+## 16. Results, Phases 4-6
+
+Measured 2026-10-12 on the §14.1 host (4 vCPU, no KVM), debug builds unless
+a row says otherwise. Runtime boot is not involved: sessions in these runs
+start on fake workers that speak the real worker protocol over the real
+mTLS worker plane, so every latency is the control plane's share.
+
+### 16.1 Phase 4: unnamed ids leave no tombstone
+
+| Target | Result | Met |
+| --- | --- | --- |
+| An unnamed destroy leaves no row; a named one leaves a tombstone | yes (`tests/raft_lifecycle_ops.rs` now expects `NOT_FOUND` after destroying its minted instance; store unit tests cover named ids) | yes |
+| Existing rows keep their tombstones across the migration | every existing row is marked named (calls entry 52) | yes |
+| 10^6 unnamed creates and destroys leave the table at the live count | 10^5 creates and destroys around 1,000 live instances leave 1,000 rows, and the store image is the same size before and after (753,664 bytes); 1,817 create-and-destroy pairs a second, store only, debug build (`tests/instance_scale_measure.rs::unnamed_churn_keeps_the_table_at_the_live_count`) | yes, at 10^5 |
+| The destroy stays one entry | 1 (`tests/raft_lifecycle_ops.rs`, unchanged table) | yes |
+
+### 16.2 Phase 5: archived idle instances
+
+| Target | Result | Met |
+| --- | --- | --- |
+| Archive and unarchive round trip | yes, `slim` and `manifestOnly` (`tests/archive_integration.rs`) | yes |
+| A lost manifest follows `onRestoreFailure` | yes | yes |
+| `--include-idle` pages a bucket listing | yes (`src/manager/archive.rs` tests, `file://`) | yes |
+| Archiving adds no raft entry | by construction: the rows drop inside the publish report's entry (calls entry 8); not yet in the op-count test | not measured |
+| 10^6 archived instances leave 10^6 slim rows and no snapshot or allocation rows | 20 instances in `tests/archive_integration.rs`; the 10^6 run is open in `TODO.md` | not measured |
+
+### 16.3 Phase 6: session mode
+
+| Target | Result | Met |
+| --- | --- | --- |
+| Unnamed session starts write zero raft entries | 0 entries for every start in `tests/session_integration.rs`, and 0 over 5,000 starts in `session_start_latency_measure` (applied index summed over lanes) | yes |
+| Session start: p50 ≤ 2 ms, p99 ≤ 10 ms (§7.2) | 2.5 ms p50, 5.5 ms p99 serial; this includes the node's mTLS round trip and its admission, which the target leaves out (debug build) | p99 yes; p50 not separable from the round trip |
+| Promotion is one entry | 1 (`tests/session_integration.rs`) | yes |
+| A promoted session is indistinguishable from a keyed instance in `instance get` | yes, apart from `promotedFrom` | yes |
+| Duplicate convergence | the later copy is stopped on the next report, read, or delayed check (`tests/session_integration.rs`) | yes, with up to 20 s across managers (calls entry 26) |
+| 10^4 simulated starts on `raft_lanes`; a leader kill leaves every session running and the list `complete` within one full-report period | not run: simulated workers do not run sessions (calls entries 18 and 58) | deferred |
+| Identity: tokens refused for an ended session or another node's lease | not built (calls entry 18) | deferred |
+| Worker restart: sessions restored or killed per gate, never orphaned | a restart ends them (calls entry 19) | changed |
+
+Session start rate and latency, measured from `CreateInstance` to the
+node accepting the start: one raft manager, 16 fake nodes on loopback
+behind the real mTLS worker plane, 2,000 starts one at a time and then
+3,000 with 64 in flight
+(`tests/session_integration.rs::session_start_latency_measure`, debug
+build, with the caller, the manager, and all 16 nodes in one process on the
+four cores):
+
+| Load | Rate | p50 | p99 | Raft entries |
+| --- | --- | --- | --- | --- |
+| One at a time | 379/s | 2.5 ms | 5.5 ms | 0 |
+| 64 in flight | 972/s | 32 ms | 71 ms | 0 |
+
+None of the 5,000 starts was refused. For comparison, §14.3's keyed
+lifecycle costs 8 entries and ran out at about 52 lifecycles a second in a
+release build, with create → running at 12 ms p50 at 10/s. Session starts
+ran about 19 times faster in a slower build and never touched the lane.
+The 64-in-flight run is bound by the one process's four cores, not by
+raft, so its latency is queueing. More nodes add admission room and any
+manager can route, neither of which helps a keyed start; that scaling is by
+design and not yet measured across managers (§16.4).
+
+### 16.4 What the results change in later phases
+
+- **Idle sessions come before waking sessions on request.** Phase 7 wakes
+  an idle instance, and an unnamed session cannot be idle until session
+  suspend exists (calls entry 18), which also brings back the node session
+  log (calls entry 19).
+- **The lane bound (§14.6) no longer limits unnamed sandboxes.** It still
+  limits keyed lifecycles and promotions.
+- **Multi-manager behavior is the least-tested part of Phase 6.** The peer
+  fan-out, the per-manager index's failover, and duplicate convergence
+  across managers want the simulated-worker session support and a
+  three-manager run before any scale claim (`TODO.md`).

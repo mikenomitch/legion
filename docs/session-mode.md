@@ -10,6 +10,22 @@ not by raft.
 A session that turns out to matter can be **promoted** to a keyed instance
 without stopping it. From then on it has a row and every keyed guarantee.
 
+**Why it exists.** A keyed instance is durable because every step of its
+life is a write to the replicated log: about 8 writes for a create, run,
+suspend, resume, and destroy, ordered one at a time by the log's scheduler
+lane. That lane caps keyed sandboxes at about 50 full lifecycles a second
+on a 4-vCPU manager, and every instance is a row that every manager keeps.
+For a platform that starts a sandbox per agent task or per tool call, most
+of those units are thrown away within minutes and never need to survive a
+node failure, so they pay for durability they do not use. A session skips
+the log entirely. Measured on the same 4-vCPU host, with one manager and 16
+test nodes in one process and the runtime's own boot left out, the control
+plane started about 970 sessions a second with 64 in flight, and about 380
+a second one at a time at 2.5 ms each, with no replicated write for any of
+them. Start capacity comes from the nodes' envelopes and from whichever
+manager routes the start, so it grows with the fleet rather than with the
+log.
+
 > Related: [stateful workloads](stateful-workloads.md) (the `slot` and
 > `keyed` modes this builds on), [sandboxes at scale](sandboxes-at-scale.md)
 > (what each keyed lifecycle step costs), [suspend and

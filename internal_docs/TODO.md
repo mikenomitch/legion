@@ -3524,6 +3524,13 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       is scheduled. Not caused by the plan-apply work — `src/worker/task_manager.rs`
       is untouched by it. Make the assertion independent of the child actually
       having started, or gate on an observed start.
+- [ ] **`exec_provider_contract_round_trips_and_times_out` is flaky under
+      parallel load.** Seen 2026-10-12 in a full `cargo test --all` on a
+      4-core VM, passing alone. Its `/bin/sh -c "exit 3"` provider can exit
+      before the keyring writes the request to its stdin, so the error is
+      `Broken pipe` instead of the exit status the test asserts. Make
+      `ExecRootKey` report the exit status when the write fails, or accept
+      either error in the test (`src/storage/keyring.rs`).
 - [ ] **`acked_write_survives_any_single_node_loss` is bimodally flaky on
       small hosts.** Seen 2026-08-07 on a 4-core shared VM, debug build:
       either the whole test completes in ~1s or a round's survivors never
