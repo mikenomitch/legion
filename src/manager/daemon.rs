@@ -314,8 +314,51 @@ pub async fn run_manager_with(
         info!(
             audit_only = authenticator.audit_only,
             auth_methods = ?authenticator.method_names(),
-            "ACLs enabled; run `legion acl bootstrap` once to mint the initial management token"
+            "ACLs enabled"
         );
+        // The initial management token is minted here, not by an RPC: an
+        // open "bootstrap while none exists" endpoint is a race any workload
+        // that reaches the manager could win (docs/auth-and-acls.md). The
+        // mint is a replicated control-lane write, so in raft mode only the
+        // control-lane leader does it, now or when it later wins leadership.
+        let bootstrap_paths =
+            crate::manager::bootstrap_token::BootstrapTokenPaths::for_this_process();
+        let secret_file = full_config.acl.bootstrap_secret_file.clone();
+        if is_control_leader {
+            let outcome = crate::manager::bootstrap_token::ensure_initial_management_token(
+                &authenticator,
+                &store,
+                secret_file.as_deref(),
+                &bootstrap_paths,
+            )?;
+            crate::manager::bootstrap_token::log_outcome(&outcome);
+        }
+        if store.raft_status().is_some() || store.persistence_status().backend == "streaming" {
+            let watch_store = store.clone();
+            let watch_auth = authenticator.clone();
+            let mut was_control_leader = is_control_leader;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(LEADER_POLL_INTERVAL).await;
+                    let control_leader = watch_store.is_raft_leader(crate::storage::Lane::Control);
+                    if leadership_acquired(was_control_leader, control_leader) {
+                        match crate::manager::bootstrap_token::ensure_initial_management_token(
+                            &watch_auth,
+                            &watch_store,
+                            secret_file.as_deref(),
+                            &bootstrap_paths,
+                        ) {
+                            Ok(outcome) => crate::manager::bootstrap_token::log_outcome(&outcome),
+                            Err(err) => warn!(
+                                error = ?err,
+                                "Failed minting the initial management token after leadership acquisition"
+                            ),
+                        }
+                    }
+                    was_control_leader = control_leader;
+                }
+            });
+        }
         // Prime remote JWKS documents, then keep them fresh in the background.
         authenticator.refresh_auth_methods().await;
         let refresh_authenticator = authenticator.clone();
@@ -341,7 +384,11 @@ pub async fn run_manager_with(
             }
         });
     } else {
-        warn!("ACLs are disabled; every API caller has full access (set acl.enabled to true to enforce)");
+        warn!(
+            "ACLs are disabled (acl.enabled = false): every API caller, including any \
+             workload that can reach this manager, has full control of the cluster. \
+             Remove acl.enabled = false to turn them back on"
+        );
     }
 
     // Idempotency records only need to outlive a client's retry window;

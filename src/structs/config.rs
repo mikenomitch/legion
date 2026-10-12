@@ -1023,9 +1023,21 @@ pub const DEF_ACL_JWKS_REFRESH: &str = "5m";
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AclConfig {
-    /// Master switch. Default: false (no enforcement).
+    /// Master switch. Default: true. With ACLs on, every API call needs a
+    /// credential, and the manager mints the initial management token itself
+    /// at first start (docs/auth-and-acls.md, "Quick start"). `false` is an
+    /// explicit choice for a throwaway cluster: every caller, including any
+    /// workload that can reach the manager, gets full access, and the manager
+    /// logs a warning at every start.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// File holding the secret for the initial management token, read once
+    /// when the manager mints that token (first start, or after every
+    /// management token was deleted). For infrastructure-as-code pre-seeding;
+    /// the secret must be at least 24 characters. Default: unset, and the
+    /// manager generates a random secret.
+    #[serde(default)]
+    pub bootstrap_secret_file: Option<String>,
     /// When true (and `enabled` is true), denials are logged with the
     /// `acl_audit` tracing target but requests are allowed. Use this to
     /// stage policies before flipping to full enforcement.
@@ -1118,6 +1130,8 @@ pub struct AclBindingRule {
 #[serde(rename_all = "camelCase")]
 pub struct AclConfigFull {
     pub enabled: bool,
+    #[serde(default)]
+    pub bootstrap_secret_file: Option<String>,
     pub audit_only: bool,
     pub login_ttl: String,
     pub token_max_ttl: Option<String>,
@@ -1128,7 +1142,8 @@ pub struct AclConfigFull {
 impl Default for AclConfigFull {
     fn default() -> Self {
         AclConfigFull {
-            enabled: false,
+            enabled: true,
+            bootstrap_secret_file: None,
             audit_only: false,
             login_ttl: DEF_ACL_LOGIN_TTL.into(),
             token_max_ttl: None,
@@ -1224,6 +1239,7 @@ impl From<AclConfigFull> for AclConfig {
     fn from(val: AclConfigFull) -> Self {
         AclConfig {
             enabled: Some(val.enabled),
+            bootstrap_secret_file: val.bootstrap_secret_file,
             audit_only: Some(val.audit_only),
             login_ttl: Some(val.login_ttl),
             token_max_ttl: val.token_max_ttl,
@@ -1251,6 +1267,7 @@ impl AclConfig {
         let d = AclConfigFull::default();
         AclConfigFull {
             enabled: self.enabled.unwrap_or(d.enabled),
+            bootstrap_secret_file: self.bootstrap_secret_file.clone(),
             audit_only: self.audit_only.unwrap_or(d.audit_only),
             login_ttl: self.login_ttl.clone().unwrap_or(d.login_ttl),
             token_max_ttl: self.token_max_ttl.clone(),

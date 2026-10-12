@@ -294,6 +294,18 @@ impl Store {
         Ok(())
     }
 
+    /// True when at least one management token exists. A cheap read the
+    /// manager uses at startup to skip minting the initial token.
+    pub fn has_management_token(&self) -> R<bool> {
+        let conn = self.read_connection()?;
+        let existing: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM acl_token WHERE token_type = 'management';",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(existing > 0)
+    }
+
     /// Inserts the initial management token if and only if no management
     /// token exists yet. Returns false (without inserting) when one does.
     /// The check and insert share one transaction so concurrent bootstrap
@@ -760,7 +772,7 @@ mod acl_store_test {
         assert!(!store.bootstrap_acl_token(&token_record("boot-2", "management"))?);
         assert_eq!(store.list_acl_tokens()?.len(), 1);
 
-        // Deleting the management token re-opens bootstrap (documented
+        // Deleting the management token lets the next start mint one (documented
         // recovery path when the initial token is lost).
         store.delete_acl_token("boot-1")?;
         assert!(store.bootstrap_acl_token(&token_record("boot-3", "management"))?);

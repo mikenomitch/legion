@@ -6,21 +6,25 @@ present a bearer credential, and the manager resolves it to a set of named
 set of resources and actions. Once ACLs are enabled, anything not allowed is
 denied, and a matching deny rule always overrides an allow.
 
-**ACLs are off by default.** With ACLs disabled, every caller has full access
-and the UI shows a dismissable warning.
+**ACLs are on by default.** Every API call needs a credential. A fresh
+manager mints its own first credential, so nothing is open while you set it
+up, and there is no bootstrap endpoint for anything else to race you to.
 
 ## Quick start
 
 ```bash
-# 1. Enable ACLs in the manager config and restart the manager.
-#    configs/manager.ncl:
-#      acl: { enabled: true },
+# 1. Start a manager. At first start it mints the initial management token
+#    and writes the secret, mode 0600, to <dataDir>/bootstrap-token and (when
+#    that file does not exist yet) ~/.legion/token:
+legion start manager --run-worker
+#   INFO ACLs are on. Created the initial management token (accessor 7c1f...).
+#        Secret written to .legion/bootstrap-token and /home/me/.legion/token (mode 0600).
+#        The CLI on this machine uses it automatically. Treat it like a root password.
 
-# 2. Mint the one-time initial management token.
-legion acl bootstrap
-export LEGION_TOKEN=lgn_...   # the printed secret (shown exactly once)
+# 2. The CLI on the same machine already works: it reads ~/.legion/token.
+legion job run configs/jobs/demo.ncl
 
-# 3. Create a policy and a token for it.
+# 3. Create a policy and a narrower token for everyone and everything else.
 legion acl policy apply dev-team --rules '[
   {"resources": ["job"],  "actions": ["read", "write"], "names": ["dev-*"]},
   {"resources": ["kv"],   "actions": ["read", "write"], "paths": ["dev/*"]},
@@ -31,6 +35,53 @@ legion acl token create --name dev-ci --policy dev-team --ttl 720h
 # 4. Check what any credential can do.
 legion acl whoami
 ```
+
+On another machine, export the secret (`LEGION_TOKEN=lgn_...`) or run
+`legion login`. The UI's login page takes the same secret.
+
+### Where the initial token goes
+
+| File | Written | Mode |
+| --- | --- | --- |
+| `<dataDir>/bootstrap-token` (`$LEGION_DATA_DIR`, else `./.legion`) | every time the manager mints the initial token | `0600` |
+| `~/.legion/token` for the user running the manager (`$LEGION_TOKEN_FILE` overrides the path) | only when the file does not exist yet, so an existing login is never overwritten | `0600` |
+
+The manager logs the accessor ID and the file paths once, and never logs the
+secret. When `~/.legion/token` already exists it is left alone and the
+manager logs a warning saying how to use the new token instead
+(`export LEGION_TOKEN="$(cat <dataDir>/bootstrap-token)"`). This matters on
+a laptop where an older cluster's token is still in that file.
+
+The mint is a replicated control-lane write. In a raft cluster only the
+manager that leads the control lane mints the token, at first start or when
+it first wins leadership, and only that manager's data dir holds the
+`bootstrap-token` file. The token itself is replicated and works against
+every manager.
+
+A manager writes the secret to `<dataDir>/bootstrap-token.pending` before the
+replicated write and renames it into place after. If the manager dies between
+the two, the next start finishes the rename, so a cluster can't end up with a
+management token whose secret nobody holds.
+
+### Pre-seeding the secret (infrastructure as code)
+
+Point `acl.bootstrapSecretFile` at a file holding the secret (at least 24
+characters). The manager reads it once, when it mints the initial token:
+
+```nickel
+acl = { bootstrapSecretFile = "/etc/legion/bootstrap-secret" },
+```
+
+A secret shorter than 24 characters fails the start, naming the setting.
+
+### Turning ACLs off
+
+`acl = { enabled = false }` is an explicit choice for a throwaway cluster.
+Every caller then has full access, including any workload that can reach the
+manager: a task on the manager's own host reaches it on loopback, and in a
+multi-host cluster every task can reach the address workers use. The manager
+logs a warning at every start, the UI shows a banner, and `legion acl whoami`
+reports `aclEnabled: false`.
 
 ## Concepts
 
@@ -207,9 +258,9 @@ token, or removing the policy that granted the stream, closes the stream
 within that interval with the same `Unauthenticated` or `PermissionDenied`
 error a new request would get.
 
-For infrastructure-as-code, `legion acl bootstrap --secret <value>` (min 24
-chars) pre-seeds the initial management token instead of generating a random
-one.
+For infrastructure-as-code, `acl.bootstrapSecretFile` pre-seeds the initial
+management token's secret (see [Pre-seeding the
+secret](#pre-seeding-the-secret-infrastructure-as-code)).
 
 Clients send the secret as a bearer credential. The CLI checks the
 `LEGION_TOKEN` env var first, then `~/.legion/token` (written by
@@ -274,7 +325,10 @@ acl = {
 
 ### Anonymous policy and audit mode (migration)
 
-There are two ways to enable ACLs on a live cluster without breaking anyone:
+ACLs are on for a new cluster. For a cluster that ran with
+`acl.enabled = false`, there are two ways to turn them on without breaking
+anyone (the first start with ACLs on mints the initial management token as
+described above):
 
 1. **Audit-only**: with `acl = { enabled = true, auditOnly = true }`, every
    denial is logged but allowed. Logs use the tracing target `acl_audit` and
@@ -365,7 +419,15 @@ debugging a `PermissionDenied`.
 
 ### Recovery
 
-If you lose the only management token, delete the management rows from the
-`acl_token` table in the manager's SQLite store (this requires filesystem
-access to the manager host). Then run `legion acl bootstrap` again.
-Bootstrap is allowed whenever no management token exists.
+If you lose every management token's secret, delete the management rows from
+the `acl_token` table in the manager's SQLite store (on the control-lane
+leader in a raft cluster; this requires filesystem access to the manager
+host), then restart the manager. With no management token in the store, it
+mints a fresh one at start and writes it to `<dataDir>/bootstrap-token`
+exactly as at first start. Use `acl.bootstrapSecretFile` to choose the
+secret.
+
+There is no `legion acl bootstrap` command and no `BootstrapAcl` RPC. An
+endpoint that works "whenever no management token exists" can be won by any
+workload that reaches the manager after a first start or a recovery, so the
+initial token is only ever minted by the manager process itself.

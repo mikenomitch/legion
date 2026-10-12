@@ -24,6 +24,7 @@ up, or start over without deleting your existing data.
 | Raft log, snapshots, cluster secret | `<data dir>/raft` | `persistence.raft.dataDir` |
 | Worker state, allocation dirs, task logs | `<data dir>/workers/<worker-id>/` | `LEGION_WORKER_STATE_PATH` (state file only) |
 | Identity token backing files | `<data dir>/identity/<alloc-id>/<name>/token` | none |
+| Initial management token (`bootstrap-token`, mode `0600`), written by the manager that mints it | `<data dir>/bootstrap-token` | none |
 
 `<data dir>` is `$LEGION_DATA_DIR` when it is set and non-empty, and `.legion`
 otherwise. A relative value resolves against the process's working directory.
@@ -33,7 +34,12 @@ An explicit setting always wins over the data dir. If your manager config sets
 shipped `configs/manager.ncl` leaves `storePath` unset so the variable applies.
 
 The CLI's saved login token (`~/.legion/token`) is per-user, not per-process,
-and does not move. Use `LEGION_TOKEN_FILE` to relocate it.
+and does not move. Use `LEGION_TOKEN_FILE` to relocate it. A manager writes
+the initial management token there at first start only when the file does not
+exist yet (see [Auth & ACLs](auth-and-acls.md#where-the-initial-token-goes)),
+so a second cluster started from the same account keeps using the first
+cluster's token until you export the second one's `bootstrap-token` as
+`LEGION_TOKEN`.
 
 ## Running two clusters from one checkout
 

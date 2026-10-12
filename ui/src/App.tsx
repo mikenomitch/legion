@@ -197,7 +197,7 @@ const identitySummary = (): { label: string; detail: string; tone: Tone } => {
       : { label: 'Resolving identity…', detail: '', tone: 'neutral' }
   }
   if (!identity.aclEnabled) {
-    return { label: 'ACLs off · full access', detail: 'Every caller has full access until acl.enabled is set', tone: 'warn' }
+    return { label: 'ACLs off · full access', detail: 'Every caller has full access because the manager config sets acl.enabled = false', tone: 'warn' }
   }
   if (identity.source === 'anonymous') {
     return { label: 'Not logged in', detail: 'ACLs are enforced — log in to see your cluster', tone: 'warn' }

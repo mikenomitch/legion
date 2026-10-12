@@ -8,7 +8,7 @@
 //!    when an RPC is added without an entry in [`endpoint_table`] — so a new
 //!    endpoint cannot ship without deciding (and testing) its ACL behavior.
 //! 2. The deny/allow matrix calls every endpoint three ways: anonymous with
-//!    ACLs enabled (protected endpoints must return PermissionDenied), with a
+//!    ACLs enabled (protected endpoints must return Unauthenticated), with a
 //!    management token (must never fail with an auth error), and with ACLs
 //!    disabled (must never fail with an auth error).
 //! 3. Scenario tests prove scoped policies behave correctly end-to-end
@@ -192,7 +192,6 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("StreamEvents", Plane::Protected("operator:read")),
         ("WhoAmI", Plane::Open),
         ("Login", Plane::Open),
-        ("BootstrapAcl", Plane::Open),
         ("GetAuthMethods", Plane::Open),
         ("CreateJoinToken", Plane::Protected("node:write")),
         ("ListJoinTokens", Plane::Protected("node:read")),
@@ -1169,10 +1168,6 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
-        "BootstrapAcl" => svc
-            .bootstrap_acl(req(BootstrapAclRequest { secret: None }, token))
-            .await
-            .map(|_| ()),
         "GetAuthMethods" => svc
             .get_auth_methods(req(GetAuthMethodsRequest {}, token))
             .await
@@ -1459,8 +1454,9 @@ fn setup_enabled() -> R<(ManagerDaemonService, Fixtures, String)> {
     let authenticator = enabled_authenticator();
 
     let (_, management_secret) = authenticator
-        .bootstrap(&store, None)
-        .map_err(|s| anyhow!(s.to_string()))?;
+        .mint_initial_management_token(&store, None)
+        .map_err(|s| anyhow!(s.to_string()))?
+        .expect("a fresh store has no management token");
     let (deletable, _) = authenticator
         .mint_token(
             &store,
@@ -1523,9 +1519,9 @@ fn every_manager_rpc_is_classified() -> R<()> {
     Ok(())
 }
 
-/// With ACLs enabled, anonymous callers are denied on every protected
-/// endpoint, rejected as unauthenticated on the worker plane, and never
-/// blocked on open endpoints.
+/// With ACLs enabled, anonymous callers are rejected as unauthenticated on
+/// every protected endpoint and on the worker plane, and never blocked on
+/// open endpoints.
 #[tokio::test]
 async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
     let (svc, fixtures, _) = setup_enabled()?;
@@ -1539,8 +1535,8 @@ async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
                 ));
                 assert_eq!(
                     status.code(),
-                    Code::PermissionDenied,
-                    "{method} (requires {capability}) returned `{}` instead of PermissionDenied: {}",
+                    Code::Unauthenticated,
+                    "{method} (requires {capability}) returned `{}` instead of Unauthenticated: {}",
                     status.code(),
                     status.message(),
                 );
@@ -2758,7 +2754,9 @@ async fn anonymous_policy_grants_tokenless_access() -> R<()> {
     let status = call_endpoint(&svc, &fixtures, "StopJob", None)
         .await
         .expect_err("anonymous policy must not allow job writes");
-    assert_eq!(status.code(), Code::PermissionDenied);
+    // Beyond what the anonymous policy grants, a credential-less caller is
+    // told to authenticate, not that its (nonexistent) policies fall short.
+    assert_eq!(status.code(), Code::Unauthenticated);
     Ok(())
 }
 

@@ -741,7 +741,9 @@ fn eval_cycle_cell(store: &Store, cell: &str) {
             .expect("enqueue");
 
         let started = std::time::Instant::now();
-        let batch = store.claim_evals(limits).expect("claim");
+        let batch = store
+            .claim_evals(limits, legion::storage::store::ClaimScope::Any)
+            .expect("claim");
         claim_us += started.elapsed().as_micros();
         assert_eq!(batch.len(), 1, "exactly the eval this cycle enqueued");
         let eval = &batch[0];
@@ -763,7 +765,11 @@ fn eval_cycle_cell(store: &Store, cell: &str) {
 
         let started = std::time::Instant::now();
         let next = store
-            .complete_evals_and_claim_next(vec![(eval.id.clone(), completion)], limits)
+            .complete_evals_and_claim_next(
+                vec![(eval.id.clone(), completion)],
+                limits,
+                legion::storage::store::ClaimScope::Any,
+            )
             .expect("settle");
         settle_us += started.elapsed().as_micros();
         assert!(next.is_empty());

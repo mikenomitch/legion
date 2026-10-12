@@ -444,3 +444,74 @@ security-sensitive factory, plus tests, to preserve setups that only ever
 worked on one machine. Dispatch still reaches old workers through heartbeat
 replies, so running work is never interrupted, only interactive calls.
 **Simplicity won.**
+
+## 17. A call with no credential is `Unauthenticated`, not `PermissionDenied`
+
+Made while implementing Phase 0. When ACLs deny an anonymous caller on a
+protected endpoint, the manager now answers `Unauthenticated` with a hint that
+names the token file, instead of `PermissionDenied`:
+
+```text
+$ legion job list -j
+{"ok":false,"error":{"code":"Unauthenticated",
+ "message":"Failed to list jobs: job:read requires a token, and no token was provided",
+ "hint":"set LEGION_TOKEN or run `legion login`. On the manager's machine, the initial management token is in <dataDir>/bootstrap-token and ~/.legion/token",
+ "retryable":false}}
+```
+
+**Alternative.** Keep `PermissionDenied` for every denial, as before, and
+only append the hint.
+
+**Trade-off.** Clients that matched `PermissionDenied` to detect "not logged
+in" now see a different code. The `acl_endpoints` matrix and one anonymous
+policy test changed with it. The UI already treats both codes as "log in".
+
+**Why.** With ACLs on by default, "no token at all" becomes the first error
+every new user and every agent hits, so it has to be unambiguous. gRPC's
+`Unauthenticated` means exactly that, and an agent can branch on the code
+(re-authenticate) instead of parsing prose. `PermissionDenied` keeps its
+meaning: a known caller whose policies fall short. The plan's Phase 0
+acceptance criterion already said `Unauthenticated`. **Ease for agents won.**
+
+## 18. The bootstrap secret is on disk before the replicated insert
+
+Made while implementing Phase 0. The manager writes the secret to
+`<dataDir>/bootstrap-token.pending`, then makes the replicated
+"insert if no management token exists" write, then renames the file into
+place. A start that finds a pending file finishes the rename when the secret
+matches a stored management token, and deletes it otherwise.
+
+**Alternative.** Insert first, then write the file, which is simpler.
+
+**Trade-off.** One more file name and a recovery step at startup.
+
+**Why.** With insert-first, a crash between the two steps leaves a cluster
+whose only management token's secret is in no file, and with no bootstrap
+endpoint the only way back is deleting rows in SQLite by hand. Writing first
+makes that crash harmless, and the replicated insert stays the single point
+that decides who wins. **Simplicity for the operator won over a few lines of
+code.**
+
+## 19. An existing `~/.legion/token` is kept, with a warning that names the fix
+
+Made while implementing Phase 0. The plan writes `~/.legion/token` only when
+it does not exist. The implementation also logs a `WARN` when it was kept:
+
+```text
+WARN /home/me/.legion/token already exists and was left alone, so the CLI on
+this machine keeps using the token in it. To use the new management token:
+export LEGION_TOKEN="$(cat .legion/bootstrap-token)"
+```
+
+**Alternative.** Overwrite the file whenever a new cluster mints its token,
+since on a laptop the existing file usually belongs to a cluster that was
+deleted (`mise run nuke`).
+
+**Trade-off.** A developer who wipes and restarts a local cluster gets
+`Unauthenticated` from the CLI until they export the new token or delete the
+stale file. The warning and the error hint both point at the fix.
+
+**Why.** The file may hold a login to a different, live cluster, and
+silently replacing someone's credential is worse than one confusing error
+with a hint. The manager can't tell a stale token from a live one for another
+cluster. **Safety won over one step of convenience.**

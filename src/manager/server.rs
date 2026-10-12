@@ -89,15 +89,14 @@ use crate::structs::{
     UpsertNetPolicyRequest,
 };
 use crate::structs::{
-    AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
-    CreateAclTokenRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply,
-    DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply,
-    DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, GetAclPolicyReply,
-    GetAclPolicyRequest, GetAuthMethodsReply, GetAuthMethodsRequest, ListAclPoliciesReply,
-    ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply,
-    ListAclUsersRequest, ListJoinTokensReply, ListJoinTokensRequest, LoginReply, LoginRequest,
-    StopCause, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply,
-    UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
+    AuthMethodInfo, CreateAclTokenReply, CreateAclTokenRequest, CreateJoinTokenReply,
+    CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply,
+    DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJoinTokenReply,
+    DeleteJoinTokenRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAuthMethodsReply,
+    GetAuthMethodsRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply,
+    ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListJoinTokensReply,
+    ListJoinTokensRequest, LoginReply, LoginRequest, StopCause, UpsertAclPolicyReply,
+    UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
 };
 use crate::structs::{
     BackupEncryptionInfo, GetKeyringStatusReply, GetKeyringStatusRequest, KeyringKeyInfo,
@@ -8847,22 +8846,6 @@ impl Manager for ManagerDaemonService {
             .await?;
         info!(principal = %token.name, "ACL login succeeded");
         Ok(Response::new(LoginReply {
-            token: Some(token),
-            secret,
-        }))
-    }
-
-    #[instrument(skip_all)]
-    async fn bootstrap_acl(
-        &self,
-        request: Request<BootstrapAclRequest>,
-    ) -> Result<Response<BootstrapAclReply>, Status> {
-        // ACL: open endpoint guarded by its one-shot semantics — it only
-        // succeeds while no management token exists.
-        let req = request.into_inner();
-        let (token, secret) = self.auth.bootstrap(&self.store, req.secret.as_deref())?;
-        info!(accessor_id = %token.accessor_id, "ACL bootstrap: initial management token created");
-        Ok(Response::new(BootstrapAclReply {
             token: Some(token),
             secret,
         }))

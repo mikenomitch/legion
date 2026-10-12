@@ -29,10 +29,12 @@ How to use it:
       [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (PLANNED)
       · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
       Phases in ship order, most dangerous gap first:
-  - [ ] Phase 0: ACLs on by default. The first management token is minted at
+  - [x] Phase 0: ACLs on by default. The first management token is minted at
         first start into `<dataDir>/bootstrap-token` and `~/.legion/token`
         (`0600`), and the open `BootstrapAcl` RPC and `legion acl bootstrap`
-        are removed (plan §6.10).
+        are removed (plan §6.10). Anonymous denials are now `Unauthenticated`
+        with a hint naming the token file (calls entry 17). Docs:
+        [auth-and-acls.md](../docs/auth-and-acls.md#quick-start).
   - [ ] Phase 1: the mTLS worker plane with per-RPC caller classes,
         including the sandbox-exec plan's `ticket` class on `ExecTask`, CSR
         issuance, the CA pin in join tokens, reachable bind and advertise,

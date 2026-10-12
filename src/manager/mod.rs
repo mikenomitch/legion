@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod auth_method;
+pub mod bootstrap_token;
 pub mod cadence;
 pub mod concurrency;
 pub mod daemon;

@@ -735,14 +735,6 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
-            name: "acl.bootstrap",
-            cli: "legion acl bootstrap",
-            grpc: Some("Manager/BootstrapAcl"),
-            summary: "One-time creation of the initial management token.",
-            mutates: true,
-            read_only_safe: false,
-        },
-        Capability {
             name: "acl.policy.list",
             cli: "legion acl policy list",
             grpc: Some("Manager/ListAclPolicies"),

@@ -528,6 +528,12 @@ same rule that a selector never matches a request without that attribute.
   `job:write`.
 - **Access page** shows admin tabs only with `acl:read` (worker join needs
   `node:read`).
+- **Logging in.** ACLs are on by default, so a fresh cluster's UI opens on the
+  log-in card. Paste the initial management token from
+  `<dataDir>/bootstrap-token` (or `~/.legion/token` on the manager's machine),
+  or log in with any configured auth method. The UI does not log in
+  automatically on the manager's machine: loopback is exactly where workloads
+  live, so being local proves nothing.
 
 Two rules keep restricted identities from breaking the app:
 
@@ -563,9 +569,9 @@ Without these, browser gRPC-Web calls would fail.
 ### Allowed browser origins
 
 The manager only answers browsers from allowed origins. Any web page can send
-requests to `127.0.0.1:4747`, and with ACLs off every caller has full access,
-so an allow-all policy would let any website you visit run jobs on your
-cluster. The same applies to DNS rebinding, where a page reaches the manager
+requests to `127.0.0.1:4747`, and with ACLs turned off every caller has full
+access, so an allow-all policy would let any website you visit run jobs on
+your cluster. The same applies to DNS rebinding, where a page reaches the manager
 under its own hostname.
 
 - Loopback origins are always allowed: `localhost`, `127.0.0.0/8`, and

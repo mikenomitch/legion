@@ -2,8 +2,9 @@
 
 > **Judgement calls:** [worker-plane-auth-plan_calls.md](../calls/worker-plane-auth-plan_calls.md)
 
-**Status: PLANNED.** Nothing here is built. The plan has two halves that
-share one threat: something reaching a node's control plane that shouldn't.
+**Status: IN EXECUTION.** Phase 0 (ACLs on by default) shipped. The plan
+has two halves that share one threat: something reaching a node's control
+plane that shouldn't.
 
 - **The worker plane** (Phases 1, 4, and 8): mutual TLS on the worker
   listener, a reachable advertised address, an encrypted worker-to-manager

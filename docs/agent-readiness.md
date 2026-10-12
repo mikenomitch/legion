@@ -548,10 +548,16 @@ All client commands and the MCP server read:
 
 - `LEGION_ADDR`: manager address (default `http://127.0.0.1:4747`).
 - `LEGION_TLS_CA_CERT`: CA certificate path for `https`/`grpcs` addresses.
-- `LEGION_TOKEN`: ACL token sent as a bearer credential when the cluster has
-  ACLs enabled. Falls back to the `legion login` token file, `~/.legion/token`.
-  On a `PermissionDenied`, call `legion acl whoami` (or the `legion_acl_whoami`
-  MCP tool) to see the caller's policies. See [Auth & ACLs](auth-and-acls.md).
+- `LEGION_TOKEN`: ACL token sent as a bearer credential. ACLs are on by
+  default, so the CLI and the MCP server need a token for every call. Falls
+  back to the token file, `~/.legion/token` (`$LEGION_TOKEN_FILE` overrides
+  the path), which `legion login` writes and which a manager writes at first
+  start for the user running it. An MCP server started on the manager's own
+  machine therefore works with nothing set. Elsewhere, give it a scoped token,
+  not the management token. A call with no token fails with
+  `Unauthenticated` and a hint naming `<dataDir>/bootstrap-token`. On a
+  `PermissionDenied`, call `legion acl whoami` (or the `legion_acl_whoami` MCP
+  tool) to see the caller's policies. See [Auth & ACLs](auth-and-acls.md).
 
 ## Recommended agent workflow
 
