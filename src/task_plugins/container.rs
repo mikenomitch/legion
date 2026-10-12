@@ -2383,7 +2383,9 @@ mod tests {
         use std::io::{Read as _, Write as _};
         let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9012);
-        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
         let task: TaskConfig = serde_json::from_value(json!({
             "name": "nginx",
             "runtime": "container",
@@ -2417,14 +2419,26 @@ mod tests {
         let stderr = std::fs::read_to_string(instance.log_dir.as_ref().unwrap().join("stderr.log"))
             .unwrap_or_default();
 
-        assert!(stdout.contains("cache-owner=101"), "layer ownership kept: {stdout}");
-        assert!(stdout.contains("nofile=1048576") || !oci_bundle_root(), "{stdout}");
-        assert!(response.starts_with("HTTP/1.1 200"), "nginx serves: {response:?} {stderr}");
+        assert!(
+            stdout.contains("cache-owner=101"),
+            "layer ownership kept: {stdout}"
+        );
+        assert!(
+            stdout.contains("nofile=1048576") || !oci_bundle_root(),
+            "{stdout}"
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "nginx serves: {response:?} {stderr}"
+        );
         assert!(
             !stderr.contains("Operation not permitted"),
             "no capability failures: {stderr}"
         );
-        assert!(access.contains("\"GET / HTTP/1.0\""), "access log via /dev/stdout: {access}");
+        assert!(
+            access.contains("\"GET / HTTP/1.0\""),
+            "access log via /dev/stdout: {access}"
+        );
         Ok(())
     }
 
@@ -2444,7 +2458,9 @@ mod tests {
     fn oci_runtime_runs_the_postgres_entrypoint() -> R<()> {
         let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9013);
-        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
         let tmp = tempfile::tempdir()?;
         let data = tmp.path().join("volume");
         std::fs::create_dir_all(&data)?;
@@ -2479,7 +2495,10 @@ mod tests {
         let stdout = std::fs::read_to_string(instance.log_dir.as_ref().unwrap().join("stdout.log"))
             .unwrap_or_default();
 
-        assert!(stderr.contains(ready), "postgres came up:\n{stdout}\n{stderr}");
+        assert!(
+            stderr.contains(ready),
+            "postgres came up:\n{stdout}\n{stderr}"
+        );
         assert!(listening, "listening on the assigned port");
         assert!(!stderr.contains("Operation not permitted"), "{stderr}");
         use std::os::unix::fs::MetadataExt;
@@ -2634,7 +2653,10 @@ mod tests {
             "ulimits": { "nofile": 4096 },
         }))?;
         let policy = config.process_policy()?;
-        assert_eq!(policy.capabilities, vec!["CAP_NET_BIND_SERVICE".to_string()]);
+        assert_eq!(
+            policy.capabilities,
+            vec!["CAP_NET_BIND_SERVICE".to_string()]
+        );
         let nofile = policy
             .rlimits
             .iter()
@@ -2692,7 +2714,9 @@ mod tests {
             ..small
         };
         check_apple_memory_floor(&ContainerRuntime::AppleContainer, &unsized_task)?;
-        assert!(ContainerTaskPlugin.check_resources(&unsized_task)?.is_empty());
+        assert!(ContainerTaskPlugin
+            .check_resources(&unsized_task)?
+            .is_empty());
         Ok(())
     }
 

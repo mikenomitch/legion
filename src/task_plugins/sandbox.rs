@@ -2897,7 +2897,14 @@ mod tests {
         let argv = build_exec_command("legion-sbx-7", true, &["-l".to_string()]);
         assert_eq!(
             argv,
-            vec!["container", "exec", "--tty", "--interactive", "legion-sbx-7", "-l"]
+            vec![
+                "container",
+                "exec",
+                "--tty",
+                "--interactive",
+                "legion-sbx-7",
+                "-l"
+            ]
         );
         assert!(!argv.contains(&"--".to_string()), "{argv:?}");
         let argv = build_exec_command("legion-sbx-7", false, &["/bin/true".to_string()]);
@@ -2917,7 +2924,9 @@ mod tests {
         assert!(err.to_string().contains("memory_mib"), "{err}");
         check_apple_memory_floor(
             "workspace",
-            &SandboxTaskConfig::from_value(&json!({ "image": "a", "command": ["x"], "memory_mib": 256 }))?,
+            &SandboxTaskConfig::from_value(
+                &json!({ "image": "a", "command": ["x"], "memory_mib": 256 }),
+            )?,
         )?;
 
         // Not pinned to macOS: 128 MiB is a valid microVM guest (sized by
@@ -2934,7 +2943,9 @@ mod tests {
         // The default 512 MiB guest clears it.
         let mut default_sized = task_with(json!({ "image": "a", "command": ["x"] }));
         default_sized.constraints = json!({ "os": "macos" });
-        assert!(SandboxTaskPlugin.check_resources(&default_sized)?.is_empty());
+        assert!(SandboxTaskPlugin
+            .check_resources(&default_sized)?
+            .is_empty());
         Ok(())
     }
 

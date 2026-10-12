@@ -505,7 +505,9 @@ static NODE_STORE: std::sync::RwLock<Option<std::sync::Arc<ContentStore>>> =
 
 /// Registers (or, with `None`, clears) this process's node content store.
 pub fn set_node_store(store: Option<std::sync::Arc<ContentStore>>) {
-    *NODE_STORE.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = store;
+    *NODE_STORE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = store;
 }
 
 /// This process's node content store, when a worker registered one.

@@ -1706,7 +1706,10 @@ mod tests {
             "CAP_NET_BIND_SERVICE",
             "CAP_AUDIT_WRITE",
         ] {
-            assert!(bounding.iter().any(|cap| cap == needed), "{needed} in {bounding:?}");
+            assert!(
+                bounding.iter().any(|cap| cap == needed),
+                "{needed} in {bounding:?}"
+            );
         }
         assert!(!bounding.iter().any(|cap| cap == "CAP_NET_RAW"));
         assert!(!bounding.iter().any(|cap| cap == "CAP_SYS_ADMIN"));
@@ -1750,7 +1753,8 @@ mod tests {
         assert_eq!(resolve_capabilities(&[], &[])?, default_capabilities());
 
         // Names are case-insensitive and the CAP_ prefix is optional.
-        let caps = resolve_capabilities(&names(&["net_raw", "CAP_SYS_PTRACE"]), &names(&["mknod"]))?;
+        let caps =
+            resolve_capabilities(&names(&["net_raw", "CAP_SYS_PTRACE"]), &names(&["mknod"]))?;
         assert!(caps.contains(&"CAP_NET_RAW".to_string()));
         assert!(caps.contains(&"CAP_SYS_PTRACE".to_string()));
         assert!(!caps.contains(&"CAP_MKNOD".to_string()));
@@ -1769,12 +1773,17 @@ mod tests {
         assert!(!everything.contains(&"CAP_SYS_ADMIN".to_string()));
 
         // A name in both lists ends up granted, as in Docker.
-        assert!(resolve_capabilities(&names(&["NET_RAW"]), &names(&["NET_RAW"]))?
-            .contains(&"CAP_NET_RAW".to_string()));
+        assert!(
+            resolve_capabilities(&names(&["NET_RAW"]), &names(&["NET_RAW"]))?
+                .contains(&"CAP_NET_RAW".to_string())
+        );
 
         // Typos fail loudly, naming the list.
         let err = resolve_capabilities(&names(&["NET_ADMINN"]), &[]).unwrap_err();
-        assert!(err.to_string().contains("security.capabilities.add"), "{err}");
+        assert!(
+            err.to_string().contains("security.capabilities.add"),
+            "{err}"
+        );
         assert!(err.to_string().contains("NET_ADMINN"), "{err}");
         let err = resolve_capabilities(&names(&["ALL"]), &names(&["ALL"])).unwrap_err();
         assert!(err.to_string().contains("both add and drop"), "{err}");
@@ -1816,11 +1825,17 @@ mod tests {
 
         for (bad, needle) in [
             (json!({ "nofiles": 10 }), "unknown ulimit"),
-            (json!({ "nofile": { "soft": 10, "hard": 5 } }), "must not exceed"),
+            (
+                json!({ "nofile": { "soft": 10, "hard": 5 } }),
+                "must not exceed",
+            ),
             (json!({ "nofile": { "soft": 10 } }), "both soft and hard"),
             (json!({ "nofile": -1 }), "non-negative"),
             (json!({ "nofile": "lots" }), "unlimited"),
-            (json!({ "nofile": { "soft": 1, "hard": 2, "max": 3 } }), "unknown field"),
+            (
+                json!({ "nofile": { "soft": 1, "hard": 2, "max": 3 } }),
+                "unknown field",
+            ),
         ] {
             let err = parse(bad.clone()).expect_err("rejected");
             assert!(err.to_string().contains(needle), "{bad}: {err}");
@@ -1981,7 +1996,11 @@ mod tests {
             if let Some(value) = read("user.legion-test") {
                 assert_eq!(value, b"kept");
             }
-            assert_eq!(read("trusted.overlay.opaque"), None, "overlay bookkeeping skipped");
+            assert_eq!(
+                read("trusted.overlay.opaque"),
+                None,
+                "overlay bookkeeping skipped"
+            );
         }
         Ok(())
     }

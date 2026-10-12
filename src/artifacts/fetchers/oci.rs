@@ -500,13 +500,9 @@ impl OciFetcher {
         // it from) a tag's current digest.
         let top_digest = match (reference.digest(), cache.as_ref()) {
             (Some(digest), _) => Some(digest.to_string()),
-            (None, Some(cache)) => Some(cache.resolve_tag(
-                runtime,
-                client,
-                reference,
-                auth,
-                req.redacted_source,
-            )?),
+            (None, Some(cache)) => {
+                Some(cache.resolve_tag(runtime, client, reference, auth, req.redacted_source)?)
+            }
             (None, None) => None,
         };
         let (raw_manifest, manifest_digest, manifest_cached) = self.platform_manifest(
@@ -756,8 +752,7 @@ mod tests {
             use std::io::{BufRead, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             let port = listener.local_addr().expect("addr").port();
-            let routes: Arc<std::sync::Mutex<HashMap<String, (String, Vec<u8>)>>> =
-                Arc::default();
+            let routes: Arc<std::sync::Mutex<HashMap<String, (String, Vec<u8>)>>> = Arc::default();
             let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
             let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (thread_routes, thread_log, thread_down) =
@@ -853,7 +848,8 @@ mod tests {
                     .collect::<Vec<_>>(),
             }))
             .unwrap();
-            let mut platform_entry = descriptor(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE, &manifest);
+            let mut platform_entry =
+                descriptor(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE, &manifest);
             platform_entry["platform"] = json!({ "os": "linux", "architecture": image_arch() });
             let index = serde_json::to_vec(&json!({
                 "schemaVersion": 2,
@@ -865,7 +861,10 @@ mod tests {
             let manifest_digest = ContentDigest::of_bytes(&manifest).as_str().to_string();
             for blob in std::iter::once(config).chain(layers.iter().copied()) {
                 self.serve(
-                    format!("/v2/lib/img/blobs/{}", ContentDigest::of_bytes(blob).as_str()),
+                    format!(
+                        "/v2/lib/img/blobs/{}",
+                        ContentDigest::of_bytes(blob).as_str()
+                    ),
                     "application/octet-stream",
                     blob.to_vec(),
                 );
@@ -945,7 +944,11 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = open_store(dir.path());
         let source = format!("oci://127.0.0.1:{}/lib/img:v1?protocol=http", registry.port);
-        let (base, app_v1, app_v2) = (b"base-layer".as_slice(), b"app-v1".as_slice(), b"app-v2".as_slice());
+        let (base, app_v1, app_v2) = (
+            b"base-layer".as_slice(),
+            b"app-v1".as_slice(),
+            b"app-v2".as_slice(),
+        );
         registry.publish("v1", br#"{"config":{"Env":["V=1"]}}"#, &[base, app_v1]);
 
         // First pull: everything comes from the registry and is kept.
@@ -953,7 +956,11 @@ mod tests {
         assert!(layout.join("index.json").is_file());
         let log = registry.take_log();
         assert_eq!(blob_pulls(&log).len(), 3, "config + 2 layers: {log:?}");
-        assert_eq!(manifest_gets(&log).len(), 2, "index + platform manifest: {log:?}");
+        assert_eq!(
+            manifest_gets(&log).len(),
+            2,
+            "index + platform manifest: {log:?}"
+        );
         assert_eq!(store.list()?.len(), 5, "index, manifest, config, 2 layers");
         let layer = layout
             .join("blobs/sha256")
@@ -963,7 +970,11 @@ mod tests {
         // Second pull of the same tag: one HEAD, no manifest or blob GETs.
         let again = pull(dir.path(), "second", &source, Some(store.clone()))?;
         let log = registry.take_log();
-        assert!(log.iter().any(|line| line.starts_with("HEAD") && line.ends_with("/manifests/v1")), "{log:?}");
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with("HEAD") && line.ends_with("/manifests/v1")),
+            "{log:?}"
+        );
         assert!(manifest_gets(&log).is_empty(), "{log:?}");
         assert!(blob_pulls(&log).is_empty(), "{log:?}");
         assert_eq!(
@@ -973,10 +984,14 @@ mod tests {
 
         // The registry stops answering: the tag's last digest on this node
         // still starts.
-        registry.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        registry
+            .down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         pull(dir.path(), "offline", &source, Some(store.clone()))?;
         assert!(blob_pulls(&registry.take_log()).is_empty());
-        registry.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        registry
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
 
         // The tag moves: the new manifests and the changed layer are pulled,
         // the shared base layer is not.
@@ -1013,14 +1028,18 @@ mod tests {
 
         pull(dir.path(), "warm", &pinned, Some(store.clone()))?;
         registry.take_log();
-        registry.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        registry
+            .down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         pull(dir.path(), "hit", &pinned, Some(store.clone()))?;
         let log = registry.take_log();
         assert!(
             log.iter().all(|line| line == "GET /v2/"),
             "a held digest asks the registry for nothing: {log:?}"
         );
-        registry.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        registry
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
 
         // No store: the full pull, every time.
         let tag = format!("oci://127.0.0.1:{}/lib/img:v1?protocol=http", registry.port);
