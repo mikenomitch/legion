@@ -36,10 +36,12 @@ use legion::structs::{
     GetInstanceRequest, GetSessionReply, GetSessionRequest, GetTaskLogsReply, GetTaskLogsRequest,
     HeartbeatReply, HeartbeatRequest, InstanceInfo, ListInstancesReply, ListInstancesRequest, Node,
     NodeMsg, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply,
-    PromoteInstanceRequest, RestartWorkerReply, RestartWorkerRequest, SessionReport, SessionStatus,
-    StartClaimReply, StartClaimRequest, StartSessionReply, StartSessionRequest,
+    PromoteInstanceRequest, RestartWorkerReply, RestartWorkerRequest, ResumeSessionReply,
+    ResumeSessionRequest, SessionReport, SessionSleepFailure, SessionStatus, StartClaimReply,
+    StartClaimRequest, StartInstanceRequest, StartSessionReply, StartSessionRequest,
     StopInstanceRequest, StopSessionReply, StopSessionRequest, StopSessionsReply,
-    StopSessionsRequest, Submission, SuspendInstanceRequest, TaskAllocation,
+    StopSessionsRequest, Submission, SuspendInstanceRequest, SuspendSessionsReply,
+    SuspendSessionsRequest, SuspendedSession, TaskAllocation,
 };
 use tonic::{Code, Request, Response, Status, Streaming};
 
@@ -55,6 +57,8 @@ struct NodeState {
     posts: Vec<TaskAllocation>,
     /// Every session id a StopSessions call named.
     stops: Vec<String>,
+    /// Sessions this node evicted, with the `evicted:` answer's details.
+    evicted: BTreeMap<String, String>,
     epoch: u64,
 }
 
@@ -140,12 +144,82 @@ impl Worker for FakeNode {
         Ok(Response::new(StopSessionsReply { stopped }))
     }
 
+    /// Suspend as a node does it, minus the checkpoint: the session stays
+    /// listed as `suspended`.
+    async fn suspend_sessions(
+        &self,
+        request: Request<SuspendSessionsRequest>,
+    ) -> Result<Response<SuspendSessionsReply>, Status> {
+        let mut state = self.lock();
+        let mut reply = SuspendSessionsReply::default();
+        for id in request.into_inner().session_ids {
+            match state.sessions.get_mut(&id) {
+                Some(status) => {
+                    let already = status.state == "suspended";
+                    status.state = "suspended".into();
+                    reply.suspended.push(SuspendedSession {
+                        session_id: id,
+                        snapshot_id: "snap-fake".into(),
+                        kind: "memory".into(),
+                        bytes: 4096,
+                        already_suspended: already,
+                    });
+                }
+                None => reply.failed.push(SessionSleepFailure {
+                    session_id: id.clone(),
+                    code: "NotFound".into(),
+                    message: format!("not_found: no session {id}"),
+                }),
+            }
+        }
+        Ok(Response::new(reply))
+    }
+
+    async fn resume_session(
+        &self,
+        request: Request<ResumeSessionRequest>,
+    ) -> Result<Response<ResumeSessionReply>, Status> {
+        let id = request.into_inner().session_id;
+        let mut state = self.lock();
+        if let Some(when) = state.evicted.get(&id) {
+            return Err(Status::not_found(format!(
+                "evicted: session {id} was evicted from n1 {when}; a local-only session cannot be restored"
+            )));
+        }
+        let full = state.full;
+        let Some(status) = state.sessions.get_mut(&id) else {
+            return Err(Status::not_found(format!("not_found: no session {id}")));
+        };
+        if status.state != "suspended" {
+            return Ok(Response::new(ResumeSessionReply {
+                session: Some(status.clone()),
+                already_running: true,
+                ..Default::default()
+            }));
+        }
+        if full {
+            return Err(Status::resource_exhausted("envelope full"));
+        }
+        status.state = "running".into();
+        Ok(Response::new(ResumeSessionReply {
+            session: Some(status.clone()),
+            resumed_from: "local".into(),
+            ..Default::default()
+        }))
+    }
+
     async fn get_session(
         &self,
         request: Request<GetSessionRequest>,
     ) -> Result<Response<GetSessionReply>, Status> {
         let id = request.into_inner().session_id;
-        match self.lock().sessions.get(&id) {
+        let state = self.lock();
+        if let Some(when) = state.evicted.get(&id) {
+            return Err(Status::not_found(format!(
+                "evicted: session {id} was evicted from n1 {when}; a local-only session cannot be restored"
+            )));
+        }
+        match state.sessions.get(&id) {
             Some(status) => Ok(Response::new(GetSessionReply {
                 session: Some(status.clone()),
                 node_id: String::new(),

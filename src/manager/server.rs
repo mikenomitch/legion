@@ -14311,6 +14311,20 @@ mod tests {
             Err(Status::unimplemented("not used in test"))
         }
 
+        async fn suspend_sessions(
+            &self,
+            _request: Request<crate::structs::SuspendSessionsRequest>,
+        ) -> Result<Response<crate::structs::SuspendSessionsReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn resume_session(
+            &self,
+            _request: Request<crate::structs::ResumeSessionRequest>,
+        ) -> Result<Response<crate::structs::ResumeSessionReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
         async fn start_session(
             &self,
             _request: Request<crate::structs::StartSessionRequest>,

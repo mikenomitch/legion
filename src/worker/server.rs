@@ -496,6 +496,108 @@ impl Worker for WorkerDaemonService {
         Ok(Response::new(crate::structs::StopSessionsReply { stopped }))
     }
 
+    /// Suspend sessions on this node (session durability plan §6.6).
+    /// Manager-only, like `StopSessions`.
+    #[instrument(err, skip_all, fields(sessions))]
+    async fn suspend_sessions(
+        &self,
+        request: Request<crate::structs::SuspendSessionsRequest>,
+    ) -> Result<Response<crate::structs::SuspendSessionsReply>, Status> {
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "SuspendSessions")?;
+        let request = request.into_inner();
+        tracing::Span::current().record("sessions", request.session_ids.len());
+        let reason = if request.reason.is_empty() {
+            "manual".to_string()
+        } else {
+            request.reason
+        };
+        let mut reply = crate::structs::SuspendSessionsReply::default();
+        for session_id in request.session_ids {
+            let task_manager = self.task_manager.clone();
+            let id = session_id.clone();
+            let trigger = reason.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::worker::task_manager::session_sleep::suspend_session(
+                    &task_manager,
+                    &id,
+                    &trigger,
+                )
+            })
+            .await
+            .map_err(|err| Status::internal(format!("session suspend panicked: {err}")))?;
+            match outcome {
+                Ok(outcome) => {
+                    use crate::worker::task_manager::session_sleep::SuspendOutcome;
+                    let (checkpoint, already) = match outcome {
+                        SuspendOutcome::Suspended(checkpoint) => (checkpoint, false),
+                        SuspendOutcome::AlreadySuspended(checkpoint) => (checkpoint, true),
+                    };
+                    reply.suspended.push(crate::structs::SuspendedSession {
+                        session_id,
+                        snapshot_id: checkpoint.snapshot_id,
+                        kind: checkpoint.kind,
+                        bytes: checkpoint.total_bytes,
+                        already_suspended: already,
+                    });
+                }
+                Err(err) => {
+                    let status = self.session_sleep_status(&session_id, &err);
+                    reply.failed.push(crate::structs::SessionSleepFailure {
+                        session_id,
+                        code: format!("{:?}", status.code()),
+                        message: status.message().to_string(),
+                    });
+                }
+            }
+        }
+        Ok(Response::new(reply))
+    }
+
+    /// Resume a suspended session on this node (session durability plan
+    /// §6.6). Manager-only.
+    #[instrument(err, skip_all, fields(session_id))]
+    async fn resume_session(
+        &self,
+        request: Request<crate::structs::ResumeSessionRequest>,
+    ) -> Result<Response<crate::structs::ResumeSessionReply>, Status> {
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "ResumeSession")?;
+        let request = request.into_inner();
+        tracing::Span::current().record("session_id", request.session_id.as_str());
+        let slot = self.launch_slot().await?;
+        let task_manager = self.task_manager.clone();
+        let session_id = request.session_id.clone();
+        let cold = request.cold;
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            crate::worker::task_manager::session_sleep::resume_session(
+                &task_manager,
+                &session_id,
+                cold,
+            )
+        })
+        .await
+        .map_err(|err| Status::internal(format!("session resume panicked: {err}")))?
+        .map_err(|err| self.session_sleep_status(&request.session_id, &err))?;
+        use crate::worker::task_manager::session_sleep::ResumeOutcome;
+        let (resumed_from, already_running) = match outcome {
+            ResumeOutcome::Resumed { from } => (from.to_string(), false),
+            ResumeOutcome::AlreadyRunning => (String::new(), true),
+        };
+        let session = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .session_status(&request.session_id);
+        Ok(Response::new(crate::structs::ResumeSessionReply {
+            session,
+            node_id: self.node_id.clone(),
+            resumed_from,
+            already_running,
+        }))
+    }
+
     /// One session on this node, for tag routing (session durability plan
     /// §6.3). The node's answer is authoritative for itself.
     #[instrument(err, skip_all, fields(session_id))]
@@ -621,6 +723,19 @@ impl Worker for WorkerDaemonService {
             .lock()
             .map_err(|_| Status::internal("Task manager lock poisoned"))?;
         let Some(session) = manager.session_status(&request.session_id) else {
+            // An evicted session runs nothing and holds nothing: stopping
+            // it forgets the id, once the ticket is checked against it.
+            if let Some((job, task)) = manager.idle_session_owner(&request.session_id) {
+                ticket.allows(&job, &task)?;
+                manager.stop_sessions(
+                    std::slice::from_ref(&request.session_id),
+                    "requested (edge stop)",
+                );
+                return Ok(Response::new(crate::structs::StopSessionReply {
+                    stopped: false,
+                    node_id: self.node_id.clone(),
+                }));
+            }
             drop(manager);
             let status = self.session_not_here(&request.session_id);
             // Already gone from this node: idempotent, unless the caller has
@@ -690,6 +805,32 @@ impl WorkerDaemonService {
 }
 
 impl WorkerDaemonService {
+    /// The status a failed suspend or resume of a session answers with
+    /// (docs/session-mode.md, "Idle sessions").
+    pub(crate) fn session_sleep_status(&self, session_id: &str, err: &anyhow::Error) -> Status {
+        use crate::worker::task_manager::session_sleep::SessionSleepError;
+        use crate::worker::task_manager::SessionRefusal;
+        if let Some(sleep) = err.downcast_ref::<SessionSleepError>() {
+            return match sleep {
+                SessionSleepError::NotHere | SessionSleepError::Evicted(_) => {
+                    self.session_not_here(session_id)
+                }
+                SessionSleepError::NotSuspendable(why) => Status::failed_precondition(why.clone()),
+                SessionSleepError::Busy => Status::aborted(sleep.to_string()),
+            };
+        }
+        match err.downcast_ref::<SessionRefusal>() {
+            Some(SessionRefusal::EnvelopeFull { .. }) => Status::resource_exhausted(format!(
+                "{err:#}; session {session_id} stays suspended with its checkpoint, retry once \
+                 sessions end"
+            )),
+            Some(SessionRefusal::NoEnvelope { .. }) => {
+                Status::failed_precondition(format!("{err:#}"))
+            }
+            None => Status::internal(format!("{err:#}")),
+        }
+    }
+
     /// NotFound for a session this node does not hold: `wrong_node` when its
     /// id carries another node's tag, `evicted` when the node remembers
     /// evicting it, `not_found` otherwise (session durability plan §6.7, row
