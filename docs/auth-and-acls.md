@@ -385,7 +385,7 @@ admits named caller classes, checked before the request is read:
 
 | RPC | Caller class | What it takes |
 | --- | --- | --- |
-| `PostWork`, `GetTaskLogs`, `RestartWorker`, `ExecTask` | `manager` | a client certificate from the cluster CA carrying `legion://manager/<id>` |
+| `PostWork`, `GetTaskLogs`, `RestartWorker`, `ExecTask`, `StopSessions` | `manager` | a client certificate from the cluster CA carrying `legion://manager/<id>` |
 | `StartClaim` | `ticket` | a boot ticket in the request ([edge-boot.md](edge-boot.md)); a client certificate is ignored |
 
 A node certificate is not a manager certificate: the CA signs both, and the

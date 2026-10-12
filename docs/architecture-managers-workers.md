@@ -36,8 +36,8 @@ else needs it.
 
 The worker plane is reachable by default and safe to expose because it is
 mutual TLS with per-RPC caller classes: only a manager certificate can call
-`PostWork`, `GetTaskLogs`, `ExecTask`, or `RestartWorker`, and `StartClaim`
-needs a signed boot ticket. See [auth-and-acls.md](auth-and-acls.md#the-worker-plane).
+`PostWork`, `GetTaskLogs`, `ExecTask`, `RestartWorker`, or `StopSessions`, and
+`StartClaim` needs a signed boot ticket. See [auth-and-acls.md](auth-and-acls.md#the-worker-plane).
 
 Where a worker listens and what it advertises:
 
@@ -317,6 +317,9 @@ and the node's name verified on the server certificate.
 - `ExecTask`: `legion exec`, actions, and the UI terminal, after the manager
   has applied ACLs.
 - `RestartWorker`: manager can instruct a worker process restart.
+- `StopSessions`: a manager ends running [sessions](session-mode.md) on the
+  node (`legion instance stop` or `destroy` on a session, or the later copy
+  of a duplicated one). Session starts arrive as `PostWork`.
 - `StartClaim` is the one RPC managers never call: edge routers do, with a
   boot ticket ([edge-boot.md](edge-boot.md)).
 

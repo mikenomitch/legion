@@ -8446,6 +8446,10 @@ service Worker {
   // for `instance stop` or `instance destroy` on a session, and to stop the
   // later copy of a duplicated session id. Ids the node does not run are
   // ignored, so the call is idempotent.
+  //
+  // Caller class: `manager` (a client certificate from the cluster CA
+  // carrying `legion://manager/<id>`); anything else is refused with
+  // `Unauthenticated`.
   rpc StopSessions (StopSessionsRequest) returns (StopSessionsReply);
 }
 
