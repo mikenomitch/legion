@@ -8,6 +8,32 @@ image. It is implemented in `src/task_plugins/exec.rs`.
 
 Run a host process directly using `std::process::Command`.
 
+## Trust
+
+An `exec` task is a process on the host, with host paths, host users, and
+host binaries. Without `user` it runs as root on the node: it can read the
+worker's credentials (its node token, its node key) and, on a node that also
+runs a manager, the cluster's. Run untrusted code in `container` or
+`sandbox`, never `exec`.
+
+- Submitting a job with an `exec` task needs the `host` grant on
+  `job:write` ([Host-level jobs](auth-and-acls.md#host-level-jobs)).
+- `user` drops to that user's uid and gid, and drops every supplementary
+  group first (`setgroups`), so the task does not inherit the worker's
+  groups.
+- `network.mode = "gated"` refuses to run as root, because a root process
+  with `CAP_SYS_ADMIN` can `setns` out of its namespace:
+
+  ```text
+  Error: task "worker" sets network.mode = "gated" but runs as root. A root exec task can
+  leave its network namespace, so gated would not hold.
+  Hint: set user = "nobody" (or another unprivileged user), or use runtime = "container"
+  ```
+
+- The [kernel host guard](network-handlers.md#the-host-guard-in-the-kernel)
+  keeps a host-mode task off Legion's ports and the metadata service, but a
+  root task can delete its table. It holds for tasks with a `user`.
+
 ## Config Schema
 
 Required:
@@ -91,6 +117,12 @@ By default an `exec` task shares the host's network (`network.mode =
 ports owned by the node datapath. Egress policy applies to traffic through
 those upstreams and to names resolved through the allocation's resolver
 (`LEGION_DNS`). In this mode, enforcement depends on the task cooperating.
+On a Linux node running the
+[kernel host guard](network-handlers.md#the-host-guard-in-the-kernel), the
+task still cannot reach the node's Legion ports, the cloud metadata service,
+or other allocations' listeners: its sockets are matched by its cgroup leaf
+and dropped with `EPERM`. A task running as root can remove that table, so
+the guard holds for tasks with a `user` only.
 
 With `network.mode = "gated"` (Linux), the worker creates an empty network
 namespace for the allocation before it starts. The process enters it with
@@ -98,9 +130,15 @@ namespace for the allocation before it starts. The process enters it with
 holds only loopback and the datapath's listeners: upstream ports, VIPs, the
 resolver, and an egress proxy at `127.0.0.1:1080` exported as `HTTP_PROXY` /
 `HTTPS_PROXY` / `ALL_PROXY`. A tool that ignores the proxy has no route out,
-so the task can't bypass egress policy. The full model, the fail-closed
-rules, and the limits (no raw UDP, no ICMP, no inbound to undeclared ports,
-Linux only) are in [Network Handlers](network-handlers.md#gated-mode).
+so its only way off the namespace is a connection the datapath judges, and
+every destination is checked against the
+[host guard](network-handlers.md#the-host-guard) before policy: the node
+itself, link-local (the cloud metadata service), and other allocations'
+listeners are refused whatever the job's policy says. A task running as root
+can leave the namespace with `setns`, so `gated` contains non-root tasks
+only. The full model, the fail-closed rules, and the limits (no raw UDP, no
+ICMP, no inbound to undeclared ports, Linux only) are in
+[Network Handlers](network-handlers.md#gated-mode).
 
 ## Capability Summary
 

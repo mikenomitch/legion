@@ -557,6 +557,78 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Exec and actions (docs/exec-and-actions.md) ---
+        Capability {
+            name: "exec",
+            cli: "legion exec <ALLOC>|--job <JOB>|--instance <ID> [-it] [--direct] -- <CMD>",
+            grpc: Some("Manager/ExecAllocation"),
+            summary: "Run a command inside a running allocation, through the manager or, with \
+                      --direct, against its worker with an exec ticket.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "exec-ticket.mint",
+            cli: "legion exec-ticket mint <ALLOC>|--instance <ID> [--action A] [-- <CMD>]",
+            grpc: Some("Manager/MintExecTicket"),
+            summary: "Mint a short-lived, single-use ticket for one direct exec session on the \
+                      worker running the target (no raft write).",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "exec-ticket.sign",
+            cli: "legion exec-ticket sign --key <PEM> --key-id <ID> --node <N> --alloc <A> --job <J> --task <T>",
+            grpc: None,
+            summary: "Sign an exec ticket offline with a delegated exec key's private key (no \
+                      manager call).",
+            mutates: false,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "exec-key.create",
+            cli: "legion exec-key create --jobs <GLOB> --public-key <PEM>",
+            grpc: Some("Manager/CreateExecKey"),
+            summary: "Register a platform's public key for minting exec tickets for matching \
+                      jobs on non-host runtimes.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "exec-key.list",
+            cli: "legion exec-key list",
+            grpc: Some("Manager/ListExecKeys"),
+            summary: "List delegated exec minting keys and their ceilings.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "exec-key.delete",
+            cli: "legion exec-key delete <ID>",
+            grpc: Some("Manager/DeleteExecKey"),
+            summary: "Delete a delegated exec key; workers drop it and end its sessions on \
+                      their next heartbeat.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "action.list",
+            cli: "legion action list <JOB>",
+            grpc: Some("Manager/ListJobActions"),
+            summary: "List the actions declared on a job's tasks, with their parameters.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "action.run",
+            cli: "legion action run <JOB> <ACTION> [--alloc <ID>|--instance <ID>] [--param k=v] \
+                  [--json]",
+            grpc: Some("Manager/ExecAllocation"),
+            summary: "Run a declared action in a running allocation, rendered by the manager; \
+                      `--json` returns its exit code and output.",
+            mutates: true,
+            read_only_safe: false,
+        },
         // --- Edge boot (docs/edge-boot.md) ---
         Capability {
             name: "boot-ticket.create",
@@ -734,14 +806,6 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion login --method <METHOD>",
             grpc: Some("Manager/Login"),
             summary: "Exchange username/password or an external JWT for an ACL token.",
-            mutates: true,
-            read_only_safe: false,
-        },
-        Capability {
-            name: "acl.bootstrap",
-            cli: "legion acl bootstrap",
-            grpc: Some("Manager/BootstrapAcl"),
-            summary: "One-time creation of the initial management token.",
             mutates: true,
             read_only_safe: false,
         },
@@ -937,8 +1001,9 @@ pub fn catalog() -> Vec<Capability> {
             name: "net.ca.show",
             cli: "legion net ca show",
             grpc: Some("Manager/GetMeshCa"),
-            summary: "Print the mesh CA certificate (never the key): what an outside client \
-                 trusts to reach a mesh-TLS port, or verifies a node certificate against.",
+            summary: "Print the cluster CA trust bundle (never a key), its pin, and the \
+                 rotation phase: what an outside client trusts to reach a mesh-TLS port or a \
+                 worker plane, or verifies a node certificate against.",
             mutates: false,
             read_only_safe: true,
         },
@@ -946,8 +1011,9 @@ pub fn catalog() -> Vec<Capability> {
             name: "net.ca.rotate",
             cli: "legion net ca rotate",
             grpc: Some("Manager/RotateMeshCa"),
-            summary: "Replace the mesh CA. Every node re-issues its certificate on its next \
-                 heartbeat; expect one heartbeat interval of refused mesh connections.",
+            summary: "Rotate the cluster CA in two steps: the new CA, cross-signed by the old \
+                 one, signs at once and the old one stays trusted for 24h, so no connection \
+                 breaks. Nodes re-issue within one heartbeat.",
             mutates: true,
             read_only_safe: false,
         },
@@ -987,23 +1053,6 @@ pub fn catalog() -> Vec<Capability> {
             summary: "Run a command inside a running allocation. `--json` collects the output \
                  into one envelope (`exitCode`, `stdout`, `stderr`); the process exits with \
                  the remote exit code.",
-            mutates: true,
-            read_only_safe: false,
-        },
-        Capability {
-            name: "action.list",
-            cli: "legion action list <JOB>",
-            grpc: Some("Manager/ListJobActions"),
-            summary: "List the actions declared on a job's tasks, with their parameters.",
-            mutates: false,
-            read_only_safe: true,
-        },
-        Capability {
-            name: "action.run",
-            cli: "legion action run <JOB> <ACTION> [--alloc <ID>] [--param k=v] --json",
-            grpc: Some("Manager/ExecAllocation"),
-            summary: "Run a declared action against a running allocation; `--json` returns \
-                 its exit code and output.",
             mutates: true,
             read_only_safe: false,
         },

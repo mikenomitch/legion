@@ -968,6 +968,52 @@ async fn handle(
         };
     }
 
+    // An external target is resolved once and judged by the host guard
+    // before any attempt; every attempt dials the address that passed, never
+    // the name again (worker-plane-auth plan §6.11).
+    let judged_target: Option<String> = match settings.target.as_ref() {
+        Some(target) if direction == "egress" => {
+            match crate::worker::netd::guard::resolve_and_guard(
+                settings.context.resolver(),
+                settings.context.host_guard(),
+                &target.host,
+                target.port,
+            )
+            .await
+            {
+                Ok(addrs) => Some(addrs[0].to_string()),
+                Err(crate::worker::netd::guard::GuardRefusal::Denied(reason)) => {
+                    let source = crate::structs::host_guard::HOST_GUARD_SOURCE;
+                    net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
+                    settings.context.record_denial(
+                        settings.allocation_id,
+                        direction,
+                        PROTOCOL_HTTP,
+                        &destination,
+                        source,
+                        Some(&reason),
+                        &method,
+                        path.split('?').next().unwrap_or("/"),
+                    );
+                    note_edge_denied(&settings);
+                    return denied_response(
+                        direction,
+                        &settings.key,
+                        &destination,
+                        source,
+                        Some(&reason),
+                    );
+                }
+                Err(crate::worker::netd::guard::GuardRefusal::Unresolved(reason)) => {
+                    net_metrics::connection(direction, PROTOCOL_HTTP, "error");
+                    note_edge_request(&settings, None, None, started, bytes_in);
+                    return error_response(StatusCode::BAD_GATEWAY, reason);
+                }
+            }
+        }
+        _ => None,
+    };
+
     // 2. Attempts.
     let retry = settings.retry.clone();
     let max_attempts = 1 + retry.as_ref().map(|r| r.attempts).unwrap_or(0);
@@ -986,7 +1032,11 @@ async fn handle(
             }
         }
         let (addr, mesh_endpoint, edge_tag) = match settings.target.as_ref() {
-            Some(target) => (target.addr(), None, None),
+            Some(target) => (
+                judged_target.clone().unwrap_or_else(|| target.addr()),
+                None,
+                None,
+            ),
             None => match settings.pick(&candidates) {
                 Some(endpoint) => {
                     candidates.retain(|e| e.addr != endpoint.addr);
@@ -1292,10 +1342,20 @@ async fn attempt_request(
             return send_over(TokioIo::new(stream), request).await;
         }
     }
-    let stream = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(err)) => return Err(AttemptError::Connect(err.to_string())),
-        Err(_) => return Err(AttemptError::Connect("dial timed out".into())),
+    // A `proxy` handler's target comes from policy a job may append to, so
+    // it is dialed through the host guard. (An external target was already
+    // resolved and judged before the attempts; `addr` is the address that
+    // passed.)
+    let stream = if hand_off.is_some() {
+        crate::worker::netd::guard::dial_guarded(&settings.context, addr, DIAL_TIMEOUT)
+            .await
+            .map_err(AttemptError::Connect)?
+    } else {
+        match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => return Err(AttemptError::Connect(err.to_string())),
+            Err(_) => return Err(AttemptError::Connect("dial timed out".into())),
+        }
     };
     let _ = stream.set_nodelay(true);
 
@@ -1651,7 +1711,18 @@ mod integration {
             policy_hash: hash.clone(),
         }]);
         cache.insert_body(&hash, policy).unwrap();
-        let context = Arc::new(ForwarderContext::new(cache, denials.clone()));
+        // The origin is on loopback, which the host guard refuses; an
+        // operator `allow` entry opens exactly its port.
+        let guard = crate::structs::host_guard::HostGuard::new(
+            &crate::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("127.0.0.1:{origin}")],
+                deny: vec![],
+            },
+        )
+        .unwrap();
+        let context = Arc::new(
+            ForwarderContext::new(cache, denials.clone()).with_host_guard(Arc::new(guard)),
+        );
         let forwarder = UpstreamForwarder::with_context(context);
 
         let port = free_port().await;

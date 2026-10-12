@@ -261,7 +261,7 @@ export default function Access() {
 
             <SectionCard
               title="Use an existing token"
-              description="Paste an ACL token secret. It is stored in this browser only and sent as a bearer token on every request."
+              description="Paste an ACL token secret. On a new cluster, the initial management token is in <dataDir>/bootstrap-token on the manager's machine. It is stored in this browser only and sent as a bearer token on every request."
             >
               <div class="flex flex-col gap-3">
                 <Field label="Token secret">

@@ -545,22 +545,42 @@ impl Issuer {
         iat: u64,
         exp: u64,
     ) -> R<IssuedToken> {
+        self.issue_ticket(
+            crate::structs::edge_boot::BOOT_TICKET_AUDIENCE,
+            jti,
+            subject,
+            claims,
+            iat,
+            exp,
+        )
+    }
+
+    /// A node-redeemed ticket for `audience` (`legion:node` boot tickets,
+    /// `legion:exec` exec tickets), signed with the active key and verified
+    /// by workers against the JWKS. Same clamping as every token: it never
+    /// outlives the key that can verify it.
+    pub fn issue_ticket(
+        &self,
+        audience: &str,
+        jti: &str,
+        subject: &str,
+        claims: Map<String, Value>,
+        iat: u64,
+        exp: u64,
+    ) -> R<IssuedToken> {
         let key = self.active_key()?;
         let mut exp = exp.min(iat + self.max_token_ttl.as_secs());
         if let Some(not_after) = key.not_after {
             exp = exp.min(not_after);
         }
         if exp <= iat {
-            bail!("boot ticket TTL collapsed to zero against the signing key's overlap window");
+            bail!("ticket TTL collapsed to zero against the signing key's overlap window");
         }
 
         let mut body = claims;
         body.insert("iss".into(), json!(self.issuer_url));
         body.insert("sub".into(), json!(subject));
-        body.insert(
-            "aud".into(),
-            json!([crate::structs::edge_boot::BOOT_TICKET_AUDIENCE]),
-        );
+        body.insert("aud".into(), json!([audience]));
         body.insert("iat".into(), json!(iat));
         body.insert("nbf".into(), json!(iat));
         body.insert("exp".into(), json!(exp));
@@ -940,6 +960,25 @@ impl WorkloadIdentityState {
     ) -> R<IssuedToken> {
         self.read_issuer()?
             .issue_boot_ticket(jti, subject, claims, iat, exp)
+    }
+
+    /// Mint an exec ticket (docs/exec-and-actions.md, "Direct exec").
+    pub fn issue_exec_ticket(
+        &self,
+        jti: &str,
+        subject: &str,
+        claims: Map<String, Value>,
+        iat: u64,
+        exp: u64,
+    ) -> R<IssuedToken> {
+        self.read_issuer()?.issue_ticket(
+            crate::structs::exec_ticket::EXEC_TICKET_AUDIENCE,
+            jti,
+            subject,
+            claims,
+            iat,
+            exp,
+        )
     }
 
     /// One pass of the rotation state machine, persisting every transition:

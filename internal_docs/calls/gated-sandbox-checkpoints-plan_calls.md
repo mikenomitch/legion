@@ -854,7 +854,7 @@ space, the guest agent dials the host (CID 2), and Firecracker cannot change
 the CID on load. A per-allocation CID is stale after every restore and
 shared by every fork anyway, so it only looks meaningful.
 
-## 38. An upstream `localPort` of 1080 or 53, and a guest port of 1080, are refused on a gated sandbox
+## 38. An upstream `localPort` of 1080 or 53, and a guest port of 1080 or 1100, are refused on a gated sandbox
 
 **Call.** Submit refuses, on a sandbox that will run gated, an advertised
 port the guest would bind on 1080 (`static` or `to`), and an upstream
@@ -879,6 +879,15 @@ gated sandbox's upstreams.
 pinned port can hit this, and saying so at submit costs nothing. (a) breaks
 the one-number rule (entry 12) for every upstream to spare two pinned
 values almost nobody picks.
+
+**Later (merging sandbox exec).** The guest agent now also listens on guest
+vsock port 1100 for exec sessions on every microVM, and an advertised port
+is served on the guest vsock port of its own number, so a gated guest port
+of 1100 is refused the same way (`... and vsock port 1100 is the guest
+agent's exec listener`). The alternative was to offset ingress vsock ports
+(`65536 + port`) and reserve nothing. It lost for the same reason as (a):
+one more pinned value almost nobody picks does not justify a second
+numbering rule.
 
 ## 39. Widen the proxy variables, defer transparent capture
 

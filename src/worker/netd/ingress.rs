@@ -630,18 +630,18 @@ async fn serve_accepted<S>(
                 // The proxy reaches the task on the private port named in
                 // the header's DESTINATION TLV.
                 let private = format!("127.0.0.1:{}", shared.spec.private_port);
-                let mut proxy = match tokio::time::timeout(
+                // The handler's target comes from policy a job may append
+                // to, so the host guard judges it: an ingress hop can't be
+                // used to dial the node's own services either.
+                let mut proxy = match crate::worker::netd::guard::dial_guarded(
+                    &shared.context,
+                    &target.addr,
                     Duration::from_secs(2),
-                    TcpStream::connect(&target.addr),
                 )
                 .await
                 {
-                    Ok(Ok(stream)) => stream,
-                    other => {
-                        let err = match other {
-                            Ok(Err(err)) => err.to_string(),
-                            _ => "dial timed out".to_string(),
-                        };
+                    Ok(stream) => stream,
+                    Err(err) => {
                         shared.context.note_handler(
                             allocation_id,
                             &target.source,

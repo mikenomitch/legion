@@ -18,6 +18,7 @@ use crate::identity::GuestUpstream;
 
 const USAGE: &str = "\
 usage: legion-guest guest-agent [--proxy-port PORT] [--dns-port PORT] [--host-cid CID]
+                                [--no-relay] [--exec-port PORT]
                                 [--ingress-port PORT]... [--upstream PORT[@VSOCK][=VIP:PORT]]...
                                 [--resume-watch [--identity DEVICE] [--poll-ms MS]]
        legion-guest guest-resume [--identity DEVICE] [--poll-ms MS]
@@ -31,6 +32,12 @@ pub struct AgentArgs {
     /// 0 disables the DNS relay.
     pub dns_port: u16,
     pub host_cid: u32,
+    /// Run the proxy and DNS relays (a gated sandbox). `--no-relay` turns
+    /// them off for a TAP or `none` sandbox, whose agent only takes exec
+    /// sessions: the guest still cannot dial the host.
+    pub relay: bool,
+    /// The guest vsock port the exec listener binds; 0 disables exec.
+    pub exec_port: u32,
     /// Ports the node datapath fronts (`--ingress-port`, repeated): the
     /// agent listens on each as a vsock port and relays to the workload's
     /// loopback port of the same number.
@@ -40,8 +47,9 @@ pub struct AgentArgs {
     /// relaying to host vsock port VSOCK (PORT when absent, as at every
     /// boot).
     pub upstreams: Vec<GuestUpstream>,
-    /// Also run the resume watch in this process (a gated sandbox launched
-    /// for memory checkpoints), so a restore can close the relays it holds.
+    /// Also run the resume watch in this process (a sandbox launched for
+    /// memory checkpoints), so a restore can close the relays and exec
+    /// sessions it holds.
     pub resume_watch: Option<ResumeArgs>,
 }
 
@@ -51,6 +59,8 @@ impl Default for AgentArgs {
             proxy_port: agent::PROXY_PORT as u16,
             dns_port: agent::DNS_PORT as u16,
             host_cid: HOST_CID,
+            relay: true,
+            exec_port: crate::exec::EXEC_PORT,
             ingress_ports: Vec::new(),
             upstreams: Vec::new(),
             resume_watch: None,
@@ -126,6 +136,8 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
                     }
                     "--dns-port" => parsed.dns_port = number(flag, value(flag, &mut rest)?)?,
                     "--host-cid" => parsed.host_cid = number(flag, value(flag, &mut rest)?)?,
+                    "--no-relay" => parsed.relay = false,
+                    "--exec-port" => parsed.exec_port = number(flag, value(flag, &mut rest)?)?,
                     "--ingress-port" => {
                         let port: u16 = number(flag, value(flag, &mut rest)?)?;
                         if port == 0 {
@@ -157,6 +169,11 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
             }
             if let (false, Some(flag)) = (resume_watch, watch_flag) {
                 bail!("guest-agent {flag} only applies with --resume-watch\n{USAGE}");
+            }
+            // Ingress and upstreams ride the relays' vsock plumbing, which a
+            // `--no-relay` agent (a TAP or `none` sandbox) does not run.
+            if !parsed.relay && (!parsed.ingress_ports.is_empty() || !parsed.upstreams.is_empty()) {
+                bail!("guest-agent --ingress-port and --upstream need the relays; drop --no-relay\n{USAGE}");
             }
             parsed.resume_watch = resume_watch.then_some(watch);
             Ok(Invocation::Agent(parsed))
@@ -196,50 +213,65 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 fn run_agent(args: &AgentArgs) -> Result<()> {
-    let config = AgentConfig {
-        proxy_listen: format!("127.0.0.1:{}", args.proxy_port).parse()?,
-        proxy_port: u32::from(args.proxy_port),
-        dns_listen: (args.dns_port != 0)
-            .then(|| format!("127.0.0.1:{}", args.dns_port).parse())
-            .transpose()?,
-        dns_port: u32::from(args.dns_port),
-        ingress_ports: args.ingress_ports.clone(),
-        upstreams: args.upstreams.clone(),
-    };
-    let started = agent::start(
-        config,
-        Arc::new(VsockDial { cid: args.host_cid }),
-        Arc::new(VsockListen),
-    )?;
-    eprintln!(
-        "legion-guest-agent: proxy on {}, dns on {} -> host cid {}; ingress on vsock {}",
-        started.proxy_addr,
-        started
-            .dns_addr
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| "off".into()),
-        args.host_cid,
-        port_list(&started.ingress.ports()),
-    );
-    log_ingress_failures(&started.ingress_errors);
-    if !started.upstreams.addresses().is_empty() {
-        eprintln!(
-            "legion-guest-agent: upstreams on {}",
-            address_list(&started.upstreams.addresses())
-        );
+    if args.exec_port != 0 {
+        // Exec first: it is the one listener every microVM's agent runs.
+        crate::exec::serve_vsock(args.exec_port)
+            .with_context(|| format!("listen for exec on vsock port {}", args.exec_port))?;
+        eprintln!("legion-guest-agent: exec on vsock port {}", args.exec_port);
     }
-    log_upstream_failures(&started.upstream_errors);
+    let started = if args.relay {
+        let config = AgentConfig {
+            proxy_listen: format!("127.0.0.1:{}", args.proxy_port).parse()?,
+            proxy_port: u32::from(args.proxy_port),
+            dns_listen: (args.dns_port != 0)
+                .then(|| format!("127.0.0.1:{}", args.dns_port).parse())
+                .transpose()?,
+            dns_port: u32::from(args.dns_port),
+            ingress_ports: args.ingress_ports.clone(),
+            upstreams: args.upstreams.clone(),
+        };
+        let started = agent::start(
+            config,
+            Arc::new(VsockDial { cid: args.host_cid }),
+            Arc::new(VsockListen),
+        )?;
+        eprintln!(
+            "legion-guest-agent: proxy on {}, dns on {} -> host cid {}; ingress on vsock {}",
+            started.proxy_addr,
+            started
+                .dns_addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "off".into()),
+            args.host_cid,
+            port_list(&started.ingress.ports()),
+        );
+        log_ingress_failures(&started.ingress_errors);
+        if !started.upstreams.addresses().is_empty() {
+            eprintln!(
+                "legion-guest-agent: upstreams on {}",
+                address_list(&started.upstreams.addresses())
+            );
+        }
+        log_upstream_failures(&started.upstream_errors);
+        Some(started)
+    } else {
+        None
+    };
     if let Some(watch) = args.resume_watch.as_ref() {
         return run_agent_watch(watch, &|identity: &crate::identity::ResumeIdentity| {
-            let restored = started.restored(identity);
-            if restored.closed > 0 {
+            let restored = started.as_ref().map(|started| started.restored(identity));
+            let closed =
+                restored.as_ref().map_or(0, |restored| restored.closed) + crate::exec::close_all();
+            if closed > 0 {
                 eprintln!(
-                    "legion-guest-agent: restored; closed {} connection(s) the capture left dead",
-                    restored.closed
+                    "legion-guest-agent: restored; closed {closed} connection(s) the capture left \
+                     dead"
                 );
             }
-            log_ingress_failures(&restored.ingress_failed);
-            log_upstream_failures(&restored.upstream_failed);
+            if let Some(restored) = restored {
+                log_ingress_failures(&restored.ingress_failed);
+                log_upstream_failures(&restored.upstream_failed);
+            }
         });
     }
     // The relays run on their own threads; this one only keeps the process
@@ -484,6 +516,22 @@ mod tests {
             GuestUpstream::parse_arg("20003@20003").unwrap(),
             GuestUpstream::parse_arg("20003").unwrap()
         );
+        // A TAP or `none` sandbox: exec only, no relays.
+        assert_eq!(
+            parse(&args(&["guest-agent", "--no-relay", "--exec-port", "1100"])).unwrap(),
+            Invocation::Agent(AgentArgs {
+                relay: false,
+                ..AgentArgs::default()
+            })
+        );
+        let err = parse(&args(&[
+            "guest-agent",
+            "--no-relay",
+            "--ingress-port",
+            "8080",
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("drop --no-relay"), "{err}");
         let err = parse(&args(&["guest-agent", "--identity", "/dev/vdc"])).unwrap_err();
         assert!(
             err.to_string().contains("only applies with --resume-watch"),

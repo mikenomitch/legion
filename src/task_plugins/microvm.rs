@@ -233,10 +233,14 @@ impl Backend {
     }
 
     /// Whether a live exec session can be opened into a running sandbox.
-    /// The VMM paths cannot yet (that needs a vsock guest agent); Apple
-    /// `container` exposes `container exec`.
+    /// The VMM paths reach the guest agent's exec listener over vsock
+    /// (sandbox-exec plan §6.1); Apple `container` exposes `container exec`.
+    /// The Linux dev path (an OCI runtime) has neither.
     pub(crate) fn supports_exec(&self) -> bool {
-        matches!(self, Self::AppleContainer)
+        matches!(
+            self,
+            Self::AppleContainer | Self::CloudHypervisor { .. } | Self::Firecracker { .. }
+        )
     }
 }
 
@@ -621,10 +625,15 @@ pub(crate) struct GuestPayload {
     /// Volume disks init mounts before the command runs, in
     /// [`VmSpec::volume_disks`] attach order.
     pub disk_mounts: Vec<GuestDiskMount>,
-    /// A gated sandbox: init starts `/legion/legion guest-agent` (the guest
-    /// binary, copied into the rootfs) before the command, and the resolver
-    /// is the agent on loopback.
+    /// Init starts `/legion/legion guest-agent` (the guest binary, copied
+    /// into the rootfs) before the command. Every microVM gets it, for its
+    /// exec listener on vsock port 1100 (sandbox-exec plan §6.1).
     pub guest_agent: bool,
+    /// A gated sandbox: the agent also relays the guest's loopback proxy and
+    /// DNS ports to the node, and the resolver is the agent on loopback.
+    /// Off, the agent runs `--no-relay`: the guest still cannot dial the
+    /// host, and the vsock device carries host-initiated exec only.
+    pub relay: bool,
     /// A gated sandbox's advertised ports, passed to the agent as
     /// `--ingress-port`: it listens on each as a vsock port and relays the
     /// node datapath's connections to the workload on the same port.
@@ -713,33 +722,44 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
     }
 
     if payload.guest_agent {
-        // The datapath's foothold: relays 127.0.0.1:1080 and :53 to the host
-        // over vsock, and the host's ingress connections in to the workload.
-        // Without it a gated guest has loopback and nothing else,
-        // which is the fail-closed outcome the mode promises. When the guest
-        // also needs the resume watch, the agent runs it.
+        // The agent takes exec sessions on vsock port 1100. On a gated guest
+        // it is also the datapath's foothold: it relays 127.0.0.1:1080 and
+        // :53 to the host over vsock, and the host's ingress connections in
+        // to the workload. Without it a gated guest has loopback and nothing
+        // else, which is the fail-closed outcome the mode promises. When the
+        // guest also needs the resume watch, the agent runs it.
+        let mut flags = String::new();
+        if !payload.relay {
+            flags.push_str(" --no-relay");
+        }
         // Each advertised port: the agent listens on it as a vsock port and
         // relays the datapath's connections to the workload's loopback port.
-        let mut flags: String = payload
-            .ingress_ports
-            .iter()
-            .map(|port| format!(" --ingress-port {port}"))
-            .collect();
+        for port in &payload.ingress_ports {
+            flags.push_str(&format!(" --ingress-port {port}"));
+        }
         // Each upstream: the agent listens on its loopback port and VIP and
         // relays to the datapath's vsock socket for the port. The argument
-        // is digits, dots, a colon, and `=`, so it needs no quoting.
+        // is digits, dots, a colon, `@`, and `=`, so it needs no quoting.
         for upstream in &payload.upstreams {
             flags.push_str(&format!(" --upstream {}", upstream.to_arg()));
         }
         if payload.resume_watch {
             flags.push_str(" --resume-watch");
         }
+        let (started, missing) = if payload.relay {
+            (
+                "gated network and exec over vsock",
+                "the sandbox has no network and takes no exec sessions",
+            )
+        } else {
+            ("exec over vsock", "the sandbox takes no exec sessions")
+        };
         script.push_str(&format!(
             "if [ -x {GUEST_AGENT_PATH} ]; then\n\
              \x20   {GUEST_AGENT_PATH} guest-agent{flags} >/dev/console 2>&1 &\n\
-             \x20   echo \"legion: guest agent started (gated network over vsock)\"\n\
+             \x20   echo \"legion: guest agent started ({started})\"\n\
              else\n\
-             \x20   echo \"legion: guest agent missing at {GUEST_AGENT_PATH}; the sandbox has no network\" >&2\n\
+             \x20   echo \"legion: guest agent missing at {GUEST_AGENT_PATH}; {missing}\" >&2\n\
              fi\n\n"
         ));
     }
@@ -808,6 +828,11 @@ pub(crate) fn install_guest_payload(
     let env_path = legion_dir.join("env");
     std::fs::write(&env_path, render_env_file(&payload.env))
         .with_context(|| format!("write {}", env_path.display()))?;
+    // Where exec sessions start: the command's working directory.
+    if let Some(cwd) = payload.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+        let cwd_path = legion_dir.join("cwd");
+        std::fs::write(&cwd_path, cwd).with_context(|| format!("write {}", cwd_path.display()))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -819,7 +844,7 @@ pub(crate) fn install_guest_payload(
     let etc = rootfs.join("etc");
     if std::fs::create_dir_all(&etc).is_ok() {
         let _ = std::fs::write(etc.join("hostname"), format!("{hostname}\n"));
-        if payload.guest_agent {
+        if payload.relay {
             // Names resolve through the agent's relay to the node resolver.
             let _ = std::fs::write(
                 etc.join("resolv.conf"),
@@ -1321,6 +1346,7 @@ mod tests {
         let payload = GuestPayload {
             command: vec!["/bin/sh".into()],
             guest_agent: true,
+            relay: true,
             resume_watch: false,
             ..GuestPayload::default()
         };
@@ -1332,8 +1358,27 @@ mod tests {
         assert!(agent_at < command_at, "the agent starts first");
         assert!(script.contains("the sandbox has no network"));
         assert!(!script.contains("--resume-watch"));
+        assert!(!script.contains("--no-relay"));
         let plain = render_init_script(&GuestPayload::default());
         assert!(!plain.contains("guest-agent"));
+    }
+
+    /// A TAP or `none` microVM runs the agent for exec only: no relays, so
+    /// the guest still cannot dial the host (sandbox-exec plan §6.1).
+    #[test]
+    fn an_ungated_guest_runs_the_agent_for_exec_only() {
+        let script = render_init_script(&GuestPayload {
+            command: vec!["/bin/sh".into()],
+            guest_agent: true,
+            relay: false,
+            ..GuestPayload::default()
+        });
+        assert!(
+            script.contains("/legion/legion guest-agent --no-relay "),
+            "{script}"
+        );
+        assert!(script.contains("the sandbox takes no exec sessions"));
+        assert!(!script.contains("has no network"));
     }
 
     /// A gated sandbox launched for checkpoints runs one process: the agent
@@ -1392,6 +1437,7 @@ mod tests {
         let script = render_init_script(&GuestPayload {
             command: vec!["/bin/sh".into()],
             guest_agent: true,
+            relay: true,
             resume_watch: true,
             ..GuestPayload::default()
         });
@@ -1421,6 +1467,7 @@ mod tests {
         let script = render_init_script(&GuestPayload {
             command: vec!["/bin/sh".into()],
             guest_agent: true,
+            relay: true,
             ingress_ports: vec![8080, 20001],
             upstreams: upstreams.clone(),
             resume_watch: true,
@@ -1444,6 +1491,7 @@ mod tests {
             .collect();
         match legion_guest::cli::parse(&words).unwrap() {
             legion_guest::cli::Invocation::Agent(args) => {
+                assert!(args.relay);
                 assert_eq!(args.ingress_ports, vec![8080, 20001]);
                 assert_eq!(args.upstreams, upstreams);
                 assert!(args.resume_watch.is_some());
@@ -1509,6 +1557,7 @@ mod tests {
                 },
             ],
             guest_agent: false,
+            relay: false,
             resume_watch: false,
             guest_binary: None,
             resolvers: Vec::new(),
@@ -1559,6 +1608,7 @@ mod tests {
                 read_only: false,
             }],
             guest_agent: false,
+            relay: false,
             resume_watch: false,
             guest_binary: None,
             resolvers: Vec::new(),
@@ -1694,9 +1744,17 @@ mod tests {
             "/run/systemd/resolve/stub-resolv.conf",
             rootfs.path().join("etc/resolv.conf"),
         )?;
+        // A TAP guest runs the agent for exec, with no relay: its names
+        // still resolve through its bridge, not the agent.
+        let agent = rootfs.path().join("agent-binary");
+        std::fs::write(&agent, b"#!/bin/sh\n")?;
         let payload = GuestPayload {
             command: vec!["/bin/true".into()],
             resolvers: vec!["10.88.0.1".parse()?, "1.1.1.1".parse()?],
+            guest_agent: true,
+            relay: false,
+            guest_binary: Some(GuestBinary::at(agent, true)?),
+            cwd: Some("/workspace".into()),
             ..GuestPayload::default()
         };
         install_guest_payload(rootfs.path(), &payload, "legion-sbx-3")?;
@@ -1704,6 +1762,11 @@ mod tests {
         assert!(
             resolv.contains("nameserver 10.88.0.1\nnameserver 1.1.1.1\n"),
             "{resolv}"
+        );
+        // Exec sessions start where the command does.
+        assert_eq!(
+            std::fs::read_to_string(rootfs.path().join("legion/cwd"))?,
+            "/workspace"
         );
 
         let untouched = tempfile::tempdir()?;

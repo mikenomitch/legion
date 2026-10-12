@@ -188,7 +188,7 @@ registration.
       resumeTimeout = "30s",
       onResume = ["/usr/local/bin/harness", "reconnect"],
       durability = "local",
-      idle = { after = "3m", signals = ["network", "cpu"], cpuBelow = 0.02 },
+      idle = { after = "3m", signals = ["network", "cpu", "exec"], cpuBelow = 0.02 },
       onPressure = true,
     },
 
@@ -299,10 +299,10 @@ a resume runs there. It is the default, written out so a reader knows a node
 loss loses the checkpoint. See [Surviving a node loss](#surviving-a-node-loss).
 
 **`idle`** suspends the sandbox once it has been quiet for `after`. Three
-minutes suits a human who stepped away. The signals are the two a TAP-wired
-microVM can show: bytes the guest sends on its TAP (`network`) and its CPU.
-`exec` is left out because a microVM takes no exec sessions, and
-`connections` is refused for a sandbox that isn't gated. Read
+minutes suits a human who stepped away. The signals are what a TAP-wired
+microVM can show: bytes the guest sends on its TAP (`network`), its CPU, and
+open `legion exec` sessions (`exec`), so a sandbox someone has a shell in
+stays awake. `connections` is refused for a sandbox that isn't gated. Read
 [An instance never goes idle](#an-instance-never-goes-idle-or-goes-idle-too-soon)
 before you tune them. See
 [idle policy](../suspend-and-resume.md#idle-policy).
@@ -958,7 +958,7 @@ a microVM matters:
 | `network` | Bytes through the node datapath, plus bytes the guest sends on its own NIC | Bytes the guest sends on its TAP (`rx_bytes` of `/sys/class/net/lgf...`) |
 | `connections` | Open connections through the datapath: ingress, and a gated sandbox's egress | Refused at submit. The guest's outbound connections leave on its own NIC, so a quiet model call would not count |
 | `cpu` | CPU at or above `cpuBelow` of the task's `cpu` | The VMM's CPU, which is the guest's |
-| `exec` | Open `exec` sessions and actions | Never fires. A microVM takes no exec sessions, so `job run` warns when it is listed |
+| `exec` | Open `exec` sessions and actions | Open sessions over the guest agent's vsock listener |
 
 Only bytes the guest sends count. What arrives on `br0` includes broadcast
 noise that would otherwise keep every sandbox awake. Any real exchange has
@@ -982,9 +982,10 @@ failure modes follow:
   other connection it holds open). Otherwise set `after` longer than your
   longest model call, or leave `idle` off and suspend from your platform,
   which knows when a call is in flight.
-- **It suspends while someone is in a shell.** Not on a microVM: `legion
-  exec` doesn't reach the guest. A shell your platform runs over the network
-  is traffic on the TAP, which keeps it awake while it sends.
+- **It suspends while someone is in a shell.** Not with `exec` listed: an
+  open `legion exec` session keeps it awake, however quiet. A shell your
+  platform runs over the network is traffic on the TAP instead, which keeps
+  it awake only while it sends.
 
 The `hint` signal, where the workload says it is parked, is not available,
 and a spec that lists it is refused:
@@ -1136,8 +1137,6 @@ tokens refresh through a read-only bind mount at `/legion/identity`). See
   node-local storage.
 - **A refreshed token lands in a file, not in the env.** A process that read
   its token once at startup keeps the old one. See [Security](#security).
-- **No exec into a running microVM**, so `legion exec` and actions don't
-  reach the guest.
 - **A pressure suspend can be lost if the worker restarts before reporting
   it.** The node then starts the sandbox again, fresh, on its retained
   storage.

@@ -21,18 +21,21 @@
 //! or the whole RPC (the leader-forward layer), so which manager a worker
 //! talks to is a reachability choice, never a correctness one.
 //!
-//! The switch is done underneath one tonic [`Channel`]: a balance channel
-//! whose endpoint set always holds exactly the active manager. Every
+//! The switch is done underneath one tonic [`Channel`] whose connector dials
+//! whichever manager is active when it (re)connects. Every
 //! [`ManagerClient`](crate::structs::manager_client::ManagerClient) cloned
 //! from it — heartbeats, health checks, the identity issuer, edge-boot
-//! ratification — follows a failover without being rebuilt.
+//! ratification, the work stream — follows a failover without being
+//! rebuilt. Every connection is TLS naming `manager.legion`, verified
+//! against the join token's CA pin or, once the worker holds it, the
+//! cluster CA bundle (worker-plane-auth plan §6.8): the managers share the
+//! cluster CA, so the token's trust covers every manager the worker learns.
 
 use crate::prelude::*;
 use crate::worker::state::WorkerStateStore;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
-use tower::discover::Change;
 
 /// Consecutive transport failures to the active manager before the worker
 /// moves to the next one. Two rather than one so a single dropped request
@@ -109,8 +112,48 @@ struct State {
 #[derive(Debug)]
 pub struct ManagerEndpoints {
     channel: Channel,
-    changes: tokio::sync::mpsc::Sender<Change<String, Endpoint>>,
-    state: StdMutex<State>,
+    state: Arc<StdMutex<State>>,
+}
+
+/// Locks the shared state, surviving a poisoned lock.
+fn lock_state(state: &StdMutex<State>) -> std::sync::MutexGuard<'_, State> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Dials the active manager over TLS that names `manager.legion` and trusts
+/// what the join token pinned (or the bundle that replaced it).
+async fn dial_active(
+    state: Arc<StdMutex<State>>,
+) -> std::io::Result<hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>>
+{
+    let io = |err: anyhow::Error| std::io::Error::other(format!("{err:#}"));
+    let (active, seed) = {
+        let state = lock_state(&state);
+        (state.active.clone(), state.seed.clone())
+    };
+    let target = crate::cluster_tls::host_port(&active).map_err(io)?;
+    let verifier = crate::worker::plane::manager_verifier(&active)
+        .or_else(|| crate::worker::plane::manager_verifier(&seed))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "no cluster CA pin for the manager at {active}; workers reach managers \
+                     only over TLS verified against their join token's pin"
+                ),
+            )
+        })?;
+    let config = crate::cluster_tls::client_config(verifier, None).map_err(io)?;
+    let name = rustls_pki_types::ServerName::try_from(crate::cluster_tls::MANAGER_SERVER_NAME)
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    let tcp = tokio::net::TcpStream::connect(&target).await?;
+    let _ = tcp.set_nodelay(true);
+    let tls = tokio_rustls::TlsConnector::from(config)
+        .connect(name, tcp)
+        .await?;
+    Ok(hyper_util::rt::TokioIo::new(tls))
 }
 
 impl ManagerEndpoints {
@@ -125,43 +168,29 @@ impl ManagerEndpoints {
                 known.push(addr);
             }
         }
-        let (channel, changes) = Channel::balance_channel::<String>(16);
-        let endpoints = ManagerEndpoints {
-            channel,
-            changes,
-            state: StdMutex::new(State {
-                seed: seed.clone(),
-                known,
-                active: seed.clone(),
-                consecutive_failures: 0,
-                store: None,
-            }),
-        };
-        endpoints.insert(&seed)?;
-        Ok(Arc::new(endpoints))
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn endpoint(addr: &str) -> R<Endpoint> {
-        Ok(Endpoint::from_shared(addr.to_string())
-            .with_context(|| format!("invalid manager address {addr:?}"))?
+        let state = Arc::new(StdMutex::new(State {
+            seed: seed.clone(),
+            known,
+            active: seed.clone(),
+            consecutive_failures: 0,
+            store: None,
+        }));
+        // The URI is a placeholder: the connector dials the active manager.
+        let dial_state = state.clone();
+        let channel = Endpoint::from_static("http://manager.legion")
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
             .keep_alive_timeout(KEEPALIVE_TIMEOUT)
-            .keep_alive_while_idle(true))
+            .keep_alive_while_idle(true)
+            .connect_with_connector_lazy(tower::service_fn(move |_: http::Uri| {
+                dial_active(dial_state.clone())
+            }));
+        Ok(Arc::new(ManagerEndpoints { channel, state }))
     }
 
-    fn insert(&self, addr: &str) -> R<()> {
-        let endpoint = Self::endpoint(addr)?;
-        self.changes
-            .try_send(Change::Insert(addr.to_string(), endpoint))
-            .map_err(|err| anyhow!("failed switching the manager channel to {addr}: {err}"))
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        lock_state(&self.state)
     }
 
     /// The channel every manager client is built from. Follows failovers.
@@ -270,15 +299,8 @@ impl ManagerEndpoints {
             let from = std::mem::replace(&mut state.active, next.clone());
             (from, next)
         };
-        // Insert before remove, so the channel is never without an endpoint
-        // (a request in between would otherwise wait for one).
-        if let Err(err) = self.insert(&to) {
-            warn!(error = ?err, "Could not switch managers");
-            let mut state = self.lock();
-            state.active = from;
-            return None;
-        }
-        let _ = self.changes.try_send(Change::Remove(from.clone()));
+        // The channel's next (re)connect dials `to`; the failed connection
+        // is what brought us here, so it is already gone.
         warn!(
             from = %from,
             to = %to,
@@ -382,25 +404,30 @@ mod tests {
         use crate::structs::manager_client::ManagerClient;
         use crate::structs::manager_server::ManagerServer;
 
-        // Manager B: answers WhoAmI. Manager A: an address nothing listens on.
+        // Manager B: answers WhoAmI over the manager's TLS listener. Manager
+        // A: an address nothing listens on. The worker trusts the cluster CA
+        // through the token's pin, recorded for A only: it covers B too.
         let store = crate::storage::store::Store::start_storage(
             &crate::structs::config::ManagerConfigFull {
                 store_path: tempfile::tempdir()?.keep().display().to_string(),
                 ..Default::default()
             },
         )?;
-        let service = crate::manager::server::ManagerDaemonService::new(store);
+        let pin = store.ensure_mesh_ca()?.pin()?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let live = format!("http://{}", listener.local_addr()?);
+        let incoming = crate::manager::daemon::manager_incoming(&store, listener, None)?;
+        let service = crate::manager::server::ManagerDaemonService::new(store);
         tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(ManagerServer::new(service))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+                .serve_with_incoming(incoming),
         );
         let dead = {
             let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
             format!("http://{}", probe.local_addr()?)
         };
+        crate::worker::plane::trust_manager(&dead, &pin)?;
 
         let managers = ManagerEndpoints::new(&dead, vec![live.clone()])?;
         let mut client = ManagerClient::new(managers.channel());

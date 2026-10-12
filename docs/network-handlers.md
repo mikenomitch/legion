@@ -463,16 +463,20 @@ behave the same whichever one the task dials. The loopback port and
 
 | Env var | Value |
 | --- | --- |
-| `LEGION_DNS` | `127.42.<b>.1`, the allocation's resolver |
+| `LEGION_DNS` | `127.42.<b>.1`, the allocation's resolver (`127.0.0.53` for a gated allocation with no upstreams) |
 | `LEGION_UPSTREAM_HOST_<KEY>` | `<key>.svc.legion` |
 | `LEGION_UPSTREAM_VIP_<KEY>` | `<vip>:<canonical port>` |
 
-**Who gets the resolver automatically.** A `container` task's
-`/etc/resolv.conf` is generated to point at it (`search svc.legion`,
+**Who gets the resolver automatically.** Every allocation with upstreams,
+and every gated `container` or `exec` allocation, upstreams or not. A gated
+allocation without a VIP block gets its resolver at the fixed address
+`127.0.0.53` inside its namespace, which spends no VIP block. A `container`
+task's `/etc/resolv.conf` is generated to point at it (`search svc.legion`,
 `ndots:1`). An `exec` task gets `LEGION_DNS` and keeps the host's
 `/etc/resolv.conf`, in gated mode too. Legion does not generate a
 resolv.conf for `exec` tasks, so point your tool at `LEGION_DNS` to use the
-allocation's resolver. A gated `sandbox` uses the guest
+allocation's resolver; on a host whose `resolv.conf` names systemd-resolved's
+`127.0.0.53`, a gated `exec` task reaches its own resolver without that. A gated `sandbox` uses the guest
 agent's relay as its resolver (`nameserver 127.0.0.1` in the guest's
 `resolv.conf`), and the agent also listens on each upstream's VIP in the
 guest, so `<key>.svc.legion` works there too (see "Sandboxes").
@@ -666,14 +670,18 @@ private key never leaves the node. Then:
 - Workloads never hold certificates. The node attributes identity, which
   keeps a per-user sandbox's identity out of the sandbox.
 
-`legion net ca show` prints the CA certificate (never the key).
-`legion net ca rotate` replaces it in one step. A manager picks up the new
-CA within 10 seconds. A node re-issues its certificate on the next heartbeat
-after a manager's dial to its worker plane is refused for the old CA (within
-seconds of any exec, logs, or dispatch to it), and in any case at its routine
-refresh, within 8 hours. Until a node re-issues, peers on different CAs refuse
-each other on the mesh and the worker plane. They never fall back to
-plaintext.
+The mesh CA is the cluster CA, the same one behind the worker plane
+([Auth & ACLs](auth-and-acls.md#the-worker-plane)). A node's mesh
+certificate is its node certificate: the worker generates the key and the
+manager signs a CSR.
+
+`legion net ca show` prints the CA trust bundle (never a key), its pin, and
+where a rotation stands. `legion net ca rotate` rotates it in two steps that
+break no mesh connection: the new CA, cross-signed by the old one, signs at
+once, and the old one stays in every trust bundle for one certificate
+lifetime (24 hours). Every node re-issues on its next heartbeat. Peers never
+fall back to plaintext ([Rotating the cluster
+CA](auth-and-acls.md#rotating-the-cluster-ca)).
 
 ### Certificates from KV
 
@@ -751,14 +759,17 @@ certificate revocation. The 24-hour lifetime takes its place.
 
 | `mode` | Meaning | Default for |
 | --- | --- | --- |
-| `host` | host networking. Policy is cooperative (proxy env vars, upstreams, the resolver) | `container`, `exec`, `sandbox` |
-| `gated` | the workload's network namespace holds loopback and the datapath only, so a `container` or non-root `exec` task can't open a socket around it. It is not yet a full boundary: the egress proxy dials from the host and does not refuse loopback, link-local, or the node's own addresses, and CIDR rules only match IP literals, so a hostname reaches a denied range. A root `exec` task can also leave the namespace. For a `sandbox`, it is a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | — |
-| `auto` | `host` for every runtime | — |
+| `host` | host networking. Policy is cooperative (proxy env vars, upstreams, the resolver) | `exec`, `sandbox`, `container` on macOS |
+| `gated` | the workload's network namespace holds loopback and the datapath only, so a `container` or non-root `exec` task can't open a socket around it. Every destination the egress proxy dials is judged by the [host guard](#the-host-guard) and then by policy, by the address a name resolves to. A root `exec` task can leave the namespace. For a `sandbox`, it is a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | `container` on Linux |
+| `auto` (the default) | `gated` for a `container` on a Linux node, `host` for everything else | — |
 | `bridge`, `cni/<name>` | reserved for the datapath plugin, rejected at submit | — |
 
-The effective mode is resolved **at placement**. It is the task's own value,
-or the one imposed by the highest-priority matching `require` policy (`mode`
-on a policy object). A namespace is set when the task starts, so a policy
+The effective mode is resolved **at placement**, with the node in hand:
+`auto` reads the node's `os` fingerprint, so one `container` job runs gated
+on its Linux nodes and on host networking on its macOS nodes. It is the
+task's own value, or the one imposed by the highest-priority matching
+`require` policy (`mode` on a policy object). An explicit `gated` is never
+downgraded. A namespace is set when the task starts, so a policy
 that changes `mode` affects the next placement, not a running allocation.
 
 ### Gated mode
@@ -767,8 +778,9 @@ With `mode = "gated"`, the worker creates an empty network namespace for the
 allocation before it starts: `/var/run/netns/legion-<allocation>`, with
 loopback up, no other interface, and no route. It binds every datapath
 listener inside that namespace: the upstream loopback ports, the VIPs, the
-allocation's resolver at `127.42.<b>.1:53`, and an **egress proxy** at
-`127.0.0.1:1080`. A `container` joins the namespace by path (an OCI
+allocation's resolver (at `127.42.<b>.1:53` with a VIP block, else at
+`127.0.0.53:53`), an **ingress listener** for every declared port, and an
+**egress proxy** at `127.0.0.1:1080`. A `container` joins the namespace by path (an OCI
 `network` namespace entry). An `exec` task enters it with `setns` before
 exec, before dropping privileges. The worker dials out from the host
 namespace, so the listeners are the only way out.
@@ -894,8 +906,8 @@ Inside the guest, the generated init starts `legion guest-agent` before the
 task's command. It relays `127.0.0.1:1080` to host vsock port 1080 and
 `127.0.0.1:53/udp` to host port 53 (using DNS-over-TCP framing). So the same
 proxy variables and the same `resolv.conf` a gated container gets work
-unchanged. The node checks every connection, and the guest cannot bypass it
-because there is no other way out.
+unchanged. The node checks every connection (the [host guard](#the-host-guard)
+first, then policy), and the guest has no other way out.
 
 The agent also carries the other direction. For every port the task
 advertises, it listens on that vsock port in the guest and relays each
@@ -964,16 +976,20 @@ What is and is not enforced:
   proxy, the resolver, and one per declared upstream. An unbound one is
   named: `egress proxy is not bound on the guest's vsock socket <path>`, or
   `upstream db is not bound on the guest's vsock socket <path>`.
-- The agent holds two ports in a gated guest. `127.0.0.1:1080` is its egress
-  proxy relay, and host vsock ports 1080 and 53 are the egress proxy and the
-  resolver. Submit refuses an advertised port the guest would bind on 1080
-  (`task "workspace" binds network.ports "socks" on port 1080 in its guest,
-  but in a gated sandbox guest 127.0.0.1:1080 is the guest agent's egress
-  proxy`), and an upstream `localPort` of 1080 or 53 (`task "workspace"
-  connect.upstreams entry "db" sets localPort 53, but a gated sandbox's
-  upstreams are relayed to the node on vsock ports of the same number, and
-  1080 and 53 are the guest's egress proxy and resolver`). Dynamic ports
-  never collide with either.
+- The agent holds three ports in a gated guest. `127.0.0.1:1080` is its
+  egress proxy relay, guest vsock port 1100 is its exec listener (each
+  advertised port is served on the guest vsock port of the same number),
+  and host vsock ports 1080 and 53 are the egress proxy and the resolver.
+  Submit refuses an advertised port the guest would bind on 1080 (`task
+  "workspace" binds network.ports "socks" on port 1080 in its guest, but in
+  a gated sandbox guest 127.0.0.1:1080 is the guest agent's egress proxy`)
+  or on 1100 (`... but in a gated sandbox guest the node serves each port on
+  the guest vsock port of the same number, and vsock port 1100 is the guest
+  agent's exec listener`), and an upstream `localPort` of 1080 or 53 (`task
+  "workspace" connect.upstreams entry "db" sets localPort 53, but a gated
+  sandbox's upstreams are relayed to the node on vsock ports of the same
+  number, and 1080 and 53 are the guest's egress proxy and resolver`).
+  Dynamic ports never collide with any of them.
 - Upstreams reach the guest only on gated networking. A TAP-wired or
   loopback-only sandbox that declares `connect.upstreams` is placed and
   gets the env vars, but they name the guest's own loopback, where nothing
@@ -1028,6 +1044,196 @@ Requirements and limits:
 - No raw UDP and no ICMP.
 - No inbound traffic except through the datapath's ingress listeners (below).
 
+## The host guard
+
+The host guard is a fixed set of destinations no allocation may reach
+through the datapath: its own node, the cloud's link-local services, and
+other allocations' listeners. It sits **below** policy. A job's rules and
+stored policy objects can't widen it; only the node's operator can, in the
+worker config.
+
+| Class | Addresses | Why |
+| --- | --- | --- |
+| loopback | `127.0.0.0/8`, `::1` | the node's own services: Legion's ports, other allocations' upstreams and VIPs |
+| unspecified | `0.0.0.0/8`, `::` | the same services by another name |
+| this node | every address on the node's interfaces, re-read every heartbeat | the same services by the node's IP |
+| link-local | `169.254.0.0/16`, `fe80::/10` | AWS, GCP, Azure, OCI, and DigitalOcean metadata, ECS task metadata (`169.254.170.2`), the VPC resolver |
+| cloud metadata | `fd00:ec2::254`, `100.100.100.200` | AWS IPv6 metadata, Alibaba Cloud metadata |
+| `hostGuard.deny` | operator CIDRs | anything else the operator wants treated like metadata |
+
+IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1`) are judged as the IPv4
+address they map.
+
+**Where it applies.** Every connection the datapath dials to a destination
+the allocation named:
+
+- the gated egress proxy, on all three paths (HTTP `CONNECT`, absolute-URI
+  HTTP, SOCKS5);
+- external upstreams (`to = "tcp://…"`, `tls://`, `http://`, `https://`), in
+  L4 and HTTP mode;
+- `proxy` handler targets, on egress and ingress. A handler that points at
+  a node-local proxy (`target = "127.0.0.1:15001"`) needs a
+  `hostGuard.allow` entry for that port; until then its health reports
+  `host-guard: 127.0.0.1 is loopback; allocations may not reach it`.
+
+Service upstreams are not judged: their endpoints come from the service
+catalog, which Legion fills, not from the allocation. Neither are `authz`
+handler calls, which the worker makes itself with request facts, never task
+bytes, and whose answer is a verdict the task never sees.
+
+**Resolve once, judge, dial what was judged.** A hostname is resolved once,
+every address it resolves to is judged, and the dial goes only to an address
+that passed. Nothing resolves the name again between the verdict and the
+connect, so `localhost`, `2130706433`, `0177.0.0.1`, a public name that
+resolves to `169.254.169.254`, and a name that rebinds between two lookups
+are all refused. A name that resolves to a mix of addresses dials only the
+ones that passed. CIDR rules in policy are matched against the same resolved
+addresses, so a hostname can't reach a range a CIDR rule denies.
+
+**Order of checks** on every gated listener: the edge-boot `boot` gate, then
+the host guard, then `policy-pending`, then the egress chain. A host-guard
+denial is final; no policy can turn it into an allow.
+
+**What a task sees** is the ordinary denial shape with source `host-guard`:
+
+```console
+$ curl -sS -x $HTTP_PROXY http://169.254.169.254/latest/meta-data/   # inside a gated task
+curl: (56) CONNECT tunnel failed, response 403
+
+HTTP/1.1 403 Forbidden
+Legion-Denied-By: host-guard
+Legion-Denied-Reason: 169.254.169.254 is link-local (cloud metadata); allocations may not reach it
+```
+
+An L4 upstream closes the connection instead. Either way the denial is
+reported on the next heartbeat as a `net.denied` event with
+`source = "host-guard"`, and `legion net policy test` explains it before the
+chain:
+
+```console
+$ legion net policy test web --to http://instance-data.ec2.internal/
+✗ deny host-guard: instance-data.ec2.internal resolves to 169.254.169.254 (link-local); allocations may not reach it
+  Hint: the host guard is set on the worker (hostGuard.allow), not in job policy
+```
+
+`net policy test` runs on the manager, so it judges the built-in classes
+(and resolves names from the manager). A node's own addresses and its
+`hostGuard` entries are judged on the worker; a `net.denied` event from the
+node is the authority. `legion net doctor` lists the guard as an
+informational step for every allocation whose egress proxy is up.
+
+**Operator overrides**, in the worker-type config, for the rare host service
+an allocation should reach on purpose:
+
+```nickel
+hostGuard = {
+  # Opened on purpose: the node exporter, for a metrics-scraping job.
+  allow = ["10.0.1.7:9100"],
+  # Extra destinations to treat like metadata.
+  deny = ["192.0.2.10/32"],
+},
+```
+
+`allow` takes `ip:port` or `cidr:port` (`[fd00::7]:9100` for IPv6) and
+nothing broader, so an override opens one service and not the node. The
+built-in classes can't be removed, only punched through one port at a time.
+An invalid entry fails manager startup with the entry named. A bare address
+in `allow` is refused for the same reason.
+
+**Limits.**
+
+- The datapath guard judges what the datapath dials. A `host`-mode task dials
+  the network directly; the [kernel guard](#the-host-guard-in-the-kernel)
+  below covers it on Linux nodes that can run it.
+- A root `exec` task in `gated` mode can `setns` back into the host
+  namespace.
+- The guard judges destinations, not the node's own outbound traffic:
+  artifact fetches, `authz` webhooks, and the worker's own calls to the
+  manager are not judged.
+
+### The host guard in the kernel
+
+A `host`-mode task (an `exec` task, a container with `network.mode =
+"host"`) never passes through the datapath, so on Linux the worker also
+installs one `nftables` table, `inet legion_host_guard`, that applies a
+floor to every socket an allocation opens. It matches sockets by the
+allocation's cgroup leaf (`<cgroupParent>/{share,reserve}/legion-<alloc>`)
+in the output hook and drops:
+
+| Destination | Why |
+| --- | --- |
+| `169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200` | the cloud metadata service |
+| `hostGuard.deny` entries | operator additions |
+| Legion's ports on any local address: the worker plane, and the manager's API, exec, and telemetry ports when the manager shares the node | the node's control plane |
+| `127.42.0.0/16` and every allocation's upstream loopback ports | other allocations' datapath listeners |
+
+An allocation keeps its own VIP block and upstream ports, and
+`hostGuard.allow` entries are accepted first. A dropped `connect()` fails at
+once with `EPERM` ("Operation not permitted"), not a timeout. Each allocation
+has its own chain with its own counters. The worker reads them every
+heartbeat and reports new drops as `net.denied` events with source
+`host-guard`, the class as the destination (`cloud metadata`, `a Legion
+control port`, `another allocation's datapath`), and `dropped in the kernel`
+in the reason, so `legion net doctor` and the event stream name the cause.
+
+The worker owns the table: it replaces it atomically whenever the set of
+allocations changes (`nft -f` with an add-delete-add transaction) and needs
+no new dependency, only the `nft` binary. Every task gets a cgroup leaf
+where the guard runs, even with `resourceEnforcement.enabled = false`: the
+leaf then carries no limits, only the label the guard matches.
+
+Whether a node runs it is the `hostGuard` node attribute, shown by
+`legion node info`:
+
+```console
+$ legion node info wkr-1
+Node ID: wkr-1
+Worker plane   https://10.0.1.7:4848
+Host guard     active (nftables)
+```
+
+A node that cannot run it says why, logs a `WARN` at start, and still runs
+host-mode tasks, because host mode is the explicit trust opt-in:
+
+```text
+Host guard     unavailable (no cgroup v2 unified hierarchy at /sys/fs/cgroup)
+```
+
+**What it does not cover.**
+
+- A task that is root on the host with `CAP_NET_ADMIN`, which is any `exec`
+  task without a `user`, can delete the table.
+- Other daemons on the node's addresses, except Legion's own ports. Host
+  mode is host networking; the guard keeps Legion's control plane, the
+  metadata service, and other allocations' listeners out of reach, not
+  every service an operator chose to run.
+- Nodes without the cgroup v2 unified hierarchy (hybrid or v1-only hosts),
+  without `nft`, or where the worker is not root.
+- macOS. Apple `container` runs each container in its own VM, and `exec`
+  tasks there are host processes.
+
+### Cloud metadata
+
+The cloud instance metadata service (`169.254.169.254`, `fd00:ec2::254`,
+`100.100.100.200`) serves the instance's role credentials to anyone who can
+reach it. The host guard refuses it for every connection the datapath
+dials, so a gated task cannot reach it through Legion. A `host`-mode task's
+traffic does not pass through Legion; on Linux nodes running the
+[kernel guard](#the-host-guard-in-the-kernel) it is dropped there instead.
+
+As defense in depth on AWS, require IMDSv2 and set the hop limit to 1, so a
+token request from inside a container's network namespace never gets an
+answer even if something routes it:
+
+```console
+$ aws ec2 modify-instance-metadata-options --instance-id i-0123456789abcdef0 \
+    --http-tokens required --http-put-response-hop-limit 1
+```
+
+GCP and Azure require a `Metadata-Flavor: Google` or `Metadata: true`
+header, which a browser-style SSRF can't set but a task can. Grant each
+node's instance role only what the worker itself needs.
+
 ## The datapath across worker restarts
 
 Tasks survive a worker restart, because the worker re-adopts their processes
@@ -1079,9 +1285,12 @@ network = {
 - **The datapath owns the advertised port.** The node's datapath binds
   `LEGION_PORT_HTTP` as consumers see it (the port in the catalog and in
   `LEGION_UPSTREAM_*` feeds) on the host. The task gets a **private twin**
-  port from the same dynamic range as its own `LEGION_PORT_HTTP` (a
-  container's port publish uses the twin too), so nothing in the task
-  changes. The task cannot take the advertised port back, because the bind
+  as its own `LEGION_PORT_HTTP` (a container's port publish uses the twin
+  too), so nothing in the task changes. On the host the twin comes from the
+  same dynamic range. Inside a gated namespace, which has its own ports, the
+  twin is the port's `to`, or the advertised port number itself when `to` is
+  unset, so an image that listens on a fixed port (`{ name = "pg", to =
+  5432 }`) needs no change. The task cannot take the advertised port back, because the bind
   fails with the address already in use. This makes ingress enforceable on
   every runtime and platform, not only on gated Linux.
 - **Every accepted connection is checked** against the ingress chain using
@@ -1095,6 +1304,11 @@ network = {
   proxied per request in HTTP mode.
 - **Gated allocations fail closed** on ingress the same way as on egress.
   While the policy is pending or the boot gate is shut, nothing is accepted.
+- **Every gated allocation gets ingress listeners**, chain or not, because
+  its namespace has no other way in. Without a chain the listener accepts
+  every peer, so a gated container's service is reachable from other nodes,
+  from its consumers, and from its health checks exactly as on host
+  networking.
 - **Health checks go through the chain**, because the checker dials the
   advertised port. A chain that denies everything also denies the checker.
   Allow `cidr = "127.0.0.0/8"` for a node-local checker. `legion net doctor`
@@ -1168,8 +1382,9 @@ Limits:
 - An ingress `proxy` hop hands the connection to your proxy, which cannot
   reach a port inside a sandbox guest, as with a gated task's private port.
 - In a gated guest, `127.0.0.1:1080` belongs to the agent's egress proxy
-  relay, so the workload cannot serve on port 1080, and submit refuses an
-  advertised port that would bind it there.
+  relay and guest vsock port 1100 to its exec listener, so the workload
+  cannot serve on port 1080 or 1100, and submit refuses an advertised port
+  that would bind either.
 - Firecracker 1.17 fixes host-initiated vsock connections that stop
   receiving after a VM is paused and resumed in place (Firecracker #6100),
   which a live `snapshot create --memory` or a fork does to the origin.
@@ -1350,16 +1565,18 @@ This section lists what that covers and what it does not.
   upstream and to names resolved through the allocation's resolver. A
   process that dials a raw address bypasses it. `mode = "gated"` (Linux,
   `container` and `exec`) closes that gap, because the namespace has no
-  route except Legion's listeners. But the egress proxy dials from the host
-  and does not refuse loopback, link-local (including the cloud metadata
-  service), or the node's own addresses, CIDR rules match only IP literals
-  (a hostname reaches a denied range), and a root `exec` task can leave the
-  namespace. Don't rely on `gated` to contain untrusted code yet. On macOS, egress stays cooperative, and
+  route except Legion's listeners, and every destination those listeners
+  dial is judged by the [host guard](#the-host-guard) before policy. A root
+  `exec` task can still leave the namespace. A host-mode task's policy stays
+  cooperative, but the [kernel guard](#the-host-guard-in-the-kernel) keeps it
+  off the node's Legion ports, the metadata service, and other allocations'
+  listeners where it runs. On macOS, egress stays cooperative, and
   there are no VIPs, per-allocation resolvers, or gated namespaces. A gated
   `sandbox` is captured over vsock, upstreams included. That path is
   implemented and unit-tested but not exercised on a real VMM in CI. A
   TAP-wired or loopback-only sandbox cannot reach its upstreams. `auto`
-  resolves to `host` for every runtime, so set `gated` explicitly.
+  resolves to `gated` for containers on Linux nodes and to `host` for
+  everything else, so set `gated` explicitly for an `exec` task.
 - **Ingress is enforced everywhere it applies.** The datapath owns the
   advertised port and the task binds a private twin, on every runtime and
   platform. A gated or TAP-wired sandbox's ports are always fronted, over

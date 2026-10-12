@@ -37,6 +37,14 @@ pub fn config() -> Command {
                         .required(false),
                 )
                 .arg(
+                    Arg::new("instance")
+                        .long("instance")
+                        .value_name("ID")
+                        .conflicts_with("alloc")
+                        .help("Target an instance: its current allocation, across resumes")
+                        .required(false),
+                )
+                .arg(
                     Arg::new("param")
                         .long("param")
                         .help("Parameter as key=value (repeatable)")
@@ -153,10 +161,15 @@ async fn run(matches: &ArgMatches) -> R<()> {
 
     let mut client = connect_manager_client().await?;
 
+    let instance_id = matches
+        .get_one::<String>("instance")
+        .cloned()
+        .unwrap_or_default();
     let allocation_id = match matches.get_one::<String>("alloc") {
         Some(raw) => raw
             .parse::<i64>()
             .map_err(|_| invalid(format!("invalid allocation id `{raw}`")))?,
+        None if !instance_id.is_empty() => 0,
         None => newest_running_allocation(&mut client, &job, format).await?,
     };
 
@@ -169,6 +182,8 @@ async fn run(matches: &ArgMatches) -> R<()> {
         tty,
         winsize: None,
         bearer_token: String::new(),
+        instance_id,
+        exec_ticket: String::new(),
     };
 
     run_action_session(&mut client, start, want_stdin, tty, format).await

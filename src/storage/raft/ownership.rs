@@ -176,6 +176,7 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("acl_token", Owner::Lane(Lane::Control)),
     ("acl_user", Owner::Lane(Lane::Control)),
     ("join_token", Owner::Lane(Lane::Control)),
+    ("exec_key", Owner::Lane(Lane::Control)),
     // Boot tickets are capabilities an operator (or a platform's minter)
     // hands out, like join tokens — but they are SPENT by ratification,
     // which is a scheduler-lane plan apply. They live on the scheduler lane

@@ -564,6 +564,13 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     // (an idle signal a microVM cannot see, an identity refresh that reboots
     // the guest). `job run` prints the same lines.
     warnings.extend(crate::structs::suspend::sandbox_submit_warnings(&config));
+    // Stored policy objects are invisible here; `job plan` and `job run`
+    // count them.
+    warnings.extend(crate::structs::network::gated_egress_warnings(
+        &config,
+        |_| false,
+    ));
+    warnings.extend(crate::task_plugins::container_security_warnings(&config));
 
     if format.is_json() {
         output::print_success(&json!({
@@ -1910,6 +1917,9 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         let allocations = reply.allocations;
         if !reply.message.is_empty() {
             println!("{}", reply.message);
+        }
+        for warning in &reply.warnings {
+            println!("warning: {warning}");
         }
         // One line per placement that carries fallback candidates: the
         // ranked list the apply walk may bind instead of the first choice

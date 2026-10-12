@@ -32,6 +32,10 @@ defaults:
 
 Set `enabled = false` to treat `resources` as scheduling estimates only. Do
 that for a pool whose jobs declare rough numbers you don't want enforced yet.
+Where the [kernel host guard](network-handlers.md#the-host-guard-in-the-kernel)
+runs, tasks still get their `legion/share/legion-<alloc>` leaf with
+enforcement off, because the guard matches sockets by it, but no limit,
+cpuset, or controller is written.
 
 Requirements:
 

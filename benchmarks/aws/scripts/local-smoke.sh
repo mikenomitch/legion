@@ -79,7 +79,11 @@ cat >"$WORK/manager/config.ncl" <<EOF
 EOF
 # exec so $! is the manager itself, not a wrapper subshell — cleanup
 # must kill the real process or failed runs leak a manager on :4747.
-(cd "$WORK/manager" && exec "$LEGION" start manager -c config.ncl) >"$WORK/manager.log" 2>&1 &
+# ACLs are on by default: the manager mints its management token into
+# $LEGION_DATA_DIR/bootstrap-token at first start. LEGION_TOKEN_FILE keeps it
+# from also landing in the developer's ~/.legion/token.
+(cd "$WORK/manager" && LEGION_DATA_DIR="$WORK/manager" LEGION_TOKEN_FILE="$WORK/cli-token" \
+    exec "$LEGION" start manager -c config.ncl) >"$WORK/manager.log" 2>&1 &
 MANAGER_PID=$!
 export LEGION_ADDR="http://127.0.0.1:4747"
 
@@ -96,6 +100,8 @@ curl -fsS -m 2 "http://127.0.0.1:4749/readyz" >/dev/null || {
     echo "manager never became ready" >&2
     exit 1
 }
+LEGION_TOKEN=$(cat "$WORK/manager/bootstrap-token")
+export LEGION_TOKEN
 
 TOKEN=$("$LEGION" join-token create --type default -j | jq -r '.data.token')
 [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || {

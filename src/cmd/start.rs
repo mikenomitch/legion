@@ -106,7 +106,7 @@ pub fn config() -> Command {
                 .requires("simulate")
                 .help("Registration ramp in nodes/second (default: 100)"),
         )
-        .arg(advertise_addr_arg())
+        .arg(crate::cmd::join::advertise_addr_arg())
         .arg(
             Arg::new("sim-no-work-stream")
                 .long("sim-no-work-stream")
@@ -165,11 +165,11 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 let opts = simulate_options(*count, arg_matches)?;
                 return run_simulated_workers(token, opts).await;
             }
-            if let Some(addr) = arg_matches.get_one::<String>("advertise-addr") {
-                crate::worker::plane::set_advertise_addr_flag(addr);
-            }
             let name = arg_matches.get_one::<String>("name").map(String::as_str);
-            run_worker(token, name).await
+            let advertise = arg_matches
+                .get_one::<String>("advertise-addr")
+                .map(String::as_str);
+            run_worker(token, name, advertise).await
         }
         Some(("gateway", arg_matches)) => {
             let listen = arg_matches
@@ -260,27 +260,15 @@ fn simulate_options(count: usize, arg_matches: &ArgMatches) -> R<SimulateOptions
             .get_one::<f64>("register-rate")
             .copied()
             .unwrap_or(defaults.register_rate),
-        advertise_addr: arg_matches
+        advertise_host: arg_matches
             .get_one::<String>("advertise-addr")
             .cloned()
-            .or(defaults.advertise_addr),
+            .or(defaults.advertise_host),
+        identity_dir: None,
         checkpoints: arg_matches.get_flag("sim-checkpoints"),
         observer: None,
         work_stream: !arg_matches.get_flag("sim-no-work-stream"),
     })
-}
-
-/// `--advertise-addr` for `legion start worker` and `legion join`: the host
-/// (or `host:port`) managers and routers dial for this worker's plane.
-pub(crate) fn advertise_addr_arg() -> Arg {
-    Arg::new("advertise-addr")
-        .long("advertise-addr")
-        .value_name("HOST[:PORT]")
-        .help(
-            "Address managers dial for this worker's plane (mTLS, port 4848 by default). \
-             Default: LEGION_WORKER_ADVERTISE_ADDR, else the local address of the route to the \
-             manager",
-        )
 }
 
 fn config_path_arg() -> Arg {

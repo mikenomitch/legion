@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use legion::manager::scheduler::{PlanMode, Scheduler};
 use legion::manager::server::ManagerDaemonService;
 use legion::manager::telemetry::{render_worker, worker_metrics};
+use legion::manager::worker_plane::WorkerPlane;
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
 use legion::structs::{
-    config::ManagerConfigFull, manager_server::ManagerServer, worker_client::WorkerClient,
-    GetTaskLogsRequest, JobConfig, PostWorkRequest, Submission, TaskAllocation, TaskConfig,
-    TaskCount, WorkerConfig,
+    config::ManagerConfigFull, manager_server::ManagerServer, GetTaskLogsRequest, JobConfig,
+    PostWorkRequest, Submission, TaskAllocation, TaskConfig, TaskCount, WorkerConfig,
 };
 use legion::worker::simulate::{launch_simulated_fleet, SimFleetRun, SimulateOptions};
 use tempfile::TempDir;
@@ -43,13 +43,15 @@ fn setup_store(dir: &TempDir) -> R<Store> {
     Ok(store)
 }
 
-/// Serve a real manager service on an ephemeral loopback port.
+/// Serve a real manager service on an ephemeral loopback port, on the same
+/// listener a manager uses: TLS with the cluster certificate for workers,
+/// plaintext for everything else.
 async fn serve_manager(store: &Store) -> R<(String, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
     let service = ManagerServer::new(ManagerDaemonService::new(store.clone()));
+    let incoming = legion::manager::daemon::manager_incoming(store, listener, None)?;
     let handle = tokio::spawn(async move {
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         if let Err(err) = tonic::transport::Server::builder()
             .add_service(service)
             .serve_with_incoming(incoming)
@@ -93,17 +95,35 @@ fn write_profiles(dir: &TempDir) -> R<String> {
         .to_string())
 }
 
-async fn launch_fleet(dir: &TempDir, manager_addr: String, count: usize) -> R<SimFleetRun> {
+/// The cluster CA pin a join token for `store`'s cluster carries.
+fn ca_pin(store: &Store) -> R<String> {
+    store.ensure_mesh_ca()?.pin()
+}
+
+async fn launch_fleet(
+    dir: &TempDir,
+    store: &Store,
+    manager_addr: String,
+    count: usize,
+) -> R<SimFleetRun> {
     let opts = SimulateOptions {
         count,
         profiles_path: Some(write_profiles(dir)?),
         name_prefix: "sim-it".into(),
         ready_after: Duration::ZERO,
         register_rate: 1000.0,
-        advertise_addr: Some("127.0.0.1".into()),
+        advertise_host: Some("127.0.0.1".into()),
+        identity_dir: Some(dir.path().join("fleet-identity")),
         ..Default::default()
     };
-    launch_simulated_fleet(manager_addr, "default".into(), None, opts).await
+    launch_simulated_fleet(
+        manager_addr,
+        "default".into(),
+        None,
+        Some(ca_pin(store)?),
+        opts,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -112,7 +132,7 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
     let store = setup_store(&dir)?;
     let (manager_addr, _manager) = serve_manager(&store).await?;
 
-    let fleet = launch_fleet(&dir, manager_addr, 8).await?;
+    let fleet = launch_fleet(&dir, &store, manager_addr, 8).await?;
     wait_until("all 8 sim nodes registered", || fleet.registered() == 8).await;
 
     // Profile-weighted fleet shape and attrs, as the manager sees them.
@@ -219,7 +239,7 @@ async fn simulated_fleet_feeds_the_worker_metric_registry() -> R<()> {
     let registrations_before = metrics.simulated_registrations_total.get(&["ok"]);
     let heartbeats_before = metrics.heartbeats_total.get(&["ok"]);
 
-    let fleet = launch_fleet(&dir, manager_addr, 4).await?;
+    let fleet = launch_fleet(&dir, &store, manager_addr, 4).await?;
     wait_until("fleet registered", || fleet.registered() == 4).await;
 
     assert!(
@@ -271,46 +291,38 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
     let store = setup_store(&dir)?;
     let (manager_addr, _manager) = serve_manager(&store).await?;
 
-    let fleet = launch_fleet(&dir, manager_addr, 4).await?;
+    let fleet = launch_fleet(&dir, &store, manager_addr, 4).await?;
     wait_until("fleet registered", || fleet.registered() == 4).await;
 
-    // The stub is a real mTLS worker plane: every node advertises it and
-    // names the fleet identity (its first node) as the certificate to
-    // verify, and managers dial it through the one worker-plane factory.
-    let node = store.get_node("sim-it-web-0")?;
-    assert!(fleet.worker_address().starts_with("https://127.0.0.1:"));
-    assert_eq!(node.config_attrs["workerPlaneName"], json!("sim-it-util-0"));
-    let target = legion::manager::worker_plane::target(&store, &node)
-        .map_err(|err| anyhow::anyhow!("{err}"))?;
-    let mut worker = target.client.clone();
-
     // Push dispatch (the manager's PostWork path) routes on node_id. The
-    // fleet certificate is issued once the identity node registers, so
-    // retry until the listener serves.
-    let push = PostWorkRequest {
-        allocation: Some(TaskAllocation {
-            provisional: None,
-            allocation_id: 999,
-            node_id: "sim-it-web-0".into(),
-            ..TaskAllocation::default()
-        }),
-    };
+    // manager dials the fleet over mTLS, verifying its fleet certificate.
+    let node = store.get_node("sim-it-web-0")?;
+    let mut worker = WorkerPlane::global()
+        .client(&store, &node)
+        .map_err(|status| anyhow::anyhow!("{status}"))?;
     let deadline = Instant::now() + DEADLINE;
-    loop {
-        match worker.post_work(push.clone()).await {
-            Ok(_) => break,
-            Err(status)
-                if status.code() == tonic::Code::Unavailable && Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(status) => {
-                return Err(anyhow::anyhow!(
-                    "push dispatch to a sim node must be accepted: {status}"
-                ))
-            }
-        }
+    while worker
+        .get_task_logs(GetTaskLogsRequest::default())
+        .await
+        .is_err_and(|status| status.code() != tonic::Code::Unimplemented)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "fleet listener never served mTLS"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    worker
+        .post_work(PostWorkRequest {
+            allocation: Some(TaskAllocation {
+                provisional: None,
+                allocation_id: 999,
+                node_id: "sim-it-web-0".into(),
+                ..TaskAllocation::default()
+            }),
+        })
+        .await
+        .context("push dispatch to a sim node must be accepted")?;
     wait_until("pushed allocation acked", || fleet.acked_allocations() >= 1).await;
 
     // Unknown node → NotFound, so a misrouted dispatch is loud.
@@ -339,18 +351,23 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
 
     // The stub enforces the same caller classes as a real worker: a client
     // that trusts the CA but presents no manager certificate is refused.
-    let ca = store
-        .mesh_ca()?
-        .context("the fleet's certificate created the CA")?;
+    let ca = store.ensure_mesh_ca()?;
     let tls = tonic::transport::ClientTlsConfig::new()
-        .ca_certificate(tonic::transport::Certificate::from_pem(&ca.cert_pem))
-        .domain_name(legion::manager::mesh_ca::node_dns_name("sim-it-util-0"));
+        .ca_certificate(tonic::transport::Certificate::from_pem(ca.bundle_pem()))
+        .domain_name(legion::manager::mesh_ca::fleet_dns_name("sim-it"));
     let anonymous = tonic::transport::Endpoint::from_shared(fleet.worker_address().to_string())?
         .tls_config(tls)?
         .connect()
         .await?;
-    let status = WorkerClient::new(anonymous)
-        .post_work(push)
+    let status = legion::structs::worker_client::WorkerClient::new(anonymous)
+        .post_work(PostWorkRequest {
+            allocation: Some(TaskAllocation {
+                provisional: None,
+                allocation_id: 999,
+                node_id: "sim-it-web-0".into(),
+                ..TaskAllocation::default()
+            }),
+        })
         .await
         .expect_err("dispatch without a manager certificate must be refused");
     assert_eq!(status.code(), tonic::Code::Unauthenticated);

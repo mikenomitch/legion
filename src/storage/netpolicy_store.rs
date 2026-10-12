@@ -172,26 +172,108 @@ impl Store {
     }
 }
 
-/// The cluster's mesh CA (`net_mesh_ca`), PEM-encoded.
+/// The cluster CA (`net_mesh_ca`), PEM-encoded. It signs node, fleet, and
+/// manager certificates (`crate::manager::mesh_ca`).
 #[derive(Debug, Clone)]
 pub struct MeshCa {
+    /// The CA that signs now.
     pub cert_pem: String,
     pub key_pem: String,
     pub created_at: String,
+    /// The CA that signed before the last rotation, still trusted until
+    /// `rotated_at` plus one certificate lifetime.
+    pub previous_cert_pem: Option<String>,
+    /// The signing CA cross-signed by the previous CA, appended to chains
+    /// while the previous CA is still trusted.
+    pub cross_cert_pem: Option<String>,
+    /// When the last rotation happened (RFC 3339).
+    pub rotated_at: Option<String>,
+}
+
+/// Where a cluster CA rotation stands, for `legion net ca show`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaRotationPhase {
+    /// One CA, trusted and signing.
+    Stable,
+    /// The new CA signs; the previous one stays trusted until `until`.
+    Overlap { until: OffsetDateTime },
+}
+
+impl MeshCa {
+    /// The rotation phase at `now`.
+    pub fn phase(&self, now: OffsetDateTime) -> CaRotationPhase {
+        let (Some(_), Some(rotated_at)) = (&self.previous_cert_pem, &self.rotated_at) else {
+            return CaRotationPhase::Stable;
+        };
+        let Ok(rotated_at) = OffsetDateTime::parse(rotated_at, &Rfc3339) else {
+            return CaRotationPhase::Stable;
+        };
+        let until = rotated_at
+            + time::Duration::try_from(crate::manager::mesh_ca::CA_ROTATION_OVERLAP)
+                .unwrap_or(time::Duration::DAY);
+        if now < until {
+            CaRotationPhase::Overlap { until }
+        } else {
+            CaRotationPhase::Stable
+        }
+    }
+
+    fn in_overlap(&self) -> bool {
+        matches!(
+            self.phase(OffsetDateTime::now_utc()),
+            CaRotationPhase::Overlap { .. }
+        )
+    }
+
+    /// The trust bundle: the signing CA, then the previous CA while it is
+    /// still trusted. Every holder trusts exactly this set.
+    pub fn bundle_pem(&self) -> String {
+        match (&self.previous_cert_pem, self.in_overlap()) {
+            (Some(previous), true) => format!("{}{previous}", self.cert_pem),
+            _ => self.cert_pem.clone(),
+        }
+    }
+
+    /// What to append to a leaf this CA signs: the cross-signed CA while the
+    /// previous CA is still trusted, so holders that have not refreshed
+    /// their bundle verify the new chain. Empty outside a rotation.
+    pub fn chain_suffix(&self) -> String {
+        match (&self.cross_cert_pem, self.in_overlap()) {
+            (Some(cross), true) => cross.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// The CA certificates a manager sends after its server certificate, so
+    /// a worker holding only its join token's pin can find the pinned CA in
+    /// the handshake (`cluster_tls::PinnedManagerVerifier`): the cross
+    /// certificate, then every trusted CA.
+    pub fn server_chain_suffix(&self) -> String {
+        format!("{}{}", self.chain_suffix(), self.bundle_pem())
+    }
+
+    /// The pin of the signing CA, which new join tokens carry.
+    pub fn pin(&self) -> R<String> {
+        crate::cluster_tls::ca_pin_pem(&self.cert_pem)
+    }
 }
 
 impl Store {
-    /// The mesh CA, if one has been created.
+    /// The cluster CA, if one has been created.
     pub fn mesh_ca(&self) -> R<Option<MeshCa>> {
         let conn = self.read_connection()?;
         conn.query_row(
-            "SELECT cert_pem, key_pem, created_at FROM net_mesh_ca WHERE id = 1;",
+            "SELECT cert_pem, key_pem, created_at, previous_cert_pem, cross_cert_pem, rotated_at
+             FROM net_mesh_ca WHERE id = 1;",
             [],
             |row| {
                 Ok(MeshCa {
                     cert_pem: row.get(0)?,
                     key_pem: row.get(1)?,
                     created_at: row.get(2)?,
+                    previous_cert_pem: row.get(3)?,
+                    cross_cert_pem: row.get(4)?,
+                    rotated_at: row.get(5)?,
                 })
             },
         )
@@ -199,7 +281,7 @@ impl Store {
         .map_err(Into::into)
     }
 
-    /// The mesh CA, created on first use. Generation happens *before* the
+    /// The cluster CA, created on first use. Generation happens *before* the
     /// replicated write so every manager applies the same bytes; a race
     /// between two first callers is settled by `INSERT OR IGNORE` and the
     /// loser reads back the winner's CA.
@@ -214,6 +296,9 @@ impl Store {
             cert_pem,
             key_pem,
             created_at,
+            previous_cert_pem: None,
+            cross_cert_pem: None,
+            rotated_at: None,
         };
         self.replicated(Lane::Control, "ensure_mesh_ca", move |s| {
             s.ensure_mesh_ca_apply(candidate.clone())
@@ -232,28 +317,53 @@ impl Store {
             .ok_or_else(|| anyhow::anyhow!("mesh CA row missing after insert"))
     }
 
-    /// Replace the mesh CA. Every node re-issues its certificate on its
-    /// next refresh; peers still on the old CA are refused until they do.
-    /// An operator action (`legion net ca rotate`).
+    /// Rotate the cluster CA (`legion net ca rotate`): generate a new CA,
+    /// cross-sign it with the current one, and sign with it from now on.
+    /// The current CA becomes `previous` and stays in every holder's trust
+    /// bundle for one certificate lifetime, so no connection between a
+    /// manager and a worker breaks during the overlap (plan §6.9). A second
+    /// rotation inside an overlap starts a new overlap from the CA that was
+    /// signing.
     #[instrument(err, skip_all)]
     pub fn rotate_mesh_ca(&self) -> R<MeshCa> {
+        let current = self.ensure_mesh_ca()?;
         let (cert_pem, key_pem) = crate::manager::mesh_ca::generate_ca()?;
-        let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let cross_cert_pem = crate::manager::mesh_ca::cross_sign(
+            &cert_pem,
+            &key_pem,
+            &current.cert_pem,
+            &current.key_pem,
+        )?;
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let next = MeshCa {
             cert_pem,
             key_pem,
-            created_at,
+            created_at: now.clone(),
+            previous_cert_pem: Some(current.cert_pem),
+            cross_cert_pem: Some(cross_cert_pem),
+            rotated_at: Some(now),
         };
         self.replicated(Lane::Control, "rotate_mesh_ca", move |s| {
             let conn = s.write_connection()?;
             conn.execute(
-                "INSERT INTO net_mesh_ca (id, cert_pem, key_pem, created_at)
-                 VALUES (1, ?1, ?2, ?3)
+                "INSERT INTO net_mesh_ca
+                    (id, cert_pem, key_pem, created_at, previous_cert_pem, cross_cert_pem, rotated_at)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET
                     cert_pem = excluded.cert_pem,
                     key_pem = excluded.key_pem,
-                    created_at = excluded.created_at;",
-                params![next.cert_pem, next.key_pem, next.created_at],
+                    created_at = excluded.created_at,
+                    previous_cert_pem = excluded.previous_cert_pem,
+                    cross_cert_pem = excluded.cross_cert_pem,
+                    rotated_at = excluded.rotated_at;",
+                params![
+                    next.cert_pem,
+                    next.key_pem,
+                    next.created_at,
+                    next.previous_cert_pem,
+                    next.cross_cert_pem,
+                    next.rotated_at
+                ],
             )?;
             Ok(next.clone())
         })
