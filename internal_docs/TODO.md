@@ -4091,6 +4091,12 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Actions: spec schema, `ListJobActions`, server-side render and param
       validation, the `action` ACL resource, `legion action list|run`
 - [x] Actions UI, MCP tools, and docs
+- [x] The exec WebSocket follows `server.tls`: with TLS on, it serves `wss://`
+      with the gRPC listener's certificate and key, so the UI terminal and
+      actions work against a TLS manager (they failed the handshake against a
+      plaintext listener before). Found while planning the manager reverse
+      proxy. [docs](../docs/exec-and-actions.md#how-it-works) ·
+      [UI docs](../docs/ui-architecture.md#exec--actions-interactive-terminal)
 
 ## Observability
 

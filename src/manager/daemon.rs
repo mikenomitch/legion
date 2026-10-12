@@ -451,7 +451,9 @@ pub async fn run_manager_with(
 
     // Exec WebSocket listener on the next port (browsers cannot do bidi
     // streaming over gRPC-Web; tonic's listener does not do HTTP upgrades).
-    // Skipped entirely when exec is disabled.
+    // It follows `server.tls` like the gRPC listener, since the UI derives
+    // `wss://` from an `https://` endpoint. Skipped entirely when exec is
+    // disabled.
     if full_config.exec.enabled {
         let exec_ws_addr: std::net::SocketAddr = format!(
             "{}:{}",
@@ -459,9 +461,11 @@ pub async fn run_manager_with(
             full_config.server.port + 1
         )
         .parse()?;
+        let exec_ws_tls = crate::manager::exec_ws::tls_acceptor(&full_config.server.tls)?;
         tokio::spawn(async move {
             if let Err(err) =
-                crate::manager::exec_ws::serve_exec_ws(exec_ws_addr, exec_ws_state).await
+                crate::manager::exec_ws::serve_exec_ws(exec_ws_addr, exec_ws_state, exec_ws_tls)
+                    .await
             {
                 tracing::error!(error = ?err, "exec ws listener exited");
             }
