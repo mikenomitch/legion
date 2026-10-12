@@ -772,6 +772,9 @@ fn map_instance_info(
         // attach ([`attach_guest_address`]).
         guest_address: None,
         guest_bridge: None,
+        // Set by GetInstance only ([`attach_wake_and_endpoints`]).
+        endpoints: Vec::new(),
+        wake: None,
     }
 }
 
@@ -5955,6 +5958,7 @@ impl Manager for ManagerDaemonService {
             &mut info,
             &guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner())),
         );
+        attach_wake_and_endpoints(&self.store, &mut info);
         if info.detail.is_none() {
             info.detail = idle_unmeasured.or(egress_unenforced);
         }
@@ -11713,6 +11717,38 @@ fn guest_addresses(
 
 /// Fill `info`'s guest address from the node reports, for its running
 /// allocation.
+/// What `legion start gateway` needs from GetInstance (docs/gateway.md):
+/// the task's `suspend.wake` block and where the current allocation serves
+/// each declared port. Lookups that fail leave the fields empty, which the
+/// gateway reads as "not routable".
+fn attach_wake_and_endpoints(store: &Store, info: &mut InstanceInfo) {
+    info.wake = store
+        .suspend_settings_for(&info.job_id, &info.task)
+        .wake
+        .map(|wake| crate::structs::InstanceWake {
+            port: wake.port,
+            timeout_ms: wake.timeout.as_millis() as u64,
+        });
+    let Some(network) = info
+        .current_alloc_id
+        .and_then(|id| store.get_allocation_by_id(id).ok().flatten())
+        .filter(|allocation| allocation.status != crate::constants::ALLOCATION_STATUS_SUSPENDED)
+        .and_then(|allocation| allocation.network)
+    else {
+        return;
+    };
+    let address = network.address.clone().unwrap_or_default();
+    info.endpoints = network
+        .ports
+        .iter()
+        .map(|port| crate::structs::InstanceEndpoint {
+            port: port.name.clone(),
+            address: address.clone(),
+            number: u32::from(port.host_port),
+        })
+        .collect();
+}
+
 fn attach_guest_address(info: &mut InstanceInfo, addresses: &HashMap<i64, (String, String)>) {
     if let Some((address, bridge)) = info
         .current_alloc_id

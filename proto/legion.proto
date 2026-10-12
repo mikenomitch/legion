@@ -3527,6 +3527,48 @@ message InstanceInfo {
   // The bridge `guest_address` belongs to (`br0`). Set exactly when
   // `guest_address` is.
   optional string guest_bridge = 36;
+
+  // Where the instance's current allocation serves each of its declared
+  // `network.ports`: the node's advertised address and the advertised
+  // (host) port, the same pair the service catalog publishes. Empty while
+  // the instance has no allocation (pending, suspended, stopped) and on
+  // rows placed before the node advertised an address. Set by GetInstance
+  // only; ListInstances leaves it empty. `legion start gateway` dials the
+  // entry named by `wake.port` (docs/gateway.md).
+  repeated InstanceEndpoint endpoints = 37;
+
+  // The task's `suspend.wake` block, when it declares one: the instance
+  // accepts wake on request through `legion start gateway`, which resumes
+  // it when a request arrives while it is suspended and holds the request
+  // until the instance serves. Unset means the gateway refuses to route to
+  // this instance. Resolved from the newest config of the instance's job
+  // and task. Set by GetInstance only.
+  optional InstanceWake wake = 38;
+}
+
+// One served port of an instance (InstanceInfo.endpoints).
+message InstanceEndpoint {
+  // The port's label in the task's `network.ports` (`http`).
+  string port = 1;
+
+  // The node's advertised address (an IP or hostname). Empty when the node
+  // advertises none.
+  string address = 2;
+
+  // The advertised port number: what the catalog, health checks, and the
+  // gateway dial. With an ingress chain this is the datapath's port in front
+  // of the task, so the chain applies to gateway traffic too.
+  uint32 number = 3;
+}
+
+// The resolved `suspend.wake` block of an instance's task.
+message InstanceWake {
+  // The `network.ports` label requests are sent to.
+  string port = 1;
+
+  // How long a gateway holds a request while the instance resumes before it
+  // answers `503` with `Retry-After`, in milliseconds. Defaults to 30000.
+  uint64 timeout_ms = 2;
 }
 
 // A cold boot that replaced a restore (InstanceInfo.cold_boot).

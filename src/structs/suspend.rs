@@ -16,6 +16,10 @@
 //!         cpuBelow = 0.02,
 //!     },
 //!     onPressure = true,            # the `suspend` memory pressure step may take it
+//!     wake = {                      # `legion start gateway` resumes it on a request
+//!         port = "http",            # the network.ports label requests go to
+//!         timeout = "30s",          # how long the gateway holds a request for the resume
+//!     },
 //! },
 //! ```
 //!
@@ -47,6 +51,68 @@ pub const MIN_IDLE_AFTER: Duration = Duration::from_secs(30);
 
 /// Default `suspend.idle.cpuBelow`: 2% of the task's `cpu`.
 pub const DEFAULT_IDLE_CPU_BELOW: f64 = 0.02;
+
+/// Default `suspend.wake.timeout`: as long as `resumeTimeout`, so a resume
+/// that falls back to a cold boot still answers the held request.
+pub const DEFAULT_WAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest `suspend.wake.timeout` accepted. A gateway holds a connection
+/// and a socket per waiting request, and clients rarely wait longer.
+pub const MAX_WAKE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The `suspend.wake` block, as written: the instance accepts requests
+/// through `legion start gateway` while it is suspended, and the gateway
+/// resumes it and holds the request until it is up (docs/gateway.md).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WakeConfig {
+    /// The `network.ports` label the gateway sends requests to.
+    pub port: String,
+    /// How long the gateway holds a request while the instance resumes.
+    /// Default `"30s"`, at most `"5m"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
+/// [`WakeConfig`] with defaults applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWake {
+    pub port: String,
+    pub timeout: Duration,
+}
+
+impl WakeConfig {
+    pub fn resolve(&self) -> Result<ResolvedWake, String> {
+        let port = self.port.trim();
+        if port.is_empty() {
+            return Err(
+                "suspend.wake.port is empty; name the network.ports label the gateway should \
+                 send requests to"
+                    .to_string(),
+            );
+        }
+        let timeout = match self.timeout.as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_WAKE_TIMEOUT,
+            Some(raw) => {
+                let timeout = humantime::parse_duration(raw).map_err(|err| {
+                    format!("suspend.wake.timeout {raw:?} is not a duration: {err}")
+                })?;
+                if timeout < Duration::from_secs(1) || timeout > MAX_WAKE_TIMEOUT {
+                    return Err(format!(
+                        "suspend.wake.timeout {raw:?} is out of range: it must be between 1s \
+                         and {}s",
+                        MAX_WAKE_TIMEOUT.as_secs()
+                    ));
+                }
+                timeout
+            }
+        };
+        Ok(ResolvedWake {
+            port: port.to_string(),
+            timeout,
+        })
+    }
+}
 
 /// One kind of activity that keeps an instance awake (plan §6.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -386,6 +452,10 @@ pub struct SuspendConfig {
     /// `suspend` step) instead of evicting it. Default false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_pressure: Option<bool>,
+    /// Wake on request through `legion start gateway`. Unset: a suspended
+    /// instance resumes only on `legion instance start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeConfig>,
 }
 
 /// [`SuspendConfig`] with defaults applied.
@@ -403,6 +473,8 @@ pub struct ResolvedSuspend {
     /// `suspend.onPressure`.
     pub on_pressure: bool,
     pub durability: SnapshotDurability,
+    /// `suspend.wake`, when the task accepts wake on request.
+    pub wake: Option<ResolvedWake>,
 }
 
 impl Default for ResolvedSuspend {
@@ -416,6 +488,7 @@ impl Default for ResolvedSuspend {
             idle: None,
             on_pressure: false,
             durability: SnapshotDurability::Local,
+            wake: None,
         }
     }
 }
@@ -425,6 +498,7 @@ impl SuspendConfig {
     /// the rest of the task live in [`validate_suspend`].
     pub fn resolve(&self) -> Result<ResolvedSuspend, String> {
         let idle = self.idle.as_ref().map(IdleConfig::resolve).transpose()?;
+        let wake = self.wake.as_ref().map(WakeConfig::resolve).transpose()?;
         let reserve = self
             .reserve
             .as_ref()
@@ -488,6 +562,7 @@ impl SuspendConfig {
             idle,
             on_pressure: self.on_pressure.unwrap_or(false),
             durability,
+            wake,
         })
     }
 }
@@ -585,6 +660,9 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
     if let Some(idle) = resolved.idle.as_ref() {
         validate_sandbox_idle_signals(task, suspend, idle)?;
     }
+    if let Some(wake) = resolved.wake.as_ref() {
+        validate_wake_port(task, wake)?;
+    }
     if !resolved.on_resume.is_empty()
         && (task.runtime != "sandbox" || resolved.checkpoint == Some(SnapshotKind::Disk))
     {
@@ -602,6 +680,38 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
         ));
     }
     Ok(())
+}
+
+/// `suspend.wake.port` must name a port the task declares: it is the port
+/// the gateway dials once the instance is up.
+fn validate_wake_port(
+    task: &crate::structs::TaskConfig,
+    wake: &ResolvedWake,
+) -> Result<(), String> {
+    let labels: Vec<&str> = task
+        .network
+        .as_ref()
+        .map(|network| {
+            network
+                .ports
+                .iter()
+                .map(|port| port.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if labels.contains(&wake.port.as_str()) {
+        return Ok(());
+    }
+    let declared = if labels.is_empty() {
+        "it declares no network.ports".to_string()
+    } else {
+        format!("it declares {}", labels.join(", "))
+    };
+    Err(format!(
+        "task {:?} sets suspend.wake.port = {:?}, but {declared}\nHint: add {{ name = {:?} }} to \
+         network.ports, or point wake.port at a declared port",
+        task.name, wake.port, wake.port
+    ))
 }
 
 /// A fixed `suspend.reserve` amount must not exceed what the task reserves,
@@ -938,6 +1048,54 @@ mod tests {
             custom.signals,
             vec![IdleSignal::Network, IdleSignal::Connections]
         );
+    }
+
+    #[test]
+    fn wake_resolves_with_defaults_and_needs_a_declared_port_test() {
+        let with_port = |wake: serde_json::Value| {
+            let mut task = task("sandbox", true, serde_json::json!({ "wake": wake }));
+            task.network = Some(crate::structs::network::NetworkConfig {
+                ports: vec![crate::structs::network::PortConfig {
+                    name: "http".into(),
+                    static_port: None,
+                    to: None,
+                }],
+                ..Default::default()
+            });
+            task
+        };
+        let ok = with_port(serde_json::json!({ "port": "http" }));
+        validate_suspend(&ok).expect("a declared port is accepted");
+        let wake = ok.suspend.unwrap().resolve().unwrap().wake.expect("wake");
+        assert_eq!(wake.port, "http");
+        assert_eq!(wake.timeout, DEFAULT_WAKE_TIMEOUT);
+
+        let err = validate_suspend(&with_port(serde_json::json!({ "port": "admin" }))).unwrap_err();
+        assert!(err.contains("suspend.wake.port = \"admin\""), "{err}");
+        assert!(err.contains("it declares http"), "{err}");
+        assert!(err.contains("Hint:"), "{err}");
+
+        let err = validate_suspend(&task(
+            "sandbox",
+            true,
+            serde_json::json!({ "wake": { "port": "http" } }),
+        ))
+        .unwrap_err();
+        assert!(err.contains("declares no network.ports"), "{err}");
+
+        for (timeout, needle) in [
+            ("0s", "out of range"),
+            ("10m", "out of range"),
+            ("soon", "not a duration"),
+        ] {
+            let err = validate_suspend(&with_port(
+                serde_json::json!({ "port": "http", "timeout": timeout }),
+            ))
+            .unwrap_err();
+            assert!(err.contains(needle), "{timeout}: {err}");
+        }
+        let err = validate_suspend(&with_port(serde_json::json!({ "port": " " }))).unwrap_err();
+        assert!(err.contains("suspend.wake.port is empty"), "{err}");
     }
 
     #[test]
