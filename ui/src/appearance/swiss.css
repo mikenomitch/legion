@@ -1,0 +1,325 @@
+/*
+ * Swiss: the structure of Legion's look, plus the appearance picker's
+ * palette and tweak rules. Colors come from palettes.css (generated); type,
+ * shape and depth defaults from index.css. See docs/ui-architecture.md.
+ */
+
+/* -- The Swiss structure ---------------------------------------------------- */
+/* Drawn from tokens (ink, canvas, signal) so every palette, in both modes,
+   gets the same structure in its own colors. Scoped to "no lab preset, or a
+   swiss-* one" so the dev-only theme lab can still preview other families;
+   :is() keeps the specificity the lab rules were written against. */
+:root:is(:not([data-design]), [data-design|='swiss']) [data-ui='page-title'] {
+  font-size: 3rem;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1.05;
+}
+:root:is(:not([data-design]), [data-design|='swiss']) [data-ui='page-header'] .eyebrow {
+  color: rgb(var(--c-ink));
+  font-weight: 700;
+}
+:root:is(:not([data-design]), [data-design|='swiss']) [data-ui='page-header'] .eyebrow::before {
+  content: '';
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  margin-right: 0.5rem;
+  background: rgb(var(--c-signal, 225 6 0));
+}
+:root:is(:not([data-design]), [data-design|='swiss']) [data-ui='card'] {
+  border-width: 2px 0 0;
+  border-color: rgb(var(--c-ink));
+  box-shadow: none;
+  background: transparent;
+}
+:root:is(:not([data-design]), [data-design|='swiss']) [data-ui='card-header'] {
+  padding-left: 0;
+  padding-right: 0;
+}
+:root:is(:not([data-design]), [data-design|='swiss']) [data-ui='card-title'] {
+  text-transform: none;
+  letter-spacing: -0.01em;
+  font-size: 1rem;
+  font-weight: 700;
+  color: rgb(var(--c-ink)) !important;
+}
+:root:is(:not([data-design]), [data-design|='swiss']) thead th {
+  color: rgb(var(--c-ink));
+  font-weight: 700;
+}
+:root:is(:not([data-design]), [data-design|='swiss']) [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-ink));
+  color: rgb(var(--c-canvas));
+}
+:root:is(:not([data-design]), [data-design|='swiss']) [data-ui='nav-item'][data-active] svg {
+  color: rgb(var(--c-canvas));
+}
+:root:is(:not([data-design]), [data-design|='swiss']) [data-ui='nav-item'] > span:first-child {
+  background: rgb(var(--c-signal, 225 6 0));
+}
+:root:is(:not([data-design]), [data-design|='swiss']) [data-ui='nav-heading'] {
+  color: rgb(var(--c-ink));
+  font-weight: 700;
+}
+
+/* -- Palettes and tweaks --------------------------------------------------- */
+/* Keyed on the attributes the appearance picker sets on <html>
+   (src/appearance/store.ts, and index.html before first paint):
+   data-palette, the `dark` class, and data-tweak-<axis>. Rules use tokens
+   wherever they can, so every tweak works with every palette in both modes.
+   Selectors that set tokens repeat their attribute ([data-tweak-x='y']
+   [data-tweak-x]) so they outrank the dev-only theme lab's token sheet
+   (:root[data-design]) and a tweak still applies on top of a lab preset. */
+
+/* -- Palettes: what the active nav item looks like ------------------------ */
+/* Yellow and blue palettes mark "you are here" with the signal color.
+   --signal-ink (set by the engine) is whichever of white or black reads
+   better on the signal. */
+:root[data-palette='yellow'] [data-ui='nav-item'][data-active],
+:root[data-palette='blue'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-signal));
+  color: var(--signal-ink, #ffffff);
+}
+:root[data-palette='yellow'] [data-ui='nav-item'][data-active] svg,
+:root[data-palette='blue'] [data-ui='nav-item'][data-active] svg {
+  color: var(--signal-ink, #ffffff);
+}
+:root[data-palette='yellow'] [data-ui='nav-item'] > span:first-child {
+  background: rgb(var(--c-ink));
+}
+:root[data-palette='yellow']:not(.dark) [data-ui='page-header'] .eyebrow::before {
+  box-shadow: inset 0 0 0 1px #0a0a0a;
+}
+
+/* -- Typeface ------------------------------------------------------------- */
+:root[data-tweak-type='akzidenz'][data-tweak-type] {
+  --font-sans: 'Archivo Variable', system-ui, -apple-system, sans-serif;
+  --font-display: 'Archivo Variable', system-ui, -apple-system, sans-serif;
+}
+:root[data-tweak-type='akzidenz'] [data-ui='page-title'],
+:root[data-tweak-type='akzidenz'] [data-ui='brand'] {
+  font-stretch: 87%;
+  font-weight: 800;
+}
+:root[data-tweak-type='akzidenz'] [data-ui='card-title'] {
+  font-stretch: 90%;
+  font-weight: 800;
+}
+:root[data-tweak-type='geist'][data-tweak-type],
+:root[data-tweak-type='mono'][data-tweak-type] {
+  --font-sans: 'Geist Variable', system-ui, -apple-system, sans-serif;
+  --font-display: 'Geist Variable', system-ui, -apple-system, sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+:root[data-tweak-type='mono'] [data-ui='main'] table,
+:root[data-tweak-type='mono'] [data-ui='badge'] {
+  font-family: var(--font-mono);
+}
+:root[data-tweak-type='mono'] [data-ui='main'] table {
+  font-size: 0.8125rem;
+}
+:root[data-tweak-type='mono'] [data-ui='page-title'],
+:root[data-tweak-type='mono'] thead th,
+:root[data-tweak-type='mono'] [data-ui='badge'],
+:root[data-tweak-type='mono'] [data-ui='card-title'],
+:root[data-tweak-type='mono'] [data-ui='nav-heading'],
+:root[data-tweak-type='mono'] .eyebrow {
+  text-transform: lowercase;
+}
+:root[data-tweak-type='mono'] thead th,
+:root[data-tweak-type='mono'] [data-ui='badge'],
+:root[data-tweak-type='mono'] [data-ui='nav-heading'],
+:root[data-tweak-type='mono'] .eyebrow {
+  letter-spacing: 0;
+}
+
+/* -- Titles --------------------------------------------------------------- */
+:root[data-tweak-titles='hairline'] [data-ui='page-title'] {
+  font-weight: 300;
+  letter-spacing: -0.05em;
+}
+:root[data-tweak-titles='hairline']:not([data-tweak-density='compact']) [data-ui='page-title'] {
+  font-size: 3.6rem;
+}
+:root[data-tweak-titles='hairline'] [data-ui='card'] {
+  border-top-width: 1px;
+}
+:root[data-tweak-titles='hairline'] [data-ui='card-title'] {
+  font-size: 1.05rem;
+  font-weight: 500;
+}
+:root[data-tweak-titles='hairline'] [data-ui='page-header'] .eyebrow,
+:root[data-tweak-titles='hairline'] thead th {
+  font-weight: 500;
+}
+:root[data-tweak-titles='hairline']:not([data-tweak-rail='black']) [data-ui='nav-item'][data-active] {
+  background: transparent;
+  color: rgb(var(--c-ink));
+  font-weight: 650;
+}
+:root[data-tweak-titles='hairline']:not([data-tweak-rail='black']) [data-ui='nav-item'][data-active] svg {
+  color: rgb(var(--c-ink));
+}
+:root[data-tweak-titles='hairline'][data-palette='yellow'] [data-ui='nav-item'] > span:first-child {
+  background: rgb(var(--c-signal));
+}
+
+/* -- Density -------------------------------------------------------------- */
+:root[data-tweak-density='compact'][data-tweak-density] {
+  font-size: 14px;
+}
+:root[data-tweak-density='compact'] [data-ui='page-title'] {
+  font-size: 2.2rem;
+}
+:root[data-tweak-density='compact'] [data-ui='main'] {
+  padding-top: 1rem;
+}
+:root[data-tweak-density='compact'] [data-ui='main'] td {
+  padding-top: 0.3rem;
+  padding-bottom: 0.3rem;
+}
+:root[data-tweak-density='compact'] [data-ui='card-header'] {
+  min-height: 34px;
+  padding-top: 0.25rem;
+  padding-bottom: 0.25rem;
+}
+:root[data-tweak-density='compact'] [data-ui='page-header'] {
+  margin-bottom: 0.9rem;
+}
+
+/* -- Cards: boxed (timetable) --------------------------------------------- */
+:root[data-tweak-cards='boxed'] [data-ui='card'] {
+  border-width: 1px;
+  border-color: rgb(var(--c-ink));
+}
+:root[data-tweak-cards='boxed'] [data-ui='card-header'] {
+  padding-left: 1rem;
+  padding-right: 1rem;
+  border-bottom-color: rgb(var(--c-ink));
+}
+:root[data-tweak-cards='boxed'] thead {
+  background: rgb(var(--c-ink));
+}
+:root[data-tweak-cards='boxed'] thead th {
+  color: rgb(var(--c-canvas));
+}
+:root[data-tweak-cards='boxed'] thead th + th {
+  border-left: 1px solid rgb(var(--c-canvas) / 0.25);
+}
+:root[data-tweak-cards='boxed'] [data-ui='main'] td + td {
+  border-left: 1px solid rgb(var(--c-line));
+}
+:root[data-tweak-cards='boxed'] [data-ui='main'] td {
+  font-variant-numeric: tabular-nums;
+}
+
+/* -- Cards: soft ---------------------------------------------------------- */
+:root[data-tweak-cards='soft'][data-tweak-cards] {
+  --r-sm: 3px;
+  --r: 5px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-2xl: 20px;
+  --r-full: 9999px;
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.04), 0 4px 12px -4px rgb(0 0 0 / 0.07);
+}
+:root[data-tweak-cards='soft'][data-tweak-cards].dark {
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.5);
+}
+:root[data-tweak-cards='soft'] [data-ui='card'] {
+  border-width: 1px;
+  border-color: rgb(var(--c-line));
+  border-radius: var(--r-lg);
+  background: rgb(var(--c-surface));
+  box-shadow: var(--shadow-card);
+}
+:root[data-tweak-cards='soft'] [data-ui='card-header'] {
+  padding-left: 1rem;
+  padding-right: 1rem;
+}
+:root[data-tweak-cards='soft'] [data-ui='page-header'] .eyebrow::before {
+  border-radius: 50%;
+}
+
+/* -- Page header: masthead ------------------------------------------------ */
+/* The band is the palette's ink. Inside it the tokens flip to the other
+   mode's values, and status shades swap to the ones made for its ground. */
+:root[data-tweak-header='masthead'] {
+  --masthead: var(--c-ink);
+}
+:root[data-tweak-header='masthead'] [data-ui='page-header'] {
+  background: rgb(var(--masthead));
+  padding: 1.5rem 1.75rem 1.4rem;
+  margin-bottom: 1.5rem;
+}
+:root:not(.dark)[data-tweak-header='masthead'] [data-ui='page-header'] {
+  --c-ink: 255 255 255;
+  --c-muted: 200 200 200;
+  --c-faint: 170 170 170;
+  --c-surface: 26 26 26;
+  --c-surface2: 40 40 40;
+  --c-line: 64 64 64;
+  --c-line-strong: 110 110 110;
+  --c-brass: 255 255 255;
+  --c-brass-strong: 255 255 255;
+  --c-ok-700: var(--c-ok-300);
+  --c-warn-700: var(--c-warn-300);
+  --c-danger-700: var(--c-danger-300);
+  --c-danger-600: var(--c-danger-400);
+  --c-info-700: var(--c-info-300);
+}
+:root.dark[data-tweak-header='masthead'] [data-ui='page-header'] {
+  --c-ink: 11 11 11;
+  --c-muted: 70 70 70;
+  --c-faint: 92 92 92;
+  --c-surface: 255 255 255;
+  --c-surface2: 222 222 222;
+  --c-line: 205 205 205;
+  --c-line-strong: 140 140 140;
+  --c-brass: 11 11 11;
+  --c-brass-strong: 11 11 11;
+  --c-ok-300: var(--c-ok-800);
+  --c-warn-300: var(--c-warn-800);
+  --c-danger-300: var(--c-danger-700);
+  --c-danger-400: var(--c-danger-700);
+  --c-info-300: var(--c-info-800);
+}
+
+/* -- Nav rail: black ------------------------------------------------------ */
+:root[data-tweak-rail='black'] #app-sidebar {
+  --c-surface: 10 10 10;
+  --c-surface2: 31 31 31;
+  --c-line: 42 42 42;
+  --c-line-strong: 85 85 85;
+  --c-ink: 255 255 255;
+  --c-muted: 207 207 207;
+  --c-faint: 168 168 168;
+  --c-brass: 255 255 255;
+  --c-brass-strong: 255 255 255;
+}
+:root.dark[data-tweak-rail='black'] #app-sidebar {
+  --c-surface: 0 0 0;
+  --c-surface2: 22 22 22;
+  --c-line: 38 38 38;
+  --c-faint: 163 163 163;
+}
+:root[data-tweak-rail='black'] #app-sidebar [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-signal));
+  color: var(--signal-ink, #ffffff);
+}
+:root[data-tweak-rail='black'] #app-sidebar [data-ui='nav-item'][data-active] svg {
+  color: var(--signal-ink, #ffffff);
+}
+:root[data-tweak-rail='black'] #app-sidebar [data-ui='nav-item'] > span:first-child {
+  background: #ffffff;
+}
+/* Mono's signal is ink, which would vanish into a black rail. */
+:root[data-palette='mono']:not(.dark)[data-tweak-rail='black'] #app-sidebar [data-ui='nav-item'][data-active] {
+  background: #ffffff;
+  color: #0a0a0a;
+}
+:root[data-palette='mono']:not(.dark)[data-tweak-rail='black'] #app-sidebar [data-ui='nav-item'][data-active] svg {
+  color: #0a0a0a;
+}

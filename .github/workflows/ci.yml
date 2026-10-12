@@ -155,6 +155,13 @@ jobs:
           npm run gen
           git diff --stat --exit-code -- src/gen
 
+      # The palette CSS is generated from src/appearance/palettes.ts; fail
+      # when someone edits one without the other.
+      - name: Check generated appearance CSS is current
+        if: steps.changes.outputs.ui == 'true'
+        working-directory: ui
+        run: npm run check:appearance
+
       - name: Typecheck and build
         if: steps.changes.outputs.ui == 'true'
         working-directory: ui

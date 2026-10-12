@@ -18,12 +18,19 @@ The UI is a SolidJS single-page app in `ui/`. It talks directly to the manager's
 
 ## Design System
 
-The visual language ("Legion command post": warm stone neutrals, brass
-accent, dark-first with a full light theme) lives in a few central places:
+The visual language is **Swiss** (International Typographic Style: black and
+white, one red square, oversized bold titles, sections separated by heavy
+rules, no rounded corners), with a full light and dark version. Each viewer can
+change its palette and a few structural tweaks; see
+[Appearance](#appearance-palettes-and-tweaks) below. It lives in a few central
+places:
 
-- **Tokens**: theme colors are CSS variables in `ui/src/index.css`
+- **Tokens**: theme colors are CSS variables generated into
+  `ui/src/appearance/palettes.css` from `ui/src/appearance/palettes.ts`
   (`--c-canvas`, `--c-surface`, `--c-line`, `--c-ink`, `--c-muted`,
-  `--c-brass`, …) mapped into Tailwind color names in
+  `--c-brass` (the accent, black in Swiss Red), `--c-signal` (the red square),
+  …); type, shape and depth are in `ui/src/index.css`. They map into
+  Tailwind color names in
   `ui/tailwind.config.js` (`bg-surface`, `text-muted`, `border-line`,
   `text-brass`, …). Light and dark themes switch by swapping variables on
   `.dark`. Pages never write `dark:` variants for theme colors.
@@ -33,15 +40,17 @@ accent, dark-first with a full light theme) lives in a few central places:
   `--shadow-card`/`--shadow-pop` back `shadow-card`/`shadow-pop`. The status
   palettes Tailwind calls `emerald`, `amber`, `red` and `sky` (shades
   200–800) read `--c-ok-*`, `--c-warn-*`, `--c-danger-*` and `--c-info-*`.
-  The defaults are the shipped values, so a theme is just a different set
-  of variables.
+  A palette or tweak is just a different set of variables, plus the
+  structural rules below.
 - **Structure hooks**: the primitives carry stable `data-ui` attributes
   (`page-header`, `page-title`, `card`, `card-header`, `card-title`, `stat`,
   `badge` with `data-tone`, `button` with `data-variant`, `tabs`, `nav-item`
   with `data-active`, `nav-heading`, `brand`, `topbar`, `main`; the sidebar is
   `#app-sidebar`). Theme CSS that needs more than variables (a title
   treatment, a card-header band) targets these instead of utility classes.
-  Keep them when refactoring a primitive.
+  `ui/src/appearance/swiss.css` is that CSS for the shipped look: the Swiss
+  structure and every palette and tweak rule. Keep the hooks when refactoring
+  a primitive.
 - **Primitives**: `ui/src/components/ui.tsx` exports the shared components
   every page builds on: `Icon`, `Badge`/`StatusBadge`/`MonoBadge`,
   `Card`/`SectionCard`/`PageHeader`/`StatCard`, `Tabs`, `Note`,
@@ -752,6 +761,76 @@ without touching the transport.
 - CI (`.github/workflows/ci.yml`, job `ui-build`) runs the drift check, the
   typecheck and the build whenever `ui/**` or the proto changes.
 
+### Appearance (palettes and tweaks)
+
+The palette button in the top bar (next to the sun/moon), or **Appearance** in
+the ⌘K palette, opens a picker. Every change applies at once and is saved in
+that browser only, so two people sharing a manager each keep their own look
+and nothing is sent to the manager.
+
+- **Mode**: Light, Dark, or System (the default, which follows the OS and
+  changes with it). The sun/moon button switches between light and dark and
+  leaves System.
+- **Palette** (colors only; each has a light and a dark version):
+
+  | Palette | `data-palette` | What changes |
+  |---|---|---|
+  | Swiss Red (default) | — | Black and white with one red square; actions are black. |
+  | Zurich Blue | `blue` | Cobalt is the signal and the action color, so red only ever means an error. |
+  | Signal Yellow | `yellow` | Yellow marks where you are, always with black text on it. |
+  | Duotone | `duotone` | Red marks structure, blue marks what you can click. |
+  | Concrete | `concrete` | Cool grey-blue neutrals and graphite ink. |
+  | Paper | `paper` | Warm off-white and warm charcoal with a softer vermilion. |
+  | Mono | `mono` | No signal color; status hues are the only color on screen. |
+
+- **Tweaks** (independent of each other and of the palette; the first choice
+  is the default):
+
+  | Tweak | Choices | Attribute when not default |
+  |---|---|---|
+  | Typeface | Inter Tight, Akzidenz (Archivo, condensed poster titles), Geist, Mono (Geist with lowercase titles and monospaced tables) | `data-tweak-type="akzidenz\|geist\|mono"` |
+  | Titles | Bold, Hairline | `data-tweak-titles="hairline"` |
+  | Density | Comfortable, Compact (14px base, about a quarter more rows per screen) | `data-tweak-density="compact"` |
+  | Cards | Rules, Boxed (sections boxed in ink, inverted table heads), Soft (rounded, light shadow) | `data-tweak-cards="boxed\|soft"` |
+  | Page header | Plain, Masthead (each page opens on an inverse band) | `data-tweak-header="masthead"` |
+  | Nav rail | Plain, Black (solid black rail, active item in the signal color) | `data-tweak-rail="black"` |
+
+**How it is applied.** The choice is stored as one JSON value under the
+`legion-appearance` localStorage key and expressed as attributes on `<html>`:
+
+```
+localStorage['legion-appearance'] = {"palette":"concrete","mode":"dark","tweaks":{"density":"compact","rail":"black"}}
+<html class="dark" data-palette="concrete" data-tweak-density="compact" data-tweak-rail="black">
+```
+
+Defaults are never written: no `data-palette` means Swiss Red, no
+`data-tweak-<axis>` means that axis's default, and choosing every default
+removes the key. A small inline script in `ui/index.html` sets the attributes
+before the first paint, so a reload never flashes the default palette or the
+wrong mode; `ui/src/appearance/store.ts` takes over once the app loads, drops
+values this build does not know (an old palette id, a removed tweak), follows
+OS mode changes while the mode is System, and follows a change made in another
+tab. The CSS is all static: `palettes.css` keys colors on `data-palette` and
+`.dark`, and `swiss.css` keys structure on the tweak attributes, so no theme
+code runs to paint the page.
+
+**Fonts.** The build ships the typefaces the Typeface tweak offers (Inter
+Tight, Roboto Mono, Archivo, Geist, Geist Mono) as `@font-face` rules; a
+browser downloads only the ones the current choice renders. The exec terminal
+reads `--font-mono` when it opens, so it follows the Typeface tweak from the
+next terminal opened.
+
+**Changing a palette.** Edit `ui/src/appearance/palettes.ts`, run
+`npm run gen:appearance` to regenerate `palettes.css`, and
+`npm run lab:contrast` to check it still meets WCAG AA in both modes (body text
+7:1, secondary and faint text, links and status badges 4.5:1). CI runs
+`npm run check:appearance`, which fails when `palettes.css` is out of date.
+
+Limits: the choice is per browser, not per user, so it does not follow a
+person to another machine. The Black nav rail is subtle on dark palettes whose
+page is already near-black; there the active item in the signal color carries
+it. Swatches in the picker show the palette in the current mode only.
+
 ### Design lab and theme studio (dev server only)
 
 `ui/src/themes/` holds candidate themes and a **theme studio** for trying
@@ -770,8 +849,9 @@ default only in `npm run lab`.
   keeps named variants; **Copy CSS tokens** produces the `:root`/`.dark`
   block to paste into `index.css`; **Copy theme JSON** produces a catalog
   entry.
-- `?design=<id>` opens a preset (`?design=current` is the shipped look);
-  `&shot=1` hides the studio for screenshots.
+- `?design=<id>` opens a preset; `&shot=1` hides the studio for
+  screenshots. The **Shipped look** preset is the app with no lab overrides,
+  that is, whatever the appearance picker has chosen.
 - Presets live in `catalog.ts` (round one) and `riffs.ts` (round two:
   Command Post, Forge and Swiss, each with its opposite mode and five riffs).
   A riff's id is `<family>-<riff>`, and `themes.css` matches family rules with
@@ -780,19 +860,18 @@ default only in `npm run lab`.
   Swiss's red square; it is never used for text. Text on a signal-colored
   fill uses `--signal-ink`, which the engine sets to white or near-black,
   whichever has more contrast.
-- **Swiss palettes and tweaks** (`swiss.ts`) are the options a theme picker
-  offers. A palette (`data-palette`: `red`, `blue`, `yellow`, `duotone`,
-  `concrete`, `paper`, `mono`) is colors only, with a light and a dark
-  version. A tweak is one structural axis set as `data-tweak-<axis>` on
-  `<html>`: `type` (`akzidenz`, `geist`, `mono`), `titles` (`hairline`),
-  `density` (`compact`), `cards` (`boxed`, `soft`), `header` (`masthead`),
-  `rail` (`black`); no attribute means the default. Tweaks combine freely
-  with each other and with every palette in both modes. The studio's
-  **Picker** section sets exactly these attributes and shows the value a
-  picker would store, for example
-  `{"palette":"concrete","mode":"dark","tweaks":{"density":"compact"}}`.
-  Presets with a twin in the other mode follow the app's own light/dark
-  toggle.
+- **Swiss palettes and tweaks.** `swiss.ts` turns every shipped palette
+  (`ui/src/appearance/palettes.ts`) and every tweak into presets so they can
+  be screenshotted and audited, plus three combinations. Swiss presets keep
+  the shipped Swiss structure (`ui/src/appearance/swiss.css` applies to the
+  shipped look and to any `swiss-*` preset), and applying one sets the same
+  `data-palette`/`data-tweak-*` attributes and saved value as the app's
+  picker. The studio's **Picker** section edits a lab theme's palette and
+  tweaks the same way. Presets with a twin in the other mode follow the app's
+  own light/dark toggle. Command Post, the look Legion shipped before Swiss,
+  remains as a reference preset. While a lab preset is applied the lab
+  decides the colors, so the app's picker changes only the tweaks; pick
+  **Shipped look** to try the picker itself.
 - **Data.** In `npm run lab` the dev server answers the UI's manager calls
   itself. **Auto** (the default) proxies to the manager when it accepts a
   connection and serves recorded responses when it does not; **Live** and

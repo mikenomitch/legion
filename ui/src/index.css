@@ -1,89 +1,40 @@
-@import '@fontsource-variable/inter';
-@import '@fontsource-variable/space-grotesk';
-@import '@fontsource-variable/fira-code';
+/* The typefaces the appearance picker offers (src/appearance/palettes.ts).
+   @font-face costs nothing until text renders in the family, so only the
+   chosen typeface is ever downloaded. */
+@import '@fontsource-variable/inter-tight';
+@import '@fontsource-variable/roboto-mono';
+@import '@fontsource-variable/archivo/standard.css';
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 /*
- * Legion theme tokens. Every theme-aware color in tailwind.config.js reads one
- * of these RGB triplets, so light/dark stay consistent across the whole app.
- *
- * The palette is "command post": warm stone neutrals, a brass accent for the
- * standard, and restrained semantic colors for status.
+ * Legion design tokens: Swiss. Type, shape and depth live here; the colors
+ * (every --c-* triplet, per palette and mode) are generated into
+ * src/appearance/palettes.css, and the structure that makes it Swiss (big
+ * titles, ruled sections, the signal square) is src/appearance/swiss.css.
+ * The appearance picker's tweaks override these by attribute on <html>.
  */
 :root {
-  /* Type, shape and depth. Themes override these the same way they override
-     colors; the defaults are the shipped look. */
-  --font-sans: 'Inter Variable', Inter, system-ui, -apple-system, sans-serif;
-  --font-display: 'Space Grotesk Variable', 'Space Grotesk', 'Inter Variable', system-ui, sans-serif;
-  --font-mono: 'Fira Code Variable', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
-  --r-sm: 0.125rem;
-  --r: 0.25rem;
-  --r-md: 0.375rem;
-  --r-lg: 0.5rem;
-  --r-xl: 0.75rem;
-  --r-2xl: 1rem;
-  --r-full: 9999px;
-  --shadow-card: 0 1px 2px 0 rgb(0 0 0 / 0.04);
-  --shadow-pop: 0 12px 32px -12px rgb(0 0 0 / 0.35);
-
-  /* Status scales: ok (emerald), warn (amber), danger (red), info (sky). */
-  --c-ok-200: 167 243 208;
-  --c-ok-300: 110 231 183;
-  --c-ok-400: 52 211 153;
-  --c-ok-500: 16 185 129;
-  --c-ok-600: 5 150 105;
-  --c-ok-700: 4 120 87;
-  --c-ok-800: 6 95 70;
-  --c-warn-200: 253 230 138;
-  --c-warn-300: 252 211 77;
-  --c-warn-400: 251 191 36;
-  --c-warn-500: 245 158 11;
-  --c-warn-600: 217 119 6;
-  --c-warn-700: 180 83 9;
-  --c-warn-800: 146 64 14;
-  --c-danger-200: 254 202 202;
-  --c-danger-300: 252 165 165;
-  --c-danger-400: 248 113 113;
-  --c-danger-500: 239 68 68;
-  --c-danger-600: 220 38 38;
-  --c-danger-700: 185 28 28;
-  --c-danger-800: 153 27 27;
-  --c-info-200: 186 230 253;
-  --c-info-300: 125 211 252;
-  --c-info-400: 56 189 248;
-  --c-info-500: 14 165 233;
-  --c-info-600: 2 132 199;
-  --c-info-700: 3 105 161;
-  --c-info-800: 7 89 133;
-
-  --c-canvas: 247 246 243;
-  --c-surface: 255 255 255;
-  --c-surface2: 244 242 237;
-  --c-line: 228 225 216;
-  --c-line-strong: 203 198 185;
-  --c-ink: 30 28 23;
-  --c-muted: 100 95 84;
-  --c-faint: 128 122 110;
-  --c-brass: 143 106 21;
-  --c-brass-strong: 110 81 16;
-  color-scheme: light;
+  --font-sans: 'Inter Tight Variable', system-ui, -apple-system, sans-serif;
+  --font-display: 'Inter Tight Variable', system-ui, -apple-system, sans-serif;
+  --font-mono: 'Roboto Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --r-sm: 0;
+  --r: 0;
+  --r-md: 0;
+  --r-lg: 0;
+  --r-xl: 0;
+  --r-2xl: 0;
+  --r-full: 0;
+  --shadow-card: none;
+  --shadow-pop: 0 0 0 1px rgb(var(--c-ink)), 0 16px 32px -16px rgb(0 0 0 / 0.35);
 }
 
 .dark {
-  --c-canvas: 12 11 9;
-  --c-surface: 23 21 17;
-  --c-surface2: 31 28 22;
-  --c-line: 45 41 32;
-  --c-line-strong: 68 61 46;
-  --c-ink: 235 230 219;
-  --c-muted: 168 160 144;
-  --c-faint: 140 132 114;
-  --c-brass: 214 180 90;
-  --c-brass-strong: 231 201 122;
-  color-scheme: dark;
+  --shadow-pop: 0 0 0 1px rgb(var(--c-ink)), 0 16px 32px -16px rgb(0 0 0 / 0.8);
 }
 
 html {
@@ -98,13 +49,6 @@ body {
   @apply bg-canvas text-ink;
 }
 
-.dark body {
-  background-image:
-    radial-gradient(ellipse 80% 50% at 50% -10%, rgb(var(--c-brass) / 0.045), transparent),
-    none;
-  background-attachment: fixed;
-}
-
 a {
   color: inherit;
 }
@@ -113,7 +57,7 @@ a {
   background: rgb(var(--c-brass) / 0.25);
 }
 
-/* Focus visibility: one consistent brass ring everywhere. */
+/* Focus visibility: one consistent accent ring everywhere. */
 :focus-visible {
   outline: 2px solid rgb(var(--c-brass) / 0.7);
   outline-offset: 1px;

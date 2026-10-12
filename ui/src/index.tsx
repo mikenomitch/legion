@@ -2,6 +2,8 @@
 import { render } from 'solid-js/web'
 
 import './index.css'
+import './appearance/palettes.css'
+import './appearance/swiss.css'
 import App from './App'
 
 const root = document.getElementById('root')

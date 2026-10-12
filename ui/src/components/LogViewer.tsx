@@ -322,7 +322,7 @@ export default function LogViewer(props: LogViewerProps) {
       <div
         ref={container}
         onScroll={onScroll}
-        class="h-[28rem] overflow-auto rounded-md border border-line bg-[#0d0c0a] p-3 font-mono text-xs leading-relaxed text-neutral-200"
+        class="h-[28rem] overflow-auto rounded-md border border-line bg-[#0b0b0b] p-3 font-mono text-xs leading-relaxed text-neutral-200"
       >
         <Show
           when={visibleLines().length > 0}

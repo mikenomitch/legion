@@ -228,7 +228,7 @@ function RolloutDetailContent() {
                   }
                 >
                   <Show when={filteredEvents().length > 0} fallback={<p class="text-sm text-muted">No log events for this filter.</p>}>
-                    <div class="max-h-[360px] overflow-auto rounded-md border border-line bg-[#0d0c0a] p-2 font-mono text-xs text-neutral-100">
+                    <div class="max-h-[360px] overflow-auto rounded-md border border-line bg-[#0b0b0b] p-2 font-mono text-xs text-neutral-100">
                       <For each={filteredEvents()}>
                         {(event) => (
                           <div class="grid grid-cols-[64px_150px_minmax(0,1fr)] items-start gap-2 border-b border-white/5 px-1 py-1.5 last:border-b-0">

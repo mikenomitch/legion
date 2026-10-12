@@ -31,6 +31,16 @@ LEGION_SEED_UI_DATA=1 cargo run -- start manager --run-worker -c configs/manager
 
 This only seeds when the store is empty and creates demo workers, a demo job, and a couple of KV entries so the UI has real backend data to render.
 
+## Appearance
+
+The look is Swiss, with seven palettes and six tweaks a viewer picks from the
+palette button in the top bar (saved per browser). Palettes live in
+`src/appearance/palettes.ts`; after changing one, run `npm run gen:appearance`
+to regenerate `src/appearance/palettes.css` (CI checks it with
+`npm run check:appearance`) and `npm run lab:contrast` to audit it. The
+structure and tweak rules are `src/appearance/swiss.css`. Details:
+[UI architecture: Appearance](../docs/ui-architecture.md#appearance-palettes-and-tweaks).
+
 ## Design lab and theme studio
 
 To work on the look of the UI, start the dev server in lab mode:
@@ -79,6 +89,7 @@ committed files differ, so a proto change cannot merge without its client.
 - `npm run lab` – dev server with the theme studio and live/recorded data
 - `npm run lab:record` / `npm run lab:crawl` – record fixtures from a live manager
 - `npm run lab:shots` / `npm run lab:contrast` – screenshot or contrast-audit every theme
+- `npm run gen:appearance` / `npm run check:appearance` – regenerate or check `src/appearance/palettes.css`
 - `npm run typecheck` – type-check without building
 - `npm run build` – type-check and produce a production build
 - `npm run gen` – regenerate `src/gen` from the proto

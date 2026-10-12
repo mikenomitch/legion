@@ -2,17 +2,14 @@
 
 > **Judgement calls:** [ui-theme-lab-plan_calls.md](../calls/ui-theme-lab-plan_calls.md)
 
-**Status: IN EXECUTION.** Phases 1 and 2 are built on
-`claude/ui-design-variations-ibx1qw`: the tokenized design system, twenty
-candidate themes, the dev-only theme studio, and recorded fake data. Round two
-narrowed to three finalists — Command Post, Forge and Swiss — each with its
-opposite mode and five riffs (`ui/src/themes/riffs.ts`). Round three picked
-Swiss and turned it into a picker-ready system: seven light/dark palettes and
-six independent tweak axes (`ui/src/themes/swiss.ts`). Phase 3 now means
-shipping Swiss as the default plus a user-facing theme picker over those
-axes, which the maintainer plans to build. Deliberately deferred: a
-user-facing theme picker in production builds, and opposite-mode palettes for
-the riffs (only the three finalists have both modes).
+**Status: SHIPPED.** Phases 1–3 are built. Phase 1–2 (the tokenized design
+system, twenty candidate themes, the dev-only theme studio and recorded fake
+data) and rounds two and three of the exploration landed on
+`claude/ui-design-variations-ibx1qw`; phase 3 shipped Swiss as the default
+look with an appearance picker over its seven palettes and six tweaks (see
+[Phase 3](#phase-3-ship-swiss-and-the-picker)). Deliberately deferred: a
+per-user (server-side) appearance preference, opposite-mode palettes for the
+non-Swiss riffs, and deciding whether the lab stays.
 
 ## Problem
 
@@ -36,7 +33,8 @@ touching components.
   change tokens live against real components — the model for the studio.
 
 Taken: tokens for everything themeable, curated presets, an internal editor.
-Rejected for now: a theme picker for end users (see calls doc, entry 1).
+Rejected for now: a theme picker for end users (see calls doc, entry 1). Round
+three reversed this for Swiss only; see phase 3.
 
 ## Jobs to be done
 
@@ -152,17 +150,56 @@ palette's colors while keeping every tweak.
 1. **Tokens + catalog + screenshots** (built). Behaviour-preserving
    tokenization, twenty themes, `lab:shots`, `lab:contrast`.
 2. **Studio + fake data** (built). Live editing, presets, export, record/replay.
-3. **Ship Swiss and a picker** (next; the maintainer is building the
-   picker). Move the Swiss family rules, the picker rules and the seven
-   palettes' tokens from the lab into production CSS (`index.css` and a
-   picker stylesheet), load only the fonts the typeface axis offers, and apply
-   the stored choice in `index.html` before first paint. The original phase 3
-   text follows for the single-theme part.
-   **Ship the pick** (waiting). Paste the chosen theme's tokens into
-   `index.css`, move its structural CSS from `themes.css` into the components
-   or `index.css`, design its second mode, re-run `lab:contrast`, update the
-   Design System section of `docs/ui-architecture.md`. Then decide whether the
-   lab stays (cheap: dev-only) or goes.
+3. **Ship Swiss and a picker** (shipped 2026-10-12). See below.
+
+## Phase 3: ship Swiss and the picker
+
+**Jobs to be done.**
+
+- *An operator* opening the UI gets Swiss in the mode their OS uses, with no
+  setup.
+- *An operator who stares at it all day* picks a palette that suits their
+  screen and eyes (Paper's warm off-white, Concrete's grey) and a density
+  that fits their fleet (Compact), and it stays that way on reload.
+- *A contributor* changes a palette's colors in one file and CI tells them if
+  they forgot to regenerate the CSS; the contrast audit tells them if it
+  fails AA.
+
+**Surface.** A palette icon in the top bar beside the sun/moon, and
+**Appearance** in the ⌘K palette, open a dialog with Mode (Light · Dark ·
+System), Palette (seven swatches) and one segmented control per tweak, plus
+**Reset to defaults**. Changes apply live and save to
+`localStorage['legion-appearance']` as
+`{"palette":"concrete","mode":"dark","tweaks":{"density":"compact"}}`;
+defaults are never stored. The page reads `data-palette`, `.dark` and
+`data-tweak-<axis>` on `<html>`.
+
+**Design.**
+
+- `ui/src/appearance/palettes.ts` owns the palettes and tweaks (moved out of
+  the lab; the lab's `swiss.ts` now imports them).
+- `scripts/gen-appearance-css.mjs` generates `ui/src/appearance/palettes.css`
+  (all color tokens per palette and mode). Swiss Red is `:root`/`.dark`; the
+  rest key on `data-palette` and step aside under `[data-design]` for the lab.
+  `npm run check:appearance` runs in CI.
+- `ui/src/appearance/swiss.css` holds the Swiss structure and every palette
+  and tweak rule, moved from the lab's `themes.css`.
+- `index.css` carries Swiss's type, radius and shadow tokens and imports the
+  offered typefaces (Inter Tight, Roboto Mono, Archivo, Geist, Geist Mono).
+- An inline script in `index.html` applies the stored choice before first
+  paint; `ui/src/appearance/store.ts` owns it at runtime (sanitizing, System
+  mode, cross-tab sync). `App.tsx`'s old `ui-theme` signal is gone.
+- The lab keeps working: its engine routes palette, tweaks and mode through
+  the store, and Command Post becomes a reference preset.
+
+**Testing.** Typecheck and build (no lab code or Command Post font in
+`dist/`), `lab:contrast` (every Swiss palette passes AA in both modes),
+`check:appearance`, and a browser run: pick a palette and tweaks, switch mode,
+reload (attributes present before the app script runs), sun/moon keeps
+tweaks, reset clears the key, phone width.
+
+**Rollout.** A visible change to every page in one PR. No migration: the old
+`ui-theme` key is ignored, so returning browsers start on System.
 
 ## Testing
 
@@ -183,4 +220,5 @@ its own PR with before/after screenshots.
   `lab:contrast`.
 - Phase 2: `npm run lab` with no manager running renders the Workers, Job and
   Task pages with data; studio edits apply live and survive a reload.
-- Phase 3: the chosen theme is the default in both modes and passes AA.
+- Phase 3: Swiss is the default in both modes; every palette passes AA in
+  both modes; a saved choice survives a reload with no flash.

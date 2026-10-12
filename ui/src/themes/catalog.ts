@@ -20,22 +20,8 @@ import { RIFF_THEMES } from './riffs.ts'
 import { SWISS_PRESETS } from './swiss.ts'
 import { monoStack, stack } from './stacks.ts'
 
-export type Hex = `#${string}`
-
-export type ThemeColors = {
-  canvas: Hex
-  surface: Hex
-  surface2: Hex
-  line: Hex
-  lineStrong: Hex
-  ink: Hex
-  muted: Hex
-  faint: Hex
-  accent: Hex
-  accentStrong: Hex
-}
-
-export type StatusColors = { ok: Hex; warn: Hex; danger: Hex; info: Hex }
+import type { Hex, StatusColors, ThemeColors } from '../appearance/palettes.ts'
+export type { Hex, StatusColors, ThemeColors }
 
 export type RadiusScale = 'none' | 'sharp' | 'default' | 'soft' | 'round'
 
@@ -77,8 +63,8 @@ export type DesignTheme = {
   tweaks?: Tweaks
 }
 
-export type TweakAxis = 'type' | 'titles' | 'density' | 'cards' | 'header' | 'rail'
-export type Tweaks = Partial<Record<TweakAxis, string>>
+import type { TweakAxis, Tweaks } from '../appearance/palettes.ts'
+export type { TweakAxis, Tweaks }
 
 
 export const RADIUS_SCALES: Record<RadiusScale, Record<string, string>> = {
@@ -462,13 +448,16 @@ export const DESIGN_THEMES: DesignTheme[] = [
   },
 ]
 
-// The shipped look (index.css), as editable presets. Not one of the twenty.
+// The look Legion shipped before Swiss, kept as editable reference presets.
+// Status hues approximate Tailwind's 500 shades through the lab's ramp.
 const COMMAND_POST_TYPE = {
   sans: stack('Inter Variable'),
   display: stack('Space Grotesk Variable'),
   mono: monoStack('Fira Code Variable'),
   label: 'Space Grotesk · Inter · Fira Code',
 }
+const COMMAND_POST_SHADOW = { card: '0 1px 2px 0 rgb(0 0 0 / 0.04)', pop: '0 12px 32px -12px rgb(0 0 0 / 0.35)' }
+const COMMAND_POST_STATUS: StatusColors = { ok: '#10b981', warn: '#f59e0b', danger: '#ef4444', info: '#0ea5e9' }
 
 export const BASELINE_THEMES: DesignTheme[] = [
   {
@@ -476,13 +465,15 @@ export const BASELINE_THEMES: DesignTheme[] = [
     pair: 'command-post-dark',
     family: 'command-post',
     role: 'base',
-    name: 'Command Post (shipped, light)',
+    name: 'Command Post (previous default, light)',
     mode: 'light',
-    tagline: 'The current look: warm stone neutrals with a brass accent.',
-    audience: 'Reference point — what Legion ships today.',
-    rationale: 'Included so every candidate can be compared against today’s UI, and as a starting point for edits.',
+    tagline: 'The look before Swiss: warm stone neutrals with a brass accent.',
+    audience: 'Reference point — what Legion shipped before Swiss.',
+    rationale: 'Included so candidates can still be compared against the previous UI, and as a starting point for edits.',
     type: COMMAND_POST_TYPE,
     radius: 'default',
+    shadow: COMMAND_POST_SHADOW,
+    status: COMMAND_POST_STATUS,
     colors: {
       canvas: '#f7f6f3', surface: '#ffffff', surface2: '#f4f2ed', line: '#e4e1d8', lineStrong: '#cbc6b9',
       ink: '#1e1c17', muted: '#645f54', faint: '#807a6e', accent: '#8f6a15', accentStrong: '#6e5110',
@@ -493,13 +484,15 @@ export const BASELINE_THEMES: DesignTheme[] = [
     pair: 'command-post',
     family: 'command-post',
     role: 'counterpart',
-    name: 'Command Post (shipped, dark)',
+    name: 'Command Post (previous default, dark)',
     mode: 'dark',
-    tagline: 'The current dark look: near-black stone with a gold accent.',
-    audience: 'Reference point — what Legion ships today.',
-    rationale: 'Included so every candidate can be compared against today’s UI, and as a starting point for edits.',
+    tagline: 'The dark look before Swiss: near-black stone with a gold accent.',
+    audience: 'Reference point — what Legion shipped before Swiss.',
+    rationale: 'Included so candidates can still be compared against the previous UI, and as a starting point for edits.',
     type: COMMAND_POST_TYPE,
     radius: 'default',
+    shadow: COMMAND_POST_SHADOW,
+    status: COMMAND_POST_STATUS,
     colors: {
       canvas: '#0c0b09', surface: '#171511', surface2: '#1f1c16', line: '#2d2920', lineStrong: '#443d2e',
       ink: '#ebe6db', muted: '#a8a090', faint: '#8c8472', accent: '#d6b45a', accentStrong: '#e7c97a',

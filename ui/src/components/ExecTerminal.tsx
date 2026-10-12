@@ -53,7 +53,7 @@ interface ExecTerminalProps {
   class?: string
 }
 
-const DEFAULT_FRAME_CLASS = 'h-72 w-full overflow-hidden rounded-md border border-line bg-[#0d0c0a] p-2'
+const DEFAULT_FRAME_CLASS = 'h-72 w-full overflow-hidden rounded-md border border-line bg-[#0b0b0b] p-2'
 
 export default function ExecTerminal(props: ExecTerminalProps) {
   let container: HTMLDivElement | undefined
@@ -78,8 +78,12 @@ export default function ExecTerminal(props: ExecTerminalProps) {
       convertEol: !props.interactive,
       cursorBlink: props.interactive,
       fontSize: 13,
-      fontFamily: '"Fira Code Variable", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-      theme: { background: '#0d0c0a', cursor: '#d6b45a' },
+      // The canvas renderer cannot read CSS variables, so resolve the
+      // appearance's monospace (it follows the Typeface tweak) once here.
+      fontFamily:
+        getComputedStyle(document.documentElement).getPropertyValue('--font-mono').trim() ||
+        'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      theme: { background: '#0b0b0b', cursor: '#f5f5f5' },
     })
     fit = new FitAddon()
     term.loadAddon(fit)

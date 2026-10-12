@@ -1,7 +1,9 @@
 // Turns a DesignTheme into CSS variables (plus the studio's fine-tuning
 // rules) and applies it to the page. Pure string building apart from
 // `applyTheme`, so the studio's "Copy CSS" export uses the same code.
-import { RADIUS_SCALES, type DesignTheme, type StatusColors, type ThemeColors, type TweakAxis } from './catalog'
+import { DEFAULT_PALETTE } from '../appearance/palettes'
+import { appearance, setAppearance } from '../appearance/store'
+import { RADIUS_SCALES, type DesignTheme, type StatusColors, type ThemeColors } from './catalog'
 import { contrast, hexToRgb, rgbToHex, statusRamp } from './contrast'
 
 const STYLE_ID = 'design-lab-vars'
@@ -108,29 +110,13 @@ export const exportCss = (theme: DesignTheme) => {
   return `${header}\n${block(selector, decls)}\n${theme.sidebar ? `\n${block(`${selector} #app-sidebar`, colorVars(theme.sidebar))}\n` : ''}`
 }
 
-const TWEAK_AXES: TweakAxis[] = ['type', 'titles', 'density', 'cards', 'header', 'rail']
-
-// The picker contract: palette and tweaks are plain attributes on <html>, so
-// a production picker can set them (and the `dark` class) from localStorage
-// before first paint without any of the lab's code.
-const applyAttributes = (theme: DesignTheme | undefined) => {
-  const root = document.documentElement
-  if (theme?.palette) root.dataset.palette = theme.palette
-  else delete root.dataset.palette
-  for (const axis of TWEAK_AXES) {
-    const value = theme?.tweaks?.[axis]
-    const key = `tweak${axis[0].toUpperCase()}${axis.slice(1)}`
-    if (value && value !== 'default') root.dataset[key] = value
-    else delete root.dataset[key]
-  }
-}
-
 export const applyTheme = (theme: DesignTheme | undefined) => {
   const root = document.documentElement
   document.getElementById(STYLE_ID)?.remove()
-  applyAttributes(theme)
   if (!theme) {
     delete root.dataset.design
+    // The shipped look: whatever the app's appearance picker has chosen.
+    setAppearance(appearance())
     return
   }
   const style = document.createElement('style')
@@ -138,14 +124,10 @@ export const applyTheme = (theme: DesignTheme | undefined) => {
   style.textContent = themeStylesheet(theme)
   document.head.appendChild(style)
   root.dataset.design = theme.flourishes ?? theme.id
-  // App.tsx reads this key for its light/dark state; each theme is designed
-  // for one mode, so keep the app in step with it.
-  try {
-    localStorage.setItem('ui-theme', theme.mode)
-  } catch {
-    // storage unavailable
-  }
-  root.classList.toggle('dark', theme.mode === 'dark')
+  // Palette, tweaks and mode go through the app's own appearance store (the
+  // same attributes the picker sets), so the app's sun/moon toggle and the
+  // picker stay in step with the preset. Each theme is designed for one mode.
+  setAppearance({ palette: theme.palette ?? DEFAULT_PALETTE, mode: theme.mode, tweaks: theme.tweaks ?? {} })
 }
 
 export const normalizeHex = (value: string): string | undefined => {

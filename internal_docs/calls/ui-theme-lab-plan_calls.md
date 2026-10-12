@@ -24,10 +24,32 @@ page (simplicity/ease). Keeping it dev-only makes the whole lab free to leave
 in the repo or delete after the pick.
 
 *Revisited in round three:* the maintainer now plans a picker saved to
-localStorage. The lab itself stays dev-only; entry 2 is the shape it hands the
-picker.
+localStorage. The lab itself stays dev-only; entry 3 is the shape it hands the
+picker, and entry 2 records that it shipped as the only look.
 
-## 2. Swiss is a palette × tweaks system, applied as attributes on `<html>`
+## 2. Swiss replaces Command Post outright; the picker offers Swiss only
+
+**Call.** Phase 3 makes Swiss Red the default in both modes and the picker's
+seven palettes and six tweaks are all Swiss. Command Post, the previous look,
+is not offered; it survives only as a reference preset in the dev-only lab.
+
+**Alternatives.** Offer Command Post (and perhaps Forge) as extra "themes"
+beside the Swiss palettes; or keep Command Post as the default and make Swiss
+opt-in.
+
+**Trade-off.** Anyone who liked the warm brass look loses it with no setting
+to bring it back, and every page changes at once. A second family would also
+have had to be written against the tweaks (most of them are Swiss-specific:
+rules, masthead, signal square).
+
+**Why.** The maintainer picked Swiss ("Swiss is my favorite") and asked for
+variations "in color (for the default)", which reads as Swiss being the
+default and the picker varying it. One family keeps every tweak meaningful
+with every palette (simplicity/ease), and AGENTS.md says to pick the right
+default for a new cluster rather than preserve an old look. The user-facing
+surface is a palette button in the top bar and an **Appearance** entry in ⌘K.
+
+## 3. Swiss is a palette × tweaks system, applied as attributes on `<html>`
 
 **Call.** Round three splits Swiss into **palettes** (colors only, each a
 light/dark pair: Red, Zurich Blue, Signal Yellow, Duotone, Concrete, Paper,
@@ -53,7 +75,62 @@ undoable on its own (extensibility: a new palette or tweak is one block of
 CSS). Plain attributes keep the production picker free of lab code and let it
 apply the stored choice before first paint.
 
-## 3. Type, shape, depth and status became CSS variables
+## 4. The choice is per browser (localStorage), not per user
+
+**Call.** The picker stores `{"palette":…,"mode":…,"tweaks":{…}}` under the
+`legion-appearance` localStorage key. Nothing reaches the manager.
+
+**Alternatives.** A per-identity preference on the manager (a KV path or a
+new RPC), so the look follows a person across machines; or a cluster-wide
+default set by the operator.
+
+**Trade-off.** The look does not follow a person to another browser, and an
+operator cannot set a house style for everyone.
+
+**Why.** It is what the maintainer described ("a theme picker that can save to
+local storage"). It needs no RPC, no ACL resource, no idempotency and no
+migration, and it works before sign-in and with ACLs off (simplicity/ease). A
+server-side preference can be added later on top of the same stored shape
+(extensibility); it is logged in TODO.md.
+
+## 5. Palette colors are generated, checked-in static CSS keyed on attributes
+
+**Call.** `scripts/gen-appearance-css.mjs` turns `palettes.ts` into
+`src/appearance/palettes.css` (every `--c-*` triplet, the status ramps,
+`--c-signal`, `--signal-ink`), keyed on `data-palette` and `.dark`. An inline
+script in `index.html` sets the attributes from localStorage before first
+paint; `npm run check:appearance` in CI fails when the CSS is stale.
+
+**Alternatives.** Compute the variables in JavaScript at startup from
+`palettes.ts` (no generated file); or generate the CSS at build time with a
+Vite plugin (no checked-in file).
+
+**Trade-off.** A generated file in the repo and a step to remember when
+editing a palette (CI catches a miss). The boot script duplicates a few lines
+of `store.ts`.
+
+**Why.** Module scripts run after the first paint can happen, so runtime
+variables would flash Swiss Red before a saved palette applied. Static CSS
+paints correctly with no theme code at all (performance), and a checked-in
+file is reviewable in a diff and needs no build-tool plugin (simplicity).
+
+## 6. Mode has a third value, System, and it is the default
+
+**Call.** Mode is Light, Dark or System. With nothing stored the page follows
+`prefers-color-scheme` and keeps following it; the sun/moon button sets an
+explicit Light or Dark.
+
+**Alternatives.** Keep the old two-state toggle (an explicit choice was saved
+on first toggle and the OS was read only when nothing was stored).
+
+**Trade-off.** One more choice in the picker, and the sun/moon button now
+leaves System silently.
+
+**Why.** "Follow my OS" is the expectation set by every OS-level dark mode,
+and a picker is the natural place for it. The old key (`ui-theme`) is dropped
+without migration, per AGENTS.md, so a returning browser starts on System.
+
+## 7. Type, shape, depth and status became CSS variables
 
 **Call.** Tailwind's `font-*`, `rounded-*`, `shadow-card/pop` and the
 `emerald/amber/red/sky` 200–800 shades now read CSS variables whose defaults
@@ -70,7 +147,7 @@ hooks become a contract: renaming one silently drops a theme's structural CSS.
 components, and it is behaviour-preserving for the shipped look
 (extensibility: the next reskin is a token change).
 
-## 4. "Notes page" read as the Workers page; "allocation page" as the task page
+## 8. "Notes page" read as the Workers page; "allocation page" as the task page
 
 **Call.** The request named the Notes page, the allocation page and the job
 page. The screenshots show Workers (`/nodes`), the task detail page
@@ -86,7 +163,7 @@ logs).
 **Why.** `/nodes` is literally "nodes"; the index shows every theme's table,
 status and badge treatment at once, which is what a look is judged on.
 
-## 5. Each candidate theme is designed for one mode
+## 9. Each candidate theme is designed for one mode
 
 **Call.** Every catalog theme is either light or dark (11 dark, 9 light), and
 the lab pins the app to that mode.
@@ -99,7 +176,7 @@ the lab pins the app to that mode.
 **Why.** Twenty strong directions beat twenty pairs of half-considered ones;
 the second mode is cheap once the direction is fixed.
 
-## 6. "A dark/light mode for each" means the three finalists, and Command Post's is the shipped dark
+## 10. "A dark/light mode for each" means the three finalists, and Command Post's is the shipped dark
 
 **Call.** Round two adds the opposite mode for Command Post, Forge and Swiss —
 not for each of the fifteen riffs. Command Post's opposite (dark) already
@@ -116,7 +193,7 @@ more palettes before the direction is chosen would spend effort on themes that
 will be discarded (simplicity/ease). Showing the shipped dark untouched keeps it
 an honest baseline.
 
-## 7. Each riff changes one or two things on purpose
+## 11. Each riff changes one or two things on purpose
 
 **Call.** Every riff keeps its family's structure and moves one or two
 variables: Command Post's accent, temperature, frame, density, darkness;
@@ -133,7 +210,7 @@ studio exists for those.
 over Swiss says "softer paper", not just "this one". It also makes the pick
 cheap to compose in the studio.
 
-## 8. Fake data is recorded real traffic, stored as proto3 JSON
+## 12. Fake data is recorded real traffic, stored as proto3 JSON
 
 **Call.** The dev server records the manager's unary gRPC-web responses into
 `ui/dev/fixtures/<Method>.json` (decoded with the generated descriptors) and
@@ -150,7 +227,7 @@ mutating call fails with an explicit message), and streams are not recorded.
 JSON keeps it editable; doing it in the dev server keeps app code untouched.
 The seed has two workers and no running tasks, too thin to judge a theme.
 
-## 9. Structural theme CSS hangs off `data-ui` hooks with attribute selectors
+## 13. Structural theme CSS hangs off `data-ui` hooks with attribute selectors
 
 **Call.** `themes.css` uses `:root[data-design='x'] [data-ui='…']` rules; the
 studio's tweaks use `:root[data-design]` and win by source order.
@@ -163,7 +240,7 @@ or a higher-specificity rule could override a theme.
 **Why.** It keeps every component unaware of themes, which is what makes the
 lab deletable.
 
-## 10. Riffs inherit by id prefix, and Swiss's structure is drawn from tokens
+## 14. Riffs inherit by id prefix, and Swiss's structure is drawn from tokens
 
 **Call.** Riff ids are `<family>-<riff>` and family rules match
 `:root[data-design|='<family>']`. Swiss's rules, which hard-coded black,
@@ -179,7 +256,7 @@ with `forge-` or `swiss-` would silently pick up those rules.
 **Why.** One rule set per family keeps riffs to a palette plus their single
 structural move, and the token rewrite is what makes Swiss Dark free.
 
-## 11. Text on a signal fill is computed, not chosen per palette
+## 15. Text on a signal fill is computed, not chosen per palette
 
 **Call.** The engine sets `--signal-ink` to whichever of white or near-black
 has more contrast on the signal color, and every signal-filled element (the
@@ -194,7 +271,7 @@ is less conventional than white.
 computed choice is never below 4.77:1 across all palettes, and new palettes
 get it for free.
 
-## 12. Screenshot data came from a real local cluster, with two local workarounds
+## 16. Screenshot data came from a real local cluster, with two local workarounds
 
 **Call.** The gallery shots come from a manager plus seven named workers
 (three pools; one drained, one lost) and four jobs, all on one host. Two
@@ -220,7 +297,7 @@ rather than the live cluster, so every shot of all twenty-one themes shows
 byte-identical data; the recording was taken from the same cluster right
 after round one.
 
-## 13. The studio renders in a shadow root
+## 17. The studio renders in a shadow root
 
 **Call.** The panel is a Solid tree inside a shadow root with its own CSS.
 
@@ -230,3 +307,50 @@ after round one.
 
 **Why.** A theme editor must not be restyled by the theme it edits; Brutalist's
 2px borders or Phosphor's scanlines would otherwise reach the panel.
+
+## 18. The build ships every offered typeface; the browser fetches one
+
+**Call.** `index.css` imports Inter Tight, Roboto Mono, Archivo, Geist and
+Geist Mono. Inter, Space Grotesk and Fira Code (Command Post) moved to the
+lab.
+
+**Alternatives.** Load a typeface's CSS on demand when the Typeface tweak
+changes; or offer only Inter Tight.
+
+**Trade-off.** The `dist/` folder carries about two dozen more woff2 files.
+
+**Why.** `@font-face` downloads nothing until text renders in the family, so a
+viewer pays only for the face they use, and static imports keep the
+no-flash-on-reload property that on-demand loading would break.
+
+## 19. The picker is a dialog from the top bar, not a Settings page
+
+**Call.** A palette icon beside the sun/moon (and **Appearance** in ⌘K) opens
+a modal like the keyboard cheat sheet. Changes apply live; there is no Save.
+
+**Alternatives.** A `/settings` route; a popover anchored to the button.
+
+**Trade-off.** No URL to link to the picker, and the dialog covers the page it
+is restyling (it is translucent at the edges only).
+
+**Why.** Legion has no Settings page and appearance is its only per-viewer
+setting; a route for one panel is overhead (simplicity). The dialog reuses the
+existing modal pattern, Escape handling and focus rules.
+
+## 20. The shipped Swiss rules coexist with the lab through selectors
+
+**Call.** `swiss.css` scopes the Swiss structure to
+`:root:is(:not([data-design]), [data-design|='swiss'])` and repeats the
+attribute on token-setting tweak rules (`[data-tweak-type='geist']
+[data-tweak-type]`); palette colors step aside under `[data-design]`. The lab
+engine applies palette, tweaks and mode through the app's appearance store.
+
+**Alternatives.** Delete the lab now that Swiss shipped; or put the lab's
+token sheet in a CSS cascade layer.
+
+**Trade-off.** Selectors that need a comment to explain their specificity.
+
+**Why.** The lab is still how palettes are audited and screenshotted, and it
+costs production nothing. `:is()` keeps the specificity every lab rule was
+written against, and routing the lab through the store keeps the app's
+sun/moon toggle and picker in step with a preset instead of fighting it.

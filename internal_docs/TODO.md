@@ -3665,26 +3665,17 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 From [ui-theme-lab-plan.md](plans/ui-theme-lab-plan.md):
 
-- [ ] Theme picker (maintainer is building it): ship Swiss as the default
-      and offer the round-three palettes (7, light/dark) and tweaks (6 axes)
-      from `ui/src/themes/swiss.ts`. Move the Swiss family + "Swiss picker"
-      rules from `themes.css` and the palette tokens into production CSS,
-      load only the typefaces the picker offers, and apply the stored
-      `{ palette, mode, tweaks }` before first paint to avoid a flash
-      ([plan round three](plans/ui-theme-lab-plan.md#round-three-swiss-as-palettes--tweaks),
-      [calls entry 2](calls/ui-theme-lab-plan_calls.md)).
 - [ ] The black-rail tweak barely shows in dark palettes whose page is
       already near-black; the active item carries it. Consider lifting the
       page or tinting the rail for those palettes.
-- [ ] Ship the pick as the default (plan phase 3):
-      paste its tokens into `index.css`, fold its `themes.css` rules into the
-      components, design its second mode, re-run `npm run lab:contrast`, and
-      update the Design System section of `docs/ui-architecture.md`. Then
-      decide whether the lab stays.
-- [ ] The shipped light theme's faint text (`--c-faint` #807a6e) is 4.26:1 on
-      surfaces and 3.94:1 on the canvas, under WCAG AA's 4.5:1. It carries
-      timestamps, hints and descriptions. Darken it (or fold it into the phase
-      3 pick); `npm run lab:contrast` reports it.
+- [ ] A per-user appearance preference on the manager (and perhaps an
+      operator-set house default), so the look follows a person across
+      browsers. The picker stores per browser only today
+      ([calls entry 4](calls/ui-theme-lab-plan_calls.md#4-the-choice-is-per-browser-localstorage-not-per-user)).
+- [ ] Decide whether the dev-only theme lab stays now that Swiss shipped. It
+      still audits and screenshots the palettes; Command Post and the other
+      candidates are reference presets only
+      ([calls entry 20](calls/ui-theme-lab-plan_calls.md#20-the-shipped-swiss-rules-coexist-with-the-lab-through-selectors)).
 - [ ] Lab fixtures (`ui/dev/fixtures/`) are one recording; re-record with
       `npm run lab:record` + `lab:crawl` after proto changes, or new fields
       will be missing from fake data.
@@ -4872,7 +4863,15 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([plan](plans/ui-theme-lab-plan.md),
       [calls](calls/ui-theme-lab-plan_calls.md),
       [docs](../docs/ui-architecture.md#design-lab-and-theme-studio-dev-server-only)).
-      Shipping the pick is open above.
+- [x] Swiss shipped as the default look with an appearance picker
+      (2026-10-12): seven light/dark palettes, six tweaks and Light/Dark/System
+      mode, saved per browser and applied before first paint; palette CSS
+      generated from `ui/src/appearance/palettes.ts` and checked in CI;
+      Command Post retired to a lab reference preset, and its faint-text
+      contrast gap with it
+      ([plan phase 3](plans/ui-theme-lab-plan.md#phase-3-ship-swiss-and-the-picker),
+      [calls](calls/ui-theme-lab-plan_calls.md),
+      [docs](../docs/ui-architecture.md#appearance-palettes-and-tweaks)).
 
 ## AWS rig: mitigations in place for the node-deregistration and plugin-build gaps
 

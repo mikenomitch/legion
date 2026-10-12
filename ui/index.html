@@ -3,10 +3,25 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#0c0b09" media="(prefers-color-scheme: dark)" />
-    <meta name="theme-color" content="#f7f6f3" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0b0b0b" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Legion</title>
+    <script>
+      // Apply the saved appearance before first paint, so the page never
+      // flashes the default palette or the wrong mode. Mirrors
+      // applyToDocument in src/appearance/store.ts; the app re-applies (and
+      // sanitizes) the choice once it loads.
+      try {
+        var a = JSON.parse(localStorage.getItem('legion-appearance') || '{}') || {}
+        var root = document.documentElement
+        var dark = a.mode === 'dark' || (a.mode !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches)
+        if (dark) root.classList.add('dark')
+        if (typeof a.palette === 'string' && a.palette !== 'red') root.setAttribute('data-palette', a.palette)
+        var t = a.tweaks || {}
+        for (var axis in t) if (/^[a-z]+$/.test(axis) && typeof t[axis] === 'string') root.setAttribute('data-tweak-' + axis, t[axis])
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -756,7 +756,7 @@ export default function TaskActions(props: Props) {
                                     </Button>
                                   </div>
                                   <Show when={open()}>
-                                    <pre class="mx-3.5 mb-3 max-h-72 overflow-auto rounded-md bg-[#0d0c0a] px-3 py-2 font-mono text-xs leading-relaxed text-[#e6e0d2]">
+                                    <pre class="mx-3.5 mb-3 max-h-72 overflow-auto rounded-md bg-[#0b0b0b] px-3 py-2 font-mono text-xs leading-relaxed text-neutral-200">
                                       <For each={row().lines} fallback={<span class="text-[#8c8472]">{row().state === 'running' ? 'waiting for output…' : 'no output'}</span>}>
                                         {(line) => <div class={line.stream === 'stderr' ? 'text-[#f2a296]' : undefined}>{line.text}</div>}
                                       </For>

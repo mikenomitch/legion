@@ -8,7 +8,7 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup } from 'solid-js'
 import { createStore, reconcile, unwrap } from 'solid-js/store'
 import { render } from 'solid-js/web'
-import { ALL_PRESETS, BASELINE_THEMES, DESIGN_THEMES, type DesignTheme, type RadiusScale, type StatusColors, type ThemeColors, type TweakAxis } from './catalog'
+import { ALL_PRESETS, BASELINE_THEMES, findTheme, DESIGN_THEMES, type DesignTheme, type RadiusScale, type StatusColors, type ThemeColors, type TweakAxis } from './catalog'
 import { RIFF_THEMES } from './riffs'
 import { SWISS_COMBO_PRESETS, SWISS_PALETTES, SWISS_PALETTE_PRESETS, SWISS_TWEAKS, SWISS_TWEAK_PRESETS } from './swiss'
 import { auditTheme, badgeContrast, contrast, type StatusName } from './contrast'
@@ -96,7 +96,8 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
 
   const [presetId, setPresetId] = createSignal(props.initialPreset)
   const [shipped, setShipped] = createSignal(!props.initial)
-  const fallback = () => (document.documentElement.classList.contains('dark') ? BASELINE_THEMES[1] : BASELINE_THEMES[0])
+  // The shipped look is Swiss Red in whichever mode is on screen.
+  const fallback = () => findTheme(document.documentElement.classList.contains('dark') ? 'swiss-dark' : 'swiss')!
   const [theme, setTheme] = createStore<DesignTheme>(clone(props.initial ?? fallback()))
   const [open, setOpen] = createSignal(read(OPEN_KEY, import.meta.env.MODE === 'lab'))
   const [toast, setToast] = createSignal('')
@@ -163,7 +164,7 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
   }
 
   // --- Swiss picker: palette × mode × tweaks (the contract a production
-  // picker would store in localStorage) ------------------------------------
+  // picker stores in localStorage) -----------------------------------------
   const applyPalette = (paletteId: string, mode: 'light' | 'dark' = theme.mode) => {
     const palette = SWISS_PALETTES.find((entry) => entry.id === paletteId)
     if (!palette) return
@@ -455,8 +456,8 @@ function Studio(props: { initial: DesignTheme | undefined; initialPreset: string
               <summary>Picker <span class="pill">Swiss · palette × tweaks</span></summary>
               <div class="section">
                 <p class="hint">
-                  What a theme picker would offer. It sets <code>data-palette</code>, the <code>dark</code> class and{' '}
-                  <code>data-tweak-*</code> on &lt;html&gt;; the stored value is shown below.
+                  The app's Appearance picker, applied to this lab theme. It sets <code>data-palette</code>, the{' '}
+                  <code>dark</code> class and <code>data-tweak-*</code> on &lt;html&gt;; the saved value is shown below.
                 </p>
                 <label class="field">
                   <span>Palette</span>

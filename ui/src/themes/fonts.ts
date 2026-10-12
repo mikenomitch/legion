@@ -1,9 +1,14 @@
-// Every typeface the design-lab themes use. Loaded only by the lab (a dev-only
-// dynamic import), so production bundles never carry them. @font-face rules
-// cost nothing until a theme actually renders text in the family.
+// Every typeface the design-lab themes use beyond the ones the app ships
+// (index.css: Inter Tight, Roboto Mono, Archivo, Geist, Geist Mono). Loaded
+// only by the lab (a dev-only dynamic import), so production bundles never
+// carry them. @font-face rules cost nothing until a theme actually renders
+// text in the family.
 
-import '@fontsource-variable/geist'
-import '@fontsource-variable/geist-mono'
+// The previous default, Command Post.
+import '@fontsource-variable/inter'
+import '@fontsource-variable/space-grotesk'
+import '@fontsource-variable/fira-code'
+
 import '@fontsource/ibm-plex-mono/400.css'
 import '@fontsource/ibm-plex-mono/500.css'
 import '@fontsource/ibm-plex-mono/600.css'
@@ -18,7 +23,6 @@ import '@fontsource/barlow-condensed/700.css'
 import '@fontsource-variable/jetbrains-mono'
 import '@fontsource-variable/outfit'
 import '@fontsource-variable/spline-sans-mono'
-import '@fontsource-variable/archivo/standard.css'
 import '@fontsource-variable/chivo-mono'
 import '@fontsource-variable/manrope'
 import '@fontsource-variable/ibm-plex-sans'
@@ -32,8 +36,6 @@ import '@fontsource-variable/bricolage-grotesque'
 import '@fontsource/fragment-mono'
 import '@fontsource-variable/libre-franklin'
 import '@fontsource-variable/newsreader'
-import '@fontsource-variable/inter-tight'
-import '@fontsource-variable/roboto-mono'
 import '@fontsource/ibm-plex-sans-condensed/400.css'
 import '@fontsource/ibm-plex-sans-condensed/500.css'
 import '@fontsource/ibm-plex-sans-condensed/600.css'
