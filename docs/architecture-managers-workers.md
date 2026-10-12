@@ -46,9 +46,13 @@ The manager's `persistence.type` decides how its state survives a manager failur
 - Optional in-process worker (`--run-worker`). When ACLs are enforced, the
   manager issues its own join token for it.
 
-TLS is off by default. Turn it on with `server.tls { enabled, certPath, keyPath }`
-in the manager config. It covers the gRPC listener and the exec WebSocket
-listener (`server.port + 1`). The telemetry listener stays plaintext.
+Operator TLS is off by default. Turn it on with `server.tls { enabled,
+certPath, keyPath }` in the manager config. It covers the gRPC listener and
+the exec WebSocket listener (`server.port + 1`). The telemetry listener stays
+plaintext. Workers speak TLS to the gRPC listener either way: the manager
+answers a TLS handshake for `manager.legion` with its cluster server
+certificate, and, without `server.tls`, still answers plaintext for the CLI
+and UI on the same port ([auth-and-acls.md](auth-and-acls.md#workers-reach-managers-over-tls)).
 
 ## Worker Startup and Join Flow
 
@@ -230,7 +234,7 @@ listener and no setting that turns one on.
 
 | Port | Who listens | Who dials it |
 | --- | --- | --- |
-| `4747` (`server.port`) | manager: gRPC API, raft transport, OIDC discovery | CLI, UI, MCP, workers, peer managers |
+| `4747` (`server.port`) | manager: gRPC API, raft transport, OIDC discovery. TLS for workers always; plaintext too unless `server.tls` is on | CLI, UI, MCP, workers (TLS), peer managers |
 | `4748` (`server.port + 1`) | manager: exec WebSocket | the UI terminal |
 | `4749` (`server.port + 2`) | manager: `/metrics`, health probes | Prometheus, load balancers |
 | `4848` (`LEGION_WORKER_PORT`) | worker plane (mTLS) | managers; edge routers (`StartClaim`) |
@@ -311,11 +315,10 @@ Two code paths exist:
 
 ## What Is Not Implemented Yet
 
-- Worker-to-manager TLS: the worker's connection to the manager does not
-  configure TLS, even when the manager has `server.tls` enabled. Heartbeat
-  replies, which carry rendered KV secrets, travel in plaintext, and the CA
-  pin check happens on the certificate reply rather than at the TLS
-  handshake.
+- Manager-to-manager (raft) TLS: raft peers dial each other in plaintext,
+  so keep the managers on a network you trust. With `server.tls` on, the
+  managers' API port drops plaintext connections, which a multi-manager raft
+  cluster still needs.
 - Workers behind NAT that managers can't dial: exec, logs, restart, and the
   mesh need a reachable `workerAddress`. Work still reaches such a worker
   through heartbeat replies.

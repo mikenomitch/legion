@@ -773,3 +773,70 @@ warning, then a `403` with `gated-default` and a hint.
 
 **Why.** A warning that fires on correct jobs teaches people to ignore it. The
 `403` itself names the source and the fix. **A quiet, accurate warning won.**
+
+## 32. Join tokens keep the manager's own scheme; workers dial TLS regardless
+
+Made while implementing Phase 4. The plan says a manager that answers TLS on
+its API port should put `https://` in its join tokens. The token's address is
+also the issuer a worker checks boot tickets against (`iss`), and the manager
+mints those tickets with its workload-identity issuer URL, which operators
+set to that same address (`http://` unless `server.tls` is on). So the token keeps that address, and the worker treats
+it as a host and port: every connection to it is TLS, naming
+`manager.legion`.
+
+**Alternative.** Rewrite the token to `https://` and the ticket issuer with
+it.
+
+**Trade-off.** A token can read `http://10.0.0.5:4747` while every byte the
+worker sends to that address is encrypted, which can surprise someone reading
+it.
+
+**Why.** Changing the scheme in two places that must agree, for a field the
+worker no longer uses to pick a transport, adds a failure mode and buys
+nothing. The docs say the worker always uses TLS. **Simplicity won.**
+
+## 33. The manager picks its certificate by the name the client asks for
+
+Made while implementing Phase 4. With `server.tls` on, the manager holds two
+certificates on one port: the operator's, for the CLI and browsers, and the
+cluster server certificate, for workers. The client's TLS server name picks
+one: `manager.legion` gets the cluster certificate, anything else (including
+no name, which is what a client dialing an IP address sends) gets the
+operator's. Workers always send `manager.legion`, including for the JWKS
+fetch, which is why that fetch uses its own small HTTP/1.1 client instead of
+`reqwest` (whose server name comes from the URL).
+
+**Alternative.** A second port for workers.
+
+**Trade-off.** A custom JWKS client to maintain, and an operator who points
+the CLI at `manager.legion` by name gets a certificate their CA doesn't
+know.
+
+**Why.** One port is one firewall rule and one advertised address, which is
+what the plan promised operators. **Ease of operation won.**
+
+## 34. A bundle accepted under a token outlives the CA that token pins
+
+Found while implementing Phase 4. Phase 1 checked a persisted bundle, and every
+re-issued one, against the join token's pin. After a CA rotation's overlap
+ends, the bundle no longer holds the pinned CA, so a worker that restarted
+then refused its own cluster. Now a worker records which token pin its bundle
+was first accepted under (`<identity dir>/token-pin`). The same token keeps
+trusting that bundle, and the manager must chain to the bundle, not the pin,
+from then on. A new token (a re-join, another cluster) must still find its
+pin in the bundle.
+
+**Alternative.** Require a re-join after every rotation, or keep the old CA in
+bundles for good.
+
+**Trade-off.** A worker whose state directory holds a bundle from this token
+trusts that bundle without re-checking the pin, so tampering with that
+directory changes what it trusts. The directory already holds the node's
+private key.
+
+**Why.** A rotation that silently strands every worker that restarts later is
+a trap, and the plan promised rotation breaks nothing. The bundle arrived over
+a connection verified against the pin or an earlier bundle, so trust chains
+back to the token. The plaintext JWKS fallback is gone too: a worker builds a
+ticket verifier only over this channel, so "refuse a plaintext JWKS URL" holds
+by construction. **Rotation that breaks nothing won.**

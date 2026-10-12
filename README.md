@@ -328,8 +328,10 @@ on a network you don't trust. Known gaps:
   code. The
   [worker-plane auth plan](internal_docs/plans/worker-plane-auth-plan.md)
   makes it the default.
-- **The worker-to-manager channel is plaintext.** The worker plane (manager
-  to worker) is mutual TLS; the other direction is covered by the same plan.
+- **Raft traffic between managers is plaintext.** Workers reach managers over
+  TLS pinned to the cluster CA, and managers reach workers over mutual TLS,
+  but peer managers talk to each other in the clear. Keep managers on a
+  network you trust.
 
 ### What's next
 

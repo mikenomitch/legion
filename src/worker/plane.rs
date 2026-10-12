@@ -131,6 +131,9 @@ impl std::fmt::Debug for NodeIdentity {
     }
 }
 
+/// The join-token pin the persisted bundle was first accepted under.
+const ACCEPTED_PIN_FILE: &str = "token-pin";
+
 /// Where a worker keeps its identity: `<state dir>/identity/`.
 pub fn identity_dir(state_path: &Path) -> PathBuf {
     state_path
@@ -218,7 +221,14 @@ impl NodeIdentity {
             bail!("persisted certificate expired");
         }
         if let Some(pin) = &self.pin {
-            if !crate::cluster_tls::bundle_contains_pin(&ca_pem, pin)? {
+            // A bundle accepted under this same token stays trusted after a
+            // CA rotation drops the CA the token pins; a bundle from another
+            // token (another cluster, a re-join) must contain its pin.
+            let accepted_under =
+                std::fs::read_to_string(self.dir.join(ACCEPTED_PIN_FILE)).unwrap_or_default();
+            if accepted_under.trim() != pin
+                && !crate::cluster_tls::bundle_contains_pin(&ca_pem, pin)?
+            {
                 bail!("persisted CA bundle does not contain this join token's pin");
             }
         }
@@ -324,8 +334,10 @@ impl NodeIdentity {
             })?
             .into_inner();
         // The first bundle a worker accepts must contain its token's pin;
-        // after that, the held bundle is what it trusts.
-        if let Some(pin) = &self.pin {
+        // after that, the held bundle is what it trusts: the reply came over
+        // a connection verified against it, and after a CA rotation's overlap
+        // it no longer holds the CA the token pins.
+        if let Some(pin) = self.pin.as_ref().filter(|_| self.roots().is_none()) {
             if !crate::cluster_tls::bundle_contains_pin(&reply.ca_pem, pin)? {
                 let presented = crate::cluster_tls::bundle_pins(&reply.ca_pem);
                 return Err(anyhow::Error::new(PinMismatch(
@@ -336,6 +348,14 @@ impl NodeIdentity {
         self.install(&reply.cert_pem, &reply.ca_pem, reply.expires_at)?;
         write_private(&self.dir.join("node.pem"), &reply.cert_pem)?;
         write_private(&self.dir.join("ca.pem"), &reply.ca_pem)?;
+        if let Some(pin) = &self.pin {
+            write_private(&self.dir.join(ACCEPTED_PIN_FILE), pin)?;
+        }
+        // From here on the manager must chain to the bundle, which follows
+        // CA rotations; the token's pin does not.
+        if let Some(roots) = self.roots() {
+            trust_manager_bundle(manager_addr, roots);
+        }
         info!(
             node_id = %self.node_id,
             expires_at = reply.expires_at,
@@ -475,6 +495,79 @@ pub fn route_source_ip(manager_addr: &str) -> R<std::net::IpAddr> {
 /// How long to wait between identity issuance attempts at startup while
 /// the manager refuses or is unreachable.
 pub const ISSUE_RETRY: Duration = Duration::from_secs(2);
+
+/// How this process's workers verify the managers they dial, per manager
+/// address (worker-plane-auth plan §6.8). One process can hold several:
+/// tests run workers for several clusters side by side.
+fn manager_trusts(
+) -> &'static Mutex<std::collections::HashMap<String, Arc<crate::cluster_tls::PinnedManagerVerifier>>>
+{
+    static TRUSTS: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, Arc<crate::cluster_tls::PinnedManagerVerifier>>>,
+    > = std::sync::OnceLock::new();
+    TRUSTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Records the join token's CA pin as what `manager_addr` must present, and
+/// returns the verifier every connection to it shares. A later call for the
+/// same address keeps the existing verifier (and whatever bundle it has
+/// learned since).
+pub fn trust_manager(
+    manager_addr: &str,
+    pin: &str,
+) -> R<Arc<crate::cluster_tls::PinnedManagerVerifier>> {
+    let key = crate::cluster_tls::host_port(manager_addr)?;
+    let mut trusts = manager_trusts().lock().unwrap_or_else(|p| p.into_inner());
+    Ok(trusts
+        .entry(key)
+        .or_insert_with(|| {
+            crate::cluster_tls::PinnedManagerVerifier::new(crate::cluster_tls::ManagerTrust::Pin(
+                pin.to_string(),
+            ))
+        })
+        .clone())
+}
+
+/// The verifier for `manager_addr`, when this process has joined it.
+pub fn manager_verifier(
+    manager_addr: &str,
+) -> Option<Arc<crate::cluster_tls::PinnedManagerVerifier>> {
+    let key = crate::cluster_tls::host_port(manager_addr).ok()?;
+    manager_trusts()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&key)
+        .cloned()
+}
+
+/// A connected gRPC channel to a manager this process has joined: TLS to
+/// `manager_addr`'s host and port, naming `manager.legion`, verified against
+/// the join token's CA pin (or the bundle once the worker holds one). The
+/// address's scheme is ignored. There is no plaintext path: a process that
+/// has not recorded a pin for this manager cannot reach it.
+pub async fn manager_channel(manager_addr: &str) -> R<tonic::transport::Channel> {
+    let verifier = manager_verifier(manager_addr).ok_or_else(|| {
+        anyhow!(
+            "no cluster CA pin for the manager at {manager_addr}; workers reach managers only \
+             over TLS verified against their join token's pin"
+        )
+    })?;
+    let config = crate::cluster_tls::client_config(verifier, None)?;
+    crate::cluster_tls::tls_connect(
+        manager_addr,
+        config,
+        crate::cluster_tls::MANAGER_SERVER_NAME,
+    )
+    .await
+}
+
+/// Moves `manager_addr`'s verifier from the join token's pin to the cluster
+/// CA bundle this worker now holds, which follows CA rotations.
+pub fn trust_manager_bundle(manager_addr: &str, roots: Arc<SwappableRoots>) {
+    if let Some(verifier) = manager_verifier(manager_addr) {
+        verifier.set_trust(crate::cluster_tls::ManagerTrust::Bundle(roots));
+    }
+}
 
 #[cfg(test)]
 mod plane_test {

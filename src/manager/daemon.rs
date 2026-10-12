@@ -22,7 +22,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
@@ -146,6 +146,7 @@ pub async fn run_manager_with(
         )?;
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
+    let store_for_api = store.clone();
     // A restore is an explicit operator action with the operator present:
     // fail fast, naming the missing root key, rather than serve a cluster
     // whose secrets are unreadable.
@@ -572,17 +573,22 @@ pub async fn run_manager_with(
     // do-nothing RPC slow?" comes from here.
     crate::manager::telemetry::start_runtime_probe();
 
-    let tls_identity = load_server_tls_identity(&full_config.server.tls)?;
-    let server_builder = match tls_identity {
-        Some(identity) => {
-            info!("Starting manager with TLS enabled");
-            Server::builder().tls_config(ServerTlsConfig::new().identity(identity))?
-        }
-        None => {
-            info!("Starting manager without TLS");
-            Server::builder()
-        }
-    };
+    // One port, TLS for workers always (worker-plane-auth plan §6.8): the
+    // cluster certificate for `manager.legion`, the operator's for every
+    // other name, and plaintext for the CLI and UI unless `server.tls` is on.
+    let operator_tls = load_operator_tls(&full_config.server.tls)?;
+    if operator_tls.is_some() {
+        info!("Starting manager with TLS enabled (operator certificate; workers use the cluster certificate)");
+    } else {
+        info!(
+            "Starting manager: TLS for workers (cluster certificate), plaintext for the CLI and UI"
+        );
+    }
+    let api_listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind the manager API on {addr}"))?;
+    let api_incoming = manager_incoming(&store_for_api, api_listener, operator_tls)?;
+    let server_builder = Server::builder();
 
     // The idle sweep reads the usage table heartbeats fill, so it shares
     // the service's handle.
@@ -626,7 +632,7 @@ pub async fn run_manager_with(
         .layer(crate::manager::telemetry::GrpcMetricsLayer)
         .add_service(manager_service)
         .add_service(raft_transport_service)
-        .serve_with_shutdown(addr, async move {
+        .serve_with_incoming_shutdown(api_incoming, async move {
             // A dropped sender also stops the server; both mean "shut down".
             let _ = stop_serving_rx.await;
         });
@@ -1174,11 +1180,11 @@ fn resolve_manager_host(host: &str) -> String {
     }
 }
 
-/// Loads the manager's TLS identity when `server.tls.enabled` is set.
-///
-/// TLS is opt-in (never inferred from files on disk) so a stray dev cert
-/// cannot flip the listener to https and strand http clients.
-fn load_server_tls_identity(tls: &TlsConfigFull) -> R<Option<Identity>> {
+/// The operator's `server.tls` certificate as a rustls key, when
+/// `server.tls.enabled` is set. TLS for the CLI and UI is opt-in (never
+/// inferred from files on disk) so a stray dev cert cannot strand http
+/// clients.
+fn load_operator_tls(tls: &TlsConfigFull) -> R<Option<Arc<rustls::sign::CertifiedKey>>> {
     if !tls.enabled {
         return Ok(None);
     }
@@ -1189,7 +1195,82 @@ fn load_server_tls_identity(tls: &TlsConfigFull) -> R<Option<Identity>> {
         .with_context(|| format!("failed to read TLS certificate {}", tls.cert_path))?;
     let key = std::fs::read_to_string(&tls.key_path)
         .with_context(|| format!("failed to read TLS key {}", tls.key_path))?;
-    Ok(Some(Identity::from_pem(cert, key)))
+    Ok(Some(
+        crate::cluster_tls::certified_key(&cert, &key).with_context(|| {
+            format!(
+                "invalid TLS certificate or key ({}, {})",
+                tls.cert_path, tls.key_path
+            )
+        })?,
+    ))
+}
+
+/// The certificate a manager presents to workers on its API port
+/// (`manager.legion`, worker-plane-auth plan §6.8), kept current: minted
+/// from the cluster CA as soon as one exists, re-minted before it expires,
+/// and re-issued under the new CA after a rotation. Polls every few seconds
+/// until the CA exists (a follower waits for the leader to create it), then
+/// every minute.
+pub fn keep_manager_server_cert(
+    store: Store,
+    identity: Arc<crate::cluster_tls::SwappableIdentity>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let store_for_mint = store.clone();
+            let minted = tokio::task::spawn_blocking(move || {
+                crate::manager::worker_plane::WorkerPlane::global().materials(&store_for_mint)
+            })
+            .await;
+            let delay = match minted {
+                Ok(Ok(materials)) => match materials.server_identity.current() {
+                    Some(key) => {
+                        identity.set(key);
+                        Duration::from_secs(60)
+                    }
+                    None => Duration::from_secs(2),
+                },
+                Ok(Err(err)) => {
+                    debug!(error = %err, "Cluster server certificate not available yet");
+                    Duration::from_secs(2)
+                }
+                Err(_) => Duration::from_secs(2),
+            };
+            tokio::time::sleep(delay).await;
+        }
+    });
+}
+
+/// The manager's API listener as a connection stream for
+/// `serve_with_incoming`: TLS for workers (the cluster certificate for
+/// `manager.legion`, the operator's for every other name) and, unless the
+/// operator turned `server.tls` on, plaintext for the CLI and UI on the same
+/// port, told apart by the first byte (docs/auth-and-acls.md, "Workers
+/// reach managers over TLS"). Tests serve a manager with it too.
+pub fn manager_incoming(
+    store: &Store,
+    listener: tokio::net::TcpListener,
+    operator: Option<Arc<rustls::sign::CertifiedKey>>,
+) -> R<tokio_stream::wrappers::ReceiverStream<std::io::Result<crate::cluster_tls::MaybeTlsStream>>>
+{
+    let cluster = crate::cluster_tls::SwappableIdentity::new();
+    // Mint now when the CA exists, so the first worker connection does not
+    // race the refresher.
+    if let Ok(materials) = crate::manager::worker_plane::WorkerPlane::global().materials(store) {
+        if let Some(key) = materials.server_identity.current() {
+            cluster.set(key);
+        }
+    }
+    keep_manager_server_cert(store.clone(), cluster.clone());
+    let tls_only = operator.is_some();
+    let config = crate::cluster_tls::server_config(
+        Arc::new(crate::cluster_tls::ManagerServerCerts { cluster, operator }),
+        None,
+        true,
+    )?;
+    Ok(crate::cluster_tls::sniffing_incoming(
+        listener, config, tls_only,
+    ))
 }
 
 /// Everything the status checker needs from the manager config, resolved once

@@ -217,6 +217,18 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let boot_fence =
         boot_state_store(name_override).map(|store| tokio::spawn(run_boot_fence(store)));
 
+    // Every connection to the manager is TLS verified against the join
+    // token's CA pin, from the first byte of the first one, before the join
+    // secret is sent (worker-plane-auth plan §6.8).
+    match ca_pin.as_deref().filter(|pin| !pin.is_empty()) {
+        Some(pin) => {
+            crate::worker::plane::trust_manager(&manager_addr, pin)?;
+        }
+        None => bail!(
+            "no cluster CA pin for the manager at {manager_addr}; join with a token from \
+             `legion join-token create`"
+        ),
+    }
     let client: ManagerClient<Channel> = connect_manager_with_retry(&manager_addr).await?;
     let credentials = Arc::new(WorkerCredentials::with_join_secret(join_secret));
 
@@ -242,6 +254,11 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         None,
         ca_pin.clone(),
     )?;
+    // A persisted bundle was pin-checked when it was first accepted; from
+    // here on it, not the token's pin, is what the manager must chain to.
+    if let Some(roots) = node_identity.roots() {
+        crate::worker::plane::trust_manager_bundle(&manager_addr, roots);
+    }
     // The datapath's persisted inputs, replayed before the first heartbeat
     // (docs/network-handlers.md, "The datapath across worker restarts").
     let _ = NETD_STATE.set(crate::worker::netd::state::NetdStateStore::beside(
@@ -365,7 +382,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             &config.pool,
             client.clone(),
             credentials.clone(),
-        )))
+        )?))
     } else {
         None
     };
@@ -594,7 +611,7 @@ fn build_edge_boot_runtime(
     pool: &str,
     client: ManagerClient<Channel>,
     credentials: Arc<WorkerCredentials>,
-) -> crate::worker::server::EdgeBootRuntime {
+) -> R<crate::worker::server::EdgeBootRuntime> {
     let refresh = humantime::parse_duration(&config.jwks_refresh)
         .unwrap_or(crate::worker::boot_ticket::DEFAULT_JWKS_REFRESH);
     let skew = humantime::parse_duration(&config.clock_skew)
@@ -603,12 +620,16 @@ fn build_edge_boot_runtime(
     // what its join token pointed at), and the JWKS lives at the well-known
     // path the manager serves alongside gRPC.
     let issuer = manager_addr.trim_end_matches('/').to_string();
-    let jwks_url = format!("{issuer}/.well-known/jwks.json");
-    let source = Box::new(crate::worker::boot_ticket::HttpJwksSource::new(
-        jwks_url,
+    // The JWKS rides the same pinned TLS as every other manager call: keys
+    // an on-path attacker could swap would let it forge tickets.
+    let verifier = crate::worker::plane::manager_verifier(manager_addr)
+        .context("edge boot needs the manager's CA pin to fetch the JWKS over TLS")?;
+    let source = Box::new(crate::worker::boot_ticket::PinnedJwksSource::new(
+        manager_addr,
+        verifier,
         Duration::from_secs(5),
-    ));
-    crate::worker::server::EdgeBootRuntime {
+    )?);
+    Ok(crate::worker::server::EdgeBootRuntime {
         verifier: Arc::new(crate::worker::boot_ticket::BootTicketVerifier::new(
             source, issuer, pool, refresh, skew,
         )),
@@ -618,7 +639,7 @@ fn build_edge_boot_runtime(
             client,
             credentials,
         }),
-    }
+    })
 }
 
 /// Ratifies claims by calling the manager's `RatifyClaim`, authenticated with
@@ -690,8 +711,22 @@ pub(crate) async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerC
     let max_backoff = Duration::from_secs(5);
 
     loop {
-        match create_manager_client(manager_addr.to_string(), String::new()).await {
-            Ok(client) => return Ok(client),
+        match crate::worker::plane::manager_channel(manager_addr).await {
+            Ok(channel) => return Ok(ManagerClient::new(channel)),
+            Err(err) if format!("{err:?}").contains("CA pin mismatch") => {
+                // Not a transient failure: whatever answers at this address
+                // is not the cluster this worker's token names.
+                let presented: Vec<String> = Vec::new();
+                let pin = match crate::worker::plane::manager_verifier(manager_addr)
+                    .map(|verifier| verifier.trust())
+                {
+                    Some(crate::cluster_tls::ManagerTrust::Pin(pin)) => pin,
+                    _ => String::new(),
+                };
+                return Err(anyhow::Error::new(crate::worker::plane::PinMismatch(
+                    crate::cluster_tls::pin_mismatch_message(manager_addr, &presented, &pin),
+                )));
+            }
             Err(err) => {
                 warn!(
                     error = ?err,
@@ -959,22 +994,6 @@ fn ensure_dir(path: &Path) -> R<()> {
     }
     fs::create_dir_all(path)?;
     Ok(())
-}
-
-#[instrument(err, skip_all)]
-async fn create_manager_client(
-    manager_addr: String,
-    _ca_cert: String,
-) -> R<ManagerClient<Channel>> {
-    // let ca_cert = Certificate::from_pem(ca_cert);
-    // let tls: ClientTlsConfig = ClientTlsConfig::new().ca_certificate(ca_cert);
-    let channel = Channel::from_shared(manager_addr)?
-        // .tls_config(tls)? TODO: Temporarily doesn' do any TLS
-        .connect()
-        .await?;
-    let client = ManagerClient::new(channel);
-
-    Ok(client)
 }
 
 // Failed heartbeats retry forever with exponential backoff in this range. The

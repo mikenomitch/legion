@@ -3,8 +3,8 @@
 > **Judgement calls:** [worker-plane-auth-plan_calls.md](../calls/worker-plane-auth-plan_calls.md)
 
 **Status: IN EXECUTION.** Phases 0 (ACLs on by default), 1 (the mTLS worker
-plane), 2 (the host guard in the datapath), and 3 (Linux containers gated by
-default) shipped. The plan
+plane), 2 (the host guard in the datapath), 3 (Linux containers gated by
+default), and 4 (the encrypted worker-to-manager channel) shipped. The plan
 has two halves that share one threat: something reaching a node's control
 plane that shouldn't.
 
@@ -1502,6 +1502,12 @@ item in `internal_docs/TODO.md`.
   each, unoptimized build). Not run: a real gated service end to end (a stock
   `nginx` on its advertised port with the default deny), and the AWS spot
   check.
+- **Phase 4** ran on the same VM: the sniffing listener (TLS and plaintext on
+  one port, operator certificate selection, a foreign CA refused), the
+  pinned JWKS fetch against a TLS server, the simulator fleet and the
+  in-process worker joining over TLS, and `worker_plane_e2e` through a CA
+  rotation. Not run: a worker on another host, and a multi-manager raft
+  cluster with `server.tls` (raft TLS is deferred).
 
 ## 10. Rollout and backward compatibility
 

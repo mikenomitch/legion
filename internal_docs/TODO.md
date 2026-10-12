@@ -66,8 +66,17 @@ How to use it:
         and namespace pieces are tested separately
         (`tests/gated_container_default.rs`,
         `netns::tests::gated_start_overhead_benchmark`).
-  - [ ] Phase 4: the encrypted worker-to-manager channel, with the ticket
-        JWKS fetched over it (plan §6.8).
+  - [x] Phase 4: the encrypted worker-to-manager channel, with the ticket
+        JWKS fetched over it (plan §6.8; calls 32 to 34). The manager's API
+        port answers TLS for `manager.legion` with its cluster certificate and
+        plaintext for the CLI and UI, told apart by the first byte; workers
+        always dial TLS pinned to the CA. Docs:
+        [auth-and-acls.md](../docs/auth-and-acls.md#workers-reach-managers-over-tls).
+  - [ ] Raft peers still dial each other in plaintext, and with `server.tls`
+        on the API port drops plaintext, which a multi-manager raft cluster
+        needs (`src/storage/raft/network.rs:197`, `driver.rs:934`). Deferred by
+        the plan (non-goals); listed in
+        [architecture-managers-workers.md](../docs/architecture-managers-workers.md#what-is-not-implemented-yet).
   - [ ] Phase 5: the host guard in the kernel: an `nftables` table matched by
         allocation cgroup, and a cgroup leaf for every task (plan §6.13).
   - [ ] Phase 6: the container privilege floor: per-allocation user
@@ -155,11 +164,9 @@ How to use it:
         (`src/storage/raft/forward.rs`), so it returns `FAILED_PRECONDITION`.
         Workers also learn only the one manager in their token. Inferred from
         code, not yet reproduced.
-  - [ ] **The worker never uses TLS to reach the manager**, even when
-        `server.tls` is on (`src/worker/daemon.rs:799-811`), and raft peers
-        dial `http://` only. `docs/auth-and-acls.md` claims listener TLS
-        "already covers transport encryption." Phase 4 of the worker-plane
-        plan covers the worker half. Fix the doc claim now.
+  - [x] **The worker never uses TLS to reach the manager.** Fixed by
+        worker-plane-auth Phase 4; the doc claim is gone. Raft peers dialing
+        `http://` stays open above.
   - [ ] **`configs/jobs/tls-edge.ncl` listens on the wrong port on Linux.** It
         declares `static = 9443, to = 443`, but `to` only applies on macOS, so
         nginx binds host :443 while the comment curls :9443.

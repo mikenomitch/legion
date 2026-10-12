@@ -162,16 +162,23 @@ fn logs_exec_and_ca_rotation_work_over_the_mtls_worker_plane_test() {
                 .or_else(|| nodes["data"]["nodes"].as_array())
                 .is_some_and(|nodes| !nodes.is_empty())
     });
-    let log = std::fs::read_to_string(cluster.dir.path().join("manager.log")).unwrap_or_default();
     cluster.wait_for("the worker plane to listen", || {
         std::fs::read_to_string(cluster.dir.path().join("manager.log"))
             .unwrap_or_default()
             .contains("Worker plane listening on 127.0.0.1")
     });
+    let log = std::fs::read_to_string(cluster.dir.path().join("manager.log")).unwrap_or_default();
+    let plane_line = log
+        .lines()
+        .find(|line| line.contains("Worker plane listening"))
+        .unwrap_or_default();
     assert!(
-        !log.contains("plaintext"),
-        "no plaintext worker plane: {log}"
+        plane_line.contains("(mTLS)"),
+        "the worker plane is mTLS: {plane_line}"
     );
+    // The in-process worker reached the manager over TLS: it registered and
+    // was issued its certificate through that channel.
+    assert!(log.contains("Node certificate issued"), "{log}");
 
     let job = cluster.dir.path().join("e2e.json");
     std::fs::write(

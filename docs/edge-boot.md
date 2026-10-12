@@ -305,7 +305,10 @@ holding or booting anything.
 
 1. signature against a cached JWKS (fetched on first use, refreshed on a `kid`
    miss and on `edgeBoot.jwksRefresh`. **A fetch failure never invalidates
-   cached keys**)
+   cached keys**). The JWKS is fetched over TLS that verifies the manager's
+   cluster certificate (`manager.legion`) against the cluster CA, so an
+   on-path attacker cannot swap the keys
+   ([auth-and-acls.md](auth-and-acls.md#workers-reach-managers-over-tls))
 2. `iss`, `aud == legion:node`, `exp`/`nbf` with bounded clock skew
 3. `legion.io/pool` against this node's own pool
 4. `legion.io/gate` intersected with the task's `speculativeStart.mode` (the
@@ -479,12 +482,6 @@ Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
 
 ## Known limitations
 
-- **The JWKS travels in plaintext until the worker-to-manager channel is
-  encrypted.** A worker fetches the keys that verify boot tickets from
-  `<manager addr>/.well-known/jwks.json`. Over a plaintext manager address an
-  on-path attacker could swap them and mint tickets this node accepts.
-  Run edge workers on a network you trust, or serve the manager with
-  `server.tls`.
 - **No island mode.** An unratified start that cannot reach a manager dies
   when its lease expires. Edge boot does not keep work running through a long
   control-plane outage.

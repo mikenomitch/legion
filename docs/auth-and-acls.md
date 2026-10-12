@@ -414,8 +414,9 @@ See [Managers and Workers](architecture-managers-workers.md#the-worker-plane)
 for the caller-class table and the ports, and [Rotating the cluster
 CA](#rotating-the-cluster-ca) below.
 
-The worker's own connection to the manager (registration, heartbeats) is
-still plaintext unless the manager serves TLS: see the TLS section below.
+The worker's own connection to the manager (registration, heartbeats, the
+JWKS) is always TLS, verified against the same CA: see
+[Workers reach managers over TLS](#workers-reach-managers-over-tls) below.
 
 ### Rotating the cluster CA
 
@@ -459,6 +460,33 @@ The exec WebSocket listener (`server.port + 1`, used by the UI terminal and
 actions) serves TLS with the same certificate and key. The telemetry
 listener (`/metrics` and health probes, `server.port + 2` by default) stays
 plaintext whatever `server.tls` says.
+
+#### Workers reach managers over TLS
+
+Workers always speak TLS to the manager's API port, whether or not the
+operator turned `server.tls` on. Registration, heartbeats (whose replies
+carry rendered KV secrets and identity tokens), artifact credentials, and
+the JWKS that boot and exec tickets are verified against all ride it.
+
+- The worker sends the name `manager.legion`, and the manager answers that
+  name with its cluster server certificate (`manager.legion`,
+  `legion://manager/<id>`), signed by the cluster CA. Any other name gets
+  the operator's `server.tls` certificate when one is configured.
+- The worker verifies that certificate against its join token's CA pin from
+  the first byte of the first connection, before it sends its join secret,
+  and against the cluster CA bundle once it holds one. A manager whose CA
+  does not match is refused with the same message as a pin mismatch at
+  join.
+- Without `server.tls`, the manager tells TLS from plaintext by the
+  connection's first byte (a TLS handshake starts with `0x16`, HTTP never
+  does), so the CLI and the UI keep using `http://` on the same port while
+  every worker uses TLS. With `server.tls` on, a plaintext connection is
+  dropped.
+- A join token keeps the address the manager advertises, `http://` or
+  `https://`. The worker dials TLS to that host and port either way.
+
+Raft traffic between managers is not covered: it stays plaintext on the
+managers' network.
 
 ### Introspection
 

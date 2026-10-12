@@ -764,22 +764,10 @@ pub fn tls_channel(
     let target = host_port(address)?;
     let sni = ServerName::try_from(sni.to_string())
         .map_err(|err| anyhow!("invalid TLS server name {sni:?}: {err}"))?;
-    let connector = tokio_rustls::TlsConnector::from(config);
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{target}"))?
         .connect_timeout(std::time::Duration::from_secs(5))
         .tcp_nodelay(true);
-    let service = tower::service_fn(move |_uri: http::Uri| {
-        let target = target.clone();
-        let sni = sni.clone();
-        let connector = connector.clone();
-        async move {
-            let tcp = tokio::net::TcpStream::connect(&target).await?;
-            let _ = tcp.set_nodelay(true);
-            let tls = connector.connect(sni, tcp).await?;
-            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tls))
-        }
-    });
-    Ok(endpoint.connect_with_connector_lazy(service))
+    Ok(endpoint.connect_with_connector_lazy(tls_connector(target, sni, config)))
 }
 
 /// Accepts TCP connections and completes TLS handshakes off the accept loop,
@@ -830,6 +818,231 @@ pub fn tls_incoming(
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
+/// What a manager presents on its API port (worker-plane-auth plan §6.8):
+/// the cluster server certificate (`manager.legion`) to a client that asks
+/// for that name, and the operator's `server.tls` certificate, when one is
+/// configured, to everyone else. Without an operator certificate every TLS
+/// client gets the cluster certificate. Workers always send
+/// `manager.legion`, so they never need the operator's CA, and the CLI and
+/// browsers never see a certificate they cannot verify.
+#[derive(Debug)]
+pub struct ManagerServerCerts {
+    pub cluster: Arc<SwappableIdentity>,
+    pub operator: Option<Arc<CertifiedKey>>,
+}
+
+impl ResolvesServerCert for ManagerServerCerts {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let wants_cluster = client_hello
+            .server_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case(MANAGER_SERVER_NAME));
+        match (&self.operator, wants_cluster) {
+            (Some(operator), false) => Some(operator.clone()),
+            _ => self.cluster.current(),
+        }
+    }
+}
+
+/// A connection on the manager's API port: TLS, or plaintext for the CLI and
+/// UI when the operator has not turned `server.tls` on.
+pub enum MaybeTlsStream {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl tonic::transport::server::Connected for MaybeTlsStream {
+    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        match self {
+            MaybeTlsStream::Plain(tcp) => tcp.connect_info(),
+            MaybeTlsStream::Tls(tls) => tls.get_ref().0.connect_info(),
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for MaybeTlsStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(tcp) => std::pin::Pin::new(tcp).poll_read(cx, buf),
+            MaybeTlsStream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for MaybeTlsStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(tcp) => std::pin::Pin::new(tcp).poll_write(cx, buf),
+            MaybeTlsStream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(tcp) => std::pin::Pin::new(tcp).poll_flush(cx),
+            MaybeTlsStream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(tcp) => std::pin::Pin::new(tcp).poll_shutdown(cx),
+            MaybeTlsStream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_shutdown(cx),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(tcp) => std::pin::Pin::new(tcp).poll_write_vectored(cx, bufs),
+            MaybeTlsStream::Tls(tls) => {
+                std::pin::Pin::new(tls.as_mut()).poll_write_vectored(cx, bufs)
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            MaybeTlsStream::Plain(tcp) => tcp.is_write_vectored(),
+            MaybeTlsStream::Tls(tls) => tls.is_write_vectored(),
+        }
+    }
+}
+
+/// The first byte of every TLS connection (a handshake record). HTTP/2's
+/// preface starts with `P` and an HTTP/1 request with a method name, so one
+/// peeked byte tells the two apart.
+pub const TLS_HANDSHAKE_BYTE: u8 = 0x16;
+
+/// Accepts connections on the manager's API port and sorts them by their
+/// first byte: a TLS handshake is completed with `config`, anything else is
+/// passed through as plaintext, unless `tls_only` (the operator turned
+/// `server.tls` on), in which case it is dropped. Handshakes run off the
+/// accept loop, as in [`tls_incoming`].
+pub fn sniffing_incoming(
+    listener: tokio::net::TcpListener,
+    config: Arc<ServerConfig>,
+    tls_only: bool,
+) -> tokio_stream::wrappers::ReceiverStream<std::io::Result<MaybeTlsStream>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    tokio::spawn(async move {
+        loop {
+            let (tcp, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    warn!(error = ?err, "Manager listener accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            let _ = tcp.set_nodelay(true);
+            if tx.is_closed() {
+                break;
+            }
+            let acceptor = acceptor.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let classified = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let mut first = [0u8; 1];
+                    let peeked = tcp.peek(&mut first).await?;
+                    if peeked == 1 && first[0] == TLS_HANDSHAKE_BYTE {
+                        let tls = acceptor.accept(tcp).await?;
+                        Ok::<_, std::io::Error>(Some(MaybeTlsStream::Tls(Box::new(tls))))
+                    } else if tls_only || peeked == 0 {
+                        Ok(None)
+                    } else {
+                        Ok(Some(MaybeTlsStream::Plain(tcp)))
+                    }
+                })
+                .await;
+                match classified {
+                    Ok(Ok(Some(stream))) => {
+                        let _ = tx.send(Ok(stream)).await;
+                    }
+                    Ok(Ok(None)) => {
+                        debug!(%peer, "Dropped a plaintext connection on a TLS-only listener")
+                    }
+                    Ok(Err(err)) => debug!(%peer, error = %err, "Manager TLS handshake failed"),
+                    Err(_) => debug!(%peer, "Manager connection sent nothing in time"),
+                }
+            });
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+/// The connector behind [`tls_channel`] and [`tls_connect`]: TCP to
+/// `target`, then TLS naming `sni`.
+fn tls_connector(
+    target: String,
+    sni: ServerName<'static>,
+    config: Arc<ClientConfig>,
+) -> impl tower::Service<
+    http::Uri,
+    Response = hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    Error = std::io::Error,
+    Future = impl std::future::Future<
+        Output = std::io::Result<
+            hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+        >,
+    > + Send
+                 + 'static,
+> + Clone
+       + Send
+       + 'static {
+    let connector = tokio_rustls::TlsConnector::from(config);
+    tower::service_fn(move |_uri: http::Uri| {
+        let target = target.clone();
+        let sni = sni.clone();
+        let connector = connector.clone();
+        async move {
+            let tcp = tokio::net::TcpStream::connect(&target).await?;
+            let _ = tcp.set_nodelay(true);
+            let tls = connector.connect(sni, tcp).await?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tls))
+        }
+    })
+}
+
+/// [`tls_channel`], connected before it returns: the first TCP connection
+/// and TLS handshake (including the server certificate check) happen here,
+/// so a caller that retries a dead or impostor manager sees the failure.
+pub async fn tls_connect(
+    address: &str,
+    config: Arc<ClientConfig>,
+    sni: &str,
+) -> R<tonic::transport::Channel> {
+    let target = host_port(address)?;
+    let sni = ServerName::try_from(sni.to_string())
+        .map_err(|err| anyhow!("invalid TLS server name {sni:?}: {err}"))?;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{target}"))?
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .tcp_nodelay(true);
+    endpoint
+        .connect_with_connector(tls_connector(target.clone(), sni, config))
+        .await
+        .with_context(|| format!("TLS connection to {address}"))
+}
+
 #[cfg(test)]
 mod cluster_tls_test {
     use super::*;
@@ -868,5 +1081,123 @@ mod cluster_tls_test {
         assert!(message.contains("sha256:51aa07"), "{message}");
         assert!(message.contains("sha256:9c1e4f"), "{message}");
         assert!(message.contains("legion join-token create"), "{message}");
+    }
+
+    /// A manager's cluster server certificate from a fresh CA, and the CA's
+    /// pin.
+    fn manager_server_key() -> R<(Arc<CertifiedKey>, String)> {
+        let (ca_pem, ca_key) = crate::manager::mesh_ca::generate_ca()?;
+        let (cert, key, _) = crate::manager::mesh_ca::issue_manager_cert(
+            &ca_pem,
+            &ca_key,
+            "m1",
+            crate::manager::mesh_ca::ManagerCertKind::Server,
+        )?;
+        Ok((
+            certified_key(&format!("{cert}{ca_pem}"), &key)?,
+            ca_pin_pem(&ca_pem)?,
+        ))
+    }
+
+    async fn sniffing(
+        operator: Option<Arc<CertifiedKey>>,
+    ) -> R<(
+        std::net::SocketAddr,
+        tokio_stream::wrappers::ReceiverStream<std::io::Result<MaybeTlsStream>>,
+        String,
+    )> {
+        let (cluster_key, pin) = manager_server_key()?;
+        let cluster = SwappableIdentity::new();
+        cluster.set(cluster_key);
+        let tls_only = operator.is_some();
+        let config = server_config(
+            Arc::new(ManagerServerCerts { cluster, operator }),
+            None,
+            true,
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        Ok((addr, sniffing_incoming(listener, config, tls_only), pin))
+    }
+
+    async fn tls_client(
+        addr: std::net::SocketAddr,
+        pin: &str,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        let verifier = PinnedManagerVerifier::new(ManagerTrust::Pin(pin.to_string()));
+        let config = client_config(verifier, None).expect("client config");
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        tokio_rustls::TlsConnector::from(config)
+            .connect(
+                ServerName::try_from(MANAGER_SERVER_NAME.to_string()).expect("name"),
+                tcp,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn the_manager_port_serves_tls_to_workers_and_plaintext_to_the_cli_test() -> R<()> {
+        use tokio::io::AsyncWriteExt;
+        use tokio_stream::StreamExt;
+        let (addr, mut incoming, pin) = sniffing(None).await?;
+
+        // A worker's TLS handshake, verified against the CA pin.
+        let client = tokio::spawn(async move { tls_client(addr, &pin).await });
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.next())
+            .await?
+            .context("a connection")??;
+        assert!(matches!(accepted, MaybeTlsStream::Tls(_)));
+        client
+            .await?
+            .context("the worker verified the cluster certificate")?;
+
+        // The CLI's plaintext HTTP/2 preface on the same port.
+        let mut plain = tokio::net::TcpStream::connect(addr).await?;
+        plain.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await?;
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.next())
+            .await?
+            .context("a connection")??;
+        assert!(matches!(accepted, MaybeTlsStream::Plain(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_worker_refuses_a_manager_from_another_cluster_test() -> R<()> {
+        use tokio_stream::StreamExt;
+        let (addr, mut incoming, _pin) = sniffing(None).await?;
+        let (_, other_pin) = manager_server_key()?;
+        let client = tokio::spawn(async move { tls_client(addr, &other_pin).await });
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), incoming.next()).await;
+        let err = client.await?.expect_err("the pin does not match");
+        assert!(err.to_string().contains("CA pin mismatch"), "{err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_operator_tls_workers_still_get_the_cluster_certificate_test() -> R<()> {
+        use tokio::io::AsyncWriteExt;
+        use tokio_stream::StreamExt;
+        // The operator's certificate comes from somewhere else entirely.
+        let (operator, _) = manager_server_key()?;
+        let (addr, mut incoming, pin) = sniffing(Some(operator)).await?;
+        let client = tokio::spawn(async move { tls_client(addr, &pin).await });
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.next())
+            .await?
+            .context("a connection")??;
+        assert!(matches!(accepted, MaybeTlsStream::Tls(_)));
+        client
+            .await?
+            .context("`manager.legion` selects the cluster certificate")?;
+
+        // Plaintext is dropped when the operator turned TLS on.
+        let mut plain = tokio::net::TcpStream::connect(addr).await?;
+        plain.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await?;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), incoming.next())
+                .await
+                .is_err(),
+            "no plaintext connection is yielded"
+        );
+        Ok(())
     }
 }

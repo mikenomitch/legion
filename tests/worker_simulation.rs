@@ -43,13 +43,15 @@ fn setup_store(dir: &TempDir) -> R<Store> {
     Ok(store)
 }
 
-/// Serve a real manager service on an ephemeral loopback port.
+/// Serve a real manager service on an ephemeral loopback port, on the same
+/// listener a manager uses: TLS with the cluster certificate for workers,
+/// plaintext for everything else.
 async fn serve_manager(store: &Store) -> R<(String, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
     let service = ManagerServer::new(ManagerDaemonService::new(store.clone()));
+    let incoming = legion::manager::daemon::manager_incoming(store, listener, None)?;
     let handle = tokio::spawn(async move {
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         if let Err(err) = tonic::transport::Server::builder()
             .add_service(service)
             .serve_with_incoming(incoming)
@@ -93,7 +95,17 @@ fn write_profiles(dir: &TempDir) -> R<String> {
         .to_string())
 }
 
-async fn launch_fleet(dir: &TempDir, manager_addr: String, count: usize) -> R<SimFleetRun> {
+/// The cluster CA pin a join token for `store`'s cluster carries.
+fn ca_pin(store: &Store) -> R<String> {
+    store.ensure_mesh_ca()?.pin()
+}
+
+async fn launch_fleet(
+    dir: &TempDir,
+    store: &Store,
+    manager_addr: String,
+    count: usize,
+) -> R<SimFleetRun> {
     let opts = SimulateOptions {
         count,
         profiles_path: Some(write_profiles(dir)?),
@@ -103,7 +115,14 @@ async fn launch_fleet(dir: &TempDir, manager_addr: String, count: usize) -> R<Si
         advertise_host: Some("127.0.0.1".into()),
         identity_dir: Some(dir.path().join("fleet-identity")),
     };
-    launch_simulated_fleet(manager_addr, "default".into(), None, None, opts).await
+    launch_simulated_fleet(
+        manager_addr,
+        "default".into(),
+        None,
+        Some(ca_pin(store)?),
+        opts,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -112,7 +131,7 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
     let store = setup_store(&dir)?;
     let (manager_addr, _manager) = serve_manager(&store).await?;
 
-    let fleet = launch_fleet(&dir, manager_addr, 8).await?;
+    let fleet = launch_fleet(&dir, &store, manager_addr, 8).await?;
     wait_until("all 8 sim nodes registered", || fleet.registered() == 8).await;
 
     // Profile-weighted fleet shape and attrs, as the manager sees them.
@@ -219,7 +238,7 @@ async fn simulated_fleet_feeds_the_worker_metric_registry() -> R<()> {
     let registrations_before = metrics.simulated_registrations_total.get(&["ok"]);
     let heartbeats_before = metrics.heartbeats_total.get(&["ok"]);
 
-    let fleet = launch_fleet(&dir, manager_addr, 4).await?;
+    let fleet = launch_fleet(&dir, &store, manager_addr, 4).await?;
     wait_until("fleet registered", || fleet.registered() == 4).await;
 
     assert!(
@@ -271,7 +290,7 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
     let store = setup_store(&dir)?;
     let (manager_addr, _manager) = serve_manager(&store).await?;
 
-    let fleet = launch_fleet(&dir, manager_addr, 4).await?;
+    let fleet = launch_fleet(&dir, &store, manager_addr, 4).await?;
     wait_until("fleet registered", || fleet.registered() == 4).await;
 
     // Push dispatch (the manager's PostWork path) routes on node_id. The

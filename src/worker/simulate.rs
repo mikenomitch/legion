@@ -556,6 +556,17 @@ pub async fn launch_simulated_fleet(
         .count
         .div_ceil(SIM_NODES_PER_CHANNEL)
         .clamp(1, SIM_MAX_CHANNELS);
+    // Every manager connection is TLS verified against the join token's CA
+    // pin (worker-plane-auth plan §6.8).
+    match ca_pin.as_deref().filter(|pin| !pin.is_empty()) {
+        Some(pin) => {
+            crate::worker::plane::trust_manager(&manager_addr, pin)?;
+        }
+        None => bail!(
+            "no cluster CA pin for the manager at {manager_addr}; start the fleet with a \
+             token from `legion join-token create`"
+        ),
+    }
     let mut clients: Vec<ManagerClient<Channel>> = Vec::with_capacity(channel_count);
     for _ in 0..channel_count {
         clients.push(connect_manager_with_retry(&manager_addr).await?);
@@ -650,6 +661,9 @@ pub async fn launch_simulated_fleet(
         Some(fleet_name.clone()),
         ca_pin,
     )?;
+    if let Some(roots) = fleet_identity.roots() {
+        crate::worker::plane::trust_manager_bundle(&manager_addr, roots);
+    }
     let server_fleet = fleet.clone();
     let issuer_client = clients[0].clone();
     let issuer_manager = manager_addr.clone();
