@@ -194,6 +194,13 @@ How to use it:
       [plan](plans/launch-spot-check-fixes-plan.md) §8.7 ·
       [calls](calls/launch-spot-check-fixes-plan_calls.md)). Each was
       deliberately deferred or found along the way.
+  - [ ] **Run the sandbox spot check** (RUNBOOK §12,
+        `tests/spot-check/smoke.sh sandboxes`; added 2026-10-12, never run).
+        Covers microVM exec, egress and the host guard, credential
+        injection, suspend/resume (local and store), idle and gateway wake,
+        memory pressure, preemption, and session mode. Needs `legion-guest`
+        on the workers and the config changes in RUNBOOK §12.0. The steps
+        marked PR #36 need the session-durability work.
   - [ ] **Re-run the AWS spot check without the shims**
         (`tests/spot-check/smoke.sh` and the RUNBOOK human pass on the
         `spot-check/launch` branch). Nothing in #17 ran on the real rig.
@@ -1793,6 +1800,13 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         labelled projections; record them in plan §14 and
         `benchmarks/scheduler/README.md`
         ([calls](calls/sandbox-scaling-plan_calls.md) #20, #60).
+  - [ ] **Run the bottleneck measurements.** "Bottleneck measurements
+        without a big fleet" in `benchmarks/aws/README.md` (added
+        2026-10-12, never run) covers 14 bottlenecks on a laptop, a sim
+        fleet, or one KVM worker. Its Gaps list names the missing harnesses
+        (loadgen session mode, sessions in `--simulate`, a fixed-delay fake
+        launch, sessions.db and ticket-cache benches, a real-runtime
+        restore loop).
   - [ ] **Suspend and resume still wait on heartbeats.** Checkpoint
         requests and reports ride the heartbeat, so a suspend takes ~3 s and
         a resume ~2 s at p50 on the default 2 s cadence, while placements

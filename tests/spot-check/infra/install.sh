@@ -32,6 +32,23 @@ done
 wait
 sc_log "Installed $(sc_ssh "$mgr1" legion --version)"
 
+# The static guest agent, beside the worker binary. The agent image is Alpine
+# (musl), so without it microVM exec and gated networking fail closed
+# (docs/task-runtime-sandbox.md, "The guest agent"; RUNBOOK 12.0). Skipped
+# with a warning when it has not been built.
+guest="${SC_GUEST_BINARY:-$SC_REPO/target-linux-amd64/x86_64-unknown-linux-musl/dist/legion-guest}"
+if [ -x "$guest" ]; then
+    sc_log "Uploading legion-guest to the workers"
+    aws s3 cp --quiet "$guest" "s3://$SC_BUCKET/legion-guest"
+    gurl="$(aws s3 presign "s3://$SC_BUCKET/legion-guest" --expires-in 3600)"
+    for name in "${SC_WORKERS[@]}"; do
+        sc_ssh "$name" "sudo curl -fsS -o /opt/legion/bin/legion-guest.new '$gurl' && sudo install -m 0755 /opt/legion/bin/legion-guest.new /opt/legion/bin/legion-guest && sudo rm /opt/legion/bin/legion-guest.new" &
+    done
+    wait
+else
+    sc_log "WARNING: no legion-guest at $guest; microVM exec and gated networking will fail closed (RUNBOOK 12.0)"
+fi
+
 if [ -n "${SC_ONLY_BINARY:-}" ]; then
     # Managers first, followers before the leader, then workers
     # (docs/upgrades.md). Restarting is enough: state lives in /var/lib/legion.
