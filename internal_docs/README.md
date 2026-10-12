@@ -106,6 +106,7 @@ When one is required and what goes in it:
 | [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | planned (gated sandboxes take memory checkpoints and become the sandbox default with deny-by-default egress, Legion-addressed TAPs as the fallback; Phase 0 is a real-VMM gate) |
 | [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
 | [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
+| [job-status-plan.md](plans/job-status-plan.md) | shipped (per-replica outcomes and status-change events deferred) |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
 | [checkpoint-encryption-plan.md](plans/checkpoint-encryption-plan.md) | shipped (2026-10-11: published checkpoint parts sealed under per-part keys from the keyring's checkpoint key, with manual checkpoint-key rotation, parallel sealing, and streaming decrypt deferred) |
@@ -196,6 +197,7 @@ by project impact. The full template and a worked example:
 - [heartbeat-scale-plan_calls.md](calls/heartbeat-scale-plan_calls.md)
 - [host-convergence-plan_calls.md](calls/host-convergence-plan_calls.md)
 - [host-process-supervision-plan_calls.md](calls/host-process-supervision-plan_calls.md)
+- [job-status-plan_calls.md](calls/job-status-plan_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
 - [jsonb-text-affinity-plan_calls.md](calls/jsonb-text-affinity-plan_calls.md)
 - [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)

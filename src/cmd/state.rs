@@ -20,7 +20,10 @@ pub const AGENT_SAVED_QUERIES: &[(&str, &str)] = &[
     ),
     (
         "agent:jobs-overview",
-        "SELECT j.id AS job, j.status, COUNT(a.id) AS allocations \
+        // `job.status` is the stored lifecycle flag, not the derived status
+        // `legion job list` shows, so it is labelled `lifecycle` here.
+        "SELECT j.id AS job, j.status AS lifecycle, COUNT(a.id) AS allocations, \
+         COALESCE(SUM(a.status NOT IN ('complete','failed','suspended')), 0) AS live \
          FROM job j \
          LEFT JOIN job_config jc ON jc.job_id = j.id \
          LEFT JOIN allocation a ON a.job_config_id = jc.id \

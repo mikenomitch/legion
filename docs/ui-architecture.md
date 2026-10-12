@@ -230,11 +230,11 @@ the Access page reports it instead.
   [Job Timestamps](jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).
   The list is sorted newest-change-first by default, matching Rollouts,
   Templates, and Manager. The job detail view (`pages/details/JobDetail.tsx`):
-  - shows created/updated under the title, and a tooltip on the `done`
-    badge. The tooltip explains that `done` is the manager's word for an
-    accepted, scheduled job, not a finished one.
-  - offers **Stop job** (two-step confirm, hidden once the job is stopped,
-    failed or destroyed) beside **Delete job**, both gated by `job:write`.
+  - shows created/updated under the title, and a tooltip on the status
+    badge that says what the derived status means (for example, `pending`:
+    a task is waiting to be placed or for a dependency).
+  - offers **Stop job** (two-step confirm, hidden once the job is stopped
+    or destroyed) beside **Delete job**, both gated by `job:write`.
     Destroy needs a stopped job first, which is why Stop lives there.
   - has a **Scale** card (`components/ScalePanel.tsx`). Per task, it shows
     the spec count, the override with its source and age, the effective count
@@ -481,8 +481,11 @@ pages and the fixtures share one vocabulary.
   the same checks the RPCs apply, and shows its blocker message as the
   tooltip. Against a manager without the field the UI falls back to the job
   spec.
-- **Job status.** The manager stores `done` for every accepted job. The job
-  page shows `running` while any allocation or instance of the job is live.
+- **Job status.** The Jobs index and the job page both show the status the
+  manager derives from the workload (`running`, `pending`, `complete`,
+  `scheduled`, `failed`, `suspended`, `idle`, `stopped`; see
+  [Job Status](jobs-tasks-and-scheduling.md#job-status)). The status chips
+  filter on it.
 - **Events.** `snapshot` and `instance` are filter categories, and their
   expanded rows show the snapshot, instance, kind, size, durations, forks,
   and error above the raw JSON.
@@ -496,8 +499,6 @@ Known limitations:
 - Pressure history comes from the bounded event journal and needs
   `operator:read`. A job-scoped token sees no Memory pressure card, though
   each instance row still shows its own last stop.
-- The Jobs index lists the stored status, so a running job reads `done`
-  there.
 - Instances, including from a snapshot (`legion instance create
   --from-snapshot`), are created and destroyed from the CLI only.
 - The content card shows no content store budgets: `GetNodeContent` reads

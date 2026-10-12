@@ -95,7 +95,7 @@ fn job_list_schema() -> Value {
         "properties": {
             "status": {
                 "type": "string",
-                "description": "Only jobs with this exact status (case-insensitive), e.g. running, stopped, failed. Omit for all."
+                "description": "Only jobs with this exact status (case-insensitive), one of running, pending, failed, scheduled, complete, suspended, idle, stopped. Omit for all."
             }
         },
         "additionalProperties": false
