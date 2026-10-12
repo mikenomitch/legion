@@ -582,6 +582,51 @@ async fn a_duplicated_session_converges_to_the_earliest_lease_test() -> R<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_duplicate_sweep_stops_the_older_generation_test() -> R<()> {
+    let cluster = Cluster::new("agents-sweep", &["n1", "n2"]).await?;
+    // A derived (untagged) id on both nodes; n2's copy has the newer
+    // generation, so n1's earlier-lease copy is the one that stops.
+    let id = "workspace-cccccccccccccccccccccccccc";
+    for (node, iat, generation) in [("n1", 1_000, 1), ("n2", 2_000, 2)] {
+        cluster.node(node).lock().sessions.insert(
+            id.into(),
+            SessionStatus {
+                session_id: id.into(),
+                job_id: cluster.job.clone(),
+                job_config_id: cluster.store().get_job_config(&cluster.job)?.id(),
+                task_name: TASK.into(),
+                envelope_allocation_id: 1,
+                state: "running".into(),
+                lease_issued_at_unix_ms: iat,
+                generation,
+                resources: json!({ "cpu": 500, "memory": 512 }).to_string(),
+                ..Default::default()
+            },
+        );
+    }
+    cluster.report("n1").await?;
+    cluster.report("n2").await?;
+    assert_eq!(
+        legion::manager::sessions::sweep_duplicates(cluster.store()).await,
+        1
+    );
+    for _ in 0..50 {
+        if !cluster.node("n1").lock().stops.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(cluster.node("n1").lock().stops, vec![id.to_string()]);
+    assert!(cluster.node("n2").lock().stops.is_empty());
+    // Swept ids are taken once.
+    assert_eq!(
+        legion::manager::sessions::sweep_duplicates(cluster.store()).await,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tagged_session_id_is_read_from_its_node_test() -> R<()> {
     let cluster = Cluster::new("agents-tag", &["n1", "n2"]).await?;
     let started = cluster.create(None).await?;

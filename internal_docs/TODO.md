@@ -2867,9 +2867,11 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
         `"store"`), `suspend.keepFor`, `evicted` answers, resume by tag with
         manifest fallback, edge resume on any node, and moves fenced by a
         generation claimed with a conditional manifest write (plan §6.7).
-  - [ ] No split brain (plan §6.7): manifest create for idempotent `store`
-        starts, the fence list, the managers' batched duplicate sweep, and
-        self-fencing after `stateful.fenceAfter`.
+  - [x] The managers' batched duplicate sweep and the generation-first
+        winner rule (plan §6.7, mechanism 3; #36).
+  - [ ] No split brain for `store` sessions (plan §6.7): manifest create
+        for idempotent `store` starts, the fence list, and self-fencing
+        after `stateful.fenceAfter`.
   - [ ] Optional `suspend.checkpointEvery` and `suspend.onWorkerStop =
         "checkpoint"` (plan §6.6).
   - [ ] Phase 6 (conditional, plan §6.8): batched raft session directory,

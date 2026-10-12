@@ -470,7 +470,13 @@ lower node id, and the other node is asked to end its copy:
 - by any manager that reads both copies while answering `get`, `stop`, or
   an idempotent create;
 - by the manager that served an idempotent create, which looks again 20
-  seconds later.
+  seconds later;
+- by every manager's duplicate sweep: once a second, each manager asks its
+  peers, in one call, about the idempotency-derived ids newly reported to
+  it, and asks the node of each losing copy to end it. This is what
+  catches two copies whose nodes heartbeat to different managers, including
+  a retried edge start. Only derived ids are swept: an id minted by a node
+  carries that node's tag and cannot run on two.
 
 This is converge-to-one, not at-most-one. A session that needs at most one
 copy at every instant should be promoted (or created with `--id`).

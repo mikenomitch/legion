@@ -313,6 +313,47 @@ pub async fn get_on_node(
     }
 }
 
+/// How often each manager sweeps the derived ids newly reported to it for
+/// copies on nodes that heartbeat to other managers.
+pub const DUPLICATE_SWEEP_EVERY: Duration = Duration::from_secs(1);
+
+/// Ids per peer query in one sweep.
+const DUPLICATE_SWEEP_BATCH: usize = 2_000;
+
+/// The managers' batched duplicate sweep (session durability plan §6.7,
+/// mechanism 3): ask every peer, in one call per batch, about the untagged
+/// (derived) session ids newly reported here, and stop the losing copy of
+/// any id two nodes run. Only derived ids can be held twice: a minted id
+/// carries its node's tag. Returns how many copies it asked to stop.
+pub async fn sweep_duplicates(store: &Store) -> usize {
+    let ids = store.sessions().take_sweep_ids();
+    let mut stopped = 0;
+    for batch in ids.chunks(DUPLICATE_SWEEP_BATCH) {
+        let view = query(
+            store,
+            QuerySessionsRequest {
+                session_ids: batch.to_vec(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut by_id: HashMap<String, Vec<IndexedSession>> = HashMap::new();
+        for entry in view.sessions {
+            let Some(id) = entry.status.as_ref().map(|s| s.session_id.clone()) else {
+                continue;
+            };
+            by_id.entry(id).or_default().push(entry);
+        }
+        for copies in by_id.into_values().filter(|copies| copies.len() > 1) {
+            if let Some((_, later)) = winner(copies) {
+                stopped += later.len();
+                stop_duplicates(store, later);
+            }
+        }
+    }
+    stopped
+}
+
 /// Stop the later copies of a duplicated session, in the background.
 fn stop_duplicates(store: &Store, later: Vec<IndexedSession>) {
     if later.is_empty() {

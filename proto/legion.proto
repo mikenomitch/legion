@@ -10914,6 +10914,12 @@ message QuerySessionsRequest {
   // With `job_id`: return only per-node totals in `node_usage`, not the
   // sessions themselves. What the session router reads.
   bool usage_only = 4;
+
+  // Every reported entry for each of these session ids, when
+  // `session_id` is empty: the managers' batched duplicate sweep, which
+  // asks its peers about all the derived ids newly reported to it once a
+  // second in one call. Router starts not yet reported are not included.
+  repeated string session_ids = 5;
 }
 
 // Reply payload for RaftTransport.QuerySessions.

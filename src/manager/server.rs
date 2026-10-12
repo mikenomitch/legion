@@ -13187,6 +13187,37 @@ fn volume_info(volume: crate::structs::Volume) -> crate::structs::VolumeInfo {
     }
 }
 
+impl ManagerDaemonService {
+    /// Mint a boot ticket (`IssueBootTicketRequest.scope = "boot"`).
+    fn mint_boot_ticket(
+        &self,
+        state: &crate::manager::workload_identity::WorkloadIdentityState,
+        identity: &AclIdentity,
+        req: &IssueBootTicketRequest,
+        job_config_id: &str,
+        task: &TaskConfig,
+        ttl: std::time::Duration,
+    ) -> Result<crate::manager::edge_boot::MintedTicket, Status> {
+        let ticket_request = crate::manager::edge_boot::TicketRequest {
+            job: req.job.clone(),
+            task: req.task.clone(),
+            job_config_id: job_config_id.to_string(),
+            instance_id: req.instance_id.clone(),
+            instance_prefix: req.instance_prefix.clone(),
+            pool: req.pool.clone(),
+            gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
+            ttl,
+            uses: if req.uses == 0 { 1 } else { req.uses },
+            accessor_id: identity.accessor_id.clone().unwrap_or_default(),
+        };
+        crate::manager::edge_boot::validate_ticket_request(&ticket_request, task, &self.edge_boot)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        let jti = crate::structs::edge_boot::new_ticket_id();
+        crate::manager::edge_boot::mint(state, &ticket_request, &jti, std::time::SystemTime::now())
+            .map_err(|e| Status::internal(format!("failed to mint boot ticket: {e:#}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18105,36 +18136,5 @@ mod tests {
             reply.max_session_seconds
         );
         Ok(())
-    }
-}
-
-impl ManagerDaemonService {
-    /// Mint a boot ticket (`IssueBootTicketRequest.scope = "boot"`).
-    fn mint_boot_ticket(
-        &self,
-        state: &crate::manager::workload_identity::WorkloadIdentityState,
-        identity: &AclIdentity,
-        req: &IssueBootTicketRequest,
-        job_config_id: &str,
-        task: &TaskConfig,
-        ttl: std::time::Duration,
-    ) -> Result<crate::manager::edge_boot::MintedTicket, Status> {
-        let ticket_request = crate::manager::edge_boot::TicketRequest {
-            job: req.job.clone(),
-            task: req.task.clone(),
-            job_config_id: job_config_id.to_string(),
-            instance_id: req.instance_id.clone(),
-            instance_prefix: req.instance_prefix.clone(),
-            pool: req.pool.clone(),
-            gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
-            ttl,
-            uses: if req.uses == 0 { 1 } else { req.uses },
-            accessor_id: identity.accessor_id.clone().unwrap_or_default(),
-        };
-        crate::manager::edge_boot::validate_ticket_request(&ticket_request, task, &self.edge_boot)
-            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
-        let jti = crate::structs::edge_boot::new_ticket_id();
-        crate::manager::edge_boot::mint(state, &ticket_request, &jti, std::time::SystemTime::now())
-            .map_err(|e| Status::internal(format!("failed to mint boot ticket: {e:#}")))
     }
 }

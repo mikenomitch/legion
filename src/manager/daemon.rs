@@ -458,6 +458,21 @@ pub async fn run_manager_with(
 
     let store_for_rotation = store.clone();
 
+    // The managers' batched duplicate sweep for sessions
+    // (docs/session-mode.md, "Duplicates").
+    let sweep_store = store.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(crate::manager::sessions::DUPLICATE_SWEEP_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let stopped = crate::manager::sessions::sweep_duplicates(&sweep_store).await;
+            if stopped > 0 {
+                debug!(stopped, "Session duplicate sweep stopped later copies");
+            }
+        }
+    });
+
     // Read-model maintenance on every manager (each holds its own cache):
     // rebuild after an outside commit to the state database, and reload a
     // rotating slice of nodes so drift from any source heals within one
