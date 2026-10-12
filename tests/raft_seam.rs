@@ -107,10 +107,11 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     // and — since C-2's rollout lane consolidation — every
     // rollout/rollout_event mutation.
     "append_rollout_event",
-    "claim_eval",
-    "claim_evals",
-    "complete_and_claim_next",
-    "complete_evals_and_claim_next",
+    // Eval claims are leader memory since the sandbox-scaling plan's Phase 1
+    // (`storage/store/eval_claims.rs`), so `claim_eval{,s}` and the
+    // `complete_*_and_claim_next` pair are no longer ops: the pair writes
+    // its outcomes through `complete_evals` and then claims in memory.
+    "complete_evals",
     "complete_eval",
     "complete_eval_with_event",
     "enqueue_eval_after_delay",
@@ -207,19 +208,13 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
 /// closure, and no op name of its own.)
 const DELEGATED_BODIES: &[&str] = &[
     "clear_job_restart_request",
-    // Fuses the eval loop's terminal write with the following claim into
-    // one scheduler-lane round: its closure calls `apply_eval_completion`
-    // (itself a switch over `complete_eval_impl` /
-    // `release_eval_for_retry{,_with_event}_apply`) and then
-    // `claim_eval_apply`. Nested `replicated` calls short-circuit inside a
-    // capture, so the pair lands in one changeset.
-    "complete_and_claim_next",
-    // The batched form of the above: its closure loops
-    // `apply_eval_completion` over the batch and then calls
-    // `claim_evals_apply`, so every terminal write and the following claim
-    // land in one changeset. Batching divides the lane's fixed per-eval
-    // round cost by the batch size.
-    "complete_evals_and_claim_next",
+    // The eval loop's batched terminal write: its closure loops
+    // `apply_eval_completion` (a switch over `complete_eval_impl` /
+    // `release_eval_for_retry{,_with_event}_apply`) over the batch and
+    // deletes the duplicates each claim subsumed, in one changeset.
+    // Completions a plan already wrote (`EvalCompletion::Settled`) are
+    // skipped, so a batch of them proposes nothing.
+    "complete_evals",
     "complete_eval",
     "complete_eval_with_event",
     // Serializes its candidate placements in the closure and shares
@@ -316,10 +311,7 @@ fn lane_for(method: &str) -> Lane {
         | "upsert_saved_state_query" => Lane::Control,
         "append_rollout_event"
         | "apply_allocation_plan"
-        | "claim_eval"
-        | "claim_evals"
-        | "complete_and_claim_next"
-        | "complete_evals_and_claim_next"
+        | "complete_evals"
         | "complete_eval"
         | "complete_eval_with_event"
         | "enqueue_eval_after_delay"

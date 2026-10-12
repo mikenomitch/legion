@@ -22,6 +22,9 @@ const EXACT = new Map<string, Tone>([
   ['suspending', 'info'],
   ['resuming', 'info'],
   ['forking', 'info'],
+  // A job waiting for capacity (docs/scheduler-and-eval-loop.md, "Blocked
+  // evals"): it places on its own when room appears.
+  ['blocked', 'warn'],
 ])
 
 export const statusTone = (status?: string | null): Tone => {

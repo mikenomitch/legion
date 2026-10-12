@@ -118,14 +118,12 @@ neighbor rules a cause in or out, and which knob to turn), see
   The outcomes are mutually exclusive. See
   [late-binding-plan-apply.md](late-binding-plan-apply.md).
 - **`legion_eval_claim_total{outcome}`** (counter): eval claim attempts by
-  an eval worker. `claimed` found work and `empty` did not. An empty attempt
-  produces an empty changeset, which skips the raft entry. It still pays for
-  the capture (a savepoint on the write connection) and the wake itself, so
-  the `empty` share is the cost of waking a worker for work that does not
-  exist. A large share means the pool is being over-woken. A saturated
-  5,000-node cluster runs at roughly 0.3 empty claims per second. Claims
-  carried over by the fused complete-and-claim round are not counted because
-  they were already paid for.
+  an eval worker. `claimed` found work and `empty` did not. A claim is a
+  mark in the leader's memory and writes nothing, so an empty attempt costs
+  one read of the queue and the wake itself: the `empty` share is the cost
+  of waking a worker for work that does not exist. A large share means the
+  pool is being over-woken. Claims carried over by the fused
+  complete-and-claim round are not counted.
 
   A claim takes a *batch* (see
   [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#batching)), so
@@ -148,6 +146,21 @@ neighbor rules a cause in or out, and which knob to turn), see
 - **`legion_eval_conflict_requeues_total`** (counter): evals released back
   to the pending queue after exhausting their plan-conflict retry budget,
   instead of failing terminally (the requeue backstop).
+- **`legion_evals_blocked{key_kind}`** (gauge): evals waiting blocked on
+  capacity, by the kind of key they wait under: `class`, `node`, or
+  `escaped` (see
+  [Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). Set by the
+  scheduler-lane leader's wake pass, so it reads 0 on other managers and is
+  refreshed when a capacity event arrives. A rising `class` count is a
+  capacity signal for that class; `escaped` means no node was schedulable.
+- **`legion_evals_unblocked_total{event}`** (counter): blocked evals returned
+  to the pending queue, by what woke them: `register`, `node` (pool,
+  availability, or attributes changed), `ready`, `freed` (allocations left a
+  node), `missed` (capacity appeared while the eval ran, so it never
+  blocked), or `startup`.
+- **`legion_blocked_wait_seconds`** (histogram): how long a blocked eval
+  waited, from the entry that blocked it to the one that woke it. Buckets run
+  from 100 ms to an hour.
 
 #### Adaptive scheduler concurrency
 

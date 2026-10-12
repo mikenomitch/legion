@@ -2410,8 +2410,34 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     if format.is_json() {
         print_json(&response.into_inner().job);
     } else {
-        let printable_job: JobPrint = response.into_inner().job.context("no job found")?.into();
+        let job = response.into_inner().job.context("no job found")?;
+        let blocked = job.blocked.clone();
+        let printable_job: JobPrint = job.into();
         print_table(vec![printable_job]);
+        // What a blocked job waits for (docs/scheduler-and-eval-loop.md,
+        // "Blocked evals"): it places on its own when that capacity appears.
+        if let Some(blocked) = blocked {
+            let mut shortfall: Vec<String> = blocked
+                .shortfall
+                .iter()
+                .map(|(resource, amount)| format!("{resource} {amount}"))
+                .collect();
+            shortfall.sort();
+            println!(
+                "Blocked on {} since {}: task {} needs {} per placement",
+                blocked.key,
+                chrono::DateTime::from_timestamp(blocked.since, 0)
+                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                    .unwrap_or_else(|| blocked.since.to_string()),
+                blocked.task,
+                if shortfall.is_empty() {
+                    "room".to_string()
+                } else {
+                    shortfall.join(", ")
+                }
+            );
+            println!("  {}", blocked.message);
+        }
     }
 
     Ok(())

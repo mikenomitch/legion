@@ -23,6 +23,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // serde skips it.
         .skip_debug("legion.CheckpointPartKey")
         .field_attribute("legion.CheckpointPartKey.key", "#[serde(skip)]")
+        // The table shows the `blocked` status; the block itself is for
+        // `-j` output and `job info`.
+        .field_attribute("legion.Job.blocked", "#[tabled(skip)]")
         .compile_protos(&[proto_file], &["."])
         .unwrap_or_else(|e| panic!("protobuf compile error: {e}"));
 

@@ -419,7 +419,7 @@ is 764 deep but not what is in it, which is what you need here. Until it has a
 
 ```console
 $ legion state query "SELECT kind, status, COUNT(*) FROM eval \
-    WHERE status IN ('pending','in_flight') GROUP BY 1,2 ORDER BY 3 DESC;"
+    WHERE status IN ('pending','blocked') GROUP BY 1,2 ORDER BY 3 DESC;"
 ```
 
 `legion state seed-queries` installs `agent:pending-evals` and

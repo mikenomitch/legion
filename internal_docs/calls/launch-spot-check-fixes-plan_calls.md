@@ -645,29 +645,44 @@ without the failed node; whatever that pass cannot place (an error, or
   exact semantics ("anywhere else first, this node only as a last resort")
   with no policy changes.
 
-## 21. Freed capacity retries waiting jobs through the existing capacity pass, gated by an in-memory flag
+## 21. A plan that places nothing blocks on main's blocked evals; a partial remainder still rides the capacity pass
 
-*Workstream: Scheduler.*
+*Workstream: Scheduler. Revised at the merge with main's blocked evals
+(sandbox-scaling plan §6.15).*
 
-When an allocation finishes or is removed, a job stops, or a job scales in,
-`Store::request_capacity_reconcile_if_waiting` queues the existing cluster
-capacity pass (a `node_join` eval with no node), but only while a plan since
-the last pass left replicas unplaced (`capacity_waiters`, an `AtomicBool` on
-the scheduler leader that starts set and is cleared at the start of each
-pass). The pass now also considers unfinished batch tasks.
+When this branch was written, a plan that placed nothing failed its eval and
+a 5 s `job_reschedule` retried it, and the unplaced remainder of a partial
+plan waited for the capacity pass. Main then shipped blocked evals: an eval
+whose plan finds no room is stored `blocked` under a key (pool, class,
+pinned node) and woken only by capacity that could help. At the merge:
 
-- **Alternative:** Nomad-style blocked evals: persist each blocked eval with
-  the resource classes it needs, and unblock only the evals that freed
-  capacity could satisfy.
-- **Trade-off:** a free re-plans every job short of its count, not only the
-  ones the freed room could help; the flag is per process, so the first free
-  after a restart or failover always runs one pass; a job with an eval
-  already queued (including the 5 s retry after a plan that placed nothing)
-  is skipped by the pass and waits for that eval.
-- **Why:** simplicity. It reuses the deduped pass that node joins already
-  queue, adds no table and no eval kind, and costs nothing when nobody is
-  waiting (no eval, no event). Precise unblocking is the upgrade if passes
-  show up in eval-loop profiles.
+- **A plan that places nothing** returns main's
+  `blocked::PlacementBlocked` for the first unplaced task (with this
+  branch's `scheduler::PlacementBlocked { unplaced }` as context, which the
+  static-port rollout logic reads), so the eval blocks and wakes precisely.
+  The message is this branch's port-aware reason.
+- **A partial plan** still succeeds, and its remainder still waits for the
+  capacity pass: when an allocation finishes or is removed, a job stops, or a
+  job scales in, `Store::request_capacity_reconcile_if_waiting` queues a
+  `node_join` eval with no node, but only while some plan since the last pass
+  left replicas unplaced (`capacity_waiters`, an `AtomicBool` on the
+  scheduler leader, set at start and cleared at the start of each pass). The
+  pass also considers unfinished batch tasks, and skips a job with a pending,
+  in-flight or blocked eval.
+
+- **Alternative:** block the partial remainder too: let a partial plan
+  apply what fits and then store the eval `blocked` under the remainder's
+  key, retiring `capacity_waiters` and the free-triggered pass.
+- **Trade-off:** two retry mechanisms coexist. A free re-plans every job
+  short of its count, not only those the freed room could help; the flag is
+  per process, so the first free after a restart or failover runs one pass.
+  `job info` shows `blocked` only for a job that placed nothing, not for one
+  running below its count.
+- **Why:** simplicity at merge time. Blocking a *succeeded* eval needs a new
+  completion path (apply, then block) through the eval loop and the blocked
+  store, which is a scheduler change of its own with its own benchmark;
+  the capacity pass already worked and is cheap when nobody waits. The
+  follow-up is open in TODO.md.
 
 ## 22. A static-port rollout that cannot surge stops the old allocation (destructive update)
 

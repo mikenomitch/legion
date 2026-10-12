@@ -1858,6 +1858,20 @@ fn migration_list() -> Vec<M<'static>> {
         // checkpoint. Scheduler lane, like `instance`.
         M::up("ALTER TABLE instance ADD COLUMN identity_epoch INTEGER NOT NULL DEFAULT 0;")
             .down(""),
+        // Blocked evals (sandbox-scaling plan, Phase 3;
+        // docs/scheduler-and-eval-loop.md, "Blocked evals"): an eval that
+        // found no room for a placement is written `status = 'blocked'` with
+        // what it waits for, in the entry that used to fail it, and returns to
+        // `pending` when capacity that could help appears. `blocked_key` is
+        // the key (`class:pool=…`, `node:<id>`, `escaped`), `blocked_detail`
+        // the JSON of what could not place and what it asks for, and
+        // `blocked_at` when it blocked (RFC 3339). Scheduler lane, like `eval`.
+        M::up(
+            "ALTER TABLE eval ADD COLUMN blocked_key TEXT;
+             ALTER TABLE eval ADD COLUMN blocked_detail TEXT;
+             ALTER TABLE eval ADD COLUMN blocked_at TEXT;",
+        )
+        .down(""),
         // Removed allocations, remembered for `ALLOCATION_HISTORY_RETENTION_SECS`
         // so `legion job logs` can still find where a removed allocation ran
         // (docs/logging.md, "Logs of removed allocations"). Written by every

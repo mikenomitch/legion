@@ -173,7 +173,9 @@ report's reading) and what changed. Tests named here fail on the old code.
   ports per node; a plan places what fits and reports the rest as unplaced;
   freed capacity (a stop, a scale-in, a finished task) retries jobs that are
   short; a static-port rollout that cannot surge stops the old allocation
-  first.
+  first. Main shipped blocked evals while this was in flight: a plan that
+  places nothing now blocks on them, and only a partial plan's remainder
+  uses the capacity pass (calls entry 21).
 - **P1-3.** A reschedule plans without the failed node first, then with it
   when nothing else fits.
 - **P1-8.** Main shipped a derived job status in
@@ -256,5 +258,6 @@ Each item is open in [TODO.md](../TODO.md) under "Follow-ups from the
   `legion exec` into a gated exec task runs in the host netns.
 - Scheduler: destructive static-port rollouts race the old process's
   graceful stop; no-op `rollout_tick` events; `batch_task_outcome_tx`
-  ignores scale overrides.
+  ignores scale overrides; the partial-placement remainder is not yet a
+  blocked eval.
 - Logs: manager (24h) and worker (7 days) retention differ.

@@ -12,7 +12,7 @@
 //! binding every other placement path goes through.
 
 use anyhow::Context;
-use legion::manager::edge_boot::{ratify, ClaimRatification, Verdict};
+use legion::manager::edge_boot::{ClaimRatification, TicketSpend, Verdict};
 use legion::storage::store::Store;
 use legion::structs::edge_boot::{Gate, RefusalReason};
 use legion::structs::{
@@ -104,6 +104,25 @@ fn submit(store: &Store) -> R<String> {
         }],
     )?;
     Ok(store.get_job_config(JOB)?.id())
+}
+
+/// Ratify with no ticket, the way a claim from a manager-dispatched
+/// speculative start is ratified.
+fn ratify(store: &Store, claim: &ClaimRatification<'_>) -> R<Verdict> {
+    legion::manager::edge_boot::ratify(store, claim, None, std::time::Instant::now())
+}
+
+/// Ratify an edge start that redeems ticket `jti`.
+fn ratify_with_ticket(store: &Store, claim: &ClaimRatification<'_>, jti: &str) -> R<Verdict> {
+    legion::manager::edge_boot::ratify(
+        store,
+        claim,
+        Some(TicketSpend {
+            jti: jti.to_string(),
+            now_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+        }),
+        std::time::Instant::now(),
+    )
 }
 
 fn claim<'a>(
@@ -235,14 +254,103 @@ fn ratifying_an_unknown_task_is_refused_not_an_error() -> R<()> {
     Ok(())
 }
 
+/// An edge start for an id that has never existed is the create: the
+/// ratification makes the row and binds it in one apply (sandbox-scaling
+/// plan, Phase 1), so a platform starting at the edge never calls
+/// CreateInstance and never races its placement eval.
 #[test]
-fn ratifying_an_instance_that_does_not_exist_is_refused() -> R<()> {
+fn ratifying_an_instance_that_never_existed_creates_and_binds_it() -> R<()> {
     let store = setup_store()?;
     store.insert_node(node("node-a"))?;
     let job_config_id = submit(&store)?;
     // No CreateInstance ever ran for `user-99`.
-    match ratify(&store, &claim("node-a", "clm_a", &job_config_id, "user-99"))? {
+    let allocation_id = match ratify(&store, &claim("node-a", "clm_a", &job_config_id, "user-99"))?
+    {
+        Verdict::Confirmed { allocation_id } => allocation_id,
+        other => panic!("expected a confirmation, got {other:?}"),
+    };
+    let instance = store
+        .get_instance("user-99")?
+        .context("the row was created")?;
+    assert_eq!(instance.current_alloc_id, Some(allocation_id));
+    assert_eq!(instance.mode, InstanceMode::Keyed);
+    Ok(())
+}
+
+/// Ids are never recycled: a destroyed instance's tombstone refuses an edge
+/// start that names it, exactly as CreateInstance does.
+#[test]
+fn ratifying_a_destroyed_instance_is_refused() -> R<()> {
+    let store = setup_store()?;
+    store.insert_node(node("node-a"))?;
+    let job_config_id = submit(&store)?;
+    store.create_keyed_instance(JOB, "default", TASK, Some("user-7"))?;
+    store.destroy_keyed_instance("user-7")?;
+    match ratify(&store, &claim("node-a", "clm_a", &job_config_id, "user-7"))? {
         Verdict::Refused { reason, .. } => assert_eq!(reason, RefusalReason::InstanceClaimed),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let tombstone = store.get_instance("user-7")?.context("tombstone")?;
+    assert_eq!(tombstone.current_alloc_id, None);
+    Ok(())
+}
+
+/// The ticket is spent by the ratification's own entry: a refusal leaves it
+/// redeemable for the node's retry inside its lease, and a single-use ticket
+/// confirms exactly once.
+#[test]
+fn a_ticket_is_spent_only_by_a_ratification_that_commits() -> R<()> {
+    let store = setup_store()?;
+    store.insert_node(node("node-a"))?;
+    let job_config_id = submit(&store)?;
+    store.insert_boot_ticket(&legion::storage::boot_ticket_store::BootTicketRecord {
+        jti: "jti-1".into(),
+        job: JOB.into(),
+        task: TASK.into(),
+        job_config_id: job_config_id.clone(),
+        instance_id: "user-5".into(),
+        instance_prefix: String::new(),
+        pool: "default".into(),
+        gate: "boot".into(),
+        uses: 1,
+        uses_spent: 0,
+        expires_at_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
+        accessor_id: "acc-1".into(),
+        created_at: Store::boot_ticket_now()?,
+    })?;
+    // Refused: the node is cordoned. The ticket must survive.
+    store.set_node_availability("node-a", "drained")?;
+    match ratify_with_ticket(
+        &store,
+        &claim("node-a", "clm_a", &job_config_id, "user-5"),
+        "jti-1",
+    )? {
+        Verdict::Refused { reason, .. } => assert_eq!(reason, RefusalReason::Ineligible),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        store.get_instance("user-5")?.is_none(),
+        "a refused edge start creates nothing"
+    );
+    // The retry commits and spends the one use.
+    store.set_node_availability("node-a", "available")?;
+    assert!(matches!(
+        ratify_with_ticket(
+            &store,
+            &claim("node-a", "clm_b", &job_config_id, "user-5"),
+            "jti-1"
+        )?,
+        Verdict::Confirmed { .. }
+    ));
+    // A second redemption of the single-use ticket is refused.
+    match ratify_with_ticket(
+        &store,
+        &claim("node-a", "clm_c", &job_config_id, "user-5"),
+        "jti-1",
+    )? {
+        Verdict::Refused { reason, detail } => {
+            assert_eq!(reason, RefusalReason::TicketInvalid, "{detail}");
+        }
         other => panic!("expected a refusal, got {other:?}"),
     }
     Ok(())

@@ -77,6 +77,10 @@ pub struct UnplacedTask {
     /// The static port that kept the task off every node it is otherwise
     /// allowed on, when a port was the cause.
     pub static_port: Option<u16>,
+    /// What the eval blocks under when nothing of the plan could place
+    /// (docs/scheduler-and-eval-loop.md, "Blocked evals"): the task's class
+    /// key, or the node a pinned instance must return to.
+    pub blocked: crate::manager::blocked::PlacementBlocked,
 }
 
 /// The error a plan returns when it could place nothing at all because no
@@ -89,6 +93,23 @@ pub struct PlacementBlocked {
 }
 
 impl PlacementBlocked {
+    /// The error for a plan that placed nothing. It carries the first
+    /// unplaced task's [`crate::manager::blocked::PlacementBlocked`] as its
+    /// source, so the eval worker blocks the eval under that key instead of
+    /// failing it, while callers that want the unplaced list (a rollout
+    /// looking for a static port) still downcast to this type.
+    pub fn nothing_placed(unplaced: Vec<UnplacedTask>) -> anyhow::Error {
+        let blocked = unplaced
+            .first()
+            .map(|task| task.blocked.clone())
+            .unwrap_or_else(|| {
+                crate::manager::blocked::PlacementBlocked::escaped(
+                    "No placements could be made".to_string(),
+                )
+            });
+        anyhow::Error::new(blocked).context(PlacementBlocked { unplaced })
+    }
+
     /// The static port that blocked the plan, if any task was blocked by one.
     pub fn static_port(&self) -> Option<u16> {
         self.unplaced.iter().find_map(|task| task.static_port)
@@ -1393,7 +1414,10 @@ impl<'a> Scheduler<'a> {
         info!(%job_config_id, mode = mode_label, "Starting scheduler plan_only");
         let nodes = self.available_nodes()?;
         if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
+            return Err(crate::manager::blocked::PlacementBlocked::escaped(
+                "No nodes available to place allocations".to_string(),
+            )
+            .into());
         }
 
         let all_tasks = self
@@ -1570,7 +1594,10 @@ impl<'a> Scheduler<'a> {
         let mode_label = mode.as_str();
         let nodes = self.available_nodes()?;
         if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
+            return Err(crate::manager::blocked::PlacementBlocked::escaped(
+                "No nodes available to place allocations".to_string(),
+            )
+            .into());
         }
 
         let mut tasks = Self::tasks_for_plan(job_config)?;
@@ -1751,7 +1778,10 @@ impl<'a> Scheduler<'a> {
         }
         timings.available_nodes_us = available_started.elapsed().as_micros() as u64;
         if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
+            return Err(crate::manager::blocked::PlacementBlocked::escaped(
+                "No nodes available to place allocations".to_string(),
+            )
+            .into());
         }
 
         let task_fetch_started = std::time::Instant::now();
@@ -1858,7 +1888,7 @@ impl<'a> Scheduler<'a> {
                     unplaced = unplaced_count,
                     "Plan could not place any allocation"
                 );
-                return Err(anyhow::Error::new(PlacementBlocked { unplaced }));
+                return Err(PlacementBlocked::nothing_placed(unplaced));
             }
             warn!(
                 %job_config_id,
@@ -3369,6 +3399,11 @@ impl<'a> Scheduler<'a> {
             }
 
             if eligible.is_empty() {
+                // No room anywhere this task may run. A partial plan places
+                // what fits and reports the rest; a plan that places nothing
+                // blocks the eval under the task's class (or the node a
+                // restore is pinned to) until capacity that could help
+                // appears (docs/scheduler-and-eval-loop.md, "Blocked evals").
                 let reason = match port_conflict {
                     Some(port) => format!(
                         "Failed to place task {}: static port {port} is already in use on every \
@@ -3378,6 +3413,17 @@ impl<'a> Scheduler<'a> {
                     ),
                     None => preemption.no_placement_error(task_config),
                 };
+                let pinned_node = if hard_restore_pins > 0 || floating_restores.is_empty() {
+                    pins.front().map(|(_, node_id)| node_id.as_str())
+                } else {
+                    None
+                };
+                let blocked = crate::manager::blocked::PlacementBlocked::for_task(
+                    task_config,
+                    task_id,
+                    pinned_node,
+                    reason.clone(),
+                );
                 return Self::record_unplaced(
                     partial,
                     &mut unplaced,
@@ -3387,6 +3433,7 @@ impl<'a> Scheduler<'a> {
                         count: count - placement_index,
                         reason,
                         static_port: port_conflict,
+                        blocked,
                     },
                 );
             }
@@ -3415,12 +3462,18 @@ impl<'a> Scheduler<'a> {
                 })
                 .collect();
             if eligible.is_empty() {
-                bail!(
-                    "Failed to place task {}: no node has enough free disk for its node-local \
-                     volume(s). Shrink the volume `size`, add disk, or use a network driver \
-                     (nfs), whose storage does not consume node disk",
-                    task_config.name
-                );
+                return Err(crate::manager::blocked::PlacementBlocked::for_task(
+                    task_config,
+                    task_id,
+                    None,
+                    format!(
+                        "Failed to place task {}: no node has enough free disk for its \
+                         node-local volume(s). Shrink the volume `size`, add disk, or use a \
+                         network driver (nfs), whose storage does not consume node disk",
+                        task_config.name
+                    ),
+                )
+                .into());
             }
 
             // A pinned instance is not a preference: placing it elsewhere would
@@ -3519,7 +3572,7 @@ impl<'a> Scheduler<'a> {
                             .filter(|node| short.get(node.id.as_str()) == Some(&RoomLimit::Disk))
                             .count();
                         let on_budget = before - on_disk;
-                        bail!(
+                        let message = format!(
                             "Failed to place task {}: {before} eligible node(s), but none has \
                              {} MiB of room for this task's memory checkpoint (suspend): \
                              {on_budget} short on the snapshots content budget, {on_disk} short \
@@ -3532,6 +3585,13 @@ impl<'a> Scheduler<'a> {
                             task_config.name,
                             needed / (1024 * 1024)
                         );
+                        return Err(crate::manager::blocked::PlacementBlocked::for_task(
+                            task_config,
+                            task_id,
+                            None,
+                            message,
+                        )
+                        .into());
                     }
                     roomy
                 }
@@ -3579,6 +3639,17 @@ impl<'a> Scheduler<'a> {
                              there once the node has room"
                                 .to_string()
                         };
+                        let reason = format!(
+                            "Failed to place task {}: instance {instance_id} holds \
+                             node-local storage on node {node_id}, {why}",
+                            task_config.name
+                        );
+                        let blocked = crate::manager::blocked::PlacementBlocked::for_task(
+                            task_config,
+                            task_id,
+                            Some(node_id.as_str()),
+                            reason.clone(),
+                        );
                         return Self::record_unplaced(
                             partial,
                             &mut unplaced,
@@ -3586,12 +3657,9 @@ impl<'a> Scheduler<'a> {
                                 task_config_id: task_id,
                                 task_name: task_config.name.clone(),
                                 count: count - placement_index,
-                                reason: format!(
-                                    "Failed to place task {}: instance {instance_id} holds \
-                                     node-local storage on node {node_id}, {why}",
-                                    task_config.name
-                                ),
+                                reason,
                                 static_port: None,
+                                blocked,
                             },
                         );
                     }
@@ -3626,6 +3694,12 @@ impl<'a> Scheduler<'a> {
                                 task_config.name, group_key.name, existing
                             ),
                         };
+                        let blocked = crate::manager::blocked::PlacementBlocked::for_task(
+                            task_config,
+                            task_id,
+                            None,
+                            reason.clone(),
+                        );
                         return Self::record_unplaced(
                             partial,
                             &mut unplaced,
@@ -3635,6 +3709,7 @@ impl<'a> Scheduler<'a> {
                                 count: count - placement_index,
                                 reason,
                                 static_port: port,
+                                blocked,
                             },
                         );
                     }
@@ -3761,9 +3836,7 @@ impl<'a> Scheduler<'a> {
                 list.push(task);
                 Ok(())
             }
-            _ => Err(anyhow::Error::new(PlacementBlocked {
-                unplaced: vec![task],
-            })),
+            _ => Err(PlacementBlocked::nothing_placed(vec![task])),
         }
     }
 

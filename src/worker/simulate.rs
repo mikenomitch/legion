@@ -17,10 +17,10 @@ use crate::prelude::*;
 
 use crate::structs::token::JoinToken;
 use crate::structs::{
-    manager_client::ManagerClient, worker_server::Worker, ExecClientFrame, GetTaskLogsReply,
-    GetTaskLogsRequest, HealthCheckRequest, HeartbeatRequest, PostWorkReply, PostWorkRequest,
-    RestartWorkerReply, RestartWorkerRequest, WorkerConfig, WorkerPreRegisterRequest,
-    WorkerRegisterRequest,
+    manager_client::ManagerClient, worker_server::Worker, AllocationHealth, CheckpointRequest,
+    ExecClientFrame, GetTaskLogsReply, GetTaskLogsRequest, HealthCheckRequest, HeartbeatRequest,
+    PostWorkReply, PostWorkRequest, RestartWorkerReply, RestartWorkerRequest, SnapshotReport,
+    TaskAllocation, WorkerConfig, WorkerPreRegisterRequest, WorkerRegisterRequest,
 };
 use crate::worker::daemon::{
     connect_manager_with_retry, heartbeat_interval_for, jittered_heartbeat_interval,
@@ -28,7 +28,7 @@ use crate::worker::daemon::{
 };
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tonic::{transport::Channel, Request, Response, Status, Streaming};
@@ -66,6 +66,18 @@ pub struct SimulateOptions {
     /// detects it the way a real worker does: `--advertise-addr` /
     /// `LEGION_WORKER_ADVERTISE_ADDR`, else the route to the manager.
     pub advertise_addr: Option<String>,
+    /// Fake the checkpoint capability: advertise `checkpoint`, fingerprint
+    /// as a Firecracker sandbox host, answer every `capture` and `delete`
+    /// request with a successful report, and report each restore payload as
+    /// restored once the allocation is ready. Lets a load generator drive
+    /// suspend, resume, and fork through the manager with no runtime.
+    pub checkpoints: bool,
+    /// Called for every allocation a node learns about, the first time it
+    /// does. A load generator embedding the fleet uses it to time delivery.
+    pub observer: Option<SimObserver>,
+    /// Receive work over `Manager.StreamWork`, as real workers do, instead
+    /// of from the heartbeat's desired set (sandbox-scaling plan §6.13).
+    pub work_stream: bool,
 }
 
 impl Default for SimulateOptions {
@@ -77,7 +89,57 @@ impl Default for SimulateOptions {
             ready_after: Duration::ZERO,
             register_rate: 100.0,
             advertise_addr: None,
+            checkpoints: false,
+            observer: None,
+            work_stream: true,
         }
+    }
+}
+
+/// How a simulated node learned about an allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimDelivery {
+    /// The manager's `PostWork` push.
+    Push,
+    /// The desired set in a heartbeat reply.
+    Heartbeat,
+    /// A `StreamWork` message.
+    Stream,
+}
+
+impl SimDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SimDelivery::Push => "push",
+            SimDelivery::Heartbeat => "heartbeat",
+            SimDelivery::Stream => "stream",
+        }
+    }
+}
+
+/// One allocation reaching a simulated node for the first time.
+#[derive(Debug, Clone)]
+pub struct SimArrival {
+    pub node_id: String,
+    pub allocation_id: i64,
+    /// `LEGION_INSTANCE_ID` from the payload's env, empty for allocations
+    /// without an instance.
+    pub instance_id: String,
+    /// The checkpoint the allocation restores from, when it carries a
+    /// restore payload.
+    pub restore_snapshot_id: Option<String>,
+    pub via: SimDelivery,
+    pub at: Instant,
+}
+
+/// Callback for [`SimArrival`]s. Runs on the delivering task, so it must be
+/// cheap (a channel send).
+#[derive(Clone)]
+pub struct SimObserver(pub Arc<dyn Fn(SimArrival) + Send + Sync>);
+
+impl std::fmt::Debug for SimObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SimObserver")
     }
 }
 
@@ -180,18 +242,33 @@ pub fn distribute(total: usize, profiles: &[SimNodeProfile]) -> R<Vec<(SimNodePr
 /// (`memory_total` bytes-as-string, `cpus` map with `frequency`), plus
 /// honest `os`/`arch` and an empty `volumeDrivers` (a sim node runs no
 /// volume drivers, so volume-requiring jobs never place on it).
-fn fingerprint_for(profile: &SimNodeProfile) -> Value {
+fn fingerprint_for(profile: &SimNodeProfile, checkpoints: bool) -> Value {
     let mut cpus = Map::new();
     for idx in 1..=profile.cpus {
         cpus.insert(format!("cpu-{idx}"), json!({ "frequency": "3000" }));
     }
-    json!({
+    let mut fingerprint = json!({
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "memory_total": (profile.memory_gb * 1024 * 1024 * 1024).to_string(),
         "cpus": cpus,
         "volumeDrivers": {},
-    })
+    });
+    if checkpoints {
+        // What a Firecracker sandbox host fingerprints, so the manager's
+        // memory-checkpoint compatibility checks pass for every sim node
+        // alike and a resume can land on any of them.
+        for (key, value) in [
+            ("sandbox.vmm", "firecracker"),
+            ("sandbox.vmm.version", "1.12.0"),
+            ("cpu.vendor", "GenuineIntel"),
+            ("cpu.model", "6:106:6"),
+            ("cpu.features", "3f9a0c21"),
+        ] {
+            fingerprint[key] = json!(value);
+        }
+    }
+    fingerprint
 }
 
 /// `config_attrs` for a sim node: worker-type attributes, then profile
@@ -254,7 +331,15 @@ struct SimNode {
     registered: AtomicBool,
     /// Desired allocations and when each was first seen (for
     /// `--ready-after`). Fed by heartbeat replies and `PostWork` dispatch.
-    allocations: Mutex<HashMap<i64, Instant>>,
+    allocations: Mutex<HashMap<i64, SimAlloc>>,
+    /// Checkpoint reports owed to the manager (`checkpoints` mode).
+    reports: Mutex<SimReports>,
+    /// The desired set as `StreamWork` delivered it (`work_stream` mode).
+    mirror: crate::worker::work_stream::SharedMirror,
+    /// Allocations whose health the manager has acknowledged, so a
+    /// streaming node reports each one once (a simulated allocation's health
+    /// never changes after it starts).
+    health_reported: Mutex<HashSet<i64>>,
     /// How many allocations this node reported on its last heartbeat. Only
     /// the *delta* against it feeds the fleet-wide gauge, so keeping the
     /// process-wide total current costs O(1) per heartbeat instead of a
@@ -262,25 +347,108 @@ struct SimNode {
     reported_acked: AtomicUsize,
 }
 
+/// What a simulated node keeps per allocation.
+#[derive(Debug, Clone)]
+struct SimAlloc {
+    first_seen: Instant,
+    job_id: String,
+    task_name: String,
+    instance_id: String,
+    /// The checkpoint this allocation restores from, until the node has
+    /// reported the restore.
+    restore: Option<String>,
+    /// The restore was reported.
+    restored: bool,
+}
+
+impl SimAlloc {
+    fn from_payload(allocation: &TaskAllocation, now: Instant) -> Self {
+        SimAlloc {
+            first_seen: now,
+            job_id: allocation.job_id.clone(),
+            task_name: allocation.task_name.clone(),
+            instance_id: payload_instance_id(allocation),
+            restore: allocation
+                .restore
+                .as_ref()
+                .map(|restore| restore.snapshot_id.clone()),
+            restored: false,
+        }
+    }
+}
+
+/// `LEGION_INSTANCE_ID` from a payload's env, where the manager injects it.
+fn payload_instance_id(allocation: &TaskAllocation) -> String {
+    serde_json::from_str::<Value>(&allocation.task_config)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("env")?
+                .get("LEGION_INSTANCE_ID")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// A node's checkpoint channel state (`checkpoints` mode). The manager
+/// re-sends a request until its report is applied, so a node answers each
+/// `(snapshot, op)` once and re-sends the recorded report while the manager
+/// keeps asking — the same dedupe contract a real worker keeps.
+#[derive(Debug, Default)]
+struct SimReports {
+    /// Reports for the next heartbeat.
+    pending: Vec<SnapshotReport>,
+    /// Every report this node has made, by `(snapshot_id, op)`, for the
+    /// requests the manager still sends.
+    answered: HashMap<(String, String), SnapshotReport>,
+}
+
 impl SimNode {
-    fn accept_allocations(&self, ids: impl IntoIterator<Item = i64>) {
+    /// Adopt allocations this node did not hold yet. Returns the ones that
+    /// were new, for the observer.
+    fn accept_allocations<'a>(
+        &self,
+        payloads: impl IntoIterator<Item = &'a TaskAllocation>,
+    ) -> Vec<&'a TaskAllocation> {
         let now = Instant::now();
         let mut allocations = self.allocations.lock().expect("sim allocations lock");
-        for id in ids {
-            allocations.entry(id).or_insert(now);
+        let mut adopted = Vec::new();
+        for payload in payloads {
+            match allocations.entry(payload.allocation_id) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(SimAlloc::from_payload(payload, now));
+                    adopted.push(payload);
+                }
+                std::collections::hash_map::Entry::Occupied(mut held) => {
+                    // A later copy may carry a restore payload the first
+                    // lacked; a restore already reported is not redone.
+                    let held = held.get_mut();
+                    if held.restore.is_none() && !held.restored {
+                        held.restore = payload
+                            .restore
+                            .as_ref()
+                            .map(|restore| restore.snapshot_id.clone());
+                    }
+                }
+            }
         }
+        adopted
     }
 
     /// Reconcile against the manager's desired set: keep ids still
-    /// desired, adopt new ones, drop the rest. Returns nothing — the next
-    /// `acked_ids` call reflects the change.
-    fn reconcile_allocations(&self, desired: &[i64]) {
-        let now = Instant::now();
-        let mut allocations = self.allocations.lock().expect("sim allocations lock");
-        allocations.retain(|id, _| desired.contains(id));
-        for id in desired {
-            allocations.entry(*id).or_insert(now);
+    /// desired, adopt new ones, drop the rest. Returns the allocations that
+    /// were new. The next `acked_ids` call reflects the change.
+    fn reconcile_allocations<'a>(&self, desired: &'a [TaskAllocation]) -> Vec<&'a TaskAllocation> {
+        {
+            let ids: HashSet<i64> = desired
+                .iter()
+                .map(|allocation| allocation.allocation_id)
+                .collect();
+            let mut allocations = self.allocations.lock().expect("sim allocations lock");
+            allocations.retain(|id, _| ids.contains(id));
         }
+        self.accept_allocations(desired)
     }
 
     /// Allocation ids old enough to report as running.
@@ -288,10 +456,102 @@ impl SimNode {
         let allocations = self.allocations.lock().expect("sim allocations lock");
         allocations
             .iter()
-            .filter(|(_, first_seen)| first_seen.elapsed() >= ready_after)
+            .filter(|(_, alloc)| alloc.first_seen.elapsed() >= ready_after)
             .map(|(id, _)| *id)
             .collect()
     }
+
+    /// Restore reports for allocations that are ready and carried a restore
+    /// payload, once each.
+    fn take_restore_reports(&self, ready_after: Duration) -> Vec<SnapshotReport> {
+        let mut allocations = self.allocations.lock().expect("sim allocations lock");
+        let mut reports = Vec::new();
+        for (id, alloc) in allocations.iter_mut() {
+            if alloc.first_seen.elapsed() < ready_after {
+                continue;
+            }
+            if let Some(snapshot_id) = alloc.restore.take() {
+                alloc.restored = true;
+                reports.push(SnapshotReport {
+                    snapshot_id,
+                    op: "restore".into(),
+                    ok: true,
+                    duration_ms: 1,
+                    allocation_id: *id,
+                    ..Default::default()
+                });
+            }
+        }
+        reports
+    }
+
+    /// Answer the manager's checkpoint requests. New work is "done" at once;
+    /// work answered before re-sends its recorded report. Answers for
+    /// requests the manager stopped sending are forgotten.
+    fn answer_checkpoint_requests(&self, requests: &[CheckpointRequest]) {
+        let allocations = self.allocations.lock().expect("sim allocations lock");
+        let mut reports = self.reports.lock().expect("sim reports lock");
+        let asked: HashSet<(String, String)> = requests
+            .iter()
+            .map(|request| (request.snapshot_id.clone(), request.op.clone()))
+            .collect();
+        reports.answered.retain(|key, _| asked.contains(key));
+        for request in requests {
+            let key = (request.snapshot_id.clone(), request.op.clone());
+            let report = match reports.answered.get(&key) {
+                Some(recorded) => recorded.clone(),
+                None => {
+                    let report =
+                        sim_checkpoint_report(request, allocations.get(&request.allocation_id));
+                    reports.answered.insert(key, report.clone());
+                    report
+                }
+            };
+            reports.pending.push(report);
+        }
+    }
+}
+
+/// The report a simulated node makes for one checkpoint request.
+fn sim_checkpoint_report(request: &CheckpointRequest, alloc: Option<&SimAlloc>) -> SnapshotReport {
+    let mut report = SnapshotReport {
+        snapshot_id: request.snapshot_id.clone(),
+        op: request.op.clone(),
+        allocation_id: request.allocation_id,
+        duration_ms: 1,
+        ..Default::default()
+    };
+    match request.op.as_str() {
+        "capture" => match alloc {
+            Some(alloc) => {
+                report.ok = true;
+                report.total_bytes = 1 << 20;
+                report.manifest_json = json!({
+                    "apiVersion": 1,
+                    "id": request.snapshot_id,
+                    "jobId": alloc.job_id,
+                    "task": alloc.task_name,
+                    "originInstance": alloc.instance_id,
+                    "originAllocId": request.allocation_id,
+                    "runtime": if request.kind == "memory" { "sandbox" } else { "exec" },
+                    "kind": request.kind,
+                    "createdAt": chrono::Utc::now().to_rfc3339(),
+                })
+                .to_string();
+            }
+            None => {
+                report.error = format!(
+                    "simulated node holds no allocation {}",
+                    request.allocation_id
+                );
+            }
+        },
+        "delete" => report.ok = true,
+        other => {
+            report.error = format!("simulated nodes cannot {other} checkpoints");
+        }
+    }
+    report
 }
 
 /// Shared fleet state: node lookup for dispatch routing plus counters for
@@ -311,9 +571,36 @@ struct SimFleet {
     /// from the authoritative per-node sets, so a lost update corrects
     /// itself within one summary interval rather than drifting forever.
     reported_allocations: AtomicI64,
+    /// `SimulateOptions::checkpoints`.
+    checkpoints: bool,
+    /// `SimulateOptions::observer`.
+    observer: Option<SimObserver>,
+    /// `SimulateOptions::work_stream`.
+    work_stream: bool,
 }
 
 impl SimFleet {
+    /// Tell the observer, if any, about allocations a node just adopted.
+    fn observe(&self, node: &SimNode, adopted: &[&TaskAllocation], via: SimDelivery) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        let at = Instant::now();
+        for payload in adopted {
+            (observer.0)(SimArrival {
+                node_id: node.name.clone(),
+                allocation_id: payload.allocation_id,
+                instance_id: payload_instance_id(payload),
+                restore_snapshot_id: payload
+                    .restore
+                    .as_ref()
+                    .map(|restore| restore.snapshot_id.clone()),
+                via,
+                at,
+            });
+        }
+    }
+
     fn acked_total(&self, ready_after: Duration) -> usize {
         self.nodes
             .values()
@@ -397,7 +684,8 @@ impl Worker for SimWorkerService {
                 ))
             })?
             .clone();
-        node.accept_allocations([allocation.allocation_id]);
+        let adopted = node.accept_allocations([&allocation]);
+        self.fleet.observe(&node, &adopted, SimDelivery::Push);
         Ok(Response::new(PostWorkReply {
             message: "Task accepted (simulated)".into(),
         }))
@@ -617,7 +905,7 @@ pub async fn launch_simulated_fleet(
     // Build the fleet.
     let mut nodes: HashMap<String, Arc<SimNode>> = HashMap::new();
     for (profile, share) in &shares {
-        let fingerprint = fingerprint_for(profile).to_string();
+        let fingerprint = fingerprint_for(profile, opts.checkpoints).to_string();
         let config_attrs =
             config_attrs_for(profile, &config, &worker_address, &fleet_identity).to_string();
         for idx in 0..*share {
@@ -632,6 +920,9 @@ pub async fn launch_simulated_fleet(
                     credentials: WorkerCredentials::with_join_secret(join_secret.clone()),
                     registered: AtomicBool::new(false),
                     allocations: Mutex::new(HashMap::new()),
+                    reports: Mutex::new(SimReports::default()),
+                    mirror: Default::default(),
+                    health_reported: Mutex::new(HashSet::new()),
                     reported_acked: AtomicUsize::new(0),
                 }),
             );
@@ -644,6 +935,9 @@ pub async fn launch_simulated_fleet(
         heartbeats_ok: AtomicU64::new(0),
         heartbeats_failed: AtomicU64::new(0),
         reported_allocations: AtomicI64::new(0),
+        checkpoints: opts.checkpoints,
+        observer: opts.observer.clone(),
+        work_stream: opts.work_stream,
     });
 
     // A sim host is exactly the host a scale campaign scrapes, so it exports
@@ -728,7 +1022,7 @@ async fn run_sim_node(
 ) {
     let mut backoff = SIM_RETRY_MIN;
     loop {
-        match register_sim_node(&client, &node).await {
+        match register_sim_node(&client, &node, &fleet).await {
             Ok(()) => {
                 node.registered.store(true, Ordering::Relaxed);
                 let registered = fleet.registered.fetch_add(1, Ordering::Relaxed) + 1;
@@ -743,6 +1037,29 @@ async fn run_sim_node(
                 backoff = std::cmp::min(backoff * 2, SIM_RETRY_MAX);
             }
         }
+    }
+
+    // Work over `StreamWork`, as a real worker receives it: each message
+    // reconciles the node's held set against the mirror at once.
+    if fleet.work_stream {
+        let attach_node = node.clone();
+        let applied_node = node.clone();
+        let applied_fleet = fleet.clone();
+        tokio::spawn(crate::worker::work_stream::run_work_stream(
+            client.clone(),
+            move |request| attach_node.credentials.attach(request),
+            node.name.clone(),
+            node.mirror.clone(),
+            move |_applied| {
+                let desired = applied_node
+                    .mirror
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .desired();
+                let adopted = applied_node.reconcile_allocations(&desired);
+                applied_fleet.observe(&applied_node, &adopted, SimDelivery::Stream);
+            },
+        ));
     }
 
     // Mutable for the same reason the real worker's is: a manager running
@@ -804,7 +1121,7 @@ async fn run_sim_node(
             }
             Err(status) if status.code() == tonic::Code::Unauthenticated => {
                 warn!(node = %node.name, "Sim heartbeat unauthenticated; re-registering");
-                if let Err(err) = register_sim_node(&client, &node).await {
+                if let Err(err) = register_sim_node(&client, &node, &fleet).await {
                     warn!(node = %node.name, error = ?err, "Sim re-registration failed; will retry");
                 }
                 tokio::time::sleep(backoff).await;
@@ -873,15 +1190,23 @@ async fn run_fleet_identity(
     }
 }
 
-async fn register_sim_node(client: &ManagerClient<Channel>, node: &SimNode) -> R<()> {
-    let outcome = register_sim_node_inner(client, node).await;
+async fn register_sim_node(
+    client: &ManagerClient<Channel>,
+    node: &SimNode,
+    fleet: &SimFleet,
+) -> R<()> {
+    let outcome = register_sim_node_inner(client, node, fleet).await;
     crate::manager::telemetry::worker_metrics()
         .simulated_registrations_total
         .inc(&[if outcome.is_ok() { "ok" } else { "error" }]);
     outcome
 }
 
-async fn register_sim_node_inner(client: &ManagerClient<Channel>, node: &SimNode) -> R<()> {
+async fn register_sim_node_inner(
+    client: &ManagerClient<Channel>,
+    node: &SimNode,
+    fleet: &SimFleet,
+) -> R<()> {
     let req = Request::new(WorkerRegisterRequest {
         name: node.name.clone(),
         pool: node.pool.clone(),
@@ -891,8 +1216,13 @@ async fn register_sim_node_inner(client: &ManagerClient<Channel>, node: &SimNode
         join_token: node.credentials.join_secret().cloned(),
         build_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: PROTOCOL_VERSION,
-        // A simulated node runs nothing it could checkpoint.
-        capabilities: Vec::new(),
+        // A simulated node runs nothing it could checkpoint, unless it was
+        // asked to fake the checkpoint channel.
+        capabilities: if fleet.checkpoints {
+            vec![crate::structs::snapshot::CHECKPOINT_CAPABILITY.to_string()]
+        } else {
+            Vec::new()
+        },
     });
     let reply = client.clone().worker_register(req).await?.into_inner();
     node.credentials.store_node_token(reply.node_token);
@@ -909,6 +1239,51 @@ async fn heartbeat_sim_node(
 ) -> Result<Option<u32>, Status> {
     let acked = node.acked_ids(ready_after);
     fleet.record_reported_allocations(node, acked.len());
+    let work_stream = if fleet.work_stream {
+        node.mirror
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .state()
+    } else {
+        None
+    };
+    // Every running allocation's health, as a real worker reports it
+    // (`TaskManager::allocation_health_snapshot`): every beat off the stream,
+    // and on it only what the manager has not acknowledged yet. The
+    // manager's per-beat cost of a dense node is part of what a scale run
+    // measures.
+    let reported_health = node
+        .health_reported
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let allocation_health: Vec<AllocationHealth> = acked
+        .iter()
+        .filter(|id| work_stream.is_none() || !reported_health.contains(id))
+        .map(|id| AllocationHealth {
+            allocation_id: *id,
+            healthy: true,
+            status: "running".into(),
+            artifact_states: None,
+        })
+        .collect();
+    let health_ids: Vec<i64> = allocation_health
+        .iter()
+        .map(|health| health.allocation_id)
+        .collect();
+    let allocation_ids = if work_stream.is_some() {
+        Vec::new()
+    } else {
+        acked.clone()
+    };
+    let snapshot_reports = if fleet.checkpoints {
+        let mut reports =
+            std::mem::take(&mut node.reports.lock().expect("sim reports lock").pending);
+        reports.extend(node.take_restore_reports(ready_after));
+        reports
+    } else {
+        Vec::new()
+    };
     let req = node.credentials.attach(Request::new(HeartbeatRequest {
         // Simulated nodes have no content store to advertise.
         content_locations: None,
@@ -921,24 +1296,51 @@ async fn heartbeat_sim_node(
         // path with nothing to model.
         provisional_claims: Vec::new(),
         id: node.name.clone(),
-        allocation_ids: acked,
+        allocation_ids,
+        work_stream,
         failed_allocations: Vec::new(),
-        allocation_health: Vec::new(),
+        allocation_health,
         volume_reports: Vec::new(),
         // Simulated nodes run no processes, so nothing ever terminates.
         terminated_allocations: Vec::new(),
         // Nor do they have cgroups to measure.
         usage: None,
-        // Nor anything to checkpoint.
-        snapshot_reports: Vec::new(),
+        // Nor anything to checkpoint, unless faking the channel.
+        snapshot_reports: snapshot_reports.clone(),
     }));
-    let reply = client.clone().heartbeat(req).await?.into_inner();
-    let desired: Vec<i64> = reply
-        .desired_allocations
-        .iter()
-        .map(|allocation| allocation.allocation_id)
-        .collect();
-    node.reconcile_allocations(&desired);
+    let reply = match client.clone().heartbeat(req).await {
+        Ok(reply) => reply.into_inner(),
+        Err(status) => {
+            // Re-send next beat, as a real worker restores drained reports.
+            if !snapshot_reports.is_empty() {
+                let mut reports = node.reports.lock().expect("sim reports lock");
+                let mut restored = snapshot_reports;
+                restored.append(&mut reports.pending);
+                reports.pending = restored;
+            }
+            return Err(status);
+        }
+    };
+    {
+        let mut reported = node
+            .health_reported
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if reply.desired_via_stream {
+            reported.extend(health_ids);
+            let running: HashSet<i64> = acked.iter().copied().collect();
+            reported.retain(|id| running.contains(id));
+        } else {
+            reported.clear();
+        }
+    }
+    if !reply.desired_via_stream {
+        let adopted = node.reconcile_allocations(&reply.desired_allocations);
+        fleet.observe(node, &adopted, SimDelivery::Heartbeat);
+    }
+    if fleet.checkpoints {
+        node.answer_checkpoint_requests(&reply.checkpoint_requests);
+    }
     Ok(reply.next_interval_seconds)
 }
 
@@ -1029,11 +1431,14 @@ mod tests {
 
     #[test]
     fn fingerprint_matches_scheduler_expectations() {
-        let fingerprint = fingerprint_for(&SimNodeProfile {
-            memory_gb: 16,
-            cpus: 2,
-            ..SimNodeProfile::default()
-        });
+        let fingerprint = fingerprint_for(
+            &SimNodeProfile {
+                memory_gb: 16,
+                cpus: 2,
+                ..SimNodeProfile::default()
+            },
+            false,
+        );
         assert_eq!(
             fingerprint["memory_total"],
             json!((16u64 * 1024 * 1024 * 1024).to_string())
@@ -1064,30 +1469,89 @@ mod tests {
         assert_eq!(attrs["workerPlaneName"], json!("sim-a-0"));
     }
 
+    fn payload(id: i64) -> TaskAllocation {
+        TaskAllocation {
+            allocation_id: id,
+            job_id: "agents".into(),
+            task_name: "workspace".into(),
+            task_config: json!({ "env": { "LEGION_INSTANCE_ID": format!("user-{id}") } })
+                .to_string(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn ready_after_gates_acks() {
-        let node = SimNode {
-            name: "sim-a-0".into(),
-            pool: "default".into(),
-            config_attrs: "{}".into(),
-            fingerprint_attrs: "{}".into(),
-            credentials: WorkerCredentials::default(),
-            registered: AtomicBool::new(false),
-            allocations: Mutex::new(HashMap::new()),
-            reported_acked: AtomicUsize::new(0),
-        };
-        node.accept_allocations([1, 2]);
+        let node = sim_node("sim-a-0");
+        let first = [payload(1), payload(2)];
+        let adopted = node.accept_allocations(&first);
+        assert_eq!(adopted.len(), 2);
         // Instantly acked with no delay...
         let mut acked = node.acked_ids(Duration::ZERO);
         acked.sort();
         assert_eq!(acked, vec![1, 2]);
         // ...but gated behind a ready-after window.
         assert!(node.acked_ids(Duration::from_secs(60)).is_empty());
-        // Reconcile drops undesired ids and adopts new ones.
-        node.reconcile_allocations(&[2, 3]);
+        // Reconcile drops undesired ids and adopts new ones, reporting only
+        // the new one as adopted.
+        let desired = [payload(2), payload(3)];
+        let adopted = node.reconcile_allocations(&desired);
+        assert_eq!(
+            adopted.iter().map(|a| a.allocation_id).collect::<Vec<_>>(),
+            vec![3]
+        );
         let mut acked = node.acked_ids(Duration::ZERO);
         acked.sort();
         assert_eq!(acked, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_faked_checkpoint_channel_answers_once_and_resends_while_asked() {
+        let node = sim_node("sim-a-0");
+        let held = [payload(7)];
+        node.accept_allocations(&held);
+        let capture = CheckpointRequest {
+            snapshot_id: "snap-1".into(),
+            op: "capture".into(),
+            allocation_id: 7,
+            kind: "memory".into(),
+            then: "stop".into(),
+            purpose: "suspend".into(),
+            ..Default::default()
+        };
+        node.answer_checkpoint_requests(std::slice::from_ref(&capture));
+        let first = std::mem::take(&mut node.reports.lock().unwrap().pending);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].ok);
+        let manifest: Value = serde_json::from_str(&first[0].manifest_json).unwrap();
+        assert_eq!(manifest["originInstance"], json!("user-7"));
+        assert_eq!(manifest["kind"], json!("memory"));
+        // Asked again (the report has not been applied yet): the same report.
+        node.answer_checkpoint_requests(std::slice::from_ref(&capture));
+        let again = std::mem::take(&mut node.reports.lock().unwrap().pending);
+        assert_eq!(again[0].manifest_json, first[0].manifest_json);
+        // No longer asked: forgotten.
+        node.answer_checkpoint_requests(&[]);
+        assert!(node.reports.lock().unwrap().answered.is_empty());
+    }
+
+    #[test]
+    fn a_restore_payload_is_reported_once_ready() {
+        let node = sim_node("sim-a-0");
+        let mut restoring = payload(9);
+        restoring.restore = Some(crate::structs::SnapshotRestore {
+            snapshot_id: "snap-9".into(),
+            ..Default::default()
+        });
+        node.accept_allocations(&[restoring]);
+        assert!(node
+            .take_restore_reports(Duration::from_secs(60))
+            .is_empty());
+        let reports = node.take_restore_reports(Duration::ZERO);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].op, "restore");
+        assert_eq!(reports[0].allocation_id, 9);
+        assert!(node.take_restore_reports(Duration::ZERO).is_empty());
     }
 
     fn sim_node(name: &str) -> Arc<SimNode> {
@@ -1099,6 +1563,9 @@ mod tests {
             credentials: WorkerCredentials::default(),
             registered: AtomicBool::new(false),
             allocations: Mutex::new(HashMap::new()),
+            reports: Mutex::new(SimReports::default()),
+            mirror: Default::default(),
+            health_reported: Mutex::new(HashSet::new()),
             reported_acked: AtomicUsize::new(0),
         })
     }
@@ -1114,6 +1581,9 @@ mod tests {
             heartbeats_ok: AtomicU64::new(0),
             heartbeats_failed: AtomicU64::new(0),
             reported_allocations: AtomicI64::new(0),
+            checkpoints: false,
+            observer: None,
+            work_stream: false,
         })
     }
 

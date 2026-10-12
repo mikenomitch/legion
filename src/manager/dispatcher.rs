@@ -42,7 +42,14 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         Vec::with_capacity(allocations.len());
     let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
 
+    let work_log = store.work_log();
     for allocation in allocations {
+        // A node streaming its work from this manager gets the placement on
+        // its stream within a round trip of the commit (sandbox-scaling plan
+        // §6.13); a push would only race it.
+        if work_log.streaming(&allocation.node_id) {
+            continue;
+        }
         if !task_cache.contains_key(&allocation.job_config_id) {
             // The read model's shared list: task configs are immutable per
             // `job_config_id`, and this used to be a SQL query (plus row
@@ -100,7 +107,18 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         // previous mounts, and never re-derives storage from a jobspec.
         let volumes =
             store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
-        let task_allocation = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+        let mut task_allocation =
+            build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+        // The push must carry everything the heartbeat's desired set does:
+        // a worker launches from whichever copy reaches it first, and a
+        // resumed instance launched from a push without its restore payload
+        // boots cold and never restores.
+        task_allocation.priority_band = store
+            .cached_band_for_job_config(&allocation.job_config_id)?
+            .as_str()
+            .to_string();
+        task_allocation.restore =
+            crate::manager::server::snapshot_restore_payload(store, instance.as_ref());
         let request = crate::structs::PostWorkRequest {
             allocation: Some(task_allocation),
         };

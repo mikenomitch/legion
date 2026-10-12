@@ -64,7 +64,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   variables, guided submission, and template-scoped delegation.
 - [Artifacts](artifacts.md): declaring, fetching, verifying, and staging inputs.
 - [Stateful Workloads & Instance Identity](stateful-workloads.md): slot and
-  keyed instances, storage handles, fencing.
+  keyed instances, storage handles, fencing, and choosing a mode.
+- [Sandboxes at Scale](sandboxes-at-scale.md): running many keyed sandboxes:
+  what each lifecycle step costs the control plane, delivery within a round
+  trip, blocked creates when capacity runs out, and measuring it.
 - [Volumes](volumes.md): persistent storage for stateful tasks. Covers plugins,
   the driver contract, node pinning, and reclaim.
 - [Suspend and Resume](suspend-and-resume.md): suspending a keyed instance to

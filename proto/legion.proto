@@ -960,8 +960,56 @@ service Manager {
   // Worker heartbeat endpoint.
   //
   // Workers send runtime state, failures, and allocation health snapshots.
-  // The manager returns the desired allocations for that worker node.
+  // The manager returns the desired allocations for that worker node,
+  // unless the worker receives its work over `StreamWork`: then the reply
+  // says so (`desired_via_stream`) and leaves the desired set out, and the
+  // heartbeat carries only a digest of what the worker holds
+  // (`work_stream`), so its size no longer grows with what the node runs.
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
+
+  // Sequenced delivery of work to one worker (docs/
+  // architecture-managers-workers.md, "Delivery"; sandbox-scaling plan,
+  // Phase 2).
+  //
+  // The worker opens this stream once and keeps it open. Its first frame is
+  // `StreamWorkRequest.open`, naming its node and the last position it
+  // applied (`last_epoch`, `last_seq`); every later frame is an `ack` of the
+  // highest `seq` it applied. The manager sends `StreamWorkReply` messages:
+  //
+  // - **Deltas.** Each committed change to an allocation on the node (placed,
+  //   updated, stopped, removed) becomes the next message on the node's
+  //   sequence: `upserts` carries the full `TaskAllocation` payload, exactly
+  //   what the heartbeat's desired set would have carried, and `stops` the
+  //   allocations that left the desired set with why. A placement reaches the
+  //   worker one network round trip after it commits, whatever the heartbeat
+  //   cadence.
+  // - **Full resync.** A message with `resync = true` carries the node's whole
+  //   desired set and replaces what the worker holds. It is the first message
+  //   on a stream that cannot resume: a new `epoch` (this manager process is
+  //   not the one the worker last streamed from, as after a failover or a
+  //   restart), a `last_seq` ahead of the manager's, or a `last_seq` older
+  //   than the messages the manager still keeps. It also follows a heartbeat
+  //   whose digest disagreed with the manager's (`HeartbeatReply.work_resync`).
+  //
+  // A worker that reconnects with the same `epoch` and a `last_seq` the
+  // manager still holds gets the messages after it replayed, then live
+  // deltas: nothing is lost and nothing is applied twice. Acked messages
+  // are pruned. The log is held in the manager's memory only: the
+  // committed allocation rows are the durable record, so a new manager
+  // process resyncs instead of replaying.
+  //
+  // Any manager serves the stream, leader or follower, from its own
+  // replica of the store.
+  //
+  // Called by the worker for its own node: the caller's authenticated
+  // per-node principal (`node:<node_id>`) must match `open.node_id`.
+  // Worker-plane endpoint: workers authenticate with their node token.
+  //
+  // Errors:
+  // - InvalidArgument: the first frame is not `open`, or names no node.
+  // - PermissionDenied: `open.node_id` does not match the caller's
+  //   credential.
+  rpc StreamWork (stream StreamWorkRequest) returns (stream StreamWorkReply);
 
   // Worker node health-check endpoint.
   //
@@ -4324,9 +4372,14 @@ message Job {
   //   restart it).
   // - `running`: at least one allocation of any version of the job is live
   //   (placed and not yet terminal).
+  // - `blocked`: nothing is live, and the job's eval found no room for a
+  //   placement and waits for capacity that could help (docs/
+  //   scheduler-and-eval-loop.md, "Blocked evals"). It places on its own when
+  //   that capacity appears; `blocked` below says what it waits for. Takes
+  //   the place `pending` would have.
   // - `pending`: nothing is live, and a task that wants an allocation has not
-  //   finished: it is waiting to be placed (no node fits, or no node is up)
-  //   or waiting on a `dependsOn` condition.
+  //   finished: it is waiting to be placed or waiting on a `dependsOn`
+  //   condition.
   // - `scheduled`: nothing is live, nothing is pending, and a cron task
   //   (`schedule`) finished its last run and waits for the next one.
   // - `complete`: nothing is live, and every task that wants an allocation
@@ -4366,6 +4419,40 @@ message Job {
   // peer. See docs/preemption-and-eviction.md. Empty only when read from a
   // manager that predates bands.
   string priority = 6;
+
+  // Set while the job has an eval blocked on capacity
+  // (docs/scheduler-and-eval-loop.md, "Blocked evals"), whatever `status`
+  // reads: a job with a live allocation reads `running` and still says here
+  // what its other placements wait for; with nothing live it reads
+  // `blocked`. Unset for a job stopped or failed by its lifecycle.
+  optional JobBlocked blocked = 7;
+}
+
+// What a blocked job waits for.
+message JobBlocked {
+  // The blocking key: `class:pool=<pool>[,<attr>=<value>...]` (any node of
+  // that pool whose attributes match the task's `=` constraints can help),
+  // `node:<id>` (a resume pinned to the node holding its checkpoint or
+  // node-local storage), or `escaped` (the cluster had no schedulable node at
+  // all; any capacity wakes it).
+  string key = 1;
+
+  // The task that could not place.
+  string task = 2;
+
+  // What one placement of `task` asks for that no eligible node had free:
+  // `cpu` (e.g. `500MHz`) and `memory` (e.g. `512MiB`), for the resources the
+  // task declares. Per placement, not the job's total.
+  map<string, string> shortfall = 3;
+
+  // The scheduler's diagnosis, the message the eval used to fail with.
+  string message = 4;
+
+  // Unix timestamp (seconds) when the eval blocked.
+  int64 since = 5;
+
+  // The blocked eval's id.
+  string eval_id = 6;
 }
 
 // Reply payload for ListJobs.
@@ -4567,7 +4654,10 @@ message HeartbeatRequest {
   // `PERMISSION_DENIED`.
   string id = 1;
 
-  // Allocation IDs currently known/running on worker.
+  // Allocation IDs currently known/running on worker. Informational: the
+  // manager decides the desired set from its own rows, not from this list.
+  // A worker that reports `work_stream` leaves it empty (the digest stands
+  // in for it).
   //
   // Default: empty list.
   repeated int64 allocation_ids = 2;
@@ -4577,7 +4667,12 @@ message HeartbeatRequest {
   // Default: empty list.
   repeated FailedAllocation failed_allocations = 3;
 
-  // Latest per-allocation health snapshots from worker.
+  // Per-allocation health snapshots from worker. A worker without
+  // `work_stream` sends every allocation's health on every beat. A worker
+  // on the stream sends only the snapshots that changed since the last
+  // reply that set `HeartbeatReply.desired_via_stream`, and everything again
+  // after any other reply. Either way the manager writes only the rows whose
+  // values changed, so a steady beat writes nothing.
   //
   // Default: empty list.
   repeated AllocationHealth allocation_health = 4;
@@ -4694,6 +4789,98 @@ message HeartbeatRequest {
   // Absent from workers that predate content locality. The manager treats
   // such a node as holding nothing, so it scores 0 on locality.
   optional ContentLocationReport content_locations = 14;
+
+  // The worker's `StreamWork` position and a digest of the desired set it
+  // holds, sent instead of `allocation_ids` by a worker that receives its
+  // work over the stream (sandbox-scaling plan, Phase 2). The manager
+  // compares the digest with its own for the node once every message up to
+  // `seq` has been applied, and answers `HeartbeatReply.work_resync` when
+  // they differ, so a delta lost to a bug is caught within one beat.
+  //
+  // Absent from workers that do not stream, which get today's full desired
+  // set in every reply.
+  optional WorkStreamState work_stream = 15;
+}
+
+// Where a worker's `StreamWork` delivery stands, as its heartbeat reports
+// it.
+message WorkStreamState {
+  // The `StreamWorkReply.epoch` of the messages the worker applied.
+  uint64 epoch = 1;
+
+  // The highest `StreamWorkReply.seq` the worker applied.
+  uint64 seq = 2;
+
+  // Digest of the allocation ids in the worker's desired set after `seq`:
+  // `<count>:<xor of splitmix64(id)>`, both in lowercase hex. Order
+  // independent, so either side can update it per delta.
+  string digest = 3;
+}
+
+// One frame from the worker on `StreamWork`.
+message StreamWorkRequest {
+  oneof frame {
+    // The first frame, and only the first.
+    StreamWorkOpen open = 1;
+    // Every later frame: the highest message the worker has applied.
+    StreamWorkAck ack = 2;
+  }
+}
+
+// Opens a `StreamWork` stream.
+message StreamWorkOpen {
+  // The worker's node id. Must match the caller's node credential.
+  string node_id = 1;
+
+  // The `epoch` of the last message the worker applied, or 0 when it holds
+  // nothing (a fresh worker process). A value other than the manager's
+  // current epoch gets a full resync.
+  uint64 last_epoch = 2;
+
+  // The `seq` of the last message the worker applied, or 0. The manager
+  // replays everything after it when it still holds those messages, and
+  // resyncs otherwise.
+  uint64 last_seq = 3;
+}
+
+// Acknowledges every `StreamWork` message up to `seq`, so the manager can
+// prune them.
+message StreamWorkAck {
+  uint64 epoch = 1;
+  uint64 seq = 2;
+}
+
+// One message on `StreamWork`.
+message StreamWorkReply {
+  // The manager process's delivery epoch: a random non-zero value chosen
+  // when the manager starts. Positions from another epoch cannot be
+  // resumed.
+  uint64 epoch = 1;
+
+  // This message's position in the node's sequence. Starts at 1 and grows
+  // by one per message.
+  uint64 seq = 2;
+
+  // `true` when `upserts` is the node's whole desired set and replaces
+  // everything the worker holds. `stops` is empty on a resync.
+  bool resync = 3;
+
+  // Allocations added to or changed in the node's desired set, as full
+  // payloads (the same `TaskAllocation` the heartbeat's desired set carries,
+  // restore payload and band included). The worker launches the new ones
+  // at once and replaces its copy of the rest.
+  repeated TaskAllocation upserts = 4;
+
+  // Allocations that left the node's desired set: stopped, removed,
+  // suspended, preempted. `cause` is the stop notice's cause, empty when
+  // the manager recorded none. A message carrying stops (or a resync, or a
+  // changed payload) makes the worker run its reconcile at once, which
+  // stops anything the desired set no longer lists.
+  repeated StopNotice stops = 5;
+
+  // The digest of the worker's desired set after applying this message, in
+  // the `WorkStreamState.digest` form.
+  string digest = 6;
 }
 
 // Content locality. One heartbeat's content advertisement. See
@@ -5121,6 +5308,18 @@ message HeartbeatReply {
   // Default: false. Never set for a heartbeat that carried no report.
   bool content_resync = 10;
 
+  // The desired set was left out of this reply because the worker receives
+  // it over `StreamWork` (sandbox-scaling plan, Phase 2): `desired_allocations`
+  // and `stop_notices` are empty and must not be read as "run nothing". Set
+  // only when the request carried `work_stream` in the epoch of a stream
+  // this manager is serving for the node.
+  bool desired_via_stream = 11;
+
+  // The worker's `work_stream.digest` disagreed with the manager's at the
+  // same `seq`: the manager will send a full resync on the stream. Never set
+  // while messages the worker has not applied are in flight.
+  bool work_resync = 12;
+
   // Every manager in the cluster, as `scheme://host:port` addresses the
   // worker can dial, so a worker is not tied to the one manager its join
   // token names.
@@ -5149,7 +5348,7 @@ message HeartbeatReply {
   // (there is no other manager to fail over to) or that predates this
   // field; an empty list leaves the worker's known set unchanged.
   // See docs/architecture-managers-workers.md.
-  repeated string manager_addresses = 11;
+  repeated string manager_addresses = 13;
 }
 
 // Why one allocation is being stopped.
@@ -7777,9 +7976,15 @@ message Eval {
   // Eval ID.
   string id = 1;
 
-  // Eval status (for example: pending, in_flight, failed).
+  // Eval status: `pending`, `in_flight`, `blocked`, or `failed`.
   //
-  // Newly enqueued evals start as `pending`.
+  // Newly enqueued evals start as `pending`. `in_flight` is reported only by
+  // the manager whose eval worker has claimed the eval: a claim is that
+  // manager's memory, and every other manager shows the row as `pending`.
+  // `blocked` means the eval's plan found no room and it waits, under a key
+  // (`class:pool=…`, `node:<id>`, `escaped`), for capacity that could help;
+  // it returns to `pending` on its own (docs/scheduler-and-eval-loop.md,
+  // "Blocked evals"). `failed` evals are never retried.
   string status = 2;
 
   // Eval kind (for example: job_submit, node_drop, rollout_tick).

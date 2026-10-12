@@ -106,7 +106,28 @@ pub fn config() -> Command {
                 .requires("simulate")
                 .help("Registration ramp in nodes/second (default: 100)"),
         )
-        .arg(advertise_addr_arg());
+        .arg(advertise_addr_arg())
+        .arg(
+            Arg::new("sim-no-work-stream")
+                .long("sim-no-work-stream")
+                .action(ArgAction::SetTrue)
+                .requires("simulate")
+                .help(
+                    "Take work from the heartbeat's desired set instead of `StreamWork`, \
+                     the delivery a worker without the work stream gets",
+                ),
+        )
+        .arg(
+            Arg::new("sim-checkpoints")
+                .long("sim-checkpoints")
+                .action(ArgAction::SetTrue)
+                .requires("simulate")
+                .help(
+                    "Fake the checkpoint channel: advertise `checkpoint`, fingerprint as a \
+                     sandbox host, and answer every capture, delete, and restore as done, \
+                     so suspend, resume, and fork can be load tested",
+                ),
+        );
 
     Command::new("start")
         .about("Start a daemon")
@@ -207,6 +228,9 @@ fn simulate_options(count: usize, arg_matches: &ArgMatches) -> R<SimulateOptions
             .get_one::<String>("advertise-addr")
             .cloned()
             .or(defaults.advertise_addr),
+        checkpoints: arg_matches.get_flag("sim-checkpoints"),
+        observer: None,
+        work_stream: !arg_matches.get_flag("sim-no-work-stream"),
     })
 }
 

@@ -13,5 +13,6 @@ pub mod queries;
 pub mod raft;
 pub mod snapshot_warm;
 pub mod store;
+pub mod work_log;
 
 pub(crate) use raft::Lane;

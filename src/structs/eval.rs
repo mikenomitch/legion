@@ -335,6 +335,12 @@ impl Eval {
             bail!("Eval job_reschedule missing identifiers");
         }
 
+        // The plan is this eval's last write unless a scheduled batch task
+        // needs its follow-up enqueued after it, so an applied plan may
+        // settle the eval in its own entry (sandbox-scaling plan, Phase 1).
+        if self.batch_follow_up_delay(store)?.is_none() {
+            crate::storage::store::arm_eval_settle();
+        }
         let outcome = self.schedule_job_allocations(store, PlanMode::Reschedule)?;
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job reschedule allocation deltas");
@@ -676,8 +682,33 @@ impl Eval {
     }
 
     fn schedule_batch_follow_up(&self, store: &Store) -> R<()> {
+        if let Some(delay) = self.batch_follow_up_delay(store)? {
+            // One timer per config. Every placing eval passes through here,
+            // and a DAG's steps each queue a `job_reschedule` as they finish
+            // (`Store::queue_dependency_progress`); without this check each
+            // of them would add another delayed `job_update`, and the job
+            // would re-run once per step at the next schedule tick.
+            if store.delayed_eval_pending("job_update", &self.job_config_id)? {
+                return Ok(());
+            }
+            store.enqueue_eval_after_delay(
+                "job_update",
+                Some(&self.job_id),
+                Some(&self.job_config_id),
+                None,
+                None,
+                delay,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// When the job's scheduled batch tasks next need a `job_update`, or
+    /// `None` when it has none (and the follow-up writes nothing).
+    fn batch_follow_up_delay(&self, store: &Store) -> R<Option<std::time::Duration>> {
         if self.job_id.trim().is_empty() || self.job_config_id.trim().is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         // The read model's copy (immutable per config id), not a SQL query
@@ -700,26 +731,7 @@ impl Eval {
             });
         }
 
-        if let Some(delay) = min_delay {
-            // One timer per config. Every placing eval passes through here,
-            // and a DAG's steps each queue a `job_reschedule` as they finish
-            // (`Store::queue_dependency_progress`); without this check each
-            // of them would add another delayed `job_update`, and the job
-            // would re-run once per step at the next schedule tick.
-            if store.delayed_eval_pending("job_update", &self.job_config_id)? {
-                return Ok(());
-            }
-            store.enqueue_eval_after_delay(
-                "job_update",
-                Some(&self.job_id),
-                Some(&self.job_config_id),
-                None,
-                None,
-                delay,
-            )?;
-        }
-
-        Ok(())
+        Ok(min_delay)
     }
 
     fn current_timestamp() -> String {
