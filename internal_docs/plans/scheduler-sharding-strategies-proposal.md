@@ -522,7 +522,7 @@ simplifying:
 writer *and* one file: node-scoped rows belong to the node's pool's shard;
 job-scoped rows belong to the job's pool's shard; a task binds to one pool
 (`constraints.rs:181`), and v1 requires a job's tasks to resolve to pools of
-one shard. Capacity arithmetic is shard-local, so oversubscription stays
+one shard. Capacity arithmetic is shard-local, so overfill stays
 impossible by construction, not by arbitration. Pools are also the only
 partition vocabulary users already have; nothing new enters the jobspec.
 
@@ -740,7 +740,7 @@ wall per regime, and the plan-path plan needs the same read.
 | Method | Eval/alloc throughput | Node axis | Blast radius | Format break | New correctness surface | Operator burden | Verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | M1 more write-class lanes | ~none (one writer; classes exhausted) | none | worse (more composites) | yes, per lane | composite half-applies | +1 lane per feature | **refuse** |
-| M2 job-keyed shards | high on paper | none | per shard | yes | **oversubscription across shards** | reshard = re-hash jobs | **reject → M3 + M4** |
+| M2 job-keyed shards | high on paper | none | per shard | yes | **overfill across shards** | reshard = re-hash jobs | **reject → M3 + M4** |
 | M3 plan shipping | planner × managers | none | none | none | staleness → conflicts | zero | **peer of rung A — the large-fleet lever** |
 | M4 raft groups over one file (rev 1) | ≈ ×1.1 on LAN (§1.2) | — | per pool | yes | row-scoped snapshots | one knob | **dropped** |
 | **M4 rung A** per-file shards, co-located | writers × N, pipelines × N on one box | planning ÷ N; memory unchanged | per pool | yes (enable/resize) | routing + cross-file FK audit | one knob; N files; per-shard status | **the axis when the writer binds — gate on Phase 0** |
@@ -797,7 +797,7 @@ wall per regime, and the plan-path plan needs the same read.
   differential test over the read API).
 - **Ownership:** exhaustiveness/disjointness per file; a changeset whose
   rows resolve to another shard is rejected before proposal; the
-  two-shards-one-node oversubscription scenario is *unconstructible*.
+  two-shards-one-node overfill scenario is *unconstructible*.
 - **Cascades:** an audit test asserting no composite depends on a
   cross-lane `ON DELETE CASCADE`, run with foreign keys disabled.
 - **Snapshots:** whole-file round-trip per shard; install refusal on a
