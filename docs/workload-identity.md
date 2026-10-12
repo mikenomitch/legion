@@ -112,7 +112,11 @@ A full runnable example is at
 - `name` is required and unique within the task.
 - `audience` must be non-empty, because a token without an audience can be
   replayed against any relying party.
-- At least one of `env` or `file` must be set.
+- At least one of `env` or `file` must be set, unless a
+  `connect.upstreams` credential names the identity (`from = { identity =
+  "<name>" }`). Then the node injects the token into requests to that
+  upstream and the identity may have no delivery at all, and no
+  `changeMode`. See [Injecting a token into an upstream](#injecting-a-token-into-an-upstream).
 - `extraClaims` are static literals. Keys can't be a reserved JWT claim
   (`iss`/`sub`/`aud`/…) or use the `legion.io/*` namespace.
 - **Change mode and delivery must be compatible.** `env` with
@@ -317,6 +321,36 @@ is a single manager, and it is always primary.
    `FailedPrecondition`. The worker logs one warning, and the task starts
    without tokens. Job specs still validate, so you can declare identities
    before the cluster enables the feature.
+
+### Injecting a token into an upstream
+
+Some origins take a token in a header and nothing else: an internal API
+that verifies Legion JWTs, a cloud endpoint fronted by an STS. Instead of
+handing the token to the task and having it set the header, name the
+identity in an upstream credential and the node sets it:
+
+```nickel
+identities = [{ name = "api", audience = ["https://api.internal.example"], ttl = "15m" }],
+connect = {
+  upstreams = [{
+    name = "api",
+    to = "https://api.internal.example",
+    credentials = [
+      { header = "Authorization", prefix = "Bearer ", from = { identity = "api" } },
+    ],
+  }],
+},
+```
+
+The task calls `http://$LEGION_UPSTREAM_API/...` with no token. The node's
+forwarder fetches the token with `GetUpstreamCredentials` (the manager
+mints it from the scheduling record, as above), holds it in memory, and asks
+for a new one once less than half the TTL is left. The worker does not run a
+refresh loop or write a file for an identity with no `env` or `file`, so the
+token is never in the task, its checkpoints, or its snapshots. The reserved
+`legion` identity cannot be injected. Everything else about injection
+(fail-closed `503`, status, the `https://` requirement) is in
+[Credential injection](network-handlers.md#credential-injection).
 
 ### Sandboxes
 

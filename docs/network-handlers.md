@@ -250,7 +250,14 @@ there too. See [What the datapath does today](#what-the-datapath-does-today).
 
 An external `https://` upstream can carry the API key itself, so the task
 never holds it. The node's forwarder sets the header on every request it
-sends to the destination, with a value it fetched from KV:
+sends to the destination, with a value from one of two providers:
+
+| Provider | `from` | The value |
+| --- | --- | --- |
+| KV | `{ kv = "secrets/openai" }` | the KV value at that path |
+| Workload identity | `{ identity = "api" }` | a signed token for the task's identity named `api`, minted for this allocation and refreshed before it expires |
+
+A KV-backed key looks like this:
 
 ```nickel
 connect = {
@@ -283,6 +290,33 @@ export OPENAI_API_KEY=placeholder          # replaced on the way out
 export ANTHROPIC_BASE_URL="http://$LEGION_UPSTREAM_ANTHROPIC"
 export ANTHROPIC_API_KEY=placeholder
 ```
+
+An origin that trusts Legion's OIDC issuer (a cloud STS, an internal API
+that verifies JWTs) can take a [workload identity](workload-identity.md)
+token instead of a stored key. Declare the identity with the origin's
+audience and name it in `from`. It needs no `env` or `file` delivery, and
+without one the token never enters the task:
+
+```nickel
+identities = [{ name = "api", audience = ["https://api.internal.example"], ttl = "15m" }],
+connect = {
+  upstreams = [{
+    name = "api",
+    to = "https://api.internal.example",
+    credentials = [
+      { header = "Authorization", prefix = "Bearer ", from = { identity = "api" } },
+    ],
+  }],
+},
+```
+
+The manager mints the token from the scheduling record, exactly like a
+delivered one (the identity's audience, TTL, `sub` template, and extra
+claims; see [Workload identity](workload-identity.md)), and the node injects
+it. The node asks for a new one once less than half the TTL is left, so the
+origin always receives an unexpired token and nothing in the task refreshes
+anything. An identity that also sets `env` or `file` is delivered to the
+task as well, as usual.
 
 **How it works without intercepting TLS.** With an `https://` upstream the
 task already speaks plain HTTP to its loopback port, and the node opens TLS to
@@ -331,11 +365,13 @@ its first heartbeat, and until then requests on that upstream get a `503`.
 - **Rotation.** `legion kv put secrets/openai ...` reaches every node on its
   next heartbeat (`GetUpstreamCredentials`, asked only for versions newer
   than the one held). Requests already in flight keep the old value. Nothing
-  restarts. Deleting the key revokes it on the next heartbeat.
-- **Fail-static.** An unreachable manager, or a KV read error, keeps the
-  last good value. A value no header can carry (a line break or NUL inside
-  it; one trailing newline is trimmed) is rejected and the previous value
-  stays.
+  restarts. Deleting the key revokes it on the next heartbeat. An identity
+  token is replaced on the first heartbeat after half its TTL has passed.
+- **Fail-static.** An unreachable manager, a KV read error, or a failed
+  token mint keeps the last good value. A value no header can carry (a line
+  break or NUL inside it; one trailing newline is trimmed) is rejected and
+  the previous value stays. An identity token held through a long manager
+  outage still expires at the origin, which then answers `401`.
 - **Status.** Problems are reported per allocation, and `legion net doctor`
   shows them on the datapath layer:
   `upstream openai credential authorization: kv secrets/openai not found (requests on this upstream get 503)`,
@@ -351,7 +387,11 @@ leak:
 | a catalog `service` upstream | refused: credentials are for external destinations |
 | `header` = `host`, `content-length`, `transfer-encoding`, or a hop-by-hop header | refused: the datapath owns these |
 | the same header twice on one upstream | refused |
-| `from = { kv = "" }`, or no provider | refused |
+| `from = { kv = "" }`, no provider, or both `kv` and `identity` | refused |
+| `from = { identity = "api" }` with no identity named `api` on the task | refused, naming the identities it does declare |
+| `from = { identity = "legion" }` | refused: the control-plane identity authenticates to Legion itself and must not be handed to another origin |
+| an identity with neither `env` nor `file`, that no credential names | refused: nothing would receive it |
+| `changeMode` or `changeSignal` on an identity with neither `env` nor `file` | refused: only the node holds that token, so there is nothing to signal or restart |
 
 Header names are case-insensitive and stored lower-cased.
 
@@ -360,9 +400,16 @@ author chose, so it needs the right to read it: `RunJob` and template runs
 require `kv:read` on every credential path, in addition to `job:write`.
 Without it the submit fails with `PermissionDenied`:
 `... (connect.upstreams[openai].credentials names kv secrets/openai; the submitter needs kv read on it)`.
-A node can only fetch a credential that an allocation placed on it declares.
-It names (allocation, upstream, header), and the manager derives each path
-from the allocation's own declaration.
+An identity credential needs no extra right: declaring an identity is
+already part of submitting the job. A node can only fetch a credential that
+an allocation placed on it declares. It names (allocation, upstream,
+header), and the manager derives each KV path or identity from the
+allocation's own declaration.
+
+**Identity provider prerequisites.** The manager must run with
+`workloadIdentity.enabled: true`. When it does not, the node holds no token
+and requests on that upstream get the `503` above, with the reason
+`workload identity is not enabled on this manager`.
 
 **Gated tasks.** A gated `container` or `exec` task reaches its upstreams
 inside its namespace, and declared upstreams are an explicit allowance, so
@@ -373,9 +420,9 @@ URL to the upstream instead, as above.
 
 **Limits.**
 
-- Only `kv` is a provider today. There is no workload-identity token or
-  webhook provider, and a credential can only be a request header: not a
-  query parameter or basic-auth pair.
+- The providers are `kv` and `identity`. There is no webhook provider (a
+  token exchange, for example), and a credential can only be a request
+  header: not a query parameter or basic-auth pair.
 - HTTP/1.1 only, like the rest of HTTP mode. A client that needs HTTP/2 to
   the origin cannot use an upstream.
 - A `sandbox` guest cannot reach its upstreams yet. A gated guest's only

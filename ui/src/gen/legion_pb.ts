@@ -9995,8 +9995,10 @@ export class UpstreamCredentialKnown extends Message<UpstreamCredentialKnown> {
   header = "";
 
   /**
-   * The KV version of the secret the worker already holds, or 0 for none.
-   * When it matches the current version the reply is `unchanged`.
+   * The version of the value the worker already holds, or 0 for none: the
+   * KV entry's version for a `kv` credential, the token's expiry (unix
+   * seconds) for an `identity` one. When it is still current the reply is
+   * `unchanged`.
    *
    * @generated from field: int64 version = 4;
    */
@@ -10111,40 +10113,45 @@ export class UpstreamCredentialValue extends Message<UpstreamCredentialValue> {
   header = "";
 
   /**
-   * The KV path the allocation's declaration names for this header. Set
-   * even when `error` is, so the worker can report which key is at fault.
+   * Where the value comes from, as the allocation's declaration names it:
+   * `kv secrets/openai` or `identity api`. Set even when `error` is, so the
+   * worker can report which key or identity is at fault. Empty when the
+   * declaration is gone.
    *
-   * @generated from field: string kv_path = 4;
+   * @generated from field: string source = 4;
    */
-  kvPath = "";
+  source = "";
 
   /**
-   * The KV entry's version. The worker re-fetches when it moves.
+   * The value's version: the KV entry's version, or the identity token's
+   * expiry in unix seconds. The worker sends it back as
+   * `UpstreamCredentialKnown.version`.
    *
    * @generated from field: int64 version = 5;
    */
   version = protoInt64.zero;
 
   /**
-   * True when `version` equals the version the worker sent. No value is
-   * returned.
+   * True when the version the worker sent is still current (the KV entry
+   * has not moved, or the identity token it holds has more than half its
+   * TTL left). No value is returned.
    *
    * @generated from field: bool unchanged = 6;
    */
   unchanged = false;
 
   /**
-   * The secret: the raw KV value, which the forwarder sends as the header
-   * value after the declared `prefix`. Treat as a secret: never log it,
-   * never write it to disk.
+   * The secret: the raw KV value, or the signed identity token, which the
+   * forwarder sends as the header value after the declared `prefix`. Treat
+   * as a secret: never log it, never write it to disk.
    *
    * @generated from field: string value = 7;
    */
   value = "";
 
   /**
-   * Why no value was returned, e.g. "kv secrets/openai not found". Empty on
-   * success.
+   * Why no value was returned, e.g. "kv secrets/openai not found" or
+   * "workload identity is not enabled on this manager". Empty on success.
    *
    * @generated from field: string error = 8;
    */
@@ -10155,8 +10162,8 @@ export class UpstreamCredentialValue extends Message<UpstreamCredentialValue> {
    * does not exist, or the allocation is not on this node or no longer
    * declares this credential. The worker drops any value it holds, so
    * deleting the key revokes the credential on the next heartbeat. False
-   * for transient problems (a KV read failure), where the worker keeps the
-   * last good value.
+   * for transient problems (a KV read failure, a failed token mint), where
+   * the worker keeps the last good value.
    *
    * @generated from field: bool absent = 9;
    */
@@ -10173,7 +10180,7 @@ export class UpstreamCredentialValue extends Message<UpstreamCredentialValue> {
     { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 2, name: "upstream", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "header", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 4, name: "kv_path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "unchanged", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 7, name: "value", kind: "scalar", T: 9 /* ScalarType.STRING */ },

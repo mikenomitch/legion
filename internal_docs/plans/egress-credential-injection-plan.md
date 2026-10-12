@@ -3,9 +3,9 @@
 > **Judgement calls:** [egress-credential-injection-plan_calls.md](../calls/egress-credential-injection-plan_calls.md)
 
 **Status: IN EXECUTION.** Phase 1 (KV-backed header credentials on external
-`https://` upstreams) is shipped. Phases 2 to 4 (a workload-identity
-provider, a webhook provider with non-header placements, per-request audit
-events) are planned. Deliberately deferred and tracked in
+`https://` upstreams) and Phase 2 (the workload-identity provider) are
+shipped. Phases 3 and 4 (a webhook provider with non-header placements,
+per-request audit events) are planned. Deliberately deferred and tracked in
 [TODO.md](../TODO.md): reaching upstreams (and so credentials) from a
 `sandbox` guest, which the gated vsock path does not carry today.
 
@@ -69,7 +69,7 @@ request the node builds for the origin.
   a credential (generic secret via SDS, or OAuth2 client-credentials) to a
   header, with `overwrite` controlling whether an existing header is
   replaced. *Take:* per-upstream declaration, the `overwrite` question (we
-  always overwrite, see calls #2), provider types as the extension seam
+  always overwrite, see calls #4), provider types as the extension seam
   (`generic`, `oauth2` map to our KV and later identity providers).
 - **Vault Agent / Nomad `template`.** Render secrets into files or env for
   the workload. This is what Legion already does with KV files. *Reject* for
@@ -178,8 +178,8 @@ connect = {
 
 `credentials[]` is `{ header, prefix?, from }`. `from` names exactly one
 provider; Phase 1 has `kv`. Later providers are sibling fields of `from`
-(`identity = { audience }`, `handler = "<name>"`), so the shape does not
-change.
+(Phase 2 shipped `identity = "<task identity name>"`; `handler = "<name>"`
+is next), so the shape does not change.
 
 ### 6.2 Validation at submit
 
@@ -247,12 +247,15 @@ problems on the datapath layer. No proto change to the status message.
 
 1. **KV provider, header placement, `https://` upstreams.** *Shipped.*
    Everything in §6.
-2. **Workload-identity provider.** `from = { identity = { audience =
-   "https://api.example" } }` mints a workload-identity JWT for the
-   allocation (docs/workload-identity.md) on the node and injects it,
-   refreshed before expiry. Useful for origins that accept OIDC (cloud
-   STS-fronted APIs, internal services). Needs: node-side token minting for
-   injection without delivering the token to the task.
+2. **Workload-identity provider.** *Shipped,* in a different shape than
+   first sketched: `from = { identity = "<name>" }` names one of the task's
+   `identities` (which owns audience, TTL, and claims) instead of an inline
+   `{ audience }`, and an identity named this way needs no `env`/`file`
+   delivery. The manager mints the token inside `GetUpstreamCredentials`
+   rather than the node calling `IssueWorkloadIdentityToken`: the token's
+   expiry is its version, and the manager re-mints once less than half the
+   TTL is left. Useful for origins that accept OIDC (cloud STS-fronted APIs,
+   internal services). See calls #6 to #8.
 3. **Webhook provider and non-header placements.** `from = { handler =
    "vault-exchange" }` calls an operator webhook with the allocation's
    facts and caches the returned value for its TTL (token exchange, short-

@@ -1345,31 +1345,43 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Fetch the KV-held secrets behind `connect.upstreams[].credentials`
+     * Fetch the values behind `connect.upstreams[].credentials`
      * (docs/network-handlers.md, "Credential injection"): headers the node's
      * forwarder sets on every request it sends to an external `https://`
      * upstream, so the task (and anything captured from it: a sandbox's
      * memory checkpoints, forks, published snapshots) never holds the secret.
      *
-     * The worker names (allocation, upstream, header) triples, never KV paths.
-     * For each one the manager checks that the allocation is placed on the
-     * calling node, reads the allocation's own task `connect` declaration,
-     * finds the upstream and the credential for that header, and takes the KV
-     * path from it. So a node can only ever read a secret that a job placed on
-     * it declares, and a job can only declare one its submitter could read
-     * (RunJob and template runs require `kv:read` on every credential path).
+     * Each credential names one provider:
+     * - `from = { kv = "<path>" }`: the KV value at that path.
+     * - `from = { identity = "<name>" }`: a workload-identity token
+     *   (docs/workload-identity.md) the manager mints for the allocation
+     *   under the task's identity of that name, with that identity's
+     *   audience, TTL, `sub` template, and extra claims.
+     *
+     * The worker names (allocation, upstream, header) triples, never KV paths
+     * or identities. For each one the manager checks that the allocation is
+     * placed on the calling node, reads the allocation's own task `connect`
+     * declaration, finds the upstream and the credential for that header, and
+     * takes the provider from it. So a node can only ever read a secret that a
+     * job placed on it declares, and a job can only declare one its submitter
+     * could read (RunJob and template runs require `kv:read` on every
+     * credential path).
      *
      * Workers call it on their heartbeat loop, only while some allocation on
-     * the node declares credentials, passing the KV version they already hold
-     * so an unchanged secret costs no material on the wire. The worker keeps
-     * values in memory only: never in its state files, never in a log line.
+     * the node declares credentials, passing the version they already hold so
+     * an unchanged value costs no material on the wire. For a KV value the
+     * version is the KV entry's; for an identity token it is the token's
+     * expiry, and the manager mints a new token once less than half the
+     * identity's TTL remains. The worker keeps values in memory only: never in
+     * its state files, never in a log line.
      *
-     * Per-entry problems (not placed here, no such credential, key missing)
-     * come back in that entry's `error` rather than failing the call, so one
-     * missing secret never blocks the others. `absent` marks the problems that
-     * are authoritative (the key or the declaration is gone): the worker drops
-     * any value it holds and fails requests on that upstream closed. Any other
-     * error, and a failed call, keeps the last good value.
+     * Per-entry problems (not placed here, no such credential, key missing,
+     * workload identity disabled on the manager) come back in that entry's
+     * `error` rather than failing the call, so one missing secret never blocks
+     * the others. `absent` marks the problems that are authoritative (the key
+     * or the declaration is gone): the worker drops any value it holds and
+     * fails requests on that upstream closed. Any other error, and a failed
+     * call, keeps the last good value.
      *
      * Called by the worker for its own node: the caller's authenticated
      * per-node principal (`node:<node_id>`) must match the request's

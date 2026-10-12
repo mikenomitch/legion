@@ -165,6 +165,14 @@ impl WorkloadIdentity {
         self.env.as_deref().is_some_and(|e| !e.trim().is_empty())
     }
 
+    /// Whether the worker delivers this identity's token to the task at all
+    /// (env or file). One that is only named by a `connect.upstreams`
+    /// credential is not: the manager mints it for the node's forwarder,
+    /// and the task never sees it.
+    pub fn is_delivered(&self) -> bool {
+        self.delivers_env() || self.delivers_file()
+    }
+
     /// Parse the configured TTL, if any.
     pub fn parsed_ttl(&self) -> R<Option<Duration>> {
         match self.ttl.as_deref() {
@@ -195,6 +203,20 @@ impl WorkloadIdentity {
         task_name: &str,
         stateful: bool,
         env_refreshes_in_guest: bool,
+    ) -> R<()> {
+        self.validate_inner(task_name, stateful, env_refreshes_in_guest, false)
+    }
+
+    /// The shared body of [`Self::validate_with`]. `injected` is true when a
+    /// `connect.upstreams` credential names this identity (`from = {
+    /// identity }`): the node then injects the token into requests to that
+    /// upstream, so the identity is useful without `env` or `file`.
+    fn validate_inner(
+        &self,
+        task_name: &str,
+        stateful: bool,
+        env_refreshes_in_guest: bool,
+        injected: bool,
     ) -> R<()> {
         let scope = format!("task {task_name} identity {:?}", self.name);
 
@@ -228,8 +250,23 @@ impl WorkloadIdentity {
             }
         }
 
-        if !self.delivers_env() && !self.delivers_file() {
-            bail!("{scope} must set at least one of env or file delivery");
+        if !self.is_delivered() {
+            if !injected {
+                bail!(
+                    "{scope} must set at least one of env or file delivery, or be named by a \
+                     connect.upstreams credential (from = {{ identity = {:?} }})",
+                    self.name
+                );
+            }
+            // Only the node holds an injection-only token, so there is
+            // nothing in the task for a change mode to act on.
+            if self.change_mode != ChangeMode::Noop || self.change_signal.is_some() {
+                bail!(
+                    "{scope} has no env or file delivery, so the node only injects it into \
+                     connect.upstreams requests and refreshes it there; changeMode and \
+                     changeSignal have nothing to act on. Hint: remove them"
+                );
+            }
         }
 
         // Parse TTL eagerly so a bad value fails admission, not first issuance.
@@ -362,6 +399,37 @@ pub fn validate_identities(
     stateful: bool,
     env_refreshes_in_guest: bool,
 ) -> R<()> {
+    validate_identities_with(task_name, identities, stateful, env_refreshes_in_guest, &[])
+}
+
+/// [`validate_identities`], given the identity names the task's
+/// `connect.upstreams` credentials inject (`from = { identity }`). Each must
+/// be declared, and an injected identity may skip `env`/`file` delivery.
+pub fn validate_identities_with(
+    task_name: &str,
+    identities: &[WorkloadIdentity],
+    stateful: bool,
+    env_refreshes_in_guest: bool,
+    injected: &[&str],
+) -> R<()> {
+    for name in injected {
+        if !identities.iter().any(|identity| identity.name == *name) {
+            let declared: Vec<&str> = identities
+                .iter()
+                .map(|identity| identity.name.as_str())
+                .collect();
+            bail!(
+                "task {task_name} connect.upstreams credential names identity {name:?}, but the \
+                 task declares {}. Hint: add {{ name = {name:?}, audience = [\"<the upstream's \
+                 audience>\"] }} to identities",
+                if declared.is_empty() {
+                    "no identities".to_string()
+                } else {
+                    format!("{declared:?}")
+                }
+            );
+        }
+    }
     let mut seen = std::collections::HashSet::new();
     // Delivery targets must be unique across the task's identities: two
     // identities writing the same file path (each on its own refresh schedule)
@@ -373,7 +441,12 @@ pub fn validate_identities(
     let mut file_targets: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for identity in identities {
-        identity.validate_with(task_name, stateful, env_refreshes_in_guest)?;
+        identity.validate_inner(
+            task_name,
+            stateful,
+            env_refreshes_in_guest,
+            injected.contains(&identity.name.as_str()),
+        )?;
         if !seen.insert(identity.name.as_str()) {
             bail!(
                 "task {task_name} declares duplicate identity name {:?}",

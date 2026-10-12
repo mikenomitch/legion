@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::prelude::{bail, R};
+use crate::prelude::{anyhow, bail, R};
 
 /// Inclusive dynamic port range used when a port has no `static` value.
 pub const DYNAMIC_PORT_MIN: u16 = 20000;
@@ -551,9 +551,9 @@ pub struct UpstreamCredential {
     pub from: CredentialFrom,
 }
 
-/// The provider behind one credential. Exactly one field is set. Only `kv`
-/// exists today; the struct is the seam later providers (a workload-identity
-/// token, a webhook) slot into as sibling fields.
+/// The provider behind one credential. Exactly one field is set. Each
+/// provider is a sibling field, so a new one (a webhook) slots in without
+/// reshaping the jobspec.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CredentialFrom {
@@ -561,6 +561,12 @@ pub struct CredentialFrom {
     /// `GetUpstreamCredentials` and keeps it in memory only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv: Option<String>,
+    /// The name of one of the task's `identities`: the manager mints that
+    /// workload-identity token for the allocation and the node injects it,
+    /// refreshed before it expires. The identity needs no `env` or `file`
+    /// delivery, in which case the token never reaches the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 impl UpstreamCredential {
@@ -571,6 +577,26 @@ impl UpstreamCredential {
             .as_deref()
             .map(str::trim)
             .filter(|path| !path.is_empty())
+    }
+
+    /// The task identity this credential injects, when it is
+    /// identity-backed.
+    pub fn identity_name(&self) -> Option<&str> {
+        self.from
+            .identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Where the value comes from, as the jobspec names it, for status
+    /// lines and logs: `kv secrets/openai` or `identity api`.
+    pub fn source(&self) -> String {
+        match (self.kv_path(), self.identity_name()) {
+            (Some(path), _) => format!("kv {path}"),
+            (None, Some(name)) => format!("identity {name}"),
+            (None, None) => "no provider".to_string(),
+        }
     }
 }
 
@@ -679,11 +705,31 @@ fn validate_upstream_credentials(task_name: &str, upstream: &UpstreamConfig) -> 
                 bail!("{at}: prefix must not contain CR, LF, or NUL");
             }
         }
-        match credential.from.kv.as_deref() {
-            Some(path) if !path.trim().is_empty() => {}
-            Some(_) => bail!("{at}: from.kv must name a KV path"),
-            None => bail!(
-                "{at}: from needs a provider; today that is {{ kv = \"<path>\" }}, e.g. \
+        match (
+            credential.from.kv.as_deref(),
+            credential.from.identity.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                bail!("{at}: from names two providers (kv and identity); set exactly one")
+            }
+            (Some(path), None) if !path.trim().is_empty() => {}
+            (Some(_), None) => bail!("{at}: from.kv must name a KV path"),
+            (None, Some(name)) => {
+                crate::structs::workload_identity::validate_identity_name(name.trim())
+                    .map_err(|err| anyhow!("{at}: from.identity: {err}"))?;
+                if name.trim() == crate::structs::workload_identity::CONTROL_PLANE_IDENTITY_NAME {
+                    bail!(
+                        "{at}: from.identity = \"{}\" is the control-plane identity, which \
+                         authenticates to Legion itself; injecting it would hand a Legion \
+                         credential to {to}. Hint: declare an identity whose audience is \
+                         that origin",
+                        name.trim()
+                    );
+                }
+            }
+            (None, None) => bail!(
+                "{at}: from needs a provider: {{ kv = \"<path>\" }} or \
+                 {{ identity = \"<task identity name>\" }}, e.g. \
                  from = {{ kv = \"secrets/{key}\" }}"
             ),
         }
@@ -1730,6 +1776,9 @@ pub fn normalize_task_connect(task_name: &str, connect: &mut Option<ConnectConfi
             if let Some(path) = credential.from.kv.as_mut() {
                 *path = path.trim().to_string();
             }
+            if let Some(name) = credential.from.identity.as_mut() {
+                *name = name.trim().to_string();
+            }
         }
         let is_http = upstream.is_http();
         let key = upstream.key().to_string();
@@ -2542,6 +2591,24 @@ mod tests {
         assert!(serde_json::from_value::<ConnectConfig>(json!({ "upstreams": [{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "vault": "a" } }] }] })).is_err());
         let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "prefix": "a\r\nb", "from": { "kv": "k" } }] }])).unwrap_err();
         assert!(err.contains("CR, LF"), "{err}");
+
+        // The identity provider: a valid name, one provider at a time, and
+        // never the control-plane identity.
+        check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "authorization", "prefix": "Bearer ", "from": { "identity": "api" } }] }]))
+            .unwrap();
+        let mut normalized = Some(connect(
+            json!([{ "name": "a", "to": "https://x", "credentials": [{ "header": "authorization", "from": { "identity": " api " } }] }]),
+        ));
+        normalize_task_connect("api", &mut normalized).unwrap();
+        let credential = &normalized.unwrap().upstreams[0].credentials[0];
+        assert_eq!(credential.identity_name(), Some("api"));
+        assert_eq!(credential.source(), "identity api");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "kv": "k", "identity": "api" } }] }])).unwrap_err();
+        assert!(err.contains("two providers"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "identity": "../x" } }] }])).unwrap_err();
+        assert!(err.contains("from.identity"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "identity": "legion" } }] }])).unwrap_err();
+        assert!(err.contains("control-plane identity"), "{err}");
     }
 
     #[test]

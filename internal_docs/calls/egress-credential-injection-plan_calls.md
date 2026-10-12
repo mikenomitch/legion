@@ -128,7 +128,77 @@ reply to every node. A separate RPC keeps secrets off the hot path and out
 of every persisted structure, and reuses the exact shape and ACL reasoning
 of the certificate RPC (one pattern, not two).
 
-## 6. Deleting the key revokes; other errors keep the last good value
+## 6. The identity provider names a task identity, which may then skip delivery
+
+```nickel
+identities = [{ name = "api", audience = ["https://api.internal.example"], ttl = "15m" }],
+connect.upstreams = [{ name = "api", to = "https://api.internal.example",
+  credentials = [{ header = "Authorization", prefix = "Bearer ", from = { identity = "api" } }] }],
+```
+
+**Call.** `from = { identity = "<name>" }` refers to an entry in the task's
+`identities`, which owns the audience, TTL, `sub` template, and extra
+claims. An identity named this way may set neither `env` nor `file`; the
+worker then skips it entirely (`parse_identities` drops undelivered
+identities), so the token exists only in the manager's reply and the
+forwarder's memory. Such an identity may not set `changeMode` or
+`changeSignal`. This deviates from the plan's sketch, which had the
+audience inline: `from = { identity = { audience = "..." } }`.
+
+**Alternatives.** (a) The plan's inline form, with the manager synthesizing
+an identity from the credential. (b) Require the identity to be delivered
+too, so the existing rule ("set env or file") never bends.
+
+**Trade-off.** Two blocks to write instead of one, and a validation rule
+that now depends on another block (`TaskConfig::validate_identities` reads
+`connect`).
+
+**Why (simplicity, extensibility).** The identity block is where the
+security-relevant choices about a token already live, and the rules that
+guard them (the `sub` uniqueness floor, reserved claims, TTL parsing) apply
+unchanged. An inline form would either grow a second copy of those fields
+or silently use cluster defaults for `sub` and TTL. (b) would put the token
+back into the task, which is exactly what injection exists to avoid.
+
+## 7. The manager mints and decides when to refresh; the token's expiry is its version
+
+**Call.** `GetUpstreamCredentials` mints the token itself, the way
+`IssueWorkloadIdentityToken` does. The worker sends the token's expiry as
+`known.version`; the manager answers `unchanged` while more than half the
+identity's TTL remains, and mints a new token otherwise. The worker side is
+the KV path unchanged: same RPC, same in-memory map, same fail-static rules.
+
+**Alternatives.** The plan's "minted on the node": the worker calls
+`IssueWorkloadIdentityToken` and runs a refresh loop per injected identity,
+as it does for delivered ones.
+
+**Trade-off.** A token's refresh is quantized to the heartbeat interval, and
+an identity whose TTL is under two heartbeats would be re-minted on every
+beat. The node also holds a token for as long as the manager is
+unreachable, until the origin rejects it as expired.
+
+**Why (simplicity).** One delivery path for every provider: the forwarder
+never learns what kind of credential it holds, and the refresh policy sits
+next to the signing key that sets the expiry. A second refresh loop on the
+worker would duplicate the delivered-identity machinery for a value that
+never touches the task.
+
+## 8. Never inject the control-plane identity
+
+**Call.** `from = { identity = "legion" }` is refused at submit: `... is the
+control-plane identity, which authenticates to Legion itself; injecting it
+would hand a Legion credential to https://...`.
+
+**Alternatives.** Allow it, for an upstream that is the cluster's own API.
+
+**Trade-off.** A task cannot use injection to call Legion's own API with its
+control-plane token; it reads the delivered token instead.
+
+**Why (security).** Every injection target is an external origin, so the
+only effect of allowing it would be to hand a token that Legion accepts to
+a third party.
+
+## 9. Deleting the key revokes; other errors keep the last good value
 
 **Call.** The reply marks authoritative problems `absent` (the key does not
 exist, or the allocation no longer declares the header); the worker drops
@@ -148,7 +218,7 @@ revocation gesture, and an operator who did it expects requests to stop.
 Transient errors still fail static, so a manager blip never takes an
 upstream down.
 
-## 7. Inject into `proxy` handler hand-offs, and say the proxy sees it
+## 10. Inject into `proxy` handler hand-offs, and say the proxy sees it
 
 **Call.** A request handed to a `proxy` hop carries the injected header,
 read once per request and also sent on every retry. The docs say a proxy hop
@@ -169,7 +239,7 @@ credential its request to the origin fails, which would make credentials and
 proxies mutually exclusive. The proxy is operator-declared code already
 trusted with the request body.
 
-## 8. Sandbox guests are left out of Phase 1, as a documented gap
+## 11. Sandbox guests are left out of Phase 1, as a documented gap
 
 **Call.** Phase 1 ships for `exec` and `container` tasks. A `sandbox` guest
 cannot reach its `connect.upstreams` at all today (the listeners are on the
@@ -189,7 +259,7 @@ and gated readiness, and it cannot be exercised end to end in CI (no KVM).
 Shipping the credential surface on the paths that work keeps each change
 reviewable; the relay work lands under the gated-sandbox plan.
 
-## 9. `authz` hops run before injection and never see the value
+## 12. `authz` hops run before injection and never see the value
 
 **Call.** External `authz` webhooks receive the task's own headers (minus
 `authorization`, `cookie`, `proxy-authorization`, as before); injection
@@ -205,7 +275,7 @@ used (it can still see the upstream and destination).
 who holds it for no decision value, and contradicts the existing rule that
 `authz` never sees authorization headers.
 
-## 10. One trailing line ending is trimmed from the KV value
+## 13. One trailing line ending is trimmed from the KV value
 
 **Call.** `sk-...\n` injects `sk-...`. A value with an inner CR, LF, or NUL
 (or empty after trimming) is refused with an error and not sent.

@@ -177,7 +177,8 @@ pub type CredentialKey = (i64, String, String);
 /// gone) and the latest fetch problem.
 #[derive(Debug, Default, Clone)]
 pub struct CredentialState {
-    pub kv_path: String,
+    /// Where the value comes from (`kv secrets/openai`, `identity api`).
+    pub source: String,
     pub version: i64,
     pub value: Option<SecretValue>,
     pub error: Option<String>,
@@ -334,8 +335,9 @@ impl ForwarderContext {
 
     // ----- credential injection -----------------------------------------
 
-    /// The KV version of the credential held for a header (0 for none), what
-    /// `GetUpstreamCredentials` compares against.
+    /// The version of the credential held for a header (0 for none): the KV
+    /// version, or an identity token's expiry. What `GetUpstreamCredentials`
+    /// compares against.
     pub fn credential_version(&self, allocation_id: i64, upstream: &str, header: &str) -> i64 {
         lock(&self.credentials)
             .get(&(allocation_id, upstream.to_string(), header.to_string()))
@@ -351,14 +353,14 @@ impl ForwarderContext {
         allocation_id: i64,
         upstream: &str,
         header: &str,
-        kv_path: &str,
+        source: &str,
         version: i64,
         value: SecretValue,
     ) {
         lock(&self.credentials).insert(
             (allocation_id, upstream.to_string(), header.to_string()),
             CredentialState {
-                kv_path: kv_path.to_string(),
+                source: source.to_string(),
                 version,
                 value: Some(value),
                 error: None,
@@ -374,7 +376,7 @@ impl ForwarderContext {
         allocation_id: i64,
         upstream: &str,
         header: &str,
-        kv_path: &str,
+        source: &str,
         error: String,
         absent: bool,
     ) {
@@ -382,8 +384,8 @@ impl ForwarderContext {
         let state = credentials
             .entry((allocation_id, upstream.to_string(), header.to_string()))
             .or_default();
-        if !kv_path.is_empty() {
-            state.kv_path = kv_path.to_string();
+        if !source.is_empty() {
+            state.source = source.to_string();
         }
         state.error = Some(error);
         if absent {
@@ -419,7 +421,6 @@ impl ForwarderContext {
         credential: &UpstreamCredential,
     ) -> Result<SecretValue, String> {
         let header = credential.header.to_ascii_lowercase();
-        let path = credential.kv_path().unwrap_or_default();
         match lock(&self.credentials).get(&(allocation_id, upstream.to_string(), header)) {
             Some(CredentialState {
                 value: Some(value), ..
@@ -427,7 +428,7 @@ impl ForwarderContext {
             Some(CredentialState {
                 error: Some(error), ..
             }) => Err(error.clone()),
-            _ => Err(format!("kv {path} not fetched yet")),
+            _ => Err(format!("{} not fetched yet", credential.source())),
         }
     }
 

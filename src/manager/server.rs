@@ -8727,7 +8727,7 @@ impl Manager for ManagerDaemonService {
                     header: known.header.clone(),
                     ..Default::default()
                 };
-                let path = declared
+                let credential = declared
                     .get(&known.allocation_id)
                     .and_then(|connect| {
                         connect
@@ -8740,10 +8740,8 @@ impl Manager for ManagerDaemonService {
                             .credentials
                             .iter()
                             .find(|credential| credential.header.eq_ignore_ascii_case(&header))
-                    })
-                    .and_then(|credential| credential.kv_path())
-                    .map(str::to_string);
-                let Some(path) = path else {
+                    });
+                let Some(credential) = credential else {
                     out.error = format!(
                         "allocation is not placed on this node or upstream {} declares no \
                          credential for header {header}",
@@ -8752,7 +8750,19 @@ impl Manager for ManagerDaemonService {
                     out.absent = true;
                     return out;
                 };
-                out.kv_path = path.clone();
+                out.source = credential.source();
+                if let Some(name) = credential.identity_name() {
+                    self.upstream_identity_token(known, name, &mut out);
+                    return out;
+                }
+                let Some(path) = credential.kv_path().map(str::to_string) else {
+                    out.error = format!(
+                        "upstream {} credential {header} names no provider",
+                        known.upstream
+                    );
+                    out.absent = true;
+                    return out;
+                };
                 match self.store.get_kv(&path) {
                     Ok(Some(entry)) => {
                         out.version = entry.version;
@@ -11218,6 +11228,110 @@ pub(crate) fn desired_payload(
 /// after each stateful task's fence window, its running allocations) down with
 /// it.
 impl ManagerDaemonService {
+    /// The token behind a `from = { identity = "<name>" }` upstream
+    /// credential (docs/network-handlers.md, "Credential injection"): the
+    /// task's identity of that name, minted for the allocation exactly as
+    /// `IssueWorkloadIdentityToken` would. The token the node already holds
+    /// (`known.version` is its expiry) stays until less than half the
+    /// identity's TTL remains, so a steady node mints about twice per TTL.
+    /// The caller has already checked the allocation is on the calling node.
+    fn upstream_identity_token(
+        &self,
+        known: &crate::structs::UpstreamCredentialKnown,
+        identity_name: &str,
+        out: &mut UpstreamCredentialValue,
+    ) {
+        let Some(state) = self.workload_identity.as_ref() else {
+            out.error = "workload identity is not enabled on this manager (set \
+                         workloadIdentity.enabled: true in the manager config)"
+                .to_string();
+            return;
+        };
+        let allocation = match self.store.get_allocation_by_id(known.allocation_id) {
+            Ok(Some(allocation)) => allocation,
+            Ok(None) => {
+                out.error = format!("allocation {} not found", known.allocation_id);
+                out.absent = true;
+                return;
+            }
+            Err(err) => {
+                warn!(allocation_id = known.allocation_id, error = ?err, "Failed loading allocation for an upstream identity");
+                out.error = "allocation could not be loaded".to_string();
+                return;
+            }
+        };
+        let task = match self
+            .store
+            .get_task_configs_for_job_config(&allocation.job_config_id)
+        {
+            Ok(tasks) => tasks
+                .into_iter()
+                .find(|(id, _)| *id == allocation.task_config_id)
+                .map(|(_, task)| task),
+            Err(err) => {
+                warn!(allocation_id = known.allocation_id, error = ?err, "Failed loading task config for an upstream identity");
+                None
+            }
+        };
+        let Some(task) = task else {
+            out.error = "task config could not be loaded".to_string();
+            return;
+        };
+        let Some(identity) = task
+            .identities
+            .iter()
+            .find(|identity| identity.name == identity_name)
+        else {
+            out.error = format!(
+                "task {} declares no identity named {identity_name:?}",
+                task.name
+            );
+            out.absent = true;
+            return;
+        };
+
+        let now = std::time::SystemTime::now();
+        let now_secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or_default();
+        let half_life = (state.token_lifetime(identity).as_secs() / 2) as i64;
+        if known.version > 0 && known.version - now_secs > half_life {
+            out.version = known.version;
+            out.unchanged = true;
+            return;
+        }
+
+        let claims =
+            match claims_for_allocation(&self.store, &allocation, &task, DEF_CLUSTER_REGION) {
+                Ok(claims) => claims,
+                Err(err) => {
+                    error!(error = ?err, "Error deriving workload identity claims for an upstream");
+                    out.error = "failed to derive workload identity claims".to_string();
+                    return;
+                }
+            };
+        match state.issue(&claims, identity, now) {
+            Ok(issued) => {
+                // Lifecycle log only, never the token.
+                info!(
+                    allocation_id = known.allocation_id,
+                    upstream = %known.upstream,
+                    identity = %identity_name,
+                    expires_at = issued.expires_at,
+                    kid = %issued.kid,
+                    "Issued workload identity token for upstream injection"
+                );
+                out.version = issued.expires_at as i64;
+                out.value = issued.token;
+            }
+            Err(err) => {
+                error!(error = ?err, "Error signing workload identity token for an upstream");
+                out.error = "failed to sign workload identity token".to_string();
+            }
+        }
+    }
+
     /// Effective network policy for every desired allocation, as content
     /// hashes. Zero store access when the cluster has no policy (cached
     /// generation) and no task on this node declares one.
@@ -14621,7 +14735,7 @@ mod tests {
             (alloc.id + 999, "openai", "authorization", 0),
         ])
         .await?;
-        assert_eq!(first[0].kv_path, "secrets/openai");
+        assert_eq!(first[0].source, "kv secrets/openai");
         assert_eq!(
             first[0].value, "sk-live-1",
             "one trailing newline is trimmed"
@@ -14677,6 +14791,105 @@ mod tests {
         .await?;
         assert!(gone[0].absent);
         assert_eq!(gone[0].error, "kv secrets/openai not found");
+        Ok(())
+    }
+
+    /// `from = { identity }`: the manager mints the task's identity for the
+    /// allocation, the node keeps it while more than half its TTL is left,
+    /// and an identity the task does not declare is absent.
+    #[tokio::test]
+    async fn get_upstream_credentials_mints_an_identity_token_test() -> R<()> {
+        use crate::structs::workload_identity::WorkloadIdentity;
+        let store = setup_store()?;
+        let wi = wi_state(&store)?;
+        let manager =
+            ManagerDaemonService::new(store.clone()).with_workload_identity(Some(wi.clone()));
+        let task = TaskConfig {
+            identities: vec![WorkloadIdentity {
+                name: "api".into(),
+                audience: vec!["https://api.example.com".into()],
+                ttl: Some("10m".into()),
+                ..Default::default()
+            }],
+            connect: Some(serde_json::from_value(json!({
+                "upstreams": [{
+                    "name": "api",
+                    "to": "https://api.example.com",
+                    "credentials": [{
+                        "header": "authorization",
+                        "prefix": "Bearer ",
+                        "from": { "identity": "api" },
+                    }],
+                }],
+            }))?),
+            ..TaskConfig::new("agent-task", "noop")
+        };
+        task.validate_identities()?;
+        let alloc = submit_and_place_identity_task(&store, "agent", task)?;
+
+        let fetch = |version: i64| {
+            let manager = &manager;
+            async move {
+                manager
+                    .get_upstream_credentials(Request::new(GetUpstreamCredentialsRequest {
+                        node_id: "node-1".into(),
+                        known: vec![crate::structs::UpstreamCredentialKnown {
+                            allocation_id: alloc.id,
+                            upstream: "api".into(),
+                            header: "authorization".into(),
+                            version,
+                        }],
+                    }))
+                    .await
+                    .map(|reply| reply.into_inner().credentials.remove(0))
+            }
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        let first = fetch(0).await?;
+        assert!(first.error.is_empty(), "{}", first.error);
+        assert_eq!(first.source, "identity api");
+        assert!(
+            (first.version - now - 600).abs() <= 5,
+            "the version is the token's expiry: {} vs now {now}",
+            first.version
+        );
+        let claims = wi
+            .verify(&first.value, "https://api.example.com")
+            .context("the injected value is a token for the upstream's audience")?;
+        assert_eq!(claims["legion.io/job"], "agent");
+
+        // Fresh enough: nothing is minted or sent.
+        let again = fetch(first.version).await?;
+        assert!(again.unchanged && again.value.is_empty(), "{again:?}");
+        assert_eq!(again.version, first.version);
+
+        // Less than half the TTL left: a new token.
+        let stale = fetch(now + 200).await?;
+        assert!(!stale.unchanged);
+        assert!(!stale.value.is_empty());
+
+        // Workload identity off on the manager: an error the node reports,
+        // not an authoritative absence.
+        let disabled = ManagerDaemonService::new(store.clone());
+        let off = disabled
+            .get_upstream_credentials(Request::new(GetUpstreamCredentialsRequest {
+                node_id: "node-1".into(),
+                known: vec![crate::structs::UpstreamCredentialKnown {
+                    allocation_id: alloc.id,
+                    upstream: "api".into(),
+                    header: "authorization".into(),
+                    version: 0,
+                }],
+            }))
+            .await?
+            .into_inner()
+            .credentials
+            .remove(0);
+        assert!(off.value.is_empty() && !off.absent);
+        assert!(off.error.contains("not enabled"), "{}", off.error);
         Ok(())
     }
 

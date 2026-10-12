@@ -2413,8 +2413,8 @@ fn declared_credentials(
 /// Keep `connect.upstreams[].credentials` current (docs/network-handlers.md,
 /// "Credential injection"): one `GetUpstreamCredentials` call per heartbeat,
 /// only while an allocation on the node declares credentials, carrying the
-/// KV version already held so an unchanged secret costs nothing on the
-/// wire. Values live in the forwarder's memory only — never in
+/// version already held (a KV version, or an identity token's expiry) so an
+/// unchanged value costs nothing on the wire. Values live in the forwarder's memory only — never in
 /// `netd_state.json`, never in a log line. Fail-static: a failed call or a
 /// transient error keeps the value in hand; an `absent` answer (the key was
 /// deleted, or the declaration is gone) drops it, so requests on that
@@ -2470,7 +2470,7 @@ async fn apply_upstream_credentials(
                     allocation_id = value.allocation_id,
                     upstream = %value.upstream,
                     header = %header,
-                    kv_path = %value.kv_path,
+                    source = %value.source,
                     error = %value.error,
                     "Upstream credential is gone; requests on this upstream fail closed"
                 );
@@ -2479,7 +2479,7 @@ async fn apply_upstream_credentials(
                 value.allocation_id,
                 &value.upstream,
                 &header,
-                &value.kv_path,
+                &value.source,
                 value.error,
                 value.absent,
             );
@@ -2493,18 +2493,18 @@ async fn apply_upstream_credentials(
             value.allocation_id,
             &value.upstream,
             &header,
-            &value.kv_path,
+            &value.source,
             value.version,
             crate::worker::forwarder::SecretValue::new(value.value),
         );
-        // The path and version only: never the value.
+        // The source and version only: never the value.
         info!(
             allocation_id = value.allocation_id,
             upstream = %value.upstream,
             header = %header,
-            kv_path = %value.kv_path,
+            source = %value.source,
             version = value.version,
-            "Installed upstream credential from KV"
+            "Installed upstream credential"
         );
     }
 }

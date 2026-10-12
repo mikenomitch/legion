@@ -303,6 +303,17 @@
                             { header = "OpenAI-Organization", from = { kv = "secrets/openai-org" } },
                         ],
                     },
+                    {
+                        name = "billing",
+                        to = "https://billing.internal.example",
+                        # The identity provider: the manager mints this
+                        # task's "billing" workload identity for the
+                        # allocation and the node injects it, asking for a
+                        # new one once half its TTL has passed.
+                        credentials = [
+                            { header = "Authorization", prefix = "Bearer ", from = { identity = "billing" } },
+                        ],
+                    },
                 ],
                 # Config files rendered from the upstreams and their live
                 # endpoint feed (docs/service-discovery.md, "Templates"):
@@ -348,6 +359,14 @@
                         mode = "0400",
                     },
                     changeMode = "noop",
+                },
+                {
+                    # Injection only: no env or file, because the "billing"
+                    # upstream's credential names it (from = { identity }).
+                    # The node holds the token; the task never sees it.
+                    name = "billing",
+                    audience = ["https://billing.internal.example"],
+                    ttl = "10m",
                 },
             ],
             # Task-level KV policy defaults; entries override field-by-field

@@ -957,31 +957,43 @@ service Manager {
   rpc GetIngressCertificates (GetIngressCertificatesRequest)
       returns (GetIngressCertificatesReply);
 
-  // Fetch the KV-held secrets behind `connect.upstreams[].credentials`
+  // Fetch the values behind `connect.upstreams[].credentials`
   // (docs/network-handlers.md, "Credential injection"): headers the node's
   // forwarder sets on every request it sends to an external `https://`
   // upstream, so the task (and anything captured from it: a sandbox's
   // memory checkpoints, forks, published snapshots) never holds the secret.
   //
-  // The worker names (allocation, upstream, header) triples, never KV paths.
-  // For each one the manager checks that the allocation is placed on the
-  // calling node, reads the allocation's own task `connect` declaration,
-  // finds the upstream and the credential for that header, and takes the KV
-  // path from it. So a node can only ever read a secret that a job placed on
-  // it declares, and a job can only declare one its submitter could read
-  // (RunJob and template runs require `kv:read` on every credential path).
+  // Each credential names one provider:
+  // - `from = { kv = "<path>" }`: the KV value at that path.
+  // - `from = { identity = "<name>" }`: a workload-identity token
+  //   (docs/workload-identity.md) the manager mints for the allocation
+  //   under the task's identity of that name, with that identity's
+  //   audience, TTL, `sub` template, and extra claims.
+  //
+  // The worker names (allocation, upstream, header) triples, never KV paths
+  // or identities. For each one the manager checks that the allocation is
+  // placed on the calling node, reads the allocation's own task `connect`
+  // declaration, finds the upstream and the credential for that header, and
+  // takes the provider from it. So a node can only ever read a secret that a
+  // job placed on it declares, and a job can only declare one its submitter
+  // could read (RunJob and template runs require `kv:read` on every
+  // credential path).
   //
   // Workers call it on their heartbeat loop, only while some allocation on
-  // the node declares credentials, passing the KV version they already hold
-  // so an unchanged secret costs no material on the wire. The worker keeps
-  // values in memory only: never in its state files, never in a log line.
+  // the node declares credentials, passing the version they already hold so
+  // an unchanged value costs no material on the wire. For a KV value the
+  // version is the KV entry's; for an identity token it is the token's
+  // expiry, and the manager mints a new token once less than half the
+  // identity's TTL remains. The worker keeps values in memory only: never in
+  // its state files, never in a log line.
   //
-  // Per-entry problems (not placed here, no such credential, key missing)
-  // come back in that entry's `error` rather than failing the call, so one
-  // missing secret never blocks the others. `absent` marks the problems that
-  // are authoritative (the key or the declaration is gone): the worker drops
-  // any value it holds and fails requests on that upstream closed. Any other
-  // error, and a failed call, keeps the last good value.
+  // Per-entry problems (not placed here, no such credential, key missing,
+  // workload identity disabled on the manager) come back in that entry's
+  // `error` rather than failing the call, so one missing secret never blocks
+  // the others. `absent` marks the problems that are authoritative (the key
+  // or the declaration is gone): the worker drops any value it holds and
+  // fails requests on that upstream closed. Any other error, and a failed
+  // call, keeps the last good value.
   //
   // Called by the worker for its own node: the caller's authenticated
   // per-node principal (`node:<node_id>`) must match the request's
@@ -4736,8 +4748,10 @@ message UpstreamCredentialKnown {
   // The injected header, lower-cased (`x-api-key`, `authorization`).
   string header = 3;
 
-  // The KV version of the secret the worker already holds, or 0 for none.
-  // When it matches the current version the reply is `unchanged`.
+  // The version of the value the worker already holds, or 0 for none: the
+  // KV entry's version for a `kv` credential, the token's expiry (unix
+  // seconds) for an `identity` one. When it is still current the reply is
+  // `unchanged`.
   int64 version = 4;
 }
 
@@ -4762,32 +4776,37 @@ message UpstreamCredentialValue {
   // The header, echoed from the request.
   string header = 3;
 
-  // The KV path the allocation's declaration names for this header. Set
-  // even when `error` is, so the worker can report which key is at fault.
-  string kv_path = 4;
+  // Where the value comes from, as the allocation's declaration names it:
+  // `kv secrets/openai` or `identity api`. Set even when `error` is, so the
+  // worker can report which key or identity is at fault. Empty when the
+  // declaration is gone.
+  string source = 4;
 
-  // The KV entry's version. The worker re-fetches when it moves.
+  // The value's version: the KV entry's version, or the identity token's
+  // expiry in unix seconds. The worker sends it back as
+  // `UpstreamCredentialKnown.version`.
   int64 version = 5;
 
-  // True when `version` equals the version the worker sent. No value is
-  // returned.
+  // True when the version the worker sent is still current (the KV entry
+  // has not moved, or the identity token it holds has more than half its
+  // TTL left). No value is returned.
   bool unchanged = 6;
 
-  // The secret: the raw KV value, which the forwarder sends as the header
-  // value after the declared `prefix`. Treat as a secret: never log it,
-  // never write it to disk.
+  // The secret: the raw KV value, or the signed identity token, which the
+  // forwarder sends as the header value after the declared `prefix`. Treat
+  // as a secret: never log it, never write it to disk.
   string value = 7;
 
-  // Why no value was returned, e.g. "kv secrets/openai not found". Empty on
-  // success.
+  // Why no value was returned, e.g. "kv secrets/openai not found" or
+  // "workload identity is not enabled on this manager". Empty on success.
   string error = 8;
 
   // True when `error` is authoritative rather than transient: the KV key
   // does not exist, or the allocation is not on this node or no longer
   // declares this credential. The worker drops any value it holds, so
   // deleting the key revokes the credential on the next heartbeat. False
-  // for transient problems (a KV read failure), where the worker keeps the
-  // last good value.
+  // for transient problems (a KV read failure, a failed token mint), where
+  // the worker keeps the last good value.
   bool absent = 9;
 }
 

@@ -2834,7 +2834,7 @@ Still unplanned, and not covered by the plan:
 Credential injection: [egress-credential-injection-plan.md](plans/egress-credential-injection-plan.md)
 · calls: [egress-credential-injection-plan_calls.md](calls/egress-credential-injection-plan_calls.md)
 · docs: [network-handlers.md#credential-injection](../docs/network-handlers.md#credential-injection).
-Phase 1 shipped (see Done, KV & secrets).
+Phases 1 and 2 shipped (see Done, KV & secrets).
 
 - [ ] **Reach `connect.upstreams` from a `sandbox` guest.** No sandbox shape
       can reach its upstream listeners today: they bind on the node's
@@ -2847,10 +2847,7 @@ Phase 1 shipped (see Done, KV & secrets).
       as the upstream listeners, counted in gated readiness. A gated sandbox
       with upstreams probably also reports `capture_ready = false` today
       (its upstream listeners never bind); confirm with a test
-      ([calls #8](calls/egress-credential-injection-plan_calls.md)).
-- [ ] Credential injection Phase 2: workload-identity provider,
-      `from = { identity = { audience } }`, minted and refreshed on the node
-      ([plan §8](plans/egress-credential-injection-plan.md#8-phases)).
+      ([calls #11](calls/egress-credential-injection-plan_calls.md)).
 - [ ] Credential injection Phase 3: webhook provider
       (`from = { handler = "<name>" }`) and non-header placements (query
       parameter, basic auth).
@@ -2861,7 +2858,7 @@ Phase 1 shipped (see Done, KV & secrets).
       (`attempt_request` in `src/worker/netd/http.rs` skips TLS and the mesh
       when `hand_off` is set), so an injected credential crosses the network
       unencrypted. Send hand-offs over the mesh when the proxy endpoint is
-      remote ([calls #7](calls/egress-credential-injection-plan_calls.md)).
+      remote ([calls #10](calls/egress-credential-injection-plan_calls.md)).
 - [ ] Credentials on policy objects (one key for every sandbox on a pool),
       with `UpsertNetPolicy` enforcing `kv:read` as it does for `certFrom`
       (plan §11).
@@ -4183,6 +4180,13 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       local `503 credential-unavailable` without dialing; deleting the key
       revokes it. Naming a path needs `kv:read`. Sandbox guests are not
       covered yet (open item under Networking).
+- [x] **Credential injection, Phase 2: the identity provider** (2026-10-12):
+      `from = { identity = "<task identity>" }` injects a workload-identity
+      token the manager mints in `GetUpstreamCredentials` (the token's expiry
+      is its version; a new one once half the TTL is left). An identity named
+      this way may skip `env`/`file`, and the worker then never sees it; the
+      control-plane `legion` identity cannot be injected
+      ([calls #6 to #8](calls/egress-credential-injection-plan_calls.md)).
 
 [encryption plan](plans/kv-encryption-plan.md) · [docs](../docs/kv-encryption.md)
 
