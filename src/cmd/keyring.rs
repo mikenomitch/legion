@@ -318,13 +318,18 @@ pub fn render_status(reply: &GetKeyringStatusReply) -> String {
         out.push_str("Data keys:\n");
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         for key in &reply.keys {
+            // The checkpoint key seals published checkpoints, not KV values.
+            let uses = if key.state == "checkpoint" {
+                "seals published checkpoints".to_string()
+            } else {
+                format!("values {}", key.value_count)
+            };
             let mut line = format!(
-                "  {}  {:<8} created {}  age {}  values {}",
+                "  {}  {:<8} created {}  age {}  {uses}",
                 key.key_id,
                 key.state,
                 unix_to_rfc3339(key.created_at),
                 human_age(now - key.created_at),
-                key.value_count
             );
             if !key.unwrapped {
                 line.push_str(&format!("  LOCKED: {}", key.error));

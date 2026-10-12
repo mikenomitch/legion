@@ -696,7 +696,7 @@ mod tests {
             ..Default::default()
         });
         assert!(matches!(
-            run(&context, &[missing.clone()], &facts).await,
+            run(&context, std::slice::from_ref(&missing), &facts).await,
             HopOutcome::Deny { .. }
         ));
         let open = hop(HandlerConfig {

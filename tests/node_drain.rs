@@ -200,7 +200,7 @@ fn stateless_job(name: &str, count: u32, constraints: serde_json::Value) -> JobC
             config: json!({ "message": "hi" }),
             resources: json!({ "memory": 128, "cpu": 100 }),
             constraints,
-            ..TaskConfig::new(&format!("{name}-task"), "service")
+            ..TaskConfig::new(format!("{name}-task"), "service")
         }],
         version: None,
     }

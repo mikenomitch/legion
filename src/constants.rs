@@ -20,6 +20,11 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const ENV_RESOURCE_ENFORCEMENT: &str = "LEGION_RESOURCE_ENFORCEMENT";
 /// cgroup v2 parent path (relative to /sys/fs/cgroup) for worker-owned cgroups.
 pub const ENV_CGROUP_PARENT: &str = "LEGION_CGROUP_PARENT";
+/// Extra memory, in MiB, a `sandbox` allocation's cgroup allows on top of
+/// its guest size, for the VMM process itself (worker `sandbox.vmmOverheadMiB`).
+pub const ENV_SANDBOX_VMM_OVERHEAD_MIB: &str = "LEGION_SANDBOX_VMM_OVERHEAD_MIB";
+/// Default for [`ENV_SANDBOX_VMM_OVERHEAD_MIB`].
+pub const DEF_SANDBOX_VMM_OVERHEAD_MIB: u64 = 64;
 
 // === Task filesystem ===
 /// Where a runtime with an isolated filesystem mounts the allocation's host
@@ -42,6 +47,15 @@ pub const CONTAINER_TASK_DIR: &str = "/legion/task";
 pub const ALLOCATION_STATUS_PLACED: &str = "placed";
 pub const ALLOCATION_STATUS_COMPLETE: &str = "complete";
 pub const ALLOCATION_STATUS_FAILED: &str = "failed";
+/// A suspended instance's allocation kept only to hold its reservation
+/// (`suspend.reserve = true`). Never dispatched to a worker.
+pub const ALLOCATION_STATUS_SUSPENDED: &str = "suspended";
+
+/// Whether an allocation row must never be sent to a worker: it finished, or
+/// it only holds a suspended instance's reservation.
+pub fn allocation_status_is_dispatchable(status: &str) -> bool {
+    !allocation_status_is_terminal(status) && status != ALLOCATION_STATUS_SUSPENDED
+}
 
 /// Whether an allocation row is in a terminal state.
 pub fn allocation_status_is_terminal(status: &str) -> bool {

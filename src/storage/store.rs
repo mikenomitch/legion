@@ -17,13 +17,23 @@ use crate::storage::migrations::get_migrations;
 // live in their own file so the keyring's write paths read as one unit.
 mod keyring_ops;
 mod read_model_check;
+// Phase 6: fork, create-from-snapshot, and snapshot names.
+mod fork_ops;
+mod snapshot_ops;
+mod suspend_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
 };
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
+pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
+pub use snapshot_ops::{
+    DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
+    SnapshotReportOutcome, SnapshotReportRecord,
+};
+pub use suspend_ops::{AbandonedResume, ResumeOutcome, WaitingResume};
 
 use crate::storage::queries::{
     DELETE_SIGNING_KEY, GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB,
@@ -351,6 +361,11 @@ pub struct SchedulingReadModel {
     /// `Arc`'d so a hot reader ([`Store::shared_task_configs_for_job_config`])
     /// takes a refcount bump instead of deep-cloning every task's JSON.
     pub task_configs: HashMap<String, Arc<Vec<(i64, TaskConfig)>>>,
+    /// Priority band per job config id, filled lazily by
+    /// [`Store::cached_band_for_job_config`]. Never invalidated, for the same
+    /// reason `task_configs` is not: a job config's band is immutable, and a
+    /// change mints a new config id.
+    pub job_config_bands: HashMap<String, Band>,
     /// Declared scheduling indexes over `nodes` (docs/scheduling-indexes.md).
     /// Maintained by the same write path that mutates `nodes` and
     /// `allocations_by_node`, so it cannot drift from them; derived state
@@ -694,6 +709,11 @@ pub struct PlanSubmission {
 pub struct PlanSubmissionPlacement {
     pub task_id: i64,
     pub candidates: Vec<String>,
+    /// Bind exactly this keyed instance (a restore the planner placed for
+    /// that instance). Absent in rows written before restores carried it,
+    /// and in the format-1 shape, which bind any unbound instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 /// A successfully applied plan: the inserted allocations plus the candidate
@@ -796,6 +816,23 @@ pub struct StoredStopNotice {
     pub preemptor_job: String,
     /// That job's band; empty when `preemptor_job` is.
     pub preemptor_band: String,
+}
+
+/// The words an instance's `last_stop` carries in place of the generic
+/// sentence for its cause: the memory pressure response's detail and hint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopExplanation {
+    pub detail: String,
+    #[serde(default)]
+    pub hint: String,
+}
+
+/// An instance's stop history and fork lineage (`instance.last_stop`,
+/// `instance.forked_from`), read beside the instance for `InstanceInfo`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceHistory {
+    pub last_stop: Option<crate::structs::instance::InstanceLastStop>,
+    pub forked_from: Option<String>,
 }
 
 /// One task's count override (`legion job scale`, docs/autoscaling.md),
@@ -1111,6 +1148,14 @@ pub struct Store {
     // no fsync, no pipeline-thread hop. Shared across clones so the gRPC
     // handler and the status-checker tick see the same table.
     liveness: Arc<crate::storage::liveness::LivenessTable>,
+    // Which node holds which content, by digest (suspend plan §6.8): the
+    // `locality` score term's input. Leader-local soft state like liveness,
+    // rebuilt from worker reports after a restart or failover. Shared across
+    // clones so the heartbeat handler writes what every Scheduler reads.
+    content_locations: Arc<crate::storage::content_index::ContentLocationIndex>,
+    // Queued snapshot warms (WarmSnapshot), per node. Leader-local soft
+    // state like the content index: best effort, never replicated.
+    snapshot_warms: Arc<crate::storage::snapshot_warm::SnapshotWarmQueue>,
     // Missed beats before a node is lost, from `heartbeat.missedBeatsBeforeLost`.
     // A node's window is ALWAYS this times its own interval.
     missed_beats_before_lost: u32,
@@ -1716,6 +1761,8 @@ impl Store {
                 TASK_STATUS_SEED_BATCH_MAX,
             )),
             liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
+            content_locations: Arc::new(crate::storage::content_index::ContentLocationIndex::new()),
+            snapshot_warms: Arc::new(crate::storage::snapshot_warm::SnapshotWarmQueue::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2936,7 +2983,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend
             FROM task_config;
             "#,
         )?;
@@ -2955,6 +3002,8 @@ impl Store {
                 // while the incremental path kept it (found by the
                 // read-model shadow check).
                 speculative_start: parse_json_column(29, row.get(29)?)?,
+                snapshots: parse_json_column(30, row.get(30)?)?,
+                suspend: parse_json_column(31, row.get(31)?)?,
                 name: row.get(1)?,
                 runtime: row.get(2)?,
                 count: TaskCount {
@@ -3024,6 +3073,7 @@ impl Store {
                 .into_iter()
                 .map(|(job_config_id, tasks)| (job_config_id, Arc::new(tasks)))
                 .collect(),
+            job_config_bands: HashMap::new(),
             indexes: IndexSet::new(Arc::clone(&self.index_settings)),
             node_pools: SharedNodePools::new(),
             scope_epochs,
@@ -3785,6 +3835,28 @@ impl Store {
         let tasks = self.get_task_configs_for_job_config(job_config_id)?;
         self.cache_set_task_configs_for_job_config(job_config_id, tasks.clone())?;
         Ok(Arc::new(tasks))
+    }
+
+    /// A job config's priority band, from the read model when it has it.
+    ///
+    /// The heartbeat path calls this once per distinct job config per node
+    /// per beat (it rides `TaskAllocation.priority_band` to the worker's
+    /// pressure response), so it must not cost a read connection in steady
+    /// state. A miss pays one point read and caches the answer.
+    pub fn cached_band_for_job_config(&self, job_config_id: &str) -> R<Band> {
+        {
+            let guard = self.read_model_reader()?;
+            if let Some(band) = guard.job_config_bands.get(job_config_id) {
+                return Ok(*band);
+            }
+        }
+        let (_, band) = self.job_band_for_job_config(job_config_id)?;
+        if !capture::in_capture() {
+            self.read_model_writer()?
+                .job_config_bands
+                .insert(job_config_id.to_string(), band);
+        }
+        Ok(band)
     }
 
     /// Deep-cloned allocations map, for callers that need owned vectors.
@@ -4979,6 +5051,7 @@ impl Store {
                     .map(|(node_id, task_id)| PlanSubmissionPlacement {
                         task_id,
                         candidates: vec![node_id],
+                        instance_id: None,
                     })
                     .collect()
             }
@@ -5519,6 +5592,12 @@ impl Store {
                     Err(error) => return Err(error),
                 };
 
+                // A restore placed for one instance binds that instance:
+                // its node was chosen for that instance's pin or `compat`.
+                let bind_instance = placement
+                    .instance_id
+                    .as_deref()
+                    .or(target_instance.as_deref());
                 let allocation = self.insert_allocation_with_data(
                     tx,
                     node_id,
@@ -5526,7 +5605,7 @@ impl Store {
                     &state.job_config_id,
                     &state.resources,
                     network.as_ref(),
-                    target_instance.as_deref(),
+                    bind_instance,
                 )?;
                 allocations.push(allocation);
                 candidate_ranks.push(rank);
@@ -6811,6 +6890,8 @@ impl Store {
             stop: parse_json_column(28, row.get(28)?)?,
             disruption: parse_json_column(29, row.get(29)?)?,
             speculative_start: parse_json_column(30, row.get(30)?)?,
+            snapshots: parse_json_column(31, row.get(31)?)?,
+            suspend: parse_json_column(32, row.get(32)?)?,
         };
 
         Ok(task_config)
@@ -6854,6 +6935,8 @@ impl Store {
             storage_handle: row.get(8)?,
             created_at: row.get(9)?,
             updated_at: row.get(10)?,
+            restore_from: row.get(11)?,
+            identity_epoch: row.get::<_, i64>(12)?.max(0) as u64,
         };
 
         Ok(instance)
@@ -7335,6 +7418,9 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn remove_node(&self, id: &str) -> R<()> {
         self.remove_allocs_for_node(id)?;
+        // Snapshots stored on the node go with it (scheduler lane, like the
+        // allocation half above).
+        self.mark_node_snapshots_lost(id)?;
         let id = id.to_owned();
         self.replicated(Lane::Control, "remove_node", move |s| {
             s.remove_node_apply(&id)
@@ -7993,6 +8079,16 @@ impl Store {
     /// The liveness soft-state table (liveness plan §6.2).
     pub fn liveness(&self) -> &Arc<crate::storage::liveness::LivenessTable> {
         &self.liveness
+    }
+
+    /// The content location index (see [`crate::storage::content_index`]).
+    pub fn content_locations(&self) -> &Arc<crate::storage::content_index::ContentLocationIndex> {
+        &self.content_locations
+    }
+
+    /// Queued snapshot warms (see [`crate::storage::snapshot_warm`]).
+    pub fn snapshot_warms(&self) -> &Arc<crate::storage::snapshot_warm::SnapshotWarmQueue> {
+        &self.snapshot_warms
     }
 
     /// Missed beats before a node is lost (`heartbeat.missedBeatsBeforeLost`).
@@ -8869,6 +8965,7 @@ impl Store {
             [job_id],
         )?;
         tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
+        Self::destroy_job_snapshots_tx(&tx, job_id)?;
         tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
         let mut stopping_event = None;
@@ -9911,6 +10008,12 @@ impl Store {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let snapshots = t
+                .snapshots
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let suspend = t.suspend.as_ref().map(serde_json::to_string).transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -9943,6 +10046,8 @@ impl Store {
                 ":stop": stop,
                 ":disruption": disruption,
                 ":speculative_start": speculative_start,
+                ":snapshots": snapshots,
+                ":suspend": suspend,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -10057,13 +10162,15 @@ impl Store {
             .tasks
             .iter()
             .map(|task| {
+                // The runtime's own defaults first, so they win over
+                // `taskResourceDefaults` (the sandbox guest size, docs/
+                // task-runtime-sandbox.md "Guest size").
+                let mut task = task.clone();
+                crate::task_plugins::normalize_runtime_task(&mut task);
                 let resources = self
                     .resource_policy
                     .normalize_task_resources(&task.resources, true)?;
-                let mut task = TaskConfig {
-                    resources,
-                    ..task.clone()
-                };
+                let mut task = TaskConfig { resources, ..task };
                 task.normalize_network()?;
                 Ok(task)
             })
@@ -12407,26 +12514,39 @@ impl Store {
         // Ordering by `node_local_pin DESC` first makes an allocation bind the
         // instance whose node-local data already lives on the node it landed
         // on; without a pin the ordering is unchanged (oldest wins), so keyed
-        // binding without volumes behaves exactly as before.
+        // binding without volumes behaves exactly as before. A restoring
+        // instance binds only on its snapshot's node while the snapshot is
+        // `local`. A `published` snapshot binds anywhere, preferring the node
+        // that captured it (which still holds the parts).
         let instance: Option<Instance> = tx
             .query_row(
                 "SELECT instance.instance_id, instance.job_id, instance.group_name, \
                  instance.task_name, instance.mode, instance.state, instance.slot_index, \
                  instance.current_alloc_id, instance.storage_handle, instance.created_at, \
-                 instance.updated_at FROM instance \
+                 instance.updated_at, instance.restore_from, instance.identity_epoch \
+                 FROM instance \
                  LEFT JOIN volume ON volume.instance_id = instance.instance_id \
                  AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
                  AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
                  WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
                  AND instance.task_name = ?3 \
-                 AND instance.mode = 'keyed' AND instance.state NOT IN ('terminated', 'stopped') \
+                 AND instance.mode = 'keyed' \
+                 AND instance.state NOT IN ('terminated', 'stopped', 'suspended') \
+                 AND COALESCE(instance.pending_op, '') != 'fork' \
                  AND instance.instance_id NOT IN (\
                      SELECT instance_id FROM allocation \
                      WHERE task_config_id = ?4 AND instance_id IS NOT NULL\
                  ) \
                  AND (?6 = '' OR instance.instance_id = ?6) \
-                 ORDER BY (volume.node_id = ?5) DESC, instance.created_at ASC, \
-                 instance.instance_id ASC LIMIT 1;",
+                 AND (instance.restore_from IS NULL OR COALESCE((\
+                     SELECT CASE WHEN snapshot.state = 'published' THEN ?5 \
+                     ELSE snapshot.node_id END FROM snapshot \
+                     WHERE snapshot.snapshot_id = instance.restore_from\
+                 ), ?5) = ?5) \
+                 ORDER BY (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
+                 COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
+                     WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
+                 instance.created_at ASC, instance.instance_id ASC LIMIT 1;",
                 params![
                     job_id,
                     group,
@@ -12561,8 +12681,81 @@ impl Store {
                     preemptor_band
                 ],
             )?;
+            // The instance keeps the cause after the allocation row and the
+            // short-lived notice are gone (`InstanceInfo.last_stop`).
+            if let Some(instance_id) = alloc.instance_id.as_deref() {
+                let record = crate::structs::instance::InstanceLastStop::from_cause(
+                    cause,
+                    alloc.id,
+                    &alloc.node_id,
+                    preemptor_job.as_deref(),
+                    now_unix,
+                );
+                Self::write_instance_last_stop_tx(tx, instance_id, &record)?;
+            }
         }
         Ok(())
+    }
+
+    /// Write an instance's `last_stop` record. A no-op for an instance id
+    /// with no row.
+    fn write_instance_last_stop_tx(
+        tx: &Connection,
+        instance_id: &str,
+        record: &crate::structs::instance::InstanceLastStop,
+    ) -> R<()> {
+        tx.execute(
+            "UPDATE instance SET last_stop = ?2 WHERE instance_id = ?1;",
+            params![instance_id, serde_json::to_string(record)?],
+        )?;
+        Ok(())
+    }
+
+    /// `last_stop` and `forked_from` for every instance of a job that has
+    /// either, keyed by instance id. One query for `instance list`.
+    pub fn instance_lineage_for_job(&self, job_id: &str) -> R<HashMap<String, InstanceHistory>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT instance_id, last_stop, forked_from FROM instance WHERE job_id = ?1 \
+             AND (last_stop IS NOT NULL OR forked_from IS NOT NULL);",
+        )?;
+        let rows = stmt.query_map([job_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        Ok(Self::collect_rows(rows)?
+            .into_iter()
+            .map(|(id, last_stop, forked_from)| {
+                (
+                    id,
+                    InstanceHistory {
+                        last_stop: last_stop.and_then(|raw| serde_json::from_str(&raw).ok()),
+                        forked_from,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// [`Self::instance_lineage_for_job`] for one instance.
+    pub fn instance_history(&self, instance_id: &str) -> R<InstanceHistory> {
+        let conn = self.read_connection()?;
+        let row: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT last_stop, forked_from FROM instance WHERE instance_id = ?1;",
+                [instance_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row
+            .map(|(last_stop, forked_from)| InstanceHistory {
+                last_stop: last_stop.and_then(|raw| serde_json::from_str(&raw).ok()),
+                forked_from,
+            })
+            .unwrap_or_default())
     }
 
     /// Stage the `allocation.stopping` event for a set of removals.
@@ -12721,6 +12914,16 @@ impl Store {
                 instance.state,
                 InstanceState::Terminated | InstanceState::Stopped
             ) {
+                continue;
+            }
+            // A suspended instance's held reservation went away (node loss, a
+            // job stop or update). It stays suspended, now holding nothing.
+            if instance.state == InstanceState::Suspended {
+                tx.execute(
+                    "UPDATE instance SET current_alloc_id = NULL, updated_at = ?1 \
+                     WHERE instance_id = ?2;",
+                    params![now, instance_id],
+                )?;
                 continue;
             }
 
@@ -13493,12 +13696,25 @@ impl Store {
         allocation_id: i64,
         cause: StopCause,
     ) -> R<Option<Allocation>> {
-        match self.remove_allocation_by_id_local(allocation_id, cause) {
+        self.remove_allocation_by_id_explained(allocation_id, cause, None)
+    }
+
+    /// [`Self::remove_allocation_by_id_because`], with the sentence and hint
+    /// the instance's `last_stop` should carry instead of the generic one
+    /// built from `cause` (the memory pressure path passes the worker's).
+    pub fn remove_allocation_by_id_explained(
+        &self,
+        allocation_id: i64,
+        cause: StopCause,
+        explanation: Option<StopExplanation>,
+    ) -> R<Option<Allocation>> {
+        match self.remove_allocation_by_id_local(allocation_id, cause, explanation.clone()) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
                     crate::storage::raft::forward::ForwardableLaneWrite::RemoveAllocationById {
                         allocation_id,
                         cause,
+                        explanation,
                     },
                     err,
                 ),
@@ -13510,9 +13726,10 @@ impl Store {
         &self,
         allocation_id: i64,
         cause: StopCause,
+        explanation: Option<StopExplanation>,
     ) -> R<Option<Allocation>> {
         self.replicated(Lane::Scheduler, "remove_allocation_by_id", move |s| {
-            s.remove_allocation_by_id_apply(allocation_id, cause)
+            s.remove_allocation_by_id_apply(allocation_id, cause, explanation.as_ref())
         })
     }
 
@@ -13520,6 +13737,7 @@ impl Store {
         &self,
         allocation_id: i64,
         cause: StopCause,
+        explanation: Option<&StopExplanation>,
     ) -> R<Option<Allocation>> {
         let allocation = self.get_allocation_by_id(allocation_id)?;
         let Some(allocation) = allocation else {
@@ -13533,6 +13751,22 @@ impl Store {
         self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
         let stopping_event =
             self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
+        if let (Some(explanation), Some(instance_id)) =
+            (explanation, allocation.instance_id.as_deref())
+        {
+            let mut record = crate::structs::instance::InstanceLastStop::from_cause(
+                cause,
+                allocation.id,
+                &allocation.node_id,
+                None,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            );
+            if !explanation.detail.is_empty() {
+                record.detail = explanation.detail.clone();
+            }
+            record.hint = explanation.hint.clone();
+            Self::write_instance_last_stop_tx(&tx, instance_id, &record)?;
+        }
         tx.commit()?;
         self.publish_staged(stopping_event);
 
@@ -14977,7 +15211,7 @@ impl Store {
             "UPDATE instance SET \
              state = CASE WHEN mode = 'keyed' THEN 'stopped' ELSE 'terminated' END, \
              current_alloc_id = NULL, updated_at = ?1 \
-             WHERE job_id = ?2 AND state NOT IN ('terminated', 'stopped');",
+             WHERE job_id = ?2 AND state NOT IN ('terminated', 'stopped', 'suspended');",
             params![now, job_id],
         )?;
         tx.commit()?;
@@ -15327,9 +15561,12 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE instance SET state = 'terminated', current_alloc_id = NULL, \
-             storage_handle = NULL, updated_at = ?1 WHERE instance_id = ?2;",
+             storage_handle = NULL, restore_from = NULL, updated_at = ?1 \
+             WHERE instance_id = ?2;",
             params![now, instance_id],
         )?;
+        // A suspend checkpoint is owned by its instance and dies with it.
+        Self::clear_suspend_tx(&tx, instance_id)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Destroy)?;
         tx.commit()?;
@@ -15393,7 +15630,12 @@ impl Store {
                      forever and cannot be stopped"
                 ),
             }),
-            InstanceState::Pending | InstanceState::Active | InstanceState::Rescheduling => {}
+            // A suspended instance can be stopped too: its checkpoint is
+            // discarded below and its held reservation, if any, removed.
+            InstanceState::Pending
+            | InstanceState::Active
+            | InstanceState::Rescheduling
+            | InstanceState::Suspended => {}
         }
 
         let now = Self::now_rfc3339()?;
@@ -15422,11 +15664,37 @@ impl Store {
             "DELETE FROM allocation WHERE instance_id = ?;",
             [instance_id],
         )?;
+        // A new instance that has not restored yet (a fork, or a create from
+        // a snapshot) keeps its restore source across the stop, and a fork
+        // still waiting for its checkpoint keeps waiting: a later start then
+        // restores it instead of booting it on an empty volume. Its own
+        // snapshots (a resume, a rollback) are dropped as before.
+        let seeding: Option<String> = tx
+            .query_row(
+                "SELECT instance.restore_from FROM instance \
+                 INNER JOIN snapshot ON snapshot.snapshot_id = instance.restore_from \
+                 WHERE instance.instance_id = ?1 \
+                 AND COALESCE(snapshot.origin_instance_id, '') != instance.instance_id;",
+                [instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let waiting_fork = Self::instance_suspend_state_on(&tx, instance_id)?
+            .pending_op
+            .as_deref()
+            == Some(crate::structs::fork::PENDING_FORK);
         tx.execute(
-            "UPDATE instance SET state = 'stopped', current_alloc_id = NULL, updated_at = ?1 \
-             WHERE instance_id = ?2;",
-            params![now, instance_id],
+            "UPDATE instance SET state = 'stopped', current_alloc_id = NULL, \
+             restore_from = ?3, updated_at = ?1 WHERE instance_id = ?2;",
+            params![now, instance_id, seeding],
         )?;
+        Self::clear_suspend_tx(&tx, instance_id)?;
+        if waiting_fork && seeding.is_some() {
+            tx.execute(
+                "UPDATE instance SET pending_op = ?2 WHERE instance_id = ?1;",
+                params![instance_id, crate::structs::fork::PENDING_FORK],
+            )?;
+        }
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
@@ -15486,6 +15754,12 @@ impl Store {
                      create a new instance instead"
                 ),
             }),
+            InstanceState::Suspended => bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is suspended; resume it through StartInstance, which \
+                     restores its checkpoint"
+                ),
+            }),
             InstanceState::Stopped => {}
         }
 
@@ -15525,7 +15799,7 @@ impl Store {
             .prepare_cached(
                 "SELECT COUNT(*) FROM instance \
                  WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
-                 AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped');",
+                 AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped', 'suspended');",
             )?
             .query_row(params![job_id, group, task_name], |row| row.get(0))?;
         Ok(count.max(0) as u32)
@@ -16289,7 +16563,8 @@ impl Store {
                      )
                      OR EXISTS (
                        SELECT 1 FROM instance i
-                       WHERE i.job_id = j.id AND i.state NOT IN ('stopped', 'terminated')
+                       WHERE i.job_id = j.id
+                         AND i.state NOT IN ('stopped', 'terminated', 'suspended')
                      )
                    );",
             )?;
@@ -19035,13 +19310,15 @@ mod tests {
     #[test]
     fn a_repeated_health_check_does_not_take_the_write_path() -> R<()> {
         let store = setup_store()?;
-        let mut msg = crate::structs::NodeMsg::default();
-        msg.id = "hc-node".into();
-        msg.status = "ready".into();
-        msg.config_attrs = "{}".into();
-        msg.fingerprint_attrs = "{}".into();
-        msg.dynamic_attrs = "{}".into();
-        msg.health_checks = "{}".into();
+        let msg = crate::structs::NodeMsg {
+            id: "hc-node".into(),
+            status: "ready".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: "{}".into(),
+            health_checks: "{}".into(),
+            ..Default::default()
+        };
         store.insert_node(msg)?;
 
         // First report is a real change and must be written.
@@ -22203,7 +22480,7 @@ mod tests {
         let job_config_id = store.get_job_config("job-candidates")?.id();
         let task_id = task_id_for(&store, "task", "job-candidates")?;
 
-        let candidates = vec!["node-a".to_string(), "node-b".to_string()];
+        let candidates = ["node-a".to_string(), "node-b".to_string()];
 
         // Nodes that have never held an allocation have no epoch row; the
         // batched read must report the same 0 the per-scope read does, because
@@ -22527,6 +22804,7 @@ mod tests {
                 placements: PlanPlacements::Candidates(vec![PlanSubmissionPlacement {
                     task_id,
                     candidates: vec!["node-a".to_string()],
+                    instance_id: None,
                 }]),
                 expected_versions: versions,
                 evictions: Vec::new(),
@@ -23544,6 +23822,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -23581,6 +23860,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
             &[PlanEviction {
@@ -23620,6 +23900,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -23688,6 +23969,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -23932,6 +24214,7 @@ mod tests {
                     .map(|node| PlanSubmissionPlacement {
                         task_id,
                         candidates: vec![node.clone()],
+                        instance_id: None,
                     })
                     .collect();
                 batch.push(PlanApplyRequest {
@@ -24058,6 +24341,7 @@ mod tests {
                     .map(|node| PlanSubmissionPlacement {
                         task_id,
                         candidates: vec![node.clone()],
+                        instance_id: None,
                     })
                     .collect();
                 batch.push(PlanApplyRequest {
@@ -24226,6 +24510,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -24272,6 +24557,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -24322,6 +24608,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -24359,6 +24646,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -24419,6 +24707,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -24455,6 +24744,7 @@ mod tests {
         let placement = || PlanSubmissionPlacement {
             task_id,
             candidates: vec!["node-a".to_string()],
+            instance_id: None,
         };
         let submission = store.insert_plan_submission_with_candidates(
             &job_config_id,
@@ -24509,6 +24799,7 @@ mod tests {
         let placement = || PlanSubmissionPlacement {
             task_id,
             candidates: vec!["node-a".to_string(), "node-b".to_string()],
+            instance_id: None,
         };
         let submission = store.insert_plan_submission_with_candidates(
             &job_config_id,
@@ -24556,6 +24847,7 @@ mod tests {
             &[PlanSubmissionPlacement {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
+                instance_id: None,
             }],
             &expected_versions,
         )?;
@@ -25621,7 +25913,7 @@ mod tests {
             count: TaskCount::new(count),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
@@ -25931,7 +26223,7 @@ mod tests {
             count: TaskCount::new(count),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -26090,7 +26382,7 @@ mod tests {
             count: TaskCount::new(2),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -26169,7 +26461,7 @@ mod tests {
             count: TaskCount::new(1),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -26242,7 +26534,7 @@ mod tests {
         TaskConfig {
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Keyed,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
@@ -27484,7 +27776,11 @@ mod tests {
             name: "tpl".into(),
             version: 1,
         };
-        store.handle_job_submit_from_template(&config, &[submission.clone()], &provenance)?;
+        store.handle_job_submit_from_template(
+            &config,
+            std::slice::from_ref(&submission),
+            &provenance,
+        )?;
 
         assert_eq!(
             store.job_template_provenance("tpl-job")?,
@@ -28024,7 +28320,7 @@ mod tests {
         assert!(
             src.cached_allocations_by_node()?
                 .get("node-a")
-                .map_or(true, |allocs| allocs.is_empty()),
+                .is_none_or(|allocs| allocs.is_empty()),
             "no allocation cached during capture"
         );
 
@@ -28271,7 +28567,7 @@ mod tests {
             store
                 .cached_allocations_by_node()?
                 .get("node-b")
-                .map_or(true, Vec::is_empty),
+                .is_none_or(Vec::is_empty),
             "node-b's only allocation was removed"
         );
 

@@ -8,7 +8,7 @@
                 command = ["sleep", "1"],
             },
             resources = {
-                cpus = 0.1,
+                cpu = 100,
                 memory = 256,
             },
         },
@@ -19,7 +19,7 @@
                 command = ["sleep", "2"],
             },
             resources = {
-                cpus = 0.5,
+                cpu = 500,
                 memory = 128,
             },
             constraints = [

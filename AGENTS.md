@@ -37,6 +37,18 @@
 - Commits: short, imperative summaries (e.g., "Refactor store helpers").
 - PRs: include summary, rationale, scope; link issues; note UX or CLI changes with before/after where relevant; ensure CI (fmt, clippy, tests) passes.
 
+## Upgrades and Breaking Changes
+Legion has no installed base to protect yet, so don't design around upgrades.
+Break things when it gives a better default or a cleaner surface.
+- Pick the default that's right for a new cluster, even if it changes
+  behavior for an existing one. Don't keep a feature off "so upgrades behave
+  the same".
+- Rename or remove config fields, jobspec fields, CLI flags, and RPC shapes
+  freely. Don't add compatibility aliases, deprecation shims, or dual
+  code paths for the old form.
+- Say what broke in the PR description, so it's a decision and not a
+  surprise.
+
 ## Security & Configuration Tips
 - `protoc` must be available locally; CI installs `protobuf-compiler`.
 - Default manager address `http://127.0.0.1:4747`. (The insecure `:4748`

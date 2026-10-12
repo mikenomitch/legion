@@ -182,6 +182,20 @@ impl WorkloadIdentity {
     /// Validate a single identity for a task. `stateful` gates the
     /// `{instance}`/`{slot}` placeholders in a per-identity `sub_template`.
     pub fn validate(&self, task_name: &str, stateful: bool) -> R<()> {
+        self.validate_with(task_name, stateful, false)
+    }
+
+    /// [`Self::validate`], for a task whose runtime keeps env-delivered
+    /// tokens fresh in a file beside the env (a memory-checkpointable
+    /// sandbox mirrors each one to `/legion/identity/<ENV>` through its
+    /// identity disk). There env with `changeMode = "noop"` is accepted: the
+    /// env holds the boot token, the file the current one.
+    pub fn validate_with(
+        &self,
+        task_name: &str,
+        stateful: bool,
+        env_refreshes_in_guest: bool,
+    ) -> R<()> {
         let scope = format!("task {task_name} identity {:?}", self.name);
 
         // The name is used as the issuance-RPC selector, in env-file fallback
@@ -231,7 +245,7 @@ impl WorkloadIdentity {
         match self.change_mode {
             ChangeMode::Noop => {
                 // env can never refresh in place — fixed at exec time.
-                if self.delivers_env() {
+                if self.delivers_env() && !env_refreshes_in_guest {
                     bail!(
                         "{scope} delivers env with changeMode noop, which can never \
                          refresh; use signal or restart for env delivery"
@@ -346,6 +360,7 @@ pub fn validate_identities(
     task_name: &str,
     identities: &[WorkloadIdentity],
     stateful: bool,
+    env_refreshes_in_guest: bool,
 ) -> R<()> {
     let mut seen = std::collections::HashSet::new();
     // Delivery targets must be unique across the task's identities: two
@@ -358,7 +373,7 @@ pub fn validate_identities(
     let mut file_targets: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for identity in identities {
-        identity.validate(task_name, stateful)?;
+        identity.validate_with(task_name, stateful, env_refreshes_in_guest)?;
         if !seen.insert(identity.name.as_str()) {
             bail!(
                 "task {task_name} declares duplicate identity name {:?}",
@@ -559,7 +574,17 @@ pub struct WorkloadIdentityClaims {
     pub instance: Option<String>,
     /// Slot index for slot-mode stateful workloads.
     pub slot: Option<u32>,
+    /// The instance's identity epoch (`legion.io/epoch`), for stateful
+    /// workloads. Raised by every fork or snapshot capture of the instance;
+    /// Legion's verifiers refuse a token from an earlier epoch
+    /// (docs/workload-identity.md, "Forks and snapshots").
+    pub epoch: Option<u64>,
 }
+
+/// The claim carrying an instance's identity epoch.
+pub const EPOCH_CLAIM: &str = "legion.io/epoch";
+/// The claim carrying the instance a token was issued to.
+pub const INSTANCE_CLAIM: &str = "legion.io/instance";
 
 impl WorkloadIdentityClaims {
     /// Build the default OIDC `sub` claim. Mirrors Nomad's composed subject
@@ -651,6 +676,9 @@ impl WorkloadIdentityClaims {
         }
         if let Some(slot) = self.slot {
             claims.insert(format!("{LEGION_CLAIM_PREFIX}slot"), slot.to_string());
+        }
+        if let (Some(_), Some(epoch)) = (&self.instance, self.epoch) {
+            claims.insert(EPOCH_CLAIM.to_string(), epoch.to_string());
         }
         claims
     }
@@ -826,6 +854,7 @@ mod tests {
             alloc_id: "alloc-42".into(),
             instance: None,
             slot: None,
+            epoch: None,
         }
     }
 
@@ -862,12 +891,14 @@ mod tests {
         let c = WorkloadIdentityClaims {
             instance: Some("api-web-0".into()),
             slot: Some(0),
+            epoch: Some(3),
             ..claims()
         };
         assert!(c.is_stateful());
         let lc = c.legion_claims();
         assert_eq!(lc["legion.io/instance"], "api-web-0");
         assert_eq!(lc["legion.io/slot"], "0");
+        assert_eq!(lc["legion.io/epoch"], "3");
     }
 
     #[test]
@@ -978,6 +1009,10 @@ mod tests {
         };
         let err = id.validate("api", false).unwrap_err();
         assert!(err.to_string().contains("can never"));
+        // A memory-checkpointable sandbox keeps the token fresh in
+        // /legion/identity/<ENV>, so there noop is the default that works.
+        id.validate_with("api", true, true)
+            .expect("env + noop on a guest that refreshes its token files");
     }
 
     #[test]
@@ -1083,14 +1118,14 @@ mod tests {
     #[test]
     fn duplicate_identity_names_rejected() {
         let ids = vec![identity("aws"), identity("aws")];
-        let err = validate_identities("api", &ids, false).unwrap_err();
+        let err = validate_identities("api", &ids, false, false).unwrap_err();
         assert!(err.to_string().contains("duplicate identity"));
     }
 
     #[test]
     fn distinct_identities_validate() {
         let ids = vec![identity("aws"), identity("gcp")];
-        validate_identities("api", &ids, false).unwrap();
+        validate_identities("api", &ids, false, false).unwrap();
     }
 
     // --- reserved control-plane identity `legion` (Phase 7) ---
@@ -1125,7 +1160,7 @@ mod tests {
         let mut b = identity("gcp");
         a.file.as_mut().unwrap().path = "/run/legion/token".into();
         b.file.as_mut().unwrap().path = "/run/legion/token".into();
-        let err = validate_identities("api", &[a, b], false).unwrap_err();
+        let err = validate_identities("api", &[a, b], false, false).unwrap_err();
         assert!(err.to_string().contains("file path"), "{err}");
     }
 
@@ -1138,7 +1173,8 @@ mod tests {
             change_mode: ChangeMode::Restart,
             ..Default::default()
         };
-        let err = validate_identities("api", &[env_id("aws"), env_id("gcp")], false).unwrap_err();
+        let err =
+            validate_identities("api", &[env_id("aws"), env_id("gcp")], false, false).unwrap_err();
         assert!(err.to_string().contains("env var"), "{err}");
     }
 
@@ -1162,7 +1198,7 @@ mod tests {
         };
         // B's env key collides with A's `<ENV>_FILE` refresh companion, so the
         // pair is rejected (the companion would otherwise clobber B's token).
-        let err = validate_identities("api", &[a, b], false).unwrap_err();
+        let err = validate_identities("api", &[a, b], false, false).unwrap_err();
         assert!(err.to_string().contains("TOKEN_FILE"), "{err}");
     }
 

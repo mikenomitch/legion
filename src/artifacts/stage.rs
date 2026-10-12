@@ -2,6 +2,7 @@
 //! under `.staging/`, verify checksums, unpack safely, and move atomically
 //! into the task directory. Corrupt bytes never reach a task directory.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -13,11 +14,13 @@ use sha2::{Digest, Sha256};
 use crate::artifacts::fetcher::{
     Credential, FetchLimits, FetchRequest, FetchedArtifact, FetchedPayload, FetcherRegistry,
 };
-use crate::artifacts::status::{ArtifactState, ArtifactStatusBoard};
+use crate::artifacts::status::{ArtifactCacheOutcome, ArtifactState, ArtifactStatusBoard};
 use crate::artifacts::{StagedArtifact, StagedPayload};
+use crate::content_store::{ContentClass, ContentDigest, ContentStore, PutOptions};
 use crate::prelude::*;
 use crate::structs::{
-    parse_artifact_source, ArtifactSpec, ArtifactUnpack, WorkerArtifactFetchConfigFull,
+    parse_artifact_source, ArtifactSpec, ArtifactUnpack, ParsedSource,
+    WorkerArtifactFetchConfigFull,
 };
 
 /// Resolves auth references into credentials at fetch time. The worker
@@ -373,6 +376,14 @@ fn unpack_tar<RD: Read>(reader: RD, dest_dir: &Path, size_budget: u64) -> R<()> 
     Ok(())
 }
 
+/// What [`ArtifactStager::fetch_into_store`] did.
+#[derive(Debug, Clone)]
+pub struct FetchedIntoStore {
+    pub entry: crate::content_store::ContentEntry,
+    /// Bytes downloaded: 0 when the store already held the digest.
+    pub fetched_bytes: u64,
+}
+
 /// The worker's staging engine: one per task manager, shared by every
 /// staging thread.
 pub struct ArtifactStager {
@@ -380,6 +391,33 @@ pub struct ArtifactStager {
     config: WorkerArtifactFetchConfigFull,
     semaphore: FetchSemaphore,
     credentials: Box<dyn CredentialSource>,
+    /// The node content store. Digest-pinned single-file artifacts are
+    /// served from it on a hit and written into it on a miss.
+    content: Option<Arc<ContentStore>>,
+    /// Digests being fetched right now, so concurrent allocations wanting
+    /// the same artifact share one download (single-flight).
+    inflight: Mutex<HashSet<ContentDigest>>,
+    inflight_done: Condvar,
+}
+
+/// Schemes whose fetchers produce a single file named by
+/// [`cached_file_name`], so a store hit can be staged exactly as a fetch
+/// would have staged it. Trees (git, file directories), OCI images, and ORAS
+/// layers are not cached yet.
+const CACHEABLE_SCHEMES: &[&str] = &["http", "https", "s3", "file"];
+
+/// Releases a single-flight claim on drop.
+struct FlightGuard<'a> {
+    stager: &'a ArtifactStager,
+    digest: ContentDigest,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut inflight = self.stager.inflight.lock().expect("artifact inflight");
+        inflight.remove(&self.digest);
+        self.stager.inflight_done.notify_all();
+    }
 }
 
 impl ArtifactStager {
@@ -393,7 +431,79 @@ impl ArtifactStager {
             config,
             semaphore: FetchSemaphore::new(parallelism),
             credentials,
+            content: None,
+            inflight: Mutex::new(HashSet::new()),
+            inflight_done: Condvar::new(),
         }
+    }
+
+    /// Serves and caches digest-pinned artifacts through the node content
+    /// store. `None` keeps direct staging.
+    pub fn with_content_store(mut self, store: Option<Arc<ContentStore>>) -> Self {
+        self.content = store;
+        self
+    }
+
+    /// The store key for an artifact, when it can be cached: a `checksum`
+    /// on a single-file scheme, with a store configured.
+    fn cache_key(&self, spec: &ArtifactSpec, parsed: &ParsedSource) -> Option<ContentDigest> {
+        self.content.as_ref()?;
+        if !CACHEABLE_SCHEMES.contains(&parsed.scheme.as_str()) {
+            return None;
+        }
+        ContentDigest::parse(spec.checksum.as_deref()?).ok()
+    }
+
+    /// Blocks until no other staging thread is fetching `digest`, then
+    /// claims it. The claim drops with the guard.
+    fn claim_flight(&self, digest: &ContentDigest) -> FlightGuard<'_> {
+        let mut inflight = self.inflight.lock().expect("artifact inflight");
+        while inflight.contains(digest) {
+            inflight = self
+                .inflight_done
+                .wait(inflight)
+                .expect("artifact inflight");
+        }
+        inflight.insert(digest.clone());
+        FlightGuard {
+            stager: self,
+            digest: digest.clone(),
+        }
+    }
+
+    /// Stages an artifact from the node store. `Ok(None)` is a miss. An
+    /// error (a corrupt blob, a copy failure) is a miss too, as far as the
+    /// caller is concerned: it fetches from origin instead.
+    fn stage_from_store(
+        &self,
+        store: &ContentStore,
+        digest: &ContentDigest,
+        spec: &ArtifactSpec,
+        parsed: &ParsedSource,
+        task_dir: &Path,
+        attempt_dir: &Path,
+    ) -> R<Option<StagedArtifact>> {
+        let Some(entry) = store.get(digest)? else {
+            return Ok(None);
+        };
+        fs::create_dir_all(attempt_dir)?;
+        let path = attempt_dir.join(cached_file_name(parsed));
+        store.copy_out(digest, &path)?;
+        let fetched = FetchedArtifact {
+            payload: FetchedPayload::File {
+                path,
+                digest: digest.to_string(),
+            },
+            bytes: entry.size,
+        };
+        place_fetched_artifact(
+            spec,
+            fetched,
+            task_dir,
+            attempt_dir,
+            self.config.max_artifact_size_bytes,
+        )
+        .map(Some)
     }
 
     pub fn config(&self) -> &WorkerArtifactFetchConfigFull {
@@ -515,6 +625,47 @@ impl ArtifactStager {
         let credential = self.resolve_credential(spec, &redacted)?;
 
         let started = Instant::now();
+
+        // Node content store: wait out any concurrent fetch of the same
+        // digest, then try a hit before going to origin.
+        let cache_key = self.cache_key(spec, &parsed);
+        let _flight = cache_key.as_ref().map(|digest| self.claim_flight(digest));
+        if let (Some(store), Some(digest)) = (self.content.as_deref(), cache_key.as_ref()) {
+            let attempt_dir = staging_root.join(format!("artifact-{index}-store"));
+            let outcome =
+                self.stage_from_store(store, digest, spec, &parsed, task_dir, &attempt_dir);
+            let _ = fs::remove_dir_all(&attempt_dir);
+            match outcome {
+                Ok(Some(staged)) => {
+                    board.update(allocation_id, index, |row| {
+                        row.state = ArtifactState::Staged;
+                        row.digest = staged.digest.clone();
+                        row.bytes_fetched = Some(staged.bytes);
+                        row.bytes_total = Some(staged.bytes);
+                        row.duration_ms = Some(started.elapsed().as_millis() as u64);
+                        row.cache = Some(ArtifactCacheOutcome::Hit);
+                        row.error = None;
+                    });
+                    info!(
+                        allocation_id,
+                        source = %redacted,
+                        digest = %digest,
+                        bytes = staged.bytes,
+                        "Staged artifact from node content store"
+                    );
+                    return Ok(staged);
+                }
+                Ok(None) => {}
+                Err(err) => warn!(
+                    allocation_id,
+                    source = %redacted,
+                    digest = %digest,
+                    error = %format!("{err:#}"),
+                    "Cached artifact unusable; fetching from origin"
+                ),
+            }
+        }
+
         let deadline = Instant::now() + std::time::Duration::from_secs(self.config.timeout_secs);
         let limits = FetchLimits {
             max_bytes: self.config.max_artifact_size_bytes,
@@ -550,6 +701,7 @@ impl ArtifactStager {
                 allocation_id,
                 index,
                 board,
+                cache_key.as_ref(),
             );
             let _ = fs::remove_dir_all(&attempt_dir);
             match outcome {
@@ -558,6 +710,7 @@ impl ArtifactStager {
                         row.state = ArtifactState::Staged;
                         row.digest = staged.digest.clone();
                         row.duration_ms = Some(started.elapsed().as_millis() as u64);
+                        row.cache = cache_key.as_ref().map(|_| ArtifactCacheOutcome::Miss);
                         row.error = None;
                     });
                     info!(
@@ -607,6 +760,7 @@ impl ArtifactStager {
         allocation_id: i64,
         index: usize,
         board: &ArtifactStatusBoard,
+        store_as: Option<&ContentDigest>,
     ) -> R<StagedArtifact> {
         let mut sink = ArtifactSink::new(attempt_dir.to_path_buf(), limits.max_bytes)?;
         let progress_board = board.clone();
@@ -646,7 +800,212 @@ impl ArtifactStager {
         });
         verify_checksum(spec, &fetched)?;
 
+        // Verified bytes go into the node store before placement moves (or
+        // unpacks) them. Best effort: a full store costs the next allocation
+        // a refetch, never this one its artifact.
+        if let (Some(store), Some(digest), FetchedPayload::File { path, .. }) =
+            (self.content.as_deref(), store_as, &fetched.payload)
+        {
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            let mut opts = PutOptions::default().expect(digest.clone());
+            opts.label = label;
+            if let Err(err) = store.put_file(ContentClass::Artifacts, path, opts) {
+                warn!(
+                    allocation_id,
+                    source = %redacted,
+                    error = %format!("{err:#}"),
+                    "Could not cache artifact in node content store"
+                );
+            }
+        }
+
         place_fetched_artifact(spec, fetched, task_dir, attempt_dir, limits.max_bytes)
+    }
+
+    /// The node content store, when this worker has one.
+    pub fn content_store(&self) -> Option<&Arc<ContentStore>> {
+        self.content.as_ref()
+    }
+
+    /// Fetch one digest-pinned, single-file artifact straight into the node
+    /// content store, with no task directory involved: the same fetcher
+    /// registry, allowed schemes, credentials, parallelism limit, retries,
+    /// size cap, and single-flight as task staging, and the bytes are
+    /// verified against `spec.checksum` before they are stored. A published
+    /// snapshot's parts are sealed and come through
+    /// [`ArtifactStager::fetch_sealed_into_store`] instead.
+    ///
+    /// A digest the store already holds is not fetched again (its pin, when
+    /// `opts` names one, is still applied). Blocking: call from a blocking
+    /// thread.
+    pub fn fetch_into_store(
+        &self,
+        spec: &ArtifactSpec,
+        class: ContentClass,
+        opts: PutOptions,
+    ) -> R<FetchedIntoStore> {
+        let digest = ContentDigest::parse(
+            spec.checksum
+                .as_deref()
+                .context("fetching into the content store needs a checksum")?,
+        )?;
+        self.fetch_digest_into_store(spec, &digest, None, class, opts)
+    }
+
+    /// [`ArtifactStager::fetch_into_store`] for a sealed checkpoint part
+    /// ([`crate::checkpoint_seal`]): the object at `url` is downloaded, opened
+    /// in place with `key`, and the plaintext checked against `key.digest()`
+    /// before it is stored. Tampering, truncation, a wrong key, and a
+    /// plaintext leftover each fail with a named
+    /// [`crate::checkpoint_seal::SealError`] and are retried like any failed
+    /// download.
+    pub fn fetch_sealed_into_store(
+        &self,
+        url: &str,
+        key: &crate::checkpoint_seal::PartKey,
+        class: ContentClass,
+        opts: PutOptions,
+    ) -> R<FetchedIntoStore> {
+        self.fetch_digest_into_store(
+            &ArtifactSpec::from_source(url),
+            key.digest(),
+            Some(key),
+            class,
+            opts,
+        )
+    }
+
+    fn fetch_digest_into_store(
+        &self,
+        spec: &ArtifactSpec,
+        digest: &ContentDigest,
+        sealed: Option<&crate::checkpoint_seal::PartKey>,
+        class: ContentClass,
+        opts: PutOptions,
+    ) -> R<FetchedIntoStore> {
+        let store = self
+            .content
+            .as_deref()
+            .context("this worker has no node content store (content.enabled = false)")?;
+        let parsed = parse_artifact_source(&spec.source)?;
+        let redacted = spec.redacted_source();
+        if !self
+            .config
+            .allowed_schemes
+            .iter()
+            .any(|allowed| allowed == &parsed.scheme)
+        {
+            bail!(
+                "scheme {} is not allowed by this worker's artifacts.fetch.allowedSchemes, so it \
+                 cannot fetch {redacted}",
+                parsed.scheme
+            );
+        }
+        let _flight = self.claim_flight(digest);
+        // Pin and check presence in one step: unpinned content (a published
+        // snapshot's parts, a warmed copy) can be evicted between a separate
+        // check and pin, and then this fetches it instead.
+        let present = match opts.pin.as_ref() {
+            Some(owner) => store.pin_if_present(digest, owner)?,
+            None => store.contains(digest)?,
+        };
+        if present {
+            if let Some(entry) = store.get(digest)? {
+                return Ok(FetchedIntoStore {
+                    entry,
+                    fetched_bytes: 0,
+                });
+            }
+        }
+        let fetcher = self
+            .registry
+            .lock()
+            .expect("fetcher registry")
+            .fetcher(&parsed.scheme)?;
+        let credential = self.resolve_credential(spec, &redacted)?;
+        let deadline = Instant::now() + std::time::Duration::from_secs(self.config.timeout_secs);
+        let limits = FetchLimits {
+            max_bytes: self.config.max_artifact_size_bytes,
+            deadline: Some(deadline),
+        };
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut tried = 0;
+        for attempt in 1..=self.config.attempts.max(1) {
+            tried = attempt;
+            if attempt > 1 {
+                std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
+            }
+            if let Err(err) = limits.check_deadline(&redacted) {
+                last_err =
+                    Some(last_err.map_or(err, |prior| prior.context("fetch deadline exceeded")));
+                break;
+            }
+            // Fetch beside the blobs, so the import below is a rename.
+            let scratch = store.staging_path("fetch")?;
+            let outcome = (|| {
+                let mut sink = ArtifactSink::new(scratch.clone(), limits.max_bytes)?;
+                let fetched = {
+                    let _permit = self.semaphore.acquire();
+                    let request = FetchRequest {
+                        scheme: &parsed.scheme,
+                        url: &parsed.url,
+                        redacted_source: &redacted,
+                        checksum: spec.checksum.as_deref(),
+                        media_type: spec.media_type.as_deref(),
+                        credential: credential.as_ref(),
+                        limits: &limits,
+                    };
+                    fetcher.fetch(&request, &mut sink)?
+                };
+                verify_checksum(spec, &fetched)?;
+                let FetchedPayload::File { path, .. } = fetched.payload else {
+                    bail!("{redacted} is not a single file");
+                };
+                // The ciphertext was downloaded unchecked (the manifest names
+                // the plaintext digest): open it in place, then the import
+                // below checks the plaintext against the digest.
+                if let Some(key) = sealed {
+                    crate::checkpoint_seal::open_file_in_place(key, &path)
+                        .with_context(|| format!("opening sealed part {redacted}"))?;
+                }
+                let entry = store.import_file(class, &path, opts.clone().expect(digest.clone()))?;
+                Ok(FetchedIntoStore {
+                    fetched_bytes: entry.size,
+                    entry,
+                })
+            })();
+            let _ = fs::remove_dir_all(&scratch);
+            match outcome {
+                Ok(done) => return Ok(done),
+                Err(err) => {
+                    warn!(
+                        source = %redacted,
+                        attempt,
+                        error = %format!("{err:#}"),
+                        "Content store fetch attempt failed"
+                    );
+                    // A wrong key, tampered bytes, or a plaintext leftover
+                    // fails the same way on every attempt: do not download
+                    // a multi-GiB part again to learn that.
+                    let permanent = err.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::checkpoint_seal::SealError>()
+                            .is_some_and(|seal| {
+                                !matches!(seal, crate::checkpoint_seal::SealError::Truncated { .. })
+                            })
+                    });
+                    last_err = Some(err);
+                    if permanent {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow!("fetch failed before any attempt ran"))
+            .context(format!("fetching {redacted} after {tried} attempt(s)")))
     }
 
     fn resolve_credential(&self, spec: &ArtifactSpec, redacted: &str) -> R<Option<Credential>> {
@@ -676,6 +1035,40 @@ impl ArtifactStager {
         }
         Ok(None)
     }
+}
+
+/// The file name a cacheable scheme's fetcher gives a single-file payload
+/// (mirrors the `http`, `s3`, and `file` fetchers), so an artifact staged from
+/// the node store lands at the same path a fresh fetch would.
+fn cached_file_name(parsed: &ParsedSource) -> String {
+    let raw = match parsed.scheme.as_str() {
+        "file" => parsed
+            .url
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "artifact".to_string()),
+        "s3" => parsed
+            .url
+            .path()
+            .rsplit('/')
+            .next()
+            .unwrap_or("object")
+            .to_string(),
+        _ => parsed
+            .url
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or("download")
+            .to_string(),
+    };
+    // Same sanitizing as `ArtifactSink::file_writer`.
+    Path::new(&raw)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "artifact".to_string())
 }
 
 /// Verifies the declared checksum against the streaming digest. Only
@@ -1790,6 +2183,240 @@ mod tests {
 
         // A different fingerprint is rejected outright.
         assert!(try_reuse_staged(task_dir, "sha256:other", &fingerprint_specs).is_none());
+        Ok(())
+    }
+
+    // ---- node content store ------------------------------------------------
+
+    use crate::content_store::{ContentStoreConfig, PinOwner};
+
+    fn store_in(dir: &Path) -> Arc<ContentStore> {
+        Arc::new(
+            ContentStore::open(
+                dir.join("content"),
+                ContentStoreConfig {
+                    min_free_disk: 0,
+                    ..ContentStoreConfig::default()
+                },
+            )
+            .expect("open content store"),
+        )
+    }
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        ContentDigest::of_bytes(bytes).to_string()
+    }
+
+    /// Plan §13 Phase 3: "Artifacts are served from the node store on the
+    /// second allocation." The origin is deleted after the first staging, so
+    /// the second can only succeed from the store, and must land identically.
+    #[test]
+    fn second_allocation_is_served_from_node_store() -> R<()> {
+        let src = tempdir()?;
+        let state = tempdir()?;
+        let store = store_in(state.path());
+        let stager = test_stager(1).with_content_store(Some(store.clone()));
+
+        let archive = write_archive(src.path(), "tool.tar.gz", &[("tool/run.sh", "echo hi")]);
+        let binary = src.path().join("agent.bin");
+        fs::write(&binary, b"agent-bytes")?;
+        let mut tarball = spec(&format!("file://{}", archive.display()));
+        tarball.checksum = Some(sha256_of(&fs::read(&archive)?));
+        let mut file = spec(&format!("file://{}", binary.display()));
+        file.checksum = Some(sha256_of(b"agent-bytes"));
+        file.dest = Some("bin/".into());
+        file.mode = Some("0755".into());
+        let specs = vec![tarball, file];
+
+        let first_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        board.init(1, &specs);
+        let first = stager.stage_task_artifacts(1, first_dir.path(), &specs, &board)?;
+        let rows = board.snapshot(1).expect("rows");
+        assert!(rows
+            .iter()
+            .all(|row| row.cache == Some(ArtifactCacheOutcome::Miss)));
+        assert_eq!(store.list()?.len(), 2);
+
+        fs::remove_file(&archive)?;
+        fs::remove_file(&binary)?;
+
+        let second_dir = tempdir()?;
+        board.init(2, &specs);
+        let second = stager.stage_task_artifacts(2, second_dir.path(), &specs, &board)?;
+        let rows = board.snapshot(2).expect("rows");
+        assert!(
+            rows.iter()
+                .all(|row| row.cache == Some(ArtifactCacheOutcome::Hit)
+                    && row.state == ArtifactState::Staged),
+            "{rows:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(second_dir.path().join("tool/run.sh"))?,
+            "echo hi"
+        );
+        let staged_bin = second_dir.path().join("bin/agent.bin");
+        assert_eq!(fs::read(&staged_bin)?, b"agent-bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&staged_bin)?.permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        // Same digests, same relative layout as the fetched run.
+        for (a, b) in first.iter().zip(&second) {
+            assert_eq!(a.digest, b.digest);
+            assert_eq!(
+                a.reference_path().strip_prefix(first_dir.path())?,
+                b.reference_path().strip_prefix(second_dir.path())?
+            );
+        }
+        // A task scribbling on its copy cannot damage the store.
+        fs::write(&staged_bin, b"scribbled")?;
+        store.verify(&ContentDigest::parse(&sha256_of(b"agent-bytes"))?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_store_entry_falls_back_to_origin() -> R<()> {
+        let src = tempdir()?;
+        let state = tempdir()?;
+        let store = store_in(state.path());
+        let stager = test_stager(1).with_content_store(Some(store.clone()));
+        let binary = src.path().join("tool.bin");
+        fs::write(&binary, b"good-bytes")?;
+        let mut artifact = spec(&format!("file://{}", binary.display()));
+        artifact.checksum = Some(sha256_of(b"good-bytes"));
+        let board = ArtifactStatusBoard::new();
+        board.init(1, std::slice::from_ref(&artifact));
+        stager.stage_task_artifacts(
+            1,
+            tempdir()?.path(),
+            std::slice::from_ref(&artifact),
+            &board,
+        )?;
+
+        // Same length, different bytes: only digest verification notices.
+        let digest = ContentDigest::parse(artifact.checksum.as_deref().unwrap())?;
+        let blob = store.path_of(&digest);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&blob, fs::Permissions::from_mode(0o644))?;
+        }
+        fs::write(&blob, b"evil-bytes")?;
+
+        let task_dir = tempdir()?;
+        board.init(2, std::slice::from_ref(&artifact));
+        stager.stage_task_artifacts(2, task_dir.path(), std::slice::from_ref(&artifact), &board)?;
+        assert_eq!(fs::read(task_dir.path().join("tool.bin"))?, b"good-bytes");
+        assert_eq!(
+            board.snapshot(2).expect("rows")[0].cache,
+            Some(ArtifactCacheOutcome::Miss),
+            "refetched from origin"
+        );
+        // The refetch repaired the store.
+        store.verify(&digest)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unchecksummed_artifacts_bypass_the_store() -> R<()> {
+        let src = tempdir()?;
+        let state = tempdir()?;
+        let store = store_in(state.path());
+        let stager = test_stager(1).with_content_store(Some(store.clone()));
+        let binary = src.path().join("tool.bin");
+        fs::write(&binary, b"bytes")?;
+        let artifact = spec(&format!("file://{}", binary.display()));
+        let board = ArtifactStatusBoard::new();
+        board.init(1, std::slice::from_ref(&artifact));
+        stager.stage_task_artifacts(
+            1,
+            tempdir()?.path(),
+            std::slice::from_ref(&artifact),
+            &board,
+        )?;
+        assert!(store.list()?.is_empty());
+        assert_eq!(board.snapshot(1).expect("rows")[0].cache, None);
+        Ok(())
+    }
+
+    /// Counts origin fetches, slowly enough that concurrent stagings overlap.
+    struct CountingFetcher {
+        fetches: Arc<std::sync::atomic::AtomicUsize>,
+        body: &'static [u8],
+    }
+
+    impl crate::artifacts::fetcher::ArtifactFetcher for CountingFetcher {
+        fn schemes(&self) -> &'static [&'static str] {
+            &["https"]
+        }
+
+        fn fetch(&self, req: &FetchRequest<'_>, sink: &mut ArtifactSink) -> R<FetchedArtifact> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let name = req
+                .url
+                .path_segments()
+                .and_then(|mut s| s.next_back())
+                .unwrap_or("download")
+                .to_string();
+            let mut writer = sink.file_writer(&name)?;
+            writer.write_all(self.body)?;
+            let (path, digest, bytes) = writer.finish()?;
+            Ok(FetchedArtifact {
+                payload: FetchedPayload::File { path, digest },
+                bytes,
+            })
+        }
+    }
+
+    #[test]
+    fn concurrent_allocations_share_one_download() -> R<()> {
+        let state = tempdir()?;
+        let store = store_in(state.path());
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = FetcherRegistry::new();
+        registry.register(Arc::new(CountingFetcher {
+            fetches: fetches.clone(),
+            body: b"shared-bytes",
+        }));
+        let mut stager = test_stager(1).with_content_store(Some(store.clone()));
+        stager.registry = Mutex::new(registry);
+        let stager = Arc::new(stager);
+
+        let mut artifact = spec("https://origin.invalid/releases/tool.bin");
+        artifact.checksum = Some(sha256_of(b"shared-bytes"));
+        let board = ArtifactStatusBoard::new();
+        let dirs: Vec<_> = (0..3).map(|_| tempdir()).collect::<Result<_, _>>()?;
+        let handles: Vec<_> = dirs
+            .iter()
+            .enumerate()
+            .map(|(i, dir)| {
+                let stager = stager.clone();
+                let board = board.clone();
+                let artifact = artifact.clone();
+                let path = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    board.init(i as i64, std::slice::from_ref(&artifact));
+                    stager.stage_task_artifacts(i as i64, &path, &[artifact], &board)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("staging thread")?;
+        }
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for dir in &dirs {
+            assert_eq!(fs::read(dir.path().join("tool.bin"))?, b"shared-bytes");
+        }
+        // Pinning by an unrelated owner does not change staging.
+        let digest = ContentDigest::parse(artifact.checksum.as_deref().unwrap())?;
+        store.pin(&digest, &PinOwner::allocation(99))?;
         Ok(())
     }
 }

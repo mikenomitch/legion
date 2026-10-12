@@ -1132,6 +1132,7 @@ fn candidate_plan_submission_falls_back_and_converges() -> R<()> {
         &[PlanSubmissionPlacement {
             task_id,
             candidates: vec!["cand-node-a".to_string(), "cand-node-b".to_string()],
+            instance_id: None,
         }],
         &versions,
     )?;

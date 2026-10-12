@@ -105,6 +105,40 @@ pub fn memory_limit_bytes(resources: &Value) -> Option<u64> {
         .map(|mib| (mib * 1024.0 * 1024.0).round() as u64)
 }
 
+/// The memory ceiling in bytes: declared `memoryMax` when set, otherwise
+/// declared `memory` (today's behavior, where the reservation is the limit).
+/// `None` when neither is declared.
+pub fn memory_ceiling_bytes(resources: &Value) -> Option<u64> {
+    resources
+        .get(crate::resources::MEMORY_MAX_KEY)
+        .and_then(Value::as_f64)
+        .filter(|mib| *mib > 0.0)
+        .map(|mib| (mib * 1024.0 * 1024.0).round() as u64)
+        .or_else(|| memory_limit_bytes(resources))
+}
+
+/// Whether this node can enforce at all: Linux with the cgroup v2 unified
+/// hierarchy mounted. The same test [`NodeResourceGovernor::from_env`] makes,
+/// for callers that need the answer before a governor exists (registration
+/// decides whether to advertise oversubscription with it).
+pub fn enforcement_available() -> bool {
+    cfg!(target_os = "linux") && Path::new(CGROUP_ROOT).join("cgroup.controllers").exists()
+}
+
+/// Whether this node can enforce under `cgroup_parent`: everything
+/// [`enforcement_available`] checks, plus write access to create the parent.
+/// The worker checks once at start, so a node without access (a non-root
+/// worker, a container with a read-only `/sys/fs/cgroup`) runs unconfined
+/// instead of failing every allocation at its first cgroup write.
+pub fn cgroup_parent_usable(cgroup_parent: &str) -> R<()> {
+    if !enforcement_available() {
+        bail!("no cgroup v2 unified hierarchy at {CGROUP_ROOT}");
+    }
+    let dir = Path::new(CGROUP_ROOT).join(cgroup_parent);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create cgroup {}", dir.display()))?;
+    Ok(())
+}
+
 /// Declared `cores`: whole exclusive CPUs.
 ///
 /// Deliberately *not* `cpus` — the scheduler treats `cpus` as an alias for
@@ -179,17 +213,15 @@ impl NodeResourceGovernor {
     /// Build the governor from the worker's `resourceEnforcement` config (via
     /// the env the daemon exports).
     ///
-    /// Enforcement stays **opt-in**: a declaration that was only ever a
-    /// scheduling estimate must not start OOM-killing workloads because the
-    /// cluster upgraded. A node that opted in but cannot enforce (no cgroup
-    /// v2) warns and degrades to `disabled` rather than failing every
-    /// allocation.
+    /// Enforcement is on by default. A node that cannot enforce (no cgroup
+    /// v2) degrades to `disabled` rather than failing every allocation; the
+    /// daemon already warned about it at start.
     pub fn from_env() -> Self {
         if !crate::task_plugins::exec_isolation::enforcement_enabled() {
             return Self::disabled();
         }
         if !cfg!(target_os = "linux") {
-            warn!("Resource enforcement is only implemented on Linux; running unconfined");
+            // The daemon logged what the switch means here at start.
             return Self::disabled();
         }
         if !Path::new(CGROUP_ROOT).join("cgroup.controllers").exists() {
@@ -252,15 +284,23 @@ impl NodeResourceGovernor {
     /// Called by worker core before `prepare()`, at the same lifecycle point
     /// volumes are mounted: a task must never observe its limits arriving
     /// after it started.
+    ///
+    /// `memory_override` replaces the declared `memory` as the ceiling, for
+    /// runtimes whose cgroup holds more than the workload (see
+    /// [`crate::task_plugins::TaskPlugin::enforced_memory_limit_bytes`]).
     pub fn assign(
         &mut self,
         allocation_id: i64,
         task: &TaskConfig,
         mode: ResourceEnforcement,
+        memory_override: Option<u64>,
     ) -> R<Option<ResourceAssignment>> {
-        let Some(assignment) = self.plan(allocation_id, task, mode)? else {
+        let Some(mut assignment) = self.plan(allocation_id, task, mode)? else {
             return Ok(None);
         };
+        if memory_override.is_some() {
+            assignment.memory_limit_bytes = memory_override;
+        }
         // The parents must exist (and delegate their controllers) before any
         // leaf can carry a limit, and the share mask must shrink before the
         // reserving task starts — otherwise its cores are briefly shared.
@@ -319,7 +359,13 @@ impl NodeResourceGovernor {
                 .join(leaf_name(allocation_id)),
             cores,
             cpu_weight: cpu_weight_shares(&task.resources),
-            memory_limit_bytes: memory_limit_bytes(&task.resources),
+            // The ceiling is `memoryMax` when the task bursts, and the
+            // reservation is protected with `memory.low` either way, so the
+            // kernel reclaims from tasks above their reservation before it
+            // touches tasks within it (docs/resource-enforcement.md,
+            // "Burstable memory").
+            memory_limit_bytes: memory_ceiling_bytes(&task.resources),
+            memory_low_bytes: memory_limit_bytes(&task.resources),
         }))
     }
 
@@ -438,6 +484,23 @@ impl NodeResourceGovernor {
         // parent put in `subtree_control`.
         enable_controllers(Path::new(CGROUP_ROOT))?;
         enable_controllers(&root)?;
+        // `memory.low` is hierarchical: a leaf's protection is capped by its
+        // ancestors' effective protection. "max" on the cgroups Legion owns
+        // passes each leaf's own `memory.low` (its reservation) through
+        // untouched. Ancestors above `cgroupParent` are the operator's: with
+        // systemd's default `memory_recursiveprot` mount option they pass it
+        // through too. Best-effort, like the controller writes: a kernel that
+        // refuses leaves the reservation unprotected, which is today's
+        // behavior, not a broken node.
+        for dir in [
+            root.clone(),
+            root.join(Slice::Share.dir_name()),
+            root.join(Slice::Reserve.dir_name()),
+        ] {
+            if let Err(err) = write_cgroup_file(&dir.join("memory.low"), "max") {
+                debug!(path = %dir.display(), error = ?err, "Could not set memory.low on a parent cgroup");
+            }
+        }
         Ok(())
     }
 
@@ -543,6 +606,9 @@ fn create_task_cgroup(assignment: &ResourceAssignment) -> R<()> {
         // them). cgroup v2's `memory.swap.max` counts *swap only*, so the
         // equivalent of the OCI spec's `swap == limit` is 0 here.
         write_cgroup_file(&dir.join("memory.swap.max"), "0")?;
+    }
+    if let Some(bytes) = assignment.memory_low_bytes {
+        write_cgroup_file(&dir.join("memory.low"), &bytes.to_string())?;
     }
     Ok(())
 }
@@ -790,6 +856,33 @@ mod tests {
         Ok(())
     }
 
+    /// `memoryMax` raises the ceiling, and the reservation becomes the
+    /// protected floor (`memory.low`). Without it the two are the same.
+    #[test]
+    fn memory_max_is_the_ceiling_and_memory_the_protected_floor() -> R<()> {
+        let mut governor = governor(&[0, 1]);
+        let bursting = governor
+            .plan(
+                13,
+                &task_with(json!({ "memory": 400, "memoryMax": 2048 })),
+                ResourceEnforcement::WorkerCgroup,
+            )?
+            .expect("governed");
+        assert_eq!(bursting.memory_limit_bytes, Some(2048 * 1024 * 1024));
+        assert_eq!(bursting.memory_low_bytes, Some(400 * 1024 * 1024));
+
+        let fixed = governor
+            .plan(
+                14,
+                &task_with(json!({ "memory": 400 })),
+                ResourceEnforcement::WorkerCgroup,
+            )?
+            .expect("governed");
+        assert_eq!(fixed.memory_limit_bytes, Some(400 * 1024 * 1024));
+        assert_eq!(fixed.memory_low_bytes, Some(400 * 1024 * 1024));
+        Ok(())
+    }
+
     /// The `Unsupported` contract: no assignment computed, nothing touched.
     /// This is what keeps unported dylib plugins behaving exactly as today.
     #[test]
@@ -834,6 +927,7 @@ mod tests {
             cores: Some(vec![0, 1]),
             cpu_weight: None,
             memory_limit_bytes: None,
+            memory_low_bytes: None,
         };
         governor.restore(5, &persisted);
         assert_eq!(governor.share_cores(), vec![2, 3]);
@@ -859,6 +953,7 @@ mod tests {
             cores: None,
             cpu_weight: None,
             memory_limit_bytes: None,
+            memory_low_bytes: None,
         };
         governor.restore(9, &unpinned);
         assert_eq!(governor.reserved_cores(), vec![0, 1, 2]);
@@ -902,5 +997,45 @@ mod tests {
             )
             .expect_err("that would leave the share slice empty");
         assert!(err.to_string().contains("share slice"), "{err}");
+    }
+
+    /// The burstable limits land in a real cgroup: `memory.max` is the
+    /// ceiling, `memory.low` the reservation, and `memory.reclaim` accepts a
+    /// write (Linux 5.19+). Needs root on a cgroup v2 host with the memory
+    /// controller delegable at the root. See
+    /// internal_docs/suspend-resume-linux-verification.md, "Phase 2".
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and a cgroup v2 host"]
+    fn burstable_limits_land_in_a_real_cgroup() -> R<()> {
+        let root = format!("legion-phase2-test-{}", std::process::id());
+        let mut governor = NodeResourceGovernor {
+            enabled: true,
+            root: PathBuf::from(&root),
+            usable_cores: fingerprint_usable_cores(),
+            reserved: BTreeMap::new(),
+        };
+        let assignment = governor
+            .assign(
+                77,
+                &task_with(json!({ "memory": 64, "memoryMax": 128 })),
+                ResourceEnforcement::WorkerCgroup,
+                None,
+            )?
+            .expect("governed");
+        let dir = assignment.absolute_cgroup_path();
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        assert_eq!(read("memory.max").trim(), (128u64 << 20).to_string());
+        assert_eq!(read("memory.low").trim(), (64u64 << 20).to_string());
+        let reclaim = std::fs::write(dir.join("memory.reclaim"), "1048576");
+        assert!(
+            reclaim.is_ok() || reclaim.as_ref().err().and_then(|e| e.raw_os_error()) == Some(11),
+            "{reclaim:?}"
+        );
+        governor.release(77, Some(&assignment));
+        for leaf in ["share", "reserve", ""] {
+            let _ = std::fs::remove_dir(PathBuf::from(CGROUP_ROOT).join(&root).join(leaf));
+        }
+        Ok(())
     }
 }

@@ -150,7 +150,7 @@ fn heartbeat_scale_benchmark_matrix() -> R<()> {
             let tick_rounds = 10;
             let tick_started = Instant::now();
             for _ in 0..tick_rounds {
-                let snapshot = legion::manager::daemon::liveness_snapshot(&store, Instant::now())?;
+                let snapshot = legion::manager::daemon::liveness_snapshot(store, Instant::now())?;
                 let lost = legion::manager::cadence::decide_lost_nodes(
                     &snapshot,
                     &legion::manager::cadence::LossContext {
@@ -171,7 +171,7 @@ fn heartbeat_scale_benchmark_matrix() -> R<()> {
             // Cadence, recorded alongside throughput rather than assumed.
             let served_interval =
                 Duration::from_secs(legion::constants::WORKER_HEARTBEAT_DURATION_SEC);
-            let snapshot = legion::manager::daemon::liveness_snapshot(&store, Instant::now())?;
+            let snapshot = legion::manager::daemon::liveness_snapshot(store, Instant::now())?;
             let freshness_ratio =
                 legion::manager::cadence::freshness_ratio(&snapshot, served_interval, 0)
                     .unwrap_or(0.0);

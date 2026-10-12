@@ -41,7 +41,8 @@ use crate::structs::{
     GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
     GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
     GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest,
-    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
+    GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodeUsageReply,
+    GetNodeUsageRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
     GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
     GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
     GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
@@ -57,12 +58,12 @@ use crate::structs::{
     ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
     ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobTemplatesReply,
     ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
-    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest,
-    ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
-    ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
-    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
+    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
+    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply,
+    ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
+    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
+    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
     QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
     RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
     RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
@@ -109,6 +110,19 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
+
+// Phase 6: ForkInstance, `from_snapshot` creates, and snapshot names.
+mod checkpoint_support;
+mod fork_rpcs;
+mod make_room;
+mod node_content_rpcs;
+mod snapshot_rpcs;
+mod suspend_rpcs;
+pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
+pub use snapshot_rpcs::{
+    checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
+};
+pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, IdleSweeper};
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     error!("{action}: {:?}", err);
@@ -347,10 +361,12 @@ struct SubmittedJob {
     message: &'static str,
     job_name: String,
     job_config_id: String,
-    /// Advisory notes appended to the reply message. Today: the one warning
-    /// that a job's priority band cannot do what its author expects because
-    /// preemption is disabled — the Nomad discoverability failure inverted,
-    /// caught at submit rather than discovered from a troubleshooting guide.
+    /// Advisory notes appended to the reply message: a priority band that
+    /// cannot do what its author expects because preemption is disabled (the
+    /// Nomad discoverability failure inverted, caught at submit rather than
+    /// discovered from a troubleshooting guide), and `resources` a runtime
+    /// accepts but cannot honor as written (`memoryMax` on an ungoverned
+    /// runtime, a sandbox `memory_mib` that disagrees with `resources`).
     warnings: Vec<String>,
 }
 
@@ -604,13 +620,77 @@ fn map_raft_event(event: crate::storage::persistence::RaftHistoryEvent) -> RaftH
 /// Map a stored [`Instance`] to its wire shape (`InstanceInfo` in
 /// `proto/legion.proto`), attaching the node-loss diagnostic when the
 /// instance is gated (see [`instance_loss_detail`]).
-fn map_instance_info(store: &Store, instance: Instance) -> InstanceInfo {
+fn map_instance_info(
+    store: &Store,
+    usage: &crate::manager::usage::UsageTable,
+    instance: Instance,
+    suspend: crate::structs::suspend::InstanceSuspendState,
+    history: crate::storage::store::InstanceHistory,
+) -> InstanceInfo {
     // Loss confirmation first: it explains an instance that is bound but
     // waiting. A volume pin explains one that is UNBOUND and waiting — the two
-    // never apply at once, and both answer "why has this not come back".
+    // never apply at once, and both answer "why has this not come back". A
+    // suspend or restore failure explains the rest.
     let detail = instance_loss_detail(store, &instance)
-        .or_else(|| instance_volume_pin_detail(store, &instance));
+        .or_else(|| instance_volume_pin_detail(store, &instance))
+        .or_else(|| suspend.lifecycle_error.clone());
+    // The checkpoint's shape, for `instance list`'s CHECKPOINT column. Only
+    // suspended or resuming instances have one, so others pay nothing.
+    let checkpoint = suspend
+        .checkpoint_id
+        .as_deref()
+        .and_then(|id| store.get_snapshot(id).ok().flatten());
+    let pending_op = suspend.pending_op.as_deref().map(|op| match op {
+        crate::structs::suspend::PENDING_SUSPEND => "suspending".to_string(),
+        crate::structs::suspend::PENDING_RESUME => "resuming".to_string(),
+        crate::structs::fork::PENDING_FORK => "forking".to_string(),
+        other => other.to_string(),
+    });
+    let usage = instance
+        .current_alloc_id
+        .and_then(|allocation_id| usage.allocation(allocation_id).cloned());
+    // The idle policy's view, from the node's latest report: only a running
+    // instance with a policy has one.
+    let idle = usage
+        .as_ref()
+        .filter(|usage| usage.idle_after_seconds > 0 && usage.idle_since_unix > 0)
+        .filter(|_| instance.state == InstanceState::Active);
+    let idle_since = idle.and_then(|usage| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(usage.idle_since_unix, 0)
+            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    });
+    let idle_after_seconds = idle.map(|usage| usage.idle_after_seconds);
+    let checkpoint_support = checkpoint_support::load_checkpoint_support(store, &instance);
+    let last_stop = history.last_stop.map(|stop| crate::structs::InstanceStop {
+        cause: stop.cause,
+        detail: stop.detail,
+        hint: stop.hint,
+        at: chrono::DateTime::<chrono::Utc>::from_timestamp(stop.at, 0)
+            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_default(),
+        allocation_id: stop.allocation_id,
+        node_id: stop.node_id,
+        preemptor_job: stop.preemptor_job,
+    });
+    let (held_memory_mib, held_cpu_mhz) = suspended_hold_of(store, &instance);
+    let cold_boot = suspend
+        .cold_boot
+        .clone()
+        .map(|cold| crate::structs::InstanceColdBoot {
+            snapshot_id: cold.snapshot_id,
+            reason: cold.reason,
+            at: chrono::DateTime::<chrono::Utc>::from_timestamp(cold.at, 0)
+                .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_default(),
+        });
     InstanceInfo {
+        cold_boot,
+        last_stop,
+        checkpoint_support,
+        forked_from: history.forked_from,
+        held_memory_mib,
+        held_cpu_mhz,
+        usage,
         instance_id: instance.instance_id,
         job_id: instance.job_id,
         group: instance.group,
@@ -623,7 +703,97 @@ fn map_instance_info(store: &Store, instance: Instance) -> InstanceInfo {
         created_at: instance.created_at,
         updated_at: instance.updated_at,
         detail,
+        restore_snapshot_id: instance.restore_from,
+        checkpoint_kind: checkpoint
+            .as_ref()
+            .map(|snapshot| snapshot.kind.as_str().to_string()),
+        checkpoint_durability: checkpoint
+            .as_ref()
+            .map(|snapshot| snapshot.durability.as_str().to_string()),
+        checkpoint_state: checkpoint
+            .as_ref()
+            .map(|snapshot| snapshot.state.as_str().to_string()),
+        checkpoint_node_id: checkpoint
+            .as_ref()
+            .and_then(|snapshot| snapshot.node_id.clone()),
+        checkpoint_bytes: checkpoint.as_ref().map(|snapshot| snapshot.total_bytes),
+        checkpoint_id: suspend.checkpoint_id,
+        suspended_at: suspend.suspended_at.and_then(|unix| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)
+                .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        }),
+        suspend_reason: suspend.suspend_reason,
+        restored_from_snapshot_id: suspend.restored_from_snapshot_id,
+        last_restore_ms: suspend.last_restore_ms.map(|ms| ms.max(0) as u64),
+        last_suspend_ms: suspend.last_suspend_ms.map(|ms| ms.max(0) as u64),
+        pending_op,
+        idle_since,
+        idle_after_seconds,
     }
+}
+
+/// What a suspended instance keeps charged to its node, as `(memory MiB,
+/// cpu MHz)`, from its held allocation row (docs/suspend-and-resume.md,
+/// "Capacity for resumes"). `(None, None)` when it holds nothing or is not
+/// suspended. Lookups that fail degrade to nothing shown.
+fn suspended_hold_of(store: &Store, instance: &Instance) -> (Option<f64>, Option<f64>) {
+    if instance.state != InstanceState::Suspended {
+        return (None, None);
+    }
+    let Some(allocation) = instance
+        .current_alloc_id
+        .and_then(|id| store.get_allocation_by_id(id).ok().flatten())
+        .filter(|allocation| allocation.status == crate::constants::ALLOCATION_STATUS_SUSPENDED)
+    else {
+        return (None, None);
+    };
+    match store.resource_policy.usage_request(&allocation.resources) {
+        Ok(request) => (
+            Some(request.amount("memory").unwrap_or(0.0)),
+            Some(request.amount("cpu").unwrap_or(0.0)),
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+/// `instance get`'s note for a running instance whose task has an idle
+/// policy that cannot act: its node sends no usage reports (a worker without
+/// `resourceEnforcement.enabled`, or one that predates usage), so nothing
+/// measures its activity and the idle sweep never sees it. `None` otherwise.
+/// Lookups that fail degrade to no note.
+fn idle_policy_unmeasured_detail(
+    store: &Store,
+    usage: &crate::manager::usage::UsageTable,
+    instance: &Instance,
+) -> Option<String> {
+    if instance.state != InstanceState::Active {
+        return None;
+    }
+    let allocation_id = instance.current_alloc_id?;
+    if usage.allocation(allocation_id).is_some() {
+        return None;
+    }
+    let settings = store.suspend_settings_for(&instance.job_id, &instance.task_name);
+    let idle = settings.idle?;
+    let allocation = store.get_allocation_by_id(allocation_id).ok()??;
+    let node = if usage.reports_for(&allocation.node_id) {
+        format!(
+            "node {} reports usage but not for this allocation (its runtime is not governed \
+             by the worker cgroup)",
+            allocation.node_id
+        )
+    } else {
+        format!(
+            "node {} sends no usage reports (resource enforcement is off or unavailable on its \
+             worker; check the worker log)",
+            allocation.node_id
+        )
+    };
+    Some(format!(
+        "idle-unmeasured: the task's suspend.idle policy (after {}s) cannot act because {node}, \
+         so the instance will not suspend when idle",
+        idle.after.as_secs()
+    ))
 }
 
 /// `pending-loss-confirmation` diagnostic for instance get/list: when an
@@ -1298,6 +1468,12 @@ pub struct ManagerDaemonService {
     /// How often `StreamEvents` and exec sessions re-check their caller's
     /// credential (`acl::STREAM_REAUTH_INTERVAL`; tests shorten it).
     stream_reauth_interval: Duration,
+    /// The latest usage report per node (docs/resource-enforcement.md,
+    /// "Measuring usage"). In memory and never in the store: it is replaced
+    /// every report interval, so a restart or failover shows nothing until
+    /// the next report rather than anything wrong. Shared with the idle
+    /// sweep (see [`Self::usage_handle`]).
+    usage: Arc<Mutex<crate::manager::usage::UsageTable>>,
 }
 
 /// Distinct merged policy bodies kept in memory.
@@ -1337,6 +1513,7 @@ impl ManagerDaemonService {
             net_status: Arc::new(Mutex::new(HashMap::new())),
             net_edges: Arc::new(Mutex::new(HashMap::new())),
             stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
+            usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
         }
     }
 
@@ -1716,7 +1893,12 @@ impl ManagerDaemonService {
             message,
             job_name: config.name.clone(),
             job_config_id,
-            warnings: self.band_submit_warnings(&config),
+            warnings: self
+                .band_submit_warnings(&config)
+                .into_iter()
+                .chain(crate::task_plugins::resource_submit_warnings(&config))
+                .chain(crate::structs::suspend::sandbox_submit_warnings(&config))
+                .collect(),
         })
     }
 
@@ -1979,6 +2161,12 @@ impl ManagerDaemonService {
     pub fn with_advertise_addr(mut self, advertise_addr: impl Into<String>) -> Self {
         self.advertise_addr = advertise_addr.into();
         self
+    }
+
+    /// The usage table heartbeats fill, for the idle sweep the maintenance
+    /// loop runs (docs/suspend-and-resume.md, "Idle policy").
+    pub fn usage_handle(&self) -> Arc<Mutex<crate::manager::usage::UsageTable>> {
+        self.usage.clone()
     }
 
     /// Attach the cluster's edge-boot settings (docs/edge-boot.md).
@@ -2287,6 +2475,30 @@ impl ManagerDaemonService {
                         task.name,
                         entry.nodes.join(", "),
                         entry.capabilities.detail
+                    );
+                }
+                // A published checkpoint (Phase 7b) resumes on another node,
+                // which a node-local instance volume cannot follow. Built-in
+                // drivers are refused offline; this catches plugin drivers
+                // by what they advertise.
+                if is_instance_volume
+                    && entry.capabilities.node_local
+                    && task
+                        .suspend
+                        .as_ref()
+                        .and_then(|suspend| suspend.resolve().ok())
+                        .is_some_and(|resolved| {
+                            resolved.durability
+                                == crate::structs::snapshot::SnapshotDurability::Store
+                        })
+                {
+                    bail!(
+                        "{}",
+                        crate::structs::snapshot::store_durability_volume_error(
+                            &task.name,
+                            &driver,
+                            "suspend.durability"
+                        )
                     );
                 }
                 if !entry.capabilities.serves_mode(mode) {
@@ -4428,6 +4640,12 @@ impl Manager for ManagerDaemonService {
             inner.task_group.as_deref(),
             inner.task_name.as_deref(),
         )?;
+        // The submit-time fixed-TAP rule, asked of the count being set: a
+        // second guest on a fixed TAP fails to boot (docs/task-runtime-sandbox.md).
+        if let Some(count) = inner.count {
+            crate::structs::fork::validate_fixed_tap(task, count, false)
+                .map_err(Status::failed_precondition)?;
+        }
         let (task_group, task_name, spec_count) =
             (task.group.clone(), task.name.clone(), task.count.num);
         let job_config_id = config.id();
@@ -4665,20 +4883,41 @@ impl Manager for ManagerDaemonService {
             AclScope::job(&request.get_ref().job_id),
         )?;
         let inner = request.into_inner();
+        // Phase 6: restoring reads the snapshot. Checked before anything is
+        // looked up, so a caller without the grant learns nothing.
+        if inner
+            .from_snapshot
+            .as_deref()
+            .is_some_and(|from| !from.trim().is_empty())
+        {
+            acl::enforce(
+                &identity,
+                AclResource::Snapshot,
+                AclAction::Read,
+                &AclScope::job(&inner.job_id),
+            )?;
+        }
         let idempotency_key = scoped_idempotency_key(
             &identity,
             "create_instance",
             inner.idempotency_key.as_deref(),
         );
 
-        if let Some(instance_id) = self
+        if let Some(recorded) = self
             .store
             .idempotency_lookup(&idempotency_key)
             .map_err(|e| map_store_error("Error checking idempotency", e))?
         {
+            // Recorded as `<id>`, or `<id> <snapshot>` for a create from a
+            // snapshot (ids never contain spaces).
+            let (instance_id, restoring_from) = recorded
+                .split_once(' ')
+                .map(|(id, snapshot)| (id.to_string(), snapshot.to_string()))
+                .unwrap_or((recorded, String::new()));
             return Ok(Response::new(CreateInstanceReply {
                 instance_id,
                 deduplicated: true,
+                restoring_from,
             }));
         }
 
@@ -4690,30 +4929,59 @@ impl Manager for ManagerDaemonService {
             inner.task.as_deref(),
         )?;
 
-        // Id policy: idSource declares the default source; a valid explicit
-        // key is always honored. See proto comments.
+        // Id policy: a valid explicit key is always honored, and requireId
+        // refuses a create without one. See proto comments.
         let requested_id = inner.instance_id.as_deref().filter(|id| !id.is_empty());
-        let id_source = task
+        let require_id = task
             .stateful
             .as_ref()
-            .and_then(|stateful| stateful.id_source.as_deref());
+            .is_some_and(|stateful| stateful.require_id);
         match requested_id {
             Some(id) => validate_keyed_instance_id(id).map_err(Status::invalid_argument)?,
-            None => {
-                if id_source == Some("caller") {
-                    return Err(Status::invalid_argument(format!(
-                        "task {} declares stateful.idSource = \"caller\"; CreateInstance must \
-                         supply instance_id",
-                        task.name
-                    )));
-                }
+            None if require_id => {
+                return Err(Status::invalid_argument(format!(
+                    "task {} sets stateful.requireId = true; CreateInstance must supply \
+                     instance_id",
+                    task.name
+                )));
             }
+            None => {}
         }
 
-        let instance = self
-            .store
-            .create_keyed_instance(&inner.job_id, &task.group, &task.name, requested_id)
-            .map_err(|e| map_store_error("Error creating instance", e))?;
+        // Phase 6: restore from a snapshot instead of booting empty.
+        let seed = inner
+            .from_snapshot
+            .as_deref()
+            .map(str::trim)
+            .filter(|from| !from.is_empty())
+            .map(|from| self.resolve_seed_snapshot(&identity, &inner.job_id, task, from, 1))
+            .transpose()?;
+        let instance_id = match seed.as_ref() {
+            Some(seed) => {
+                let requested: Vec<String> = requested_id.map(str::to_string).into_iter().collect();
+                let mint = u32::from(requested.is_empty());
+                self.store
+                    .create_keyed_instances_from_snapshot(
+                        &inner.job_id,
+                        &task.group,
+                        &task.name,
+                        &requested,
+                        mint,
+                        &seed.snapshot_id,
+                    )
+                    .map_err(|e| map_store_error("Error creating instance", e))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Status::internal("create from snapshot created nothing"))?
+            }
+            None => {
+                self.store
+                    .create_keyed_instance(&inner.job_id, &task.group, &task.name, requested_id)
+                    .map_err(|e| map_store_error("Error creating instance", e))?
+                    .instance_id
+            }
+        };
+        let restoring_from = seed.map(|seed| seed.snapshot_id).unwrap_or_default();
 
         // Place promptly: a reschedule plan adds exactly the missing keyed
         // allocations without disturbing live ones.
@@ -4727,13 +4995,19 @@ impl Manager for ManagerDaemonService {
             )
             .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
 
+        let recorded = if restoring_from.is_empty() {
+            instance_id.clone()
+        } else {
+            format!("{instance_id} {restoring_from}")
+        };
         self.store
-            .idempotency_record(&idempotency_key, "create_instance", &instance.instance_id)
+            .idempotency_record(&idempotency_key, "create_instance", &recorded)
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
 
         Ok(Response::new(CreateInstanceReply {
-            instance_id: instance.instance_id,
+            instance_id,
             deduplicated: false,
+            restoring_from,
         }))
     }
 
@@ -4754,6 +5028,19 @@ impl Manager for ManagerDaemonService {
             AclScope::job(&request.get_ref().job_id),
         )?;
         let inner = request.into_inner();
+        // Phase 6: restoring reads the snapshot (see create_instance).
+        if inner
+            .from_snapshot
+            .as_deref()
+            .is_some_and(|from| !from.trim().is_empty())
+        {
+            acl::enforce(
+                &identity,
+                AclResource::Snapshot,
+                AclAction::Read,
+                &AclScope::job(&inner.job_id),
+            )?;
+        }
         let idempotency_key = scoped_idempotency_key(
             &identity,
             "create_instances",
@@ -4766,14 +5053,20 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Error checking idempotency", e))?
         {
             // The recorded replay is the comma-joined created ids (the id
-            // charset cannot contain commas, so the join is unambiguous).
+            // charset cannot contain commas, so the join is unambiguous),
+            // then ` <snapshot>` for a create from a snapshot.
+            let (ids, restoring_from) = recorded
+                .split_once(' ')
+                .map(|(ids, snapshot)| (ids.to_string(), snapshot.to_string()))
+                .unwrap_or((recorded, String::new()));
             return Ok(Response::new(CreateInstancesReply {
-                instance_ids: recorded
+                instance_ids: ids
                     .split(',')
                     .filter(|id| !id.is_empty())
                     .map(str::to_string)
                     .collect(),
                 deduplicated: true,
+                restoring_from,
             }));
         }
 
@@ -4797,31 +5090,55 @@ impl Manager for ManagerDaemonService {
             inner.task.as_deref(),
         )?;
 
-        // idSource "caller" requires every id to be caller-supplied;
-        // server-minting (`count`) contradicts that policy.
-        let id_source = task
+        // requireId means every id is caller-supplied, and server-minting
+        // (`count`) contradicts that.
+        let require_id = task
             .stateful
             .as_ref()
-            .and_then(|stateful| stateful.id_source.as_deref());
-        if id_source == Some("caller") && inner.count > 0 {
+            .is_some_and(|stateful| stateful.require_id);
+        if require_id && inner.count > 0 {
             return Err(Status::invalid_argument(format!(
-                "task {} declares stateful.idSource = \"caller\", so every id must be \
-                 caller-supplied; count > 0 asks the server to mint ids — list explicit \
-                 instance_ids instead",
+                "task {} sets stateful.requireId = true, so every id must be caller-supplied; \
+                 count > 0 asks the server to mint ids. List explicit instance_ids instead",
                 task.name
             )));
         }
 
-        let created = self
-            .store
-            .create_keyed_instances(
+        // Phase 6: restore every instance from a snapshot.
+        let seed = inner
+            .from_snapshot
+            .as_deref()
+            .map(str::trim)
+            .filter(|from| !from.is_empty())
+            .map(|from| {
+                self.resolve_seed_snapshot(
+                    &identity,
+                    &inner.job_id,
+                    task,
+                    from,
+                    inner.instance_ids.len() + inner.count as usize,
+                )
+            })
+            .transpose()?;
+        let created = match seed.as_ref() {
+            Some(seed) => self.store.create_keyed_instances_from_snapshot(
                 &inner.job_id,
                 &task.group,
                 &task.name,
                 &inner.instance_ids,
                 inner.count,
-            )
-            .map_err(|e| map_store_error("Error creating instances", e))?;
+                &seed.snapshot_id,
+            ),
+            None => self.store.create_keyed_instances(
+                &inner.job_id,
+                &task.group,
+                &task.name,
+                &inner.instance_ids,
+                inner.count,
+            ),
+        }
+        .map_err(|e| map_store_error("Error creating instances", e))?;
+        let restoring_from = seed.map(|seed| seed.snapshot_id).unwrap_or_default();
 
         // One placement eval covers the whole batch: a reschedule plan adds
         // exactly the missing keyed allocations without disturbing live ones.
@@ -4835,13 +5152,19 @@ impl Manager for ManagerDaemonService {
             )
             .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
 
+        let recorded = if restoring_from.is_empty() {
+            created.join(",")
+        } else {
+            format!("{} {restoring_from}", created.join(","))
+        };
         self.store
-            .idempotency_record(&idempotency_key, "create_instances", &created.join(","))
+            .idempotency_record(&idempotency_key, "create_instances", &recorded)
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
 
         Ok(Response::new(CreateInstancesReply {
             instance_ids: created,
             deduplicated: false,
+            restoring_from,
         }))
     }
 
@@ -4961,15 +5284,14 @@ impl Manager for ManagerDaemonService {
             inner.idempotency_key.as_deref(),
         );
 
-        if let Some(message) = self
+        if let Some(recorded) = self
             .store
             .idempotency_lookup(&idempotency_key)
             .map_err(|e| map_store_error("Error checking idempotency", e))?
         {
-            return Ok(Response::new(StartInstanceReply {
-                message,
-                deduplicated: true,
-            }));
+            return Ok(Response::new(
+                suspend_rpcs::RecordedStart::from_record(recorded).into_reply(true),
+            ));
         }
 
         let instance = self
@@ -5015,6 +5337,19 @@ impl Manager for ManagerDaemonService {
             )));
         }
 
+        // A suspended instance resumes from its checkpoint (or boots cold).
+        if instance.state == InstanceState::Suspended {
+            let recorded = self.resume_instance(&instance, inner.cold)?;
+            self.store
+                .idempotency_record(
+                    &idempotency_key,
+                    "start_instance",
+                    &serde_json::to_string(&recorded).unwrap_or_default(),
+                )
+                .map_err(|e| map_store_error("Error recording idempotency", e))?;
+            return Ok(Response::new(recorded.into_reply(false)));
+        }
+
         let outcome = self
             .store
             .start_keyed_instance(&inner.instance_id)
@@ -5050,6 +5385,8 @@ impl Manager for ManagerDaemonService {
         Ok(Response::new(StartInstanceReply {
             message,
             deduplicated: false,
+            resuming_from: String::new(),
+            node_id: String::new(),
         }))
     }
 
@@ -5271,13 +5608,26 @@ impl Manager for ManagerDaemonService {
         let inner = request.into_inner();
         let group = inner.group.filter(|group| !group.trim().is_empty());
 
+        let mut suspend = self
+            .store
+            .instance_suspend_states_for_job(&inner.job_id)
+            .map_err(|e| map_store_error("Error listing instances", e))?;
+        let mut history = self
+            .store
+            .instance_lineage_for_job(&inner.job_id)
+            .map_err(|e| map_store_error("Error listing instances", e))?;
+        let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         let instances = self
             .store
             .list_instances(&inner.job_id)
             .map_err(|e| map_store_error("Error listing instances", e))?
             .into_iter()
             .filter(|instance| group.as_deref().is_none_or(|group| instance.group == group))
-            .map(|instance| map_instance_info(&self.store, instance))
+            .map(|instance| {
+                let state = suspend.remove(&instance.instance_id).unwrap_or_default();
+                let history = history.remove(&instance.instance_id).unwrap_or_default();
+                map_instance_info(&self.store, &usage, instance, state, history)
+            })
             .collect();
 
         Ok(Response::new(ListInstancesReply { instances }))
@@ -5310,12 +5660,109 @@ impl Manager for ManagerDaemonService {
         // instance with no allocation and a sandbox demonstrably running on a
         // node is otherwise inexplicable; this is the state that explains it.
         let (provisional, provisional_node_id) = self.provisional_claim_for(&inner.instance_id);
+        let suspend = self
+            .store
+            .instance_suspend_state(&inner.instance_id)
+            .map_err(|e| map_store_error("Error loading instance", e))?;
+        let history = self
+            .store
+            .instance_history(&inner.instance_id)
+            .map_err(|e| map_store_error("Error loading instance", e))?;
 
+        let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        let idle_unmeasured = idle_policy_unmeasured_detail(&self.store, &usage, &instance);
+        let mut info = map_instance_info(&self.store, &usage, instance, suspend, history);
+        drop(usage);
+        if info.detail.is_none() {
+            info.detail = idle_unmeasured;
+        }
         Ok(Response::new(GetInstanceReply {
-            instance: Some(map_instance_info(&self.store, instance)),
+            instance: Some(info),
             provisional,
             provisional_node_id,
         }))
+    }
+
+    // === SNAPSHOTS (docs/suspend-and-resume.md) ===
+    // The handlers live in `snapshot_rpcs`; each enforces `snapshot` ACLs
+    // itself (coarse `AclScope::any()` first, the job scope after lookup).
+
+    async fn create_snapshot(
+        &self,
+        request: Request<crate::structs::CreateSnapshotRequest>,
+    ) -> Result<Response<crate::structs::CreateSnapshotReply>, Status> {
+        self.create_snapshot_rpc(request).await
+    }
+
+    async fn list_snapshots(
+        &self,
+        request: Request<crate::structs::ListSnapshotsRequest>,
+    ) -> Result<Response<crate::structs::ListSnapshotsReply>, Status> {
+        self.list_snapshots_rpc(request).await
+    }
+
+    async fn get_snapshot(
+        &self,
+        request: Request<crate::structs::GetSnapshotRequest>,
+    ) -> Result<Response<crate::structs::GetSnapshotReply>, Status> {
+        self.get_snapshot_rpc(request).await
+    }
+
+    async fn delete_snapshot(
+        &self,
+        request: Request<crate::structs::DeleteSnapshotRequest>,
+    ) -> Result<Response<crate::structs::DeleteSnapshotReply>, Status> {
+        self.delete_snapshot_rpc(request).await
+    }
+
+    async fn restore_instance(
+        &self,
+        request: Request<crate::structs::RestoreInstanceRequest>,
+    ) -> Result<Response<crate::structs::RestoreInstanceReply>, Status> {
+        self.restore_instance_rpc(request).await
+    }
+
+    // Phase 6. The handler lives in `fork_rpcs`, and enforces `job:write`
+    // and `snapshot:write` on the origin's job itself.
+    async fn fork_instance(
+        &self,
+        request: Request<crate::structs::ForkInstanceRequest>,
+    ) -> Result<Response<crate::structs::ForkInstanceReply>, Status> {
+        self.fork_instance_rpc(request).await
+    }
+
+    // Phase 6. `snapshot:write` on the job, enforced in `fork_rpcs`.
+    async fn set_snapshot_alias(
+        &self,
+        request: Request<crate::structs::SetSnapshotAliasRequest>,
+    ) -> Result<Response<crate::structs::SetSnapshotAliasReply>, Status> {
+        self.set_snapshot_alias_rpc(request).await
+    }
+
+    // Phase 6. `snapshot:write` on the job, enforced in `fork_rpcs`.
+    async fn delete_snapshot_alias(
+        &self,
+        request: Request<crate::structs::DeleteSnapshotAliasRequest>,
+    ) -> Result<Response<crate::structs::DeleteSnapshotAliasReply>, Status> {
+        self.delete_snapshot_alias_rpc(request).await
+    }
+
+    // The handler lives in `snapshot_rpcs`, and enforces `snapshot:read`
+    // itself (coarse, then on the snapshot's job).
+    async fn warm_snapshot(
+        &self,
+        request: Request<crate::structs::WarmSnapshotRequest>,
+    ) -> Result<Response<crate::structs::WarmSnapshotReply>, Status> {
+        self.warm_snapshot_rpc(request).await
+    }
+
+    // The handler lives in `suspend_rpcs`, and enforces `job:write` (plus
+    // `snapshot:write` for a memory checkpoint) itself.
+    async fn suspend_instance(
+        &self,
+        request: Request<crate::structs::SuspendInstanceRequest>,
+    ) -> Result<Response<crate::structs::SuspendInstanceReply>, Status> {
+        self.suspend_instance_rpc(request).await
     }
 
     /// List volumes, optionally filtered. See docs/volumes.md.
@@ -5837,6 +6284,11 @@ impl Manager for ManagerDaemonService {
         let id = req.id;
         acl::enforce_node_binding(&identity, &id)?;
         let provisional_claims = req.provisional_claims;
+        // Checkpoint outcomes first: a failed restore also fails its
+        // allocation in `failed_allocations` below, and the instance's
+        // restore source must be cleared before that reschedules it, or the
+        // replacement would try the same restore again.
+        snapshot_rpcs::apply_snapshot_reports(&self.store, &id, &req.snapshot_reports);
 
         // Offloaded, not called inline. In steady state this is now cheap —
         // one read-model lookup and one map write, no commit and no fsync
@@ -5889,6 +6341,13 @@ impl Manager for ManagerDaemonService {
         // manager owns the state machine (see docs/volumes.md).
         apply_volume_reports(&self.store, &id, &req.volume_reports);
 
+        // Before the desired set is built, so an allocation the worker just
+        // evicted for memory pressure is already gone from this reply and is
+        // not handed straight back to it.
+        if let Err(err) = handle_pressure_actions(&self.store, &id, &req.pressure_actions) {
+            error!(node_id = %id, error = ?err, "Error handling pressure actions");
+        }
+
         let desired_allocations = build_desired_allocations(&self.store, &id, &req.allocation_ids)
             .map_err(|e| map_store_error("Error building desired allocations", e))?;
         // Endpoint feed for the node-local upstream forwarders. Costs nothing
@@ -5917,6 +6376,33 @@ impl Manager for ManagerDaemonService {
                 status.insert(id.clone(), req.net_status.clone());
             }
         }
+        // Measured usage, when this beat carries a report (every 10s from
+        // workers with enforcement on). In memory only, never the store.
+        {
+            let now = std::time::Instant::now();
+            let mut usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(report) = req.usage.clone() {
+                usage.ingest(&id, report, now);
+            }
+            usage.sweep(now);
+        }
+        // Content locality (docs/artifacts.md, "Content locality"): fold the
+        // node's content report into the in-memory location index, and ask
+        // for a full report when this manager cannot apply a delta (it just
+        // started or took over, or a reply was lost). Off raft, like usage.
+        let content_resync = req.content_locations.as_ref().is_some_and(|report| {
+            let outcome = self.store.content_locations().ingest(
+                &id,
+                report,
+                std::time::Instant::now(),
+            );
+            if outcome == crate::storage::content_index::IngestOutcome::Resync {
+                debug!(node_id = %id, base_epoch = report.base_epoch, "Content report needs resync");
+                true
+            } else {
+                false
+            }
+        });
         // Service-graph samples: fold into per-(caller, service) windows.
         if !req.net_edges.is_empty() {
             let callers: HashMap<i64, (String, String)> = desired_allocations
@@ -5928,6 +6414,9 @@ impl Manager for ManagerDaemonService {
         // Reclaim work for this node. Re-sent every heartbeat until the worker
         // confirms, so a worker that dies mid-destroy simply retries.
         let volume_destroy = build_volume_destroy_requests(&self.store, &id);
+        // Checkpoint work for this node, re-sent until it reports (the
+        // checkpoint channel, see `snapshot_rpcs`). One indexed lookup.
+        let checkpoint_requests = snapshot_rpcs::build_checkpoint_requests(&self.store, &id);
         // Why this node's recently-removed allocations went away. Advisory:
         // a lookup failure costs the worker a cause, never a reconcile, so
         // it is logged and dropped rather than failing the heartbeat.
@@ -5982,9 +6471,52 @@ impl Manager for ManagerDaemonService {
             stop_notices,
             claim_verdicts,
             next_interval_seconds,
+            checkpoint_requests,
+            content_resync,
         };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all, fields(node_id = %request.get_ref().node_id))]
+    async fn get_node_usage(
+        &self,
+        request: Request<GetNodeUsageRequest>,
+    ) -> Result<Response<GetNodeUsageReply>, Status> {
+        // Coarse check before the lookup, so a caller without node access
+        // cannot tell which node ids exist; the pool scope is enforced after.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        let node_id = request.into_inner().node_id;
+        let node = self
+            .store
+            .get_node(&node_id)
+            .map_err(|e| map_store_error("Error getting node", e))?;
+        acl::enforce(
+            &identity,
+            AclResource::Node,
+            AclAction::Read,
+            &AclScope::pool(&node.pool),
+        )?;
+        Ok(Response::new(self.node_usage_reply(&node)?))
+    }
+
+    async fn list_node_usage(
+        &self,
+        request: Request<ListNodeUsageRequest>,
+    ) -> Result<Response<ListNodeUsageReply>, Status> {
+        self.list_node_usage_rpc(request).await
+    }
+
+    async fn get_node_content(
+        &self,
+        request: Request<GetNodeContentRequest>,
+    ) -> Result<Response<GetNodeContentReply>, Status> {
+        self.get_node_content_rpc(request).await
     }
 
     #[instrument(skip_all)]
@@ -6159,6 +6691,9 @@ impl Manager for ManagerDaemonService {
                 request.build_version.as_str()
             },
             "protocolVersion": request.protocol_version,
+            // Optional features the worker implements (`checkpoint`, ...).
+            // Feature-specific work is only sent to workers that list it.
+            "capabilities": request.capabilities,
         })
         .to_string();
 
@@ -9146,6 +9681,117 @@ async fn fetch_allocation_logs(
 /// go through the reschedule/move machinery. This path is the one that makes a
 /// batch task's success real: the allocation row becomes terminal and the
 /// task's status follows the exit code.
+/// Apply what a node's memory pressure response did (docs/resource-
+/// enforcement.md, "Memory pressure"): a `node.pressure` event per action,
+/// and for the eviction steps, the allocation's removal with
+/// `cause = node_pressure` plus an eval so the scheduler replaces it.
+///
+/// The worker has already stopped the task; this records the fact. Reports
+/// for allocations this node does not hold (already removed, or another
+/// node's) are ignored, which also makes a re-sent report harmless.
+fn handle_pressure_actions(
+    store: &Store,
+    node_id: &str,
+    actions: &[crate::structs::PressureAction],
+) -> R<()> {
+    let metrics = crate::manager::telemetry::metrics();
+    for action in actions {
+        metrics
+            .node_pressure_actions_total
+            .inc(&[node_id, action.step.as_str()]);
+        if action.step == "reclaim" {
+            let instance_id = pressure_instance_id(store, action);
+            store
+                .events()
+                .node_pressure(node_id, action, instance_id.as_deref());
+            continue;
+        }
+        if action.step == "suspend" {
+            // The state change rides the local suspension's snapshot report
+            // (applied earlier in this heartbeat): the instance is
+            // `suspended`, not evicted, and nothing is rescheduled.
+            let instance_id = pressure_instance_id(store, action);
+            store
+                .events()
+                .node_pressure(node_id, action, instance_id.as_deref());
+            continue;
+        }
+        let Some(existing) = store.get_allocation_by_id(action.allocation_id)? else {
+            debug!(
+                allocation_id = action.allocation_id,
+                node_id, "Pressure-evicted allocation already removed"
+            );
+            continue;
+        };
+        if existing.node_id != node_id {
+            warn!(
+                allocation_id = action.allocation_id,
+                reported_node_id = %node_id,
+                owner_node_id = %existing.node_id,
+                "Ignoring pressure eviction report from non-owner node"
+            );
+            continue;
+        }
+        store
+            .events()
+            .node_pressure(node_id, action, existing.instance_id.as_deref());
+        // The worker's own sentence and hint become the instance's
+        // `last_stop`, so the row explains itself without the event.
+        let explanation = crate::storage::store::StopExplanation {
+            detail: action.detail.clone(),
+            hint: action.hint.clone(),
+        };
+        let Some(removed) = store.remove_allocation_by_id_explained(
+            action.allocation_id,
+            StopCause::NodePressure,
+            Some(explanation),
+        )?
+        else {
+            continue;
+        };
+        let priority = store
+            .cached_band_for_job_config(&removed.job_config_id)
+            .map(|band| band.eval_priority())
+            .unwrap_or(store.default_eval_priority);
+        store.enqueue_eval(
+            "job_reschedule",
+            Some(&removed.job_id),
+            Some(&removed.job_config_id),
+            Some(node_id),
+            Some(priority),
+        )?;
+        info!(
+            allocation_id = removed.id,
+            job_id = %removed.job_id,
+            node_id,
+            step = %action.step,
+            "Allocation removed for node memory pressure; replacement scheduled"
+        );
+    }
+    Ok(())
+}
+
+/// The instance a pressure action touched, for the `node.pressure` event:
+/// the allocation's instance while its row exists, else (a pressure suspend,
+/// whose allocation the snapshot report already removed) the instance its
+/// checkpoint was taken from. Lookup failures read as none: the field is
+/// advisory.
+fn pressure_instance_id(store: &Store, action: &crate::structs::PressureAction) -> Option<String> {
+    if let Ok(Some(allocation)) = store.get_allocation_by_id(action.allocation_id) {
+        if allocation.instance_id.is_some() {
+            return allocation.instance_id;
+        }
+    }
+    if action.snapshot_id.is_empty() {
+        return None;
+    }
+    store
+        .get_snapshot(&action.snapshot_id)
+        .ok()
+        .flatten()
+        .and_then(|snapshot| snapshot.instance_id)
+}
+
 fn handle_terminated_allocations(
     store: &Store,
     node_id: &str,
@@ -9717,7 +10363,9 @@ fn build_desired_allocations(
         // A finished allocation keeps its row (the slot is still spent) but
         // must never be dispatched again — re-sending it would relaunch a
         // completed batch task on the next worker restart.
-        if crate::constants::allocation_status_is_terminal(&allocation.status) {
+        // A suspended instance's held reservation (`suspend.reserve`) is a
+        // row with nothing to run.
+        if !crate::constants::allocation_status_is_dispatchable(&allocation.status) {
             continue;
         }
         let tasks = task_cache
@@ -9746,12 +10394,15 @@ fn build_desired_allocations(
         };
         let volumes =
             store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
-        allocations.push(build_task_allocation(
-            task,
-            &allocation,
-            instance.as_ref(),
-            &volumes,
-        )?);
+        let mut payload = build_task_allocation(task, &allocation, instance.as_ref(), &volumes)?;
+        // The band orders the worker's memory pressure response. Read from
+        // the read model, so steady-state heartbeats pay no store read.
+        payload.priority_band = store
+            .cached_band_for_job_config(&allocation.job_config_id)?
+            .as_str()
+            .to_string();
+        payload.restore = snapshot_rpcs::snapshot_restore_payload(store, instance.as_ref());
+        allocations.push(payload);
     }
 
     Ok(allocations)
@@ -10846,7 +11497,7 @@ mod tests {
         let job = JobConfig {
             priority: Default::default(),
             name: job_name.into(),
-            tasks: vec![TaskConfig::new(&format!("{job_name}-task"), "service")],
+            tasks: vec![TaskConfig::new(format!("{job_name}-task"), "service")],
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
@@ -10948,7 +11599,7 @@ mod tests {
         let task = TaskConfig {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
@@ -11207,7 +11858,7 @@ mod tests {
         let task = TaskConfig {
             stateful: Some(crate::structs::StatefulConfig {
                 mode: crate::structs::InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -14137,12 +14788,12 @@ mod tests {
     // KEYED-MODE INSTANCE RPCs (see docs/stateful-workloads.md)
     //
 
-    fn keyed_task(name: &str, group: &str, id_source: Option<&str>) -> TaskConfig {
+    fn keyed_task(name: &str, group: &str, require_id: bool) -> TaskConfig {
         TaskConfig {
             group: group.into(),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Keyed,
-                id_source: id_source.map(String::from),
+                require_id,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -14204,7 +14855,11 @@ mod tests {
         insert_node(&store, "node-a")?;
         let manager = ManagerDaemonService::new(store.clone());
         let job_id = "sandbox-rpc";
-        submit_keyed_job(&store, job_id, vec![keyed_task("sandbox", "default", None)])?;
+        submit_keyed_job(
+            &store,
+            job_id,
+            vec![keyed_task("sandbox", "default", false)],
+        )?;
         // Keyed task with zero instances: the submit eval placed nothing.
         assert!(store.allocs_for_job(job_id)?.is_empty());
 
@@ -14218,6 +14873,7 @@ mod tests {
                 task: None,
                 instance_id: Some("user-a".into()),
                 idempotency_key: None,
+                from_snapshot: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -14287,6 +14943,7 @@ mod tests {
                 task: None,
                 instance_id: Some("user-a".into()),
                 idempotency_key: None,
+                from_snapshot: None,
             })))
             .expect_err("tombstoned id must be rejected");
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
@@ -14300,6 +14957,7 @@ mod tests {
                 task: None,
                 instance_id: None,
                 idempotency_key: None,
+                from_snapshot: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -14330,6 +14988,7 @@ mod tests {
                 task: task.map(String::from),
                 instance_id: id.map(String::from),
                 idempotency_key: None,
+                from_snapshot: None,
             })))
         };
 
@@ -14347,8 +15006,8 @@ mod tests {
             &store,
             "multi",
             vec![
-                keyed_task("sandbox", "sandboxes", None),
-                keyed_task("runner", "runners", Some("caller")),
+                keyed_task("sandbox", "sandboxes", false),
+                keyed_task("runner", "runners", true),
             ],
         )?;
         let status = create("multi", None, None, None).expect_err("ambiguous keyed task");
@@ -14366,17 +15025,17 @@ mod tests {
         assert_eq!(instance.group, "sandboxes");
         assert_eq!(instance.task_name, "sandbox");
 
-        // idSource = "caller": the id is required ...
+        // requireId: the id is required ...
         let status = create("multi", None, Some("runner"), None).expect_err("caller id required");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert!(status.message().contains("idSource"));
+        assert!(status.message().contains("requireId"));
         // ... and an explicit one is accepted.
         let reply = create("multi", None, Some("runner"), Some("tenant-1"))
             .map_err(|err| anyhow!(err))?
             .into_inner();
         assert_eq!(reply.instance_id, "tenant-1");
 
-        // Explicit ids are accepted even when idSource is unset/uuid ...
+        // Explicit ids are accepted without requireId too ...
         let reply = create("multi", Some("sandboxes"), None, Some("explicit.id_OK-1"))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -14413,7 +15072,11 @@ mod tests {
         insert_node(&store, "node-a")?;
         let manager = ManagerDaemonService::new(store.clone());
         let job_id = "sandbox-idem";
-        submit_keyed_job(&store, job_id, vec![keyed_task("sandbox", "default", None)])?;
+        submit_keyed_job(
+            &store,
+            job_id,
+            vec![keyed_task("sandbox", "default", false)],
+        )?;
         let runtime = tokio::runtime::Runtime::new()?;
 
         // Create twice with the same key: one instance, replayed reply.
@@ -14424,6 +15087,7 @@ mod tests {
                 task: None,
                 instance_id: None,
                 idempotency_key: Some("create-1".into()),
+                from_snapshot: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -14434,6 +15098,7 @@ mod tests {
                 task: None,
                 instance_id: None,
                 idempotency_key: Some("create-1".into()),
+                from_snapshot: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -14477,8 +15142,8 @@ mod tests {
             &store,
             job_id,
             vec![
-                keyed_task("sandbox", "sandboxes", None),
-                keyed_task("runner", "runners", None),
+                keyed_task("sandbox", "sandboxes", false),
+                keyed_task("runner", "runners", false),
             ],
         )?;
         store.create_keyed_instance(job_id, "sandboxes", "sandbox", Some("s-1"))?;

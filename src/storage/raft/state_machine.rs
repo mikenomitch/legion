@@ -1335,9 +1335,10 @@ mod tests {
             .unwrap();
 
             // Hold the lock every capture and apply takes, as a long write
-            // would, and build on another thread.
-            let held = capture::capture_exclusion()?;
+            // would, and build on another thread. Taken after the (async)
+            // builder handoff so no guard is held across an await.
             let builder = sm.get_snapshot_builder().await;
+            let held = capture::capture_exclusion()?;
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let _ = tx.send(builder.build().map(|snapshot| snapshot.meta));

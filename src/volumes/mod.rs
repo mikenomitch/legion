@@ -27,6 +27,7 @@ use crate::prelude::*;
 
 pub mod builtins;
 pub mod conformance;
+pub mod copy;
 pub mod exec;
 
 pub use exec::ExecVolumeDriver;
@@ -59,9 +60,12 @@ pub const ACCESS_MODE_MULTI_READER: &str = "multi-reader";
 
 /// An operation in the volume contract.
 ///
-/// v1 dispatches the first four. The rest are **reserved**: their names are
-/// fixed so a plugin can advertise them in `capabilities.ops` and Legion can
-/// start dispatching them without an ABI break (plan, judgement call 1).
+/// Every driver implements the first four. `snapshot`, `restore`, `clone`,
+/// and `snapshot-delete` are optional: a driver advertises them in
+/// `capabilities.ops` and implements the matching [`VolumeDriver`] method.
+/// The rest are **reserved**: their names are fixed so a plugin can advertise
+/// them and Legion can start dispatching them without an ABI break (plan,
+/// judgement call 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VolumeOp {
@@ -69,13 +73,16 @@ pub enum VolumeOp {
     Mount,
     Unmount,
     Destroy,
+    // --- optional, advertised in `capabilities.ops` ---
+    Snapshot,
+    Restore,
+    Clone,
+    #[serde(rename = "snapshot-delete")]
+    DeleteSnapshot,
     // --- reserved ---
     Create,
     Attach,
     Detach,
-    Snapshot,
-    Restore,
-    Clone,
     Expand,
 }
 
@@ -92,6 +99,7 @@ impl VolumeOp {
             VolumeOp::Snapshot => "snapshot",
             VolumeOp::Restore => "restore",
             VolumeOp::Clone => "clone",
+            VolumeOp::DeleteSnapshot => "snapshot-delete",
             VolumeOp::Expand => "expand",
         }
     }
@@ -195,8 +203,10 @@ pub struct VolumeCapabilities {
     /// Params a job MAY supply, for documentation and `legion volume plugins`.
     #[serde(default)]
     pub optional_params: Vec<String>,
-    /// Reserved ops this plugin implements beyond the required four. Nothing
-    /// dispatches these yet; advertising one is forward-compatible.
+    /// Optional ops this plugin implements beyond the required four
+    /// (`snapshot`, `restore`, `clone`, `snapshot-delete`). Legion only
+    /// dispatches an optional op to a driver that lists it here; advertising
+    /// a reserved one is forward-compatible.
     #[serde(default)]
     pub ops: Vec<String>,
     /// False when the driver is installed but unusable on this node (no
@@ -281,6 +291,18 @@ impl VolumeCapabilities {
         self.volume_modes.contains(&mode)
     }
 
+    pub fn with_ops(mut self, ops: &[VolumeOp]) -> Self {
+        self.ops = ops.iter().map(|op| op.as_str().to_string()).collect();
+        self
+    }
+
+    /// Whether the driver advertises an optional op. This is the check a
+    /// runtime's checkpoint support rests on: a task whose volume driver
+    /// advertises `snapshot` can take a disk checkpoint.
+    pub fn supports(&self, op: VolumeOp) -> bool {
+        self.ops.iter().any(|advertised| advertised == op.as_str())
+    }
+
     /// Names the params a job left out. Used by admission so the error points
     /// at the field, not at a driver stack trace.
     pub fn missing_params(&self, params: &BTreeMap<String, Value>) -> Vec<String> {
@@ -360,6 +382,13 @@ pub struct VolumeRequest {
     #[serde(default)]
     pub alloc_id: i64,
     pub node: VolumeNodeRef,
+    /// The snapshot a `snapshot`, `restore`, `clone`, or `snapshot-delete`
+    /// acts on. For `snapshot` only `id` is meaningful: the caller picks it,
+    /// so a retried call lands on the same snapshot. For the others it is
+    /// what a previous `snapshot` returned. Absent (and not serialized) for
+    /// the required ops, so their payload is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<crate::structs::checkpoint::VolumeSnapshotRef>,
 }
 
 impl VolumeRequest {
@@ -376,7 +405,24 @@ impl VolumeRequest {
             instance: None,
             alloc_id: 0,
             node,
+            snapshot: None,
         }
+    }
+
+    pub fn with_snapshot(
+        mut self,
+        snapshot: crate::structs::checkpoint::VolumeSnapshotRef,
+    ) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// The snapshot this request names, or an error naming the op that needed
+    /// one.
+    pub fn require_snapshot(&self) -> R<&crate::structs::checkpoint::VolumeSnapshotRef> {
+        self.snapshot
+            .as_ref()
+            .with_context(|| format!("volume `{}` request names no snapshot", self.op))
     }
 
     pub fn with_mode(mut self, mode: VolumeMode) -> Self {
@@ -570,6 +616,46 @@ pub trait VolumeDriver: Send + Sync {
     /// Permanently delete the volume and its data. Idempotent: destroying what
     /// is already gone succeeds.
     fn destroy(&self, request: &VolumeRequest) -> R<()>;
+
+    /// Capture the volume as snapshot `request.snapshot.id`, independent of
+    /// the volume from then on (destroying the volume keeps the snapshot).
+    /// Idempotent: snapshotting to an id that already exists returns that
+    /// snapshot unchanged. The caller makes the volume quiet first (task
+    /// stopped or VM paused); a snapshot of a volume under write is only
+    /// crash-consistent.
+    fn snapshot(
+        &self,
+        _request: &VolumeRequest,
+    ) -> R<crate::structs::checkpoint::VolumeSnapshotRef> {
+        Err(unsupported_op(self.name(), VolumeOp::Snapshot))
+    }
+
+    /// Replace the volume's contents with `request.snapshot`. The snapshot
+    /// survives. Idempotent: restoring twice leaves the same contents. The
+    /// caller unmounts the volume first.
+    fn restore(&self, _request: &VolumeRequest) -> R<()> {
+        Err(unsupported_op(self.name(), VolumeOp::Restore))
+    }
+
+    /// Create `request.volume` as a copy of `request.snapshot`. A later
+    /// `mount` attaches it with `fresh: false`. Idempotent: cloning into a
+    /// volume that a previous call already created succeeds.
+    fn clone_volume(&self, _request: &VolumeRequest) -> R<()> {
+        Err(unsupported_op(self.name(), VolumeOp::Clone))
+    }
+
+    /// Delete `request.snapshot`. Idempotent: deleting what is gone succeeds.
+    fn delete_snapshot(&self, _request: &VolumeRequest) -> R<()> {
+        Err(unsupported_op(self.name(), VolumeOp::DeleteSnapshot))
+    }
+}
+
+/// The error an optional op returns on a driver that does not implement it.
+pub fn unsupported_op(driver: &str, op: VolumeOp) -> anyhow::Error {
+    anyhow!(
+        "volume driver `{driver}` does not support `{op}` (it is not in the driver's \
+         capabilities.ops)"
+    )
 }
 
 /// Where a worker keeps volume data and finds out-of-tree plugins.

@@ -31,6 +31,48 @@ type ServerItem = Result<ExecServerFrame, Status>;
 /// The concrete stream type returned to tonic for `Worker.ExecTask`.
 pub type ExecTaskStream = ReceiverStream<ServerItem>;
 
+/// Open exec sessions per allocation (the manager's id), for the idle
+/// policy's `exec` signal (docs/suspend-and-resume.md, "Idle policy"): an
+/// instance someone is working in is never idle, however quiet the task.
+static OPEN_SESSIONS: std::sync::LazyLock<Mutex<std::collections::HashMap<i64, u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Counts one exec session as open until dropped.
+pub struct OpenSession {
+    allocation_id: i64,
+}
+
+impl OpenSession {
+    pub fn open(allocation_id: i64) -> Self {
+        *OPEN_SESSIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(allocation_id)
+            .or_default() += 1;
+        OpenSession { allocation_id }
+    }
+}
+
+impl Drop for OpenSession {
+    fn drop(&mut self) {
+        let mut sessions = OPEN_SESSIONS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = sessions.get_mut(&self.allocation_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                sessions.remove(&self.allocation_id);
+            }
+        }
+    }
+}
+
+/// Exec sessions open right now, per allocation.
+pub fn open_sessions() -> std::collections::HashMap<i64, u32> {
+    OPEN_SESSIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
 /// Commands the async frame reader hands to the blocking driver thread.
 enum InputCmd {
     Stdin(Vec<u8>),
@@ -131,8 +173,14 @@ pub async fn handle_exec_task(
     let session_id = format!("exec-{}", start.allocation_id);
     let _ = out_tx.send(Ok(started_frame(session_id))).await;
 
-    // Driver thread owns the session and does all blocking I/O.
-    spawn_driver(session, out_tx.clone(), in_rx);
+    // Driver thread owns the session and does all blocking I/O. It also
+    // holds the open-session count, so the count drops when the session ends.
+    spawn_driver(
+        session,
+        out_tx.clone(),
+        in_rx,
+        OpenSession::open(start.allocation_id),
+    );
 
     // Async reader: pull client frames, forward to the driver / answer pings.
     tokio::spawn(async move {
@@ -170,8 +218,10 @@ fn spawn_driver(
     mut session: Box<dyn ExecSession>,
     out_tx: mpsc::Sender<ServerItem>,
     in_rx: std_mpsc::Receiver<InputCmd>,
+    open: OpenSession,
 ) {
     std::thread::spawn(move || {
+        let _open = open;
         // Start output readers.
         let reader_handles = match session.take_output() {
             Ok(ExecOutputStreams { stdout, stderr }) => {

@@ -92,6 +92,16 @@ impl WorkerVolumeManager {
         serde_json::to_value(self.registry.capabilities()).unwrap_or_else(|_| json!({}))
     }
 
+    /// Whether volumes from `driver` live only on this node. An unknown
+    /// driver reads as node-local, the safe direction for every caller (the
+    /// memory pressure response never evicts node-pinned storage).
+    pub fn is_node_local(&self, driver: &str) -> bool {
+        self.registry
+            .get(driver)
+            .map(|plugin| plugin.capabilities().node_local)
+            .unwrap_or(true)
+    }
+
     pub fn driver_names(&self) -> Vec<String> {
         self.registry.names()
     }
@@ -204,6 +214,7 @@ impl WorkerVolumeManager {
             instance: instance.cloned(),
             alloc_id: allocation.id,
             node: self.registry.node_ref(&self.node_id),
+            snapshot: None,
         };
 
         let result = plugin.mount(&request)?;
@@ -315,6 +326,207 @@ impl WorkerVolumeManager {
                 });
             }
         }
+    }
+
+    /// Snapshot every instance volume (`stateful.storage`) an allocation has
+    /// mounted, as `snapshot_id` (the first) and `snapshot_id-<n>` (any
+    /// further), with the driver's `snapshot` op. All or nothing: a failure
+    /// deletes the snapshots already taken and names the volume.
+    ///
+    /// The caller makes the volume quiet first (task paused or stopped) for
+    /// a consistent copy; a running task's snapshot is crash-consistent.
+    #[instrument(err, skip_all, fields(allocation_id, snapshot_id))]
+    pub fn snapshot_instance_volumes(
+        &self,
+        allocation_id: i64,
+        snapshot_id: &str,
+    ) -> R<Vec<crate::structs::checkpoint::VolumeSnapshotRef>> {
+        let mounts: Vec<MountedVolume> = self
+            .mounts_for(allocation_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|mount| mount.instance_volume)
+            .collect();
+        let mut taken = Vec::new();
+        for (index, mount) in mounts.iter().enumerate() {
+            let id = if index == 0 {
+                snapshot_id.to_string()
+            } else {
+                format!("{snapshot_id}-{index}")
+            };
+            let result = (|| -> R<crate::structs::checkpoint::VolumeSnapshotRef> {
+                let plugin = self.registry.require(&mount.driver)?;
+                if !plugin.capabilities().supports(VolumeOp::Snapshot) {
+                    return Err(crate::volumes::unsupported_op(
+                        &mount.driver,
+                        VolumeOp::Snapshot,
+                    ));
+                }
+                let mut request = mount.request.clone();
+                request.op = VolumeOp::Snapshot;
+                request.snapshot = Some(crate::structs::checkpoint::VolumeSnapshotRef {
+                    id,
+                    volume_id: mount.volume_id.clone(),
+                    driver: mount.driver.clone(),
+                    mode: mount.mode,
+                    attrs: Default::default(),
+                    size: 0,
+                });
+                plugin.snapshot(&request)
+            })();
+            match result {
+                Ok(snapshot) => taken.push(snapshot),
+                Err(err) => {
+                    for snapshot in &taken {
+                        if let Err(cleanup) = self.delete_volume_snapshot(snapshot) {
+                            warn!(error = ?cleanup, "Failed to drop a partial volume snapshot");
+                        }
+                    }
+                    return Err(err.context(format!(
+                        "failed to snapshot volume `{}` ({})",
+                        mount.name, mount.driver
+                    )));
+                }
+            }
+        }
+        Ok(taken)
+    }
+
+    /// Replace a volume's contents with `snapshot`, with the driver's
+    /// `restore` op. Called before the volume is mounted for the allocation
+    /// that restores it.
+    #[instrument(err, skip_all, fields(volume_id = %mount.volume_id))]
+    pub fn restore_volume(
+        &self,
+        allocation: &Allocation,
+        mount: &VolumeMount,
+        snapshot: &crate::structs::checkpoint::VolumeSnapshotRef,
+    ) -> R<()> {
+        let plugin = self.registry.require(&mount.driver)?;
+        if !plugin.capabilities().supports(VolumeOp::Restore) {
+            return Err(crate::volumes::unsupported_op(
+                &mount.driver,
+                VolumeOp::Restore,
+            ));
+        }
+        let request = VolumeRequest {
+            api_version: crate::volumes::VOLUME_API_VERSION,
+            op: VolumeOp::Restore,
+            mode: mount.mode,
+            volume: VolumeRef {
+                id: mount.volume_id.clone(),
+                name: mount.name.clone(),
+                driver: mount.driver.clone(),
+                attrs: mount.attrs.clone(),
+                read_only: mount.read_only,
+            },
+            params: mount.params.clone(),
+            instance: None,
+            alloc_id: allocation.id,
+            node: self.registry.node_ref(&self.node_id),
+            snapshot: Some(snapshot.clone()),
+        };
+        plugin.restore(&request).with_context(|| {
+            format!(
+                "failed to restore volume `{}` ({}) from snapshot {}",
+                mount.name, mount.driver, snapshot.id
+            )
+        })?;
+        info!(
+            allocation_id = allocation.id,
+            volume_id = %mount.volume_id,
+            snapshot = %snapshot.id,
+            "Restored volume from snapshot"
+        );
+        Ok(())
+    }
+
+    /// Create a volume as a copy of `snapshot`, with the driver's `clone`
+    /// op (Phase 6: a fork, or an instance created from a snapshot). Called
+    /// before the new volume's first mount, which then finds it populated.
+    /// Idempotent like the op, so a re-dispatch never re-copies over writes
+    /// the instance already made.
+    #[instrument(err, skip_all, fields(volume_id = %mount.volume_id))]
+    pub fn clone_volume(
+        &self,
+        allocation: &Allocation,
+        mount: &VolumeMount,
+        snapshot: &crate::structs::checkpoint::VolumeSnapshotRef,
+    ) -> R<()> {
+        let plugin = self.registry.require(&mount.driver)?;
+        if !plugin.capabilities().supports(VolumeOp::Clone) {
+            return Err(crate::volumes::unsupported_op(
+                &mount.driver,
+                VolumeOp::Clone,
+            ));
+        }
+        if snapshot.driver != mount.driver {
+            bail!(
+                "snapshot {} was taken with volume driver `{}`, but this instance's volume `{}` \
+                 uses `{}`; a clone stays within one driver",
+                snapshot.id,
+                snapshot.driver,
+                mount.name,
+                mount.driver
+            );
+        }
+        let request = VolumeRequest {
+            api_version: crate::volumes::VOLUME_API_VERSION,
+            op: VolumeOp::Clone,
+            mode: mount.mode,
+            volume: VolumeRef {
+                id: mount.volume_id.clone(),
+                name: mount.name.clone(),
+                driver: mount.driver.clone(),
+                attrs: mount.attrs.clone(),
+                read_only: mount.read_only,
+            },
+            params: mount.params.clone(),
+            instance: None,
+            alloc_id: allocation.id,
+            node: self.registry.node_ref(&self.node_id),
+            snapshot: Some(snapshot.clone()),
+        };
+        plugin.clone_volume(&request).with_context(|| {
+            format!(
+                "failed to clone volume `{}` ({}) from snapshot {}",
+                mount.name, mount.driver, snapshot.id
+            )
+        })?;
+        info!(
+            allocation_id = allocation.id,
+            volume_id = %mount.volume_id,
+            snapshot = %snapshot.id,
+            "Cloned volume from snapshot"
+        );
+        Ok(())
+    }
+
+    /// Delete a volume snapshot with the driver's `snapshot-delete` op.
+    /// Idempotent, like the op.
+    pub fn delete_volume_snapshot(
+        &self,
+        snapshot: &crate::structs::checkpoint::VolumeSnapshotRef,
+    ) -> R<()> {
+        let plugin = self.registry.require(&snapshot.driver)?;
+        let request = VolumeRequest {
+            api_version: crate::volumes::VOLUME_API_VERSION,
+            op: VolumeOp::DeleteSnapshot,
+            mode: snapshot.mode,
+            volume: VolumeRef {
+                id: snapshot.volume_id.clone(),
+                name: String::new(),
+                driver: snapshot.driver.clone(),
+                attrs: Default::default(),
+                read_only: false,
+            },
+            params: Default::default(),
+            instance: None,
+            alloc_id: 0,
+            node: self.registry.node_ref(&self.node_id),
+            snapshot: Some(snapshot.clone()),
+        };
+        plugin.delete_snapshot(&request)
     }
 
     /// Run the driver's `destroy` for volumes the manager asked to reclaim.
@@ -432,6 +644,7 @@ impl WorkerVolumeManager {
                 instance: None,
                 alloc_id: 0,
                 node: self.registry.node_ref(&self.node_id),
+                snapshot: None,
             };
 
             match driver.destroy(&volume_request) {

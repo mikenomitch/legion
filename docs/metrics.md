@@ -225,6 +225,27 @@ neighbor rules a cause in or out, and which knob to turn), see
   increments it anymore. It is still exported so dashboards that graph it
   don't break.
 
+### Content locality
+
+- **`legion_scheduler_locality_placements_total{outcome}`** (counter):
+  placements whose task had a content set
+  ([artifacts.md](artifacts.md#content-locality)), by how much of the set the
+  chosen node already held. `outcome` is `warm` (all of it), `partial`
+  (some), or `cold` (none). Counted when the plan picks the node, so a
+  placement the apply later binds to a fallback candidate counts the planned
+  node. Tasks without digest-pinned artifacts are not counted.
+
+  The locality hit ratio at placement:
+
+  ```promql
+  sum(rate(legion_scheduler_locality_placements_total{outcome="warm"}[5m]))
+    / sum(rate(legion_scheduler_locality_placements_total[5m]))
+  ```
+
+  A low ratio while nodes hold the content usually means other score terms
+  outweigh locality (raise `schedulerSettings.weights.locality`), or the
+  warm nodes are full.
+
 ### Scheduling indexes
 
 See [scheduling-indexes.md](scheduling-indexes.md) for the feature these
@@ -274,6 +295,81 @@ instrument.
   back. `path="heartbeat"` means the node resumed beating.
   `path="reregistration"` means the worker re-registered. `marked_lost` minus
   this is the fleet's net loss. A flapping fleet moves both.
+
+### Node usage
+
+Per-node gauges from the usage reports workers with
+`resourceEnforcement.enabled` send every 10 seconds
+([resource-enforcement.md](resource-enforcement.md#measuring-usage)). Updated
+when a report arrives. A node whose report is older than 2 minutes drops to
+`0`, so a node that stopped reporting doesn't look current. Usage lives on the
+manager that received the heartbeat, so with several managers sum or max
+across them by `node`.
+
+- **`legion_node_memory_physical_bytes{node}`** (gauge): `MemTotal`.
+- **`legion_node_memory_available_bytes{node}`** (gauge): `MemAvailable`, the
+  kernel's estimate of memory new work can use without swapping. The one to
+  alert on for a node running short.
+- **`legion_node_memory_used_bytes{node}`** (gauge): sum of `memory.current`
+  over the node's governed allocations.
+- **`legion_node_cpu_used_millicores{node}`** (gauge): CPU used by governed
+  allocations over the last interval, in thousandths of a core.
+
+One series per reporting node. Reservations aren't exported as gauges. Read
+them with `legion node usage`.
+
+- **`legion_node_pressure_actions_total{node,step}`** (counter): actions a
+  node's memory pressure response reported, by `step` (`reclaim`, `suspend`,
+  `evict-bursting`, `evict-reserved`). Counted when the heartbeat carrying
+  them reaches this manager, so with several managers sum across them. A
+  rising `evict-*` rate means reservations are too low for real usage, or a
+  ratio is too aggressive. See
+  [resource-enforcement.md](resource-enforcement.md#memory-pressure).
+
+### Suspend and resume
+
+Observed when a node's report reaches this manager, so with several managers
+sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
+
+- **`legion_instance_suspend_seconds{kind}`** (histogram): how long each
+  successful suspend's capture took on its node, by checkpoint `kind`
+  (`memory`, `disk`). For a memory suspend this is the time the guest spent
+  paused plus storing its memory. Buckets run from 25 ms to 60 s.
+- **`legion_instance_resume_seconds{kind}`** (histogram): how long each
+  successful resume's restore took on its node, by `kind`. Placement time is
+  not included. The memory target is under 300 ms for a 1 GiB guest on local
+  NVMe.
+- **`legion_instance_suspends_total{reason}`** (counter): suspends applied,
+  by `reason`: `manual` (SuspendInstance), `idle` (a task's idle policy),
+  `pressure` (a node's `suspend` pressure step), or `make_room` (to make room
+  for a resume, see
+  [Capacity for resumes](suspend-and-resume.md#capacity-for-resumes)).
+- **`legion_idle_sweep_suspends_total{outcome}`** (counter): suspends the
+  idle sweep tried to start, by `outcome`: `started`, or `skipped` (the
+  instance changed under it, an operation was already in flight, or its node
+  cannot checkpoint). Counted on the manager that ran the sweep, which is the
+  one holding the node's usage reports.
+- **`legion_make_room_suspends_total{outcome}`** (counter): suspends the
+  manager started to make room for a resume waiting on its checkpoint's
+  node, by `outcome`: `started`, `failed` (the suspend could not start), or
+  `no_room` (suspending every eligible instance would not have been enough,
+  so none was suspended, counted once per round). A steady `no_room` means
+  resumes wait on nodes whose work cannot be suspended for them.
+- **`legion_checkpoint_bytes{kind}`** (histogram): size of each captured
+  checkpoint, suspends and snapshots alike, from 1 MiB to 64 GiB. A disk
+  suspend reports 0, because its volume stays in place uncopied.
+- **`legion_checkpoint_publish_bytes{kind}`** (histogram): bytes a node
+  uploaded to its `contentStore` to publish one checkpoint
+  (`durability = "store"`). 0 when the store already held every part, since
+  parts are keyed by digest.
+- **`legion_checkpoint_publish_seconds{kind}`** (histogram): how long each
+  successful publish took on its node, from 50 ms to 10 minutes.
+- **`legion_checkpoint_publish_total{outcome}`** (counter): publishes
+  reported, by `outcome`: `published`, `retrying` (the attempt failed and the
+  manager asks the node again after a backoff), or `failed` (the last of three
+  attempts failed). A failed publish leaves the checkpoint local to its node,
+  so alert on a rising `failed` rate, and watch `retrying` for a store going
+  bad.
 
 ### Heartbeat cadence
 
@@ -539,9 +635,11 @@ root key is per-manager state ([kv-encryption.md](kv-encryption.md)).
   and decrypt every KV value (every data key unwrapped). `0` when the
   keyring is locked, disabled, or not initialized yet. Alert on `0` while
   `encryption.enabled` is true, since it means a root key is missing here.
-- **`legion_keyring_keys{state}`** (gauge): data keys by state (`active`
-  | `retired`). If the `retired` count stays above zero longer than a rewrap
-  takes, values still sit under an old key.
+- **`legion_keyring_keys{state}`** (gauge): keyring keys by state
+  (`active` | `retired` data keys, and the `checkpoint` key that seals
+  published checkpoints). If the `retired` count stays above zero longer
+  than a rewrap takes, values still sit under an old key. `checkpoint` is 1
+  once the keyring is initialized.
 - **`legion_keyring_active_key_age_seconds`** (gauge): age of the active
   data key. It rotates automatically at `encryption.dataKeyRotationAge`
   (default 30 days).
@@ -594,6 +692,10 @@ of worker readiness. Default: disabled.
   time of one heartbeat round-trip (status report plus reconcile against the
   manager's reply). In a scale test, use it to show the workers are not the
   bottleneck.
+- **`legion_worker_pressure_actions_total{step}`** (counter): actions this
+  node's memory pressure response took, by `step` (`reclaim`,
+  `evict-bursting`, `evict-reserved`). Counted when the worker acts, before
+  the manager hears about it.
 - **`legion_worker_allocations_running`** (gauge): allocations this worker
   currently runs, as reported on its last heartbeat.
 - **`legion_worker_allocation_failures_reported_total`** (counter):

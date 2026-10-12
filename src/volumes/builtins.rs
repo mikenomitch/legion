@@ -15,10 +15,12 @@
 use std::path::{Path, PathBuf};
 
 use crate::prelude::*;
+use crate::structs::checkpoint::VolumeSnapshotRef;
+use crate::volumes::copy::{clone_file, clone_tree, CopyMethod};
 use crate::volumes::{
     create_dir_with_mode, is_mount_point, run_mount_command, MountResult, VolumeCapabilities,
-    VolumeDriver, VolumeMode, VolumeRequest, VolumeRuntimeConfig, ACCESS_MODE_MULTI_READER,
-    ACCESS_MODE_SINGLE_WRITER,
+    VolumeDriver, VolumeMode, VolumeOp, VolumeRequest, VolumeRuntimeConfig,
+    ACCESS_MODE_MULTI_READER, ACCESS_MODE_SINGLE_WRITER,
 };
 
 /// Every built-in, constructed against one worker's runtime config.
@@ -43,15 +45,93 @@ pub fn all(config: &VolumeRuntimeConfig) -> Vec<Box<dyn VolumeDriver>> {
 /// instance holding one can only be replaced on that machine. `size` is
 /// recorded as an attribute but **not enforced**: a directory has no quota, and
 /// pretending otherwise would be worse than being honest about it.
+///
+/// **Snapshots** live beside the volumes, under
+/// `<worker state dir>/volumes/local-dir-snapshots/<snapshot_id>/`, so
+/// destroying a volume never takes its snapshots with it. A snapshot is a
+/// reflink copy where the filesystem supports one (btrfs, XFS, APFS) and a
+/// sparse copy everywhere else. `restore` and `clone` copy back the same way.
 pub struct LocalDirDriver {
     root: PathBuf,
+    snapshot_root: PathBuf,
 }
+
+/// The file inside a snapshot directory that records what was captured.
+/// Written last, so its presence means the snapshot is complete.
+const SNAPSHOT_RECORD: &str = "snapshot.json";
 
 impl LocalDirDriver {
     pub fn new(volume_root: PathBuf) -> Self {
         LocalDirDriver {
             root: volume_root.join("local-dir"),
+            snapshot_root: volume_root.join("local-dir-snapshots"),
         }
+    }
+
+    fn snapshot_dir(&self, snapshot_id: &str) -> R<PathBuf> {
+        // The id becomes a directory name, so constrain it the same way the
+        // `fs` param is: no separators, no `..`.
+        if snapshot_id.is_empty()
+            || snapshot_id.starts_with('.')
+            || !snapshot_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            bail!("invalid snapshot id {snapshot_id:?}: use letters, digits, `-`, `_`, and `.`");
+        }
+        Ok(self.snapshot_root.join(snapshot_id))
+    }
+
+    /// Where a snapshot keeps the captured bytes: the directory tree in
+    /// filesystem mode, the disk image in block mode.
+    fn snapshot_payload(dir: &Path, mode: VolumeMode) -> PathBuf {
+        match mode {
+            VolumeMode::Filesystem => dir.join("data"),
+            VolumeMode::Block => dir.join("disk.img"),
+        }
+    }
+
+    /// The volume's bytes in `mode`: its directory, or its disk image.
+    fn volume_payload(&self, volume_id: &str, mode: VolumeMode) -> PathBuf {
+        match mode {
+            VolumeMode::Filesystem => self.dir_for(volume_id),
+            VolumeMode::Block => self.image_for(volume_id),
+        }
+    }
+
+    fn read_snapshot_record(dir: &Path) -> Option<VolumeSnapshotRef> {
+        let raw = std::fs::read_to_string(dir.join(SNAPSHOT_RECORD)).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// Copy `source` (a directory or an image) to `dest`, which must not exist.
+    fn copy_payload(source: &Path, dest: &Path, mode: VolumeMode) -> R<CopyMethod> {
+        match mode {
+            VolumeMode::Filesystem => clone_tree(source, dest),
+            VolumeMode::Block => clone_file(source, dest),
+        }
+    }
+
+    /// The snapshot directory a request's snapshot ref points at, checked to
+    /// be complete and of the requested mode.
+    fn existing_snapshot(&self, request: &VolumeRequest) -> R<(PathBuf, VolumeSnapshotRef)> {
+        let wanted = request.require_snapshot()?;
+        let dir = self.snapshot_dir(&wanted.id)?;
+        let record = Self::read_snapshot_record(&dir).with_context(|| {
+            format!(
+                "local-dir snapshot {} does not exist on this node (or never finished)",
+                wanted.id
+            )
+        })?;
+        if record.mode != request.mode {
+            bail!(
+                "local-dir snapshot {} was taken in {} mode, the request is {} mode",
+                wanted.id,
+                record.mode,
+                request.mode
+            );
+        }
+        Ok((dir, record))
     }
 
     fn dir_for(&self, volume_id: &str) -> PathBuf {
@@ -146,6 +226,12 @@ impl VolumeDriver for LocalDirDriver {
         VolumeCapabilities::new("local-dir", true)
             .with_params(&[], &["size", "mode", "fs"])
             .with_volume_modes(&modes)
+            .with_ops(&[
+                VolumeOp::Snapshot,
+                VolumeOp::Restore,
+                VolumeOp::Clone,
+                VolumeOp::DeleteSnapshot,
+            ])
             .with_detail(detail)
     }
 
@@ -183,6 +269,194 @@ impl VolumeDriver for LocalDirDriver {
         std::fs::remove_dir_all(&dir)
             .with_context(|| format!("failed to remove volume directory {}", dir.display()))?;
         Ok(())
+    }
+
+    fn snapshot(&self, request: &VolumeRequest) -> R<VolumeSnapshotRef> {
+        let wanted = request.require_snapshot()?;
+        let dir = self.snapshot_dir(&wanted.id)?;
+        if let Some(existing) = Self::read_snapshot_record(&dir) {
+            // Idempotent: a retry after a lost reply finds the finished
+            // snapshot and returns it rather than taking a second one.
+            if existing.volume_id != request.volume.id {
+                bail!(
+                    "snapshot id {} already names a snapshot of volume {}",
+                    wanted.id,
+                    existing.volume_id
+                );
+            }
+            return Ok(existing);
+        }
+
+        let source = self.volume_payload(&request.volume.id, request.mode);
+        if !source.exists() {
+            bail!(
+                "local-dir volume {} has no {} data to snapshot at {}",
+                request.volume.id,
+                request.mode,
+                source.display()
+            );
+        }
+
+        // Build under a staging name and rename into place, so a crash
+        // mid-copy never leaves a directory that looks like a snapshot.
+        std::fs::create_dir_all(&self.snapshot_root)
+            .with_context(|| format!("failed to create {}", self.snapshot_root.display()))?;
+        let staging = self.snapshot_root.join(format!(
+            ".{}.partial-{}",
+            wanted.id,
+            crate::util::random_string(8)
+        ));
+        std::fs::create_dir_all(&staging)?;
+        let built = (|| -> R<VolumeSnapshotRef> {
+            let payload = Self::snapshot_payload(&staging, request.mode);
+            let method = Self::copy_payload(&source, &payload, request.mode)?;
+            let size = match request.mode {
+                VolumeMode::Block => std::fs::metadata(&payload)?.len(),
+                VolumeMode::Filesystem => crate::volumes::copy::tree_size_bytes(&payload),
+            };
+            let record = VolumeSnapshotRef {
+                id: wanted.id.clone(),
+                volume_id: request.volume.id.clone(),
+                driver: "local-dir".to_string(),
+                mode: request.mode,
+                attrs: [
+                    ("path".to_string(), json!(dir.display().to_string())),
+                    ("method".to_string(), json!(method.as_str())),
+                ]
+                .into_iter()
+                .collect(),
+                size,
+            };
+            std::fs::write(
+                staging.join(SNAPSHOT_RECORD),
+                serde_json::to_vec_pretty(&record)?,
+            )?;
+            Ok(record)
+        })();
+        let record = match built {
+            Ok(record) => record,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err);
+            }
+        };
+        if let Err(err) = std::fs::rename(&staging, &dir) {
+            let _ = std::fs::remove_dir_all(&staging);
+            // A concurrent call finished first: its snapshot is the answer.
+            if let Some(existing) = Self::read_snapshot_record(&dir) {
+                return Ok(existing);
+            }
+            return Err(err)
+                .with_context(|| format!("failed to publish snapshot {}", dir.display()));
+        }
+        info!(
+            volume_id = %request.volume.id,
+            snapshot_id = %record.id,
+            mode = %request.mode,
+            method = %record.attrs.get("method").and_then(serde_json::Value::as_str).unwrap_or(""),
+            size_bytes = record.size,
+            "Snapshotted local-dir volume"
+        );
+        Ok(record)
+    }
+
+    fn restore(&self, request: &VolumeRequest) -> R<()> {
+        let (dir, record) = self.existing_snapshot(request)?;
+        let payload = Self::snapshot_payload(&dir, record.mode);
+        let target = self.volume_payload(&request.volume.id, request.mode);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Copy beside the target, then swap: the volume is either all old or
+        // all restored, never half of each.
+        let staging = target.with_file_name(format!(
+            ".{}.restore-{}",
+            target
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            crate::util::random_string(8)
+        ));
+        if let Err(err) = Self::copy_payload(&payload, &staging, request.mode) {
+            let _ = std::fs::remove_dir_all(&staging);
+            let _ = std::fs::remove_file(&staging);
+            return Err(err);
+        }
+        match request.mode {
+            // rename(2) replaces a file atomically.
+            VolumeMode::Block => std::fs::rename(&staging, &target)?,
+            // A non-empty directory cannot be renamed over, so move the old
+            // tree aside first and delete it after the swap.
+            VolumeMode::Filesystem => {
+                let old = target.with_file_name(format!(
+                    ".{}.old-{}",
+                    request.volume.id,
+                    crate::util::random_string(8)
+                ));
+                if target.exists() {
+                    std::fs::rename(&target, &old)?;
+                }
+                std::fs::rename(&staging, &target)?;
+                let _ = std::fs::remove_dir_all(&old);
+            }
+        }
+        info!(
+            volume_id = %request.volume.id,
+            snapshot_id = %record.id,
+            "Restored local-dir volume from snapshot"
+        );
+        Ok(())
+    }
+
+    fn clone_volume(&self, request: &VolumeRequest) -> R<()> {
+        let (dir, record) = self.existing_snapshot(request)?;
+        let target_dir = self.dir_for(&request.volume.id);
+        if target_dir.exists() {
+            // Volume ids are unique per instance, so an existing directory is
+            // a previous attempt of this same clone that finished (the copy is
+            // published by rename, never left half-built).
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.root)?;
+        let staging = self.root.join(format!(
+            ".{}.clone-{}",
+            request.volume.id,
+            crate::util::random_string(8)
+        ));
+        let payload = Self::snapshot_payload(&dir, record.mode);
+        let copied = match request.mode {
+            VolumeMode::Filesystem => clone_tree(&payload, &staging),
+            VolumeMode::Block => std::fs::create_dir_all(&staging)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| clone_file(&payload, &staging.join("disk.img"))),
+        };
+        if let Err(err) = copied {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err);
+        }
+        if let Err(err) = std::fs::rename(&staging, &target_dir) {
+            let _ = std::fs::remove_dir_all(&staging);
+            if target_dir.exists() {
+                return Ok(());
+            }
+            return Err(err)
+                .with_context(|| format!("failed to publish clone {}", target_dir.display()));
+        }
+        info!(
+            volume_id = %request.volume.id,
+            snapshot_id = %record.id,
+            "Cloned local-dir volume from snapshot"
+        );
+        Ok(())
+    }
+
+    fn delete_snapshot(&self, request: &VolumeRequest) -> R<()> {
+        let dir = self.snapshot_dir(&request.require_snapshot()?.id)?;
+        if !dir.exists() {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("failed to remove snapshot {}", dir.display()))
     }
 }
 
@@ -664,6 +938,149 @@ mod tests {
                 volume_dir: root.join("volumes"),
             },
         )
+    }
+
+    fn snapshot_ref(id: &str, mode: VolumeMode) -> VolumeSnapshotRef {
+        VolumeSnapshotRef {
+            id: id.into(),
+            volume_id: "vol-test".into(),
+            driver: "local-dir".into(),
+            mode,
+            attrs: BTreeMap::new(),
+            size: 0,
+        }
+    }
+
+    /// The Phase 3 round trip, filesystem mode: write a marker, snapshot,
+    /// mutate, restore, and the marker is back. Every op runs twice.
+    #[test]
+    fn local_dir_filesystem_snapshot_round_trip() -> R<()> {
+        let root = temp_root("local-dir-snap-fs");
+        let plugin = LocalDirDriver::new(root.join("volumes"));
+        let mount = request(VolumeOp::Mount, "local-dir", &root);
+        let dir = plugin.mount(&mount)?.mount_path.expect("path");
+        std::fs::create_dir_all(dir.join("nested"))?;
+        std::fs::write(dir.join("marker"), b"v1")?;
+        std::fs::write(dir.join("nested/file"), b"deep")?;
+
+        let snap = request(VolumeOp::Snapshot, "local-dir", &root)
+            .with_snapshot(snapshot_ref("snap-1", VolumeMode::Filesystem));
+        let taken = plugin.snapshot(&snap)?;
+        assert_eq!(taken.id, "snap-1");
+        assert_eq!(taken.size, 6);
+        assert!(matches!(
+            taken.attrs.get("method").and_then(Value::as_str),
+            Some("reflink" | "copy")
+        ));
+        assert_eq!(plugin.snapshot(&snap)?, taken, "snapshot is idempotent");
+
+        std::fs::write(dir.join("marker"), b"v2")?;
+        std::fs::write(dir.join("added-later"), b"x")?;
+
+        let restore = request(VolumeOp::Restore, "local-dir", &root).with_snapshot(taken.clone());
+        plugin.restore(&restore)?;
+        plugin.restore(&restore)?;
+        assert_eq!(std::fs::read(dir.join("marker"))?, b"v1");
+        assert_eq!(std::fs::read(dir.join("nested/file"))?, b"deep");
+        assert!(
+            !dir.join("added-later").exists(),
+            "restore replaces, not merges"
+        );
+
+        // Destroying the volume keeps the snapshot, and a clone brings it
+        // back as a new, independent volume.
+        plugin.destroy(&mount)?;
+        let mut clone = request(VolumeOp::Clone, "local-dir", &root).with_snapshot(taken.clone());
+        clone.volume.id = "vol-fork".into();
+        plugin.clone_volume(&clone)?;
+        plugin.clone_volume(&clone)?;
+        let mut fork_mount = request(VolumeOp::Mount, "local-dir", &root);
+        fork_mount.volume.id = "vol-fork".into();
+        let fork = plugin.mount(&fork_mount)?;
+        assert!(!fork.fresh, "a cloned volume is not fresh");
+        let fork_dir = fork.mount_path.expect("path");
+        assert_eq!(std::fs::read(fork_dir.join("marker"))?, b"v1");
+
+        let delete =
+            request(VolumeOp::DeleteSnapshot, "local-dir", &root).with_snapshot(taken.clone());
+        plugin.delete_snapshot(&delete)?;
+        plugin.delete_snapshot(&delete)?;
+        assert!(
+            plugin.restore(&restore).is_err(),
+            "a deleted snapshot cannot restore"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    /// Block mode, without needing mkfs: the driver reattaches an existing
+    /// image as-is, so the test plants one with known bytes.
+    #[test]
+    fn local_dir_block_snapshot_round_trip() -> R<()> {
+        let root = temp_root("local-dir-snap-block");
+        let plugin = LocalDirDriver::new(root.join("volumes"));
+        let image = plugin.image_for("vol-test");
+        std::fs::create_dir_all(image.parent().unwrap())?;
+        let mut original = vec![0u8; 256 * 1024];
+        original[..6].copy_from_slice(b"marker");
+        original[200_000] = 7;
+        std::fs::write(&image, &original)?;
+
+        let mount = request(VolumeOp::Mount, "local-dir", &root).with_mode(VolumeMode::Block);
+        assert!(!plugin.mount(&mount)?.fresh);
+
+        let snap = request(VolumeOp::Snapshot, "local-dir", &root)
+            .with_mode(VolumeMode::Block)
+            .with_snapshot(snapshot_ref("snap-b", VolumeMode::Block));
+        let taken = plugin.snapshot(&snap)?;
+        assert_eq!(taken.size, original.len() as u64);
+        assert_eq!(plugin.snapshot(&snap)?, taken);
+
+        std::fs::write(&image, b"mutated")?;
+        let restore = request(VolumeOp::Restore, "local-dir", &root)
+            .with_mode(VolumeMode::Block)
+            .with_snapshot(taken.clone());
+        plugin.restore(&restore)?;
+        plugin.restore(&restore)?;
+        assert_eq!(std::fs::read(&image)?, original);
+
+        // A filesystem-mode restore of a block snapshot is refused rather
+        // than writing an image into a directory volume.
+        let wrong_mode = request(VolumeOp::Restore, "local-dir", &root).with_snapshot(taken);
+        let err = plugin.restore(&wrong_mode).unwrap_err().to_string();
+        assert!(err.contains("block mode"), "{err}");
+
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn local_dir_snapshot_ids_cannot_escape_the_snapshot_root() {
+        let root = temp_root("local-dir-snap-id");
+        let plugin = LocalDirDriver::new(root.join("volumes"));
+        for bad in ["../x", "a/b", "", ".hidden"] {
+            let snap = request(VolumeOp::Snapshot, "local-dir", &root)
+                .with_snapshot(snapshot_ref(bad, VolumeMode::Filesystem));
+            assert!(plugin.snapshot(&snap).is_err(), "{bad:?} accepted");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn local_dir_advertises_its_optional_ops() {
+        let caps = LocalDirDriver::new(PathBuf::from("/tmp/v")).capabilities();
+        for op in [
+            VolumeOp::Snapshot,
+            VolumeOp::Restore,
+            VolumeOp::Clone,
+            VolumeOp::DeleteSnapshot,
+        ] {
+            assert!(caps.supports(op), "{op} not advertised");
+        }
+        assert!(!TmpfsDriver::new(PathBuf::from("/tmp/v"))
+            .capabilities()
+            .supports(VolumeOp::Snapshot));
     }
 
     #[test]

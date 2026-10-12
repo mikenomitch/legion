@@ -12,18 +12,26 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 
+pub mod checkpoint;
 mod container;
 mod exec;
 pub mod exec_isolation;
 mod exec_session;
+pub mod guest_resume;
 mod microvm;
 mod oci_bundle;
 mod oci_image;
 pub mod resource_enforcement;
 mod sandbox;
-pub use sandbox::vsock_socket_base_for;
+mod sandbox_checkpoint;
+pub use sandbox::{sandbox_usage_source, vsock_socket_base_for, SandboxUsageSource};
+pub use sandbox_checkpoint::{
+    firecracker_needs_api_socket, sandbox_checkpoint_support, sandbox_vmm_attrs, IDENTITY_DRIVE_ID,
+};
 mod schema_docs;
+mod vmm_api;
 
+pub use checkpoint::{AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport};
 pub use container::ContainerTaskPlugin;
 pub use exec::ExecTaskPlugin;
 pub use exec_session::{spawn_pipe, spawn_pty, ExecOptions, ExecOutputStreams, ExecSession};
@@ -51,7 +59,10 @@ pub use schema_docs::{
 /// - `2` — graceful stop (Phase 1b): `stop_with` returns `R<bool>` ("a notice
 ///   was delivered; the process is still running") and [`StopContext`] gained
 ///   `signal`, `deadline` and `grace`.
-pub const TASK_PLUGIN_ABI_VERSION: u32 = 2;
+/// - `3` — checkpoints (suspend plan Phase 3): `checkpoint_support`,
+///   `checkpoint`, and `restore` joined the trait, and [`TaskInstance`]
+///   gained `checkpoint_launch`.
+pub const TASK_PLUGIN_ABI_VERSION: u32 = 3;
 
 /// Symbol name the loader looks for. A plugin declares it with
 /// [`declare_task_plugin_abi!`].
@@ -388,6 +399,15 @@ pub struct TaskInstance {
     /// worker, or an unported runtime — and a plugin that ignores the field
     /// entirely behaves exactly as it does today.
     pub resource_assignment: Option<ResourceAssignment>,
+    /// Launch this allocation so it can be memory-checkpointed later.
+    ///
+    /// Set by worker core before `start` when the task's runtime reports
+    /// [`CheckpointSupport::Memory`] and the job enables suspend or
+    /// snapshots. A sandbox on Firecracker then boots with an API socket,
+    /// and every memory-checkpointable sandbox reserves an identity disk
+    /// (see [`sandbox_checkpoint`]). `false`, the default, launches exactly
+    /// as before checkpoints existed.
+    pub checkpoint_launch: bool,
 }
 
 impl TaskInstance {
@@ -519,6 +539,28 @@ pub trait TaskPlugin: Send + Sync {
         None
     }
 
+    /// The subdirectory of the host task directory that
+    /// [`TaskPlugin::file_delivery_root`] maps to, when it is not the task
+    /// directory itself. A sandbox projects only its identity files into the
+    /// guest, so they get a directory of their own on the host.
+    fn file_delivery_host_subdir(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The worker just rewrote this allocation's workload-identity tokens on
+    /// the host (a refresh). A runtime whose workload cannot read the host
+    /// files directly, such as a microVM guest, copies them in here, with no
+    /// restart. The default does nothing: the host file is what the task
+    /// reads.
+    fn identity_tokens_refreshed(
+        &self,
+        _allocation: &Allocation,
+        _task: &TaskConfig,
+        _instance: &mut TaskInstance,
+    ) -> R<()> {
+        Ok(())
+    }
+
     /// Whether this runtime can deliver a Unix signal to the running task (needed
     /// for an identity with `changeMode: signal`).
     fn supports_signal(&self) -> bool {
@@ -600,6 +642,172 @@ pub trait TaskPlugin: Send + Sync {
     /// which the `container` runtime writes into the generated OCI spec).
     fn resource_enforcement(&self) -> ResourceEnforcement {
         ResourceEnforcement::Unsupported
+    }
+
+    /// The memory ceiling, in bytes, worker core should write for this task
+    /// instead of its declared `resources.memory`. `None` (the default) means
+    /// the declared amount is the ceiling.
+    ///
+    /// For runtimes whose process holds more than the workload: the
+    /// `sandbox` runtime's cgroup holds the VMM, so its ceiling is the guest
+    /// size plus the worker's `sandbox.vmmOverheadMiB`. Only consulted when
+    /// [`Self::resource_enforcement`] is not `Unsupported`.
+    fn enforced_memory_limit_bytes(&self, task: &TaskConfig) -> Option<u64> {
+        let _ = task;
+        None
+    }
+
+    /// Runtime-specific normalization of a task at submit, applied before the
+    /// manager folds in `taskResourceDefaults`, so anything this sets wins
+    /// over a cluster default. The default does nothing.
+    ///
+    /// Only built-in runtimes are consulted ([`normalize_runtime_task`]):
+    /// normalization runs inside the submit transaction, which must not
+    /// load a dylib. The `sandbox` runtime uses it to default `memory` to
+    /// its own 512 MiB and pin its guest size.
+    fn normalize_task(&self, task: &mut TaskConfig) {
+        let _ = task;
+    }
+
+    /// Runtime-specific judgement of a task's `resources`, at submit: an
+    /// `Err` rejects the job, and each returned string is a submit warning
+    /// (appended to the `job run` reply). The default has nothing to say.
+    ///
+    /// For runtimes whose own config also sizes the workload: the `sandbox`
+    /// runtime warns when an explicit `memory_mib` disagrees with the guest
+    /// size `resources` imply.
+    fn check_resources(&self, task: &TaskConfig) -> R<Vec<String>> {
+        let _ = task;
+        Ok(Vec::new())
+    }
+
+    /// What this runtime can checkpoint for a task (suspend plan §6.5).
+    ///
+    /// The default is the honest answer for any runtime that runs a host
+    /// process: [`CheckpointSupport::Disk`] when the task has a volume whose
+    /// driver advertises `snapshot`, else [`CheckpointSupport::None`]. A disk
+    /// checkpoint is the volume half alone, and the volume is worker core's,
+    /// not the runtime's, so a runtime gets it without writing any code.
+    /// Runtimes that can capture memory (the sandbox on a real VMM) override.
+    fn checkpoint_support(&self, query: &CheckpointQuery<'_>) -> CheckpointSupport {
+        if query.snapshot_volume {
+            CheckpointSupport::Disk
+        } else {
+            CheckpointSupport::None
+        }
+    }
+
+    /// Capture the running allocation's memory half into `out`, then either
+    /// keep it running ([`AfterCheckpoint::Resume`]) or leave it stopped
+    /// ([`AfterCheckpoint::Stop`]).
+    ///
+    /// Worker core drives the whole capture and owns the disk half:
+    ///
+    /// 1. call `checkpoint` with `then`;
+    /// 2. snapshot each mounted volume with the driver's `snapshot` op while
+    ///    the task is quiet (a memory runtime keeps the guest paused across
+    ///    this step only for [`AfterCheckpoint::Stop`]; a live checkpoint's
+    ///    disk half is crash-consistent);
+    /// 3. write the [`SnapshotManifest`](crate::structs::checkpoint::SnapshotManifest)
+    ///    from the returned parts and the volume refs.
+    ///
+    /// The default is a disk checkpoint: there is no memory to capture, so it
+    /// stops the task when asked to and returns no parts. Only called for a
+    /// task whose [`checkpoint_support`](Self::checkpoint_support) is not
+    /// `None`.
+    fn checkpoint(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        out: &CheckpointDir,
+        then: AfterCheckpoint,
+    ) -> R<crate::structs::checkpoint::MemoryParts> {
+        let _ = out;
+        if then == AfterCheckpoint::Stop {
+            self.stop(allocation, task, instance)?;
+        }
+        Ok(crate::structs::checkpoint::MemoryParts::default())
+    }
+
+    /// Resume a task that [`checkpoint`](Self::checkpoint) left paused
+    /// ([`AfterCheckpoint::Pause`]). Worker core calls it after the disk half,
+    /// on success and on failure alike, so a paused task never stays paused.
+    /// The default does nothing: a runtime that cannot pause never left
+    /// anything paused.
+    fn resume_after_checkpoint(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+    ) -> R<()> {
+        let _ = (allocation, task, instance);
+        Ok(())
+    }
+
+    /// Ask a running guest to give back up to `bytes` of memory, for the
+    /// memory pressure response's `reclaim` step
+    /// (docs/resource-enforcement.md, "Memory pressure"). Returns the bytes
+    /// handed back, or `None` when this runtime has no such lever and the
+    /// worker should use `memory.reclaim` on the allocation's cgroup instead.
+    ///
+    /// The default is `None`: a host process's memory is the cgroup's to
+    /// reclaim. The sandbox overrides it with its balloon, because guest RAM
+    /// is anonymous VMM memory the host kernel cannot reclaim without swap.
+    fn reclaim_guest_memory(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &TaskInstance,
+        bytes: u64,
+    ) -> R<Option<u64>> {
+        let _ = (allocation, task, instance, bytes);
+        Ok(None)
+    }
+
+    /// Undo [`reclaim_guest_memory`](Self::reclaim_guest_memory) once the
+    /// pressure episode is over (deflate the balloon). The default has
+    /// nothing to undo.
+    fn release_guest_memory(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &TaskInstance,
+    ) -> R<()> {
+        let _ = (allocation, task, instance);
+        Ok(())
+    }
+
+    /// Start the allocation from a checkpoint instead of booting it. Called
+    /// in place of `start`, after `prepare` and after worker core restored or
+    /// cloned the volumes the manifest names.
+    ///
+    /// `source` holds the manifest's memory parts under their recorded file
+    /// names. `identity` is who the restored allocation is now (its id, its
+    /// instance, a fresh token).
+    ///
+    /// The default handles a disk checkpoint: the volumes already hold the
+    /// captured state, so restoring is a fresh `start` on them. A memory
+    /// manifest is refused, because this runtime wrote none.
+    fn restore(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        manifest: &crate::structs::checkpoint::SnapshotManifest,
+        source: &CheckpointDir,
+        identity: &crate::structs::checkpoint::ResumeIdentity,
+    ) -> R<()> {
+        let _ = (source, identity);
+        if manifest.kind == crate::structs::checkpoint::SnapshotKind::Memory {
+            bail!(
+                "task runtime `{}` cannot restore memory checkpoint {} (written by `{}`)",
+                self.name(),
+                manifest.id,
+                manifest.runtime
+            );
+        }
+        self.start(allocation, task, instance)
     }
 
     /// Desugars runtime-config fields into artifacts (artifact system plan §8).
@@ -870,6 +1078,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
     let mut registry = TaskPluginRegistry::new();
     for task in &config.tasks {
         registry.validate_task_config(task)?;
+        validate_memory_max(task)?;
         task.validate_checks()?;
         task.validate_kv_injections()?;
         task.validate_network()?;
@@ -882,6 +1091,22 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_stop()?;
         task.validate_disruption()?;
         task.validate_speculative_start()
+            .map_err(|err| anyhow!(err))?;
+        if let Some(snapshots) = task.snapshots.as_ref() {
+            snapshots
+                .resolve()
+                .map_err(|err| anyhow!("task {}: {err}", task.name))?;
+        }
+        crate::structs::suspend::validate_suspend(task).map_err(|err| anyhow!(err))?;
+        // One predicate decides "asks for memory checkpoints", so submit-time
+        // refusals and the worker's launch decision can never disagree.
+        crate::structs::snapshot::validate_memory_checkpoint_network(task)
+            .map_err(|err| anyhow!(err))?;
+        let create_first = config
+            .rollout_config_for_group(&task.group)
+            .and_then(|rollout| rollout.replacement)
+            == Some(crate::structs::RolloutReplacement::CreateFirst);
+        crate::structs::fork::validate_fixed_tap(task, task.count.num, create_first)
             .map_err(|err| anyhow!(err))?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.runtime, false)?;
@@ -1131,10 +1356,17 @@ pub fn resolve_task_dir_destination(root: &str, declared: &str) -> Result<PathBu
         return Err("path cannot be empty".to_string());
     }
     let path = std::path::Path::new(declared);
+    // Containers see their task directory at /legion/task; a sandbox guest
+    // receives its token files under /legion/identity.
+    let what = if root == sandbox::GUEST_IDENTITY_ROOT {
+        "sandbox identity directory"
+    } else {
+        "container task directory"
+    };
     let relative = if path.is_absolute() {
         path.strip_prefix(root).map_err(|_| {
             format!(
-                "{declared:?} is outside the container task directory; use a path under {root} \
+                "{declared:?} is outside the {what}; use a path under {root} \
                  (or a relative path), or switch to env delivery"
             )
         })?
@@ -1153,7 +1385,7 @@ pub fn resolve_task_dir_destination(root: &str, declared: &str) -> Result<PathBu
             std::path::Component::RootDir if normalized.as_os_str().is_empty() => {}
             _ => {
                 return Err(format!(
-                    "{declared:?} escapes the container task directory; use a path under {root}"
+                    "{declared:?} escapes the {what}; use a path under {root}"
                 ))
             }
         }
@@ -1191,6 +1423,93 @@ fn validate_file_delivery_paths(task: &TaskConfig, root: &str) -> R<()> {
     Ok(())
 }
 
+/// `resources.memoryMax` against the task's declared `memory`, and the
+/// runtime's own [`TaskPlugin::check_resources`] verdict. Declared values
+/// only: the manager re-checks against `taskResourceDefaults` when it
+/// normalizes the job (`ResourcePolicy::normalize_task_resources`).
+fn validate_memory_max(task: &TaskConfig) -> R<()> {
+    if let Some(resources) = task.resources.as_object() {
+        crate::resources::validate_memory_max(resources)
+            .with_context(|| format!("task {}", task.name))?;
+    }
+    let mut registry = TaskPluginRegistry::new();
+    if registry.load_plugin(&task.runtime, false).is_ok() {
+        if let Some(plugin) = registry.plugin(&task.runtime) {
+            plugin.check_resources(task)?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply a built-in runtime's [`TaskPlugin::normalize_task`] to one task.
+/// Third-party runtimes are left alone: their tasks keep the cluster's
+/// `taskResourceDefaults`, as they always have.
+pub fn normalize_runtime_task(task: &mut TaskConfig) {
+    if matches!(task.runtime.as_str(), "exec" | "container" | "sandbox") {
+        if let Ok(loaded) = load_task_plugin(&task.runtime) {
+            loaded.plugin.normalize_task(task);
+        }
+    }
+}
+
+/// A `cpu` (or its alias `cpus`) under 10 MHz is almost always a CPU count
+/// written in the wrong unit: `cpus = 1` reads as one CPU but reserves 1 MHz.
+/// Accepted, since it is valid, but called out with the likely intent.
+fn tiny_cpu_warning(task: &TaskConfig) -> Option<String> {
+    let (key, value) = ["cpus", "cpu"].into_iter().find_map(|key| {
+        task.resources
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .map(|value| (key, value))
+    })?;
+    (value > 0.0 && value < 10.0).then(|| {
+        format!(
+            "task {} sets resources.{key} = {value}, which is {value} MHz, not {value} CPU(s): \
+             `cpu` and its alias `cpus` are in MHz. Did you mean cpu = {}? (For whole \
+             exclusive CPUs use `cores`; a sandbox's guest CPU count is `config.vcpus`.)",
+            task.name,
+            (value * 1000.0).round() as u64
+        )
+    })
+}
+
+/// Advisory lines for a job's `resources`, shown on `job run`: a `memoryMax`
+/// the runtime cannot enforce, and whatever each runtime's
+/// [`TaskPlugin::check_resources`] has to say. Never fails: a runtime that
+/// will not load is a validation error reported elsewhere.
+pub fn resource_submit_warnings(config: &JobConfig) -> Vec<String> {
+    let mut registry = TaskPluginRegistry::new();
+    let mut warnings = Vec::new();
+    for task in &config.tasks {
+        if let Some(line) = tiny_cpu_warning(task) {
+            warnings.push(line);
+        }
+        if registry.load_plugin(&task.runtime, false).is_err() {
+            continue;
+        }
+        let Some(plugin) = registry.plugin(&task.runtime) else {
+            continue;
+        };
+        if task
+            .resources
+            .get(crate::resources::MEMORY_MAX_KEY)
+            .is_some()
+            && plugin.resource_enforcement() == ResourceEnforcement::Unsupported
+        {
+            warnings.push(format!(
+                "task {} sets resources.memoryMax, but the {} runtime does not enforce \
+                 resources: the scheduler still reserves resources.memory, and nothing caps the \
+                 task at memoryMax. See docs/resource-enforcement.md",
+                task.name, task.runtime
+            ));
+        }
+        if let Ok(lines) = plugin.check_resources(task) {
+            warnings.extend(lines);
+        }
+    }
+    warnings
+}
+
 /// The `resources` rules that apply to a runtime the worker can confine
 /// (`container`, `exec`) — Nomad's, because the semantics are Nomad's.
 ///
@@ -1207,7 +1526,8 @@ fn validate_governed_resources(task: &TaskConfig) -> R<()> {
             bail!(
                 "task {} declares resources.cores {cores}, which must be a whole number on the \
                  {} runtime: `cores` reserves exclusive CPUs and a cpuset cannot hold a fraction \
-                 of one. Round it, or use `cpu` (MHz) for a proportional share instead",
+                 of one. Round it, or declare `cpu` in MHz (for example `cpu = 500`, about half \
+                 of a 1 GHz core) for a proportional share instead",
                 task.name,
                 task.runtime,
             );
@@ -1642,6 +1962,145 @@ mod tests {
         Ok(())
     }
 
+    /// The Phase 3 disk round trip on the `exec` runtime, no KVM: the task
+    /// writes a marker to its volume, the allocation is disk-checkpointed
+    /// (stopped, volume snapshotted), the marker is mutated, the snapshot is
+    /// restored, and the restarted task sees the original marker.
+    #[test]
+    fn exec_disk_checkpoint_round_trip() -> R<()> {
+        use crate::structs::checkpoint::{SnapshotKind, SnapshotManifest, VolumeSnapshotRef};
+        use crate::volumes::builtins::LocalDirDriver;
+        use crate::volumes::{
+            VolumeDriver, VolumeMode, VolumeNodeRef, VolumeOp, VolumeRef, VolumeRequest,
+        };
+
+        let tmp = tempfile::tempdir()?;
+        let driver = LocalDirDriver::new(tmp.path().join("volumes"));
+        let volume = |op| {
+            VolumeRequest::new(
+                op,
+                VolumeRef {
+                    id: "vol-exec".into(),
+                    name: "data".into(),
+                    driver: "local-dir".into(),
+                    attrs: Default::default(),
+                    read_only: false,
+                },
+                VolumeNodeRef {
+                    id: "node-1".into(),
+                    data_dir: tmp.path().to_path_buf(),
+                    volume_dir: tmp.path().join("volumes"),
+                },
+            )
+        };
+        let dir = driver
+            .mount(&volume(VolumeOp::Mount))?
+            .mount_path
+            .expect("dir");
+
+        let mut registry = TaskPluginRegistry::new();
+        registry.load_plugin("exec", true)?;
+        let plugin = registry.plugin("exec").context("missing exec plugin")?;
+        let task = TaskConfig {
+            config: json!({"command": ["/bin/sh", "-c",
+                "cd \"$LEGION_VOLUME_DATA\" && if [ -f marker ]; then cat marker > seen; else echo v1 > marker; fi"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        let support = plugin.checkpoint_support(
+            &CheckpointQuery::new(&task.config)
+                .with_snapshot_volume(driver.capabilities().supports(VolumeOp::Snapshot)),
+        );
+        assert_eq!(support, CheckpointSupport::Disk);
+        assert_eq!(
+            plugin.checkpoint_support(&CheckpointQuery::new(&task.config)),
+            CheckpointSupport::None,
+            "no snapshot-capable volume, no checkpoint"
+        );
+
+        let run = |instance: &mut TaskInstance| -> R<()> {
+            let mut child = instance.child.take().context("task process")?;
+            assert!(child.wait()?.success());
+            instance.pid = None;
+            Ok(())
+        };
+        let mut instance = TaskInstance::default();
+        instance
+            .extra_env
+            .insert("LEGION_VOLUME_DATA".into(), dir.display().to_string());
+        plugin.prepare(&alloc(), &task, &mut instance)?;
+        plugin.start(&alloc(), &task, &mut instance)?;
+        run(&mut instance)?;
+        assert_eq!(std::fs::read_to_string(dir.join("marker"))?, "v1\n");
+
+        // Capture: the runtime stops the task and writes no memory, then the
+        // worker snapshots the quiet volume.
+        let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
+        let parts =
+            plugin.checkpoint(&alloc(), &task, &mut instance, &out, AfterCheckpoint::Stop)?;
+        assert!(parts.is_empty(), "a disk checkpoint has no memory parts");
+        let snapshot = driver.snapshot(&volume(VolumeOp::Snapshot).with_snapshot(
+            VolumeSnapshotRef {
+                id: "snap-exec".into(),
+                volume_id: "vol-exec".into(),
+                driver: "local-dir".into(),
+                mode: VolumeMode::Filesystem,
+                attrs: Default::default(),
+                size: 0,
+            },
+        ))?;
+
+        std::fs::write(dir.join("marker"), "v2\n")?;
+        driver.restore(&volume(VolumeOp::Restore).with_snapshot(snapshot.clone()))?;
+
+        let manifest = SnapshotManifest {
+            api_version: crate::structs::checkpoint::MANIFEST_API_VERSION,
+            id: "snap-exec".into(),
+            job_id: "job".into(),
+            task: "exec-task".into(),
+            origin_instance: None,
+            origin_alloc_id: 1,
+            runtime: "exec".into(),
+            kind: SnapshotKind::Disk,
+            created_at: "2026-10-10T00:00:00Z".into(),
+            volumes: vec![snapshot],
+            memory: parts.parts,
+            compat: parts.compat,
+            runtime_state: Value::Null,
+        };
+        let identity = crate::structs::checkpoint::ResumeIdentity::default();
+        let mut restored = TaskInstance::default();
+        restored
+            .extra_env
+            .insert("LEGION_VOLUME_DATA".into(), dir.display().to_string());
+        plugin.prepare(&alloc(), &task, &mut restored)?;
+        plugin.restore(&alloc(), &task, &mut restored, &manifest, &out, &identity)?;
+        run(&mut restored)?;
+        assert_eq!(
+            std::fs::read_to_string(dir.join("seen"))?,
+            "v1\n",
+            "the restarted task saw the snapshot-time marker"
+        );
+
+        // A memory manifest is not something `exec` can restore.
+        let mut memory = manifest;
+        memory.kind = SnapshotKind::Memory;
+        let err = plugin
+            .restore(
+                &alloc(),
+                &task,
+                &mut TaskInstance::default(),
+                &memory,
+                &out,
+                &identity,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot restore memory checkpoint"),
+            "{err}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn noop_plugin_loads_when_built() -> R<()> {
         if std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_err() {
@@ -1764,6 +2223,34 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_tap_sandbox_is_refused_when_its_rollout_creates_first() -> R<()> {
+        let config = |replacement| JobConfig {
+            priority: Default::default(),
+            rollout: Some(crate::structs::RolloutConfig {
+                replacement: Some(replacement),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "tap-job".into(),
+            tasks: vec![TaskConfig {
+                config: json!({
+                    "image": "alpine",
+                    "command": ["sleep", "60"],
+                    "network": { "mode": "tap", "tap": "tap0" },
+                }),
+                ..TaskConfig::new("box", "sandbox")
+            }],
+            version: None,
+        };
+        let err = validate_job_config(&config(crate::structs::RolloutReplacement::CreateFirst))
+            .expect_err("createFirst would boot two guests on tap0");
+        assert!(format!("{err:#}").contains("createFirst"), "{err:#}");
+        assert!(format!("{err:#}").contains("Hint:"), "{err:#}");
+        validate_job_config(&config(crate::structs::RolloutReplacement::DestroyFirst))?;
+        Ok(())
+    }
+
+    #[test]
     fn validates_default_rollout_strategy() -> R<()> {
         let config = JobConfig {
             priority: Default::default(),
@@ -1810,7 +2297,7 @@ mod tests {
             count: crate::structs::TaskCount::new(2),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
@@ -1929,7 +2416,7 @@ mod tests {
             tasks: vec![TaskConfig {
                 stateful: Some(crate::structs::StatefulConfig {
                     mode: InstanceMode::Keyed,
-                    id_source: None,
+                    require_id: false,
                     initial_instances: None,
                     on_lost: None,
                     storage: None,
@@ -2104,7 +2591,7 @@ mod tests {
             // A disabled governor (the default worker) never assigns,
             // whatever the mode — the opt-in promise.
             assert!(governor
-                .assign(1, &task, plugin.resource_enforcement())
+                .assign(1, &task, plugin.resource_enforcement(), None)
                 .expect("disabled governor never fails")
                 .is_none());
         }
@@ -2135,11 +2622,43 @@ mod tests {
             ExecTaskPlugin.resource_enforcement(),
             ResourceEnforcement::WorkerCgroup
         );
-        // The sandbox runtime is the designed-for next adopter, not one yet.
+        // The VMM process is the sandbox's host process.
         assert_eq!(
             SandboxTaskPlugin.resource_enforcement(),
-            ResourceEnforcement::Unsupported
+            ResourceEnforcement::WorkerCgroup
         );
+    }
+
+    /// `cpus = 1` reads as one CPU but means 1 MHz: submit warns, naming the
+    /// likely intent. Ordinary MHz values and `cores` are left alone.
+    #[test]
+    fn a_tiny_cpu_value_warns_that_cpu_is_mhz() {
+        let config = |resources: serde_json::Value| {
+            job_with(TaskConfig {
+                resources,
+                config: json!({"command": ["true"]}),
+                ..TaskConfig::new("api", "exec")
+            })
+        };
+        let warnings = resource_submit_warnings(&config(json!({ "cpus": 1 })));
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("resources.cpus = 1") && line.contains("cpu = 1000")),
+            "{warnings:?}"
+        );
+        let warnings = resource_submit_warnings(&config(json!({ "cpu": 0.5 })));
+        assert!(
+            warnings.iter().any(|line| line.contains("cpu = 500")),
+            "{warnings:?}"
+        );
+        for quiet in [json!({ "cpu": 500 }), json!({ "cores": 1 }), json!({})] {
+            let warnings = resource_submit_warnings(&config(quiet.clone()));
+            assert!(
+                warnings.iter().all(|line| !line.contains("MHz, not")),
+                "{quiet}: {warnings:?}"
+            );
+        }
     }
 
     /// A cpuset cannot hold half a CPU. This was silently rounded on macOS
@@ -2155,7 +2674,11 @@ mod tests {
         let err = validate_job_config(&job_with(task)).expect_err("half a core is not a cpuset");
         let message = err.to_string();
         assert!(message.contains("whole number"), "{message}");
-        assert!(message.contains("cpu"), "{message}");
+        assert!(message.contains("cpu = 500"), "{message}");
+        assert!(
+            !message.contains("cpus = 0.5"),
+            "cpus is MHz, not cores: {message}"
+        );
 
         // Whole numbers are fine, on both governed runtimes.
         for (runtime, config) in [
@@ -2209,16 +2732,20 @@ mod tests {
         .expect("an explicit cgroup alone stays valid");
     }
 
-    /// An ungoverned runtime keeps accepting whatever it accepted before:
-    /// its `resources` are scheduling-only, so there is nothing to enforce
-    /// and nothing to reject.
+    /// `sandbox` became governed (its VMM runs in the worker cgroup), so it
+    /// now gets the same admission rules as `exec` and `container`. It was
+    /// the last built-in runtime that was not: ungoverned runtimes (`noop`,
+    /// third-party plugins) still skip these rules, which
+    /// `the_enforcement_contract_holds_for_all_three_modes` covers.
     #[test]
-    fn ungoverned_runtimes_keep_accepting_scheduling_only_resources() -> R<()> {
-        validate_job_config(&job_with(TaskConfig {
-            resources: json!({ "cores": 1.5, "cpu": 500 }),
+    fn sandbox_tasks_get_governed_resource_rules() {
+        let err = validate_job_config(&job_with(TaskConfig {
+            resources: json!({ "cores": 1.5 }),
             config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
             ..TaskConfig::new("box", "sandbox")
         }))
+        .expect_err("a fractional cpuset is rejected on a governed runtime");
+        assert!(err.to_string().contains("whole number"), "{err}");
     }
 
     #[test]
@@ -2401,7 +2928,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_task_accepts_env_identity_but_not_file_delivery() -> R<()> {
+    fn sandbox_task_scopes_identity_files_to_the_guest_identity_dir() -> R<()> {
         let config = json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]});
 
         // Env delivery is baked into the guest env file at boot, so it works.
@@ -2418,15 +2945,66 @@ mod tests {
             ..TaskConfig::new("box", "sandbox")
         }))?;
 
-        // File delivery would have to reach inside a running guest, which
-        // needs an agent the runtime does not have yet.
+        // File delivery reaches the guest under /legion/identity (the
+        // identity disk on a microVM, a bind mount in dev mode). A host path
+        // is refused with the fix.
         let err = validate_job_config(&job_with(TaskConfig {
             identities: vec![file_identity("aws")],
-            config,
+            config: config.clone(),
             ..TaskConfig::new("box", "sandbox")
         }))
-        .expect_err("sandbox has no identity file delivery");
-        assert!(err.to_string().contains("identity file delivery"), "{err}");
+        .expect_err("/var/run/... is not in the guest");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("outside the sandbox identity directory")
+                && message.contains("/legion/identity"),
+            "{message}"
+        );
+        for path in ["/legion/identity/aws", "aws"] {
+            validate_job_config(&job_with(TaskConfig {
+                identities: vec![WorkloadIdentity {
+                    file: Some(WorkloadIdentityFile {
+                        path: path.into(),
+                        mode: None,
+                    }),
+                    ..file_identity("aws")
+                }],
+                config: config.clone(),
+                ..TaskConfig::new("box", "sandbox")
+            }))
+            .unwrap_or_else(|err| panic!("{path} should be accepted: {err:#}"));
+        }
+        Ok(())
+    }
+
+    /// Env with `changeMode = "noop"` (the default) is accepted on a
+    /// memory-checkpointable sandbox, which keeps the token fresh at
+    /// `/legion/identity/<ENV>`, and refused on one without an identity disk.
+    #[test]
+    fn env_noop_identities_need_a_sandbox_that_refreshes_them() -> R<()> {
+        let identity = WorkloadIdentity {
+            name: "vault".into(),
+            audience: vec!["vault.internal".into()],
+            env: Some("VAULT_TOKEN".into()),
+            ..Default::default()
+        };
+        let mut checkpointable: TaskConfig = serde_json::from_value(json!({
+            "name": "box",
+            "runtime": "sandbox",
+            "config": {"image": "alpine", "command": ["sleep", "1"]},
+            "stateful": {"mode": "keyed"},
+            "suspend": {"checkpoint": "memory"},
+        }))?;
+        checkpointable.identities = vec![identity.clone()];
+        validate_job_config(&job_with(checkpointable))?;
+
+        let err = validate_job_config(&job_with(TaskConfig {
+            identities: vec![identity],
+            config: json!({"image": "alpine", "command": ["sleep", "1"]}),
+            ..TaskConfig::new("box", "sandbox")
+        }))
+        .expect_err("no identity disk to refresh it");
+        assert!(format!("{err:#}").contains("can never"), "{err:#}");
         Ok(())
     }
 

@@ -15,6 +15,7 @@ use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker, PermitSet}
 use crate::prelude::*;
 use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest, ResourceValue};
 use crate::scheduling_index::{IndexMode, IndexQueryOutcome};
+pub use crate::storage::content_index::{ContentRef, LocalityScores};
 use crate::storage::errors::StorageError;
 use crate::storage::store::{
     AllocationRef, AvailableNodes, JobAllocationsByNode, PlanApplyOutcome, PlanSubmissionPlacement,
@@ -25,7 +26,10 @@ use crate::structs::{
     TaskStatusState,
 };
 use policy::score_node_for_context;
-pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
+pub use policy::{
+    load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy,
+    DEF_SCHEDULER_LOCALITY_WEIGHT,
+};
 use preemption::{eligible_victims, preemption_cost, select_victims, VictimCandidate};
 pub use preemption::{
     PlannedPreemption, PreemptionMode, PreemptionSettings, DEFAULT_VICTIM_EXEMPT_AGE,
@@ -46,6 +50,12 @@ pub struct PlannedAllocation {
     /// means no fallback — the epoch compare-and-set is exact, as it was
     /// before candidate lists (docs/late-binding-plan-apply.md).
     pub candidates: Vec<String>,
+    /// The keyed instance this placement is for, when the plan chose the
+    /// node for one instance in particular (a restore, whose `compat` and
+    /// pin are that instance's). The apply binds exactly this instance, so
+    /// two restores placed in one plan cannot swap nodes. `None` keeps the
+    /// ordinary "any unbound instance" binding.
+    pub instance_id: Option<String>,
 }
 
 /// Parsed `schedulerSettings.plan_candidates`: how many ranked candidates
@@ -580,7 +590,8 @@ impl PreemptionPass {
         }
         if self.rejected.is_empty() {
             return format!(
-                "{base}. Preemption ran but found nothing to displace: every feasible node is                  full of work at this band or above"
+                "{base}. Preemption ran but found nothing to displace: every feasible node is \
+                 full of work at this band or above"
             );
         }
         let detail = self.rejected.describe();
@@ -656,6 +667,10 @@ struct NodeScoringState {
     can_fit_task_request: bool,
     common_resources: CommonResourceAvailability,
     common_feasibility_bitmap: u8,
+    /// Fraction of the placement's content set this node holds (0 when the
+    /// set is empty or the node has not reported). Filled by
+    /// [`PlanScoringCache::apply_locality`], once per task.
+    locality: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -725,6 +740,9 @@ struct PlanScoringCache {
     affinity: TaskAffinityCache,
     common_demand: CommonResourceDemand,
     group_name: Option<String>,
+    /// This task's locality scores, kept for nodes outside `states` and for
+    /// the policy-plugin path. `None` skips the term.
+    locality: Option<Arc<crate::storage::content_index::LocalityScores>>,
 }
 
 impl PlanScoringCache {
@@ -817,6 +835,7 @@ impl PlanScoringCache {
                 can_fit_task_request,
                 common_resources,
                 common_feasibility_bitmap,
+                locality: 0.0,
             });
         }
 
@@ -826,6 +845,28 @@ impl PlanScoringCache {
             affinity,
             common_demand,
             group_name,
+            locality: None,
+        }
+    }
+
+    /// Fold this task's locality scores into the per-candidate state: one
+    /// lookup per candidate per task, so the per-placement loop reads a
+    /// field instead of hashing a node id.
+    fn apply_locality(
+        &mut self,
+        candidates: &[&Node],
+        locality: Option<&Arc<crate::storage::content_index::LocalityScores>>,
+    ) {
+        // Shared, not copied: on a large fleet the score map holds an entry
+        // per warm node, and the refill path applies it a second time.
+        self.locality = locality.cloned();
+        let Some(scores) = locality else {
+            return;
+        };
+        for node in candidates {
+            if let Some(position) = self.index.get(&NodeKey::of(node)) {
+                self.states[*position].locality = scores.score(&node.id);
+            }
         }
     }
 
@@ -1654,6 +1695,7 @@ impl<'a> Scheduler<'a> {
                 .map(|placement| PlanSubmissionPlacement {
                     task_id: placement.task_config_id,
                     candidates: placement.candidates.clone(),
+                    instance_id: placement.instance_id.clone(),
                 })
                 .collect::<Vec<_>>();
             self.store.submit_and_apply_plan_with_candidates(
@@ -2632,10 +2674,15 @@ impl<'a> Scheduler<'a> {
         // the full set: `count.per` targets every attribute group, `distinct`
         // constraints need diversity, volume-pinned tasks need their exact
         // node, and multi-task groups place from their own candidate sets.
+        // Stateful tasks can carry pins too (a node-local `stateful.storage`
+        // volume, or a restore from a `local` snapshot), and a truncated list
+        // that leaves out the pinned node fails the placement as if the node
+        // were gone.
         let allow_truncation = index_armed
             && task_config.count.per.is_none()
             && constraint_set.distinct_keys().is_empty()
             && task_config.volumes.is_empty()
+            && task_config.stateful.is_none()
             && !in_multi_task_group;
 
         let base_eligible = if index_armed {
@@ -2733,7 +2780,9 @@ impl<'a> Scheduler<'a> {
             resource_ledger,
             &plan.task_request,
         );
-
+        // Content locality: computed once per task, from the in-memory
+        // location index. Skipped (no cost beyond walking the task's
+        // artifacts) when the weight is 0 or the content set is empty.
         // Instances holding node-local storage can only be replaced on the node
         // their data lives on. Pins are consumed one per placement, in slot
         // order; the allocation binder independently prefers the instance whose
@@ -2748,6 +2797,58 @@ impl<'a> Scheduler<'a> {
             })
             .into();
 
+        // Instances restoring from a snapshot (a resume, RestoreInstance, or
+        // any instance created with `restore_from`). A `local` snapshot pins
+        // the instance to the node holding its bytes and is checked against
+        // the manifest's `compat` there. A `published` one has no pin: its
+        // `compat` filters every candidate, and the locality term prefers
+        // nodes holding its parts. Only keyed tasks can restore, so every
+        // other task skips the lookup entirely.
+        let restores = if task_config
+            .stateful
+            .as_ref()
+            .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed)
+        {
+            self.store
+                .restore_pins_for_task(task_id)
+                .unwrap_or_else(|err| {
+                    warn!(task_id, error = ?err, "Failed loading restore pins; placing unpinned");
+                    Vec::new()
+                })
+        } else {
+            Vec::new()
+        };
+        // Score locality after the restore lookup, so a restoring instance's
+        // manifest parts count toward the content set.
+        let locality = self.locality_scores(task_config, &restores, weights);
+        scoring_cache.apply_locality(&candidates, locality.as_ref());
+
+        let mut restore_manifests: HashMap<String, crate::storage::store::RestorePin> =
+            HashMap::new();
+        // Published restores with no volume pin, placed after the hard
+        // restore pins and before the volume pins, which is the order the
+        // binder pairs them in (restoring instances first).
+        let mut floating_restores: std::collections::VecDeque<String> =
+            std::collections::VecDeque::new();
+        let mut hard_restore_pins = 0usize;
+        for restore in restores {
+            let volume_pinned = pins
+                .iter()
+                .any(|(instance, _)| *instance == restore.instance_id);
+            if !volume_pinned {
+                if let Some(node_id) = restore.hard_pin() {
+                    // Restores are rare and recent: place them first, where
+                    // the binder (which prefers restoring instances on their
+                    // snapshot's node) will pair them up.
+                    pins.push_front((restore.instance_id.clone(), node_id.to_string()));
+                    hard_restore_pins += 1;
+                } else {
+                    floating_restores.push_back(restore.instance_id.clone());
+                }
+            }
+            restore_manifests.insert(restore.instance_id.clone(), restore);
+        }
+
         // Disk accounting for node-local volumes, within this plan. Placing 3
         // replicas that each provision a 100G local volume onto a node with
         // 150G free must fail the third placement, not fill the disk at
@@ -2757,6 +2858,28 @@ impl<'a> Scheduler<'a> {
         // (nfs) never count — their bytes live on the storage server, and
         // charging them to the node would block placements for no reason.
         let mut planned_local_bytes: HashMap<String, u64> = HashMap::new();
+        // Checkpoint headroom (docs/suspend-and-resume.md, "Capacity for
+        // resumes"): a new instance of a task that suspends to memory skips
+        // nodes with no room for one more of its checkpoints, whether the
+        // `snapshots` content budget or the disk under it is what is short.
+        // Read once per task from the in-memory content index, and empty (no
+        // per-node work at all) unless a node is short.
+        let budget_short: Option<(
+            u64,
+            HashMap<String, crate::storage::content_index::RoomLimit>,
+        )> = crate::structs::suspend::expected_memory_checkpoint_bytes(task_config).and_then(
+            |needed| {
+                let short = self
+                    .store
+                    .content_locations()
+                    .snapshot_budget_short_nodes(needed);
+                (!short.is_empty()).then_some((needed, short))
+            },
+        );
+        // Spread forks (`instance fork --spread`): per fork checkpoint, the
+        // nodes its forks run on or were placed on in this plan. Loaded on
+        // first use, so a plan with no spread fork never reads it.
+        let mut spread_nodes: HashMap<String, HashSet<String>> = HashMap::new();
 
         for _ in 0..count {
             let mut eligible = Self::eligible_nodes(
@@ -2809,6 +2932,7 @@ impl<'a> Scheduler<'a> {
                     resource_ledger,
                     &plan.task_request,
                 );
+                scoring_cache.apply_locality(&candidates, locality.as_ref());
                 eligible = Self::eligible_nodes(
                     &candidates,
                     plan.constraint_set(),
@@ -2838,7 +2962,13 @@ impl<'a> Scheduler<'a> {
                     group_key
                         .and_then(|key| group_assignments.get(key))
                         .cloned(),
-                    pins.front().map(|(_, node_id)| node_id.clone()),
+                    // The pin this placement will take: none when a
+                    // published restore (which has no node) goes next.
+                    if hard_restore_pins == 0 && !floating_restores.is_empty() {
+                        None
+                    } else {
+                        pins.front().map(|(_, node_id)| node_id.clone())
+                    },
                     preemption,
                 )? {
                     // Book the victims against the ledger so the placement
@@ -2932,7 +3062,117 @@ impl<'a> Scheduler<'a> {
             // A pinned instance is not a preference: placing it elsewhere would
             // silently start the workload on empty storage, so failing the eval
             // with a diagnostic is the correct outcome.
-            let pin = pins.pop_front();
+            let (pin, floating) = if hard_restore_pins > 0 {
+                hard_restore_pins -= 1;
+                (pins.pop_front(), None)
+            } else if let Some(instance_id) = floating_restores.pop_front() {
+                (None, Some(instance_id))
+            } else {
+                (pins.pop_front(), None)
+            };
+            // A restore's node was chosen for that instance (its pin, or its
+            // `compat` and spread), so the apply must bind that instance.
+            let bind_instance = floating.clone().or_else(|| {
+                pin.as_ref()
+                    .filter(|(instance_id, _)| restore_manifests.contains_key(instance_id))
+                    .map(|(instance_id, _)| instance_id.clone())
+            });
+            if let Some((instance_id, node_id)) = pin.as_ref() {
+                if let Some(restore) = restore_manifests.get(instance_id) {
+                    // A memory checkpoint resumes a running guest, so the
+                    // node must match the CPU and VMM it was captured on.
+                    // Failing the placement with the attribute that differs
+                    // is the outcome; a corrupt guest never is.
+                    check_restore_compat(task_config, restore, node_id, node_lookup)?;
+                }
+            }
+            let floating_restore = floating
+                .as_ref()
+                .and_then(|instance_id| restore_manifests.get(instance_id));
+            let eligible = match floating_restore {
+                Some(restore) => filter_restore_compat(task_config, restore, eligible)?,
+                None => eligible,
+            };
+            // A spread fork never shares a node with a sibling. A hard rule,
+            // like `distinct`: with no other node left the fork waits.
+            let spread_snapshot = floating_restore
+                .filter(|restore| restore.spread)
+                .map(|restore| restore.snapshot_id.clone());
+            let eligible = match spread_snapshot.as_deref() {
+                None => eligible,
+                Some(snapshot_id) => {
+                    let taken = match spread_nodes.entry(snapshot_id.to_string()) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => entry.insert(
+                            self.store.nodes_running_forks_of(snapshot_id).unwrap_or_else(
+                                |err| {
+                                    warn!(
+                                        snapshot_id,
+                                        error = ?err,
+                                        "Failed loading spread fork nodes; spreading within this plan only"
+                                    );
+                                    HashSet::new()
+                                },
+                            ),
+                        ),
+                    };
+                    let spread: Vec<&Node> = eligible
+                        .into_iter()
+                        .filter(|node| !taken.contains(node.id.as_str()))
+                        .collect();
+                    if spread.is_empty() {
+                        // Not an error for the rest of the task: its other
+                        // placements go ahead, and this fork stays pending
+                        // until a node without a sibling can take it.
+                        let mut nodes: Vec<&str> = taken.iter().map(String::as_str).collect();
+                        nodes.sort_unstable();
+                        info!(
+                            task = %task_config.name,
+                            instance_id = floating.as_deref().unwrap_or_default(),
+                            snapshot_id,
+                            siblings_on = %nodes.join(", "),
+                            "Spread fork waits: every eligible node runs a sibling"
+                        );
+                        continue;
+                    }
+                    spread
+                }
+            };
+            // Only a fresh placement is constrained: a restore already has
+            // its checkpoint, and a volume-pinned instance has no other node.
+            let eligible = match budget_short.as_ref() {
+                Some((needed, short)) if pin.is_none() && floating.is_none() => {
+                    let before = eligible.len();
+                    let roomy: Vec<&Node> = eligible
+                        .iter()
+                        .copied()
+                        .filter(|node| !short.contains_key(node.id.as_str()))
+                        .collect();
+                    if roomy.is_empty() {
+                        use crate::storage::content_index::RoomLimit;
+                        let on_disk = eligible
+                            .iter()
+                            .filter(|node| short.get(node.id.as_str()) == Some(&RoomLimit::Disk))
+                            .count();
+                        let on_budget = before - on_disk;
+                        bail!(
+                            "Failed to place task {}: {before} eligible node(s), but none has \
+                             {} MiB of room for this task's memory checkpoint (suspend): \
+                             {on_budget} short on the snapshots content budget, {on_disk} short \
+                             on disk (free space plus evictable content, less \
+                             content.minFreeDisk). Raise content.budgets.snapshots or free disk \
+                             on those workers, delete snapshots you no longer need (`legion \
+                             snapshot list`), or resume or destroy suspended instances to release \
+                             their checkpoints. `legion node usage <node>` shows each node's \
+                             checkpoint room",
+                            task_config.name,
+                            needed / (1024 * 1024)
+                        );
+                    }
+                    roomy
+                }
+                _ => eligible,
+            };
             let eligible = match pin.as_ref() {
                 None => eligible,
                 Some((instance_id, node_id)) => {
@@ -3023,6 +3263,19 @@ impl<'a> Scheduler<'a> {
                 (ranked[0].clone(), ranked)
             };
 
+            let mut ranked_candidates = ranked_candidates;
+            if let Some(snapshot_id) = spread_snapshot {
+                // No fallback candidates: the apply could bind a fallback node
+                // a sibling in this same plan also falls back to.
+                ranked_candidates.truncate(1);
+                spread_nodes
+                    .entry(snapshot_id)
+                    .or_default()
+                    .insert(node_id.clone());
+            }
+            if let Some(scores) = locality.as_ref() {
+                record_locality_placement(scores.score(&node_id));
+            }
             let placed_node = node_lookup.get(node_id.as_str());
             if let Some(node) = placed_node {
                 let wanted = task_local_volume_bytes(node, task_config);
@@ -3054,6 +3307,7 @@ impl<'a> Scheduler<'a> {
                 node_id,
                 task_config_id: task_id,
                 candidates: ranked_candidates,
+                instance_id: bind_instance,
             });
         }
 
@@ -3168,7 +3422,8 @@ impl<'a> Scheduler<'a> {
             planned_task_allocations,
             planned,
             weights,
-        );
+        )
+        .with_locality(scoring_cache.locality.as_deref());
         let selected = reschedule_rng
             .as_mut()
             .map(|rng| self.select_policy_node_with_jitter(&ctx, rng))
@@ -3635,7 +3890,11 @@ impl<'a> Scheduler<'a> {
                 .as_ref()
                 .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed);
             if keyed {
-                *desired = store.count_live_keyed_instances(job_id, &task.group, &task.name)?;
+                // Live instances, plus suspended ones whose allocation row
+                // holds their reservation (`suspend.reserve`), so the
+                // scheduler neither culls the hold nor re-places it.
+                *desired =
+                    store.count_keyed_allocations_desired(job_id, &task.group, &task.name)?;
             }
         }
         Ok(())
@@ -3861,7 +4120,8 @@ impl<'a> Scheduler<'a> {
                 ctx.planned_task_allocations,
                 ctx.planned,
                 ctx.weights,
-            );
+            )
+            .with_locality(ctx.locality);
             return self.policy.select_node(fallback_ctx);
         }
 
@@ -3951,6 +4211,69 @@ impl<'a> Scheduler<'a> {
         top.first().copied()
     }
 
+    /// The content a placement of this task needs on its node: its
+    /// digest-pinned artifacts (the node content store keys them by their
+    /// `checksum`), plus any restore manifest parts. Image layers join once
+    /// the content store holds them by digest (cache plan Phase 1's OCI
+    /// per-blob storage). Order and duplicates do not matter to the score.
+    pub fn content_set(
+        &self,
+        task_config: &TaskConfig,
+        restores: &[crate::storage::store::RestorePin],
+    ) -> Vec<ContentRef> {
+        let mut content: Vec<ContentRef> = task_config
+            .artifacts
+            .iter()
+            .filter_map(|artifact| artifact.checksum.as_deref())
+            // Normalized the way the node content store keys it, so a
+            // checksum written in uppercase still matches the advertisement.
+            .filter_map(|checksum| crate::content_store::ContentDigest::parse(checksum).ok())
+            .map(|digest| ContentRef::digest(digest.to_string()))
+            .collect();
+        content.extend(Self::restore_content(restores));
+        content
+    }
+
+    /// The memory parts of every restore this placement serves (suspend plan
+    /// §6.6 and §6.8), sized from their manifests: a placement that resumes
+    /// a checkpoint needs those bytes on its node. A `local` snapshot is
+    /// already pinned to the node that holds it, so today this only moves the
+    /// score in step with the pin. It starts to matter once snapshots can
+    /// restore on another node (Phase 7b). The disk half lives in the volume
+    /// driver, not the content store, so it is not part of the set. A
+    /// manifest that does not parse contributes nothing, and the restore
+    /// itself reports the error.
+    fn restore_content(restores: &[crate::storage::store::RestorePin]) -> Vec<ContentRef> {
+        restores
+            .iter()
+            .filter_map(|restore| {
+                serde_json::from_str::<crate::structs::checkpoint::SnapshotManifest>(
+                    &restore.manifest_json,
+                )
+                .ok()
+            })
+            .flat_map(|manifest| manifest.memory)
+            .map(|part| ContentRef::sized(part.digest, part.size))
+            .collect()
+    }
+
+    /// This task's per-node locality, or `None` to skip the term.
+    fn locality_scores(
+        &self,
+        task_config: &TaskConfig,
+        restores: &[crate::storage::store::RestorePin],
+        weights: SchedulerWeights,
+    ) -> Option<Arc<LocalityScores>> {
+        if weights.locality <= 0.0 {
+            return None;
+        }
+        let content = self.content_set(task_config, restores);
+        self.store
+            .content_locations()
+            .locality_scores(&content)
+            .map(Arc::new)
+    }
+
     fn scheduler_weights(&self) -> R<SchedulerWeights> {
         let mut weights = SchedulerWeights::for_policy(self.policy.name());
         let Some(settings) = self.store.scheduler_settings.as_ref() else {
@@ -3991,6 +4314,7 @@ impl<'a> Scheduler<'a> {
                 "spread" => weights.spread = weight,
                 "bin_pack" => weights.bin_pack = weight,
                 "automatic_anti_affinity" => weights.automatic_anti_affinity = weight,
+                "locality" => weights.locality = weight,
                 _ => {}
             }
         }
@@ -4337,6 +4661,120 @@ fn node_provides_volume_drivers(
     })
 }
 
+/// A restoring instance's parsed manifest, or the placement error for an
+/// unreadable one.
+fn restore_manifest(
+    task_config: &TaskConfig,
+    restore: &crate::storage::store::RestorePin,
+) -> R<crate::structs::checkpoint::SnapshotManifest> {
+    crate::structs::checkpoint::SnapshotManifest::from_json(&restore.manifest_json).with_context(
+        || {
+            format!(
+                "Failed to place task {}: instance {} restores snapshot {}, whose manifest is \
+                 unreadable",
+                task_config.name, restore.instance_id, restore.snapshot_id
+            )
+        },
+    )
+}
+
+/// Whether `node` can restore `manifest` (its `compat` block against the
+/// node's fingerprint).
+fn node_restore_compat(
+    manifest: &crate::structs::checkpoint::SnapshotManifest,
+    node: &Node,
+) -> Result<(), crate::structs::checkpoint::CompatMismatch> {
+    let empty = Map::new();
+    let attrs = node.fingerprint_attrs.as_object().unwrap_or(&empty);
+    crate::structs::checkpoint::compat_matches(manifest, attrs)
+}
+
+/// Check a restoring instance's snapshot `compat` against the node it is
+/// pinned to (`node_id`: its local snapshot's node, or its volume's). The
+/// error names the instance, the snapshot, the node, and the attribute that
+/// differs, with both values.
+fn check_restore_compat(
+    task_config: &TaskConfig,
+    restore: &crate::storage::store::RestorePin,
+    node_id: &str,
+    node_lookup: &AvailableNodes,
+) -> R<()> {
+    let manifest = restore_manifest(task_config, restore)?;
+    let Some(node) = node_lookup.get(node_id) else {
+        // The pin below reports an unavailable node with its own message.
+        return Ok(());
+    };
+    if let Err(mismatch) = node_restore_compat(&manifest, node) {
+        bail!(
+            "Failed to place task {}: instance {} restores {} snapshot {}, which node {node_id} \
+             cannot run: {mismatch}. A memory snapshot resumes only on the CPU and VMM it was \
+             taken on; restore an older snapshot, or restart the instance cold",
+            task_config.name,
+            restore.instance_id,
+            manifest.kind.as_str(),
+            restore.snapshot_id
+        );
+    }
+    Ok(())
+}
+
+/// Keep the candidates that can restore a `published` snapshot, which has
+/// no hard pin: its `compat` is checked per candidate (suspend plan §6.8,
+/// "Hard versus soft"). A disk snapshot (empty `compat`) passes the compat
+/// check everywhere. Either way a candidate's worker must advertise
+/// `checkpoint-fetch`, since it may have to fetch the parts first, so a
+/// mixed-version fleet never sends a published restore to an older worker.
+/// When none fit, the error names up to three candidates and why each one
+/// fails.
+fn filter_restore_compat<'b>(
+    task_config: &TaskConfig,
+    restore: &crate::storage::store::RestorePin,
+    eligible: Vec<&'b Node>,
+) -> R<Vec<&'b Node>> {
+    use crate::structs::snapshot::{node_advertises, CHECKPOINT_FETCH_CAPABILITY};
+    let manifest = restore_manifest(task_config, restore)?;
+    let mut rejected: Vec<String> = Vec::new();
+    let mut fitting = Vec::with_capacity(eligible.len());
+    for node in eligible {
+        if !node_advertises(node, CHECKPOINT_FETCH_CAPABILITY) {
+            if rejected.len() < 3 {
+                rejected.push(format!(
+                    "{}: its worker cannot fetch published snapshots (no \
+                     `{CHECKPOINT_FETCH_CAPABILITY}` capability; upgrade it)",
+                    node.id
+                ));
+            }
+            continue;
+        }
+        if manifest.compat.is_empty() {
+            fitting.push(node);
+            continue;
+        }
+        match node_restore_compat(&manifest, node) {
+            Ok(()) => fitting.push(node),
+            Err(mismatch) => {
+                if rejected.len() < 3 {
+                    rejected.push(format!("{}: {mismatch}", node.id));
+                }
+            }
+        }
+    }
+    if fitting.is_empty() {
+        bail!(
+            "Failed to place task {}: instance {} restores published {} snapshot {}, and no \
+             eligible node can run it ({}). A memory snapshot resumes only on the CPU and VMM \
+             it was taken on, on a worker that can fetch published snapshots; add a matching \
+             node, or restart the instance cold",
+            task_config.name,
+            restore.instance_id,
+            manifest.kind.as_str(),
+            restore.snapshot_id,
+            rejected.join("; ")
+        );
+    }
+    Ok(fitting)
+}
+
 /// Bytes of **node-local** volume storage one placement of this task would put
 /// on `node`, judged by the node's own advertised driver capabilities.
 ///
@@ -4441,6 +4879,22 @@ struct CachedLoadBounds {
     range: f64,
 }
 
+/// `legion_scheduler_locality_placements_total{outcome}`: how warm the chosen
+/// node was for placements that had a content set. `warm` held all of it,
+/// `partial` some, `cold` none. The hit ratio is warm over the total.
+fn record_locality_placement(score: f64) {
+    let outcome = if score >= 1.0 - 1e-9 {
+        "warm"
+    } else if score > 0.0 {
+        "partial"
+    } else {
+        "cold"
+    };
+    crate::manager::telemetry::metrics()
+        .scheduler_locality_placements_total
+        .inc(&[outcome]);
+}
+
 fn cached_load_bounds(eligible: &[&Node], scoring_cache: &PlanScoringCache) -> CachedLoadBounds {
     let mut min_load: Option<usize> = None;
     let mut max_load: Option<usize> = None;
@@ -4492,10 +4946,18 @@ fn score_node_with_cache(
                 0.0
             }
         });
+    let locality_score = match state {
+        Some(state) => state.locality,
+        None => scoring_cache
+            .locality
+            .as_ref()
+            .map_or(0.0, |scores| scores.score(&node.id)),
+    };
     weights.affinity * affinity_score
         + weights.spread * spread_score
         + weights.bin_pack * bin_pack_score
         - weights.automatic_anti_affinity * anti_affinity_penalty
+        + weights.locality * locality_score
 }
 
 fn score_nodes_with_cache<'a>(
@@ -4981,7 +5443,7 @@ mod tests {
             count: TaskCount::new(count),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: crate::structs::InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -5008,6 +5470,119 @@ mod tests {
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         Ok(store.get_job_config(name)?.id())
+    }
+
+    /// Two equal nodes, one already holding the task's pinned artifact: the
+    /// placement lands on the warm one, every time. Without locality this
+    /// is a coin flip (bin_pack on two empty nodes ties).
+    #[test]
+    fn placement_prefers_the_node_holding_the_content() -> R<()> {
+        use crate::storage::content_index::IngestOutcome;
+        use crate::structs::{ArtifactSpec, ContentLocation, ContentLocationReport};
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        for round in 0..6 {
+            let store = setup_store()?;
+            store.insert_node(make_node_msg("node-a", json!({})))?;
+            store.insert_node(make_node_msg("node-b", json!({})))?;
+            let report = |added: Vec<ContentLocation>| ContentLocationReport {
+                epoch: 1,
+                base_epoch: 0,
+                full: true,
+                added,
+                removed: Vec::new(),
+                snapshot_budget: None,
+            };
+            let now = std::time::Instant::now();
+            assert_eq!(
+                store.content_locations().ingest(
+                    "node-b",
+                    &report(vec![ContentLocation {
+                        digest: digest.clone(),
+                        bytes: 64 * 1024 * 1024,
+                    }]),
+                    now,
+                ),
+                IngestOutcome::Replaced
+            );
+            // node-a reported too, holding nothing.
+            store
+                .content_locations()
+                .ingest("node-a", &report(Vec::new()), now);
+
+            let mut task = TaskConfig::new("agent".to_string(), "noop");
+            task.artifacts = vec![ArtifactSpec {
+                checksum: Some(digest.clone()),
+                ..ArtifactSpec::from_source("https://example.com/agent.bin")
+            }];
+            let job_config_id = submit_job(&store, &format!("warm-{round}"), vec![task])?;
+            let scheduler = Scheduler::new(&store)?;
+            assert_eq!(scheduler.weights.locality, DEF_SCHEDULER_LOCALITY_WEIGHT);
+            let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+            assert_eq!(outcome.allocations.len(), 1);
+            assert_eq!(outcome.allocations[0].node_id, "node-b", "round {round}");
+        }
+        Ok(())
+    }
+
+    /// The content set is the task's digest-pinned artifacts; tasks without
+    /// any skip the term entirely.
+    #[test]
+    fn content_set_is_the_pinned_artifact_digests() -> R<()> {
+        use crate::structs::ArtifactSpec;
+        let store = setup_store()?;
+        let scheduler = Scheduler::new(&store)?;
+        let digest = format!("sha256:{}", "cd".repeat(32));
+        let mut task = TaskConfig::new("agent".to_string(), "noop");
+        assert!(scheduler.content_set(&task, &[]).is_empty());
+        assert!(scheduler
+            .locality_scores(&task, &[], scheduler.weights)
+            .is_none());
+        task.artifacts = vec![
+            ArtifactSpec {
+                checksum: Some(digest.clone()),
+                ..ArtifactSpec::from_source("https://example.com/a.bin")
+            },
+            ArtifactSpec::from_source("https://example.com/unpinned.bin"),
+        ];
+        assert_eq!(
+            scheduler.content_set(&task, &[]),
+            vec![ContentRef::digest(digest.clone())]
+        );
+
+        // A restoring instance adds its manifest's memory parts, sized.
+        let manifest = serde_json::json!({
+            "id": "snap-1", "jobId": "j", "task": "agent", "originAllocId": 7,
+            "runtime": "sandbox", "kind": "memory", "createdAt": "2026-10-10T00:00:00Z",
+            "memory": [{ "role": "memory", "file": "mem", "digest": "sha256:ee", "size": 4096 }],
+        });
+        let restore = crate::storage::store::RestorePin {
+            instance_id: "user-1".into(),
+            snapshot_id: "snap-1".into(),
+            node_id: Some("node-a".into()),
+            manifest_json: manifest.to_string(),
+            published: false,
+            spread: false,
+        };
+        assert_eq!(
+            scheduler.content_set(&task, std::slice::from_ref(&restore)),
+            vec![
+                ContentRef::digest(digest),
+                ContentRef::sized("sha256:ee", 4096)
+            ]
+        );
+        Ok(())
+    }
+
+    /// `weights.locality` parses like every other weight; 0 turns it off.
+    #[test]
+    fn locality_weight_is_configurable() -> R<()> {
+        let store =
+            setup_store_with_scheduler("spread", Some(json!({ "weights": { "locality": 0.0 } })))?;
+        assert_eq!(Scheduler::new(&store)?.weights.locality, 0.0);
+        let store =
+            setup_store_with_scheduler("spread", Some(json!({ "weights": { "locality": 2.5 } })))?;
+        assert_eq!(Scheduler::new(&store)?.weights.locality, 2.5);
+        Ok(())
     }
 
     #[test]
@@ -5150,7 +5725,7 @@ mod tests {
             count: TaskCount::new(3),
             stateful: Some(crate::structs::StatefulConfig {
                 mode: crate::structs::InstanceMode::Keyed,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
@@ -7536,7 +8111,7 @@ mod tests {
                 .map(|index| TaskConfig {
                     group: format!("group-{index}"),
                     resources: json!({ "memory": 1024 }),
-                    ..TaskConfig::new(&format!("task-{index}"), "noop")
+                    ..TaskConfig::new(format!("task-{index}"), "noop")
                 })
                 .collect();
             let job_config_id = submit_job(&store, "quality", tasks)?;
@@ -7809,6 +8384,7 @@ mod tests {
             node_id: node.to_string(),
             task_config_id: task,
             candidates: candidates.iter().map(|id| id.to_string()).collect(),
+            instance_id: None,
         }
     }
 

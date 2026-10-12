@@ -188,6 +188,25 @@ impl Backend {
         Ok(Self::OciRuntime { binary })
     }
 
+    /// The value this backend reports as the `sandbox.vmm` node attribute
+    /// and records in a checkpoint's `compat.vmm.type`.
+    pub(crate) fn vmm_name(&self) -> &'static str {
+        match self {
+            Self::CloudHypervisor { .. } => "cloud-hypervisor",
+            Self::Firecracker { .. } => "firecracker",
+            Self::AppleContainer => "apple-container",
+            Self::OciRuntime { .. } => "oci-runtime",
+        }
+    }
+
+    /// The VMM binary, for the real microVM backends.
+    pub(crate) fn binary(&self) -> Option<&str> {
+        match self {
+            Self::CloudHypervisor { binary } | Self::Firecracker { binary } => Some(binary),
+            Self::AppleContainer | Self::OciRuntime { .. } => None,
+        }
+    }
+
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::CloudHypervisor { .. } => "cloud-hypervisor",
@@ -231,6 +250,49 @@ fn require_kvm() -> R<()> {
     );
 }
 
+/// Every microVM monitor installed on this node, whether or not KVM is
+/// usable. The fingerprint reports a version for each, so a memory checkpoint
+/// taken on the non-default VMM can still find a node that runs it.
+pub(crate) fn installed_vmms() -> Vec<Backend> {
+    let mut found = Vec::new();
+    if !cfg!(target_os = "linux") {
+        return found;
+    }
+    if let Some(binary) = vmm_binary(CLOUD_HYPERVISOR_BIN_ENV, "cloud-hypervisor") {
+        found.push(Backend::CloudHypervisor { binary });
+    }
+    if let Some(binary) = vmm_binary(FIRECRACKER_BIN_ENV, "firecracker") {
+        found.push(Backend::Firecracker { binary });
+    }
+    found
+}
+
+/// The version a VMM binary reports for `--version`, normalized to bare
+/// `X.Y.Z` (Firecracker prints `Firecracker v1.7.0`, cloud-hypervisor
+/// `cloud-hypervisor v41.0.0`). `None` when the binary cannot be run.
+pub(crate) fn vmm_version(binary: &str) -> Option<String> {
+    let output = Command::new(binary).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_vmm_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The first whitespace-separated token that looks like a version, with any
+/// leading `v` dropped.
+pub(crate) fn parse_vmm_version(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|token| token.trim_start_matches('v'))
+        .find(|token| {
+            token.chars().next().is_some_and(|ch| ch.is_ascii_digit()) && token.contains('.')
+        })
+        .map(|token| {
+            token
+                .trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric())
+                .to_string()
+        })
+}
+
 /// The configured binary if set, else the name resolved on `PATH`.
 fn vmm_binary(env_var: &str, default_name: &str) -> Option<String> {
     if let Some(configured) = std::env::var(env_var)
@@ -266,6 +328,40 @@ pub(crate) struct VmSpec {
     /// end is Legion's datapath listening on `<socket>_<port>`
     /// (docs/network-handlers.md, "Sandboxes").
     pub vsock: Option<VsockSpec>,
+    /// The identity disk of a memory-checkpointable sandbox, attached after
+    /// the volume disks as drive `identity`. Its guest device is passed on
+    /// the kernel cmdline as `legion.identity=`, so the guest agent finds it
+    /// without probing.
+    pub identity_disk: Option<PathBuf>,
+    /// A virtio-balloon device, the memory pressure response's `reclaim`
+    /// lever for a guest (docs/resource-enforcement.md, "Memory pressure").
+    /// Configured only for sandboxes that can be memory-checkpointed or that
+    /// set `resources.memoryMax`: the ones that run above a reservation.
+    pub balloon: Option<BalloonSpec>,
+}
+
+/// The balloon device a guest boots with. It starts deflated (the guest
+/// sees all of its memory) and `deflate_on_oom` lets the guest take memory
+/// back before its own OOM killer would act, so inflating it can slow a
+/// guest down but never kill it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BalloonSpec {
+    /// Free page reporting: the guest tells the host about pages it freed,
+    /// so the host reclaims them with no balloon target at all. Needs
+    /// `CONFIG_PAGE_REPORTING` in the guest kernel, and is inert without it.
+    /// cloud-hypervisor only: not every Firecracker release Legion supports
+    /// accepts the field, and an unknown config field fails the boot.
+    pub free_page_reporting: bool,
+}
+
+impl VmSpec {
+    /// Guest device of the identity disk: the next virtio-blk slot after the
+    /// volume disks.
+    pub(crate) fn identity_device(&self) -> Option<String> {
+        self.identity_disk
+            .as_ref()
+            .map(|_| guest_volume_device(self.volume_disks.len()))
+    }
 }
 
 /// The vsock device of a gated sandbox: the guest's context id and the
@@ -291,6 +387,10 @@ pub(crate) struct VmDisk {
     pub read_only: bool,
 }
 
+/// Firecracker's id for the guest NIC. A fork's restore names it to move
+/// the NIC to another TAP device (`network_overrides`).
+pub(crate) const GUEST_NIC_ID: &str = "eth0";
+
 /// A pre-created host TAP device handed to the guest as its NIC. Legion does
 /// not create TAP devices (that needs CAP_NET_ADMIN and a host network plan);
 /// the operator or a network plugin does.
@@ -314,6 +414,9 @@ pub(crate) fn kernel_cmdline(spec: &VmSpec, firecracker: bool) -> String {
     cmdline.push_str(&format!(
         " root={GUEST_ROOT_DEVICE} rw init={GUEST_INIT_PATH}"
     ));
+    if let Some(device) = spec.identity_device() {
+        cmdline.push_str(&format!(" legion.identity={device}"));
+    }
     if let Some(extra) = spec
         .extra_cmdline
         .as_deref()
@@ -345,6 +448,13 @@ pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
         }
         args.push(arg);
     }
+    if let Some(identity) = spec.identity_disk.as_ref() {
+        args.push(format!(
+            "path={},readonly=on,id={}",
+            identity.display(),
+            crate::task_plugins::IDENTITY_DRIVE_ID
+        ));
+    }
     args.push("--cpus".to_string());
     args.push(format!("boot={}", spec.vcpus));
     args.push("--memory".to_string());
@@ -355,6 +465,17 @@ pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
     args.push("off".to_string());
     args.push("--api-socket".to_string());
     args.push(spec.api_socket.display().to_string());
+    if let Some(balloon) = spec.balloon.as_ref() {
+        args.push("--balloon".to_string());
+        args.push(format!(
+            "size=0,deflate_on_oom=on{}",
+            if balloon.free_page_reporting {
+                ",free_page_reporting=on"
+            } else {
+                ""
+            }
+        ));
+    }
     if let Some(tap) = spec.tap.as_ref() {
         let mut net = format!("tap={}", tap.device);
         if let Some(mac) = tap.mac.as_deref() {
@@ -392,6 +513,14 @@ pub(crate) fn firecracker_config(spec: &VmSpec) -> Value {
             "is_read_only": disk.read_only,
         }));
     }
+    if let Some(identity) = spec.identity_disk.as_ref() {
+        drives.push(json!({
+            "drive_id": crate::task_plugins::IDENTITY_DRIVE_ID,
+            "path_on_host": identity.display().to_string(),
+            "is_root_device": false,
+            "is_read_only": true,
+        }));
+    }
 
     let mut config = json!({
         "boot-source": {
@@ -406,7 +535,7 @@ pub(crate) fn firecracker_config(spec: &VmSpec) -> Value {
     });
     if let Some(tap) = spec.tap.as_ref() {
         let mut iface = json!({
-            "iface_id": "eth0",
+            "iface_id": GUEST_NIC_ID,
             "host_dev_name": tap.device,
         });
         if let Some(mac) = tap.mac.as_deref() {
@@ -420,7 +549,31 @@ pub(crate) fn firecracker_config(spec: &VmSpec) -> Value {
             "uds_path": vsock.socket.display().to_string(),
         });
     }
+    if spec.balloon.is_some() {
+        // `free_page_reporting` is deliberately not sent (see BalloonSpec).
+        config["balloon"] = json!({
+            "amount_mib": 0,
+            "deflate_on_oom": true,
+            "stats_polling_interval_s": 0,
+        });
+    }
     config
+}
+
+/// How far to inflate a balloon to take back `request_bytes` more: from
+/// `current_mib`, never past `guest_mib - reserved_mib`, so a guest is never
+/// squeezed below the memory it reserved. Returns the new target in MiB.
+pub(crate) fn balloon_target_mib(
+    current_mib: u64,
+    request_bytes: u64,
+    guest_mib: u64,
+    reserved_mib: u64,
+) -> u64 {
+    let ceiling = guest_mib.saturating_sub(reserved_mib);
+    let request_mib = request_bytes.div_ceil(1024 * 1024);
+    current_mib
+        .saturating_add(request_mib)
+        .min(ceiling.max(current_mib))
 }
 
 /// What the generated guest init runs.
@@ -440,6 +593,11 @@ pub(crate) struct GuestPayload {
     /// worker's own binary, copied into the rootfs) before the command, and
     /// the resolver is the agent on loopback.
     pub guest_agent: bool,
+    /// A sandbox launched for memory checkpoints: init starts
+    /// `/legion/legion guest-resume` in the background, which watches the
+    /// identity disk and refreshes the guest after every restore (new
+    /// allocation id and token, reseeded RNG, resynced clock, `onResume`).
+    pub resume_watch: bool,
 }
 
 /// One volume disk mount inside the guest. A volume with no declared `path`
@@ -531,6 +689,18 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
              fi\n\n"
         ));
     }
+    if payload.resume_watch {
+        // Restores happen with the guest frozen mid-instruction, so nothing
+        // in the guest runs on its own afterward. This watcher notices the
+        // identity disk change and refreshes what a restore made stale.
+        script.push_str(&format!(
+            "if [ -x {GUEST_AGENT_PATH} ]; then\n\
+             \x20   {GUEST_AGENT_PATH} guest-resume >/dev/console 2>&1 &\n\
+             else\n\
+             \x20   echo \"legion: resume handler missing at {GUEST_AGENT_PATH}; a restored guest keeps its old identity\" >&2\n\
+             fi\n\n"
+        ));
+    }
     script.push_str(&format!(
         "if [ -r {GUEST_ENV_PATH} ]; then . {GUEST_ENV_PATH}; fi\n\n"
     ));
@@ -603,7 +773,7 @@ pub(crate) fn install_guest_payload(
             );
         }
     }
-    if payload.guest_agent {
+    if payload.guest_agent || payload.resume_watch {
         install_guest_agent(rootfs)?;
     }
     Ok(())
@@ -778,7 +948,102 @@ mod tests {
             tap: None,
             api_socket: PathBuf::from("/allocs/7/.sandbox/ch.sock"),
             vsock: None,
+            identity_disk: None,
+            balloon: None,
         }
+    }
+
+    #[test]
+    fn the_identity_disk_follows_the_volumes_on_both_vmms() {
+        let mut spec = spec();
+        spec.volume_disks = vec![VmDisk {
+            path: PathBuf::from("/v/disk.img"),
+            read_only: false,
+        }];
+        spec.identity_disk = Some(PathBuf::from("/links/identity.img"));
+        assert_eq!(spec.identity_device().as_deref(), Some("/dev/vdc"));
+        assert!(kernel_cmdline(&spec, true).contains("legion.identity=/dev/vdc"));
+
+        let args = cloud_hypervisor_args(&spec);
+        let disk_at = args.iter().position(|a| a == "--disk").expect("--disk");
+        assert_eq!(args[disk_at + 2], "path=/v/disk.img");
+        assert_eq!(
+            args[disk_at + 3],
+            "path=/links/identity.img,readonly=on,id=identity"
+        );
+
+        let drives = firecracker_config(&spec)["drives"].clone();
+        assert_eq!(drives[2]["drive_id"], "identity");
+        assert_eq!(drives[2]["path_on_host"], "/links/identity.img");
+        assert_eq!(drives[2]["is_read_only"], true);
+
+        // Without one, nothing changes: no extra drive, no cmdline arg.
+        spec.identity_disk = None;
+        assert!(!kernel_cmdline(&spec, true).contains("legion.identity"));
+        assert_eq!(
+            firecracker_config(&spec)["drives"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_balloon_is_configured_on_both_vmms_only_when_asked() {
+        let mut spec = spec();
+        assert!(!cloud_hypervisor_args(&spec).contains(&"--balloon".to_string()));
+        assert!(firecracker_config(&spec).get("balloon").is_none());
+
+        spec.balloon = Some(BalloonSpec {
+            free_page_reporting: true,
+        });
+        let args = cloud_hypervisor_args(&spec);
+        let at = args
+            .iter()
+            .position(|arg| arg == "--balloon")
+            .expect("--balloon");
+        assert_eq!(
+            args[at + 1],
+            "size=0,deflate_on_oom=on,free_page_reporting=on"
+        );
+        let balloon = firecracker_config(&spec)["balloon"].clone();
+        assert_eq!(balloon["amount_mib"], 0);
+        assert_eq!(balloon["deflate_on_oom"], true);
+        assert!(balloon.get("free_page_reporting").is_none());
+
+        spec.balloon = Some(BalloonSpec {
+            free_page_reporting: false,
+        });
+        let args = cloud_hypervisor_args(&spec);
+        let at = args.iter().position(|arg| arg == "--balloon").unwrap();
+        assert_eq!(args[at + 1], "size=0,deflate_on_oom=on");
+    }
+
+    #[test]
+    fn balloon_targets_never_squeeze_below_the_reservation() {
+        const MIB: u64 = 1024 * 1024;
+        // 4 GiB guest, 512 MiB reserved: at most 3584 MiB in the balloon.
+        assert_eq!(balloon_target_mib(0, 1000 * MIB, 4096, 512), 1000);
+        assert_eq!(balloon_target_mib(3000, 1000 * MIB, 4096, 512), 3584);
+        assert_eq!(balloon_target_mib(3584, MIB, 4096, 512), 3584);
+        // Partial MiB rounds up; a guest with no room above its
+        // reservation gets nothing.
+        assert_eq!(balloon_target_mib(0, 1, 4096, 512), 1);
+        assert_eq!(balloon_target_mib(0, 100 * MIB, 512, 512), 0);
+    }
+
+    #[test]
+    fn vmm_versions_parse_from_both_banners() {
+        assert_eq!(
+            parse_vmm_version("Firecracker v1.7.0\n").as_deref(),
+            Some("1.7.0")
+        );
+        assert_eq!(
+            parse_vmm_version("cloud-hypervisor v41.0.0-dirty\n").as_deref(),
+            Some("41.0.0-dirty")
+        );
+        assert_eq!(parse_vmm_version("no version here"), None);
     }
 
     #[test]
@@ -852,10 +1117,32 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpointable_guest_starts_the_resume_handler_before_the_command() {
+        let payload = GuestPayload {
+            command: vec!["/bin/sh".into()],
+            resume_watch: true,
+            ..GuestPayload::default()
+        };
+        let script = render_init_script(&payload);
+        let watch_at = script
+            .find("/legion/legion guest-resume")
+            .expect("resume handler line");
+        let command_at = script.find("'/bin/sh'").expect("command");
+        assert!(watch_at < command_at, "the handler starts first");
+        assert!(!script.contains("guest-agent"));
+        let plain = render_init_script(&GuestPayload {
+            command: vec!["/bin/sh".into()],
+            ..GuestPayload::default()
+        });
+        assert!(!plain.contains("guest-resume"));
+    }
+
+    #[test]
     fn a_gated_guest_starts_the_agent_before_the_command() {
         let payload = GuestPayload {
             command: vec!["/bin/sh".into()],
             guest_agent: true,
+            resume_watch: false,
             ..GuestPayload::default()
         };
         let script = render_init_script(&payload);
@@ -926,6 +1213,7 @@ mod tests {
                 },
             ],
             guest_agent: false,
+            resume_watch: false,
         };
         let script = render_init_script(&payload);
 
@@ -971,6 +1259,7 @@ mod tests {
                 read_only: false,
             }],
             guest_agent: false,
+            resume_watch: false,
         };
 
         let dir = tempfile::tempdir()?;

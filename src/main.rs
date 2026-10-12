@@ -29,7 +29,9 @@ fn cli() -> Command {
         .subcommand(cmd::service::config())
         .subcommand(cmd::net::config())
         .subcommand(cmd::guest_agent::config())
+        .subcommand(cmd::guest_resume::config())
         .subcommand(cmd::volume::config())
+        .subcommand(cmd::snapshot::config())
         .subcommand(cmd::state::config())
         .subcommand(cmd::raft::config())
         .subcommand(cmd::acl::config())
@@ -84,7 +86,9 @@ async fn main() -> R<()> {
         Some(("service", sub_matches)) => cmd::service::handle(sub_matches).await?,
         Some(("net", sub_matches)) => cmd::net::handle(sub_matches).await?,
         Some(("guest-agent", sub_matches)) => cmd::guest_agent::handle(sub_matches).await?,
+        Some(("guest-resume", sub_matches)) => cmd::guest_resume::handle(sub_matches).await?,
         Some(("volume", sub_matches)) => cmd::volume::handle(sub_matches).await?,
+        Some(("snapshot", sub_matches)) => cmd::snapshot::handle(sub_matches).await?,
         Some(("state", sub_matches)) => cmd::state::handle(sub_matches).await?,
         Some(("raft", sub_matches)) => cmd::raft::handle(sub_matches).await?,
         Some(("acl", sub_matches)) => cmd::acl::handle(sub_matches).await?,

@@ -68,7 +68,7 @@ fn sandbox_task() -> TaskConfig {
     TaskConfig {
         stateful: Some(StatefulConfig {
             mode: InstanceMode::Keyed,
-            id_source: None,
+            require_id: false,
             initial_instances: None,
             on_lost: None,
             storage: None,

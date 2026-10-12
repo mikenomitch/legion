@@ -32,7 +32,6 @@
                 # sandbox's identity (and its storage) can never leak into a
                 # new one.
                 mode = "keyed",
-                idSource = "uuid",
                 # The persistent half of the sandbox. `mode = "block"` because
                 # a guest kernel attaches a block device, not a host
                 # directory = the local-dir driver serves a formatted disk
@@ -56,10 +55,9 @@
                     "echo \"boots so far: $(wc -l < /workspace/boots.log)\"; " ++
                     "sleep 3600",
                 ],
-                # Guest size. The microVM gets exactly this; the scheduler's
-                # `resources` block below governs placement.
+                # Guest vCPUs. Guest RAM follows `resources` below
+                # (memoryMax, else memory), so placement and the VM agree.
                 vcpus = 1,
-                memory_mib = 512,
                 # Writable scratch inside the ephemeral root disk. Everything
                 # outside /workspace is discarded when the allocation ends.
                 rootfs_headroom_mib = 256,
@@ -74,13 +72,15 @@
                 # hypervisor = "cloud-hypervisor",
                 # kernel = "/var/lib/legion/kernels/vmlinux",
                 # kernel_args = "quiet",
-                # Guest NIC backed by a *pre-created* host TAP device. Legion
-                # does not create TAP devices (that needs CAP_NET_ADMIN and a
-                # host addressing plan). Default is loopback-only.
-                # network = { mode = "tap", tap = "tap0" },
+                # Guest NIC on a TAP device Legion creates per instance and
+                # attaches to a host bridge you own (needs CAP_NET_ADMIN on
+                # the worker). Default is loopback-only. A fixed device name
+                # (tap = "tap0") is refused on a keyed task, since it fits
+                # one guest per node.
+                # network = { mode = "tap", tap = "auto", bridge = "br0" },
             },
             resources = {
-                cpus = 1,
+                cpu = 1000,
                 memory = 512,
             },
             constraints = {

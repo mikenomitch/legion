@@ -70,7 +70,7 @@ Routes in `App.tsx`:
 - `/manager` (+ `/manager/:id`)
 - `/raft`, `/events`, `/kv`, `/access`, `/api`, `/state-explorer`,
   `/observability` (shown only when the manager reports o11y enabled),
-  `/testing`
+  `/testing` (unlisted component fixtures, see below)
 - anything else renders a not-found card naming the path
 
 A shared layout provides the grouped sidebar nav, a slim topbar
@@ -214,7 +214,10 @@ the Access page reports it instead.
 - `Nodes.tsx`: the worker index. Status is the node's liveness
   (`active`/`lost`/…). The health-check summary has its own column, a badge
   marks any availability other than `available`, and the last column is
-  labelled Heartbeat because that is what it shows.
+  labelled Heartbeat because that is what it shows. A "Memory used /
+  reserved" column shows two thin bars per node from `GetNodeUsage`, the
+  oversubscription ratio, and a red dot while the node is under memory
+  pressure (see [Usage, pressure, and snapshots](#usage-pressure-and-snapshots)).
 - `Jobs.tsx`: job list and on-demand spec retrieval, with status chips above
   the table. The chips come from `ListJobsReply.status_counts`, which the
   server counts over the whole query-matched set before the status filter.
@@ -240,10 +243,15 @@ the Access page reports it instead.
     whole card is hidden when `GetJobScaleStatus` is denied.
   - marks stateful tasks with a "stateful · slot/keyed" badge (plus storage
     path). For jobs with stateful tasks or live `ListInstances` rows, it
-    renders a polled read-only Instances panel (id, mode, color-coded state,
-    slot, current allocation, storage handle, created). Keyed instance
-    create/destroy is CLI-only (`legion instance ...`). The UI does not
-    mutate instances.
+    renders a polled Instances panel (`components/InstancesTable.tsx`: id,
+    mode, color-coded state, slot, current allocation, memory, CPU, idle,
+    storage handle, created) and a Snapshots card
+    (`components/SnapshotsPanel.tsx`). Keyed instance create/destroy is
+    CLI-only (`legion instance ...`). The only instance mutation in the UI is
+    restoring one from a snapshot.
+  - shows a "Memory pressure" card, beside "Preemption history", when a
+    node's pressure response acted on this job's allocations, and Memory and
+    Idle columns on the allocation table.
 - `pages/details/TaskDetail.tsx`: definition, volumes, artifacts, discovery,
   health, runtime allocations, exec, logs. The header badge is the same live
   per-task status the job page's task cards show
@@ -254,7 +262,8 @@ the Access page reports it instead.
   call the `SetNodeAvailability` RPC behind `legion node cordon|drain|uncordon`
   ([node availability](jobs-tasks-and-scheduling.md)) and are gated by
   `node:write` on the node's pool. The RPC's reply shows under the header,
-  along with a note explaining a drained node.
+  along with a note explaining a drained node. The Usage card and the node's
+  "Memory pressure" card are described below.
 - `Services.tsx`: the discovery catalog (`ListServices`) with healthy/total
   counts. `pages/details/ServiceDetail.tsx` resolves endpoints
   (`ResolveService`, unhealthy included) and renders the same layered
@@ -270,7 +279,10 @@ the Access page reports it instead.
 - `Rollouts.tsx`: rollout list, per-group status, event logs, manual advance
   action. The detail page polls at the live cadence.
 - `Events.tsx`: live scheduler event feed with filtering and pause/resume.
-  The job and node chips on each row link to their pages.
+  The job and node chips on each row link to their pages. Expanded
+  `node.pressure` rows show the detail and hint as labeled lines, and
+  `snapshot.*` rows show snapshot, instance, kind, size, and error, above
+  the raw JSON.
 - `KeyValue.tsx`: key tree browser and CRUD/patch editor.
 - `Manager.tsx`: manager config snapshots.
 - `Raft.tsx`: under Cluster navigation. Polled consensus status, recent raft
@@ -279,7 +291,11 @@ the Access page reports it instead.
 - `components/LogViewer.tsx`: the live task log tail, with stream and
   allocation filters and **Find in logs** (case-insensitive, hits
   highlighted, "N of M lines match").
-- `TestingUtils.tsx`: an empty placeholder page with no features.
+- `TestingUtils.tsx`: unlisted (`/testing`), lazy-loaded. Renders the
+  usage, pressure, instance (suspended, idle countdown, last stop, forks),
+  snapshot (published, named, fork and suspend checkpoints), and content
+  locality components from fixtures in `ui/src/fixtures/`, for shapes a dev
+  cluster cannot produce. Nothing on it calls the manager.
 
 ## Service Discovery
 
@@ -313,6 +329,89 @@ Storage shows up wherever you'd ask "where is my data"
   owning instance, and node.
 - **Worker detail**: volumes materialized on that host, with a note that
   draining or losing the node strands the node-local ones.
+
+## Usage, pressure, and snapshots
+
+Measured usage, the memory pressure response
+([resource-enforcement.md](resource-enforcement.md)), suspend, resume, fork,
+and snapshots ([suspend-and-resume.md](suspend-and-resume.md)), and content
+locality ([artifacts.md](artifacts.md)) appear on the pages where their
+questions get asked. `utils/usage.ts`, `utils/instances.ts`,
+`utils/snapshots.ts`, and `utils/events.ts` hold the pure helpers, so the
+pages and the fixtures share one vocabulary.
+
+- **Worker page, Usage card** (`components/NodeUsagePanel.tsx`), from
+  `GetNodeUsage`: memory and CPU capacity with the `×ratio` when
+  oversubscribed, reserved (percent of what the scheduler packs against) and
+  used (percent of physical) bars, the pressure status (`ok`, `under
+  pressure`, `response off`, `status unknown`, `not reported`), every
+  allocation's res/max, used, peak, CPU, and idle, and the "Under pressure,
+  in order" list with a chip per step (`suspend` included). It matches
+  `legion node usage`. A node that reports cores but no clock speed (Apple
+  Silicon) shows `10 cores` and measures CPU use in cores. The old
+  reservation-only card stays for custom resources, and for the whole page
+  when the manager has no `GetNodeUsage` or the caller lacks `node:read`.
+- **Worker page, Content and locality card**
+  (`components/NodeContentCard.tsx`), from `GetNodeContent`: whether the
+  worker can checkpoint and publish, the snapshots captured here or fetched
+  or warmed here with their parts held, and every advertised digest with the
+  snapshot and role it belongs to and how many nodes hold it. When the
+  manager holds no content report for the node, the card says why.
+- **Workers index, Memory column**, from one `ListNodeUsage` call per poll
+  (one `GetNodeUsage` per row against a manager without it).
+- **Memory pressure cards** (`components/PressureHistory.tsx`) read
+  `node.pressure` events (job page by job, worker page by node) and put each
+  action's detail and hint on their own lines, with the instance when the
+  event names one. They need `operator:read`, like every event view, and are
+  hidden when empty.
+- **Instances card** on the job page (`components/InstancesPanel.tsx` and
+  `components/InstancesTable.tsx`): a state filter, and per instance its
+  state (`suspended` has its own accent tone, with the suspend reason and
+  any operation in flight), memory and CPU, idle time with a live countdown
+  to the idle suspend, the checkpoint (kind, local or published, size, node,
+  age) with the last suspend and restore durations, fork lineage, storage,
+  and why the platform last stopped it (`last_stop`, with the hint). Keyed
+  instances get Suspend (with a kind menu when both kinds are possible),
+  Resume, Resume cold, and Fork (count 1 to 10, and spread only when the
+  manager allows it), each a two-step confirm. Rows are keyed by instance
+  id and cells read their row through an accessor, so an armed confirm
+  survives every poll.
+- **Snapshots card** on the job page: kind, purpose, state, durability,
+  node, size, created, and expiry per snapshot, with names shown and
+  removable, and a row expansion that loads the manifest, pause time, fork
+  lineage, and which nodes hold the parts (`GetSnapshot`). Take snapshot
+  (with publish when the manager allows it; memory is a two-step confirm
+  because it pauses the guest), Restore (two-step, `local` or `published`
+  manual snapshots of keyed, running instances), Name, Warm (published
+  snapshots), and Delete (two-step).
+- **Eligibility.** Every Suspend, Fork, spread, and memory snapshot control
+  reads `InstanceInfo.checkpoint_support`, which the manager computes with
+  the same checks the RPCs apply, and shows its blocker message as the
+  tooltip. Against a manager without the field the UI falls back to the job
+  spec.
+- **Job status.** The manager stores `done` for every accepted job. The job
+  page shows `running` while any allocation or instance of the job is live.
+- **Events.** `snapshot` and `instance` are filter categories, and their
+  expanded rows show the snapshot, instance, kind, size, durations, forks,
+  and error above the raw JSON.
+- **Tolerance.** Every field the manager may not send renders as `-` or a
+  named state rather than an error. Unknown snapshot states and purposes
+  render as plain badges. Each new RPC treats `Unimplemented` and a denied
+  permission as "no card".
+
+Known limitations:
+
+- Pressure history comes from the bounded event journal and needs
+  `operator:read`. A job-scoped token sees no Memory pressure card, though
+  each instance row still shows its own last stop.
+- The Jobs index lists the stored status, so a running job reads `done`
+  there.
+- Instances, including from a snapshot (`legion instance create
+  --from-snapshot`), are created and destroyed from the CLI only.
+- The content card shows no content store budgets: `GetNodeContent` reads
+  the location index, which carries digests and sizes but not classes.
+- A macOS worker reports no usage, so the idle countdown and populated usage
+  are only visible on Linux workers with enforcement on, and on `/testing`.
 
 ## Job Templates
 
@@ -353,8 +452,11 @@ same rule that a selector never matches a request without that attribute.
   changing.
 - **Mutating controls** (stop/destroy job, scale, cordon/drain/uncordon,
   rollout advance/stop, KV save/delete/patch, raft commands, saved-query
-  writes, exec and actions, template publish/delete) render disabled with a
-  title explaining why.
+  writes, exec and actions, template publish/delete, snapshot
+  create/delete/restore) render disabled with a title explaining why. The
+  Snapshots card is hidden without `snapshot:read` on the job. Take snapshot
+  and Delete need `snapshot:write`, and Restore needs `snapshot:read` and
+  `job:write`.
 - **Access page** shows admin tabs only with `acl:read` (worker join needs
   `node:read`).
 

@@ -1,12 +1,91 @@
-# Judgement Calls: Authenticated, Reachable Worker Plane
+# Judgement Calls: Authenticated Worker Plane and Isolated Workloads
 
 Plan: [worker-plane-auth-plan.md](../plans/worker-plane-auth-plan.md)
 
 Entries are ranked by project impact, highest first. An entry's number is its
 rank. These were made while writing the plan, before any code, so each one is
-also an open invitation to argue in review.
+also an open invitation to argue in review. Entries 1, 2, 4, 6, 7, 10, 13,
+14, and 16 were added on 2026-10-11 when the plan took on local workload
+isolation and folded in the sandbox-exec plan's amendments, which also
+extended entry 12. Entry 16 reverses the plan's earlier call to keep a
+plaintext path for one release.
 
-## 1. Managers dial workers over mTLS, not a worker-initiated reverse channel
+## 1. ACLs are on by default, and the first token is minted at first start
+
+`acl.enabled` defaults to `true`. The manager mints the initial management
+token itself at first start, writes it to `<dataDir>/bootstrap-token` and
+(when absent) `~/.legion/token`, both `0600`, and the open `BootstrapAcl`
+RPC is removed.
+
+```text
+INFO ACLs are on. Created the initial management token (accessor 7c1f...).
+     Secret written to /var/lib/legion/bootstrap-token and ~/.legion/token (mode 0600).
+```
+
+**Alternatives.**
+- (a) Keep ACLs off and bind the manager to a Unix socket for local use.
+- (b) Keep ACLs off but require a token from non-loopback callers.
+- (c) Keep ACLs off and deny allocation cgroups at the firewall.
+- (d) Turn ACLs on but keep `legion acl bootstrap` as the way to get the
+  first token, which is Nomad's and Consul's model.
+
+**Trade-off.** Every API call now needs a token. Scripts off the manager's
+machine need `LEGION_TOKEN`, the UI asks for a token on first visit, and every
+test harness that assumed "off" has to say so. Infrastructure-as-code loses
+the `--secret` flag and gains `acl.bootstrapSecretFile` instead.
+
+**Why.** With ACLs off, any task on any node owns the cluster: co-located
+tasks over loopback, and every other task over the network, because workers
+must reach the manager anyway. (a) and (b) protect nothing in scope. A
+host-network task is a loopback caller, the gated proxy dials from the
+worker's loopback, and a root `exec` task can open any socket. (c) is in the
+plan as defense in depth (§6.13), but it can't protect a remote manager, a
+node without `nftables`, or macOS. (d) leaves an open endpoint that any local
+task can race to after first start or after a recovery. Minting at first
+start into a root-only file is what kubeadm and k3s do, and because the CLI
+reads `~/.legion/token`, the laptop flow still has nothing to configure.
+**Ease is preserved, and the default stops being a takeover.**
+
+## 2. Linux containers are gated by default, with default-deny egress
+
+`network.mode = "auto"` resolves to `gated` for `container` on Linux nodes.
+A gated container with no policy denies egress with `gated-default`.
+`network.mode = "host"` is the explicit opt-in and needs the `host` grant.
+
+```nickel
+network = { egress = { allow = ["api.stripe.com:443"] } },   # open one host
+network = { mode = "host" },                                # opt out (host grant)
+```
+
+**Alternatives.**
+- (a) **Bridge networking**: a veth pair and NAT per allocation, with
+  `nftables` blocking the host and metadata. This is Docker's default and
+  Nomad's opt-in `bridge` mode. UDP, ICMP, Java, and database drivers all keep
+  working.
+- (b) **Gated with allow-by-default**: a private namespace and the host
+  guard, but egress open through the proxy unless a policy says otherwise.
+- (c) Keep `host` as the default and rely on the kernel host guard (§6.13).
+
+**Trade-off.** A container that dials out needs an `egress.allow` line.
+No raw UDP, no ICMP, IPv4 only, and tools that ignore proxy variables (Java's
+default client, most database drivers) have no route, so they need external
+upstreams or `host`. Every container start pays for a namespace. Services
+keep working only because Phase 3 also gives every gated allocation ingress
+twins and a resolver.
+
+**Why.** The gated-sandbox plan already argues for deny on every gated
+runtime, because one mode with two defaults is the kind of thing nobody
+remembers at 3am. (a) keeps egress policy cooperative and adds a second
+datapath with IPAM next to gated, which is the "three concepts where we wanted
+one" pattern Legion exists to avoid. The `bridge` mode name stays reserved for
+the datapath plugin. (b) is one line away for any author who wants it
+(`egress = { policy = "allow" }`), and the host guard holds under it, so the
+default can be the strict one. (c) leaves every host daemon and every
+non-root-but-hostile container one `connect()` from the node. **Safety and
+one consistent concept won over compatibility.** Revisit when transparent
+capture lands in gated namespaces, which removes the proxy-awareness cost.
+
+## 3. Managers dial workers over mTLS, not a worker-initiated reverse channel
 
 Workers keep a listener, and managers dial it with mutual TLS.
 
@@ -33,17 +112,57 @@ exist. **Simplicity and performance won over NAT support.**
 $ legion join lgnjoin_...   # plus: allow tcp/4848 from the managers
 ```
 
-## 2. The worker binds all interfaces by default
+## 4. The host guard is a node-owned floor below policy
 
-Once every privileged RPC requires a manager certificate, the worker binds
-`0.0.0.0:4848` with no flag.
+Loopback, the node's own addresses, link-local, and known metadata addresses
+are denied for every allocation before policy runs. Only the node's operator
+can open a hole, one `ip:port` at a time, in worker config. The same floor is
+enforced in the datapath for gated tasks and by `nftables` for host-mode
+tasks.
+
+```nickel
+hostGuard = { allow = ["10.0.1.7:9100"] },   # worker config, not job config
+```
+
+```text
+Legion-Denied-By: host-guard
+Legion-Denied-Reason: 169.254.169.254 is link-local (cloud metadata); allocations may not reach it
+```
+
+**Alternatives.**
+- (a) Ship the floor as a stored `require` policy object that cluster admins
+  can edit or delete, so it uses the existing policy machinery.
+- (b) Let a job opt out (`network.hostAccess = true`) for the jobs that
+  legitimately need a host service.
+
+**Trade-off.** A job that legitimately needs a host service (a node exporter
+scraper, a local license daemon) can't get it without the node's operator.
+Two enforcement points (datapath and kernel) implement one rule, so they can
+drift. A gated task can't reach a same-node service by the node's IP through
+the proxy, only through an upstream.
+
+**Why.** (a) puts the floor where a `net:write` mistake, or a compromised
+admin token, removes it from every node at once, and policy merge rules
+would have to treat it as special anyway so job rules can't widen it. (b)
+turns the floor back into a default that a job author, the person the floor
+protects against, can turn off. The thing at risk is the node, so the node's
+config owns the exception. One name (`host-guard`) for both enforcement
+points keeps the concept single for the person reading a denial. Shared
+address-class code and one spot-check table keep them from drifting.
+**Simplicity of the mental model won over flexibility.**
+
+## 5. The worker binds all interfaces by default
+
+Once every privileged RPC requires a manager certificate or a ticket, the
+worker binds `0.0.0.0:4848` with no flag.
 
 **Alternative.** Keep the loopback default and require
 `LEGION_WORKER_HOST=0.0.0.0` for multi-host. Secure-by-default in the narrow
 sense: nothing listens on the network unless asked.
 
 **Trade-off.** A TLS listener is exposed on every worker by default. Its attack
-surface is the TLS stack and `StartClaim`'s ticket verification.
+surface is the TLS stack and the ticket verifiers for `StartClaim` and
+direct `ExecTask`.
 
 **Why.** The opt-in path is the bug we are fixing. `legion join` on a second
 box would still silently break exec, logs, and the mesh until someone found
@@ -51,7 +170,64 @@ the env var. The listener is safe to expose because of 6.1, not because of the
 bind, and a default that only works on one machine contradicts "adding a
 worker is two commands." **Ease won.**
 
-## 3. One cluster CA, with roles in URI SANs
+## 6. `exec` stays host-level, and gated `exec` refuses to run as root
+
+`exec` keeps `network.mode = "host"` by default and keeps running as the
+worker's user when `user` is unset. A gated `exec` task must name a non-root
+`user`, or submit refuses it.
+
+```text
+Error: task "worker" sets network.mode = "gated" but runs as root.
+A root exec task can leave its network namespace, so gated would not hold.
+Hint: set user = "nobody" (or another unprivileged user), or use runtime = "container"
+```
+
+**Alternatives.**
+- (a) Gate `exec` by default too, like containers.
+- (b) Run `exec` as `nobody` by default, as Nomad's `exec` driver does.
+
+**Trade-off.** A default `exec` task is still root on its node, and the
+kernel host guard can't stop it (it can delete the table). The plan contains
+that by permission (entry 7), not by isolation.
+
+**Why.** `exec` exists to run host binaries with host paths and users. A
+namespace around a root process is not a boundary, because it can `setns`
+back, so (a) would add a default that breaks real `exec` jobs and still not
+hold. (b) breaks every `exec` job that writes outside its task directory, and
+Nomad itself pairs it with `raw_exec`, the unisolated runtime, disabled by
+default. Legion's `exec` is that unisolated runtime, so the honest equivalent
+is to make it a privilege and to say in the docs that untrusted code belongs
+in `container` or `sandbox`. **Honesty and compatibility won over a default
+that looks safer than it is.**
+
+## 7. Host-level jobs need the `host` grant on `job:write`
+
+The existing `host` flag, today only on `exec` rules, becomes valid on `job`
+rules. Submitting a job with a host-level task (`exec`, a container with host
+networking or relaxed security, a Linux `dev` sandbox) needs it.
+
+```text
+Error: PermissionDenied: job "backup" has a host-level task ("dump" uses runtime "exec").
+Submitting it needs a job:write rule with host = true.
+```
+
+**Alternatives.**
+- (a) A worker-config switch per runtime, like Nomad's `raw_exec` plugin
+  `enabled = false`, so a pool can refuse host-level work.
+- (b) A new ACL resource (`host`) instead of a flag.
+
+**Trade-off.** Teams that deploy `exec` jobs today need their policies
+updated. The check runs on the write path for every submit, after parsing.
+
+**Why.** "Can deploy" meaning "is root on every node" is the gap. The
+vocabulary already has `host` for exactly this distinction on exec, so
+extending it to `job` adds no new concept, where (b) would add one. (a) is a
+placement-time refusal that surfaces late and per node, and says nothing
+about who may ask. A node-pool restriction is still available through a
+`require` policy that imposes `mode = "gated"`. **Extensibility of the
+existing ACL vocabulary won over a new knob.**
+
+## 8. One cluster CA, with roles in URI SANs
 
 The existing mesh CA signs manager certificates too. Roles live in the URI SAN
 (`legion://manager/<id>`, `legion://node/<id>`), checked on every call.
@@ -69,7 +245,7 @@ location. Nomad and Consul both run one CA with role names.
 **Simplicity won.** Revisit if the CA ever moves to an external provider for
 one plane but not the other.
 
-## 4. The join token pins the CA hash
+## 9. The join token pins the CA hash
 
 `legion join-token create` embeds `caHash = "sha256:..."`, and the worker
 refuses a manager whose CA does not match.
@@ -87,45 +263,148 @@ kubeadm's `--discovery-token-ca-cert-hash`, folded into the token so there is
 still nothing extra to type.
 
 ```console
-error: the manager at http://10.0.0.5:4747 presented cluster CA sha256:51aa07...,
+error: the manager at https://10.0.0.5:4747 presented cluster CA sha256:51aa07...,
 but this join token pins sha256:9c1e4f...
 ```
 
-## 5. Workers send a CSR, departing from mesh_ca's manager-generated keys
+## 10. Per-allocation user namespaces and Docker's seccomp profile for Linux containers
+
+Every Linux container gets its own 65,536-id host range, a cgroup namespace,
+and Docker's default seccomp profile. Opting out of either needs the `host`
+grant.
+
+```nickel
+config = { image = "postgres:17", command = ["postgres"],
+           security = { userNamespace = true, seccomp = "default" } },   # the defaults
+```
+
+**Alternatives.**
+- (a) One shared subordinate range for every container, as Docker's
+  `userns-remap` does.
+- (b) Require images to run as non-root, as Kubernetes' `restricted` profile
+  does, and skip user namespaces.
+- (c) gVisor (`runsc`) as the default runtime.
+- (d) Widen capabilities to Docker's 14 now that user namespaces make them
+  safer, for image compatibility.
+
+**Trade-off.** Volumes need idmapped mounts, so older kernels and runtimes
+fail volume-backed starts with a named reason. Files written into host
+volumes before the change need re-owning once. The worker owns an id pool
+and a slot table. Mounting `sysfs` in a user namespace forces an ordering
+decision with the gated namespace that Phase 6 has to settle first.
+
+**Why.** Today container root is host uid 0 with the whole syscall surface
+open. (a) lets a container that escapes its mount namespace own every other
+container's files. (b) breaks the large share of images that run as root,
+and moves the burden to every job author. (c) costs syscall-heavy workloads
+and compatibility, and Legion already ships the strong boundary for
+untrusted code as the microVM `sandbox` runtime. (d) is not needed: the three
+capabilities Legion keeps are already tighter than Docker's, and widening
+them is a compatibility change this plan has no evidence for. Because the
+worker extracts layers itself, shifting ownership costs nothing extra.
+**Safety won, and the extraction path we already own kept it cheap.**
+
+## 11. Workers send a CSR, departing from mesh_ca's manager-generated keys
 
 The worker generates its key and sends a CSR. The manager no longer returns
-private keys to new workers.
+private keys to anyone.
 
 **Alternative.** Keep the current design (`src/manager/mesh_ca.rs:72-75`):
 the manager generates both halves, which its own comment justifies as "a CSR
 flow is more ceremony than a 24-hour credential warrants."
 
-**Trade-off.** More code on both sides, a persisted key on the worker, and two
-issuance paths during the compatibility window.
+**Trade-off.** More code on both sides and a persisted key on the worker.
 
 **Why.** That comment was right when the cert guarded only mesh flows. Now it
 guards a node's identity to the control plane, and the channel it travels over
-stays plaintext until Phase 3. A key that never leaves the node removes a
-whole class of on-path attacks for the cost of one optional proto field.
+stays plaintext until Phase 4. A key that never leaves the node removes a
+whole class of on-path attacks for the cost of one proto field. The old path
+is removed rather than kept beside the new one (entry 16).
 
-## 6. `StartClaim` shares the listener, with optional client certs
+## 12. One listener with per-RPC caller classes, including tickets on `ExecTask`
 
-One TLS listener. Manager-only RPCs check for a manager certificate, and
-`StartClaim` keeps ticket-only authorization.
+One TLS listener. Manager-only RPCs check for a manager certificate,
+`StartClaim` keeps ticket-only authorization, and `ExecTask` admits a manager
+certificate or, when the worker sets `exec.direct = true`, an exec ticket. The
+classification test allows more than one class per RPC.
 
-**Alternative.** A second port for edge-boot routers, with mandatory client
-certs on the manager port.
+```rust
+("ExecTask", &[Caller::Manager, Caller::Ticket]),
+```
+
+**Alternatives.**
+- (a) A second port for edge-boot routers and direct-exec clients, with
+  mandatory client certs on the manager port.
+- (b) A separate `DirectExec` RPC for ticket holders, so every RPC has
+  exactly one class.
 
 **Trade-off.** The TLS handshake succeeds for anyone. Authorization happens
 per RPC, so a missing check on a new RPC would be a hole. The classification
-test exists to catch that.
+test exists to catch that, and it now has to reason about RPCs with two
+classes, so it also sends one request per class to prove the table matches
+the handlers.
 
-**Why.** One port per worker keeps firewall rules and docs simple, and routers
-benefit from TLS too, since they now know they reached the real node. The
-per-RPC check mirrors how the manager already enforces ACLs, including the
-"fail the build if unclassified" guard.
+**Why.** One port per worker keeps firewall rules and docs simple, and
+routers and exec clients benefit from TLS too, since they now know they
+reached the real node. (b) would duplicate the exec session protocol for a
+difference that is only in who may open it. The sandbox-exec plan asked for
+the two-class shape (its §9), and folding it here keeps one table as the
+source of truth. A request that carries a non-manager certificate is refused
+rather than downgraded to the ticket path, so the two classes can't be mixed.
+The per-RPC check mirrors how the manager already enforces ACLs, including
+the "fail the build if unclassified" guard.
 
-## 7. The advertise address is auto-detected from the route to the manager
+## 13. Ticket verifiers need the JWKS over TLS that pins the cluster CA
+
+From Phase 4, a worker refuses to build a ticket verifier (edge boot or
+direct exec) over a plaintext non-loopback manager address. Direct exec
+therefore needs worker-plane-auth Phases 1 and 4.
+
+```text
+error: exec.direct = true needs the cluster JWKS over TLS, but the manager
+address is http://10.0.0.5:4747
+```
+
+**Alternatives.**
+- (a) Keep fetching over plain HTTP, as edge boot does today, and document
+  the exposure.
+- (b) Deliver the JWKS on the heartbeat reply.
+
+**Trade-off.** Direct exec can't ship before the encrypted worker channel.
+Edge boot keeps today's exposure until Phase 4 lands.
+
+**Why.** A ticket is only as trustworthy as the keys that verify it. Over
+plain HTTP, anyone on the path between a worker and its manager can swap the
+JWKS and mint tickets that open shells. (b) rides the same plaintext channel,
+so it moves the problem without fixing it. Refusing to run over plaintext
+makes the dependency visible at start instead of hiding it in a doc.
+**Safety won over shipping direct exec one phase earlier.**
+
+## 14. The proxy judges resolved addresses and dials the address it judged
+
+For a hostname, the proxy and the external-upstream dialer resolve first,
+judge every address against the host guard and CIDR rules, and dial only an
+address that passed. Name rules still match on the name.
+
+**Alternatives.**
+- (a) Keep judging names as names and rely on the kernel guard to catch
+  bad addresses at dial time.
+- (b) Resolve to judge, but let the dial resolve again.
+
+**Trade-off.** Resolution moves before the verdict on every named
+connection, so a slow resolver now delays the `403` as well as the connect.
+The dialer has to take a resolved address and keep the original name for
+SNI and the `Host` header.
+
+**Why.** Today a CIDR rule never sees a hostname, so the documented metadata
+rule is bypassed by any name that resolves to `169.254.169.254`, by
+`localhost`, or by a decimal literal like `2130706433`. (a) doesn't work,
+because the proxy dials from the worker, which the kernel guard deliberately
+doesn't match. (b) leaves a DNS-rebinding window between the verdict and the
+dial. Resolution already happens on every named dial, so judging its result
+adds no lookup. **Correctness won, at no performance cost.**
+
+## 15. The advertise address is auto-detected from the route to the manager
 
 The worker advertises the local address it uses to reach its manager, unless
 `LEGION_WORKER_ADVERTISE_ADDR` or `--advertise-addr` says otherwise.
@@ -134,7 +413,7 @@ The worker advertises the local address it uses to reach its manager, unless
 non-loopback interface.
 
 **Trade-off.** Behind NAT, or with asymmetric routing, the guess is wrong and
-only the Phase 2 probe tells you.
+only the Phase 8 probe tells you.
 
 **Why.** On the common topology (managers and workers on one private network)
 the source address toward the manager is exactly the address the manager
@@ -142,16 +421,26 @@ should dial back, and a co-located worker still gets `127.0.0.1`. "First
 non-loopback interface" picks Docker bridges and VPN tunnels. Requiring a flag
 breaks the two-command join.
 
-## 8. Plaintext stays allowed only to loopback, for one release
+## 16. No compatibility paths: no plaintext workers, no unpinned tokens, no server-generated keys
 
-A new manager talks plaintext only to a protocol-2 worker advertising a
-loopback address, and drops that path one release after Phase 1.
+A new manager never dials a worker over plaintext, join tokens without
+`caHash` are refused, and the node certificate API takes a CSR only. A
+protocol-2 worker keeps heartbeating, but exec, logs, and restart against it
+fail with an error naming its protocol version.
 
-**Alternative.** Keep plaintext for any old worker, or remove it immediately.
+This reverses the plan's earlier call, which kept plaintext to a protocol-2
+worker on loopback for one release, accepted unpinned tokens with a warning,
+and kept manager-generated keys for old workers.
 
-**Trade-off.** One more release of a branch in the client factory.
+**Alternative.** That earlier call: keep each old path for one release so a
+rolling upgrade is invisible.
 
-**Why.** Old workers only ever advertised `127.0.0.1`, so plaintext to loopback
-is the entire set of setups that worked before. Keeping it makes the rolling
-upgrade invisible. Allowing it to remote hosts would preserve nothing that
-worked and would keep the hole open.
+**Trade-off.** During an upgrade, exec and logs against a not-yet-upgraded
+worker fail until it is upgraded. Outstanding join tokens must be re-minted.
+
+**Why.** AGENTS.md says Legion has no installed base to protect and asks for
+no deprecation shims or dual code paths. Each kept path was a branch in a
+security-sensitive factory, plus tests, to preserve setups that only ever
+worked on one machine. Dispatch still reaches old workers through heartbeat
+replies, so running work is never interrupted, only interactive calls.
+**Simplicity won.**

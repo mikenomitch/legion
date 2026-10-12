@@ -65,6 +65,7 @@ const ICON_PATHS: Record<string, string> = {
   compass: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z m4.24-14.24-2.12 6.36-6.36 2.12 2.12-6.36 6.36-2.12z',
   minus: 'M5 12h14',
   square: 'M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z',
+  camera: 'M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z M12 16a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
   wifiOff: 'M2 2l20 20 M8.5 16.5a5 5 0 0 1 7 0 M2 8.82a15 15 0 0 1 4.17-2.65 M10.66 5c4.01-.36 8.14.9 11.34 3.76 M16.85 11.25a10 10 0 0 1 2.22 1.68 M5 13a10 10 0 0 1 5.24-2.76 M12 20h.01',
 }
 
@@ -444,7 +445,7 @@ export function Button(props: ButtonProps) {
 // Two-step destructive button: first click arms it, second click confirms.
 // A short grace period after arming means an accidental double-click cannot
 // confirm; blur and Escape disarm; the state change is announced politely.
-export function ConfirmButton(props: { label: string; confirmLabel?: string; onConfirm: () => void; size?: ButtonSize; icon?: IconName; class?: string; disabled?: boolean }) {
+export function ConfirmButton(props: { label: string; confirmLabel?: string; onConfirm: () => void; size?: ButtonSize; icon?: IconName; class?: string; disabled?: boolean; title?: string; variant?: 'danger' | 'subtle' }) {
   const [armed, setArmed] = createSignal(false)
   let timer: ReturnType<typeof setTimeout> | undefined
   let armedAt = 0
@@ -468,11 +469,15 @@ export function ConfirmButton(props: { label: string; confirmLabel?: string; onC
   }
   return (
     <Button
-      variant="danger"
+      variant={props.variant ?? 'danger'}
       size={props.size}
       icon={props.icon ?? 'trash'}
       disabled={props.disabled}
-      class={cx(armed() && 'border-red-500 bg-red-500/15 font-semibold', props.class)}
+      title={props.title}
+      class={cx(
+        armed() && (props.variant === 'subtle' ? 'border-brass bg-brass/15 font-semibold' : 'border-red-500 bg-red-500/15 font-semibold'),
+        props.class,
+      )}
       onClick={click}
       onBlur={disarm}
       onKeyDown={(event: KeyboardEvent) => {
@@ -544,6 +549,30 @@ export const trHoverClass = 'transition-colors hover:bg-surface2/50'
 
 export function TableShell(props: { children: JSX.Element; class?: string }) {
   return <div class={cx('overflow-x-auto', props.class)}>{props.children}</div>
+}
+
+/**
+ * A thin horizontal fill bar. `percent` is clamped to 0-100 for drawing, so a
+ * caller can pass the honest number (an oversubscribed node reserves past
+ * 100%) and print it beside the bar.
+ */
+export function Meter(props: { percent: number; tone?: Tone; size?: 'sm' | 'xs'; class?: string; label?: string }) {
+  const width = () => Math.max(0, Math.min(100, props.percent))
+  return (
+    <div
+      role="meter"
+      aria-label={props.label}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(props.percent)}
+      class={cx('w-full overflow-hidden rounded-full bg-line/70', props.size === 'xs' ? 'h-1' : 'h-1.5', props.class)}
+    >
+      <div
+        class={cx('h-full rounded-full transition-all', dotToneClasses[props.tone ?? 'ok'], props.percent > 0 && 'min-w-[3px]')}
+        style={{ width: `${width()}%` }}
+      />
+    </div>
+  )
 }
 
 export function DefList(props: { items: Array<[JSX.Element, JSX.Element]>; class?: string; cols?: 1 | 2 | 3 }) {

@@ -1472,7 +1472,7 @@ mod tests {
 
     fn eligible(id: &str) -> Option<String> {
         let n: u32 = id[2..].parse().expect("numbered id");
-        (n % 3 != 0).then(|| id.to_string())
+        (!n.is_multiple_of(3)).then(|| id.to_string())
     }
 
     fn walk(

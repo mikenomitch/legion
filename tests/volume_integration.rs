@@ -174,7 +174,7 @@ fn stateful_job(name: &str, count: u32, driver: &str, params: Option<Value>) -> 
             config: json!({ "command": ["sleep", "60"] }),
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(StatefulStorageConfig {

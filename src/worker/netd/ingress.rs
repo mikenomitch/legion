@@ -381,8 +381,13 @@ async fn serve_accepted<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut client = Prefixed::new(leftover, client);
     let allocation_id = shared.spec.allocation_id;
+    // Counted as open (and its bytes as activity) for the idle policy's
+    // `connections` and `network` signals, from here until it closes.
+    let mut client = shared
+        .context
+        .activity()
+        .track(allocation_id, Prefixed::new(leftover, client));
     let peer_text = peer.to_string();
     let facts = ConnectFacts {
         host: None,

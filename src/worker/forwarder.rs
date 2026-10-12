@@ -182,6 +182,8 @@ pub struct ForwarderContext {
     kv_certs: Mutex<HashMap<i64, KvCertState>>,
     /// Service-graph samples since the last heartbeat.
     edges: Arc<crate::worker::netd::graph::EdgeLedger>,
+    /// Ingress connections and bytes per allocation, for the idle policy.
+    activity: Arc<crate::worker::netd::activity::ActivityLedger>,
 }
 
 /// One external handler hop as the datapath has seen it.
@@ -226,7 +228,14 @@ impl ForwarderContext {
             ingress_tls: Mutex::new(HashMap::new()),
             kv_certs: Mutex::new(HashMap::new()),
             edges: Arc::new(crate::worker::netd::graph::EdgeLedger::new()),
+            activity: Arc::new(crate::worker::netd::activity::ActivityLedger::new()),
         }
+    }
+
+    /// Ingress activity per allocation (open connections, last bytes), read
+    /// by the usage sampler for the idle policy.
+    pub fn activity(&self) -> &Arc<crate::worker::netd::activity::ActivityLedger> {
+        &self.activity
     }
 
     /// The service-graph ledger the heartbeat drains.

@@ -78,6 +78,15 @@ KV values  ── kv_entry.value = base64(nonce ‖ ciphertext ‖ tag) under
   The wrapped data keys are ordinary replicated rows, so backups carry
   them, and a rotation is one replicated write that every manager sees.
 
+The keyring holds one more key beside the data keys: the **checkpoint key**
+(`ck_…`, state `checkpoint`). Published checkpoint parts are sealed under
+keys derived from it (see
+[published checkpoint encryption](suspend-and-resume.md#published-checkpoint-encryption)).
+It is wrapped by the root key like a data key, so `legion keyring root-key
+rewrap` covers it, but it never encrypts a KV value, `legion keyring rotate`
+leaves it alone, and it is never collected. Losing the root key loses it,
+and with it every published checkpoint.
+
 A row whose `enc_key_id` is `NULL` is a plaintext row. It was written before
 encryption existed, or with `encryption.enabled = false`. It stays readable,
 and a rewrap converts it.
@@ -217,6 +226,7 @@ State:        unlocked (every data key is available here)
 Manager:      http://10.0.0.5:4747
 Data keys:
   dk_1c2f8e3b7a9d4e60  active   created 2026-09-21T10:02:11Z  age 3d  values 412
+  ck_7d02a9e14b6c3f85  checkpoint created 2026-09-21T10:02:11Z  age 3d  seals published checkpoints
 Values:       412 encrypted, 0 plaintext
 Rewrap:       nothing pending
 Rotation:     every 30days (active key age 3d)
@@ -326,6 +336,10 @@ Put these values back with `legion kv put`:
   prod/api/token
   secrets/ghcr-pull
 ```
+
+A reset also drops a checkpoint key it cannot unwrap and mints a new one.
+Checkpoints published under the old key can no longer be fetched, so their
+restores fail and follow `onRestoreFailure`.
 
 Jobs that referenced a deleted value fail through the normal
 `missing_kv_dependency` path ([KV Store](kv-store.md#fail-semantics-and-recovery))
