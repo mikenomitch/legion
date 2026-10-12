@@ -198,6 +198,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#28](https://github.com/mikenomitch/legion/pull/28) | Streaming persistence: one credential path for replica, takeover restore and lease (platform identity by default, keys in `persistence.streaming.credentials`), boot checks, and the object-storage lease that could never be acquired on real S3 | Breaking: lease keys and `LITESTREAM_*` key vars removed; [plan](plans/manager-workload-identity-plan.md) · [calls](calls/manager-workload-identity-plan_calls.md) |
 | [#20](https://github.com/mikenomitch/legion/pull/20) | Operator UI gaps: instance and allocation pages, event filters by instance/allocation, KV values hidden until revealed, worker public addresses, stale rollouts cancel themselves | [plan](plans/operator-ui-gaps-plan.md) · [calls](calls/operator-ui-gaps-plan_calls.md) |
 | [#19](https://github.com/mikenomitch/legion/pull/19) | Task page tabs, guided template launch, Actions tab; template-launched jobs list their tasks again | UI only; [plan](plans/ui-task-and-template-redesign-plan.md) · [calls](calls/ui-task-and-template-redesign-plan_calls.md) |
 | [#24](https://github.com/mikenomitch/legion/pull/24) | Gated sandbox checkpoints Phases 1 to 4: gated memory checkpoints, `gated-default` deny, the static `legion-guest` agent, gated idle signals, Legion-addressed TAP guests (`tap`/`mac` removed) | Phase 0 (KVM) pending, so the gated-by-default flip is held; [plan](plans/gated-sandbox-checkpoints-plan.md) · [calls](calls/gated-sandbox-checkpoints-plan_calls.md) |
