@@ -9639,7 +9639,9 @@ mod tests {
         assert_eq!(outcome.allocations.len(), 1);
         assert_eq!(outcome.unplaced.len(), 1);
         assert!(
-            outcome.unplaced[0].reason.contains("disruption.minAvailable"),
+            outcome.unplaced[0]
+                .reason
+                .contains("disruption.minAvailable"),
             "the reason names the floor: {}",
             outcome.unplaced[0].reason
         );

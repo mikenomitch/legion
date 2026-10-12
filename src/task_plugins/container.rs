@@ -2371,10 +2371,11 @@ mod tests {
     }
 
     /// P0-7 end to end, with the official nginx image as it ships: the
-    /// default capabilities let its root master `chown` its cache and run
-    /// workers as `nginx`; extraction kept the image's `chown nginx`
-    /// (uid 101); its `access.log -> /dev/stdout` symlink reaches the task's
-    /// log; and the open-file limit is no longer 1024.
+    /// default capabilities let its root master `chown` its cache to `nginx`
+    /// (uid 101) and run workers as that user; extraction kept the owners
+    /// the image records (`/etc/shadow` is group `shadow`, gid 42); its
+    /// `access.log -> /dev/stdout` symlink reaches the task's log; and the
+    /// open-file limit is no longer 1024.
     ///
     /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_runs_stock_nginx -- --ignored`
     #[test]
@@ -2392,7 +2393,7 @@ mod tests {
             "config": {
                 "image": "nginx:1.27-alpine",
                 "command": ["sh", "-c", format!(
-                    "stat -c 'cache-owner=%u' /var/cache/nginx; \
+                    "stat -c 'shadow-group=%g' /etc/shadow; \
                      echo \"nofile=$(ulimit -n)\"; \
                      sed -i 's/listen  *80;/listen {port};/' /etc/nginx/conf.d/default.conf && \
                      exec nginx -g 'daemon off;'"
@@ -2420,8 +2421,18 @@ mod tests {
             .unwrap_or_default();
 
         assert!(
-            stdout.contains("cache-owner=101"),
+            stdout.contains("shadow-group=42"),
             "layer ownership kept: {stdout}"
+        );
+        // nginx's master chowned its temp dir to its worker user: CAP_CHOWN.
+        use std::os::unix::fs::MetadataExt;
+        let client_temp =
+            work_root(&allocation, &instance).join("bundle/rootfs/var/cache/nginx/client_temp");
+        assert_eq!(
+            std::fs::metadata(&client_temp)?.uid(),
+            101,
+            "nginx chowned {}: {stderr}",
+            client_temp.display()
         );
         let nofile = oci_bundle::default_rlimits()
             .into_iter()
