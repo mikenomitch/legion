@@ -3,9 +3,9 @@
 > **Judgement calls:** [`calls/session-durability-and-routing-plan_calls.md`](../calls/session-durability-and-routing-plan_calls.md)
 
 **Status: PLANNED** (written 2026-10-12). Builds on session mode from
-[sandbox-scaling-plan.md](sandbox-scaling-plan.md) Phase 6, which is in
-flight in [#30](https://github.com/mikenomitch/legion/pull/30); every
-`src/` citation below is at that PR's head (`86e0d24`), not `main`. This
+[sandbox-scaling-plan.md](sandbox-scaling-plan.md) Phase 6, shipped in
+[#30](https://github.com/mikenomitch/legion/pull/30); `src/` citations
+are at `main` after that merge (`4a2fee3`). This
 plan replaces the parts of sandbox-scaling §6.3, §6.4 and §6.5 that its
 Phase 6 deferred (calls entries 18 and 19 there) with a narrower order:
 let a node start sessions concurrently, survive a worker restart, route
@@ -53,7 +53,7 @@ one:
   `NOT_FOUND`, indistinguishable from an id that never existed.
 - **Every start goes through a manager.** The router builds a room view,
   ranks envelopes, and calls the chosen worker
-  (`src/manager/sessions.rs:476-605`), and edge starts are refused
+  (`src/manager/sessions.rs:477-606`), and edge starts are refused
   (`docs/session-mode.md:365`). Starts scale with how fast managers can
   route, not with the fleet. The one measurement, about 970 starts a
   second, ran one manager, 16 fake nodes and the load generator on four
@@ -206,6 +206,9 @@ they are.
 - Unpromoted sessions can suspend on their node and resume there, with
   `durability = "local"` (node-held, lost with the node or on eviction) or
   `"store"` (also published, resumable anywhere) (Phase 5).
+- Every failure in the catalog of §6.7 (node loss, partitions, ring
+  changes, racing resumes, a bucket or manager outage) has a defined
+  outcome, a test, and an answer the caller can act on.
 - Every answer about an unreachable session says why: `evicted`,
   `node lost`, `node unreachable`, or `not found`.
 - Zero raft entries per session for start, suspend, resume, and stop,
@@ -232,7 +235,7 @@ they are.
 - **Starts go through a manager.** The router picks the envelope with the
   most room from a one-second view built from raft allocation rows and the
   merged session index, then calls the worker's `PostWork`
-  (`src/manager/sessions.rs:368-406`, `:476-605`). Edge starts are refused
+  (`src/manager/sessions.rs:369-407`, `:477-606`). Edge starts are refused
   (`docs/session-mode.md:365`).
 - **The session index is soft, per manager.** Nodes report deltas against
   an epoch with a full report every 30 beats
@@ -244,9 +247,9 @@ they are.
   Idempotent creates derive the id from the key
   (`src/structs/session.rs:135`).
 - **Start on a running session is a no-op**, and on an unknown id is
-  `NOT_FOUND` (`src/manager/server.rs:5721-5735`).
+  `NOT_FOUND` (`src/manager/server.rs:6050-6064`).
 - **The worker holds sessions in memory.** Ending one is routine
-  (`src/worker/task_manager.rs:2992`); a session whose envelope leaves the
+  (`src/worker/task_manager.rs:3008`); a session whose envelope leaves the
   node is ended after 30 s (`:355`). Nothing is written to disk.
 - **Allocations survive a worker restart** through the JSON
   `WorkerStateStore`, re-adopted by pid and start time
@@ -258,7 +261,7 @@ they are.
 - **A manager-routed session start is already a provisional claim.** The
   router sends `PostWork` with a `ProvisionalAllocation` whose `origin` is
   `"manager"`, an empty `ticket_jti`, and a `SessionStart` lease
-  (`src/manager/sessions.rs:608-680`). The worker admits it against the
+  (`src/manager/sessions.rs:609-681`). The worker admits it against the
   envelope, not node free capacity. An edge start is the same claim with
   `origin = "edge"` and a ticket.
 - **Edge boot already has the edge half.** `Worker.StartClaim` on the
@@ -277,24 +280,24 @@ they are.
 
 Taking managers off the path only helps if a node can absorb its share.
 Today it cannot run starts side by side, for three reasons found reading
-#30's worker:
+the worker on `main`:
 
 - **One lock covers the whole launch.** Every worker RPC and the heartbeat
-  share one `Arc<Mutex<WorkerTaskManager>>` (`src/worker/server.rs:57`).
+  share one `Arc<Mutex<WorkerTaskManager>>` (`src/worker/server.rs:58`).
   A session start takes it to admit (`src/worker/edge.rs:96-103`), then
   takes it again for the launch itself
-  (`src/worker/task_manager.rs:4535`, `begin_task_allocation_gated`), and
+  (`src/worker/task_manager.rs:4550`, `begin_task_allocation_gated`), and
   the runtime's `plugin.start()` runs inside it
-  (`src/worker/task_manager.rs:2781`). A sandbox start that takes 30 ms
+  (`src/worker/task_manager.rs:2796`). A sandbox start that takes 30 ms
   holds every other start, stop, heartbeat, and exec on the node for 30 ms,
   so a node tops out near 1 / (launch time), about 30 starts a second,
   however many cores it has.
 - **Every start rewrites and fsyncs the worker's whole state file.**
   `run_allocation` ends in `persist_state()`
-  (`src/worker/task_manager.rs:2790`), which serializes every allocation
+  (`src/worker/task_manager.rs:2805`), which serializes every allocation
   to pretty JSON and writes it with `sync_all`
   (`src/worker/state.rs:156-168`, `:313-315`), under the same lock. It
-  skips unratified claims' contents (`:4133-4144`) but still pays the
+  skips unratified claims' contents (`:4148-4159`) but still pays the
   write and the fsync for each session start, and the file grows with
   everything else on the node.
 - **Every start spawns an OS thread** (`src/worker/edge.rs:121`). Cheap
@@ -313,7 +316,7 @@ The fix:
    start that cannot get a launch slot within `edgeBoot.queueTimeout`
    (default 1 s) is refused with `RESOURCE_EXHAUSTED` and `retryable`, so
    the picker spills to the next node instead of piling up threads.
-4. `session_usage` (`src/worker/task_manager.rs:3080`) scans every
+4. `session_usage` (`src/worker/task_manager.rs:3095`) scans every
    session on each admission; the ledger keeps running totals instead.
 
 This phase is valuable alone: the manager-routed path gets the same
@@ -463,32 +466,32 @@ $ legion session start agents --node https://10.0.1.7:4848 --ticket "$T" --key r
   ratification: a session has no row to ratify.
 
 **The manager-routed path stays,** for platforms with no load balancer
-and for low rates, and gets faster where measurement says. Known costs at
-#30's head: an idempotent create calls `find()` before placing, which
+and for low rates, and gets faster where measurement says. Known costs on
+`main`: an idempotent create calls `find()` before placing, which
 fans out to every peer (`src/manager/sessions.rs:487-499`); and one
 manager process per start does an ACL check, a config lookup, and an mTLS
-`PostWork` (`:608-680`). Phase 4 measures it in a release build with three
+`PostWork` (`:609-681`). Phase 4 measures it in a release build with three
 managers on separate hosts, then fixes what dominates; the derived-id
 fan-out is replaced by asking only the node the room view would pick
 first, with the 20 s duplicate check as the backstop.
 
 ### 6.5 Everything else between here and tens of thousands a second
 
-An audit of the rest of the path at #30's head, at the target of 50,000
+An audit of the rest of the path on `main`, at the target of 50,000
 starts and 50,000 ends a second across 2,000 nodes and three managers
 (25 starts a second per node):
 
 | Ceiling | Where | At the target | Fix | Phase |
 | --- | --- | --- | --- | --- |
-| Manager routes every start | `src/manager/sessions.rs:476` | ~1k/s measured on 4 cores, debug | Edge starts | 4 |
-| Launch under the node-wide lock | `src/worker/task_manager.rs:4535`, `:2781` | ~1 / launch time per node | Admission/launch split | 1 |
-| Full-state JSON fsync per start | `src/worker/task_manager.rs:2790`, `src/worker/state.rs:156` | one fsync per start, under the lock | `sessions.db` group commit | 1, 2 |
+| Manager routes every start | `src/manager/sessions.rs:477` | ~1k/s measured on 4 cores, debug | Edge starts | 4 |
+| Launch under the node-wide lock | `src/worker/task_manager.rs:4550`, `:2796` | ~1 / launch time per node | Admission/launch split | 1 |
+| Full-state JSON fsync per start | `src/worker/task_manager.rs:2805`, `src/worker/state.rs:156` | one fsync per start, under the lock | `sessions.db` group commit | 1, 2 |
 | Thread per start | `src/worker/edge.rs:121` | unbounded under bursts | bounded launch pool, `RESOURCE_EXHAUSTED` | 1 |
-| Admission scans every session | `src/worker/task_manager.rs:3080` | O(sessions) per start | running totals | 1 |
+| Admission scans every session | `src/worker/task_manager.rs:3095` | O(sessions) per start | running totals | 1 |
 | Idempotent create fans out | `src/manager/sessions.rs:487` | one peer RPC per manager per start | node-local dedupe (edge), single probe (routed) | 4 |
 | `get`/`stop` fan out | `src/manager/sessions.rs:173` | one peer RPC per manager per call | tag routing | 3 |
 | Heartbeat ingest | `src/storage/session_index.rs:286` | ~100k deltas/s cluster-wide, ~33k/s per manager under one `RwLock` write | fine at the target (map updates); shard the lock by node if profiling shows contention | measure in 4 |
-| Full report size | `src/manager/daemon.rs:528` (tonic's 4 MiB default decode limit) | ~200 B a session, so about 20,000 sessions per node per full report | chunk full reports across beats, or raise the limit for heartbeats | 2 |
+| Full report size | `src/manager/daemon.rs:605` (tonic's 4 MiB default decode limit) | ~200 B a session, so about 20,000 sessions per node per full report | chunk full reports across beats, or raise the limit for heartbeats | 2 |
 | Index memory | `src/storage/session_index.rs` | ~300 B a session; 10^6 running is ~300 MB across managers | none needed | — |
 | Raft | none on the path | 0 entries per session | keep it so | — |
 | Ticket verification | `docs/edge-boot.md`, "Verification" | one ES256 verify a start, ~0.1 ms of node CPU | cache verified tickets by `jti` | 4 |
@@ -558,17 +561,112 @@ $ legion instance start workspace-r8p2k5ta.4h6w... -j   # its node is down
   start, preferring nodes that hold its parts. A resumed session keeps its
   id; when it lands on another node the tag is stale, and §6.3's fallback
   finds it.
-- **Duplicates.** A resume that raced to two nodes converges to one by the
-  existing rule (earliest lease wins); the resume refreshes the lease.
+- **Duplicates.** A resume that raced to two nodes, or a resume while the
+  old node was only unreachable, is settled by the session's generation
+  (§6.7, "Fencing a moved session"), not by the earliest lease.
 
-### 6.7 What each failure costs
+### 6.7 Failure modes, and how routing handles them
+
+One rule carries most of this section: **the ring places, the id
+routes.** A picker's hash ring decides where a *new* session starts. Every
+later request for that session (traffic, resume, stop, exec) is addressed
+by its session id, whose tag names the node it lives on, never by hashing
+the user's key again. A picker keeps a `tag → address` map from
+`ListSessionNodes` (every node with an envelope, accepting or not) beside
+its ring (accepting nodes only). Most of the failures below are harmless
+because of that split; the ones that are not are where a session has
+moved.
+
+**Generations.** Every session carries a generation, starting at 1.
+With `durability = "store"` the session manifest records it, and every
+resume of the session, on its old node or a new one, claims the next
+generation with a conditional write to the manifest (`If-Match` on its
+ETag; the S3 client already speaks it for the streaming lease,
+`src/storage/s3_credentials.rs:213`) before its gate opens. The bucket is
+the fencing authority, so a move needs no raft entry and no manager, and
+a stale resume anywhere fails its write and aborts. The generation rides
+on the session's reports and in its `SessionStatus`. A `local` session
+never moves, so its generation stays 1.
+
+**Moving is cautious for running sessions, eager for idle ones.** An
+idle session has nothing running, so resuming it elsewhere the moment its
+node is unreachable is safe: any later resume on the old node loses the
+conditional write. A *running* session might still be running. Before
+moving one, the resuming node probes the tagged node over the worker
+plane (`GetSession`, 2 s) and, if it answers, asks it to stop its copy
+first. It moves without that only if the probe fails *and* the managers
+mark the node down or unreachable in `ListSessionNodes`, or the caller
+passes `--force-move`. This narrows row 8 below to partitions where
+neither the new node nor any manager can reach the old one.
+
+#### Fencing a moved session
+
+When two copies of one session id exist, the higher generation wins, then
+the earliest lease. A losing copy is stopped by whichever party sees both:
+the manager whose index holds both (heartbeat reply), a manager answering a
+read, or the losing node itself, whose next publish or suspend fails the
+conditional write and ends its copy with `superseded`. A session that
+cannot reach the bucket to suspend keeps running and keeps retrying. Its
+node's next heartbeat to a manager that indexes the newer copy stops it.
+
+This replaces sandbox-scaling's earliest-lease-wins rule for any session
+with a generation above 1, because "earliest" picks exactly the wrong copy
+after a move: the stale one.
+
+#### The failure catalog
+
+| # | What happened | What the platform sees | What Legion does | What is lost |
+| --- | --- | --- | --- | --- |
+| 1 | **Nodes added to the ring** | ~1/N of keys now hash to new nodes | Nothing. Existing sessions are routed by id tag, which did not change. New starts for moved keys land on new nodes | Cache locality for moved keys' *new* sessions, once |
+| 2 | **Nodes removed or draining** | The node leaves the ring (`accepting = false`) but stays in the tag map | Draining ends or suspends its sessions on its own schedule; resumes of its `store` sessions land elsewhere (row 5) | Nothing for `store`; running `local` sessions end at drain |
+| 3 | **Idempotent retry across a ring change** | The retry hashes to a different node | Both nodes derive the same untagged id; duplicates converge on heartbeat, earliest lease wins (generation 1 on both) | A few seconds of a second copy's CPU |
+| 4 | **Picker routes by key instead of id** (a platform bug) | The node answers `NOT_FOUND` with `wrong_node` and the id's tag | Nothing to do; the hint says to route by the id | One extra hop |
+| 5 | **Node dies; session was idle with `durability = "store"`** | Connect to the tagged node fails, or the tag map shows it down | The picker (or a manager) sends a resume to any node in its ring. That node reads the manifest at its deterministic path from the id, claims generation g+1 by conditional write, fetches parts, restores, and answers with its own node | Nothing since the checkpoint |
+| 6 | **Node dies; session was running with `durability = "store"`** | Same as 5 | Same as 5, from the last published checkpoint | Everything since the last checkpoint. `suspend.checkpointEvery` (open question) narrows the window |
+| 7 | **Node dies; `durability = "local"`** | Tagged node down | Managers answer `node lost` once the node is marked lost; the picker can answer the same from the tag map | The session |
+| 8 | **Node unreachable from the picker but alive** (a partial partition) | Same as 5 to the picker | An idle session moves at once (safe, above). A running one moves only after the new node's probe fails and managers mark the node down; if the new node or a manager can reach it, the old copy is stopped first. In a full partition, the old copy is fenced when it next suspends or when a manager sees both, and until then **two copies run** | Side effects from the stale copy during a full partition. Documented, not prevented: at-most-one needs promotion |
+| 9 | **Node returns after a move** | Its full report lists the stale copy | The index sees two copies, keeps the higher generation, and stops the old one in the heartbeat reply | Nothing more |
+| 10 | **Two resumes race** (two pickers, or a retry) | Both nodes start restoring | One conditional write wins; the loser aborts before the gate opens and answers `ABORTED` with the winner's node | Nothing |
+| 11 | **Resume to the same node finds its envelope full** | `RESOURCE_EXHAUSTED` | `store`: resume elsewhere (row 5). `local`: refused, retryable; the checkpoint stays put | Nothing |
+| 12 | **Bucket unavailable** | Suspends still succeed locally; moves fail | Parts stay pinned locally and publish retries; rows 5 and 6 fail with `UNAVAILABLE` until it is back | Nothing, unless the node also dies (then as row 7) |
+| 13 | **Managers unavailable** | Nothing on the edge path | Edge starts, routing by tag, and moves all work without a manager while tickets and the cached JWKS last. Managers rebuild their index from full reports when back | Listings and manager-routed calls during the outage |
+| 14 | **Stale node list at the picker** | Connect timeouts or refusals | Picker hops to the next ring node, and refreshes | Latency |
+| 15 | **Worker restart** | A brief refusal window on that node | Phase 2 re-adopts running and sleeping sessions | Nothing |
+| 16 | **Platform loses its id → node cache** | Only the session id is left | The tag routes it; a stale tag after a move falls back to the manifest (it names the current node) or a manager lookup | One extra hop |
+
+**Where the current node is written down after a move.** The tag goes
+stale after row 5. The session keeps its id (it is the session's name to
+the platform). The resume reply returns the new node, and a picker should
+cache `id → node` and prefer it over the tag. A picker that lost the
+cache finds the current node in the manifest, which every move rewrites,
+or by asking a manager. Re-minting the id on every move would keep the tag
+exact, but would break every reference the platform holds to the session.
+
+#### Network volumes
+
+Sessions refuse `volumes` today (`docs/session-mode.md:178`), and this plan
+keeps that. A session that needs a network volume is promoted, because
+moving a volume safely needs exactly what sessions give up: a durable
+owner that can declare the old node lost before attaching the volume
+elsewhere. Without that, row 8's two live copies would both write the same
+volume. The keyed path already has it (reschedule on node loss, with the
+volume driver's attach fencing), so `promote.onVolume` from sandbox-scaling
+§6.6 stays the answer. It costs one raft entry per session that attaches a
+volume, not per start.
+
+A session's checkpoint already holds its local disk, so "persisted
+remotely" in the common case is `durability = "store"` (rows 5 and 6),
+not a volume.
+
+#### Summary by durability
 
 | Event | `durability = "local"` session | `durability = "store"` session |
 | --- | --- | --- |
 | Worker restart | Running and sleeping sessions kept (Phase 2) | Same |
-| Manager failover | Nothing lost; routing by tag needs no index | Same |
-| Node silent, comes back | Sessions kept; answers `UNAVAILABLE` meanwhile | Resumes elsewhere if asked meanwhile, and the copy on the returning node is the later duplicate and is stopped |
-| Node lost | Lost, answered as `node lost` | Idle ones resume elsewhere from the manifest; running ones are lost |
+| Manager failover or outage | Nothing lost; routing by tag needs no manager | Same, and moves still work |
+| Ring change | Nothing; the id routes | Same |
+| Node silent, comes back | Sessions kept; answers `UNAVAILABLE` meanwhile | May have moved meanwhile (g+1); the returning copy is fenced |
+| Node lost | Lost, answered as `node lost` | Resumes elsewhere from the last checkpoint |
 | Eviction | Lost, answered as `evicted` for `keepFor` | Parts fetched back on the next resume |
 
 ### 6.8 The replicated directory, and why it is Phase 6 (conditional)
@@ -627,8 +725,13 @@ then, every session-sized write stays off raft.
   beside `StartClaim`'s); `Worker.ResumeSession` and
   `Worker.SuspendSessions` are manager-only like `StopSessions`.
   `SessionStatus.state` gains `suspended`; `SessionStatus.checkpoint`
-  (durability, bytes, published URL) and `SessionStatus.origin`
-  (`manager` | `edge`, plus the ticket `jti`) are new.
+  (durability, bytes, published URL), `SessionStatus.origin`
+  (`manager` | `edge`, plus the ticket `jti`) and
+  `SessionStatus.generation` are new. `StartSessionRequest.resume_id`
+  resumes an existing `store` session on the receiving node, and
+  `force_move` skips the probe. Refusals gain `wrong_node` (with the id's
+  tag) and `superseded` (with the winning generation and node). The
+  session manifest gains `generation` and `node`.
 - **Worker config:** `edgeBoot.launchConcurrency` (default `2 × cores`)
   and `edgeBoot.queueTimeout` (default `1s`).
 - **Jobspec:** `suspend.keepFor` (new, default `"24h"`, session tasks
@@ -650,18 +753,21 @@ then, every session-sized write stays off raft.
    full report after, full reports chunked past the message limit.
    Valuable alone: worker upgrades stop killing sessions.
 3. **The node in the id.** Tagged mint, tag resolution, tag-first routing
-   for `get`/`stop`/`start`/`promote`, fallback to fan-out. Valuable alone:
+   for `get`/`stop`/`start`/`promote`, fallback to fan-out, and the
+   `wrong_node` answer (§6.7 row 4). Valuable alone:
    per-request cost no longer grows with the manager count, and a silent
    node's sessions answer `UNAVAILABLE` naming the node instead of
    `NOT_FOUND`.
 4. **Starts that skip the manager.** `ListSessionNodes` and its balancer
-   formats, session tickets, `Worker.StartSession|StopSession|GetSession`,
-   node-local idempotency; the routed path measured across three managers
+   formats (with the ring and tag-map split of §6.7), session tickets,
+   `Worker.StartSession|StopSession|GetSession`, node-local idempotency; the routed path measured across three managers
    and its derived-id fan-out removed. Valuable alone: start rate scales
    with nodes.
-5. **Sleeping on the node.** Session suspend (`local` and `store`), the
-   node's idle policy for sessions, `keepFor` and eviction answers, resume
-   by tag with manifest fallback. Valuable alone: idle sessions stop
+5. **Sleeping on the node, and moving.** Session suspend (`local` and
+   `store`), the node's idle policy for sessions, `keepFor` and eviction
+   answers, resume by tag with manifest fallback, edge resume on any node,
+   generations with conditional manifest writes, probe-before-move, and
+   generation-first duplicate resolution (§6.7). Valuable alone: idle sessions stop
    costing envelope room. Unblocks wake-on-request Phase 3.
 6. **Replicated directory (conditional, §6.8).** Only past its trigger.
 
@@ -691,6 +797,13 @@ then, every session-sized write stays off raft.
   the AWS rig across as many nodes as it has, reporting starts per second
   per node and manager CPU, and extrapolate to the 2,000-node target only
   from a per-node number that stays flat as nodes are added.
+- **Failure catalog (§6.7):** one integration test per row, in
+  `tests/session_failures.rs`, with fake nodes over the real worker plane
+  and a `file://` bucket that honours conditional writes. Rows 5 to 10
+  kill, partition (a node the test's picker cannot reach but managers can,
+  and one nobody can), and revive nodes, and assert the surviving copy,
+  its generation, and that the stale copy is stopped. Ring changes (rows
+  1 to 3) run against a reference ring in the test harness.
 - **Phase 5:** suspend and resume round trip on the same node (`exec`
   runtime with a test checkpoint; KVM memory checkpoints in the KVM suite);
   eviction under `minFreeDisk` answers `evicted`; `store` fallback when the
@@ -712,6 +825,11 @@ and its "What you give up" table and Limitations change with each phase.
 
 ## 11. Open questions
 
+- **Periodic checkpoints for running `store` sessions**
+  (`suspend.checkpointEvery`, rows 6 and 8 of §6.7). Without them, a
+  running session that loses its node is lost back to its last suspend.
+  Lean: offer it once diff snapshots (sandbox-scaling Phase 8) make a
+  periodic checkpoint cheap, not before.
 - **Should Legion ship a picker?** A small `legion start edge-router`
   holding the ring would make the high-rate path work out of the box.
   Lean: no in this plan; publish the list and the refusal shape, and
@@ -744,4 +862,6 @@ and its "What you give up" table and Limitations change with each phase.
 - **Phase 5:** an idle session suspends on its node, frees its envelope
   share (`legion node usage`), and resumes on the same node from local
   disk; an evicted one answers `evicted`; a `store` session on a fenced
-  node resumes elsewhere; zero raft entries for the whole cycle.
+  node resumes elsewhere with no manager on the path; two racing resumes
+  leave exactly one copy; a revived node's stale copy is stopped within
+  one heartbeat; zero raft entries for the whole cycle.

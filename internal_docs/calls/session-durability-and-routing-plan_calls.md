@@ -28,7 +28,7 @@ $ legion session start agents --node https://10.0.1.7:4848 --ticket "$T" -j
 **Trade-off.** The highest-rate path needs a component Legion does not
 ship, configured by the platform. Admission is only exact per node: two
 pickers can race for a node's last slot and one is refused and hops.
-A leaked session ticket starts sessions until it expires (entry 3).
+A leaked session ticket starts sessions until it expires (entry 5).
 
 **Why (performance, then simplicity).** Every manager-routed start costs a
 manager some CPU and an mTLS call, so the rate is bounded by managers
@@ -73,7 +73,56 @@ node-held session and every snapshot carries them, which at the plan's
 already knows exactly what it holds. (a) stays as Phase 4 behind a
 measured trigger (plan §6.8).
 
-## 3. A session ticket names no instance, prefix, or job config, and is not spent per session
+## 3. The ring places, the id routes
+
+**Call.** A picker's consistent-hash ring decides only where a new
+session starts. Every later request for the session is addressed by its
+id (tag, then the picker's `id → node` cache, then the manifest or a
+manager), never by re-hashing the user's key. `ListSessionNodes` feeds two
+structures: the ring (accepting nodes) and the tag map (every node with
+an envelope).
+
+**Alternatives.**
+- (a) Route every request by hashing the user key, as a stateless sticky
+  balancer would.
+- (b) Route every request through a lookup (index or directory).
+
+**Trade-off.** Pickers keep a small map beside the ring, and a platform
+that hashes keys for follow-up requests is wrong by construction (it gets
+`wrong_node`, plan §6.7 row 4).
+
+**Why (simplicity, performance).** Under (a), adding one node moves ~1/N
+of all live sessions' traffic to a node that does not hold them, so every
+scale-out is a partial outage. Splitting placement from addressing makes
+ring changes affect only where new sessions go, which is the property
+consistent hashing was meant to buy. (b) puts a lookup back on every
+request.
+
+## 4. Moves are fenced by a generation claimed with a conditional write to the session manifest
+
+**Call.** Every resume of a `store` session claims generation g+1 by an
+`If-Match` write to its manifest before its gate opens. When two copies
+exist, the higher generation wins, then the earliest lease. A stale copy
+ends itself with `superseded` when its own conditional write fails, or is
+stopped by a manager that sees both.
+
+**Alternatives.**
+- (a) Keep sandbox-scaling's earliest-lease-wins rule.
+- (b) Fence moves through raft (one entry per move) or a manager-held
+  lease.
+
+**Trade-off.** Moves depend on the bucket supporting conditional writes
+(S3 does, with ETag preconditions; `file://` in tests). A bucket outage
+blocks moves (plan §6.7 row 12). In a full partition two copies still run
+until the stale one next touches the bucket or a manager.
+
+**Why (performance, correctness).** (a) keeps the stale copy after a
+move, because it has the earlier lease. (b) adds a write or a manager to
+the edge resume path for every move. The manifest is already the record
+of a `store` session and already lives in the bucket, so a conditional
+write there is the cheapest authority that exists.
+
+## 5. A session ticket names no instance, prefix, or job config, and is not spent per session
 
 **Call.** `legion boot-ticket create <job> --task <task> --scope session`
 mints a JWT that lets its holder start sessions of that task on nodes in
@@ -97,7 +146,7 @@ deploy. The envelope already bounds what any holder can start, so the
 ticket's blast radius is the envelope's, the same trade sandbox-scaling
 calls entry 30 accepted for prefix tickets.
 
-## 4. The node is in the session id
+## 6. The node is in the session id
 
 **Call.** A minted session id carries an 8-character keyed hash of its
 start node: `workspace-q4n7c2rd.7k2qd9x4m1b8c3rj5t0v6wye2h`. Any manager
@@ -119,7 +168,25 @@ manager. A collision or stale tag costs a probe, never a wrong answer,
 because the node answers for itself. (c) goes stale on every job update
 that replaces envelopes in place.
 
-## 5. The node's start path is fixed first, before edge starts
+## 7. Running sessions move only after a probe; idle ones move at once
+
+**Call.** A resume of a running session on another node first probes the
+tagged node and asks it to stop. It moves without that only when the probe
+fails and managers mark the node down, or the caller passes
+`--force-move`. Idle sessions move immediately.
+
+**Alternative.** Move on the first connect failure for every session.
+
+**Trade-off.** A running session on a dead node takes the probe timeout
+plus manager detection before it comes back elsewhere.
+
+**Why (correctness).** Moving an idle session is always safe, because the
+conditional write fences any later resume of the old copy. Moving a
+running one on a picker's connect failure turns every picker-to-node blip
+into two live copies with real side effects. The probe from a second
+vantage point, plus the managers' view, narrows that to full partitions.
+
+## 8. The node's start path is fixed first, before edge starts
 
 **Call.** Phase 1 takes the runtime launch out from under the worker's
 single task-manager lock, stops the per-start fsync of the JSON state
@@ -132,15 +199,34 @@ refusal. Edge starts come in Phase 4.
 **Trade-off.** The headline change (no manager on the path) lands three
 phases later.
 
-**Why (performance).** Read at #30's head, a node serializes every launch
-behind one lock (`src/worker/task_manager.rs:4535`, `:2781`), so its rate
+**Why (performance).** Read on `main` after #30, a node serializes every launch
+behind one lock (`src/worker/task_manager.rs:4550`, `:2796`), so its rate
 is about one over the launch time. Edge starts with that lock in place
 would move the ceiling from a few managers to each node, at roughly 30
 starts a second per node for a 30 ms launch, and the target needs the
 per-node number. Phase 1 also speeds the manager-routed path, so it pays
 off on its own.
 
-## 6. Session tasks may suspend with `durability = "local"`
+## 9. Sessions still refuse network volumes, and a volume still means promotion
+
+**Call.** Session tasks keep refusing `volumes`. A session that needs a
+network volume is promoted (one raft entry), and the keyed path moves it
+on node loss.
+
+**Alternative.** Let unpromoted sessions attach network volumes and move
+them with the generation fence.
+
+**Trade-off.** A platform that wants a per-session network disk pays a
+promotion per such session.
+
+**Why (correctness).** The generation fence stops a stale *compute* copy
+eventually; it cannot stop two copies writing one block device during a
+partition. Safe re-attach needs an owner that declares the old node lost
+first, which is the durable record sessions give up. A session's own disk
+travels in its checkpoint under `durability = "store"`, which covers the
+common case.
+
+## 10. Session tasks may suspend with `durability = "local"`
 
 **Call.** Relax the submit refusal at `src/structs/session.rs:408`: a
 session may sleep on its node only, pinned until `suspend.keepFor`
@@ -161,7 +247,7 @@ A bucket is extra infrastructure and an upload per suspend; `store`
 stays available for platforms that want node-loss survival, and the
 `evicted` answer makes the loss explicit rather than silent.
 
-## 7. Edge idempotency is node-local, and derived ids stay untagged
+## 11. Edge idempotency is node-local, and derived ids stay untagged
 
 **Call.** An edge start with an idempotency key derives the untagged
 session id on the node and dedupes against the node's own claim table.
@@ -181,7 +267,7 @@ retry on another node would start a differently named duplicate that
 nothing converges. Untagged, the id is the same everywhere, and the
 existing converge-to-one rule covers the rare cross-node retry.
 
-## 8. Phase 2 group-commits the session log instead of fsyncing each start
+## 12. Phase 2 group-commits the session log instead of fsyncing each start
 
 **Call.** `sessions.db` flushes every 50 ms, and a restarted worker also
 adopts live session processes the log missed.
@@ -196,15 +282,3 @@ anyway.
 (about 2.5 ms p50 in sandbox-scaling §16.3); a per-start fsync would
 roughly double it on ordinary disks for no durability gain.
 
-## 9. The plan is written against PR #30's branch, not `main`
-
-**Call.** Citations point at #30's head (`86e0d24`), and the plan lands
-as a separate docs-only change.
-
-**Alternative.** Wait for #30 to merge, or add the plan to #30.
-
-**Trade-off.** Line numbers may drift as #30 is rebased.
-
-**Why (simplicity).** The design question is live now, and #30 is being
-rebased by another thread; folding a new plan into it would widen a large
-PR under review.

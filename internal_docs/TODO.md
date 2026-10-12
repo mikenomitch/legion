@@ -2823,8 +2823,7 @@ Plan: [artifact-system-plan.md](plans/artifact-system-plan.md) · docs: [artifac
 
 Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.md), [volume-plugin-system](plans/volume-plugin-system-plan.md) · docs: [volumes.md](../docs/volumes.md), [stateful-workloads.md](../docs/stateful-workloads.md)
 
-- [ ] **Session durability and routing back** (needs session mode from
-      [#30](https://github.com/mikenomitch/legion/pull/30); plan in
+- [ ] **Session durability and routing back** (builds on session mode; plan in
       [#35](https://github.com/mikenomitch/legion/pull/35)). A worker
       restart ends every unpromoted session, a session cannot sleep,
       finding one fans out to every manager, and every start goes through
@@ -2844,7 +2843,8 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
         measured across three managers.
   - [ ] Phase 5: session suspend on the node (`durability = "local"` or
         `"store"`), `suspend.keepFor`, `evicted` answers, resume by tag with
-        manifest fallback.
+        manifest fallback, edge resume on any node, and moves fenced by a
+        generation claimed with a conditional manifest write (plan §6.7).
   - [ ] Phase 6 (conditional, plan §6.8): batched raft session directory,
         only past its trigger.
 
