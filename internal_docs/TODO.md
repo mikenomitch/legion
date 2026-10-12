@@ -198,6 +198,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#29](https://github.com/mikenomitch/legion/pull/29) | Deterministic `nodes_considered` scheduler tests (flaked ~1 in 3,000 runs) | Test-only seed on `Scheduler`; bench shows no change |
 | [#20](https://github.com/mikenomitch/legion/pull/20) | Operator UI gaps: instance and allocation pages, event filters by instance/allocation, KV values hidden until revealed, worker public addresses, stale rollouts cancel themselves | [plan](plans/operator-ui-gaps-plan.md) · [calls](calls/operator-ui-gaps-plan_calls.md) |
 | [#19](https://github.com/mikenomitch/legion/pull/19) | Task page tabs, guided template launch, Actions tab; template-launched jobs list their tasks again | UI only; [plan](plans/ui-task-and-template-redesign-plan.md) · [calls](calls/ui-task-and-template-redesign-plan_calls.md) |
 | [#24](https://github.com/mikenomitch/legion/pull/24) | Gated sandbox checkpoints Phases 1 to 4: gated memory checkpoints, `gated-default` deny, the static `legion-guest` agent, gated idle signals, Legion-addressed TAP guests (`tap`/`mac` removed) | Phase 0 (KVM) pending, so the gated-by-default flip is held; [plan](plans/gated-sandbox-checkpoints-plan.md) · [calls](calls/gated-sandbox-checkpoints-plan_calls.md) |
@@ -3846,6 +3847,13 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       [calls](calls/adaptive-scheduler-concurrency-plan_calls.md),
       [docs/adaptive-scheduler-concurrency.md](../docs/adaptive-scheduler-concurrency.md).
       Phase 0 (measurement) was skipped and phases 4–5 are open items above.
+- [x] **The `nodes_considered` scheduler tests are deterministic**
+      ([#29](https://github.com/mikenomitch/legion/pull/29)).
+      `spread_limits_nodes_considered_by_count` and its bin_pack twin failed
+      about once per 3,000 runs: their node load was the job's own
+      allocations, which a Fresh plan drops, so every pick was uniform. The
+      load now comes from a filler job, and the subset RNG is pinned per
+      iteration through a test-only `Scheduler` seed.
 
 ## Task runtimes
 
