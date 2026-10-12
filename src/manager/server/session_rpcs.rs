@@ -63,17 +63,12 @@ impl ManagerDaemonService {
             "create_instance",
             request.idempotency_key.as_deref(),
         );
-        let (session_id, derived) = if scoped.is_empty() {
-            (crate::structs::mint_instance_id(&task.name), false)
-        } else {
-            (
-                crate::structs::session::derived_session_id(&task.name, &config.name, &scoped),
-                true,
-            )
-        };
-        let started = sessions::start(&self.store, config, task, &session_id, derived).await?;
+        let derived_id = (!scoped.is_empty()).then(|| {
+            crate::structs::session::derived_session_id(&task.name, &config.name, &scoped)
+        });
+        let started = sessions::start(&self.store, config, task, derived_id.as_deref()).await?;
         Ok(Response::new(CreateInstanceReply {
-            instance_id: session_id,
+            instance_id: started.session_id,
             deduplicated: started.deduplicated,
             restoring_from: String::new(),
             mode: InstanceMode::Session.to_string(),

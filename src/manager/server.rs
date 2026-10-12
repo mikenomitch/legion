@@ -10815,29 +10815,54 @@ impl Manager for ManagerDaemonService {
         let ttl = humantime::parse_duration(&ttl)
             .map_err(|e| Status::invalid_argument(format!("invalid ttl `{ttl}`: {e}")))?;
 
-        let ticket_request = crate::manager::edge_boot::TicketRequest {
-            job: req.job.clone(),
-            task: req.task.clone(),
-            job_config_id: job_config_id.clone(),
-            instance_id: req.instance_id.clone(),
-            instance_prefix: req.instance_prefix.clone(),
-            pool: req.pool.clone(),
-            gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
-            ttl,
-            uses: if req.uses == 0 { 1 } else { req.uses },
-            accessor_id: identity.accessor_id.clone().unwrap_or_default(),
+        let minted = match req.scope.trim() {
+            "" | "boot" => {
+                self.mint_boot_ticket(state, &identity, &req, &job_config_id, &task, ttl)?
+            }
+            "session" => {
+                if !req.instance_id.trim().is_empty()
+                    || !req.instance_prefix.trim().is_empty()
+                    || !req.job_config_id.trim().is_empty()
+                    || req.gate != 0
+                    || req.uses > 1
+                {
+                    return Err(Status::invalid_argument(
+                        "a session ticket names no instance, instance prefix, job config, gate, \
+                         or use count: the node mints the session id and starts the spec of the \
+                         envelope it holds, and the ticket is good for any number of sessions \
+                         until it expires",
+                    ));
+                }
+                let session_request = crate::manager::edge_boot::SessionTicketRequest {
+                    job: req.job.clone(),
+                    task: req.task.clone(),
+                    pool: req.pool.clone(),
+                    ttl,
+                    accessor_id: identity.accessor_id.clone().unwrap_or_default(),
+                };
+                crate::manager::edge_boot::validate_session_ticket_request(
+                    &session_request,
+                    &task,
+                    &self.edge_boot,
+                )
+                .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+                let jti = crate::structs::edge_boot::new_ticket_id();
+                crate::manager::edge_boot::mint_session_ticket(
+                    state,
+                    &session_request,
+                    &job_config_id,
+                    &jti,
+                    std::time::SystemTime::now(),
+                )
+                .map_err(|e| Status::internal(format!("failed to mint session ticket: {e:#}")))?
+            }
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown ticket scope `{other}` (boot|session)"
+                )))
+            }
         };
-        crate::manager::edge_boot::validate_ticket_request(&ticket_request, &task, &self.edge_boot)
-            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
-
-        let jti = crate::structs::edge_boot::new_ticket_id();
-        let minted = crate::manager::edge_boot::mint(
-            state,
-            &ticket_request,
-            &jti,
-            std::time::SystemTime::now(),
-        )
-        .map_err(|e| Status::internal(format!("failed to mint boot ticket: {e:#}")))?;
+        let jti = minted.record.jti.clone();
         tracing::Span::current().record("jti", jti.as_str());
 
         self.store
@@ -10923,6 +10948,11 @@ impl Manager for ManagerDaemonService {
                 expires_at_unix: record.expires_at_unix,
                 accessor_id: record.accessor_id,
                 created_at: record.created_at,
+                scope: if record.gate == crate::manager::edge_boot::SESSION_TICKET_GATE {
+                    "session".to_string()
+                } else {
+                    "boot".to_string()
+                },
             })
             .collect();
         Ok(Response::new(ListBootTicketsReply { tickets }))
@@ -11995,6 +12025,11 @@ pub(crate) fn desired_payload(
     let volumes =
         store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
     let mut payload = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+    crate::manager::dispatcher::attach_session_task_spec(
+        &mut payload,
+        task,
+        tasks.iter().map(|(id, task)| (*id, task)),
+    )?;
     // The band orders the worker's memory pressure response. Read from the
     // read model, so building a payload pays no store read for it.
     payload.priority_band = store
@@ -14259,6 +14294,27 @@ mod tests {
             &self,
             _request: Request<crate::structs::StopSessionsRequest>,
         ) -> Result<Response<crate::structs::StopSessionsReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn get_session(
+            &self,
+            _request: Request<crate::structs::GetSessionRequest>,
+        ) -> Result<Response<crate::structs::GetSessionReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn start_session(
+            &self,
+            _request: Request<crate::structs::StartSessionRequest>,
+        ) -> Result<Response<crate::structs::StartSessionReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn stop_session(
+            &self,
+            _request: Request<crate::structs::StopSessionRequest>,
+        ) -> Result<Response<crate::structs::StopSessionReply>, Status> {
             Err(Status::unimplemented("not used in test"))
         }
 
@@ -18042,5 +18098,36 @@ mod tests {
             reply.max_session_seconds
         );
         Ok(())
+    }
+}
+
+impl ManagerDaemonService {
+    /// Mint a boot ticket (`IssueBootTicketRequest.scope = "boot"`).
+    fn mint_boot_ticket(
+        &self,
+        state: &crate::manager::workload_identity::WorkloadIdentityState,
+        identity: &AclIdentity,
+        req: &IssueBootTicketRequest,
+        job_config_id: &str,
+        task: &TaskConfig,
+        ttl: std::time::Duration,
+    ) -> Result<crate::manager::edge_boot::MintedTicket, Status> {
+        let ticket_request = crate::manager::edge_boot::TicketRequest {
+            job: req.job.clone(),
+            task: req.task.clone(),
+            job_config_id: job_config_id.to_string(),
+            instance_id: req.instance_id.clone(),
+            instance_prefix: req.instance_prefix.clone(),
+            pool: req.pool.clone(),
+            gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
+            ttl,
+            uses: if req.uses == 0 { 1 } else { req.uses },
+            accessor_id: identity.accessor_id.clone().unwrap_or_default(),
+        };
+        crate::manager::edge_boot::validate_ticket_request(&ticket_request, task, &self.edge_boot)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        let jti = crate::structs::edge_boot::new_ticket_id();
+        crate::manager::edge_boot::mint(state, &ticket_request, &jti, std::time::SystemTime::now())
+            .map_err(|e| Status::internal(format!("failed to mint boot ticket: {e:#}")))
     }
 }

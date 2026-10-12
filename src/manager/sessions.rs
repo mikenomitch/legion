@@ -146,19 +146,19 @@ pub fn merge(replies: Vec<QuerySessionsReply>, now_ms: i64) -> SessionView {
     }
 }
 
-/// Of the copies of one session id, the one that stays (the earliest lease,
-/// ties broken by node id) and the ones that should stop.
+/// Of the copies of one session id, the one that stays and the ones that
+/// should stop. The higher generation wins (a copy resumed from a newer
+/// checkpoint holds the newer state); then the earliest lease; then the
+/// lower node id, so every manager picks the same copy.
 pub fn winner(mut copies: Vec<IndexedSession>) -> Option<(IndexedSession, Vec<IndexedSession>)> {
     copies.sort_by(|a, b| {
         let key = |entry: &IndexedSession| {
-            (
-                entry
-                    .status
-                    .as_ref()
-                    .map(|status| status.lease_issued_at_unix_ms)
-                    .unwrap_or_default(),
-                entry.node_id.clone(),
-            )
+            let (generation, lease) = entry
+                .status
+                .as_ref()
+                .map(|status| (status.generation, status.lease_issued_at_unix_ms))
+                .unwrap_or_default();
+            (std::cmp::Reverse(generation), lease, entry.node_id.clone())
         };
         key(a).cmp(&key(b))
     });
@@ -170,9 +170,22 @@ pub fn winner(mut copies: Vec<IndexedSession>) -> Option<(IndexedSession, Vec<In
 /// The running session with this id, if any: the surviving copy, with a stop
 /// sent to any later copy. An id without the minted shape is never a session,
 /// so it is answered without asking the peers.
+///
+/// An id that carries a node tag is asked of that node first
+/// (`Worker.GetSession`): one call instead of a fan-out. The node's answer is
+/// final when it has the session or says it never had it; a node that does
+/// not answer, a tag no live node has, or a node that says the tag is not
+/// its own falls back to the merged view.
 pub async fn find(store: &Store, session_id: &str) -> Option<IndexedSession> {
     if !crate::structs::is_minted_instance_id(session_id) {
         return None;
+    }
+    if let Some(tag) = crate::structs::session_node_tag(session_id) {
+        match probe_tagged(store, session_id, tag).await {
+            Probe::Found(entry) => return Some(*entry),
+            Probe::Absent => return None,
+            Probe::Unknown => {}
+        }
     }
     let view = query(
         store,
@@ -185,6 +198,119 @@ pub async fn find(store: &Store, session_id: &str) -> Option<IndexedSession> {
     let (kept, later) = winner(view.sessions)?;
     stop_duplicates(store, later);
     Some(kept)
+}
+
+/// What the node a session id names said about it.
+enum Probe {
+    Found(Box<IndexedSession>),
+    /// The node answered and does not hold the session.
+    Absent,
+    /// No answer worth trusting: fall back to the merged view.
+    Unknown,
+}
+
+/// How long the tag-to-node map is reused before the node list is read again.
+const NODE_TAG_TTL: Duration = Duration::from_secs(5);
+
+struct NodeTags {
+    read_at: Instant,
+    by_tag: HashMap<String, Vec<String>>,
+}
+
+fn node_tag_cache() -> &'static Mutex<HashMap<usize, NodeTags>> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, NodeTags>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The nodes whose tag is `tag` (almost always one). Read from the store's
+/// node list at most every [`NODE_TAG_TTL`]; a miss re-reads once, so a node
+/// that joined since is found.
+pub fn nodes_for_tag(store: &Store, tag: &str) -> Vec<String> {
+    let key = std::sync::Arc::as_ptr(store.sessions()) as usize;
+    let lookup = |fresh: bool| -> Option<Vec<String>> {
+        let mut cache = node_tag_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let stale = cache
+            .get(&key)
+            .is_none_or(|tags| fresh || tags.read_at.elapsed() > NODE_TAG_TTL);
+        if stale {
+            let mut by_tag: HashMap<String, Vec<String>> = HashMap::new();
+            for node_id in store.cached_node_ids().unwrap_or_default() {
+                by_tag
+                    .entry(crate::structs::node_tag(&node_id))
+                    .or_default()
+                    .push(node_id);
+            }
+            cache.insert(
+                key,
+                NodeTags {
+                    read_at: Instant::now(),
+                    by_tag,
+                },
+            );
+        }
+        cache
+            .get(&key)
+            .and_then(|tags| tags.by_tag.get(tag).cloned())
+    };
+    lookup(false).or_else(|| lookup(true)).unwrap_or_default()
+}
+
+async fn probe_tagged(store: &Store, session_id: &str, tag: &str) -> Probe {
+    let nodes = nodes_for_tag(store, tag);
+    if nodes.is_empty() {
+        return Probe::Unknown;
+    }
+    let mut absent = 0;
+    for node_id in &nodes {
+        match get_on_node(store, node_id, session_id).await {
+            Ok(Some(status)) => {
+                return Probe::Found(Box::new(IndexedSession {
+                    node_id: node_id.clone(),
+                    status: Some(status),
+                    recent: false,
+                }))
+            }
+            Ok(None) => absent += 1,
+            Err(err) => {
+                debug!(session_id, node_id = %node_id, error = %err, "Session probe failed");
+            }
+        }
+    }
+    if absent == nodes.len() {
+        Probe::Absent
+    } else {
+        Probe::Unknown
+    }
+}
+
+/// Ask one node for a session (`Worker.GetSession`). `Ok(None)` when the
+/// node answers that it does not hold it (never had it, or evicted it);
+/// a `wrong_node` answer is an error, so the caller looks elsewhere.
+pub async fn get_on_node(
+    store: &Store,
+    node_id: &str,
+    session_id: &str,
+) -> Result<Option<SessionStatus>, Status> {
+    let (mut client, target) = worker_client(store, node_id)?;
+    let mut request = tonic::Request::new(crate::structs::GetSessionRequest {
+        session_id: session_id.to_string(),
+        ticket: String::new(),
+    });
+    request.set_timeout(WORKER_CALL_TIMEOUT);
+    match client.get_session(request).await {
+        Ok(reply) => Ok(reply.into_inner().session),
+        Err(status)
+            if status.code() == tonic::Code::NotFound
+                && !status.message().starts_with("wrong_node:") =>
+        {
+            Ok(None)
+        }
+        Err(status) => Err(crate::manager::worker_plane::worker_call_error(
+            &target.node_id,
+            &target.address,
+            status,
+        )),
+    }
 }
 
 /// Stop the later copies of a duplicated session, in the background.
@@ -465,6 +591,9 @@ fn rank(view: &RoomView, needs: &BTreeMap<String, f64>) -> Vec<String> {
 /// idempotent create).
 #[derive(Debug, Clone)]
 pub struct StartedSession {
+    /// The session's id: the derived id when one was asked for, else the id
+    /// minted for the node that took it (it carries that node's tag).
+    pub session_id: String,
     pub node_id: String,
     pub state: String,
     pub deduplicated: bool,
@@ -472,21 +601,25 @@ pub struct StartedSession {
 
 /// Start an unnamed session of a session task: pick a node whose envelope
 /// has room, send it the start, and try the next node if it refuses.
-/// `derived` says the id came from an idempotency key, which makes a retry
-/// find the running session instead of starting a second.
+/// `derived_id` is the id an idempotency key derived, which makes a retry
+/// find the running session instead of starting a second. Without one, each
+/// attempt mints an id carrying the tag of the node it is sent to
+/// ([`crate::structs::mint_session_id`]), so a later read goes straight to
+/// that node.
 pub async fn start(
     store: &Store,
     config: &JobConfig,
     task: &TaskConfig,
-    session_id: &str,
-    derived: bool,
+    derived_id: Option<&str>,
 ) -> Result<StartedSession, Status> {
     let metrics = crate::manager::telemetry::metrics();
     let job_id = config.name.as_str();
-    if derived {
+    let derived = derived_id.is_some();
+    if let Some(session_id) = derived_id {
         if let Some(existing) = find(store, session_id).await {
             metrics.session_starts_total.inc(&["deduplicated"]);
             return Ok(StartedSession {
+                session_id: session_id.to_string(),
                 node_id: existing.node_id.clone(),
                 state: existing
                     .status
@@ -536,6 +669,14 @@ pub async fn start(
     let mut refusals = Vec::new();
     for node_id in candidates.into_iter().take(ROUTER_ATTEMPTS) {
         let issued_at = now_unix_ms();
+        let minted;
+        let session_id = match derived_id {
+            Some(id) => id,
+            None => {
+                minted = crate::structs::mint_session_id(&task.name, &node_id);
+                minted.as_str()
+            }
+        };
         match send_start(
             store,
             config,
@@ -558,6 +699,7 @@ pub async fn start(
                     state: "starting".into(),
                     lease_issued_at_unix_ms: issued_at,
                     resources: task.resources.to_string(),
+                    ..Default::default()
                 };
                 store
                     .sessions()
@@ -575,6 +717,7 @@ pub async fn start(
                 }
                 debug!(session_id, node_id = %node_id, "Session started");
                 return Ok(StartedSession {
+                    session_id: session_id.to_string(),
                     node_id,
                     state: "starting".into(),
                     deduplicated: false,
@@ -730,6 +873,7 @@ mod sessions_test {
             state: "running".into(),
             lease_issued_at_unix_ms: iat,
             resources: r#"{"cpu":500,"memory":512}"#.into(),
+            ..Default::default()
         }
     }
 

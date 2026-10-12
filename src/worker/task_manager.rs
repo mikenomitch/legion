@@ -372,6 +372,25 @@ fn envelope_refusal(
     None
 }
 
+/// The status an idle (suspended or evicted) session reports.
+fn idle_session_status(
+    row: &crate::worker::session_log::PersistedSession,
+) -> crate::structs::SessionStatus {
+    crate::structs::SessionStatus {
+        session_id: row.session_id.clone(),
+        job_id: row.job_id.clone(),
+        job_config_id: row.job_config_id.clone(),
+        task_name: row.task_name.clone(),
+        envelope_allocation_id: 0,
+        state: row.state.as_str().to_string(),
+        lease_issued_at_unix_ms: row.lease_issued_at_unix_ms,
+        resources: row.resources.to_string(),
+        generation: row.generation,
+        origin: row.origin.clone(),
+        ticket_jti: row.ticket_jti.clone(),
+    }
+}
+
 /// How long a session may outlive its envelope on the node before it is
 /// ended. Covers a job update replacing the envelope (stop, then start, in
 /// one reconcile, unless a slow-stopping neighbour holds the start back); a
@@ -613,6 +632,17 @@ pub struct WorkerTaskManager {
     /// checkpoint, or evicted and remembered for `suspend.keepFor`. Keyed by
     /// session id; mirrored in the session log.
     idle_sessions: HashMap<String, crate::worker::session_log::PersistedSession>,
+    /// The session task each envelope on this node serves, by the envelope's
+    /// local key (`TaskAllocation.session_task_spec`), for edge starts.
+    session_specs: HashMap<i64, SessionSpec>,
+}
+
+/// A session task's spec, as its envelope's payload carried it.
+#[derive(Debug, Clone)]
+pub struct SessionSpec {
+    pub job_config_id: String,
+    pub task_config_id: i64,
+    pub task: TaskConfig,
 }
 
 impl Default for WorkerTaskManager {
@@ -689,6 +719,7 @@ impl WorkerTaskManager {
             session_log: None,
             session_log_unavailable: false,
             idle_sessions: HashMap::new(),
+            session_specs: HashMap::new(),
         }
     }
 
@@ -3147,6 +3178,26 @@ impl WorkerTaskManager {
             .map(|(local, task)| (*local, task))
     }
 
+    /// The spec of a session task this node holds an envelope for, for an
+    /// edge start. `None` without a live envelope, or when the envelope's
+    /// payload predates carrying it.
+    pub fn session_spec(&self, job_id: &str, task_name: &str) -> Option<SessionSpec> {
+        let (local, _) = self.envelope_for(job_id, task_name)?;
+        self.session_specs.get(&local).cloned()
+    }
+
+    /// When and why this node evicted a session's local-only checkpoint, if
+    /// it still remembers (`suspend.keepFor`).
+    pub fn evicted_session(&self, session_id: &str) -> Option<String> {
+        let row = self.idle_sessions.get(session_id)?;
+        (row.state == crate::worker::session_log::SessionLogState::Evicted).then(|| {
+            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.updated_at_unix_ms)
+                .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_default();
+            format!("at {at} ({})", row.evicted_reason)
+        })
+    }
+
     /// Admit a session into its task's envelope on this node.
     ///
     /// The envelope's resources are the room; the node's free capacity is
@@ -3203,37 +3254,85 @@ impl WorkerTaskManager {
     /// allocations and are not listed.
     pub fn session_statuses(&mut self) -> Vec<crate::structs::SessionStatus> {
         self.settle_sessions(std::time::Instant::now());
-        self.claims
-            .sessions()
-            .into_iter()
-            .filter(|claim| !claim.is_ratified())
-            .map(|claim| {
-                let envelope = self
-                    .envelope_for(&claim.job_id, &claim.task_name)
-                    .and_then(|(local, _)| self.external_id(local))
-                    .unwrap_or(0);
-                crate::structs::SessionStatus {
-                    session_id: claim.instance_id.clone(),
-                    job_id: claim.job_id.clone(),
-                    job_config_id: claim.job_config_id.clone(),
-                    task_name: claim.task_name.clone(),
-                    envelope_allocation_id: envelope,
-                    state: match claim.stage {
-                        ClaimStage::Serving | ClaimStage::Booted => "running",
-                        _ => "starting",
-                    }
-                    .to_string(),
-                    lease_issued_at_unix_ms: claim
-                        .session
-                        .map(|session| session.lease_issued_at_unix_ms)
-                        .unwrap_or_default(),
-                    resources: claim.resources.to_string(),
-                }
-            })
-            .collect()
+        // One envelope lookup per task, not per session: a node with
+        // thousands of sessions builds this report every heartbeat.
+        let mut envelopes: HashMap<(String, String), i64> = HashMap::new();
+        let mut statuses = Vec::new();
+        for claim in self.claims.sessions() {
+            if claim.is_ratified() {
+                continue;
+            }
+            let envelope = *envelopes
+                .entry((claim.job_id.clone(), claim.task_name.clone()))
+                .or_insert_with(|| {
+                    self.envelope_for(&claim.job_id, &claim.task_name)
+                        .and_then(|(local, _)| self.external_id(local))
+                        .unwrap_or(0)
+                });
+            statuses.push(self.session_status_of(&claim, envelope));
+        }
+        statuses.extend(self.idle_session_statuses());
+        statuses
+    }
+
+    /// The status a session claim reports, given its envelope's id.
+    fn session_status_of(
+        &self,
+        claim: &ClaimRecord,
+        envelope_allocation_id: i64,
+    ) -> crate::structs::SessionStatus {
+        crate::structs::SessionStatus {
+            session_id: claim.instance_id.clone(),
+            job_id: claim.job_id.clone(),
+            job_config_id: claim.job_config_id.clone(),
+            task_name: claim.task_name.clone(),
+            envelope_allocation_id,
+            state: match claim.stage {
+                ClaimStage::Serving | ClaimStage::Booted => "running",
+                _ => "starting",
+            }
+            .to_string(),
+            lease_issued_at_unix_ms: claim
+                .session
+                .map(|session| session.lease_issued_at_unix_ms)
+                .unwrap_or_default(),
+            resources: claim.resources.to_string(),
+            generation: claim.session.map(|session| session.generation).unwrap_or(1),
+            origin: claim.origin.clone(),
+            ticket_jti: claim.ticket_jti.clone(),
+        }
+    }
+
+    /// The sessions this node holds that run nothing: suspended or evicted.
+    fn idle_session_statuses(&self) -> Vec<crate::structs::SessionStatus> {
+        let mut statuses: Vec<_> = self
+            .idle_sessions
+            .values()
+            .map(idle_session_status)
+            .collect();
+        statuses.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        statuses
+    }
+
+    /// One session on this node, running or idle, for `Worker.GetSession`.
+    /// Promoted sessions are allocations and are not sessions any more.
+    pub fn session_status(&self, session_id: &str) -> Option<crate::structs::SessionStatus> {
+        if let Some(idle) = self.idle_sessions.get(session_id) {
+            return Some(idle_session_status(idle));
+        }
+        let claim = self.claims.by_instance(session_id)?;
+        if !claim.is_session() || claim.is_ratified() {
+            return None;
+        }
+        let envelope = self
+            .envelope_for(&claim.job_id, &claim.task_name)
+            .and_then(|(local, _)| self.external_id(local))
+            .unwrap_or(0);
+        Some(self.session_status_of(claim, envelope))
     }
 
     fn settle_sessions(&mut self, now: std::time::Instant) {
+        let mut envelopes: HashMap<(String, String), bool> = HashMap::new();
         for claim in self.claims.sessions() {
             let local = claim.local_key;
             if claim.is_ratified() {
@@ -3266,7 +3365,10 @@ impl WorkerTaskManager {
                 info!(session_id = %claim.instance_id, "Session ended");
                 continue;
             }
-            if self.envelope_for(&claim.job_id, &claim.task_name).is_some() {
+            let has_envelope = *envelopes
+                .entry((claim.job_id.clone(), claim.task_name.clone()))
+                .or_insert_with(|| self.envelope_for(&claim.job_id, &claim.task_name).is_some());
+            if has_envelope {
                 self.orphaned_sessions.remove(&claim.claim_id);
                 continue;
             }
@@ -3338,6 +3440,27 @@ impl WorkerTaskManager {
             }
         }
         let (alloc, task) = task_from_allocation(allocation)?;
+        // An envelope carries the session task it serves, so this node can
+        // start that task's sessions from a session ticket.
+        if !allocation.session_task_spec.is_empty() {
+            match serde_json::from_str::<TaskConfig>(&allocation.session_task_spec) {
+                Ok(session_task) => {
+                    self.session_specs.insert(
+                        alloc.id,
+                        SessionSpec {
+                            job_config_id: allocation.job_config_id.clone(),
+                            task_config_id: allocation.session_task_config_id,
+                            task: session_task,
+                        },
+                    );
+                }
+                Err(err) => warn!(
+                    allocation_id = alloc.id,
+                    error = ?err,
+                    "Envelope carries an unreadable session task spec; edge starts refused"
+                ),
+            }
+        }
         // A duplicate dispatch (heartbeat and push racing) of an allocation
         // whose launch is still in its runtime call. Launching it again would
         // start it twice; tearing the first one down would waste the work.
@@ -5370,6 +5493,8 @@ mod tests {
             task_snapshots: String::new(),
             identity_epoch: 0,
             promoted_from_session: String::new(),
+            session_task_spec: String::new(),
+            session_task_config_id: 0,
             task_lifecycle: String::new(),
             task_restart: String::new(),
         }

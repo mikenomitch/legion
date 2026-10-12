@@ -64,6 +64,13 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         ("StartClaim", &[Caller::Ticket]),
         ("Probe", &[Caller::Manager]),
         ("StopSessions", &[Caller::Manager]),
+        // A manager certificate (the manager's routed read), or a session
+        // ticket (a front-end reading a session it started at the edge).
+        ("GetSession", &[Caller::Manager, Caller::Ticket]),
+        // Session tickets only: the manager starts and stops sessions with
+        // PostWork and StopSessions.
+        ("StartSession", &[Caller::Ticket]),
+        ("StopSession", &[Caller::Ticket]),
     ]
 }
 
@@ -224,6 +231,28 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
             .stop_sessions(legion::structs::StopSessionsRequest {
                 session_ids: vec!["workspace-not-running".into()],
                 reason: "stop".into(),
+            })
+            .await
+            .map(|_| ()),
+        "GetSession" => client
+            .get_session(legion::structs::GetSessionRequest {
+                session_id: "workspace-not-running".into(),
+                ticket: String::new(),
+            })
+            .await
+            .map(|_| ()),
+        "StartSession" => client
+            .start_session(legion::structs::StartSessionRequest {
+                job_id: "job".into(),
+                task_name: "workspace".into(),
+                ..Default::default()
+            })
+            .await
+            .map(|_| ()),
+        "StopSession" => client
+            .stop_session(legion::structs::StopSessionRequest {
+                session_id: "workspace-not-running".into(),
+                ticket: String::new(),
             })
             .await
             .map(|_| ()),

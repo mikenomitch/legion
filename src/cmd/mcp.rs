@@ -447,7 +447,8 @@ fn tool_defs() -> Vec<ToolDef> {
                     "job_config_id": { "type": "string", "description": "Pin to an exact job config. Default: the job's current config." },
                     "ttl": { "type": "string", "description": "Lifetime, e.g. 5m. Default: edgeBoot.defaultTicketTtl." },
                     "uses": { "type": "integer", "description": "Redemptions allowed. Default 1." },
-                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the ticket already minted." }
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the ticket already minted." },
+                    "scope": { "type": "string", "enum": ["boot", "session"], "description": "boot (default): start one instance. session: a reusable ticket a front-end presents to Worker.StartSession/StopSession/GetSession on any node of the pool to start sessions of a session-mode task with no manager call (docs/session-mode.md). Session tickets take no instance, prefix, gate, or job_config_id, and default to unlimited uses." }
                 },
                 "required": ["job", "task", "pool"],
                 "additionalProperties": false
@@ -1335,15 +1336,18 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_boot_ticket_create" => {
+            let scope = opt_str_arg(&args, "scope").unwrap_or_else(|| "boot".to_string());
+            let session = scope == "session";
             let gate = match opt_str_arg(&args, "gate") {
                 Some(raw) => crate::structs::edge_boot::Gate::parse(&raw)
                     .map_err(|err| format!("{err:#}"))?,
+                None if session => crate::structs::edge_boot::Gate::Off,
                 None => crate::structs::edge_boot::Gate::Boot,
             };
             let uses = args
                 .get("uses")
                 .and_then(|value| value.as_u64())
-                .unwrap_or(1) as u32;
+                .unwrap_or(if session { 0 } else { 1 }) as u32;
             let mut client = connect().await?;
             grpc(
                 client.issue_boot_ticket(crate::structs::IssueBootTicketRequest {
@@ -1357,6 +1361,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     ttl: opt_str_arg(&args, "ttl").unwrap_or_default(),
                     uses,
                     idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                    scope,
                 }),
             )
             .await

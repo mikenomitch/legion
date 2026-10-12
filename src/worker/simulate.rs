@@ -772,6 +772,34 @@ impl Worker for SimWorkerService {
         crate::worker::plane::require_manager(&request, "StopSessions")?;
         Ok(Response::new(crate::structs::StopSessionsReply::default()))
     }
+
+    async fn get_session(
+        &self,
+        request: Request<crate::structs::GetSessionRequest>,
+    ) -> Result<Response<crate::structs::GetSessionReply>, Status> {
+        crate::worker::plane::require_manager(&request, "GetSession")?;
+        Err(Status::not_found(
+            "not_found: a simulated node runs no sessions",
+        ))
+    }
+
+    async fn start_session(
+        &self,
+        _request: Request<crate::structs::StartSessionRequest>,
+    ) -> Result<Response<crate::structs::StartSessionReply>, Status> {
+        Err(Status::failed_precondition(
+            "a simulated node does not accept edge starts",
+        ))
+    }
+
+    async fn stop_session(
+        &self,
+        _request: Request<crate::structs::StopSessionRequest>,
+    ) -> Result<Response<crate::structs::StopSessionReply>, Status> {
+        Err(Status::failed_precondition(
+            "a simulated node does not accept edge starts",
+        ))
+    }
 }
 
 /// A launched fleet: observability for tests and drivers, plus the point

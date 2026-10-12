@@ -495,6 +495,233 @@ impl Worker for WorkerDaemonService {
             .stop_sessions(&request.session_ids, &format!("requested ({reason})"));
         Ok(Response::new(crate::structs::StopSessionsReply { stopped }))
     }
+
+    /// One session on this node, for tag routing (session durability plan
+    /// §6.3). The node's answer is authoritative for itself.
+    #[instrument(err, skip_all, fields(session_id))]
+    async fn get_session(
+        &self,
+        request: Request<crate::structs::GetSessionRequest>,
+    ) -> Result<Response<crate::structs::GetSessionReply>, Status> {
+        // Caller classes: manager, ticket (a session ticket).
+        let caller = crate::worker::plane::caller_of(&request, "GetSession")?;
+        let request = request.into_inner();
+        tracing::Span::current().record("session_id", request.session_id.as_str());
+        let ticket = match caller {
+            crate::worker::plane::Caller::Manager(_) => None,
+            crate::worker::plane::Caller::Ticket => {
+                Some(self.verify_session_ticket(&request.ticket, "GetSession")?)
+            }
+        };
+        let session = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .session_status(&request.session_id);
+        let Some(session) = session else {
+            return Err(self.session_not_here(&request.session_id));
+        };
+        if let Some(ticket) = ticket {
+            ticket.allows(&session.job_id, &session.task_name)?;
+        }
+        Ok(Response::new(crate::structs::GetSessionReply {
+            session: Some(session),
+            node_id: self.node_id.clone(),
+        }))
+    }
+
+    /// Start a session from a session ticket (session durability plan
+    /// §6.4): no manager on the path, nothing written to raft.
+    #[instrument(err, skip_all, fields(job, task, session_id))]
+    async fn start_session(
+        &self,
+        request: Request<crate::structs::StartSessionRequest>,
+    ) -> Result<Response<crate::structs::StartSessionReply>, Status> {
+        // Caller class: ticket only.
+        let caller = crate::worker::plane::caller_of(&request, "StartSession")?;
+        if let crate::worker::plane::Caller::Manager(_) = caller {
+            return Err(Status::unauthenticated(
+                "StartSession is the edge entry point and admits a session ticket only; \
+                 managers start sessions with PostWork",
+            ));
+        }
+        let request = request.into_inner();
+        let ticket = self.verify_session_ticket(&request.ticket, "StartSession")?;
+        let claims = ticket.0.clone();
+        let job = if request.job_id.is_empty() {
+            claims.job.clone()
+        } else {
+            request.job_id.clone()
+        };
+        let task = if request.task_name.is_empty() {
+            claims.task.clone()
+        } else {
+            request.task_name.clone()
+        };
+        ticket.allows(&job, &task)?;
+        let span = tracing::Span::current();
+        span.record("job", job.as_str());
+        span.record("task", task.as_str());
+
+        let slot = self.launch_slot().await?;
+        let task_manager = self.task_manager.clone();
+        let node_id = self.node_id.clone();
+        let key = request.idempotency_key.clone();
+        let started = tokio::task::spawn_blocking(move || {
+            edge::start_edge_session(&task_manager, &node_id, &claims, &key, slot)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("session start panicked: {err}")))?
+        .map_err(|err| admission_status(&err))?;
+        span.record("session_id", started.session_id.as_str());
+
+        let state = if started.deduplicated || !request.wait.unwrap_or(true) {
+            self.task_manager
+                .lock()
+                .map_err(|_| Status::internal("Task manager lock poisoned"))?
+                .session_status(&started.session_id)
+                .map(|status| status.state)
+                .unwrap_or_else(|| "starting".to_string())
+        } else {
+            match edge::wait_until_running(&self.task_manager, &started.session_id, EDGE_START_WAIT)
+                .await
+            {
+                Ok(true) => "running".to_string(),
+                Ok(false) => "starting".to_string(),
+                Err(err) => return Err(Status::internal(format!("{err:#}"))),
+            }
+        };
+        Ok(Response::new(crate::structs::StartSessionReply {
+            session_id: started.session_id,
+            node_id: self.node_id.clone(),
+            state,
+            deduplicated: started.deduplicated,
+        }))
+    }
+
+    /// End one session from a session ticket.
+    #[instrument(err, skip_all, fields(session_id))]
+    async fn stop_session(
+        &self,
+        request: Request<crate::structs::StopSessionRequest>,
+    ) -> Result<Response<crate::structs::StopSessionReply>, Status> {
+        // Caller class: ticket only.
+        let caller = crate::worker::plane::caller_of(&request, "StopSession")?;
+        if let crate::worker::plane::Caller::Manager(_) = caller {
+            return Err(Status::unauthenticated(
+                "StopSession admits a session ticket only; managers end sessions with \
+                 StopSessions",
+            ));
+        }
+        let request = request.into_inner();
+        tracing::Span::current().record("session_id", request.session_id.as_str());
+        let ticket = self.verify_session_ticket(&request.ticket, "StopSession")?;
+        let mut manager = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?;
+        let Some(session) = manager.session_status(&request.session_id) else {
+            drop(manager);
+            let status = self.session_not_here(&request.session_id);
+            // Already gone from this node: idempotent, unless the caller has
+            // the wrong node.
+            if status.message().starts_with("not_found") {
+                return Ok(Response::new(crate::structs::StopSessionReply {
+                    stopped: false,
+                    node_id: self.node_id.clone(),
+                }));
+            }
+            return Err(status);
+        };
+        ticket.allows(&session.job_id, &session.task_name)?;
+        let stopped = manager.stop_sessions(
+            std::slice::from_ref(&request.session_id),
+            "requested (edge stop)",
+        );
+        Ok(Response::new(crate::structs::StopSessionReply {
+            stopped: !stopped.is_empty(),
+            node_id: self.node_id.clone(),
+        }))
+    }
+}
+
+/// How long `StartSession` waits for a session to be running before it
+/// answers `starting`.
+const EDGE_START_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A verified session ticket.
+pub(crate) struct VerifiedSessionTicket(crate::structs::edge_boot::SessionTicketClaims);
+
+impl VerifiedSessionTicket {
+    /// PermissionDenied unless the ticket covers this job and task.
+    fn allows(&self, job: &str, task: &str) -> Result<(), Status> {
+        self.0
+            .covers(job, task)
+            .map_err(|err| Status::permission_denied(format!("{err:#}")))
+    }
+}
+
+impl WorkerDaemonService {
+    /// Verify a session ticket presented on the worker plane.
+    pub(crate) fn verify_session_ticket(
+        &self,
+        token: &str,
+        rpc: &str,
+    ) -> Result<VerifiedSessionTicket, Status> {
+        if token.trim().is_empty() {
+            return Err(Status::unauthenticated(format!(
+                "{rpc} admits a manager certificate or a session ticket; this request carried \
+                 neither"
+            )));
+        }
+        let Some(edge_boot) = self.edge_boot.as_ref() else {
+            return Err(Status::failed_precondition(format!(
+                "{rpc}: this node does not accept edge starts (set edgeBoot.acceptClaims: true \
+                 in its worker config)"
+            )));
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        edge_boot
+            .verifier
+            .verify_session(token, now)
+            .map(VerifiedSessionTicket)
+            .map_err(|err| Status::permission_denied(format!("session ticket refused: {err:#}")))
+    }
+}
+
+impl WorkerDaemonService {
+    /// NotFound for a session this node does not hold: `wrong_node` when its
+    /// id carries another node's tag, `evicted` when the node remembers
+    /// evicting it, `not_found` otherwise (session durability plan §6.7, row
+    /// 4).
+    pub(crate) fn session_not_here(&self, session_id: &str) -> Status {
+        if let Some(evicted) = self
+            .task_manager
+            .lock()
+            .ok()
+            .and_then(|manager| manager.evicted_session(session_id))
+        {
+            return Status::not_found(format!(
+                "evicted: session {session_id} was evicted from {} {}; a local-only session \
+                 cannot be restored. Start a new session, or set suspend.durability = \"store\" \
+                 to keep idle sessions in the content store",
+                self.node_id, evicted
+            ));
+        }
+        let own = crate::structs::node_tag(&self.node_id);
+        match crate::structs::session_node_tag(session_id) {
+            Some(tag) if tag != own => Status::not_found(format!(
+                "wrong_node: session {session_id} carries node tag {tag}, and this node \
+                 ({}) is {own}. Route requests for a session by its id's tag, not by \
+                 re-hashing a key: `legion session nodes` maps tags to node addresses",
+                self.node_id
+            )),
+            _ => Status::not_found(format!(
+                "not_found: node {} holds no session {session_id}",
+                self.node_id
+            )),
+        }
+    }
 }
 
 /// Drive one edge-initiated claim: stream its stages to the caller, ratify it

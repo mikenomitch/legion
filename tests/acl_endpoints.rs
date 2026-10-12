@@ -1292,6 +1292,7 @@ async fn call_endpoint(
                     ttl: "5m".into(),
                     uses: 1,
                     idempotency_key: None,
+                    scope: String::new(),
                 },
                 token,
             ))

@@ -535,6 +535,7 @@ mod session_index_test {
             state: "running".into(),
             lease_issued_at_unix_ms: iat,
             resources: r#"{"cpu":500,"memory":512}"#.into(),
+            ..Default::default()
         }
     }
 

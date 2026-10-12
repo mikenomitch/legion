@@ -5457,7 +5457,10 @@ message SessionReport {
 
 // One session as its node reports it.
 message SessionStatus {
-  // The session id (`<task>-<26 base32>`).
+  // The session id: `<task>-<node tag>.<26 base32>` when minted by a router
+  // or a node (the tag names the node it started on, session durability
+  // plan §6.3), or `<task>-<26 base32>` when derived from an idempotency
+  // key.
   string session_id = 1;
 
   // Its job, the exact job config it runs, and its task.
@@ -5469,14 +5472,32 @@ message SessionStatus {
   // when a job update replaces the envelope on the node.
   int64 envelope_allocation_id = 5;
 
-  // `starting` (admitted, not running yet) or `running`.
+  // `starting` (admitted, not running yet), `running`, `suspended`
+  // (checkpointed on its node, nothing running, not using envelope room),
+  // or `evicted` (a local-only checkpoint that is gone; reported for
+  // `suspend.keepFor` so the answer is `evicted`, not `not found`).
   string state = 6;
 
-  // When the manager that started it issued it, unix milliseconds.
+  // When the session was issued, unix milliseconds: by the manager that
+  // routed it, or by the node itself for an edge start.
   int64 lease_issued_at_unix_ms = 7;
 
   // The session's reserved resources, as a JSON object.
   string resources = 8;
+
+  // The session's generation (session durability plan §6.7): 1 at start,
+  // one more for every resume that claimed its manifest. Of two copies of
+  // one session id, the higher generation survives, then the earlier
+  // lease, then the lower node id.
+  uint64 generation = 9;
+
+  // Who started it: `manager` (a manager's session router) or `edge` (a
+  // session ticket presented to `Worker.StartSession`).
+  string origin = 10;
+
+  // For an edge start, the `jti` of the session ticket it was started
+  // with. Empty otherwise.
+  string ticket_jti = 11;
 }
 
 // Where a worker's `StreamWork` delivery stands, as its heartbeat reports
@@ -8897,6 +8918,133 @@ service Worker {
   // carrying `legion://manager/<id>`); anything else is refused with
   // `Unauthenticated`.
   rpc StopSessions (StopSessionsRequest) returns (StopSessionsReply);
+
+  // Answers for one session on this node (session durability plan §6.3,
+  // docs/session-mode.md "Routing"). A manager calls it to route `instance
+  // get|stop|start|promote` on a session id straight to the node its id
+  // names, instead of asking every manager's session index.
+  //
+  // The node's answer is authoritative for itself:
+  // - OK with the session's status when the node holds it, running or
+  //   sleeping.
+  // - NotFound when it does not. The message starts with `wrong_node` when
+  //   the id's node tag is not this node's (the caller routed by something
+  //   other than the id, or the session moved), and with `not_found`
+  //   otherwise. A node that evicted a local-only checkpoint answers
+  //   NotFound starting with `evicted` for `suspend.keepFor` after the
+  //   eviction, naming when and why.
+  //
+  // Caller classes: `manager`, and `ticket` (a session ticket, see
+  // `StartSession`, for the session's job and task).
+  rpc GetSession (GetSessionRequest) returns (GetSessionReply);
+
+  // Starts a session of a session task on this node from a session ticket,
+  // with no manager on the path (session durability plan §6.4,
+  // docs/session-mode.md "Starting at the edge"). The node verifies the
+  // ticket offline, mints the session id with its own node tag, admits the
+  // session into its envelope, launches it, and answers once it is running.
+  // Managers learn about it from the node's next heartbeat; nothing is
+  // written to raft.
+  //
+  // A platform keeps a consistent-hash ring over `ListSessionNodes` and
+  // sends each new session to a node on it. Every later request for the
+  // session is routed by its id's node tag, never by hashing again.
+  //
+  // With `idempotency_key`, the node derives the session id from the key
+  // (the untagged shape) and answers a retry that lands on it from its own
+  // table with `deduplicated = true`. A retry that lands on another node
+  // (a ring change) starts a second copy there; the managers' duplicate
+  // sweep stops one of the two (docs/session-mode.md, "Duplicates").
+  //
+  // Caller class: `ticket` (a session ticket: `legion.io/scope = session`,
+  // minted with `IssueBootTicket` and `scope = "session"`). Admitted only on
+  // a worker with `edgeBoot.acceptClaims: true`.
+  //
+  // Errors:
+  // - FailedPrecondition: edge starts are off on this node, or it holds no
+  //   envelope for the task. Not retryable here; try another node.
+  // - ResourceExhausted: the envelope is full, or every launch slot stayed
+  //   busy for `edgeBoot.queueTimeout`. Retryable on another node.
+  // - PermissionDenied: the ticket failed verification (named check).
+  // - Internal: the runtime failed to start the session.
+  rpc StartSession (StartSessionRequest) returns (StartSessionReply);
+
+  // Ends one session on this node. Caller class: `ticket` (a session ticket
+  // for the session's job and task). Idempotent: a session the node no
+  // longer runs answers `stopped = false`. NotFound with `wrong_node` when
+  // the id's tag names another node.
+  rpc StopSession (StopSessionRequest) returns (StopSessionReply);
+}
+
+// Request payload for Worker.StartSession.
+message StartSessionRequest {
+  // The session ticket.
+  string ticket = 1;
+
+  // The job and session task to start. Optional: they default to the
+  // ticket's, and must match it when set.
+  string job_id = 2;
+  string task_name = 3;
+
+  // Optional idempotency key. The same key always derives the same session
+  // id, so a retry to the same node is answered from its table.
+  string idempotency_key = 4;
+
+  // Wait until the session is running before answering (default true:
+  // `false` answers once the session is admitted, in state `starting`).
+  optional bool wait = 5;
+}
+
+// Reply payload for Worker.StartSession.
+message StartSessionReply {
+  // The new session's id: `<task>-<this node's tag>.<26 base32>`, or the
+  // derived id for an idempotent start.
+  string session_id = 1;
+
+  // This node's id.
+  string node_id = 2;
+
+  // `running`, or `starting` when the caller did not wait.
+  string state = 3;
+
+  // True when an idempotent retry found the session already running here.
+  bool deduplicated = 4;
+}
+
+// Request payload for Worker.StopSession.
+message StopSessionRequest {
+  // The session ticket.
+  string ticket = 1;
+
+  // The session to end.
+  string session_id = 2;
+}
+
+// Reply payload for Worker.StopSession.
+message StopSessionReply {
+  // True when this call ended the session; false when it was already gone.
+  bool stopped = 1;
+
+  // This node's id.
+  string node_id = 2;
+}
+
+// Request payload for Worker.GetSession.
+message GetSessionRequest {
+  // The session id.
+  string session_id = 1;
+
+  // A session ticket, for the `ticket` caller class. Empty for a manager.
+  string ticket = 2;
+}
+
+// Reply payload for Worker.GetSession.
+message GetSessionReply {
+  // The session, as this node reports it in its heartbeat.
+  SessionStatus session = 1;
+
+  // This node's id.
+  string node_id = 2;
 }
 
 // Request payload for Worker.StopSessions.
@@ -9604,6 +9752,16 @@ message TaskAllocation {
   // A node without it starts the allocation normally, which is what a
   // replacement after node loss does. Empty otherwise.
   string promoted_from_session = 28;
+
+  // On an envelope allocation only: the full spec of the session task the
+  // envelope serves, as JSON, and that task's config id
+  // (docs/session-mode.md, "Starting at the edge"). A node holding the
+  // envelope can then start the task's sessions from a session ticket
+  // (`Worker.StartSession`) with no manager on the path: the spec it starts
+  // is exactly the one its envelope was placed for. Empty on every other
+  // allocation.
+  string session_task_spec = 29;
+  int64 session_task_config_id = 30;
 }
 
 // Request payload for PostWork.
@@ -10275,6 +10433,19 @@ message IssueBootTicketRequest {
   // Optional idempotency key. A repeat with the same key returns the
   // originally minted ticket rather than minting a second capability.
   optional string idempotency_key = 10;
+
+  // What the ticket authorizes: `boot` (the default) or `session`.
+  //
+  // A `session` ticket (session durability plan §6.4) lets its holder start,
+  // read, and stop sessions of one session task, on any node of `pool` that
+  // holds the task's envelope (`Worker.StartSession`, `GetSession`,
+  // `StopSession`), until it expires. It names no instance, prefix, or job
+  // config (the node starts the spec of the envelope it holds), so
+  // `instance_id`, `instance_prefix`, `job_config_id`, and `gate` must be
+  // empty. It is not spent per session: `uses` must be 0 or 1 and is
+  // recorded as 0 (unlimited); the envelopes' room bounds what it can
+  // start. The task must be a session task.
+  string scope = 11;
 }
 
 // Reply payload for IssueBootTicket.
@@ -10332,6 +10503,8 @@ message BootTicket {
   string accessor_id = 11;
   // Mint time, RFC3339.
   string created_at = 12;
+  // `boot` or `session` (see `IssueBootTicketRequest.scope`).
+  string scope = 13;
 }
 
 // Reply payload for ListBootTickets.

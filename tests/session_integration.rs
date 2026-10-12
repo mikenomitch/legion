@@ -33,12 +33,13 @@ use legion::structs::manager_server::Manager;
 use legion::structs::worker_server::{Worker, WorkerServer};
 use legion::structs::{
     CreateInstanceRequest, DestroyInstanceRequest, ExecClientFrame, ExecServerFrame,
-    GetInstanceRequest, GetTaskLogsReply, GetTaskLogsRequest, HeartbeatReply, HeartbeatRequest,
-    InstanceInfo, ListInstancesReply, ListInstancesRequest, Node, NodeMsg, PostWorkReply,
-    PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest,
-    RestartWorkerReply, RestartWorkerRequest, SessionReport, SessionStatus, StartClaimReply,
-    StartClaimRequest, StopInstanceRequest, StopSessionsReply, StopSessionsRequest, Submission,
-    SuspendInstanceRequest, TaskAllocation,
+    GetInstanceRequest, GetSessionReply, GetSessionRequest, GetTaskLogsReply, GetTaskLogsRequest,
+    HeartbeatReply, HeartbeatRequest, InstanceInfo, ListInstancesReply, ListInstancesRequest, Node,
+    NodeMsg, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply,
+    PromoteInstanceRequest, RestartWorkerReply, RestartWorkerRequest, SessionReport, SessionStatus,
+    StartClaimReply, StartClaimRequest, StartSessionReply, StartSessionRequest,
+    StopInstanceRequest, StopSessionReply, StopSessionRequest, StopSessionsReply,
+    StopSessionsRequest, Submission, SuspendInstanceRequest, TaskAllocation,
 };
 use tonic::{Code, Request, Response, Status, Streaming};
 
@@ -109,6 +110,7 @@ impl Worker for FakeNode {
                     state: "running".into(),
                     lease_issued_at_unix_ms: session.lease_issued_at_unix_ms,
                     resources: allocation.task_resources.clone(),
+                    ..Default::default()
                 },
             );
         }
@@ -136,6 +138,34 @@ impl Worker for FakeNode {
             }
         }
         Ok(Response::new(StopSessionsReply { stopped }))
+    }
+
+    async fn get_session(
+        &self,
+        request: Request<GetSessionRequest>,
+    ) -> Result<Response<GetSessionReply>, Status> {
+        let id = request.into_inner().session_id;
+        match self.lock().sessions.get(&id) {
+            Some(status) => Ok(Response::new(GetSessionReply {
+                session: Some(status.clone()),
+                node_id: String::new(),
+            })),
+            None => Err(Status::not_found(format!("not_found: no session {id}"))),
+        }
+    }
+
+    async fn start_session(
+        &self,
+        _request: Request<StartSessionRequest>,
+    ) -> Result<Response<StartSessionReply>, Status> {
+        Err(Status::unimplemented("fake node"))
+    }
+
+    async fn stop_session(
+        &self,
+        _request: Request<StopSessionRequest>,
+    ) -> Result<Response<StopSessionReply>, Status> {
+        Err(Status::unimplemented("fake node"))
     }
 
     async fn probe(&self, _request: Request<ProbeRequest>) -> Result<Response<ProbeReply>, Status> {
@@ -537,6 +567,7 @@ async fn a_duplicated_session_converges_to_the_earliest_lease_test() -> R<()> {
                 state: "running".into(),
                 lease_issued_at_unix_ms: iat,
                 resources: json!({ "cpu": 500, "memory": 512 }).to_string(),
+                ..Default::default()
             },
         );
     }
@@ -548,6 +579,70 @@ async fn a_duplicated_session_converges_to_the_earliest_lease_test() -> R<()> {
     cluster.node("n2").lock().sessions.remove(id);
     assert!(cluster.report("n2").await?.stop_sessions.is_empty());
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tagged_session_id_is_read_from_its_node_test() -> R<()> {
+    let cluster = Cluster::new("agents-tag", &["n1", "n2"]).await?;
+    let started = cluster.create(None).await?;
+    assert_eq!(
+        legion::structs::session_node_tag(&started.instance_id),
+        Some(legion::structs::node_tag(&started.node_id).as_str()),
+        "the router mints the id for the node that took it"
+    );
+
+    // A session the index has never heard of (started at the edge, no
+    // report yet) is found by asking the node its id names.
+    let edge_id = legion::structs::mint_session_id(TASK, "n2");
+    cluster.node("n2").lock().sessions.insert(
+        edge_id.clone(),
+        SessionStatus {
+            session_id: edge_id.clone(),
+            job_id: cluster.job.clone(),
+            job_config_id: cluster.store().get_job_config(&cluster.job)?.id(),
+            task_name: TASK.into(),
+            envelope_allocation_id: 1,
+            state: "running".into(),
+            lease_issued_at_unix_ms: 1_000,
+            resources: json!({ "cpu": 500, "memory": 512 }).to_string(),
+            origin: "edge".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(cluster.get(&edge_id).await?.node_id.as_deref(), Some("n2"));
+
+    // The named node's "never had it" is final.
+    let gone = legion::structs::mint_session_id(TASK, "n1");
+    let missing = cluster
+        .get(&gone)
+        .await
+        .expect_err("n1 holds no such session");
+    assert_eq!(missing.code(), Code::NotFound);
+    Ok(())
+}
+
+#[test]
+fn a_higher_generation_wins_a_duplicate_before_the_earlier_lease_test() {
+    let copy = |node: &str, iat: i64, generation: u64| legion::structs::IndexedSession {
+        node_id: node.into(),
+        status: Some(SessionStatus {
+            session_id: "s".into(),
+            lease_issued_at_unix_ms: iat,
+            generation,
+            ..Default::default()
+        }),
+        recent: false,
+    };
+    let (kept, later) = legion::manager::sessions::winner(vec![
+        copy("n1", 1_000, 1),
+        copy("n2", 2_000, 2),
+        copy("n0", 2_000, 2),
+    ])
+    .expect("a winner");
+    assert_eq!(kept.node_id, "n0");
+    let mut stopped: Vec<_> = later.into_iter().map(|copy| copy.node_id).collect();
+    stopped.sort();
+    assert_eq!(stopped, vec!["n1", "n2"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

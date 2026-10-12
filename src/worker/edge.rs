@@ -140,6 +140,159 @@ pub fn admit_and_launch(
     Ok(admitted)
 }
 
+/// A session started at the edge (`Worker.StartSession`).
+#[derive(Debug, Clone)]
+pub struct EdgeSession {
+    pub session_id: String,
+    pub claim_id: String,
+    /// True when an idempotent retry found it already on this node.
+    pub deduplicated: bool,
+}
+
+/// The session id an edge start with an idempotency key derives. Scoped to
+/// edge starts of the ticket's job and task, so it never collides with a
+/// manager-routed key's id.
+pub fn edge_derived_session_id(job_id: &str, task_name: &str, key: &str) -> String {
+    crate::structs::session::derived_session_id(task_name, job_id, &format!("edge:{key}"))
+}
+
+/// Start a session on this node from a session ticket, with no manager on
+/// the path (session durability plan §6.4). The caller verified the ticket
+/// and holds a launch slot.
+///
+/// The node mints the id with its own tag (or derives it from the
+/// idempotency key), builds the payload from the spec its envelope carried,
+/// and admits it through the same claim machinery a manager-routed session
+/// takes. A refusal is a [`crate::worker::task_manager::SessionRefusal`]
+/// and holds nothing.
+pub fn start_edge_session(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    node_id: &str,
+    ticket: &crate::structs::edge_boot::SessionTicketClaims,
+    idempotency_key: &str,
+    slot: crate::worker::launch_pool::LaunchSlot,
+) -> R<EdgeSession> {
+    let (job_id, task_name) = (ticket.job.as_str(), ticket.task.as_str());
+    let derived = !idempotency_key.trim().is_empty();
+    let session_id = if derived {
+        edge_derived_session_id(job_id, task_name, idempotency_key.trim())
+    } else {
+        crate::structs::mint_session_id(task_name, node_id)
+    };
+    let spec = {
+        let guard = task_manager.lock().expect("task manager");
+        if derived {
+            if let Some(existing) = guard.session_status(&session_id) {
+                return Ok(EdgeSession {
+                    claim_id: crate::structs::session::session_claim_id(&existing.session_id),
+                    session_id: existing.session_id,
+                    deduplicated: true,
+                });
+            }
+        }
+        guard.session_spec(job_id, task_name)
+    };
+    let Some(spec) = spec else {
+        return Err(crate::worker::task_manager::SessionRefusal::NoEnvelope {
+            job_id: job_id.to_string(),
+            task_name: task_name.to_string(),
+        }
+        .into());
+    };
+    let issued_at = crate::util::now_unix_ms();
+    // The session's own identity, for the workload's environment
+    // (`LEGION_INSTANCE_ID`, `LEGION_INSTANCE_MODE=session`), as the
+    // manager's router builds it.
+    let identity = crate::structs::Instance {
+        instance_id: session_id.clone(),
+        job_id: job_id.to_string(),
+        group: spec.task.group.clone(),
+        task_name: task_name.to_string(),
+        mode: crate::structs::InstanceMode::Session,
+        state: crate::structs::InstanceState::Pending,
+        slot_index: None,
+        current_alloc_id: None,
+        storage_handle: None,
+        created_at: String::new(),
+        updated_at: String::new(),
+        restore_from: None,
+        identity_epoch: 0,
+        named: false,
+        promoted_from: None,
+    };
+    let allocation = crate::structs::Allocation {
+        id: 0,
+        status: "provisional".into(),
+        resources: spec.task.resources.clone(),
+        node_id: node_id.to_string(),
+        job_config_id: spec.job_config_id.clone(),
+        task_config_id: spec.task_config_id,
+        job_id: job_id.to_string(),
+        instance_id: Some(session_id.clone()),
+        network: None,
+    };
+    let claim_id = crate::structs::session::session_claim_id(&session_id);
+    let provisional = ProvisionalAllocation {
+        claim_id: claim_id.clone(),
+        gate: Gate::Serve.to_wire(),
+        lease_deadline_unix: 0,
+        instance_id: session_id.clone(),
+        origin: "edge".into(),
+        on_refused: OnRefused::Stop.as_str().into(),
+        ticket_jti: ticket.jti.clone(),
+        session: Some(crate::structs::SessionStart {
+            lease_issued_at_unix_ms: issued_at,
+        }),
+    };
+    let payload = crate::manager::dispatcher::build_task_allocation_with(
+        &spec.task,
+        &allocation,
+        Some(&identity),
+        &[],
+        Some(provisional.clone()),
+    )?;
+    admit_and_launch(task_manager, &payload, &provisional, Some(slot))?;
+    crate::manager::telemetry::worker_metrics()
+        .edge_session_starts_total
+        .inc();
+    Ok(EdgeSession {
+        session_id,
+        claim_id,
+        deduplicated: false,
+    })
+}
+
+/// Wait until a session's launch settles: `Ok(true)` once it runs,
+/// `Ok(false)` when it is still starting at `timeout`, and an error when
+/// it ended (its runtime failed) before running.
+pub async fn wait_until_running(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    session_id: &str,
+    timeout: Duration,
+) -> R<bool> {
+    let deadline = Instant::now() + timeout;
+    let mut pause = Duration::from_millis(2);
+    loop {
+        let state = task_manager
+            .lock()
+            .expect("task manager")
+            .session_status(session_id)
+            .map(|status| status.state);
+        match state.as_deref() {
+            Some("running") => return Ok(true),
+            Some(_) => {}
+            None => {
+                bail!("session {session_id} ended before it started running; see the node's log")
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_millis(50));
+    }
+}
+
 /// Apply a ratification verdict pushed by the manager (or fetched by the
 /// node) to a live claim.
 pub fn apply_verdict(
@@ -293,6 +446,8 @@ mod worker_edge_test {
             task_snapshots: String::new(),
             identity_epoch: 0,
             promoted_from_session: String::new(),
+            session_task_spec: String::new(),
+            session_task_config_id: 0,
             task_lifecycle: String::new(),
             task_restart: String::new(),
         }

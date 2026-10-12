@@ -304,26 +304,98 @@ pub fn mint_instance_id(task_name: &str) -> String {
     format!("{prefix}-{random}")
 }
 
+/// Length of the node tag a session id minted on a node carries
+/// (session durability plan §6.3): 8 base32 characters, 40 bits.
+pub const NODE_TAG_LEN: usize = 8;
+
+/// The tag of a node in the session ids it mints: 8 base32 characters of a
+/// SHA-256 over the node id. It does not spell the node's name, and 10^4
+/// nodes collide with probability about 5 × 10^-5; a collision costs one
+/// extra probe, never a wrong answer, because the node answers for itself.
+pub fn node_tag(node_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"legion-node-tag\0");
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    base32_from_bits(&digest, NODE_TAG_LEN)
+}
+
+/// `len` lowercase base32 characters from the leading bits of `bytes`.
+fn base32_from_bits(bytes: &[u8], len: usize) -> String {
+    (0..len)
+        .map(|index| {
+            let bit = index * 5;
+            let (byte, offset) = (bit / 8, bit % 8);
+            let next = bytes.get(byte + 1).copied().unwrap_or(0);
+            let window = (u16::from(bytes[byte]) << 8) | u16::from(next);
+            let value = (window >> (11 - offset)) & 0x1f;
+            MINTED_ID_ALPHABET[value as usize] as char
+        })
+        .collect()
+}
+
+/// Mint a session id on (or for) a node: `{task}-{node tag}.{26 base32}`.
+///
+/// The tag lets anything holding the id route straight to the node that
+/// runs it, with no lookup and no write anywhere (session durability plan
+/// §6.3). The 130 random bits are the same as [`mint_instance_id`]'s, and
+/// the shape is reserved the same way.
+pub fn mint_session_id(task_name: &str, node_id: &str) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let random: String = (0..MINTED_ID_RANDOM_LEN)
+        .map(|_| MINTED_ID_ALPHABET[rng.gen_range(0..MINTED_ID_ALPHABET.len())] as char)
+        .collect();
+    let max_prefix = KEYED_INSTANCE_ID_MAX_LEN - MINTED_ID_RANDOM_LEN - NODE_TAG_LEN - 2;
+    let prefix: String = task_name.chars().take(max_prefix).collect();
+    format!("{prefix}-{}.{random}", node_tag(node_id))
+}
+
+fn is_base32(raw: &str, len: usize) -> bool {
+    raw.len() == len && raw.bytes().all(|b| MINTED_ID_ALPHABET.contains(&b))
+}
+
+/// The minted suffix of `id`, split: `(prefix, tag, random)`, with `tag`
+/// empty for an untagged id. `None` when `id` is not minted.
+fn minted_parts(id: &str) -> Option<(&str, &str, &str)> {
+    let (prefix, suffix) = id.rsplit_once('-')?;
+    if prefix.is_empty() {
+        return None;
+    }
+    match suffix.split_once('.') {
+        None => is_base32(suffix, MINTED_ID_RANDOM_LEN).then_some((prefix, "", suffix)),
+        Some((tag, random)) => (is_base32(tag, NODE_TAG_LEN)
+            && is_base32(random, MINTED_ID_RANDOM_LEN))
+        .then_some((prefix, tag, random)),
+    }
+}
+
 /// Whether `id` has the reserved shape of a server-minted id: a non-empty
 /// prefix, a `-`, and exactly [`MINTED_ID_RANDOM_LEN`] characters of the
-/// lowercase base32 alphabet at the end.
+/// lowercase base32 alphabet at the end, optionally preceded by a
+/// [`NODE_TAG_LEN`]-character node tag and a `.`.
 pub fn is_minted_instance_id(id: &str) -> bool {
-    let Some((prefix, random)) = id.rsplit_once('-') else {
-        return false;
-    };
-    !prefix.is_empty()
-        && random.len() == MINTED_ID_RANDOM_LEN
-        && random.bytes().all(|b| MINTED_ID_ALPHABET.contains(&b))
+    minted_parts(id).is_some()
+}
+
+/// The node tag a session id carries, when it was minted on a node.
+pub fn session_node_tag(id: &str) -> Option<&str> {
+    minted_parts(id)
+        .map(|(_, tag, _)| tag)
+        .filter(|tag| !tag.is_empty())
 }
 
 /// Whether `id` is a server-minted id of task `task_name`: the minted shape
-/// with the prefix [`mint_instance_id`] gives that task.
+/// with the prefix [`mint_instance_id`] (or [`mint_session_id`]) gives that
+/// task.
 pub fn is_minted_for_task(id: &str, task_name: &str) -> bool {
-    let max_prefix = KEYED_INSTANCE_ID_MAX_LEN - MINTED_ID_RANDOM_LEN - 1;
-    is_minted_instance_id(id)
-        && id
-            .rsplit_once('-')
-            .is_some_and(|(prefix, _)| prefix.chars().eq(task_name.chars().take(max_prefix)))
+    let Some((prefix, tag, _)) = minted_parts(id) else {
+        return false;
+    };
+    let tag_len = if tag.is_empty() { 0 } else { NODE_TAG_LEN + 1 };
+    let max_prefix = KEYED_INSTANCE_ID_MAX_LEN - MINTED_ID_RANDOM_LEN - 1 - tag_len;
+    prefix.chars().eq(task_name.chars().take(max_prefix))
 }
 
 /// Validate a keyed instance id: `[A-Za-z0-9._-]{1,128}`.
@@ -423,6 +495,34 @@ mod tests {
         assert!(is_minted_for_task(&id, "workspace"));
         assert!(!is_minted_for_task(&id, "work"));
         assert!(!is_minted_for_task("user-42", "user"));
+        assert!(is_minted_for_task(&long, &"t".repeat(200)));
+    }
+
+    #[test]
+    fn session_ids_carry_their_node_tag_and_stay_reserved_test() {
+        let id = mint_session_id("workspace", "w-17");
+        let tag = node_tag("w-17");
+        assert_eq!(tag.len(), NODE_TAG_LEN);
+        assert_eq!(node_tag("w-17"), tag, "the tag is stable");
+        assert_ne!(node_tag("w-18"), tag);
+        assert!(id.starts_with(&format!("workspace-{tag}.")), "{id}");
+        assert!(is_minted_instance_id(&id));
+        assert_eq!(session_node_tag(&id), Some(tag.as_str()));
+        assert!(is_minted_for_task(&id, "workspace"));
+        assert!(
+            validate_keyed_instance_id(&id).is_err(),
+            "callers may not pick one"
+        );
+        // An untagged minted id has no tag; a near miss is not minted.
+        assert_eq!(session_node_tag(&mint_instance_id("workspace")), None);
+        assert!(!is_minted_instance_id("workspace-q4n7c2rd.short"));
+        assert!(!is_minted_instance_id(
+            "workspace-q4n7c2r.abcdefghijklmnopqrstuvwxyz"
+        ));
+        assert!(validate_keyed_instance_id("workspace-v1.2").is_ok());
+        // A long task name is truncated so the id stays valid.
+        let long = mint_session_id(&"t".repeat(200), "w-17");
+        assert_eq!(long.len(), KEYED_INSTANCE_ID_MAX_LEN);
         assert!(is_minted_for_task(&long, &"t".repeat(200)));
     }
 
