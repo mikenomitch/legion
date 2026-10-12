@@ -14,5 +14,6 @@ pub mod raft;
 pub(crate) mod s3_credentials;
 pub mod snapshot_warm;
 pub mod store;
+pub mod work_log;
 
 pub(crate) use raft::Lane;

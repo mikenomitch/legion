@@ -54,11 +54,25 @@
 //! `~/.legion/token`, `LEGION_TLS_CA_CERT`) because it calls the CLI's own
 //! `connect_manager_client()` — one source of truth, so the fast path cannot
 //! drift into talking to the manager differently from the way a user does.
+//!
+//! # Modes
+//!
+//! `--mode jobs` (the default) is the submitter described above.
+//! `--mode instances` drives keyed-instance lifecycles (create, suspend,
+//! resume, destroy) against an embedded simulated fleet and reports stage
+//! latencies; see `instances.rs`:
+//!
+//! ```text
+//! legion-loadgen --mode instances --simulate 50 --sessions 2000 --rate 100 \
+//!     [--manager http://host:4747] [--job loadgen-sandboxes] [--hold-ms 0]
+//! ```
+
+mod instances;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Arg, ArgAction, Command};
@@ -155,7 +169,71 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build the tokio runtime")?;
-    runtime.block_on(run(&matches))
+    match matches.get_one::<String>("mode").map(String::as_str) {
+        Some("instances") => runtime.block_on(run_instances(&matches)),
+        _ => runtime.block_on(run(&matches)),
+    }
+}
+
+async fn run_instances(matches: &clap::ArgMatches) -> Result<()> {
+    let duration =
+        |name: &str| -> Duration { Duration::from_millis(*matches.get_one::<u64>(name).unwrap()) };
+    // `--join-token` carries the worker type and secret a cluster that
+    // checks join tokens wants from the embedded fleet (and the manager
+    // address, used when neither `--manager` nor LEGION_ADDR names one).
+    let token = matches
+        .get_one::<String>("join-token")
+        .map(|raw| legion::structs::token::JoinToken::decode(raw))
+        .transpose()
+        .context("--join-token")?;
+    let manager = matches
+        .get_one::<String>("manager")
+        .cloned()
+        .or_else(|| std::env::var("LEGION_ADDR").ok())
+        .or_else(|| token.as_ref().map(|token| token.addr.clone()))
+        .unwrap_or_else(|| legion::prelude::DEF_MANAGER_ADDRESS.to_string());
+    let opts = instances::InstancesOptions {
+        manager,
+        job: matches.get_one::<String>("job").unwrap().clone(),
+        sessions: *matches.get_one::<usize>("sessions").unwrap(),
+        rate: *matches.get_one::<f64>("rate").unwrap(),
+        concurrency: *matches.get_one::<usize>("concurrency").unwrap(),
+        connections: *matches.get_one::<usize>("connections").unwrap(),
+        simulate: *matches.get_one::<usize>("simulate").unwrap(),
+        worker_type: token
+            .as_ref()
+            .map(|token| token.worker_type.clone())
+            .unwrap_or_else(|| matches.get_one::<String>("worker-type").unwrap().clone()),
+        join_secret: token
+            .as_ref()
+            .map(|token| token.secret.clone())
+            .or_else(|| matches.get_one::<String>("join-secret").cloned()),
+        hold: duration("hold-ms"),
+        ready_after: duration("ready-after-ms"),
+        stage_timeout: duration("stage-timeout-ms"),
+        submit_job: !matches.get_flag("no-submit"),
+        quiet: matches.get_flag("quiet"),
+        advertise_host: matches.get_one::<String>("advertise-host").unwrap().clone(),
+        sim_name_prefix: matches
+            .get_one::<String>("sim-name-prefix")
+            .cloned()
+            .unwrap_or_else(|| format!("lg-{}", std::process::id())),
+        sim_profiles: matches.get_one::<String>("sim-profiles").cloned(),
+    };
+    let summary = instances::run(opts).await?;
+    let rendered = serde_json::to_string_pretty(&summary)?;
+    if let Some(out) = matches.get_one::<String>("out") {
+        std::fs::write(out, format!("{rendered}\n"))
+            .with_context(|| format!("failed to write {out}"))?;
+    }
+    println!("{rendered}");
+    if summary["failed"].as_u64().unwrap_or(0) > 0 {
+        bail!(
+            "{} session(s) failed; see `errors` above",
+            summary["failed"]
+        );
+    }
+    Ok(())
 }
 
 fn cli() -> Command {
@@ -166,16 +244,113 @@ fn cli() -> Command {
              comparing a cell run with this against Nomad or K8s.",
         )
         .arg(
+            Arg::new("mode")
+                .long("mode")
+                .value_parser(["jobs", "instances"])
+                .default_value("jobs")
+                .help(
+                    "`jobs` submits the rig's jobspecs; `instances` drives keyed-instance \
+                     lifecycles against an embedded simulated fleet",
+                ),
+        )
+        .arg(
             Arg::new("workload-dir")
                 .long("workload-dir")
-                .required(true)
-                .help("Directory holding manifest.json and the rendered jobspecs"),
+                .required_if_eq("mode", "jobs")
+                .help("Directory holding manifest.json and the rendered jobspecs (jobs mode)"),
         )
         .arg(
             Arg::new("out")
                 .long("out")
-                .required(true)
-                .help("Path to write the submits.json array to"),
+                .required_if_eq("mode", "jobs")
+                .help(
+                    "Path to write the submits.json array to (jobs mode), or the summary \
+                     JSON (instances mode, optional)",
+                ),
+        )
+        .arg(
+            Arg::new("job")
+                .long("job")
+                .default_value("loadgen-sandboxes")
+                .help("instances mode: the keyed job every session is an instance of"),
+        )
+        .arg(
+            Arg::new("no-submit")
+                .long("no-submit")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "instances mode: use an existing --job instead of submitting the \
+                     built-in keyed sandbox job",
+                ),
+        )
+        .arg(
+            Arg::new("sessions")
+                .long("sessions")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("1000")
+                .help("instances mode: lifecycles to run"),
+        )
+        .arg(
+            Arg::new("simulate")
+                .long("simulate")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("20")
+                .help("instances mode: simulated nodes to embed (checkpoint channel faked)"),
+        )
+        .arg(
+            Arg::new("worker-type")
+                .long("worker-type")
+                .default_value("default")
+                .help("instances mode: worker type the simulated nodes register as"),
+        )
+        .arg(
+            Arg::new("join-secret")
+                .long("join-secret")
+                .help("instances mode: join token secret, when the cluster enforces ACLs"),
+        )
+        .arg(Arg::new("join-token").long("join-token").help(
+            "instances mode: a `legion join-token create` token for the embedded \
+                     fleet (sets its worker type and secret; overrides --worker-type and \
+                     --join-secret)",
+        ))
+        .arg(
+            Arg::new("advertise-host")
+                .long("advertise-host")
+                .default_value("127.0.0.1")
+                .help(
+                    "instances mode: host the manager dials to push work to the embedded \
+                     fleet (only used for a node whose work stream is down)",
+                ),
+        )
+        .arg(Arg::new("sim-name-prefix").long("sim-name-prefix").help(
+            "instances mode: node-id prefix for the embedded fleet (default \
+                     lg-<pid>); keep it fixed across runs against one cluster so each run \
+                     re-registers the same nodes",
+        ))
+        .arg(Arg::new("sim-profiles").long("sim-profiles").help(
+            "instances mode: node_profiles JSON for the embedded fleet (the \
+                     benchmark scenario schema); default one 4-CPU, 32 GiB profile",
+        ))
+        .arg(
+            Arg::new("hold-ms")
+                .long("hold-ms")
+                .value_parser(clap::value_parser!(u64))
+                .default_value("0")
+                .help("instances mode: how long a session runs before it is suspended"),
+        )
+        .arg(
+            Arg::new("ready-after-ms")
+                .long("ready-after-ms")
+                .value_parser(clap::value_parser!(u64))
+                .default_value("0")
+                .help("instances mode: simulated boot time before a node reports running"),
+        )
+        .arg(
+            Arg::new("stage-timeout-ms")
+                .long("stage-timeout-ms")
+                .value_parser(clap::value_parser!(u64))
+                .default_value("60000")
+                .help("instances mode: how long one stage may take before the session fails"),
         )
         .arg(
             Arg::new("manager")

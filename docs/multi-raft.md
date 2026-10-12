@@ -251,9 +251,14 @@ available through the `GetRaftStatus` / `ListRaftHistory` /
 The engine supports multiple raft groups. Every store method that writes is
 assigned to a lane:
 
-- `control`: job, config, KV, and instance writes.
-- `scheduler`: placement, eval, and rollout writes.
-- `status`: heartbeat and liveness writes.
+- `control`: job, config, KV, node registration, ACL, and template writes.
+- `scheduler`: placement, eval, rollout, instance, volume, snapshot, and
+  boot-ticket writes. An instance is created, bound to its allocation,
+  suspended, forked, and destroyed on this lane, which is why a keyed
+  sandbox's whole lifecycle can ride a handful of scheduler-lane entries
+  (and why an edge-boot ratification spends its ticket in the same entry
+  that places the instance).
+- `status`: heartbeat, liveness, allocation health, and task status writes.
 
 A test checks that every method is assigned, and the transport routes groups
 by `group_id`.

@@ -101,6 +101,7 @@ async fn launch_fleet(dir: &TempDir, manager_addr: String, count: usize) -> R<Si
         ready_after: Duration::ZERO,
         register_rate: 1000.0,
         advertise_host: "127.0.0.1".into(),
+        ..Default::default()
     };
     launch_simulated_fleet(manager_addr, "default".into(), None, opts).await
 }

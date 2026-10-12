@@ -25,3 +25,4 @@ pub mod task_supervisor;
 pub mod templates;
 pub mod usage;
 pub mod volumes;
+pub mod work_stream;

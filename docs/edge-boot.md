@@ -314,6 +314,20 @@ ratification is refused even if the first workload has since exited. Nodes
 are expected to behave correctly, but Legion does not trust any node to be
 the only holder of a ticket.
 
+**The ratification is one write.** The ticket spend, the instance bind, the
+allocation, and the `provisional.ratified` event commit in a single
+scheduler-lane entry, all or nothing. A ratification that is refused (the
+node no longer fits, another node won the instance) therefore leaves the
+ticket unspent: a single-use ticket is consumed only by the start that
+actually ratifies.
+
+**The edge start can be the create.** A ticket that names a keyed instance
+id that has never existed creates the instance in that same entry, so a
+platform does not have to call `CreateInstance` first. A destroyed id is a
+tombstone, not "never existed", and is refused (`instance_claimed`): ids
+are never recycled. An id that is not a valid keyed instance id is refused
+with `unknown_target`.
+
 **Revocation is by TTL only.** The fast path cannot check a revocation list
 without adding the round trip the ticket exists to avoid. If you need fast
 revocation, set short TTLs and mint new tickets. The manager can always

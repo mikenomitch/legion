@@ -51,7 +51,7 @@ pub const AGENT_SAVED_QUERIES: &[(&str, &str)] = &[
     (
         "agent:pending-evals",
         "SELECT id AS eval_id, kind, status, job_id, priority FROM eval \
-         WHERE status IN ('pending','in_flight') ORDER BY priority DESC, id ASC;",
+         WHERE status IN ('pending','in_flight','blocked') ORDER BY priority DESC, id ASC;",
     ),
 ];
 
