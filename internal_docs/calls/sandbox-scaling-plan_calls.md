@@ -2,8 +2,8 @@
 
 Decisions made while writing
 [`plans/sandbox-scaling-plan.md`](../plans/sandbox-scaling-plan.md), and
-while implementing its Phases 0–3 (entries 5, 10, 11, 13, 14, 16, 17, 22,
-and 28–40). **Entries are ranked by project impact, highest first. The
+while implementing its Phases 0–3 (entries 5, 10, 11, 13, 14, 15, 17, 18,
+23, and 29–41). **Entries are ranked by project impact, highest first. The
 number is the rank.** Implementation-time calls get inserted at their rank
 as the phases execute. If a citation elsewhere names an entry by number,
 fix it when you renumber. The plan cites entries by number throughout.
@@ -321,7 +321,7 @@ script that read `eval.failed` as a capacity signal must read
 `eval.blocked` or the job's `blocked` block (the upgrade note in the PR
 says so). `shortfall` is what one placement asks for, which tells an
 operator what kind of node to add but not how many. Rollout ticks and the
-node-scoped passes keep their old outcome (entry 31).
+node-scoped passes keep their old outcome (entry 32).
 
 **Why (simplicity).** The job row is control-lane state and the eval is
 scheduler-lane state; (a) would make every block and wake a cross-lane
@@ -363,7 +363,7 @@ unclaimed `pending` row gets the same recovery for free: the next leader
 runs it, and handlers are idempotent reconciles, which the old recovery
 also relied on. (a) still writes when the queue is idle, which is exactly
 when the claim was a round of its own. "Place" went from 4 entries to 1
-with this and entry 16 together.
+with this and entry 17 together.
 
 ## 12. Measure, then group commit, before any new semantics
 
@@ -389,7 +389,51 @@ are allocations with health). Phase 1 helps every keyed user now, without
 a new mode, and the eval-path plan already showed that fewer rounds beat
 faster rounds on a serial lane.
 
-## 13. Phase 0 was measured on a stated single-host substitute, not the AWS rig
+## 13. Phase 1's rate target was missed at about 2×, and Phases 0–3 ship with the bound named
+
+**Call.** Phase 1 met its entry targets (8 entries per lifecycle on an idle
+cluster, down from 22, and about 3 per session under load) but not its
+rate target. The sustained lifecycle ceiling on the substitute host went
+from about 25 to about 50 per second, not the ≥ 5× (≈ 125) the plan set.
+Phases 0–3 ship anyway, with the gap in §14, in `TODO.md`, and in the
+public limit:
+
+```text
+docs/sandboxes-at-scale.md, "Limits to know about":
+  One scheduler lane orders every placement ... about 50 lifecycles a
+  second on the 4-vCPU reference host
+```
+
+**Alternatives.** (a) Hold the PR and widen the plan-apply group commit.
+Concurrent plans already share an entry, but each sandbox placement is its
+own eval, and they averaged 1.09 plans per entry here. More placements per
+eval, or more evals in flight, would raise that. (b) Cut the per-entry cost:
+pipeline more than one proposal per lane, or stop executing each write
+twice (once to capture the changeset, once to apply it). (c) Restate the
+target to match the result.
+
+**Trade-off.** A platform that needs more than about 50 sandbox lifecycles
+a second from one cluster on comparable hardware has to wait for that
+follow-up or for session mode (Phase 6), which takes unnamed starts off
+raft entirely.
+
+**Why (performance, honestly measured).** Profiling at an offered 100/s
+shows what bounds it. The manager used 1.1 of 4 cores. The busiest thread
+was the scheduler lane's raft pipeline, at about 54%. Each entry costs
+about 6 ms of wall time on that lane (changeset capture 3.2 ms, propose to
+apply 2.7 ms). At about 160 entries a second and 3 entries per lifecycle,
+that is about 52 lifecycles a second. `lanes` measures the same as
+`single` (52.0 vs 51.8/s), because instance writes and plans share the
+scheduler lane in both. The lane is latency-bound, not CPU-bound, so the
+remaining lever is fewer or cheaper entries, which means changing the plan
+apply's unit or raft's write path. Both are new semantics, past the "no new
+semantics" scope of Phase 1, and each deserves its own measured change (the
+plan apply has its own failure isolation to keep). Phase 0's gate exists so
+that numbers like this reorder the plan instead of being hidden: (c) would
+hide one. Placement latency on an idle cluster dropped too (p99 220 → 68 ms,
+create to running), which is the number users feel below the ceiling.
+
+## 14. Phase 0 was measured on a stated single-host substitute, not the AWS rig
 
 **Call.** Every Phase 0 and later number in this PR comes from one 4-vCPU
 Intel Xeon (2.1 GHz, 15 GiB, no KVM), a release build, a single-voter raft
@@ -413,7 +457,7 @@ ratios on the same box (≥ 5× rate, ≤ 8 entries), which a single host
 measures fairly when every phase runs on it in the same way, and the
 entry counts that drive the rest of the plan do not depend on the host.
 
-## 14. The blocked-eval index is the rows, and every replica keeps the capacity-event log
+## 15. The blocked-eval index is the rows, and every replica keeps the capacity-event log
 
 **Call.** Entry 9 put the key → eval index in leader memory, rebuilt from
 rows on election. The implementation keeps no second index: the wake pass
@@ -446,7 +490,7 @@ every election into a re-plan of every blocked job; the replay window is
 exact for the window that matters
 (`tests/blocked_evals.rs::a_new_leader_rebuilds_from_rows_and_replays_a_missed_wake`).
 
-## 15. Every phase carries p50 and p99 latency targets, measured first in Phase 0
+## 16. Every phase carries p50 and p99 latency targets, measured first in Phase 0
 
 **Call.** The plan sets latency SLOs (placement decision, dispatch, running
 from cold boot and from restore, resume from local memory, published
@@ -467,7 +511,7 @@ resume, not the cluster's placements per second, and the benchmark history shows
 phase that raises throughput by queuing longer would pass a
 throughput-only bar.
 
-## 16. An eval settles inside the plan that finishes it
+## 17. An eval settles inside the plan that finishes it
 
 **Call.** A handler whose plan is its last write arms its settle
 (`arm_eval_settle`); the plan apply then deletes the eval row, deletes the
@@ -489,7 +533,7 @@ after its plan would settle too early, so arming is opt-in per handler.
 only later; (b) amortizes nothing when the queue holds one eval, which is
 the steady state for interactive creates. Fused, a placement is one entry.
 
-## 17. Stop and destroy write directly and queue no eval
+## 18. Stop and destroy write directly and queue no eval
 
 **Call.** `StopInstance` and `DestroyInstance` remove the allocation and
 change the instance row in one group-committed scheduler-lane write, and
@@ -511,7 +555,7 @@ paid the enqueue; writing directly makes destroy 1 entry instead of 4,
 and Phase 3's wake pass already covers the one thing the eval could have
 done for other jobs (use the freed room).
 
-## 18. Unnamed sessions converge to one, and idempotency derives the id
+## 19. Unnamed sessions converge to one, and idempotency derives the id
 
 **Call.** Two nodes may briefly run the same unnamed session id. The
 leader stops the one with the later lease within a heartbeat. A create
@@ -531,7 +575,7 @@ makes the leader a per-create hop. The derived id gives the agent the one
 property it needs, the same id on retry, and a duplicate is rare and
 bounded.
 
-## 19. No external session registry, not even as a seam
+## 20. No external session registry, not even as a seam
 
 **Call.** Option 6 is rejected as a default and is not built as a plugin
 seam in this plan.
@@ -551,7 +595,7 @@ exists usually fits the first one only. The node-owned design needs no
 external store beyond the content store that published checkpoints already
 require.
 
-## 20. Cells are deferred behind a measured trigger
+## 21. Cells are deferred behind a measured trigger
 
 **Call.** Key-range sharding of instance rows across raft groups is Phase
 7, built only when Phase 0's harness shows the scheduler lane above 70%
@@ -569,7 +613,7 @@ Cells add scatter-gather lists, cross-cell renames, and per-cell
 leadership to every operator's mental model. That cost is worth paying
 only with evidence.
 
-## 21. Prefix tickets stand in for leases at the edge, and spend once
+## 22. Prefix tickets stand in for leases at the edge, and spend once
 
 **Call.** An edge-started session uses a multi-use, instance-prefix boot
 ticket as its authorization. The node mints the session id. The ticket is
@@ -587,7 +631,7 @@ another to spend, two raft writes per session. Edge boot already allowed
 prefix and multi-use tickets and already accepted "runs anything a live
 ticket names" as the edge blast radius.
 
-## 22. The ticket spend rides the ratification, and an edge start can be the create
+## 23. The ticket spend rides the ratification, and an edge start can be the create
 
 **Call.** `boot_ticket` moves to the scheduler lane. A ratification spends
 its ticket, creates the keyed instance when the ticket names an id that has
@@ -613,7 +657,7 @@ conditional update inside the same transaction
 (b) costs a create and its placement eval per start, the very writes edge
 boot was meant to skip.
 
-## 23. Per-session events stay off the replicated journal
+## 24. Per-session events stay off the replicated journal
 
 **Call.** Session lifecycle events go to the live `StreamEvents`
 broadcast and to the node's session log, shipped in batches to the bucket.
@@ -632,7 +676,7 @@ starts per second it would roll over in under a second, so journaling
 costs raft writes and still loses the record. The shipped log is the
 honest audit trail at that rate.
 
-## 24. Session workload identity comes from the lease, and the boundary moves to the envelope
+## 25. Session workload identity comes from the lease, and the boundary moves to the envelope
 
 **Call.** The manager issues tokens for a session after verifying the
 node, the lease (or ticket), and the envelope allocation, not an
@@ -653,7 +697,7 @@ a credential, so promote-on-identity would put nearly every session back
 in raft. The blast radius matches what edge boot already accepted, and
 promoted sessions keep today's boundary for workloads that need it.
 
-## 25. The target is millions running and hundreds of millions idle per cluster, not billions running
+## 26. The target is millions running and hundreds of millions idle per cluster, not billions running
 
 **Call.** The plan's per-cluster targets are at least 10^6 running
 sessions and 10^8 idle ones, with billions reached through federation.
@@ -670,7 +714,7 @@ agents". The largest primary claims are Cloudflare's tens of millions of
 agents and Google's tens to hundreds of millions of instances, mostly
 idle. A target the design can be measured against beats one it cannot.
 
-## 26. Snapshot-clone density before a sub-VM tier
+## 27. Snapshot-clone density before a sub-VM tier
 
 **Call.** Phase 8 densifies with one microVM per session sharing pages
 from a warm base checkpoint (option 8). Phase 9 adds only a seam for
@@ -689,7 +733,7 @@ keeps the promise and reuses fork machinery that already shares pages on
 Firecracker. Tier 2 belongs to a runtime plugin that can make its own
 isolation claim.
 
-## 27. The worker's session log is a new SQLite database, not the JSON state file
+## 28. The worker's session log is a new SQLite database, not the JSON state file
 
 **Call.** Sessions are recorded in `sessions.db` on the worker. The JSON
 `WorkerStateStore` keeps allocations only.
@@ -704,7 +748,7 @@ about.
 on every change (`src/worker/state.rs:151`). At 10,000 sessions per node
 with churn that is quadratic I/O. Fly's `flyd` and Nomad's client state
 both use an embedded database for this reason.
-## 28. A streamed allocation starts through the push path, and everything else through the reconcile
+## 29. A streamed allocation starts through the push path, and everything else through the reconcile
 
 **Call.** The worker starts an allocation that a delta added at once, by
 calling its own `PostWork` handler (identity delivery, launch, refreshers,
@@ -731,7 +775,7 @@ excludes. (b) reimplements the reconcile's stop ordering, restore
 replacement, and protected-claim logic. Starting new work is the latency
 that matters, and it is exactly what the push path already does.
 
-## 29. Edge-boot provisional deltas are deferred
+## 30. Edge-boot provisional deltas are deferred
 
 **Call.** Phase 2 does not move manager-side speculative dispatch and its
 ratification payload onto the stream; they stay `PostWork` pushes, and an
@@ -741,14 +785,14 @@ edge start's verdict stays the `RatifyClaim` reply.
 
 **Trade-off.** Speculative dispatch still needs the worker listener and a
 push per claim, and the stream and the push can race for the same work
-(handled by the guard in entry 28).
+(handled by the guard in entry 29).
 
 **Why (simplicity).** The edge-boot suites pass unmodified this way, which
 is one of Phase 2's acceptance tests, and the verdict path is already one
 RPC. Moving it is a protocol change to a security-relevant flow that
 deserves its own change. Open in TODO.md.
 
-## 30. A streaming heartbeat carries a position, a digest, and changed health only
+## 31. A streaming heartbeat carries a position, a digest, and changed health only
 
 **Call.** A worker on the stream sends `work_stream { epoch, seq, digest }`,
 no `allocation_ids`, and only the allocation health that changed since a
@@ -774,7 +818,7 @@ nothing. (b) needs the sorted set on every check; the xor updates in O(1)
 per delta on both sides. Measured: 42-byte request and 7-byte reply at 300
 allocations against 5,154 and 102,670 bytes for the full set.
 
-## 31. Only job evals that place work block
+## 32. Only job evals that place work block
 
 **Call.** `job_submit`, `job_update`, `job_reschedule`, and `job_scale`
 block. A `rollout_tick` that cannot place still fails its rollout, and the
@@ -793,7 +837,7 @@ nothing; changing rollout semantics is outside this plan. Node-scoped
 evals carry no job, so they cannot be one-per-job, and their per-job retry
 already lands in the right place.
 
-## 32. The wake pass matches constraints, not capacity, and budget reports do not wake
+## 33. The wake pass matches constraints, not capacity, and budget reports do not wake
 
 **Call.** An event wakes a blocked eval when the node is available and the
 blocked task's permit and constraints accept it (`node_could_help`), or
@@ -817,7 +861,7 @@ strand work, which is worse than a wasted plan. Budget reports are worker
 heartbeat data, not committed changes, so they would need a second event
 source. Open in TODO.md.
 
-## 33. Simulated workers send allocation health and stream by default
+## 34. Simulated workers send allocation health and stream by default
 
 **Call.** `--simulate` nodes report every acknowledged allocation as
 healthy, every beat off the stream and once on it, and take their work
@@ -834,7 +878,7 @@ invisible to every scale run because the simulator never sent health (plan
 §5.1), which is how it went unmeasured. A simulator that is faithful by
 default is the one the next regression shows up in.
 
-## 34. `allocation_health.updated_at` and `task_status.updated_at` mean "last changed"
+## 35. `allocation_health.updated_at` and `task_status.updated_at` mean "last changed"
 
 **Call.** Health and status upserts write only when a value changed, so
 their `updated_at` is when the value last changed, not when it was last
@@ -849,7 +893,7 @@ not these rows, is the freshness signal.
 **Why (performance).** Writing a timestamp is what made every beat a
 10,000-row changeset on a dense node; a steady beat now writes nothing.
 
-## 35. One generic scheduler-lane group commit for instance operations
+## 36. One generic scheduler-lane group commit for instance operations
 
 **Call.** Creates, stops, starts, destroys, resumes, suspends, forks,
 ratifications, and snapshot reports all go through
@@ -869,7 +913,7 @@ mix (creates arriving while resumes report); per-op coalescers would split
 the same traffic into smaller batches. One mechanism is one place to get
 savepoint isolation right.
 
-## 36. Op counts sum every lane's applied index, and the measured lifecycle is an instance of a running task
+## 37. Op counts sum every lane's applied index, and the measured lifecycle is an instance of a running task
 
 **Call.** `tests/raft_lifecycle_ops.rs` asserts entries per stage as the
 sum of every lane's raft applied index, and prints
@@ -889,7 +933,7 @@ would bleed into it; the applied index is per store and exact. Platforms
 run thousands of instances of one task, so the steady-state lifecycle is
 the number that scales.
 
-## 37. The keyed-pending capacity bug was fixed in Phase 0, and the capacity pass stays as a backstop
+## 38. The keyed-pending capacity bug was fixed in Phase 0, and the capacity pass stays as a backstop
 
 **Call.** Phase 0's test confirmed the bug (a keyed task's `count` is
 stored as 1, so only tasks with zero allocations were retried) and the fix
@@ -909,7 +953,7 @@ release), and nothing else would ever look at it. The pass costs one read
 per join burst; dropping it trades that for a class of permanently stuck
 jobs.
 
-## 38. The raft seam test still parses only `store.rs` and `acl_store.rs`
+## 39. The raft seam test still parses only `store.rs` and `acl_store.rs`
 
 **Call.** `tests/raft_seam.rs` was updated for the ops this work removed
 (`claim_eval{,s}`, the `complete_*_and_claim_next` pair) and added
@@ -926,7 +970,7 @@ write on the wrong lane at runtime.
 **Why (simplicity).** Extending it means classifying about a dozen
 existing ops from earlier work, which is its own change. Open in TODO.md.
 
-## 39. Session mode's user documentation is drafted in the plan, not published
+## 40. Session mode's user documentation is drafted in the plan, not published
 
 **Call.** The documentation for `stateful.mode = "session"` (when to use
 it, what it gives up against `keyed`, its use cases with sandboxes among
@@ -951,7 +995,7 @@ reconstructed at Phase 6 from code, after the decisions it should have
 shaped. Writing the public text now, in the plan, settles the trade-offs
 before the code and costs only a move when it ships.
 
-## 40. The AWS sandbox campaign embeds its nodes on the load box and labels every projection
+## 41. The AWS sandbox campaign embeds its nodes on the load box and labels every projection
 
 **Call.** `benchmarks/aws/scripts/run-sandbox-campaign.sh` runs on the rig
 with no spot fleet: `legion-loadgen --mode instances` embeds its simulated

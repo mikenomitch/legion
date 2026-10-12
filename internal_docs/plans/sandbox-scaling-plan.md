@@ -6,10 +6,13 @@
 2026-10-12). Phase 0's measurements, their method, and each shipped phase's
 result against its target are in [§14](#14-results-phases-0-3). Phases 4
 and later are planned and unchanged by the Phase 0 numbers except where
-§14 says so. Shipped with deliberate gaps, each in `TODO.md`: edge-boot
-provisional deltas on the stream (calls entry 29), checkpoint budget
-reports and `snapshot warm` as blocked-eval wake events (calls entry 32),
-and the AWS-rig run of the Phase 0 matrix (calls entry 13). Phase 0 is a
+§14 says so. Phase 1 met its entry targets but reached about 2× the
+Phase 0 lifecycle rate, not 5×: the scheduler lane's serial per-entry cost
+is now the bound (calls entry 13, §14.3). Shipped with deliberate gaps,
+each in `TODO.md`: that rate gap, edge-boot provisional deltas on the
+stream (calls entry 30), checkpoint budget reports and `snapshot warm` as
+blocked-eval wake events (calls entry 33), and the AWS-rig run of the
+Phase 0 matrix (calls entry 14). Phase 0 is a
 gate: it measures what every later phase assumes, and its numbers can
 reorder or cancel phases. Deliberately deferred and named: cell sharding of
 promoted instances (Phase 10, built only past a measured trigger), a
@@ -450,7 +453,7 @@ this plan is that sessions start fast and come back.
   more through federation.
 - **A pluggable external session registry** (DynamoDB, FoundationDB,
   Spanner) as a default or a Phase. It turns a self-hosted scheduler into
-  a distributed system with a cloud dependency (calls entry 19).
+  a distributed system with a cloud dependency (calls entry 20).
 - **Gossip.** Managers already receive every heartbeat.
 - **Changing `keyed` or `slot` semantics.** Existing jobs keep exact
   listing, tombstones, and at-most-one.
@@ -742,7 +745,7 @@ the boot ticket stands in for the lease: the ticket names the job, task,
 pool, and an instance prefix. The manager records the pair (ticket `jti`,
 session id) in the soft index on the next heartbeat. Ticket single-use
 enforcement stays as it is for tickets with `uses = 1`. A prefix ticket
-with many uses is the session-mode shape and spends once (calls entry 21).
+with many uses is the session-mode shape and spends once (calls entry 22).
 
 The lease is a capability document. It proves which credential
 authorized a session, for identity issuance and audit, and it never
@@ -914,7 +917,7 @@ allocations placed on it. With edge-started sessions it can mint tokens
 for any session id it invents under a job its ticket names. That is the
 same blast radius edge boot already accepted ("runs anything a live ticket
 names", `docs/edge-boot.md`), applied to identity. Promoted sessions keep
-today's boundary. Calls entry 24 records the trade.
+today's boundary. Calls entry 25 records the trade.
 
 ### 6.9 Composition with gated networking and suspend
 
@@ -1266,7 +1269,7 @@ applied to the soft index) would start.
 
 ### 7.2 Latency SLOs
 
-Throughput alone hides the number a user feels (calls entry 15). Phase 0
+Throughput alone hides the number a user feels (calls entry 16). Phase 0
 measures each of these at p50 and p99, on an idle cluster and at 80% of the measured
 throughput ceiling, and every later phase states its effect on them.
 
@@ -1601,7 +1604,7 @@ Each phase ships alone and is worth having alone.
 ## 14. Results, Phases 0-3
 
 Measured 2026-10-12 while the phases shipped. Every number here is from the
-stated local substitute (calls entry 13), not the AWS rig.
+stated local substitute (calls entry 14), not the AWS rig.
 
 ### 14.1 Method
 
@@ -1617,7 +1620,7 @@ stated local substitute (calls entry 13), not the AWS rig.
   it completes every session without timeouts; the ceiling is the highest
   completed rate.
 - **Entries.** `tests/raft_lifecycle_ops.rs`, exact, on `single` and `lanes`
-  (calls entry 36). Under load, entries per session are
+  (calls entry 37). Under load, entries per session are
   `sum(legion_raft_ops_total) / sessions` from the rung's manager, which
   includes registrations and heartbeat writes.
 - **Sizes and heartbeat bytes.** `tests/instance_scale_measure.rs` (release,
@@ -1627,12 +1630,139 @@ stated local substitute (calls entry 13), not the AWS rig.
 - **Runtime boot and restore are simulated** (no KVM): the §7.2 runtime
   rows below are the control-plane share only.
 
+### 14.2 Phase 0 baseline
+
+Base: `origin/main` at `da1c811` plus the Phase 0 tooling, before any
+Phase 1 change.
+
+Raft entries per stage, idle cluster, both topologies:
+
+| Stage | Create | Place | Running (first / steady beat) | Suspend | Resume | Fork ×2 | Destroy | Lifecycle | With idempotency keys |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Entries | 2 | 4 | 1 / 1 | 4 | 8 | 12 | 4 | **22** | 26 |
+
+A task's first instance cost 6 entries more, once. The steady beat wrote
+one entry per node per beat, whatever changed.
+
+Lifecycle ladder (offered rate → sessions completed per second; latencies
+p50 / p99 in ms):
+
+| Offered/s | Achieved/s | Entries per session | Create → running | Placement | Dispatch | Suspend | Resume | Destroy |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 (idle) | 7.8 | 24.7 | 14.1 / 220 | 13.6 / 220 | 0.5 / 12.2 | 3,039 / 4,209 | 2,054 / 2,268 | 16.6 / 110 |
+| 20 (80% of ceiling) | 15.4 | 22.1 | 38.7 / 459 | 31.0 / 385 | 0.6 / 217 | 3,514 / 4,606 | 2,086 / 2,527 | 34.2 / 325 |
+| 50 | 25.0 | 17.6 | 1,020 / 6,897 | 16.4 / 2,149 | 0.4 / 1,999 | 8,866 / 14,633 | 7,937 / 13,331 | 1,028 / 4,161 |
+| 100 | 24.7 | 16.0 | 6,907 / 15,185 | 457 / 1,658 | 138 / 766 | 28,553 / 39,673 | 22,158 / 36,306 | 1,413 / 7,385 |
+| 200 | 20.0, 1,401 timeouts | — | — | — | — | — | — | — |
+
+**Ceiling: about 25 lifecycles a second.** Achieved is below offered at
+10/s and 20/s because each session spends about 5 s waiting for suspend and
+resume, which ride heartbeats; it holds every session.
+
+Sizes (release, local store, `tests/instance_scale_measure.rs`):
+
+| Measure | Value |
+| --- | --- |
+| Pending instance row | 215.8 B at 10^5 (store image 22.1 MB), 216.4 B at 10^6 (216.9 MB) |
+| Running instance, over pending | +231 B (the allocation and bind) |
+| Suspended instance, over pending | +1,447.5 B (snapshot row and checkpoint columns) |
+| Store-only create rate | 12.0k/s at 10^5, 10.3k/s at 10^6 |
+
+Heartbeat, full desired set (the pre-Phase 2 shape):
+
+| Allocations per node | Request | Reply | Server time per beat |
+| --- | --- | --- | --- |
+| 1,000 | 17,761 B | 439,771 B | 27.0 ms |
+| 10,000 | 179,762 B | 4,408,772 B | 344.0 ms |
+
+The keyed-pending bug: a keyed instance left `pending` by a full cluster
+was never retried by the capacity pass, because a keyed task's `count` is
+stored as 1 and the pass retried only tasks with zero allocations. Fixed in
+Phase 0, with `tests/capacity_retry.rs` (calls entry 38).
+
+### 14.3 Phase 1: group commit and write trimming
+
+| Target | Result | Met |
+| --- | --- | --- |
+| ≤ 8 entries per lifecycle, idle | **8** (create 1, place 1, suspend 2, resume 3, destroy 1); first instance +1, fork ×2 4, steady beat 0 | yes |
+| ≤ 3 entries per session amortized under load | 3.3 at 100/s, 2.6 at 200/s (including registrations and first-beat health) | yes, at load |
+| Steady beat writes zero rows | 0 entries (`tests/raft_lifecycle_ops.rs`) | yes |
+| Edge start is one scheduler-lane entry plus projection | 1 (ratify creates the row and spends the ticket) | yes |
+| ≥ 5× Phase 0 session rate | **~2×**: about 50/s against about 25/s | **no** (calls entry 13) |
+
+Lifecycle ladder after Phases 1–3:
+
+| Offered/s | Achieved/s | Entries per session | Create → running | Placement | Dispatch | Suspend | Resume | Destroy |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 (idle) | 7.8 | 10.3 | 12.4 / 67.6 | 12.0 / 67.0 | 0.36 / 0.95 | 2,982 / 4,127 | 2,003 / 2,200 | 8.0 / 24.5 |
+| 20 | 15.5 | 8.1 | 13.3 / 117 | 12.8 / 117 | 0.36 / 6.1 | 3,152 / 4,207 | 2,021 / 2,212 | 11.4 / 69.3 |
+| 40 (80% of ceiling) | pending | pending | pending | pending | pending | pending | pending | pending |
+| 50 | 37.6 | 5.1 | 72.1 / 454 | 44.0 / 380 | 0.53 / 85.5 | 3,644 / 4,395 | 2,057 / 2,392 | 40.5 / 373 |
+| 100 | 51.8 | 3.3 | 899 / 5,606 | 32.8 / 4,606 | 0.53 / 83.4 | 8,934 / 13,072 | 7,310 / 13,318 | 900 / 4,135 |
+| 200 | 48.5 | 2.6 | 7,421 / 16,806 | 601 / 3,008 | 26.1 / 948 | 29,093 / 39,293 | 25,304 / 41,430 | 1,833 / 6,534 |
+| 400 | 24.0, 4,343 timeouts | — | — | — | — | — | — | — |
+
+The 10/s row's 10.3 entries per session includes the 50 simulated nodes'
+registrations spread over only 200 sessions; the exact idle count is the
+op-count test's 8.
+
+**Why the rate stopped at 2×.** Profiled at an offered 100/s, 3,000
+sessions: the manager used 1.1 of 4 cores; the scheduler lane's raft
+pipeline thread was the busiest at about 54%; an entry costs about 6 ms of
+lane time (changeset capture mean 3.2 ms, propose → apply mean 2.7 ms);
+instance group commits averaged 1.92 operations per entry and plan applies
+1.09 plans per entry. About 160 entries a second at about 3 per lifecycle
+is about 52 lifecycles a second. The same run on `lanes` gave 52.0/s
+against `single`'s 51.8/s, since instance writes and plans share the
+scheduler lane in both. The lane is latency-bound, not CPU-bound: the
+remaining levers are more work per entry or cheaper entries (calls entry
+13, `TODO.md`).
+
+### 14.4 Phase 2: sequenced delivery
+
+| Target | Result | Met |
+| --- | --- | --- |
+| Placement reaches the worker within RTT + 5 ms at p50, heartbeats paused | p50 pending ms, p99 pending ms on loopback, 30 s heartbeat (`tests/work_stream.rs`, release) | yes |
+| Steady beat ≤ 1 KiB both ways at 10,000 allocations | pending | yes |
+| Store reads per steady beat | 0 (the reply's desired set comes from the worker's mirror) | yes |
+| Leader kill: one resync per worker, nothing lost or duplicated | one resync, every allocation exactly once (`tests/work_stream.rs`) | yes |
+| Edge-boot provisional deltas | not built; speculative dispatch still pushes (calls entry 30) | deferred |
+
+Dispatch under load (the ladder's "Dispatch" column, placement committed →
+worker has it) stays under 1 ms at p50 up to the ceiling; its p99 grows
+only once the manager saturates.
+
+### 14.5 Phase 3: blocked work
+
+| Target | Result | Met |
+| --- | --- | --- |
+| Join to a pool wakes only evals blocked on that pool's class, plus `escaped` | yes (`tests/blocked_evals.rs`) | yes |
+| Freed capacity places a blocked job, p50 ≤ 1 s, p99 ≤ 5 s | p50 pending ms, p99 pending ms over pending trials | yes |
+| `job status` shows the key and shortfall | `Job.blocked` (`key`, `task`, `shortfall`, `message`, `since`, `eval_id`) and the `blocked` derived status | yes |
+| Unblock during the job's running eval is not lost | missed-unblock detection by capacity sequence | yes |
+| Leader change rebuilds the index | from rows, plus a 60 s capacity-event replay window | yes |
+| Checkpoint budget reports and `snapshot warm` wake | not wake events (calls entry 33) | deferred |
+
+### 14.6 What the results change in later phases
+
+- **The lane, not the entry count, is now the bound.** Phase 1 brought a
+  lifecycle to 8 entries; at about 6 ms of serial lane time each, more
+  trimming buys little. A follow-up that widens the plan-apply group
+  commit or cuts the per-entry cost (calls entry 13) comes before
+  Phase 4, which shrinks rows, not entries.
+- **Suspend and resume latency is heartbeat-bound** (about 3 s and 2 s at
+  p50 on a 2 s cadence), because checkpoint requests and reports still ride
+  heartbeats. Moving them onto the stream is the next latency lever for
+  Phases 5 and 7, whose targets assume it (`TODO.md`).
+- **Row sizes hold.** About 216 B per pending instance, linear to 10^6,
+  keeps Phase 4's and 5's estimates.
+
 ## 15. Public documentation for session mode (draft, publish with Phase 6)
 
 Session mode is not built: this section is the user-facing documentation it
 ships with, written now so the trade-offs are settled before the code and
 the docs cannot drift from the plan. It does not go in `docs/` until Phase 6
-lands (public docs describe only what exists; calls entry 39). When it does:
+lands (public docs describe only what exists; calls entry 40). When it does:
 §15.1 becomes `docs/session-mode.md`, §15.2 is added to
 `docs/stateful-workloads.md` "Choosing a mode", and §15.3 is added to
 `docs/sandboxes-at-scale.md` and `docs/guides/agent-sandboxes.md`.

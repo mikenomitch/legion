@@ -198,6 +198,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#27](https://github.com/mikenomitch/legion/pull/27) | Sandbox scaling Phases 0–3: 8-entry keyed lifecycles, `StreamWork` delivery, blocked evals, the AWS sandbox campaign | [plan](plans/sandbox-scaling-plan.md) · [calls](calls/sandbox-scaling-plan_calls.md); rate target missed at ~2× (calls #13) |
 | [#20](https://github.com/mikenomitch/legion/pull/20) | Operator UI gaps: instance and allocation pages, event filters by instance/allocation, KV values hidden until revealed, worker public addresses, stale rollouts cancel themselves | [plan](plans/operator-ui-gaps-plan.md) · [calls](calls/operator-ui-gaps-plan_calls.md) |
 | [#19](https://github.com/mikenomitch/legion/pull/19) | Task page tabs, guided template launch, Actions tab; template-launched jobs list their tasks again | UI only; [plan](plans/ui-task-and-template-redesign-plan.md) · [calls](calls/ui-task-and-template-redesign-plan_calls.md) |
 | [#24](https://github.com/mikenomitch/legion/pull/24) | Gated sandbox checkpoints Phases 1 to 4: gated memory checkpoints, `gated-default` deny, the static `legion-guest` agent, gated idle signals, Legion-addressed TAP guests (`tap`/`mac` removed) | Phase 0 (KVM) pending, so the gated-by-default flip is held; [plan](plans/gated-sandbox-checkpoints-plan.md) · [calls](calls/gated-sandbox-checkpoints-plan_calls.md) |
@@ -256,12 +257,6 @@ How to use it:
       lost-node replans now retry plan conflicts and hand off to a
       `job_reschedule` eval instead of leaving the job short
       ([calls](calls/plan-path-fleet-scaling-plan_calls.md) #15).
-- [ ] **Heartbeats rebuild the node's whole desired set every beat.** Add a
-      desired-state version to the heartbeat so an unchanged node gets a
-      cheap "unchanged" reply (proto + worker change). Adaptive cadence
-      already caps the beat rate (calls #16). Planned more broadly as
-      sequenced delivery, Phase 2 of
-      [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md).
 - [ ] **Job stop/destroy at scale drains at ~4 evals/s** (AWS 10k cleanup,
       2026-10-10). Profile with `legion_eval_phase_seconds{kind="job_stop"}`.
 - [x] **Re-ran `web_fleet` on AWS with Phase 4 and adaptive cadence**
@@ -765,22 +760,25 @@ How to use it:
       batch the eval lifecycle ops into fewer proposals, or give the
       pipeline more than one thread per lane. Wants measurement of which
       of the ~6 ops are actually separable before any design.
+      **Half done (2026-10-12):** sandbox-scaling Phase 1 made eval claims
+      leader memory and fused the settle into the plan apply, so a placing
+      eval is one entry ([calls](calls/sandbox-scaling-plan_calls.md) #11,
+      #17). What is left is the lane itself, and it now bounds keyed
+      sandbox lifecycles at ~50/s on a 4-vCPU host, against the plan's
+      ≥ 5× target of ~125/s: ~6 ms of serial lane time per entry (capture
+      3.2 ms, propose → apply 2.7 ms), the pipeline thread ~54% busy, the
+      manager at 1.1 of 4 cores, and the same in `single` and `lanes`
+      ([plan §14.3](plans/sandbox-scaling-plan.md#143-phase-1-group-commit-and-write-trimming),
+      [calls](calls/sandbox-scaling-plan_calls.md) #13). Levers: more
+      placements per plan entry (sandbox placements average 1.09 plans per
+      entry, one eval each), a cheaper capture (each write executes twice,
+      once to capture and once to apply), or a pipelined lane.
 - [ ] **Fused top-k candidate scoring.** Ranked candidate lists materialize a
       scored vector per placement; the one-candidate path (`plan_candidates:
       0`) uses the fused argmax loop that does not. A fused top-k loop would
       give the default path the same win — worth doing when the
       candidate-construction benchmark (+2–10% plan-only) says it pays
       ([calls #20](calls/late-binding-plan-apply-plan_calls.md)).
-- [ ] **Capacity exhaustion still fails evals terminally.** The late-binding
-      requeue backstop only covers *conflict* errors; a replan that finds no
-      eligible capacity at all ("no available nodes …") still ends the eval
-      in `failed`. Blocked-and-retried capacity waits are the gang-scheduling
-      plan's blocked-eval machinery
-      ([plan](plans/gang-scheduling-plan.md)) — when that lands, consider
-      routing plain single-task capacity failures through it too. Now
-      planned as Phase 3 of
-      [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md), a generic
-      blocked-work queue the gang plan can reuse.
 - [ ] Edge boot follow-ups — the feature shipped (phases 1–4;
       [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
       [calls](calls/edge-boot-plan_calls.md)); these are what it left open.
@@ -845,18 +843,6 @@ How to use it:
           p50/p99, confirmed vs refused by reason, coalescer batch size and
           commit time on the lanes involved, and the rate where p99 crosses
           `ratifyTimeout`. Numbers go in `benchmarks/scheduler/README.md`.
-    - [ ] **Stop the ticket spend from being its own raft commit.**
-          `verify_and_spend` → `Store::spend_boot_ticket`
-          (`src/storage/boot_ticket_store.rs`) is one unbatched
-          `replicated(Lane::Control, ..)` write per start, and the placement
-          then commits again on the plan path. That is two serial commits per
-          sandbox, and the unbatched one is likely the first ceiling
-          (hundreds to low thousands per second). Prefer folding the
-          conditional `UPDATE boot_ticket` into the ratification's plan-apply
-          transaction: one commit per start, and a refused placement stops
-          burning a ticket use. Fallback: a spend coalescer like
-          `heartbeat_coalescer`. Keep the cross-node double-spend refusal and
-          test it, plus expiry and refused-placement-leaves-`uses_spent`.
     - [ ] **Let ratifications fill commit batches.** Ratifications go through
           `submit_and_apply_plan_for_instance` → the plan coalescer, capped by
           `plan_apply_batch_max` (default 16, clamped 1..=128). Evals fill
@@ -1658,61 +1644,66 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       guest-agent path would implement. Exec is now planned as Phase 1 of
       [sandbox-exec-plan.md](plans/sandbox-exec-plan.md).
 - [ ] **Sandbox scaling to very large session counts**:
-      [plan](plans/sandbox-scaling-plan.md) (PLANNED) ·
-      [calls](calls/sandbox-scaling-plan_calls.md). Every keyed sandbox is a
-      raft row, about 22 raft entries across create, place, suspend, resume,
-      and destroy (26 with idempotency keys, counted from code, plan §5.1),
-      and a tombstone forever. Raft should hold only envelopes and named
-      instances.
-  - [ ] Phase 0 (gate): an op-count test per lifecycle stage on the
-        `raft_apply_roundtrip` harness, a `legion-loadgen` instance mode,
-        simulated allocation health, bytes per instance row, heartbeat bytes
-        at 1,000 and 10,000 allocations per node, and the latency SLOs at p50
-        and p99 (plan §7.2). Numbers in `benchmarks/scheduler/README.md`.
-  - [ ] Phase 1: group commit and write trimming with no new semantics
-        (target ≤ 8 entries per lifecycle, ≥ 5× the Phase 0 rate).
-  - [ ] Phase 2: sequenced delivery. A per-node delta log in leader memory,
-        `Manager.StreamWork` with acks, full resync on failover or gaps, and
-        delta heartbeats (plan §6.13). Targets: dispatch within a round trip
-        of the commit, steady heartbeats under 1 KiB at 10,000 allocations.
-        Supersedes the "Heartbeats rebuild the node's whole desired set every
-        beat" item under Scheduling & placement.
-  - [ ] Phase 3: blocked work keyed by what blocked it, woken by matching
-        node joins, uncordons, freed capacity, attribute changes, and budget
-        reports (plan §6.15). Covers the "Capacity exhaustion still fails
-        evals terminally" item under Scheduling & placement, and the gang
-        plan builds on it.
+      [plan](plans/sandbox-scaling-plan.md) (IN EXECUTION) ·
+      [calls](calls/sandbox-scaling-plan_calls.md) ·
+      [docs](../docs/sandboxes-at-scale.md). Phases 0–3 shipped (Done,
+      below): a keyed sandbox lifecycle is 8 raft entries, work streams to
+      nodes, and a full cluster blocks creates instead of failing them.
+      Every keyed sandbox is still a raft row and a tombstone forever; raft
+      should hold only envelopes and named instances.
+  - [ ] **The lifecycle rate reached ~2× Phase 0, not the ≥ 5× target.**
+        ~50 lifecycles/s against ~25/s on the 4-vCPU reference host; the
+        scheduler lane's serial per-entry cost is the bound. Tracked with
+        its levers in "Cut the raft round trips per eval, or widen the lane
+        pipeline" under Scheduling & placement
+        ([plan §14.3](plans/sandbox-scaling-plan.md#143-phase-1-group-commit-and-write-trimming),
+        [calls](calls/sandbox-scaling-plan_calls.md) #13).
+  - [ ] **Run the sandbox campaign on the AWS rig.** Every Phase 0–3 number
+        is from a single-host substitute. `benchmarks/aws/scripts/run-sandbox-campaign.sh`
+        (3 managers, one load box, ~$1/hour) produces the ceiling,
+        per-lifecycle raft and CPU cost, memory per resident sandbox, and
+        labelled projections; record them in plan §14 and
+        `benchmarks/scheduler/README.md`
+        ([calls](calls/sandbox-scaling-plan_calls.md) #14, #41).
+  - [ ] **Suspend and resume still wait on heartbeats.** Checkpoint
+        requests and reports ride the heartbeat, so a suspend takes ~3 s and
+        a resume ~2 s at p50 on the default 2 s cadence, while placements
+        land in one round trip. Put checkpoint requests on the `StreamWork`
+        stream and reports on a prompt path; Phases 5 and 7's resume and
+        wake targets assume it
+        ([plan §14.6](plans/sandbox-scaling-plan.md#146-what-the-results-change-in-later-phases)).
+  - [ ] **Edge-boot provisional deltas on the stream.** Speculative dispatch
+        still pushes with `PostWork` and the verdict arrives on the
+        `RatifyClaim` reply
+        ([calls](calls/sandbox-scaling-plan_calls.md) #30).
+  - [ ] **Checkpoint budget reports and `snapshot warm` as blocked-eval wake
+        events.** Only registration, node changes, readiness, and freed
+        allocations wake today
+        ([calls](calls/sandbox-scaling-plan_calls.md) #33).
+  - [ ] **Arm the fused settle in more handlers.** Only `job_reschedule`
+        without a batch follow-up settles inside its plan; `job_submit`,
+        `job_update`, and `job_scale` still settle in a separate entry
+        ([calls](calls/sandbox-scaling-plan_calls.md) #17).
+  - [ ] **Rollout ticks and node-scoped passes do not block.** They keep the
+        old terminal outcome when nothing fits
+        ([calls](calls/sandbox-scaling-plan_calls.md) #32).
+  - [ ] **The raft seam test does not read `src/storage/store/*.rs`.**
+        `tests/raft_seam.rs` parses only `store.rs` and `acl_store.rs`, so a
+        replicated write added in a store submodule (`eval_claims.rs`,
+        `blocked_evals.rs`) is not checked for a lane classification
+        ([calls](calls/sandbox-scaling-plan_calls.md) #39).
   - [ ] Phase 4: server-minted ids grow to 130 bits and leave no tombstone.
         Caller ids may not take that shape.
   - [ ] Phase 5: archive suspended keyed instances to content-store
         manifests (`suspend.archive`).
   - [ ] Phase 6: `stateful.mode = "session"`: envelopes, the session
         router, leases, node session logs, the leader index, and
-        `PromoteInstance`.
+        `PromoteInstance`. Its user docs are drafted in plan §15.
   - [ ] Phase 7: wake on request through `legion start gateway` and
         `suspend.wake` (plan §6.14). The suspend plan's Phase 8 keeps
         node-local wake on connect.
   - [ ] Phases 8 to 10: snapshot-clone density (with suspend plan Phase 8),
         a sub-VM tier seam, and cells only past the plan §6.11 trigger.
-  - [ ] Found during the plan: allocation health is a status-lane raft
-        write per node per beat, because the manager upserts every
-        allocation with `updated_at = now` and nothing skips unchanged rows
-        (`src/manager/server.rs:6311`, `src/storage/store.rs:13291`). It
-        grows with sandboxes per node, and simulated workers never send it,
-        so the AWS rig has not seen it. Phase 1 fixes it.
-  - [ ] Found during the plan: edge ratification only binds an existing
-        unbound keyed instance (`src/storage/store.rs:12560-12580`), so an
-        edge start still needs `CreateInstance` first, and that create's
-        placement eval can bind the row before the edge claim does. Phase 1
-        makes ratification create the row.
-  - [ ] Found during the plan: the `node_join` capacity pass compares
-        allocations to `count` (`src/storage/store.rs:14557-14607`), and
-        keyed tasks define no count, so a keyed instance left `pending` for
-        lack of room appears never to be retried. Phase 0 confirms with a
-        test, and Phase 3 fixes it.
-  - [ ] Found during the plan: `docs/multi-raft.md` says instance writes go
-        on the control lane, but `instance` is owned by the scheduler lane
-        (`src/storage/raft/ownership.rs:222`). Fix the doc.
 - [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (PLANNED) ·
       [calls](calls/sandbox-exec-plan_calls.md). Exec into Linux microVM
       sandboxes, and exec sessions that skip the manager. Implemented
@@ -4140,6 +4131,53 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
       [calls](calls/edge-boot-plan_calls.md)). Phase 0's measurement and
       phase 5's backlog are open above.
+- [x] **The ticket spend rides the ratification** (2026-10-12). `boot_ticket`
+      moved to the scheduler lane, and a ratification spends its ticket,
+      creates the keyed instance when the ticket names an id that never
+      existed, and places it in one group-committed entry, so an edge start
+      is one entry and a refused ratification leaves the ticket unspent
+      ([sandbox-scaling calls](calls/sandbox-scaling-plan_calls.md) #23,
+      [docs](../docs/edge-boot.md)).
+- [x] **Sandbox scaling Phases 0–3** (2026-10-12,
+      [#27](https://github.com/mikenomitch/legion/pull/27)):
+      [plan](plans/sandbox-scaling-plan.md) §14 ·
+      [calls](calls/sandbox-scaling-plan_calls.md) ·
+      [docs](../docs/sandboxes-at-scale.md). Open phases and gaps are above,
+      under Task runtimes.
+  - [x] Phase 0: `tests/raft_lifecycle_ops.rs` asserts raft entries per
+        lifecycle stage on `single` and `lanes`; `legion-loadgen --mode
+        instances` drives create → running → suspend → resume → destroy at
+        an open-loop rate (simulated nodes send allocation health and fake
+        checkpoints); row sizes at 10^5 and 10^6 and heartbeat bytes at
+        1,000 and 10,000 allocations (`tests/instance_scale_measure.rs`).
+        Baseline: 22 entries per lifecycle, ~25 lifecycles/s.
+  - [x] Phase 0 found and fixed: a keyed instance left `pending` by a full
+        cluster was never retried by the capacity pass
+        (`tests/capacity_retry.rs`, calls #38).
+  - [x] Phase 1: 8 entries per lifecycle. Allocation health is written only
+        on change; eval claims are leader memory; a placing eval settles
+        inside its plan; stop and destroy queue no eval; concurrent instance
+        operations group-commit (`schedulerSettings.instance_group_commit`,
+        default on); the docs fix for instance writes being on the scheduler
+        lane (`docs/multi-raft.md`). The ≥ 5× rate target was missed (~2×),
+        open above.
+  - [x] Phase 2: `Manager.StreamWork` delivers placements to nodes one round
+        trip after commit, with per-process epochs, per-node sequences,
+        acks, replay, and digest-checked resync; a steady heartbeat carries
+        a position and digest instead of the allocation set
+        ([docs](../docs/architecture-managers-workers.md#delivery)).
+        Replaces the "heartbeats rebuild the node's whole desired set every
+        beat" item.
+  - [x] Phase 3: unplaceable job evals end `blocked` under a key (pool
+        class, pinned node, or `escaped`), one per job, woken only by
+        matching capacity (registration, node change, readiness, freed
+        allocations) with missed-unblock detection; `Job.blocked` and the
+        `blocked` job status
+        ([docs](../docs/scheduler-and-eval-loop.md#blocked-evals)). Replaces
+        the "capacity exhaustion still fails evals terminally" item.
+  - [x] A standalone AWS sandbox campaign
+        (`benchmarks/aws/scripts/run-sandbox-campaign.sh`,
+        `analysis/sandbox_report.py`), not yet run (open above).
 
 ## Persistence
 

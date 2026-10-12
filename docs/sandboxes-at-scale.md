@@ -154,6 +154,12 @@ runtime's own boot or restore time for the end-to-end figure.
 - **Per-sandbox lifecycle events go to the replicated event journal**, which
   keeps the newest ~10,000 rows; a platform creating thousands of sandboxes
   a second should follow `legion events follow` rather than page history.
-- **One scheduler lane orders every placement.** Throughput past the
-  measured ceiling needs fewer entries per sandbox, not more managers:
-  adding managers adds replicas, not lanes.
+- **One scheduler lane orders every placement,** one entry at a time, in
+  both raft topologies. The lane bounds a cluster's lifecycle rate: on a
+  4-vCPU reference host (one manager, simulated nodes), about 50 full
+  create → suspend → resume → destroy lifecycles a second, at about 6 ms
+  of lane time per entry and about 3 entries per lifecycle under load.
+  Below that, a create is running in about 12 ms at p50 and 70 ms at p99;
+  past it, requests queue and latency grows. More managers add replicas,
+  not lanes, so they do not raise the ceiling. Measure your own hardware
+  with the tools [above](#measuring-it-on-your-hardware).
