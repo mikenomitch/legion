@@ -46,6 +46,9 @@ instance, type a command, and toggle *Interactive (tty)* if you want a shell.
 An embedded terminal (xterm.js) streams the session. A link can open it on one
 allocation: `/jobs/web/tasks/api?tab=actions&action=shell&alloc=4217`.
 
+The allocation page (`/allocations/<id>`) has the same **Actions** panel
+aimed at that one allocation.
+
 ## Actions
 
 An **action** is a named, parameterized command template declared on a task.

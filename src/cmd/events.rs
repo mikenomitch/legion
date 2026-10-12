@@ -14,7 +14,7 @@ use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{ListEventsRequest, SchedulerEvent, StreamEventsRequest};
 
-fn filter_args() -> [Arg; 4] {
+fn filter_args() -> [Arg; 6] {
     [
         Arg::new("kind")
             .long("kind")
@@ -27,6 +27,13 @@ fn filter_args() -> [Arg; 4] {
             .long("level")
             .value_parser(["info", "warn", "error"])
             .help("Filter by severity level"),
+        Arg::new("instance")
+            .long("instance")
+            .help("Filter to events about one stateful instance (its metadata or its allocations)"),
+        Arg::new("allocation")
+            .long("allocation")
+            .value_parser(clap::value_parser!(i64))
+            .help("Filter by exact allocation ID"),
     ]
 }
 
@@ -86,6 +93,8 @@ async fn list_events(matches: &ArgMatches) -> R<()> {
         job_id: opt_string(matches, "job"),
         node_id: opt_string(matches, "node"),
         level: opt_string(matches, "level"),
+        instance_id: opt_string(matches, "instance"),
+        allocation_id: matches.get_one::<i64>("allocation").copied(),
     };
 
     let mut client = connect_manager_client().await?;
@@ -125,6 +134,8 @@ async fn follow_events(matches: &ArgMatches) -> R<()> {
         job_id: opt_string(matches, "job"),
         node_id: opt_string(matches, "node"),
         level: opt_string(matches, "level"),
+        instance_id: opt_string(matches, "instance"),
+        allocation_id: matches.get_one::<i64>("allocation").copied(),
     };
 
     let mut client = connect_manager_client().await?;

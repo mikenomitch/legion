@@ -54,32 +54,32 @@ use crate::structs::{
     IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
     IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
     JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
-    JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvValueType,
-    LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest,
-    ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
-    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobTemplatesReply,
-    ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
-    ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
-    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
-    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply,
-    ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
-    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
-    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
-    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
-    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
-    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
-    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
-    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
-    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
-    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
-    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
-    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvJobReference,
+    KvValueType, LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply,
+    ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply,
+    ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
+    ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply,
+    ListKvRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply,
+    ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
+    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
+    ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest,
+    ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node,
+    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
+    PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent,
+    RaftStatus, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest,
+    RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest,
+    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
+    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
+    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RotateMeshCaReply,
+    RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest,
+    SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, ServiceEdge,
+    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
+    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
+    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
+    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
@@ -883,21 +883,33 @@ fn scheduler_event_filter(
     node_id: Option<String>,
     level: Option<String>,
 ) -> SchedulerEventFilter {
-    let normalize = |value: Option<String>| {
-        value.and_then(|value| {
-            let trimmed = value.trim().to_string();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-    };
     SchedulerEventFilter {
         // Explicit 0 means "from the very beginning"; only reject negatives.
         after_id: after_id.filter(|id| *id >= 0),
         limit,
-        kind: normalize(kind),
-        job_id: normalize(job_id),
-        node_id: normalize(node_id),
-        level: normalize(level),
+        kind: normalize_event_filter_value(kind),
+        job_id: normalize_event_filter_value(job_id),
+        node_id: normalize_event_filter_value(node_id),
+        level: normalize_event_filter_value(level),
+        instance_id: None,
+        allocation_id: None,
     }
+}
+
+/// `GetJobSpecReply.rendered_jobspec`: the stored config as the JSON shape
+/// `RunJobRequest.parsed_jobspec` takes.
+fn rendered_jobspec_json(config: &JobConfig) -> Result<String, Status> {
+    serde_json::to_string(config).map_err(|error| {
+        error!(?error, job = %config.name, "Error serializing job config");
+        Status::internal("Error serializing job config")
+    })
+}
+
+fn normalize_event_filter_value(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
 }
 
 // Outbound buffer for one StreamEvents subscriber. Slow consumers exert
@@ -3922,14 +3934,18 @@ impl Manager for ManagerDaemonService {
             AclScope::none(),
         )?;
         let request = request.into_inner();
-        let filter = scheduler_event_filter(
-            request.after_id,
-            request.limit,
-            request.kind,
-            request.job_id,
-            request.node_id,
-            request.level,
-        );
+        let filter = SchedulerEventFilter {
+            instance_id: normalize_event_filter_value(request.instance_id),
+            allocation_id: request.allocation_id,
+            ..scheduler_event_filter(
+                request.after_id,
+                request.limit,
+                request.kind,
+                request.job_id,
+                request.node_id,
+                request.level,
+            )
+        };
 
         let events = self
             .store
@@ -4044,14 +4060,18 @@ impl Manager for ManagerDaemonService {
         )?;
         let credential = self.stream_credential(&request);
         let request = request.into_inner();
-        let filter = scheduler_event_filter(
-            request.after_id,
-            None,
-            request.kind,
-            request.job_id,
-            request.node_id,
-            request.level,
-        );
+        let filter = SchedulerEventFilter {
+            instance_id: normalize_event_filter_value(request.instance_id),
+            allocation_id: request.allocation_id,
+            ..scheduler_event_filter(
+                request.after_id,
+                None,
+                request.kind,
+                request.job_id,
+                request.node_id,
+                request.level,
+            )
+        };
 
         let store = self.store.clone();
         // Subscribe before replaying history so no event can fall between the
@@ -4098,7 +4118,19 @@ impl Manager for ManagerDaemonService {
                 };
                 match received {
                     Ok(event) => {
-                        if event.id <= last_sent || !filter.matches(&event) {
+                        // The instance filter's allocation half reads the
+                        // allocation row, so an allocation placed after the
+                        // stream opened still matches.
+                        let allocation_instance = |id: i64| {
+                            store
+                                .get_allocation_by_id(id)
+                                .ok()
+                                .flatten()
+                                .and_then(|allocation| allocation.instance_id)
+                        };
+                        if event.id <= last_sent
+                            || !filter.matches_with(&event, allocation_instance)
+                        {
                             continue;
                         }
                         last_sent = event.id;
@@ -4390,10 +4422,12 @@ impl Manager for ManagerDaemonService {
             .store
             .get_submissions_for_config(&config.id())
             .map_err(|e| map_store_error("Error getting submissions", e))?;
+        let rendered_jobspec = rendered_jobspec_json(&config)?;
 
-        let reply = GetJobSpecReply { submissions };
-
-        Ok(Response::new(reply))
+        Ok(Response::new(GetJobSpecReply {
+            submissions,
+            rendered_jobspec,
+        }))
     }
 
     async fn get_job_spec_by_config(
@@ -4417,8 +4451,17 @@ impl Manager for ManagerDaemonService {
             .store
             .get_submissions_for_config(&config_id)
             .map_err(|e| map_store_error("Error getting submissions", e))?;
+        let config = self
+            .store
+            .get_job_config_by_id_optional(&config_id)
+            .map_err(|e| map_store_error("Error getting job config", e))?
+            .ok_or_else(|| Status::not_found("Job config not found"))?;
+        let rendered_jobspec = rendered_jobspec_json(&config)?;
 
-        Ok(Response::new(GetJobSpecReply { submissions }))
+        Ok(Response::new(GetJobSpecReply {
+            submissions,
+            rendered_jobspec,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -7749,6 +7792,21 @@ impl Manager for ManagerDaemonService {
             .store
             .allocation_health_for_allocations(&allocation_ids)
             .map_err(|e| map_store_error("Error getting allocation health", e))?;
+        // Task names, so a client can group a job's allocations by task
+        // without a second lookup.
+        let task_config_ids: Vec<i64> = ledger
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .allocations
+                    .iter()
+                    .map(|allocation| allocation.task_config_id)
+            })
+            .collect();
+        let task_names = self
+            .store
+            .task_names_for_configs(&task_config_ids)
+            .map_err(|e| map_store_error("Error getting task names", e))?;
 
         let mut nodes: Vec<LedgerNode> = ledger.into_iter().map(Into::into).collect();
         for node in &mut nodes {
@@ -7756,6 +7814,10 @@ impl Manager for ManagerDaemonService {
                 allocation.artifact_states = allocation_health
                     .get(&allocation.id)
                     .and_then(|snapshot| snapshot.artifact_states.clone());
+                allocation.task_name = task_names
+                    .get(&allocation.task_config_id)
+                    .cloned()
+                    .unwrap_or_default();
             }
         }
         nodes.retain(|entry| match &entry.node {
@@ -8390,6 +8452,7 @@ impl Manager for ManagerDaemonService {
                 allocation_id: endpoint.allocation_id,
                 node_id: endpoint.node_id,
                 address: endpoint.address.unwrap_or_default(),
+                public_address: endpoint.public_address.unwrap_or_default(),
                 port: u32::from(endpoint.port.unwrap_or(0)),
                 healthy: endpoint.healthy,
                 health_status: endpoint.health_status,
@@ -8433,19 +8496,40 @@ impl Manager for ManagerDaemonService {
 
     #[instrument(skip_all)]
     async fn get_kv(&self, request: Request<GetKvRequest>) -> Result<Response<GetKvReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Kv,
             AclAction::Read,
             AclScope::path(&request.get_ref().key),
         )?;
         let req = request.into_inner();
-        let entry = self
+        let entry = if req.metadata_only {
+            self.store.get_kv_metadata(&req.key)
+        } else {
+            self.store.get_kv(&req.key)
+        }
+        .map_err(|e| map_store_error("Error getting kv entry", e))?;
+        // Who reads this key, limited to jobs the caller may see.
+        let references = self
             .store
-            .get_kv(&req.key)
-            .map_err(|e| map_store_error("Error getting kv entry", e))?;
+            .job_kv_references_for_key(&req.key)
+            .map_err(|e| map_store_error("Error getting kv references", e))?
+            .into_iter()
+            .filter(|reference| {
+                identity.allows(
+                    AclResource::Job,
+                    AclAction::Read,
+                    &self.job_read_scope(&reference.job_id),
+                )
+            })
+            .map(|reference| KvJobReference {
+                job_id: reference.job_id,
+                job_config_id: reference.job_config_id,
+                json_pointer: reference.json_pointer,
+            })
+            .collect();
 
-        Ok(Response::new(GetKvReply { entry }))
+        Ok(Response::new(GetKvReply { entry, references }))
     }
 
     /// Resolves an artifact credential from KV for a worker about to fetch.
@@ -8502,10 +8586,14 @@ impl Manager for ManagerDaemonService {
         let identity =
             self.check_acl(&request, AclResource::Kv, AclAction::Read, AclScope::any())?;
         let req = request.into_inner();
-        let mut entries = self
-            .store
-            .list_kv(&req.prefix)
-            .map_err(|e| map_store_error("Error listing kv entries", e))?;
+        // Values only on request: browsing key names should not decrypt and
+        // ship every secret in the prefix.
+        let entries = if req.include_values {
+            self.store.list_kv(&req.prefix)
+        } else {
+            self.store.list_kv_keys(&req.prefix)
+        };
+        let mut entries = entries.map_err(|e| map_store_error("Error listing kv entries", e))?;
         entries.retain(|entry| {
             identity.allows(
                 AclResource::Kv,
@@ -10773,6 +10861,7 @@ impl ManagerDaemonService {
                     allocation_id: row.allocation_id,
                     node_id: row.node_id.clone(),
                     address: row.address.clone().unwrap_or_default(),
+                    public_address: row.public_address.clone().unwrap_or_default(),
                     port: u32::from(row.port.unwrap_or(0)),
                     healthy: row.healthy,
                     health_status: row.health_status.clone(),
@@ -11177,6 +11266,7 @@ fn build_upstream_endpoints(
                         allocation_id: row.allocation_id,
                         node_id: row.node_id,
                         address: row.address.unwrap_or_default(),
+                        public_address: row.public_address.unwrap_or_default(),
                         port: u32::from(row.port.unwrap_or(0)),
                         healthy: row.healthy,
                         health_status: row.health_status,

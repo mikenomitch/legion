@@ -33,6 +33,8 @@ import type { Tone } from './utils/status'
 import Access from './pages/Access'
 import OidcCallback from './pages/OidcCallback'
 import Events from './pages/Events'
+import AllocationDetail from './pages/details/AllocationDetail'
+import InstanceDetail from './pages/details/InstanceDetail'
 import JobDetail from './pages/details/JobDetail'
 import JobSpecDetail from './pages/details/JobSpecDetail'
 import ManagerNodeDetail from './pages/details/ManagerNodeDetail'
@@ -93,7 +95,7 @@ type CommandPaletteItem = {
 
 type SidebarNode = SidebarItem | SidebarSection
 
-const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'templates', 'volumes'])
+const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'templates', 'volumes', 'allocations'])
 
 // The section a detail URL belongs to, as the ⌘K "Recent" group names it.
 const RECENT_KINDS: Record<string, string> = {
@@ -104,6 +106,7 @@ const RECENT_KINDS: Record<string, string> = {
   services: 'Services',
   templates: 'Templates',
   volumes: 'Volumes',
+  allocations: 'Allocations',
 }
 
 // Anonymous callers keep the whole sidebar: they have not had a chance to
@@ -262,7 +265,7 @@ const Layout = (props: RouteSectionProps) => {
           { kind: 'item', label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Every job on the cluster and its health.', icon: 'layers' },
           { kind: 'item', label: 'Templates', path: '/templates', title: 'Templates', copy: 'Reusable job templates with guided parameters.', icon: 'layoutTemplate' },
           { kind: 'item', label: 'Services', path: '/services', title: 'Services', copy: 'Discoverable endpoints and their health.', icon: 'radio' },
-          { kind: 'item', label: 'Network', path: '/network', title: 'Network', copy: 'Who calls whom on the datapath, and the egress and ingress policy that decides it.', icon: 'shieldCheck' },
+          { kind: 'item', label: 'Network', path: '/network', title: 'Network', copy: 'Who calls whom on the datapath, and the egress and ingress policy that decides it.', icon: 'waypoints' },
           { kind: 'item', label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Version rollouts and their progress.', icon: 'rocket' },
           { kind: 'item', label: 'Volumes', path: '/volumes', title: 'Volumes', copy: 'Persistent storage behind stateful tasks.', icon: 'hardDrive' },
         ],
@@ -754,7 +757,7 @@ const Layout = (props: RouteSectionProps) => {
     const labels = buildCrumbs(location.pathname)
       .slice(1)
       .map((crumb) => crumb.label)
-      .filter((label) => label !== 'Tasks' && label !== 'Specs')
+      .filter((label) => label !== 'Tasks' && label !== 'Specs' && label !== 'Instances')
     document.title = [...(labels.length > 0 ? labels.reverse() : ['Overview']), 'Legion'].join(' · ')
   })
 
@@ -1146,6 +1149,8 @@ const AppRoutes = () => {
       <Route path="/jobs/:id" component={JobDetail} />
       <Route path="/jobs/:id/tasks/:taskName" component={TaskDetail} />
       <Route path="/jobs/:id/specs/:configId" component={JobSpecDetail} />
+      <Route path="/jobs/:id/instances/:instanceId" component={InstanceDetail} />
+      <Route path="/allocations/:id" component={AllocationDetail} />
       <Route path="/services" component={Services} />
       <Route path="/services/:name" component={ServiceDetail} />
       <Route path="/network" component={Network} />

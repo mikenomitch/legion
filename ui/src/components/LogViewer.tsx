@@ -1,5 +1,7 @@
+import { Code, ConnectError } from '@connectrpc/connect'
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import { managerClient } from '../grpcClient'
+import { AllocationLink } from './AllocationLink'
 import { Button, Dot, Icon, Note, cx, inputClass, selectClass } from './ui'
 
 // Live-tailing task log viewer.
@@ -60,6 +62,9 @@ export default function LogViewer(props: LogViewerProps) {
     const ids = props.allocationIds
     return ids && ids.length > 0 ? new Set(ids.map((id) => id.toString())) : undefined
   }
+  // One allocation is read directly (`allocation_id`), so the manager proxies
+  // a single worker read instead of one per allocation of the whole job.
+  const singleAlloc = () => (props.allocationIds?.length === 1 ? props.allocationIds[0] : undefined)
 
   const appendChunk = (alloc: string, stream: string, chunk: string) => {
     const key = `${alloc}:${stream}`
@@ -80,6 +85,7 @@ export default function LogViewer(props: LogViewerProps) {
     try {
       const resp = await managerClient.getAllocationLogs({
         job: props.job,
+        allocationId: singleAlloc(),
         stream: streamFilter(),
         tail: true,
         maxBytes: BigInt(WINDOW_BYTES),
@@ -130,6 +136,10 @@ export default function LogViewer(props: LogViewerProps) {
       const allocList = Array.from(seenAllocs).sort()
       if (allocList.length !== knownAllocs().length) setKnownAllocs(allocList)
     } catch (err) {
+      if (err instanceof ConnectError && err.code === Code.NotFound && singleAlloc() !== undefined) {
+        setError(`Allocation #${String(singleAlloc())} no longer exists, so its logs can't be read through the manager.`)
+        return
+      }
       setError(err instanceof Error ? err.message : String(err))
     }
   }
@@ -222,7 +232,7 @@ export default function LogViewer(props: LogViewerProps) {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${props.job}-logs.txt`
+    a.download = singleAlloc() !== undefined ? `${props.job}-alloc-${String(singleAlloc())}-logs.txt` : `${props.job}-logs.txt`
     a.click()
     URL.revokeObjectURL(url)
   }
@@ -322,7 +332,12 @@ export default function LogViewer(props: LogViewerProps) {
             {(line) => (
               <div class={`flex gap-2 ${wrap() ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}>
                 <Show when={multipleAllocs()}>
-                  <span class="shrink-0 select-none text-neutral-600">#{line.alloc}</span>
+                  <AllocationLink
+                    id={line.alloc}
+                    job={props.job}
+                    variant="inherit"
+                    class="shrink-0 select-none text-neutral-600 hover:text-neutral-300"
+                  />
                 </Show>
                 <span
                   class={`shrink-0 select-none ${

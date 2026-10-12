@@ -198,6 +198,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#20](https://github.com/mikenomitch/legion/pull/20) | Operator UI gaps: instance and allocation pages, event filters by instance/allocation, KV values hidden until revealed, worker public addresses, stale rollouts cancel themselves | [plan](plans/operator-ui-gaps-plan.md) · [calls](calls/operator-ui-gaps-plan_calls.md) |
 | [#19](https://github.com/mikenomitch/legion/pull/19) | Task page tabs, guided template launch, Actions tab; template-launched jobs list their tasks again | UI only; [plan](plans/ui-task-and-template-redesign-plan.md) · [calls](calls/ui-task-and-template-redesign-plan_calls.md) |
 | [#14](https://github.com/mikenomitch/legion/pull/14) | Live KV file updates (`onChange = "update"`) and KV-backed ingress certificates (`certFrom = { kv }`) | [plan](plans/kv-cert-delivery-plan.md) · [calls](calls/kv-cert-delivery-plan_calls.md) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
@@ -3285,6 +3286,23 @@ From [ui-task-and-template-redesign-plan.md](plans/ui-task-and-template-redesign
 - [ ] Template catalog and authoring views: usage counts, jobs behind the
       latest version, version-to-version source diff
 
+Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
+
+- [ ] `LEGION_WORKER_PUBLIC_ADDRESS=auto`: detect the public address from
+      cloud metadata (EC2 IMDSv2, GCP, Azure) instead of the operator wiring a
+      `curl` into the start script
+      ([calls 5](calls/operator-ui-gaps-plan_calls.md#5-the-public-address-is-a-per-node-env-var-not-worker-type-config))
+- [ ] Manager reverse proxy so a browser can open a service on nodes with no
+      reachable ports ([plan](plans/manager-reverse-proxy-plan.md))
+- [ ] `GetAllocation` RPC (job-scoped) so the allocation page works for tokens
+      without `node:read`; today it reads the whole ledger
+      ([calls 4](calls/operator-ui-gaps-plan_calls.md#4-the-allocation-page-reads-the-ledger-instead-of-a-new-getallocation-rpc))
+- [ ] `legion kv get --json` omits `GetKvReply.references`; only the text
+      output prints `used by:`
+- [ ] The instance event filter scans the bounded journal with `json_extract`;
+      an indexed `scheduler_event.instance_id` column if the journal bound ever
+      grows ([calls 3](calls/operator-ui-gaps-plan_calls.md#3-the-instance-event-filter-reads-metadata-not-a-new-column))
+
 ## Cross-cutting
 
 - [ ] **Ship a Nickel contract library for the jobspec.** `legion job schema`
@@ -4242,6 +4260,29 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       UI took the first JSON submission as the spec, which for a template run
       can be `template.variables.json`. It now prefers `job.rendered.json`
       ([calls entry 5](calls/ui-task-and-template-redesign-plan_calls.md)).
+- [x] Operator UI gaps (2026-10-12, [#20](https://github.com/mikenomitch/legion/pull/20)):
+      tasks and per-task allocations no longer come up empty
+      (`GetJobSpecReply.rendered_jobspec`, `LedgerAllocation.task_name`);
+      instance page (`/jobs/:job/instances/:id`) and allocation page
+      (`/allocations/:id`) with event timelines from new `instance_id` /
+      `allocation_id` event filters (`legion events --instance/--allocation`,
+      MCP `legion_events`); the allocation page embeds the task page's
+      Actions panel for that one allocation; KV values hidden until revealed (`ListKv` returns no values unless
+      `include_values`, `GetKv.metadata_only`, `GetKvReply.references` for
+      "Used by"); `LEGION_WORKER_PUBLIC_ADDRESS` →
+      `ServiceEndpoint.public_address` for working endpoint links, private
+      addresses marked; service-graph boxes link to their pages; a rollout
+      whose target is no longer the latest config cancels itself instead of
+      retiring the newer allocations (the stuck `kv-demo` / undone scale);
+      the manager page renders its config instead of JSON, and the KV
+      encryption card moved to the KV page
+      ([plan](plans/operator-ui-gaps-plan.md),
+      [calls](calls/operator-ui-gaps-plan_calls.md),
+      docs: [event-stream](../docs/event-stream.md),
+      [kv-store](../docs/kv-store.md),
+      [service-discovery](../docs/service-discovery.md#public-addresses),
+      [rollouts](../docs/rollouts.md#a-newer-version-supersedes-a-running-rollout),
+      [ui-architecture](../docs/ui-architecture.md)).
 
 ## AWS rig: mitigations in place for the node-deregistration and plugin-build gaps
 

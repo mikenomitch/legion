@@ -89,7 +89,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_net_ca_rotate` | **yes** | Replace the mesh CA. Every node re-issues its certificate on its next heartbeat, and peers on different CAs refuse each other until then. |
 | `legion_net_policy_apply` | **yes** | Create or replace a network policy object. `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
-| `legion_events` | no | List scheduler events. Poll with `after_id` to tail. |
+| `legion_events` | no | List scheduler events. Poll with `after_id` to tail. `instance_id` narrows to one stateful instance (its own events plus its allocations'), `allocation_id` to one allocation. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
 | `legion_state_query` | no | Read-only SQL against the state store. |
 | `legion_state_schema` | no | Describe state store tables. |
@@ -435,6 +435,10 @@ ways (see [Event Stream](event-stream.md)):
 ```bash
 # A window of recent history (oldest first), with filters:
 legion events list --kind eval --job demo --level warn --json
+
+# Everything about one sandbox instance, or one allocation:
+legion events list --instance box-KPI6u4fi8GmwSWCo --json
+legion events list --allocation 98 --json
 
 # Live tail over the StreamEvents gRPC stream; in JSON mode each line is a
 # complete { "ok": true, "data": <event> } envelope (NDJSON):

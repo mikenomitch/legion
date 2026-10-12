@@ -2461,10 +2461,22 @@ message GetJobSpecByConfigRequest {
 
 // Reply payload for GetJobSpec.
 message GetJobSpecReply {
-  // Submissions associated with the latest job config.
-  //
-  // Field number intentionally remains `2` for compatibility.
+  // Source submissions associated with the job config, exactly as the
+  // submitter sent them (usually Nickel source, not JSON). Read these to show
+  // what was typed; read `rendered_jobspec` to learn what the job is.
   repeated Submission submissions = 2;
+
+  // The job config the manager stored, as a JSON object: `name`, `priority`,
+  // `version`, `rollout`/`rollout_by_group` when set, and `tasks` — each
+  // task in the same camelCase shape `RunJobRequest.parsed_jobspec` accepts
+  // (`group`, `runtime`, `lifecycle`, `count`, `dependsOn`, `config`,
+  // `resources`, `checks`, `network`, `service`, `stateful`, ...).
+  //
+  // This is the authoritative structure of the job whatever language it was
+  // written in, with scale overrides NOT applied (`count` is the spec's).
+  // Empty string only when the config could not be loaded, which the
+  // manager reports as an error instead.
+  string rendered_jobspec = 3;
 }
 
 // One job spec history entry.
@@ -6697,12 +6709,48 @@ message GetKvRequest {
   //
   // Must be non-empty.
   string key = 1;
+
+  // Return the entry without its value: `entry.value` is the empty string
+  // and the manager does not decrypt it. Everything else (type, version,
+  // timestamps, `encrypted`, and `GetKvReply.references`) is returned.
+  //
+  // For a client that shows a key's details and reveals the value only on
+  // request. Default `false`. Needs the same `kv:read` as a full read.
+  bool metadata_only = 2;
 }
 
 // Reply payload for GetKv.
 message GetKvReply {
   // Entry when found; unset when key does not exist.
   optional KvEntry entry = 1;
+
+  // Jobs whose current config reads this key: through a `$path/key`
+  // reference anywhere in the jobspec, or through a task's `kvInjections`
+  // (env vars and files rendered from KV). One entry per place the key is
+  // read, so a job that reads it twice appears twice with different
+  // `json_pointer`s.
+  //
+  // Recorded at submit time from the job's latest config; a job that stopped
+  // reading the key drops out when its next version is submitted. Only jobs
+  // the caller holds `job:read` on are listed, so the list can be shorter
+  // than the real set. Returned even when `entry` is unset, so a reference
+  // to a key that was deleted is still visible.
+  repeated KvJobReference references = 2;
+}
+
+// One place a job's config reads a KV key (GetKvReply.references).
+message KvJobReference {
+  // Job that reads the key.
+  string job_id = 1;
+
+  // Job config that recorded the reference (the job's latest version when
+  // it was submitted).
+  string job_config_id = 2;
+
+  // Where in the job config the key is read, as a JSON pointer: for example
+  // `/tasks/0/config/env/DB_PASSWORD` for a `$path/key` reference, or
+  // `/tasks/web/kvInjections/env/GREETING` for an injected env var.
+  string json_pointer = 3;
 }
 
 // Request payload for ListKv.
@@ -6711,6 +6759,16 @@ message ListKvRequest {
   //
   // Default empty string matches all keys.
   string prefix = 1;
+
+  // Return each entry's value. Default `false`: entries come back with
+  // `value` set to the empty string, and the manager never decrypts them.
+  //
+  // Listing is for browsing keys; reading a secret should be a deliberate
+  // act, so a listing does not ship every plaintext to whoever asks for the
+  // key names. Fetch one value with `GetKv`, or set this to `true` (as
+  // `legion kv list --values` does) to get them all. Every other field
+  // (type, version, timestamps, `encrypted`) is returned either way.
+  bool include_values = 2;
 }
 
 // Reply payload for ListKv.
@@ -7001,6 +7059,16 @@ message ServiceEndpoint {
   // PROXY protocol v2 TLV; a plain client dialing the port directly is
   // refused at the handshake.
   bool mesh_tls = 13;
+
+  // Public host name or IP of the endpoint's node, when its worker was
+  // started with `LEGION_WORKER_PUBLIC_ADDRESS`; empty otherwise.
+  //
+  // `address` is where the cluster reaches the endpoint (usually a private
+  // address); this is where a client outside the private network reaches
+  // the same `port`, for links in the UI and CLI. Display only: nothing in
+  // the cluster dials it, and it does not open the port — the node's
+  // firewall or security group must still allow the traffic.
+  string public_address = 14;
 }
 
 // Request payload for ListServiceEdges.
@@ -7288,6 +7356,14 @@ message LedgerAllocation {
   // stateless tasks. Full instance metadata (mode, state, slot index,
   // storage handle) is available via `GetInstance` / `ListInstances`.
   optional string instance_id = 9;
+
+  // Name of the task this allocation runs (the `name` of the task config
+  // named by `task_config_id`).
+  //
+  // Lets a client group a job's allocations by task without a second
+  // lookup. Empty only when the task config row is gone, which a live
+  // allocation never sees.
+  string task_name = 11;
 }
 
 // Request payload for UpdateNodeDynamic.
@@ -7402,6 +7478,35 @@ message ListEventsRequest {
 
   // Optional severity filter. Values: `info`, `warn`, `error`.
   optional string level = 6;
+
+  // Optional stateful instance filter: only events about this instance.
+  //
+  // An event is about an instance when its `metadata_json` names it — as
+  // `instanceId` (suspend, resume, restore, fork, snapshot, volume, and
+  // provisional-start events) or `instance_id` (`node.pressure`), as one of `instances` (the
+  // forks an `instance.forked` or `instance.fork_failed` created), or as one
+  // of `suspending` (the instances an `instance.make_room` suspended) — or
+  // when it is about an allocation that fulfilled the instance, matched the
+  // way `allocation_id` matches (so `allocation.placed`, `allocation.failed`,
+  // `allocation.stopping`, and the rest). The allocation match covers
+  // allocations the manager still has a row for; events about an allocation
+  // whose row has since been pruned match only through their metadata.
+  //
+  // Combines with the other filters (AND). Matched exactly; an unknown id
+  // simply matches nothing.
+  optional string instance_id = 7;
+
+  // Optional allocation filter: only events about this allocation.
+  //
+  // Matches `SchedulerEvent.allocation_id`, and also the batched events that
+  // cover several allocations and so leave that field unset: they list them
+  // in metadata as `placements[].allocationId` (`allocation.placed`) or
+  // `allocations[].allocationId` (`allocation.stopping`,
+  // `allocation.preempted`), or `victims[].allocationId`
+  // (`allocation.preempt_planned`). A batched event lists at most its first
+  // 20 allocations, so a batch of more than 20 matches only for those 20. `allocation.removed` events name no allocation ids and never
+  // match.
+  optional int64 allocation_id = 8;
 }
 
 // Reply payload for ListEvents.
@@ -7436,6 +7541,17 @@ message StreamEventsRequest {
 
   // Optional severity filter. Values: `info`, `warn`, `error`.
   optional string level = 5;
+
+  // Optional stateful instance filter. Same semantics as
+  // `ListEventsRequest.instance_id`, with one difference for live events:
+  // the allocation match is resolved against the instance's allocations when
+  // each event arrives, so an allocation placed after the stream opened is
+  // still matched.
+  optional string instance_id = 6;
+
+  // Optional allocation filter. Same semantics as
+  // `ListEventsRequest.allocation_id`.
+  optional int64 allocation_id = 7;
 }
 
 // Internal eval queue item.

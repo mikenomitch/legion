@@ -734,6 +734,11 @@ pub struct ServiceEndpointRow {
     pub allocation_id: i64,
     pub node_id: String,
     pub address: Option<String>,
+    /// The node's `publicAddress`, when its worker declares one: where a
+    /// client outside the private network reaches `port`. Display only;
+    /// nothing in the cluster dials it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_address: Option<String>,
     pub port: Option<u16>,
     pub healthy: bool,
     pub health_status: String,

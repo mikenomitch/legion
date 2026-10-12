@@ -725,6 +725,16 @@ cardinality. Submitting the job places nothing until you create instances.
 Config updates and rollouts bring each keyed task to its live-instance count
 and replace every live instance's allocation with one on the new config.
 
+### Inspecting an instance in the UI
+
+Instance ids on the job page link to an instance page,
+`/jobs/<job>/instances/<id>`. It covers state, the current allocation and
+node, storage, lineage, last stop, usage, the instance's snapshots, the
+instance actions, and a timeline of every event about the instance and the
+allocations that ran it. `legion events list --instance <id>` gives the same
+timeline from the CLI. See
+[Inspecting an instance](suspend-and-resume.md#inspecting-an-instance).
+
 ## Scale-In / Scale-Out Retention
 
 - **Scale-in** (`count` 3 → 2): slot 2's instance is marked `terminated`, but

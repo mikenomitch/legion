@@ -5,7 +5,7 @@ import { memorySnapshotBlocker } from './jobspec'
 import type { Tone } from './status'
 
 /*
- * Instance lifecycle vocabulary for suspend, resume, and fork
+ * Instance lifecycle vocabulary for suspend, resume, fork, stop, and start
  * (docs/suspend-and-resume.md), and the rules for which actions a row
  * offers. The manager enforces every one of these. The functions here only
  * decide what the UI enables and what a disabled control's tooltip says.
@@ -200,6 +200,42 @@ export const resumeBlocker = (instance: InstanceInfo, jobName: string): string |
   const write = writeBlocker(jobName)
   return write ? `Resuming ${write.toLowerCase()}` : undefined
 }
+
+// States StopInstance moves to `stopped`. A suspended instance can be
+// stopped too, which discards its checkpoint (StopInstance in the proto).
+const STOPPABLE = new Set(['pending', 'active', 'rescheduling', 'suspended'])
+
+/**
+ * Why Stop is unavailable, or undefined. Stop keeps the row, the id, and the
+ * storage handle, so Start brings the same instance back; slot instances
+ * follow `count.num` instead, and a destroyed one is a tombstone.
+ */
+export const stopBlocker = (instance: InstanceInfo, jobName: string): string | undefined => {
+  if (!keyed(instance)) return 'Slot instances follow count.num: scale the task or stop the job instead'
+  if (instance.state === 'terminated') return 'Destroyed instances are tombstones and cannot be stopped'
+  if (instance.state === 'stopped') return 'Already stopped'
+  if (!STOPPABLE.has(instance.state)) return `The instance is ${instance.state}`
+  const write = writeBlocker(jobName)
+  return write ? `Stopping ${write.toLowerCase()}` : undefined
+}
+
+/** Why Start is unavailable for a stopped instance, or undefined. A suspended one resumes instead. */
+export const startBlocker = (instance: InstanceInfo, jobName: string): string | undefined => {
+  if (!keyed(instance)) return 'Slot instances follow count.num'
+  if (instance.state !== 'stopped') return `Only a stopped instance can be started; this one is ${instance.state}`
+  const write = writeBlocker(jobName)
+  return write ? `Starting ${write.toLowerCase()}` : undefined
+}
+
+/** The instance's own page. */
+export const instanceHref = (jobId: string, instanceId: string): string =>
+  `/jobs/${encodeURIComponent(jobId)}/instances/${encodeURIComponent(instanceId)}`
+
+/**
+ * The volume id inside a storage handle. A handle is `{plugin}/{volume_id}`;
+ * plugin names never contain a slash, so the split is unambiguous.
+ */
+export const volumeIdFromHandle = (handle: string): string => handle.slice(handle.indexOf('/') + 1)
 
 /**
  * Memory snapshot eligibility for the Take snapshot form: the manager's

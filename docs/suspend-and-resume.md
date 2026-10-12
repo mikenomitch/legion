@@ -937,6 +937,29 @@ $ legion instance get user-17 -j | jq .data.last_stop
   "hint": "raise resources.memory toward real usage", "at": "2026-10-10T06:12:44Z", "allocation_id": 1063, "node_id": "w-03" }
 ```
 
+For the full history, `legion events list --instance <id>` returns every
+event about the instance: its suspends, resumes, restores, forks, and
+snapshots, plus placements and failures of the allocations that ran it (see
+[Event Stream](event-stream.md#events-about-one-instance-or-one-allocation)).
+
+In the UI, every instance id on the job page's Instances table opens the
+instance page (`/jobs/<job>/instances/<id>`). It shows:
+
+- the state, mode, slot, current allocation and node, storage volume, and
+  fork lineage (forked from, and the forks of this instance);
+- the last stop with its cause and hint, and a warning when the last resume
+  booted cold;
+- memory, CPU, and idle against the reservation, with the idle countdown;
+- the checkpoint and what the instance can checkpoint right now;
+- the same Suspend, Resume, Resume cold, and Fork controls as the job page,
+  plus Stop and Start (Destroy stays CLI-only);
+- its snapshots with Restore;
+- a live event timeline from the instance filter, grouped by day, with kind
+  filter chips.
+
+The timeline needs `operator:read`. Without it the page says so and shows
+everything else.
+
 `legion snapshot get <id> -j` adds `holders` for a memory snapshot: every
 node that advertises its parts to the manager's location index, with how
 many of the parts it holds. That is where a published resume, restore, or

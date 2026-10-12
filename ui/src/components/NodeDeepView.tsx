@@ -7,6 +7,7 @@ import { NodeContentCard } from './NodeContentCard'
 import { snapshotBudgets } from '../utils/usage'
 import { NodeUsageCard } from './NodeUsagePanel'
 import { PressureHistoryCard } from './PressureHistory'
+import { AllocationLink } from './AllocationLink'
 import { AllocationPorts } from './ServiceEndpoints'
 import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
 import { parseAllocNetwork } from '../utils/allocations'
@@ -16,6 +17,7 @@ import { parseArtifactStates } from '../utils/jobspec'
 import { managerClient } from '../grpcClient'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
 import { fetchNodeUsage } from '../utils/usage'
+import { nodePublicAddress } from '../utils/services'
 import type { Tone } from '../utils/status'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../utils/volumes'
 
@@ -720,12 +722,12 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                           <thead class={theadClass}>
                             <tr>
                               <th class={thClass}>ID</th>
+                              <th class={thClass}>Job</th>
+                              <th class={thClass}>Task</th>
                               <th class={thClass}>Instance</th>
                               <th class={thClass}>Status</th>
                               <th class={thClass}>Ports</th>
-                              <th class={thClass}>Job</th>
                               <th class={thClass}>Spec</th>
-                              <th class={thClass}>Task config</th>
                             </tr>
                           </thead>
                           <tbody class="divide-y divide-line">
@@ -735,10 +737,39 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                 const unstagedCount = artifactRows.filter((row) => row.state !== 'staged').length
                                 return (
                                   <tr class={trHoverClass}>
-                                    <td class={tdClass + ' font-mono text-xs'}>#{String(allocation.id)}</td>
+                                    <td class={tdClass}>
+                                      <AllocationLink id={allocation.id} job={allocation.jobId || undefined} />
+                                    </td>
+                                    <td class={tdClass}>
+                                      <A class="font-medium hover:text-brass-strong" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}`}>{allocation.jobId || '—'}</A>
+                                    </td>
+                                    <td class={tdClass}>
+                                      <Show
+                                        when={allocation.taskName && allocation.jobId}
+                                        fallback={<span class="font-mono text-xs text-muted">{allocation.taskConfigId ? `config ${String(allocation.taskConfigId)}` : '—'}</span>}
+                                      >
+                                        <A
+                                          class="text-muted hover:text-brass-strong"
+                                          href={`/jobs/${encodeURIComponent(allocation.jobId)}/tasks/${encodeURIComponent(allocation.taskName)}`}
+                                          title={`Task config ${String(allocation.taskConfigId)}`}
+                                        >
+                                          {allocation.taskName}
+                                        </A>
+                                      </Show>
+                                    </td>
                                     <td class={tdClass}>
                                       <Show when={allocation.instanceId} fallback={<span class="text-faint">—</span>}>
-                                        <MonoBadge title={`Stateful instance ${allocation.instanceId}`}>{allocation.instanceId}</MonoBadge>
+                                        <Show
+                                          when={allocation.jobId}
+                                          fallback={<MonoBadge title={`Stateful instance ${allocation.instanceId}`}>{allocation.instanceId}</MonoBadge>}
+                                        >
+                                          <A
+                                            href={`/jobs/${encodeURIComponent(allocation.jobId)}/instances/${encodeURIComponent(allocation.instanceId!)}`}
+                                            title={`Stateful instance ${allocation.instanceId}`}
+                                          >
+                                            <MonoBadge class="hover:border-brass/50">{allocation.instanceId}</MonoBadge>
+                                          </A>
+                                        </Show>
                                       </Show>
                                     </td>
                                     <td class={tdClass}>
@@ -752,17 +783,13 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                       </span>
                                     </td>
                                     <td class={tdClass}>
-                                      <AllocationPorts network={parseAllocNetwork(allocation.network)} />
-                                    </td>
-                                    <td class={tdClass}>
-                                      <A class="font-medium hover:text-brass-strong" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}`}>{allocation.jobId || '—'}</A>
+                                      <AllocationPorts network={parseAllocNetwork(allocation.network)} publicAddress={nodePublicAddress(node()?.configAttrs)} />
                                     </td>
                                     <td class={tdClass}>
                                       <A class="font-mono text-xs text-muted hover:text-brass-strong" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}/specs/${encodeURIComponent(allocation.jobConfigId || '')}`}>
                                         {allocation.jobConfigId || '—'}
                                       </A>
                                     </td>
-                                    <td class={tdClass + ' font-mono text-xs text-muted'}>{allocation.taskConfigId ? String(allocation.taskConfigId) : '—'}</td>
                                   </tr>
                                 )
                               }}

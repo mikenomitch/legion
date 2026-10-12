@@ -36,6 +36,42 @@ export const endpointUrl = (endpoint: {
   return `${protocol}://${hostPort}`
 }
 
+// RFC 1918, carrier-grade NAT, loopback, link-local, and IPv6 ULA/loopback.
+// A browser outside the cluster's network usually cannot open these, so the
+// UI says so instead of offering what looks like a working link.
+export const isPrivateHost = (host: string): boolean => {
+  const value = host.trim().toLowerCase().replace(/^\[|\]$/g, '')
+  if (value === 'localhost' || value === '::1' || value.startsWith('fc') || value.startsWith('fd') || value.startsWith('fe80:')) return true
+  const octets = value.split('.').map((part) => Number(part))
+  if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return false
+  const [a, b] = octets
+  return (
+    a === 10 ||
+    a === 127 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254) ||
+    (a === 100 && b >= 64 && b <= 127)
+  )
+}
+
+// A node's public address, from the `publicAddress` config attribute its
+// worker registers (LEGION_WORKER_PUBLIC_ADDRESS). `configAttrs` is the
+// node's JSON-encoded attribute map.
+export const nodePublicAddress = (configAttrs: string | undefined): string | undefined => {
+  if (!configAttrs) return undefined
+  try {
+    const parsed = JSON.parse(configAttrs) as Record<string, unknown>
+    const value = parsed.publicAddress
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export const PUBLIC_ADDRESS_HINT =
+  "This is the node's private address, which a browser outside the cluster's network usually can't reach. Start the worker with LEGION_WORKER_PUBLIC_ADDRESS set to its public host or IP (and open the port) to get a working link here."
+
 export type DiagnosisLevel = 'ok' | 'fail' | 'warn'
 
 export type DiagnosisStep = {
