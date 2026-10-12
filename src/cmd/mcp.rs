@@ -920,6 +920,7 @@ fn tool_defs() -> Vec<ToolDef> {
                 "properties": {
                     "instance_id": { "type": "string", "description": "Instance id to start." },
                     "cold": { "type": "boolean", "description": "Suspended instances only: discard the checkpoint and boot fresh. Default false." },
+                    "force_move": { "type": "boolean", "description": "Sessions with suspend.durability = \"store\" only: move the session to another node even when its old node did not answer the probe. Use only once that node is known to be down. Default false." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["instance_id"],
@@ -1784,11 +1785,16 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 .get("cold")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
+            let force_move = args
+                .get("force_move")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
             let mut client = connect().await?;
             grpc(client.start_instance(StartInstanceRequest {
                 instance_id,
                 idempotency_key,
                 cold,
+                force_move,
             }))
             .await
         }

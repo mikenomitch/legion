@@ -200,14 +200,49 @@ pub fn start_edge_session(
         .into());
     };
     let issued_at = crate::util::now_unix_ms();
-    // The session's own identity, for the workload's environment
-    // (`LEGION_INSTANCE_ID`, `LEGION_INSTANCE_MODE=session`), as the
-    // manager's router builds it.
+    let (payload, provisional) = session_payload(
+        &spec,
+        job_id,
+        &session_id,
+        node_id,
+        "edge",
+        &ticket.jti,
+        issued_at,
+    )?;
+    // An idempotent `store` start creates the session's manifest before its
+    // gate opens, so two nodes that derived the same id cannot both run it
+    // (session durability plan §6.7, row 3).
+    crate::worker::task_manager::session_store::claim_new_store_session(task_manager, &payload)?;
+    admit_and_launch(task_manager, &payload, &provisional, Some(slot))?;
+    crate::manager::telemetry::worker_metrics()
+        .edge_session_starts_total
+        .inc();
+    Ok(EdgeSession {
+        session_id,
+        claim_id: crate::structs::session::session_claim_id(&provisional.instance_id),
+        deduplicated: false,
+    })
+}
+
+/// The launch payload and provisional block of a session of `spec` on this
+/// node, as a manager's router or an edge start builds it: the session's own
+/// identity in the workload's environment (`LEGION_INSTANCE_ID`,
+/// `LEGION_INSTANCE_MODE=session`), the serve gate, and the lease it was
+/// first issued at (kept across a resume on another node).
+pub fn session_payload(
+    spec: &crate::worker::task_manager::SessionSpec,
+    job_id: &str,
+    session_id: &str,
+    node_id: &str,
+    origin: &str,
+    ticket_jti: &str,
+    issued_at: i64,
+) -> R<(TaskAllocation, ProvisionalAllocation)> {
     let identity = crate::structs::Instance {
-        instance_id: session_id.clone(),
+        instance_id: session_id.to_string(),
         job_id: job_id.to_string(),
         group: spec.task.group.clone(),
-        task_name: task_name.to_string(),
+        task_name: spec.task.name.clone(),
         mode: crate::structs::InstanceMode::Session,
         state: crate::structs::InstanceState::Pending,
         slot_index: None,
@@ -228,18 +263,17 @@ pub fn start_edge_session(
         job_config_id: spec.job_config_id.clone(),
         task_config_id: spec.task_config_id,
         job_id: job_id.to_string(),
-        instance_id: Some(session_id.clone()),
+        instance_id: Some(session_id.to_string()),
         network: None,
     };
-    let claim_id = crate::structs::session::session_claim_id(&session_id);
     let provisional = ProvisionalAllocation {
-        claim_id: claim_id.clone(),
+        claim_id: crate::structs::session::session_claim_id(session_id),
         gate: Gate::Serve.to_wire(),
         lease_deadline_unix: 0,
-        instance_id: session_id.clone(),
-        origin: "edge".into(),
+        instance_id: session_id.to_string(),
+        origin: origin.to_string(),
         on_refused: OnRefused::Stop.as_str().into(),
-        ticket_jti: ticket.jti.clone(),
+        ticket_jti: ticket_jti.to_string(),
         session: Some(crate::structs::SessionStart {
             lease_issued_at_unix_ms: issued_at,
         }),
@@ -251,15 +285,7 @@ pub fn start_edge_session(
         &[],
         Some(provisional.clone()),
     )?;
-    admit_and_launch(task_manager, &payload, &provisional, Some(slot))?;
-    crate::manager::telemetry::worker_metrics()
-        .edge_session_starts_total
-        .inc();
-    Ok(EdgeSession {
-        session_id,
-        claim_id,
-        deduplicated: false,
-    })
+    Ok((payload, provisional))
 }
 
 /// Wait until a session's launch settles: `Ok(true)` once it runs,
@@ -448,6 +474,7 @@ mod worker_edge_test {
             promoted_from_session: String::new(),
             session_task_spec: String::new(),
             session_task_config_id: 0,
+            session_seal_keys: Vec::new(),
             task_lifecycle: String::new(),
             task_restart: String::new(),
         }

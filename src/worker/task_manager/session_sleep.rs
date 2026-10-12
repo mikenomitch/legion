@@ -56,6 +56,23 @@ pub enum SessionSleepError {
     NotSuspendable(String),
     /// Another capture or resume of the session is in progress.
     Busy,
+    /// A `store` session's manifest names a newer generation (or another
+    /// node won the claim): this node's copy ended. The message ends in
+    /// `[winner node=<id> generation=<g>]`.
+    Superseded(String),
+    /// An idempotent `store` start found the session already created by
+    /// another node; the message names it.
+    AlreadyExists(String),
+    /// The content store holding `store` session manifests could not be
+    /// reached, so no generation could be claimed.
+    StoreUnavailable(String),
+    /// A move found the manifest naming another node as running the
+    /// session; the caller probes that node, or retries with `force_move`.
+    RunningElsewhere {
+        node: String,
+        address: String,
+        generation: u64,
+    },
 }
 
 impl std::fmt::Display for SessionSleepError {
@@ -70,6 +87,20 @@ impl std::fmt::Display for SessionSleepError {
                 f,
                 "another suspend, checkpoint, or resume of this session is in progress; retry \
                  shortly"
+            ),
+            SessionSleepError::Superseded(why)
+            | SessionSleepError::AlreadyExists(why)
+            | SessionSleepError::StoreUnavailable(why) => write!(f, "{why}"),
+            SessionSleepError::RunningElsewhere {
+                node,
+                address,
+                generation,
+            } => write!(
+                f,
+                "running_elsewhere: the session's manifest says generation {generation} runs on \
+                 node {node} ({address}); stop it there first, or move it anyway with \
+                 force_move once that node is known to be down [winner node={node} \
+                 generation={generation}]"
             ),
         }
     }
@@ -203,13 +234,12 @@ impl WorkerTaskManager {
             .map(|claim| claim.instance_id.clone())
     }
 
-    /// Check that a running session may be captured, and mark the capture
-    /// in progress. `for_suspend` also needs the task to sleep locally; a
-    /// live checkpoint needs only a `suspend` block.
+    /// Check that a running session may be captured (for a suspend or a
+    /// live checkpoint), and mark the capture in progress. It needs a
+    /// `suspend` block, and a `store` one needs a content store.
     pub fn begin_session_capture(
         &mut self,
         session_id: &str,
-        for_suspend: bool,
     ) -> Result<CapturePlan, SessionSleepError> {
         if self.session_captures.contains(session_id)
             || self.resuming_sessions.contains_key(session_id)
@@ -241,15 +271,10 @@ impl WorkerTaskManager {
                 claim.task_name
             )));
         };
-        if for_suspend && suspend.durability == SnapshotDurability::Store {
-            // Phase 5b seam: a `store` session publishes its checkpoint and
-            // claims a generation with a conditional manifest write here.
-            return Err(SessionSleepError::NotSuspendable(format!(
-                "task {} sets suspend.durability = \"store\", which unpromoted sessions do not \
-                 support yet. Use durability = \"local\" (the checkpoint stays on this node), \
-                 or promote the session first: `legion instance promote {session_id}`",
-                claim.task_name
-            )));
+        if suspend.durability == SnapshotDurability::Store {
+            // A `store` session publishes what it captures; without a
+            // content store it cannot (session_store.rs).
+            self.require_manifests()?;
         }
         let kind = self
             .local_suspend_kind(claim.local_key)
@@ -399,6 +424,7 @@ impl WorkerTaskManager {
         self.session_payloads.remove(session_id);
         self.session_checkpoint_due.remove(session_id);
         self.session_captures.remove(session_id);
+        self.session_live_published.remove(session_id);
         if let Some(checkpoint) = self.session_checkpoints.remove(session_id) {
             self.release_session_checkpoint(&checkpoint);
         }
@@ -415,6 +441,16 @@ impl WorkerTaskManager {
             self.release_session_checkpoint(checkpoint);
         }
         self.unlog_session(session_id);
+        if row.store
+            && self.session_manifests.is_some()
+            && !super::session_store::reason_keeps_manifest(reason)
+        {
+            self.pending_manifest_deletes.push((
+                row.job_id.clone(),
+                session_id.to_string(),
+                row.generation,
+            ));
+        }
         info!(
             session_id,
             state = row.state.as_str(),
@@ -440,14 +476,26 @@ impl WorkerTaskManager {
         if let Some(checkpoint) = row.checkpoint.as_ref() {
             self.release_session_checkpoint(checkpoint);
         }
+        crate::manager::telemetry::worker_metrics()
+            .session_evictions_total
+            .inc(&[eviction_label(reason)]);
+        if row.store && !row.published_url.is_empty() {
+            // A published `store` session lives on in the content store:
+            // drop the local copy quietly, so a resume (here or on any node)
+            // finds the manifest instead of an `evicted` answer.
+            self.unlog_session(session_id);
+            info!(
+                session_id,
+                reason,
+                "Dropped a published session's local copy; it resumes from the content store"
+            );
+            return true;
+        }
         let row = row.into_evicted(reason, crate::util::now_unix_ms());
         warn!(
             session_id,
             reason, "Evicted a suspended session's local checkpoint"
         );
-        crate::manager::telemetry::worker_metrics()
-            .session_evictions_total
-            .inc(&[eviction_label(reason)]);
         if let Some(log) = self.session_log() {
             log.put(row.clone());
         }
@@ -545,10 +593,16 @@ impl WorkerTaskManager {
     /// envelope again under the same id, and build the payload that
     /// restores it (or boots it fresh, `cold`). A full envelope is a
     /// [`SessionRefusal`] and leaves the session suspended.
+    ///
+    /// `claimed` is the generation a `store` session's resume claimed in its
+    /// manifest ([`super::session_store::claim_held_for_resume`]); the row
+    /// carries it from here on, so a failed launch leaves a row the bucket
+    /// still names this node for.
     pub fn begin_session_resume(
         &mut self,
         session_id: &str,
         cold: bool,
+        claimed: Option<u64>,
     ) -> R<Option<(ClaimRecord, TaskAllocation, bool)>> {
         if self.running_session(session_id).is_some() {
             return Ok(None);
@@ -558,7 +612,7 @@ impl WorkerTaskManager {
         {
             return Err(SessionSleepError::Busy.into());
         }
-        let Some(row) = self
+        let Some(mut row) = self
             .idle_sessions
             .get(session_id)
             .filter(|row| row.state == SessionLogState::Suspended)
@@ -566,6 +620,9 @@ impl WorkerTaskManager {
         else {
             return Err(self.idle_answer(session_id).into());
         };
+        if let Some(generation) = claimed {
+            row.generation = generation;
+        }
         let (Some(payload), Some(checkpoint)) = (row.payload.clone(), row.checkpoint.clone())
         else {
             return Err(SessionSleepError::NotSuspendable(format!(
@@ -584,8 +641,9 @@ impl WorkerTaskManager {
         };
         let mut record =
             crate::worker::edge::record_from_payload(&payload, &provisional, resources);
-        // The same session: its original lease and generation (a local
-        // session never moves, so its generation stays 1).
+        // The same session: its original lease, and its generation (a
+        // `local` session never moves, so its generation stays 1; a `store`
+        // session's resume claimed the next one).
         record.session = Some(crate::worker::claims::SessionClaim {
             lease_issued_at_unix_ms: row.lease_issued_at_unix_ms,
             generation: row.generation,
@@ -598,11 +656,22 @@ impl WorkerTaskManager {
             let on_resume = launch_suspend(&launch)
                 .map(|suspend| suspend.on_resume)
                 .unwrap_or_default();
+            // A published checkpoint's local parts are an evictable cache
+            // entry: the part keys let the restore fetch any that are gone.
+            let (part_keys, part_key_error) = if row.store {
+                crate::structs::checkpoint::SnapshotManifest::from_json(&checkpoint.manifest_json)
+                    .map(|manifest| self.session_seal_keys(&row.job_id).part_keys_for(&manifest))
+                    .unwrap_or_default()
+            } else {
+                Default::default()
+            };
             launch.restore = Some(crate::structs::SnapshotRestore {
                 snapshot_id: checkpoint.snapshot_id.clone(),
                 kind: checkpoint.kind.clone(),
                 manifest_json: checkpoint.manifest_json.clone(),
                 on_resume,
+                part_keys,
+                part_key_error,
                 ..Default::default()
             });
         }
@@ -651,9 +720,7 @@ impl WorkerTaskManager {
             let Some(suspend) = self.session_suspend_config(claim.local_key) else {
                 continue;
             };
-            let (Some(every), SnapshotDurability::Local) =
-                (suspend.checkpoint_every, suspend.durability)
-            else {
+            let Some(every) = suspend.checkpoint_every else {
                 continue;
             };
             let started = claim
@@ -700,10 +767,7 @@ impl WorkerTaskManager {
             .filter(|claim| matches!(claim.stage, ClaimStage::Serving | ClaimStage::Booted))
             .filter(|claim| {
                 self.session_suspend_config(claim.local_key)
-                    .is_some_and(|suspend| {
-                        suspend.on_worker_stop == OnWorkerStop::Checkpoint
-                            && suspend.durability == SnapshotDurability::Local
-                    })
+                    .is_some_and(|suspend| suspend.on_worker_stop == OnWorkerStop::Checkpoint)
             })
             .map(|claim| {
                 let last = self
@@ -739,7 +803,7 @@ impl WorkerTaskManager {
             let Some(suspend) = self.session_suspend_config(local_key) else {
                 continue;
             };
-            if suspend.idle.is_none() || suspend.durability != SnapshotDurability::Local {
+            if suspend.idle.is_none() {
                 continue;
             }
             let sandbox = if task.runtime == "sandbox" {
@@ -817,20 +881,48 @@ fn checkpoint_from(manifest: &crate::structs::checkpoint::SnapshotManifest) -> S
     }
 }
 
+/// How a suspend ends for a `store` session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendMode {
+    /// Publish the checkpoint and write the manifest `suspended` (a `local`
+    /// session just stays on the node).
+    Publish,
+    /// Self-fencing: keep the checkpoint on this node, marked fenced, and
+    /// write nothing (the content store is unreachable anyway). On
+    /// reconnect the node resumes only what the bucket still names it for.
+    Fence,
+}
+
 /// Suspend a running session on this node: capture its checkpoint, stop
 /// it, free its envelope share, and record it `suspended`. A failed capture
 /// leaves it running. `trigger` (`idle`, `manual`) is for the log.
+///
+/// A `store` session then publishes its checkpoint and writes its manifest
+/// ([`super::session_store::publish_suspended`]). A manifest naming a newer
+/// generation ends the row and fails the suspend (superseded); an
+/// unreachable content store keeps the row unpublished, and the session
+/// maintenance loop retries the publish.
 pub fn suspend_session(
     manager: &Arc<Mutex<WorkerTaskManager>>,
     session_id: &str,
     trigger: &str,
+) -> R<SuspendOutcome> {
+    suspend_session_with(manager, session_id, trigger, SuspendMode::Publish)
+}
+
+/// [`suspend_session`] with an explicit [`SuspendMode`].
+pub fn suspend_session_with(
+    manager: &Arc<Mutex<WorkerTaskManager>>,
+    session_id: &str,
+    trigger: &str,
+    mode: SuspendMode,
 ) -> R<SuspendOutcome> {
     let plan = {
         let mut guard = manager.lock().expect("task manager");
         if let Some(checkpoint) = guard.suspended_checkpoint(session_id) {
             return Ok(SuspendOutcome::AlreadySuspended(checkpoint));
         }
-        guard.begin_session_capture(session_id, true)?
+        guard.begin_session_capture(session_id)?
     };
     let request = CheckpointRequest {
         snapshot_id: crate::structs::snapshot::new_snapshot_id(),
@@ -860,9 +952,35 @@ pub fn suspend_session(
                 kind = plan.kind.as_str(),
                 "Suspended session"
             );
-            Ok(SuspendOutcome::Suspended(
-                recorded.context("suspend finished without a checkpoint")?,
-            ))
+            let checkpoint = recorded.context("suspend finished without a checkpoint")?;
+            let store = manager
+                .lock()
+                .expect("task manager")
+                .idle_row(session_id)
+                .is_some_and(|row| row.store);
+            if !store {
+                return Ok(SuspendOutcome::Suspended(checkpoint));
+            }
+            if mode == SuspendMode::Fence {
+                manager
+                    .lock()
+                    .expect("task manager")
+                    .mark_fenced(session_id);
+                return Ok(SuspendOutcome::Suspended(checkpoint));
+            }
+            match super::session_store::publish_suspended(manager, session_id) {
+                Ok(_) => {}
+                Err(err @ SessionSleepError::Superseded(_)) => return Err(err.into()),
+                Err(err) => {
+                    warn!(session_id, error = %err, "Suspended session not published yet; the publish is retried");
+                }
+            }
+            let checkpoint = manager
+                .lock()
+                .expect("task manager")
+                .suspended_checkpoint(session_id)
+                .unwrap_or(checkpoint);
+            Ok(SuspendOutcome::Suspended(checkpoint))
         }
         Err(err) => {
             manager
@@ -884,7 +1002,7 @@ pub fn checkpoint_session(
     let plan = manager
         .lock()
         .expect("task manager")
-        .begin_session_capture(session_id, false)?;
+        .begin_session_capture(session_id)?;
     let request = CheckpointRequest {
         snapshot_id: crate::structs::snapshot::new_snapshot_id(),
         op: "capture".into(),
@@ -905,6 +1023,20 @@ pub fn checkpoint_session(
     if !guard.record_session_checkpoint(&plan, checkpoint.clone()) {
         bail!("session {session_id} ended while it was checkpointed");
     }
+    let store = guard.session_is_store(plan.local_key);
+    drop(guard);
+    if store {
+        // A `store` session's live checkpoint is published and its
+        // manifest written; that write is also its fence (a superseded copy
+        // ends there).
+        match super::session_store::publish_live(manager, session_id, &checkpoint) {
+            Ok(()) => {}
+            Err(err @ SessionSleepError::Superseded(_)) => return Err(err.into()),
+            Err(err) => {
+                warn!(session_id, error = %err, "Session checkpoint kept on this node only; publishing it failed");
+            }
+        }
+    }
     Ok(checkpoint)
 }
 
@@ -915,10 +1047,13 @@ pub fn resume_session(
     session_id: &str,
     cold: bool,
 ) -> R<ResumeOutcome> {
+    // A `store` session claims its next generation before its gate opens
+    // (session durability plan §6.7); a lost claim ends the stale row.
+    let claimed = super::session_store::claim_held_for_resume(manager, session_id)?;
     let Some((claim, payload, restoring)) = manager
         .lock()
         .expect("task manager")
-        .begin_session_resume(session_id, cold)?
+        .begin_session_resume(session_id, cold, claimed)?
     else {
         return Ok(ResumeOutcome::AlreadyRunning);
     };
@@ -937,7 +1072,11 @@ pub fn resume_session(
     );
     match launched {
         Ok(()) if running => Ok(ResumeOutcome::Resumed {
-            from: if restoring { "local" } else { "cold" },
+            from: match (restoring, claimed.is_some()) {
+                (true, true) => "store",
+                (true, false) => "local",
+                (false, _) => "cold",
+            },
         }),
         Ok(()) => bail!("session {session_id} was stopped while it resumed"),
         Err(err) => Err(err.context(format!(

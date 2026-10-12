@@ -150,6 +150,7 @@ async fn serve_worker(dir: &tempfile::TempDir) -> R<Cluster> {
         edge_boot: None,
         direct_exec: None,
         launch_pool: Default::default(),
+        node_identity: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = format!("https://127.0.0.1:{}", listener.local_addr()?.port());
@@ -250,6 +251,7 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
             .resume_session(legion::structs::ResumeSessionRequest {
                 session_id: "workspace-not-running".into(),
                 cold: false,
+                ..Default::default()
             })
             .await
             .map(|_| ()),

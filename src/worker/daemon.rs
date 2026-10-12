@@ -391,6 +391,17 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 None,
             )
         });
+    let sessions_config = parse_sessions_payload(&config.artifacts);
+    let session_manifests = build_session_manifests(
+        content_store_target.as_ref(),
+        Arc::new(ManagerCredentialSource::new(
+            managers.clone(),
+            name.clone(),
+            credentials.clone(),
+        )),
+        &name,
+        &advertised,
+    );
     let content_store = open_content_store(&content_dir, content_config);
     let content_publishing = build_content_publishing(
         content_store.clone(),
@@ -452,6 +463,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         // Before `configure_artifacts`, which hands the store to the stager.
         manager.configure_content_store(content_store.clone());
         manager.configure_content_publishing(content_publishing);
+        manager.configure_session_manifests(session_manifests);
         manager.configure_artifacts(
             artifact_fetch_config,
             Box::new(ManagerCredentialSource::new(
@@ -571,6 +583,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         edge_boot: edge_boot.clone(),
         direct_exec: direct_exec.clone(),
         launch_pool: launch_pool.clone(),
+        node_identity: Some(node_identity.clone()),
     };
     let worker_router = Server::builder().add_service(WorkerServer::new(worker_node));
 
@@ -771,6 +784,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             edge_boot: edge_boot.clone(),
             direct_exec: direct_exec.clone(),
             launch_pool: launch_pool.clone(),
+            node_identity: Some(node_identity.clone()),
         });
         tokio::spawn(crate::worker::work_stream::run_work_stream(
             client.clone(),
@@ -795,7 +809,8 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         edge_boot.as_ref().map(|runtime| runtime.spec_cache.clone()),
         Some(managers.clone()),
     );
-    let self_fence_fut = start_self_fence_watchdog(task_manager.clone(), last_successful_heartbeat);
+    let self_fence_fut =
+        start_self_fence_watchdog(task_manager.clone(), last_successful_heartbeat.clone());
     let checks_fut = start_node_checks(
         name.clone(),
         config.additional_node_checks.clone(),
@@ -809,7 +824,14 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let supervisor_fut = start_task_supervisor(task_manager.clone());
     // Idle sessions: expiry, eviction, periodic checkpoints, and the
     // restores a restart left (docs/session-mode.md#idle-sessions).
-    let session_fut = start_session_maintenance(task_manager.clone(), launch_pool.clone());
+    let session_fut = start_session_maintenance(
+        task_manager.clone(),
+        launch_pool.clone(),
+        last_successful_heartbeat,
+        sessions_config
+            .fence_list_every()
+            .unwrap_or(crate::structs::DEFAULT_FENCE_LIST_EVERY),
+    );
     let stop_checkpoint_timeout =
         humantime::parse_duration(&edge_boot_config.stop_checkpoint_timeout)
             .unwrap_or(Duration::from_secs(60));
@@ -842,12 +864,20 @@ const SESSION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 /// found dead with an `onWorkerStop` checkpoint, then every
 /// [`SESSION_MAINTENANCE_INTERVAL`] sweeps expired and orphaned checkpoints
 /// (and evicts the oldest under `content.minFreeDisk` pressure), and runs a
-/// `suspend.checkpointEvery` round.
+/// `suspend.checkpointEvery` round. For `store` sessions it also
+/// (docs/session-mode.md, "No split brain"): self-fences when neither a
+/// manager nor the content store answered for `stateful.fenceAfter`, and
+/// unfences once the store answers again; retries publishes that did not
+/// land; deletes the manifests of sessions that ended; and every
+/// `fence_list_every` lists this node's fence markers.
 async fn start_session_maintenance(
     task_manager: Arc<Mutex<WorkerTaskManager>>,
     launch_pool: Arc<crate::worker::launch_pool::LaunchPool>,
+    last_successful_heartbeat: Arc<Mutex<std::time::Instant>>,
+    fence_list_every: Duration,
 ) -> R<()> {
     use crate::worker::task_manager::session_sleep;
+    use crate::worker::task_manager::session_store;
     let restores = task_manager
         .lock()
         .expect("task manager")
@@ -878,8 +908,50 @@ async fn start_session_maintenance(
         }
     }
     let mut per_capture = Duration::from_secs(5);
+    let mut last_fence_list = std::time::Instant::now();
     loop {
         tokio::time::sleep(SESSION_MAINTENANCE_INTERVAL).await;
+        let manifests = task_manager
+            .lock()
+            .expect("task manager")
+            .session_manifests();
+        if let Some(manifests) = manifests {
+            let since_manager = last_successful_heartbeat.lock().map(|at| at.elapsed()).ok();
+            let since_store = manifests.last_success().map(|at| at.elapsed());
+            let manager = task_manager.clone();
+            let list_fences = last_fence_list.elapsed() >= fence_list_every;
+            if list_fences {
+                last_fence_list = std::time::Instant::now();
+            }
+            let pool = launch_pool.clone();
+            let handle = tokio::runtime::Handle::current();
+            let upkeep = tokio::task::spawn_blocking(move || {
+                session_store::self_fence(&manager, since_manager, since_store);
+                if list_fences {
+                    match session_store::process_fence_list(&manager) {
+                        Ok(0) => {}
+                        Ok(ended) => info!(ended, "Ended session copies a move fenced"),
+                        Err(err) => {
+                            debug!(error = %err, "Fence list failed; retried next interval")
+                        }
+                    }
+                }
+                let fenced = !manager
+                    .lock()
+                    .expect("task manager")
+                    .fenced_sessions()
+                    .is_empty();
+                if fenced {
+                    session_store::unfence(&manager, || handle.block_on(pool.acquire()).ok());
+                }
+                session_store::retry_unpublished(&manager);
+                session_store::run_manifest_deletes(&manager);
+            })
+            .await;
+            if let Err(err) = upkeep {
+                warn!(error = %err, "Store session upkeep failed");
+            }
+        }
         let manager = task_manager.clone();
         let mut estimate = per_capture;
         let round = tokio::task::spawn_blocking(move || {
@@ -1381,6 +1453,39 @@ fn parse_artifacts_payload(
         content,
         payload.content_store,
     ))
+}
+
+/// The worker config's `sessions` block, from the artifacts payload it rides
+/// in (defaults when absent or unreadable).
+fn parse_sessions_payload(raw: &str) -> crate::structs::WorkerSessionsConfig {
+    if raw.trim().is_empty() {
+        return Default::default();
+    }
+    serde_json::from_str::<crate::structs::WorkerArtifactsPayload>(raw)
+        .ok()
+        .and_then(|payload| payload.sessions)
+        .unwrap_or_default()
+}
+
+/// The session manifests in the worker's `contentStore`, when one is
+/// configured: what `store` sessions claim generations in (docs/session-mode.md,
+/// "No split brain").
+fn build_session_manifests(
+    target: Option<&crate::content_publish::ContentStoreTarget>,
+    credentials: Arc<dyn crate::artifacts::CredentialSource>,
+    node_id: &str,
+    advertised: &str,
+) -> Option<Arc<crate::session_manifest::SessionManifests>> {
+    let target = target?;
+    match crate::session_manifest::backend_for(target, credentials) {
+        Ok(backend) => Some(Arc::new(crate::session_manifest::SessionManifests::new(
+            backend, node_id, advertised,
+        ))),
+        Err(err) => {
+            warn!(error = ?err, "Invalid contentStore config; store sessions cannot suspend here");
+            None
+        }
+    }
 }
 
 /// The publisher for the worker's `contentStore`, when one is configured.

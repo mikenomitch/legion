@@ -96,6 +96,25 @@ pub fn config() -> Command {
                     .long("no-wait")
                     .action(clap::ArgAction::SetTrue)
                     .help("Return once admitted (state `starting`) instead of once running"),
+            )
+            .arg(
+                Arg::new("resume-id")
+                    .long("resume-id")
+                    .value_name("SESSION")
+                    .help(
+                        "Resume this store-durability session on --node from its manifest \
+                         (it may have run or slept on another node)",
+                    ),
+            )
+            .arg(
+                Arg::new("force-move")
+                    .long("force-move")
+                    .action(clap::ArgAction::SetTrue)
+                    .requires("resume-id")
+                    .help(
+                        "With --resume-id: move the session even when the node its manifest \
+                         names did not answer (only once that node is known to be down)",
+                    ),
             ),
     );
     let get_cmd = edge_args(
@@ -326,6 +345,11 @@ async fn start(matches: &ArgMatches) -> R<()> {
                     .cloned()
                     .unwrap_or_default(),
                 wait: matches.get_flag("no-wait").then_some(false),
+                resume_id: matches
+                    .get_one::<String>("resume-id")
+                    .cloned()
+                    .unwrap_or_default(),
+                force_move: matches.get_flag("force-move"),
             })
             .await
             .map(tonic::Response::into_inner),
@@ -336,10 +360,23 @@ async fn start(matches: &ArgMatches) -> R<()> {
             "node": reply.node_id,
             "state": reply.state,
             "deduplicated": reply.deduplicated,
+            "resumedFrom": reply.resumed_from,
+            "generation": reply.generation,
+            "movedFrom": reply.moved_from,
         }));
     } else {
+        let moved = if reply.moved_from.is_empty() {
+            String::new()
+        } else {
+            format!(", moved from {}", reply.moved_from)
+        };
+        let resumed = if reply.resumed_from.is_empty() {
+            String::new()
+        } else {
+            format!(", resumed from {}", reply.resumed_from)
+        };
         println!(
-            "{} on {} ({}{})",
+            "{} on {} ({}{}{}{})",
             reply.session_id,
             reply.node_id,
             reply.state,
@@ -347,7 +384,9 @@ async fn start(matches: &ArgMatches) -> R<()> {
                 ", deduplicated"
             } else {
                 ""
-            }
+            },
+            resumed,
+            moved
         );
     }
     Ok(())
