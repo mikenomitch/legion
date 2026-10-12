@@ -58,6 +58,25 @@ pub fn spawn_health_monitor(
         return;
     }
 
+    // The monitor is a tokio task. Every caller is expected to run inside the
+    // worker's runtime (directly, or on a thread that entered it — see
+    // `task_manager::enter_runtime`). A caller that does not would make
+    // `tokio::spawn` panic and take its thread down silently, leaving the
+    // allocation at "health checks starting" forever; say so instead.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        error!(
+            allocation_id = allocation.id,
+            task_name = %task.name,
+            "Cannot start health checks: no async runtime on this thread"
+        );
+        manager.lock().expect("task manager").set_allocation_health(
+            allocation.id,
+            false,
+            "health checks could not start (worker bug: no async runtime); see the worker log",
+        );
+        return;
+    };
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     {
         let mut guard = manager.lock().expect("task manager");
@@ -70,7 +89,7 @@ pub fn spawn_health_monitor(
         guard.set_allocation_health(allocation.id, false, "health checks starting");
     }
 
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         run_health_monitor(manager, allocation, task, shutdown_rx).await;
     });
 }
@@ -158,10 +177,46 @@ async fn run_health_monitor(
         })
         .collect();
 
+    // Set while the task's process is down (exited, awaiting the
+    // supervisor's relaunch or terminal for good).
+    let mut process_was_down = false;
+
     loop {
         tokio::select! {
             result = result_rx.recv() => {
                 let Some(result) = result else { break; };
+                // A check against a process that has exited can only fail,
+                // and the exit is the supervisor's to act on: it restarts the
+                // task under its `restart` policy, or fails the allocation
+                // with the exit status and the task's last stderr lines. If
+                // these failures counted too, the allocation would fail as
+                // `tcp check failed: Connection refused` — the symptom, with
+                // the cause (a refused image pull, a missing input) hidden in
+                // the task's logs.
+                let process_down = manager
+                    .lock()
+                    .expect("task manager")
+                    .process_exit(allocation.id)
+                    .is_some();
+                if process_down {
+                    process_was_down = true;
+                    continue;
+                }
+                if process_was_down {
+                    // Relaunched by the supervisor: the same fresh start an
+                    // unhealthy restart gets (boot grace, boot checks again).
+                    process_was_down = false;
+                    for check_state in state.values_mut() {
+                        check_state.failures.clear();
+                    }
+                    for value in boot_status.values_mut() {
+                        *value = false;
+                    }
+                    if !boot_status.is_empty() {
+                        boot_ready.store(false, Ordering::SeqCst);
+                    }
+                    start_time = Instant::now();
+                }
                 let Some(check_state) = state.get_mut(&result.name) else {
                     continue;
                 };
@@ -312,10 +367,15 @@ async fn handle_unhealthy(
         }
     }
 
-    manager
-        .lock()
-        .expect("task manager")
-        .record_failure(allocation.id, format!("health check failed: {reason}"));
+    let mut guard = manager.lock().expect("task manager");
+    // What the task itself last said is often the real story behind a check
+    // that never passed (an image pull the registry refused, a missing
+    // config file), so it rides along in the reason the user reads.
+    let reason = match guard.recent_stderr(allocation.id) {
+        Some(stderr) => format!("health check failed: {reason}; last stderr: {stderr}"),
+        None => format!("health check failed: {reason}"),
+    };
+    guard.record_failure(allocation.id, reason);
     Ok(())
 }
 

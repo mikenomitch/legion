@@ -598,17 +598,6 @@ impl ForwarderContext {
         self.mesh_wanted.load(Ordering::Relaxed)
     }
 
-    /// Whether the worker should (re)issue its node certificate now.
-    pub fn mesh_needs_refresh(&self) -> bool {
-        if !self.mesh_wanted() {
-            return false;
-        }
-        match self.mesh.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            Some((identity, _)) => identity.needs_refresh(),
-            None => true,
-        }
-    }
-
     pub fn set_mesh_identity(&self, identity: MeshIdentity) -> R<()> {
         let client = identity.client_config()?;
         *self.mesh.write().unwrap_or_else(|p| p.into_inner()) = Some((Arc::new(identity), client));

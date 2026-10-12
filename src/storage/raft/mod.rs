@@ -137,6 +137,13 @@ pub(crate) trait RaftJoinHandler: Send + Sync + 'static {
         &self,
         request: FetchRootKeyRequest,
     ) -> Result<FetchRootKeyReply, tonic::Status>;
+
+    /// Answers `RaftTransport.TriggerElection`: campaign for every raft
+    /// group this manager runs, now (the target half of `transfer-leader`).
+    async fn trigger_election(
+        &self,
+        request: crate::structs::TriggerElectionRequest,
+    ) -> Result<crate::structs::TriggerElectionReply, tonic::Status>;
 }
 
 /// Everything the `RaftTransport` tonic service needs to route an inbound
@@ -161,6 +168,12 @@ pub(crate) struct RaftTransportRegistry {
     /// `Store::raft_set_advertised_schema_version` to stand in for an older
     /// build.
     pub(crate) schema_version: Arc<std::sync::atomic::AtomicU32>,
+    /// Per lane: set the first time an AppendEntries (a leader's
+    /// replication or heartbeat) reaches this manager. A restarted member
+    /// holds its own elections until this flips or its quiet window passes,
+    /// so it rejoins as a follower instead of deposing a healthy leader
+    /// with a higher term (see `driver::quiet_start`).
+    pub(crate) append_entries_seen: HashMap<Lane, Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RaftTransportRegistry {
@@ -170,6 +183,28 @@ impl RaftTransportRegistry {
         group_id: &str,
     ) -> Option<&openraft::Raft<types::TypeConfig>> {
         self.lanes.get(&Lane::from_wire_name(group_id)?)
+    }
+
+    /// The raft GROUP that carries `lane` on this manager: the lane itself
+    /// under `lanes` topology, and the one control group under `single`,
+    /// where every lane rides it. This is the space a `ForwardLaneWrite`
+    /// envelope's `group_id` lives in — senders address the group that
+    /// commits the op, not the op's logical lane — so a receiver must
+    /// compare in the same space.
+    pub(crate) fn group_for(&self, lane: Lane) -> Lane {
+        physical_group(self.lanes.len(), lane)
+    }
+}
+
+/// The raft group that commits `lane` when `active_groups` groups run:
+/// `single` topology has exactly one (control), which carries every lane.
+/// Shared by the forwarding sender and receiver so they can never disagree
+/// about which space a `group_id` is in.
+pub(crate) fn physical_group(active_groups: usize, lane: Lane) -> Lane {
+    if active_groups <= 1 {
+        Lane::Control
+    } else {
+        lane
     }
 }
 

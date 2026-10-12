@@ -835,6 +835,50 @@ comparison build. Public write-up in [docs/benchmarks.md](../../docs/benchmarks.
 `plan` phase averages 26 ms per eval at 20k and 45 ms at 50k, far above
 `plan_and_apply` here, and is the open item in TODO.md.
 
+## Sandbox scaling Phases 0–3 — 2026-10-12
+
+[sandbox-scaling-plan.md § 14](../../internal_docs/plans/sandbox-scaling-plan.md#14-results-phases-0-3)
+has the full tables and method. One 4-vCPU Intel Xeon (2.1 GHz, 15 GiB, no
+KVM), release builds, a single-voter raft manager on isolated ports, and
+`legion-loadgen --mode instances --simulate 50` driving keyed lifecycles
+(create → running → suspend → resume → destroy) at an open-loop rate.
+"Before" is `origin/main` at `da1c811` plus the Phase 0 tooling.
+
+Raft entries per lifecycle, idle cluster (`tests/raft_lifecycle_ops.rs`,
+both topologies):
+
+| Stage | Create | Place | Steady beat | Suspend | Resume | Fork ×2 | Destroy | Lifecycle |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Before | 2 | 4 | 1 | 4 | 8 | 12 | 4 | 22 |
+| After | 1 | 1 | 0 | 2 | 3 | 4 | 1 | **8** |
+
+Lifecycle ladder, sessions completed per second and create → running
+p50 / p99:
+
+| Offered/s | Before | After |
+| --- | --- | --- |
+| 10 | 7.8/s, 14.1 / 220 ms | 7.8/s, 12.4 / 67.6 ms |
+| 20 | 15.4/s, 38.7 / 459 ms | 15.5/s, 13.3 / 117 ms |
+| 50 | 25.0/s, 1,020 / 6,897 ms | 37.6/s, 72.1 / 454 ms |
+| 100 | 24.7/s, 6,907 / 15,185 ms | 51.8/s, 899 / 5,606 ms |
+| 200 | 20.0/s, 1,401 timeouts | 48.5/s, 7,421 / 16,806 ms |
+
+The ceiling doubled (~25 → ~50 lifecycles/s), short of the plan's 5×. The
+bound is now the scheduler lane's serial per-entry cost (~6 ms each:
+changeset capture 3.2 ms, propose → apply 2.7 ms), with the manager at 1.1
+of 4 cores and `lanes` measuring the same as `single` (52.0 vs 51.8/s).
+
+Heartbeat, steady beat at 10,000 allocations per node: before, 179,762 B
+up and 4,408,772 B down, 344 ms of server time; after (streaming),
+pending.
+
+Scheduler micro-benchmarks (`benchmarks/micro/scheduler_bench.rs`, Criterion
+medians; before is `origin/main` at `0560f75`, the merge base; two rounds in
+opposite order, `LEGION_BENCH_SCALING_NODES=1000,5000
+LEGION_BENCH_SKIP_CONCURRENT=1`):
+
+pending
+
 ## Exec sessions: proxied vs direct (sandbox-exec Phase 0) — 2026-10-12
 
 `tests/exec_session_benchmark.rs`, release build, one 4-vCPU Xeon @ 2.8 GHz

@@ -120,7 +120,9 @@ mod make_room;
 mod node_content_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
+mod work_stream;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
+pub(crate) use snapshot_rpcs::snapshot_restore_payload;
 pub use snapshot_rpcs::{
     checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
 };
@@ -130,8 +132,24 @@ pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, Idl
 type CachedExecKeys = (std::time::Instant, String, Vec<crate::structs::ExecKey>);
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
-    error!("{action}: {:?}", err);
+    let status = store_error_status(action, &err);
+    // Log by what the error means for the server. A refused or missing-thing
+    // answer (NotFound, FailedPrecondition, a non-leader redirect, ...) is
+    // the caller's to act on and is returned to it in full, so it is not a
+    // server error: an ERROR line for every `legion job info typo` or every
+    // heartbeat that races its node's registration buried the real ones.
+    match status.code() {
+        tonic::Code::Internal | tonic::Code::DataLoss | tonic::Code::Unknown => {
+            error!("{action}: {:?}", err)
+        }
+        tonic::Code::Unavailable => warn!("{action}: {err:#}"),
+        _ => debug!("{action}: {err:#}"),
+    }
+    status
+}
 
+/// The gRPC status for a store error (see [`map_store_error`]).
+fn store_error_status(action: &str, err: &anyhow::Error) -> Status {
     // A write proposed on a raft non-leader: FAILED_PRECONDITION with the
     // leader name+address in the message so callers can redial (plan §A4,
     // JC-4). Checked before the storage-error classes because the raft
@@ -140,11 +158,31 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
         .chain()
         .find_map(|cause| cause.downcast_ref::<crate::storage::raft::driver::NotRaftLeader>())
     {
-        return Status::failed_precondition(format!("{action}: {not_leader}"));
+        let mut status = Status::failed_precondition(format!("{action}: {not_leader}"));
+        // Machine-readable leader address: the leader-forward layer replays
+        // the request there, so a caller of any manager gets the leader's
+        // answer instead of this rejection (spot-check P2-5).
+        if let Some(value) = not_leader
+            .leader_addr
+            .as_deref()
+            .and_then(|addr| addr.parse().ok())
+        {
+            status.metadata_mut().insert(
+                crate::manager::leader_forward::RAFT_LEADER_METADATA_KEY,
+                value,
+            );
+        }
+        return status;
     }
 
-    let Some(storage_error) = StorageError::from_anyhow(&err) else {
-        return Status::internal(action);
+    let Some(storage_error) = StorageError::from_anyhow(err) else {
+        // An untyped error is a bug or an unexpected failure, not a caller
+        // mistake, so INTERNAL — but with its cause: the caller gets the same
+        // sentence the server just logged rather than a bare "Internal
+        // error". Errors that ARE a caller's state problem are typed
+        // (`StorageError::FailedPrecondition`, `NotFound`, ...) and mapped
+        // below.
+        return Status::internal(format!("{action}: {err:#}"));
     };
 
     let message = format!("{action}: {storage_error}");
@@ -152,6 +190,7 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
         StorageError::NotFound { .. } => Status::not_found(message),
         StorageError::Conflict { .. } => Status::already_exists(message),
         StorageError::InvalidInput { .. } => Status::invalid_argument(message),
+        StorageError::FailedPrecondition { .. } => Status::failed_precondition(message),
         StorageError::ForeignKey { .. } => Status::failed_precondition(message),
         StorageError::DatabaseBusy | StorageError::DatabaseLocked => Status::unavailable(message),
         StorageError::DatabaseReadOnly => Status::failed_precondition(message),
@@ -1743,6 +1782,24 @@ impl ManagerDaemonService {
         self.auth.authenticate(request.metadata(), &self.store)
     }
 
+    /// Every manager a worker may dial (`HeartbeatReply.manager_addresses`,
+    /// `WorkerRegisterReply.manager_addresses`): the replicated raft
+    /// membership's advertised listeners, with this manager's own API scheme
+    /// (`https` when `server.tls` is on). Empty outside raft mode, which
+    /// leaves a worker's known set unchanged.
+    fn worker_manager_addresses(&self) -> Vec<String> {
+        let scheme = if self.advertise_addr.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        };
+        self.store
+            .raft_member_addresses()
+            .into_iter()
+            .map(|host_port| format!("{scheme}://{host_port}"))
+            .collect()
+    }
+
     /// Job scope for read/lifecycle endpoints, carrying the job's stored
     /// template provenance so `templates`-scoped rules cover the jobs their
     /// templates created. Provenance lookup failures degrade to a scope
@@ -1853,6 +1910,10 @@ impl ManagerDaemonService {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
         })?;
+        self.validate_job_capabilities(&config).map_err(|e| {
+            error!("Error validating capabilities: {:?}", e);
+            Status::invalid_argument(format!("Error validating capabilities: {e:#}"))
+        })?;
         // Artifact admission: desugar/auth/pin. Pin resolution can reach
         // registries, so it runs as blocking work.
         let artifact_pins =
@@ -1875,7 +1936,8 @@ impl ManagerDaemonService {
         // status so the instance-management RPCs accept it again. Stopped
         // keyed instances stay stopped — each needs an explicit
         // `instance start` (see docs/stateful-workloads.md).
-        self.store
+        let was_stopped = self
+            .store
             .clear_job_stopped_status(&config.name)
             .map_err(|e| map_store_error("Error clearing stopped job status", e))?;
 
@@ -1884,7 +1946,8 @@ impl ManagerDaemonService {
         // auto-recovers). Clearing the failed status here re-runs the job's
         // allocations through the normal submit/eval flow with the latest KV
         // state (see docs/kv-store.md).
-        self.store
+        let was_failed = self
+            .store
             .clear_job_failed_status(&config.name)
             .map_err(|e| map_store_error("Error clearing failed job status", e))?;
 
@@ -1941,8 +2004,37 @@ impl ManagerDaemonService {
                         Some("job_update"),
                         "Job config unchanged; forced reschedule queued",
                     )
+                } else if was_stopped {
+                    // Re-running a stopped job's unchanged spec starts it
+                    // again. It used to answer "no update needed" and place
+                    // nothing, which left no obvious way to restart a job.
+                    (
+                        Some("job_update"),
+                        "Job config unchanged; job was stopped, starting it again",
+                    )
+                } else if was_failed {
+                    (
+                        Some("job_update"),
+                        "Job config unchanged; job had failed, starting it again",
+                    )
+                } else if self
+                    .store
+                    .job_is_idle(&config.name)
+                    .map_err(|e| map_store_error("Error loading job allocations", e))?
+                {
+                    // Nothing of the job is running or queued to run (it
+                    // finished, or nothing could be placed): a re-run means
+                    // run it again.
+                    (
+                        Some("job_update"),
+                        "Job config unchanged; job was not running, starting it again",
+                    )
                 } else {
-                    (None, "Job config unchanged; no update needed")
+                    (
+                        None,
+                        "Job config unchanged; no update needed (the job is running; use \
+                         --force-reschedule to restart it)",
+                    )
                 }
             }
             JobSubmitOutcome::Created { .. } => (Some("job_submit"), "Job submit success"),
@@ -2575,6 +2667,78 @@ impl ManagerDaemonService {
             }
         }
         Ok(notes)
+    }
+
+    /// Admission check for `container` tasks' capabilities against the
+    /// worker types' `container.allowCaps`.
+    ///
+    /// The real gate is on the worker, which refuses to start a container
+    /// whose effective capability set leaves its node's allowlist. This is
+    /// the cheap half of it: when *no* worker type allows a task's set, the
+    /// task could never start anywhere, so the job is rejected at submit
+    /// with the same advice instead of placing and failing. A set some
+    /// worker type allows passes, even if placement then lands the task on a
+    /// node of another type; that start fails on the node.
+    fn validate_job_capabilities(&self, config: &JobConfig) -> R<()> {
+        let mut requested = Vec::new();
+        for task in &config.tasks {
+            if let Some(caps) = crate::task_plugins::container_task_capabilities(task)? {
+                requested.push((task.name.as_str(), caps));
+            }
+        }
+        if requested.is_empty() {
+            return Ok(());
+        }
+        let allowlists: Vec<(String, crate::task_plugins::CapabilityAllowlist)> = self
+            .store
+            .list_worker_types()?
+            .into_iter()
+            .map(|worker_type| {
+                let allowlist =
+                    crate::structs::WorkerContainerConfig::from_payload(&worker_type.container)
+                        .and_then(|container| {
+                            crate::task_plugins::CapabilityAllowlist::from_config(
+                                container.allow_caps.as_deref(),
+                            )
+                        })
+                        .unwrap_or_default();
+                (worker_type.name, allowlist)
+            })
+            .collect();
+        if allowlists.is_empty() {
+            // No worker types configured: nothing to judge against.
+            return Ok(());
+        }
+        for (task, caps) in requested {
+            if allowlists
+                .iter()
+                .any(|(_, allowlist)| allowlist.refused(&caps).is_empty())
+            {
+                continue;
+            }
+            // Name what the most permissive type still refuses, so the
+            // message points at the smallest change.
+            let (_, closest) = allowlists
+                .iter()
+                .min_by_key(|(_, allowlist)| allowlist.refused(&caps).len())
+                .expect("at least one worker type");
+            let refused: Vec<String> = closest
+                .refused(&caps)
+                .iter()
+                .map(|cap| cap.trim_start_matches("CAP_").to_string())
+                .collect();
+            let types: Vec<&str> = allowlists.iter().map(|(name, _)| name.as_str()).collect();
+            bail!(
+                "task {task} would run with capabilities no worker type allows container tasks \
+                 to have: {refused}. An operator allows them with container.allowCaps in a \
+                 worker type's config (worker types: {types}); otherwise take them out of the \
+                 task (remove them from security.capabilities.add, or list them in \
+                 security.capabilities.drop)",
+                refused = refused.join(", "),
+                types = types.join(", "),
+            );
+        }
+        Ok(())
     }
 
     /// Admission check for volume declarations, against what the cluster
@@ -3939,10 +4103,13 @@ impl Manager for ManagerDaemonService {
         )?;
         let name = request.into_inner().name;
 
-        let job = self
+        let mut job = self
             .store
             .get_job_with_status(&name)
             .map_err(|e| map_store_error("Error getting job", e))?;
+        self.store
+            .overlay_blocked_jobs(std::slice::from_mut(&mut job))
+            .map_err(|e| map_store_error("Error loading blocked evals", e))?;
         let template = self
             .store
             .job_template_provenance(&name)
@@ -4399,6 +4566,17 @@ impl Manager for ManagerDaemonService {
 
     type StreamEventsStream = ReceiverStream<Result<SchedulerEvent, Status>>;
 
+    type StreamWorkStream = ReceiverStream<Result<crate::structs::StreamWorkReply, Status>>;
+
+    /// Sequenced delivery of work to one worker (see `work_stream`).
+    #[instrument(skip_all)]
+    async fn stream_work(
+        &self,
+        request: Request<tonic::Streaming<crate::structs::StreamWorkRequest>>,
+    ) -> Result<Response<Self::StreamWorkStream>, Status> {
+        self.stream_work_rpc(request).await
+    }
+
     #[instrument(skip_all)]
     async fn stream_events(
         &self,
@@ -4581,6 +4759,10 @@ impl Manager for ManagerDaemonService {
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
+        })?;
+        self.validate_job_capabilities(&config).map_err(|e| {
+            error!("Error validating capabilities: {:?}", e);
+            Status::invalid_argument(format!("Error validating capabilities: {e:#}"))
         })?;
         // Artifact admission for plan mirrors run: pins resolve here too so
         // the plan shows the digests a submit would ship.
@@ -4873,6 +5055,11 @@ impl Manager for ManagerDaemonService {
             .store
             .get_jobs_with_status()
             .map_err(|e| map_store_error("Error getting jobs", e))?;
+        // Before the query, the counts, and the status filter: `blocked` is
+        // a status like any other to all three.
+        self.store
+            .overlay_blocked_jobs(&mut jobs)
+            .map_err(|e| map_store_error("Error loading blocked evals", e))?;
         // Provenance feeds the `templates` rule selector so template-scoped
         // identities see the jobs their templates created. One batch query
         // instead of one per row; management tokens skip it entirely.
@@ -5368,53 +5555,63 @@ impl Manager for ManagerDaemonService {
             .filter(|from| !from.is_empty())
             .map(|from| self.resolve_seed_snapshot(&identity, &inner.job_id, task, from, 1))
             .transpose()?;
-        let instance_id = match seed.as_ref() {
-            Some(seed) => {
-                let requested: Vec<String> = requested_id.map(str::to_string).into_iter().collect();
-                let mint = u32::from(requested.is_empty());
-                self.store
-                    .create_keyed_instances_from_snapshot(
-                        &inner.job_id,
-                        &task.group,
-                        &task.name,
-                        &requested,
-                        mint,
-                        &seed.snapshot_id,
-                    )
-                    .map_err(|e| map_store_error("Error creating instance", e))?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| Status::internal("create from snapshot created nothing"))?
-            }
-            None => {
-                self.store
-                    .create_keyed_instance(&inner.job_id, &task.group, &task.name, requested_id)
-                    .map_err(|e| map_store_error("Error creating instance", e))?
-                    .instance_id
-            }
-        };
-        let restoring_from = seed.map(|seed| seed.snapshot_id).unwrap_or_default();
-
-        // Place promptly: a reschedule plan adds exactly the missing keyed
-        // allocations without disturbing live ones.
-        self.store
-            .enqueue_eval(
-                "job_reschedule",
-                Some(&inner.job_id),
-                Some(&config.id()),
-                None,
-                Some(self.store.default_eval_priority),
-            )
-            .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
-
-        let recorded = if restoring_from.is_empty() {
-            instance_id.clone()
-        } else {
-            format!("{instance_id} {restoring_from}")
-        };
-        self.store
-            .idempotency_record(&idempotency_key, "create_instance", &recorded)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let restoring_from = seed
+            .as_ref()
+            .map(|seed| seed.snapshot_id.clone())
+            .unwrap_or_default();
+        // One scheduler-lane entry for the whole create: the row, the
+        // placement eval (a reschedule plan adds exactly the missing keyed
+        // allocations without disturbing live ones), and the idempotency
+        // record, group-committed with whatever other instance writes are
+        // in flight (sandbox-scaling plan, Phase 1). It used to be three
+        // entries, one of them on the control lane.
+        let job_id = inner.job_id.clone();
+        let group = task.group.clone();
+        let task_name = task.name.clone();
+        let requested = requested_id.map(str::to_string);
+        let config_id = config.id();
+        let priority = self.store.default_eval_priority;
+        let seed_snapshot = seed.map(|seed| seed.snapshot_id);
+        let key = idempotency_key.clone();
+        let instance_id = self
+            .store
+            .scheduler_group_commit("create_instance", move |s| {
+                let instance_id = match seed_snapshot.as_deref() {
+                    Some(snapshot_id) => {
+                        let requested: Vec<String> = requested.into_iter().collect();
+                        let mint = u32::from(requested.is_empty());
+                        s.create_keyed_instances_from_snapshot(
+                            &job_id,
+                            &group,
+                            &task_name,
+                            &requested,
+                            mint,
+                            snapshot_id,
+                        )?
+                        .into_iter()
+                        .next()
+                        .context("create from snapshot created nothing")?
+                    }
+                    None => {
+                        s.create_keyed_instance(&job_id, &group, &task_name, requested.as_deref())?
+                            .instance_id
+                    }
+                };
+                s.enqueue_eval(
+                    "job_reschedule",
+                    Some(&job_id),
+                    Some(&config_id),
+                    None,
+                    Some(priority),
+                )?;
+                let recorded = match seed_snapshot.as_deref() {
+                    Some(snapshot_id) => format!("{instance_id} {snapshot_id}"),
+                    None => instance_id.clone(),
+                };
+                s.idempotency_record(&key, "create_instance", &recorded)?;
+                Ok(instance_id)
+            })
+            .map_err(|e| map_store_error("Error creating instance", e))?;
 
         Ok(Response::new(CreateInstanceReply {
             instance_id,
@@ -5532,46 +5729,54 @@ impl Manager for ManagerDaemonService {
                 )
             })
             .transpose()?;
-        let created = match seed.as_ref() {
-            Some(seed) => self.store.create_keyed_instances_from_snapshot(
-                &inner.job_id,
-                &task.group,
-                &task.name,
-                &inner.instance_ids,
-                inner.count,
-                &seed.snapshot_id,
-            ),
-            None => self.store.create_keyed_instances(
-                &inner.job_id,
-                &task.group,
-                &task.name,
-                &inner.instance_ids,
-                inner.count,
-            ),
-        }
-        .map_err(|e| map_store_error("Error creating instances", e))?;
-        let restoring_from = seed.map(|seed| seed.snapshot_id).unwrap_or_default();
-
-        // One placement eval covers the whole batch: a reschedule plan adds
-        // exactly the missing keyed allocations without disturbing live ones.
-        self.store
-            .enqueue_eval(
-                "job_reschedule",
-                Some(&inner.job_id),
-                Some(&config.id()),
-                None,
-                Some(self.store.default_eval_priority),
-            )
-            .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
-
-        let recorded = if restoring_from.is_empty() {
-            created.join(",")
-        } else {
-            format!("{} {restoring_from}", created.join(","))
-        };
-        self.store
-            .idempotency_record(&idempotency_key, "create_instances", &recorded)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let restoring_from = seed
+            .as_ref()
+            .map(|seed| seed.snapshot_id.clone())
+            .unwrap_or_default();
+        // One scheduler-lane entry for the rows, the placement eval (one
+        // covers the whole batch: a reschedule plan adds exactly the missing
+        // keyed allocations without disturbing live ones), and the
+        // idempotency record, as in `create_instance`.
+        let job_id = inner.job_id.clone();
+        let group = task.group.clone();
+        let task_name = task.name.clone();
+        let requested = inner.instance_ids.clone();
+        let count = inner.count;
+        let config_id = config.id();
+        let priority = self.store.default_eval_priority;
+        let seed_snapshot = seed.map(|seed| seed.snapshot_id);
+        let key = idempotency_key.clone();
+        let created = self
+            .store
+            .scheduler_group_commit("create_instances", move |s| {
+                let created = match seed_snapshot.as_deref() {
+                    Some(snapshot_id) => s.create_keyed_instances_from_snapshot(
+                        &job_id,
+                        &group,
+                        &task_name,
+                        &requested,
+                        count,
+                        snapshot_id,
+                    )?,
+                    None => {
+                        s.create_keyed_instances(&job_id, &group, &task_name, &requested, count)?
+                    }
+                };
+                s.enqueue_eval(
+                    "job_reschedule",
+                    Some(&job_id),
+                    Some(&config_id),
+                    None,
+                    Some(priority),
+                )?;
+                let recorded = match seed_snapshot.as_deref() {
+                    Some(snapshot_id) => format!("{} {snapshot_id}", created.join(",")),
+                    None => created.join(","),
+                };
+                s.idempotency_record(&key, "create_instances", &recorded)?;
+                Ok(created)
+            })
+            .map_err(|e| map_store_error("Error creating instances", e))?;
 
         Ok(Response::new(CreateInstancesReply {
             instance_ids: created,
@@ -5637,37 +5842,29 @@ impl Manager for ManagerDaemonService {
             )));
         }
 
-        let outcome = self
+        // One scheduler-lane entry: the stop and its idempotency record.
+        // No eval follows. The stop already removed the allocation rows
+        // (workers stop on their next heartbeat), so there is nothing to
+        // place, and work waiting for the room it frees is woken by the
+        // blocked-eval index, not by a reschedule pass over this job
+        // (sandbox-scaling plan, Phases 1 and 3).
+        let instance_id = inner.instance_id.clone();
+        let key = idempotency_key.clone();
+        let message = self
             .store
-            .stop_keyed_instance(&inner.instance_id)
+            .scheduler_group_commit("stop_instance", move |s| {
+                let message = match s.stop_keyed_instance(&instance_id)? {
+                    StopInstanceOutcome::Stopped { .. } => {
+                        format!("Stopped instance {instance_id}")
+                    }
+                    StopInstanceOutcome::AlreadyStopped => {
+                        format!("Instance {instance_id} already stopped")
+                    }
+                };
+                s.idempotency_record(&key, "stop_instance", &message)?;
+                Ok(message)
+            })
             .map_err(|e| map_store_error("Error stopping instance", e))?;
-
-        let message = match outcome {
-            StopInstanceOutcome::Stopped { .. } => {
-                // Reconcile promptly. The stop itself already removed the
-                // allocation rows (workers stop on their next heartbeat); the
-                // eval just confirms nothing else needs (re)placement.
-                if let Ok(config) = self.store.get_job_config(&instance.job_id) {
-                    self.store
-                        .enqueue_eval(
-                            "job_reschedule",
-                            Some(&instance.job_id),
-                            Some(&config.id()),
-                            None,
-                            Some(self.store.default_eval_priority),
-                        )
-                        .map_err(|e| map_store_error("Error scheduling reconcile", e))?;
-                }
-                format!("Stopped instance {}", inner.instance_id)
-            }
-            StopInstanceOutcome::AlreadyStopped => {
-                format!("Instance {} already stopped", inner.instance_id)
-            }
-        };
-
-        self.store
-            .idempotency_record(&idempotency_key, "stop_instance", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
 
         Ok(Response::new(StopInstanceReply {
             message,
@@ -5751,48 +5948,43 @@ impl Manager for ManagerDaemonService {
 
         // A suspended instance resumes from its checkpoint (or boots cold).
         if instance.state == InstanceState::Suspended {
-            let recorded = self.resume_instance(&instance, inner.cold)?;
-            self.store
-                .idempotency_record(
-                    &idempotency_key,
-                    "start_instance",
-                    &serde_json::to_string(&recorded).unwrap_or_default(),
-                )
-                .map_err(|e| map_store_error("Error recording idempotency", e))?;
+            let recorded = self.resume_instance(&instance, inner.cold, &idempotency_key)?;
             return Ok(Response::new(recorded.into_reply(false)));
         }
 
-        let outcome = self
+        // One scheduler-lane entry: the start, its placement eval (placed
+        // promptly, exactly like CreateInstance), and the idempotency record.
+        let config_id = self
             .store
-            .start_keyed_instance(&inner.instance_id)
+            .get_job_config(&instance.job_id)
+            .map_err(|e| map_store_error("Error loading job config", e))?
+            .id();
+        let instance_id = inner.instance_id.clone();
+        let job_id = instance.job_id.clone();
+        let priority = self.store.default_eval_priority;
+        let key = idempotency_key.clone();
+        let message = self
+            .store
+            .scheduler_group_commit("start_instance", move |s| {
+                let message = match s.start_keyed_instance(&instance_id)? {
+                    StartInstanceOutcome::Started => {
+                        s.enqueue_eval(
+                            "job_reschedule",
+                            Some(&job_id),
+                            Some(&config_id),
+                            None,
+                            Some(priority),
+                        )?;
+                        format!("Started instance {instance_id}")
+                    }
+                    StartInstanceOutcome::AlreadyRunning => {
+                        format!("Instance {instance_id} already running")
+                    }
+                };
+                s.idempotency_record(&key, "start_instance", &message)?;
+                Ok(message)
+            })
             .map_err(|e| map_store_error("Error starting instance", e))?;
-
-        let message = match outcome {
-            StartInstanceOutcome::Started => {
-                // Place promptly, exactly like CreateInstance does.
-                let config = self
-                    .store
-                    .get_job_config(&instance.job_id)
-                    .map_err(|e| map_store_error("Error loading job config", e))?;
-                self.store
-                    .enqueue_eval(
-                        "job_reschedule",
-                        Some(&instance.job_id),
-                        Some(&config.id()),
-                        None,
-                        Some(self.store.default_eval_priority),
-                    )
-                    .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
-                format!("Started instance {}", inner.instance_id)
-            }
-            StartInstanceOutcome::AlreadyRunning => {
-                format!("Instance {} already running", inner.instance_id)
-            }
-        };
-
-        self.store
-            .idempotency_record(&idempotency_key, "start_instance", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
 
         Ok(Response::new(StartInstanceReply {
             message,
@@ -5848,37 +6040,27 @@ impl Manager for ManagerDaemonService {
             &AclScope::job(&instance.job_id),
         )?;
 
-        let outcome = self
+        // One scheduler-lane entry: the destroy and its idempotency record.
+        // No eval follows, for the reason `stop_instance` gives: the destroy
+        // already removed the allocation rows, and waiting work wakes from
+        // the blocked-eval index (sandbox-scaling plan, Phases 1 and 3).
+        let instance_id = inner.instance_id.clone();
+        let key = idempotency_key.clone();
+        let message = self
             .store
-            .destroy_keyed_instance(&inner.instance_id)
+            .scheduler_group_commit("destroy_instance", move |s| {
+                let message = match s.destroy_keyed_instance(&instance_id)? {
+                    DestroyInstanceOutcome::Destroyed { .. } => {
+                        format!("Destroyed instance {instance_id}")
+                    }
+                    DestroyInstanceOutcome::AlreadyTerminated => {
+                        format!("Instance {instance_id} already terminated")
+                    }
+                };
+                s.idempotency_record(&key, "destroy_instance", &message)?;
+                Ok(message)
+            })
             .map_err(|e| map_store_error("Error destroying instance", e))?;
-
-        let message = match outcome {
-            DestroyInstanceOutcome::Destroyed { .. } => {
-                // Reconcile promptly. The destroy itself already removed the
-                // allocation rows (workers stop on their next heartbeat); the
-                // eval just confirms nothing else needs (re)placement.
-                if let Ok(config) = self.store.get_job_config(&instance.job_id) {
-                    self.store
-                        .enqueue_eval(
-                            "job_reschedule",
-                            Some(&instance.job_id),
-                            Some(&config.id()),
-                            None,
-                            Some(self.store.default_eval_priority),
-                        )
-                        .map_err(|e| map_store_error("Error scheduling reconcile", e))?;
-                }
-                format!("Destroyed instance {}", inner.instance_id)
-            }
-            DestroyInstanceOutcome::AlreadyTerminated => {
-                format!("Instance {} already terminated", inner.instance_id)
-            }
-        };
-
-        self.store
-            .idempotency_record(&idempotency_key, "destroy_instance", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
 
         Ok(Response::new(DestroyInstanceReply {
             message,
@@ -6823,20 +7005,39 @@ impl Manager for ManagerDaemonService {
             error!(node_id = %id, error = ?err, "Error handling pressure actions");
         }
 
-        let desired_allocations = build_desired_allocations(&self.store, &id, &req.allocation_ids)
-            .map_err(|e| map_store_error("Error building desired allocations", e))?;
+        // A worker that receives its work over `StreamWork` gets no desired
+        // set here: it holds it already, and the heartbeat carries only a
+        // digest of it (sandbox-scaling plan §6.13). Its connect and policy
+        // feeds are computed from the payloads the stream sent, and only
+        // when some allocation needs one, so a steady beat reads nothing.
+        let stream = req
+            .work_stream
+            .as_ref()
+            .map(|reported| self.store.work_log().check_heartbeat(&id, reported))
+            .unwrap_or_default();
+        let (desired_allocations, feed_allocations) = if stream.via_stream {
+            let held = self.store.work_log().held_payloads(&id, |allocation| {
+                !allocation.task_connect.is_empty()
+                    || !allocation.task_network.is_empty()
+                    || !allocation.network.is_empty()
+            });
+            (Vec::new(), held)
+        } else {
+            let desired = build_desired_allocations(&self.store, &id, &req.allocation_ids)
+                .map_err(|e| map_store_error("Error building desired allocations", e))?;
+            (desired.clone(), desired)
+        };
         // Endpoint feed for the node-local upstream forwarders. Costs nothing
         // (no store access at all) when no desired allocation uses connect, and
         // is infallible by construction: a connect-layer problem must never
         // stop this node from reconciling its allocations.
-        let mut upstream_endpoints = build_upstream_endpoints(&self.store, &desired_allocations);
+        let mut upstream_endpoints = build_upstream_endpoints(&self.store, &feed_allocations);
         // Effective network policy per desired allocation, as content hashes.
         // Same contract as the endpoint feed: no store access when no policy
         // exists and no task declares one; never fails the heartbeat.
-        let net_policies = self.build_net_policies(&id, &desired_allocations);
+        let net_policies = self.build_net_policies(&id, &feed_allocations);
         // `proxy` handler targets ride the same feed, flagged `for_handler`.
-        upstream_endpoints
-            .extend(self.build_handler_endpoints(&desired_allocations, &net_policies));
+        upstream_endpoints.extend(self.build_handler_endpoints(&feed_allocations, &net_policies));
         // Denials the node's datapath recorded, turned into events so "which
         // rule blocked it" is answerable without node access.
         for denial in &req.net_denials {
@@ -6880,7 +7081,7 @@ impl Manager for ManagerDaemonService {
         });
         // Service-graph samples: fold into per-(caller, service) windows.
         if !req.net_edges.is_empty() {
-            let callers: HashMap<i64, (String, String)> = desired_allocations
+            let callers: HashMap<i64, (String, String)> = feed_allocations
                 .iter()
                 .map(|a| (a.allocation_id, (a.job_id.clone(), a.task_name.clone())))
                 .collect();
@@ -6894,20 +7095,25 @@ impl Manager for ManagerDaemonService {
         let checkpoint_requests = snapshot_rpcs::build_checkpoint_requests(&self.store, &id);
         // Why this node's recently-removed allocations went away. Advisory:
         // a lookup failure costs the worker a cause, never a reconcile, so
-        // it is logged and dropped rather than failing the heartbeat.
-        let stop_notices = match self.store.stop_notices_for_node(&id) {
-            Ok(notices) => notices
-                .into_iter()
-                .map(|notice| StopNotice {
-                    allocation_id: notice.allocation_id,
-                    cause: notice.cause.as_str().to_string(),
-                    preemptor_job: notice.preemptor_job,
-                    preemptor_band: notice.preemptor_band,
-                })
-                .collect(),
-            Err(err) => {
-                debug!(node_id = %id, error = ?err, "Error loading stop notices");
-                Vec::new()
+        // it is logged and dropped rather than failing the heartbeat. A
+        // streaming worker got each one with its stop.
+        let stop_notices = if stream.via_stream {
+            Vec::new()
+        } else {
+            match self.store.stop_notices_for_node(&id) {
+                Ok(notices) => notices
+                    .into_iter()
+                    .map(|notice| StopNotice {
+                        allocation_id: notice.allocation_id,
+                        cause: notice.cause.as_str().to_string(),
+                        preemptor_job: notice.preemptor_job,
+                        preemptor_band: notice.preemptor_band,
+                    })
+                    .collect(),
+                Err(err) => {
+                    debug!(node_id = %id, error = ?err, "Error loading stop notices");
+                    Vec::new()
+                }
             }
         };
 
@@ -6990,6 +7196,9 @@ impl Manager for ManagerDaemonService {
             revoked_exec_sessions,
             exec_keys,
             exec_keys_version,
+            manager_addresses: self.worker_manager_addresses(),
+            desired_via_stream: stream.via_stream,
+            work_resync: stream.resync,
         };
 
         Ok(Response::new(reply))
@@ -7151,6 +7360,7 @@ impl Manager for ManagerDaemonService {
             resource_enforcement: worker_config.resource_enforcement,
             edge_boot: worker_config.edge_boot,
             security: worker_config.security,
+            container: worker_config.container,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -7216,11 +7426,17 @@ impl Manager for ManagerDaemonService {
         .to_string();
 
         // Re-registration (a worker restart, or a token rotation) keeps the
-        // operator's availability: a drained or ineligible node must not
-        // silently become schedulable again. Only a new node starts
+        // operator's availability: a drained node must not silently become
+        // schedulable again. `unavailable` is NOT operator intent — node
+        // loss sets it — and a registering worker is by definition alive,
+        // so it returns to `available` here, the same way a recovering
+        // heartbeat does. Keeping it registered the node `active` but
+        // unschedulable, which the scheduler then reported as "No nodes
+        // available" (spot-check P0-6). Only a new node starts
         // `available`. The value is resolved here, not in the store's apply
         // step, so every replica applies the same explicit value.
         let availability = match self.store.get_node(&node_id) {
+            Ok(existing) if existing.availability == "unavailable" => "available".to_string(),
             Ok(existing) => existing.availability,
             Err(err)
                 if matches!(
@@ -7256,12 +7472,24 @@ impl Manager for ManagerDaemonService {
             warn!(node_id = %node_id, error = %err, "Failed to queue the capacity pass after registration");
         }
 
-        let node_token = if self.auth.enabled {
-            let secret = self.auth.mint_node_token(&self.store, &node_id)?;
-            info!(node_id = %node_id, "Minted node token for registered worker");
-            Some(secret)
-        } else {
-            None
+        // A worker that re-registers with its own node token (a restart:
+        // the token is persisted in its state directory) keeps it — the
+        // reply carries none, meaning "keep the one you presented". Rotating
+        // it here would make every restart depend on the worker persisting
+        // the new secret before anything else goes wrong, and would gain
+        // nothing: the caller already proved it holds this node's credential.
+        // A join-token (or management) registration mints and rotates.
+        let node_token = match &grant {
+            _ if !self.auth.enabled => None,
+            RegistrationGrant::Node(_) => {
+                info!(node_id = %node_id, "Worker re-registered with its node token; keeping it");
+                None
+            }
+            _ => {
+                let secret = self.auth.mint_node_token(&self.store, &node_id)?;
+                info!(node_id = %node_id, "Minted node token for registered worker");
+                Some(secret)
+            }
         };
 
         info!(
@@ -7284,6 +7512,7 @@ impl Manager for ManagerDaemonService {
             node_token,
             manager_build_version: env!("CARGO_PKG_VERSION").to_string(),
             manager_protocol_version: PROTOCOL_VERSION,
+            manager_addresses: self.worker_manager_addresses(),
         };
 
         Ok(Response::new(reply))
@@ -7542,24 +7771,59 @@ impl Manager for ManagerDaemonService {
     ) -> Result<Response<GetAllocationLogsReply>, Status> {
         let identity = self.authenticate_acl(&request)?;
         let req = request.into_inner();
+        // Coarse gate before any lookup ("check before you fetch"), so a
+        // caller with no job read anywhere cannot probe which allocation ids
+        // exist; the precise job scope is enforced once the job is known.
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::any(),
+        )?;
 
         // Resolve which allocations to read: a single allocation id when given,
-        // otherwise every allocation belonging to the named job.
+        // otherwise every allocation belonging to the named job. Removed
+        // allocations come from the manager's allocation history
+        // (docs/logging.md, "Logs of removed allocations").
+        let mut removed: Vec<crate::storage::store::RemovedAllocation> = Vec::new();
         let allocations = if let Some(allocation_id) = req.allocation_id {
-            let alloc = self
+            let live = self
                 .store
                 .get_allocation_by_id(allocation_id)
-                .map_err(|e| map_store_error("Error loading allocation", e))?
-                .ok_or_else(|| {
-                    Status::not_found(format!("allocation {allocation_id} not found"))
-                })?;
-            acl::enforce(
-                &identity,
-                AclResource::Job,
-                AclAction::Read,
-                &AclScope::job(&alloc.job_id),
-            )?;
-            vec![alloc]
+                .map_err(|e| map_store_error("Error loading allocation", e))?;
+            match live {
+                Some(alloc) => {
+                    acl::enforce(
+                        &identity,
+                        AclResource::Job,
+                        AclAction::Read,
+                        &AclScope::job(&alloc.job_id),
+                    )?;
+                    vec![alloc]
+                }
+                None => {
+                    let gone = self
+                        .store
+                        .removed_allocations(None, Some(allocation_id), 1)
+                        .map_err(|e| map_store_error("Error loading allocation history", e))?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            Status::not_found(format!(
+                                "allocation {allocation_id} not found (removed allocations are \
+                                 remembered for 24 hours)"
+                            ))
+                        })?;
+                    acl::enforce(
+                        &identity,
+                        AclResource::Job,
+                        AclAction::Read,
+                        &AclScope::job(&gone.job_id),
+                    )?;
+                    removed.push(gone);
+                    Vec::new()
+                }
+            }
         } else {
             acl::enforce(
                 &identity,
@@ -7572,13 +7836,38 @@ impl Manager for ManagerDaemonService {
                     "either job or allocation_id is required",
                 ));
             }
-            let job = self
-                .store
-                .get_job(&req.job)
-                .map_err(|e| map_store_error("Error loading job", e))?;
-            self.store
-                .allocs_for_job(&job.id)
-                .map_err(|e| map_store_error("Error loading job allocations", e))?
+            // A destroyed job is gone, but its removed allocations' logs are
+            // not: fall through to the history before reporting NotFound.
+            let (live, job_missing) = match self.store.get_job(&req.job) {
+                Ok(job) => (
+                    self.store
+                        .allocs_for_job(&job.id)
+                        .map_err(|e| map_store_error("Error loading job allocations", e))?,
+                    false,
+                ),
+                Err(err)
+                    if matches!(
+                        StorageError::from_anyhow(&err),
+                        Some(StorageError::NotFound { .. })
+                    ) =>
+                {
+                    (Vec::new(), true)
+                }
+                Err(err) => return Err(map_store_error("Error loading job", err)),
+            };
+            if live.is_empty() || req.include_removed {
+                removed = self
+                    .store
+                    .removed_allocations(Some(&req.job), None, REMOVED_ALLOCATION_LOGS_LIMIT)
+                    .map_err(|e| map_store_error("Error loading allocation history", e))?;
+            }
+            if job_missing && removed.is_empty() {
+                return Err(Status::not_found(format!(
+                    "Error loading job: job {} not found",
+                    req.job
+                )));
+            }
+            live
         };
 
         // Caches keyed by node / job config so we reuse worker connections and
@@ -7621,6 +7910,10 @@ impl Manager for ManagerDaemonService {
                 task_name,
                 streams: Vec::new(),
                 error: String::new(),
+                removed: false,
+                removal_cause: String::new(),
+                removed_at_unix: 0,
+                status: allocation.status.clone(),
             };
 
             match fetch_allocation_logs(&self.store, &allocation, &req, &mut clients).await {
@@ -7628,6 +7921,38 @@ impl Manager for ManagerDaemonService {
                 Err(message) => entry.error = message,
             }
 
+            logs.push(entry);
+        }
+
+        // Removed allocations: the worker still holds their files (until its
+        // log retention expires), so the read is the same proxied call.
+        for gone in removed {
+            let allocation = crate::structs::Allocation {
+                id: gone.allocation_id,
+                status: gone.status.clone(),
+                resources: Value::Null,
+                node_id: gone.node_id.clone(),
+                job_config_id: gone.job_config_id.clone(),
+                task_config_id: gone.task_config_id,
+                job_id: gone.job_id.clone(),
+                instance_id: None,
+                network: None,
+            };
+            let mut entry = AllocationLog {
+                allocation_id: gone.allocation_id,
+                node_id: gone.node_id,
+                task_name: gone.task_name,
+                streams: Vec::new(),
+                error: String::new(),
+                removed: true,
+                removal_cause: gone.cause,
+                removed_at_unix: gone.removed_at_unix,
+                status: gone.status,
+            };
+            match fetch_allocation_logs(&self.store, &allocation, &req, &mut clients).await {
+                Ok(streams) => entry.streams = streams,
+                Err(message) => entry.error = message,
+            }
             logs.push(entry);
         }
 
@@ -7935,10 +8260,20 @@ impl Manager for ManagerDaemonService {
         )?;
         let req = request.into_inner();
         let actor = req.actor.unwrap_or_else(|| "api".to_string());
-        let outcome = self
-            .store
-            .issue_raft_command(&req.command, req.target_node_id.as_deref(), &actor)
-            .map_err(|e| map_store_error("Error issuing raft command", e))?;
+        // Off the async workers: `transfer-leader` / `step-down` wait (up to
+        // their deadline) for leadership to move, and membership changes
+        // wait for commits.
+        let outcome = {
+            let store = self.store.clone();
+            let command = req.command.clone();
+            let target = req.target_node_id.clone();
+            tokio::task::spawn_blocking(move || {
+                store.issue_raft_command(&command, target.as_deref(), &actor)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft command task failed: {e}")))?
+            .map_err(|e| map_store_error("Error issuing raft command", e))?
+        };
         let status = self
             .store
             .raft_status()
@@ -10130,7 +10465,9 @@ impl Manager for ManagerDaemonService {
             }))
         };
 
-        // An edge-originated claim carries the ticket that authorized it.
+        // An edge-originated claim carries the ticket that authorized it,
+        // spent inside the ratification's own entry.
+        let mut spend = None;
         if !req.ticket.trim().is_empty() {
             if !self.edge_boot.enabled {
                 return refuse(
@@ -10148,19 +10485,24 @@ impl Manager for ManagerDaemonService {
                 .store
                 .get_node(&req.node_id)
                 .map_err(|e| map_store_error("Error loading node", e))?;
-            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-            if let Err(err) = crate::manager::edge_boot::verify_and_spend(
-                &self.store,
+            match crate::manager::edge_boot::verify_ticket(
                 state,
                 &req.ticket,
                 &req.instance_id,
                 &node.pool,
-                now_unix,
             ) {
-                return refuse(
-                    crate::structs::edge_boot::RefusalReason::TicketInvalid,
-                    format!("{err:#}"),
-                );
+                Ok(claims) => {
+                    spend = Some(crate::manager::edge_boot::TicketSpend {
+                        jti: claims.jti,
+                        now_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+                    });
+                }
+                Err(err) => {
+                    return refuse(
+                        crate::structs::edge_boot::RefusalReason::TicketInvalid,
+                        format!("{err:#}"),
+                    );
+                }
             }
         }
 
@@ -10173,7 +10515,7 @@ impl Manager for ManagerDaemonService {
             instance_id: &req.instance_id,
             gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
         };
-        let verdict = crate::manager::edge_boot::ratify(&self.store, &claim)
+        let verdict = crate::manager::edge_boot::ratify(&self.store, &claim, spend, started)
             .map_err(|e| Status::internal(format!("ratification failed: {e:#}")))?;
 
         let job_id = self
@@ -10183,20 +10525,12 @@ impl Manager for ManagerDaemonService {
             .unwrap_or_default();
         match verdict {
             crate::manager::edge_boot::Verdict::Confirmed { allocation_id } => {
-                let latency_ms = started.elapsed().as_millis() as u64;
                 tracing::Span::current().record("verdict", "confirmed");
                 crate::manager::telemetry::worker_metrics()
                     .provisional_ratify_seconds
                     .observe(started.elapsed().as_secs_f64());
-                self.store.events().provisional_ratified(
-                    &req.claim_id,
-                    allocation_id,
-                    &req.node_id,
-                    &job_id,
-                    &req.instance_id,
-                    crate::structs::edge_boot::Gate::from_wire(req.gate).as_str(),
-                    latency_ms,
-                );
+                // `alloc.ratified` was recorded inside the ratification's
+                // own entry.
                 // The committed payload rides back with the verdict: the
                 // node booted from one that could not name assigned ports,
                 // the bound instance, or resolved mounts, and must replace it
@@ -10352,15 +10686,16 @@ async fn fetch_allocation_logs(
         .map_err(|e| format!("failed to load node {}: {e}", allocation.node_id))?;
     let target = crate::manager::worker_plane::WorkerTarget::for_node(&node)
         .map_err(|status| status.message().to_string())?;
-    if !clients.contains_key(&target.address) {
+    // Keyed by what the channel verifies, not the address alone: two nodes
+    // that advertise one address must not share a channel.
+    let key = format!("{}@{}", target.server_name, target.address);
+    if !clients.contains_key(&key) {
         let client = crate::manager::worker_plane::WorkerPlane::global()
             .client_for(store, &target)
             .map_err(|status| status.message().to_string())?;
-        clients.insert(target.address.clone(), client);
+        clients.insert(key.clone(), client);
     }
-    let client = clients
-        .get_mut(&target.address)
-        .expect("worker client just inserted");
+    let client = clients.get_mut(&key).expect("worker client just inserted");
 
     let reply = client
         .get_task_logs(GetTaskLogsRequest {
@@ -10511,6 +10846,7 @@ fn handle_terminated_allocations(
     node_id: &str,
     terminated: &[crate::structs::TerminatedAllocation],
 ) -> R<()> {
+    let mut freed_capacity = false;
     for report in terminated {
         let allocation_id = report.allocation_id;
         let Some(existing) = store.get_allocation_by_id(allocation_id)? else {
@@ -10533,6 +10869,18 @@ fn handle_terminated_allocations(
         let Some(allocation) = store.complete_allocation(allocation_id, report.success)? else {
             continue;
         };
+        freed_capacity = true;
+        // Tasks that depend on this one were held until it exited; queue
+        // the eval that places them. Best effort: a failure here must not
+        // fail the heartbeat, and the next eval of the job re-checks.
+        if let Err(error) = store.queue_dependency_progress(&allocation) {
+            warn!(
+                allocation_id,
+                job_id = %allocation.job_id,
+                error = %format!("{error:#}"),
+                "Failed to queue dependency progress after a terminal report"
+            );
+        }
 
         store.events().allocation_terminated(
             allocation_id,
@@ -10552,6 +10900,11 @@ fn handle_terminated_allocations(
             "Allocation reached a terminal state"
         );
     }
+    // A finished allocation no longer holds node capacity: retry jobs that
+    // are short of room (no-op unless some plan left replicas unplaced).
+    if freed_capacity {
+        store.request_capacity_reconcile_if_waiting();
+    }
     Ok(())
 }
 
@@ -10561,6 +10914,7 @@ fn handle_failed_allocations(
     node_id: &str,
     failed: &[FailedAllocation],
 ) -> R<()> {
+    let mut freed_capacity = false;
     for failure in failed {
         let allocation_id = failure.allocation_id;
         let allocation_context = {
@@ -10586,6 +10940,7 @@ fn handle_failed_allocations(
         }
 
         store.remove_allocation_by_id(allocation_id)?;
+        freed_capacity = true;
 
         store.events().allocation_failed(
             allocation_id,
@@ -10622,6 +10977,19 @@ fn handle_failed_allocations(
             }
             MoveDecision::JobFailed => {
                 store.mark_job_failed(&context.job_id)?;
+                // The task failed for good: say so in its status, so a
+                // `complete` dependent can run and a `success` one never does.
+                if let Err(error) = store.set_task_status(
+                    context.task_config_id,
+                    crate::structs::TaskStatusState::Failed,
+                ) {
+                    warn!(
+                        allocation_id,
+                        job_id = %context.job_id,
+                        error = %format!("{error:#}"),
+                        "Failed to record the failed task status"
+                    );
+                }
                 warn!(
                     allocation_id,
                     job_id = %context.job_id,
@@ -10645,6 +11013,13 @@ fn handle_failed_allocations(
         );
     }
 
+    // The removed rows freed node capacity (see
+    // `Store::request_capacity_reconcile_if_waiting`). Reports that were
+    // ignored (unknown, or from a node that does not own the allocation)
+    // freed nothing.
+    if freed_capacity {
+        store.request_capacity_reconcile_if_waiting();
+    }
     Ok(())
 }
 
@@ -11070,7 +11445,7 @@ fn build_desired_allocations(
         return Ok(Vec::new());
     }
 
-    let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
+    let mut task_cache = DesiredTaskCache::default();
     let mut allocations = Vec::new();
 
     for allocation in desired {
@@ -11082,44 +11457,60 @@ fn build_desired_allocations(
         if !crate::constants::allocation_status_is_dispatchable(&allocation.status) {
             continue;
         }
-        let tasks = task_cache
-            .entry(allocation.job_config_id.clone())
-            .or_default();
-        if tasks.is_empty() {
-            // The cached accessor, deliberately: this runs once per
-            // distinct job config per node per heartbeat, so on a 5,000-node
-            // fleet at a 2s cadence it was ~10k read-connection acquisitions
-            // per second for rows the read model already holds. Task configs
-            // are immutable per `job_config_id` — a change mints a new
-            // config id — which is why the scheduler already reads them this
-            // way and why the cache needs no invalidation.
-            let task_configs =
-                store.cached_task_configs_for_job_config(&allocation.job_config_id)?;
-            for (id, config) in task_configs {
-                tasks.insert(id, config);
-            }
-        }
-        let task = tasks
-            .get(&allocation.task_config_id)
-            .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
-        let instance = match allocation.instance_id.as_deref() {
-            Some(instance_id) => store.get_instance(instance_id)?,
-            None => None,
-        };
-        let volumes =
-            store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
-        let mut payload = build_task_allocation(task, &allocation, instance.as_ref(), &volumes)?;
-        // The band orders the worker's memory pressure response. Read from
-        // the read model, so steady-state heartbeats pay no store read.
-        payload.priority_band = store
-            .cached_band_for_job_config(&allocation.job_config_id)?
-            .as_str()
-            .to_string();
-        payload.restore = snapshot_rpcs::snapshot_restore_payload(store, instance.as_ref());
-        allocations.push(payload);
+        allocations.push(desired_payload(store, &allocation, &mut task_cache)?);
     }
 
     Ok(allocations)
+}
+
+/// Task configs by job config, for building many payloads.
+#[derive(Default)]
+pub(crate) struct DesiredTaskCache(HashMap<String, HashMap<i64, TaskConfig>>);
+
+/// The payload a worker runs one allocation from: the same
+/// `TaskAllocation` whichever path delivers it — the heartbeat's desired
+/// set, a `StreamWork` message, or the `PostWork` push — so a worker that
+/// launches from whichever copy reaches it first launches the same thing.
+pub(crate) fn desired_payload(
+    store: &Store,
+    allocation: &crate::structs::Allocation,
+    task_cache: &mut DesiredTaskCache,
+) -> R<crate::structs::TaskAllocation> {
+    let tasks = task_cache
+        .0
+        .entry(allocation.job_config_id.clone())
+        .or_default();
+    if tasks.is_empty() {
+        // The cached accessor, deliberately: this runs once per distinct job
+        // config per node per heartbeat, so on a 5,000-node fleet at a 2s
+        // cadence it was ~10k read-connection acquisitions per second for
+        // rows the read model already holds. Task configs are immutable per
+        // `job_config_id` — a change mints a new config id — which is why the
+        // scheduler already reads them this way and why the cache needs no
+        // invalidation.
+        let task_configs = store.cached_task_configs_for_job_config(&allocation.job_config_id)?;
+        for (id, config) in task_configs {
+            tasks.insert(id, config);
+        }
+    }
+    let task = tasks
+        .get(&allocation.task_config_id)
+        .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
+    let instance = match allocation.instance_id.as_deref() {
+        Some(instance_id) => store.get_instance(instance_id)?,
+        None => None,
+    };
+    let volumes =
+        store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
+    let mut payload = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+    // The band orders the worker's memory pressure response. Read from the
+    // read model, so building a payload pays no store read for it.
+    payload.priority_band = store
+        .cached_band_for_job_config(&allocation.job_config_id)?
+        .as_str()
+        .to_string();
+    payload.restore = snapshot_rpcs::snapshot_restore_payload(store, instance.as_ref());
+    Ok(payload)
 }
 
 /// Resolve the current endpoint set for every upstream declared by this node's
@@ -12104,8 +12495,6 @@ mod tests {
     use futures::StreamExt;
     use serde_json::{json, Map, Value};
     use tempfile::Builder;
-    use tokio::sync::oneshot;
-    use tonic::transport::Server;
 
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
@@ -12130,6 +12519,123 @@ mod tests {
     /// leader's name and address in the message (plan §A4, JC-4) — even
     /// when the typed error is buried under pipeline context, as the raft
     /// driver produces it.
+    #[test]
+    fn map_store_error_keeps_the_cause_of_a_refused_request() {
+        // P2-2: a precondition the caller can fix is FAILED_PRECONDITION
+        // with the store's own sentence, not a bare "Internal error".
+        let err = anyhow::Error::new(StorageError::failed_precondition(
+            "Job web must be stopped before it can be destroyed (it is running)",
+        ))
+        .context("raft op destroy_job");
+        let status = map_store_error("Error deleting job", err);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status
+                .message()
+                .contains("must be stopped before it can be destroyed"),
+            "{}",
+            status.message()
+        );
+        assert!(!status.message().contains("foreign key"));
+
+        // An untyped failure is still INTERNAL, but carries its cause.
+        let err = anyhow!("disk quota exceeded").context("failed writing plan");
+        let status = map_store_error("Error running job", err);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(
+            status.message(),
+            "Error running job: failed writing plan: disk quota exceeded"
+        );
+    }
+
+    /// The submit half of the capability allowlist: a container task whose
+    /// effective set no worker type allows is rejected before it places; a
+    /// set some type allows, and any drop-only adjustment, passes.
+    #[test]
+    fn capabilities_no_worker_type_allows_are_rejected_at_submit() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let job = |security: Value| -> R<crate::structs::JobConfig> {
+            Ok(serde_json::from_value(json!({
+                "name": "caps",
+                "tasks": [{
+                    "name": "tool",
+                    "runtime": "container",
+                    "config": { "image": "alpine", "command": ["true"], "security": security },
+                }],
+            }))?)
+        };
+        let admin = job(json!({ "capabilities": { "add": ["SYS_ADMIN"] } }))?;
+        let dropper = job(json!({ "capabilities": { "drop": ["ALL"] } }))?;
+
+        // No worker types yet: nothing to judge against.
+        manager.validate_job_capabilities(&admin)?;
+
+        let worker_type = |name: &str, container: &str| crate::structs::WorkerConfig {
+            name: name.into(),
+            pool: "default".into(),
+            resources: "{}".into(),
+            reserved_resources: "{}".into(),
+            container: container.into(),
+            ..Default::default()
+        };
+        store.insert_worker_type(&worker_type("default", ""))?;
+        let err = manager
+            .validate_job_capabilities(&admin)
+            .expect_err("no worker type allows SYS_ADMIN")
+            .to_string();
+        assert!(err.contains("task tool"), "{err}");
+        assert!(err.contains("SYS_ADMIN"), "{err}");
+        assert!(err.contains("container.allowCaps"), "{err}");
+        assert!(err.contains("worker types: default"), "{err}");
+        manager.validate_job_capabilities(&dropper)?;
+        manager.validate_job_capabilities(&job(json!({}))?)?;
+
+        // One worker type allows it: admitted (that type's nodes can run it).
+        store.insert_worker_type(&worker_type("privileged", r#"{"allowCaps":["ALL"]}"#))?;
+        manager.validate_job_capabilities(&admin)?;
+
+        // A task pinned to macOS ignores capabilities, so it is not judged.
+        let mut mac = admin.clone();
+        store.insert_worker_type(&worker_type("privileged", ""))?;
+        assert!(manager.validate_job_capabilities(&mac).is_err());
+        mac.tasks[0].constraints = json!({ "os": "macos" });
+        manager.validate_job_capabilities(&mac)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn destroying_a_running_job_is_a_failed_precondition_with_the_reason() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let config: crate::structs::JobConfig = serde_json::from_value(json!({
+            "name": "still-running",
+            "tasks": [{ "name": "web", "runtime": "noop" }],
+        }))?;
+        store.handle_job_submit(
+            &config,
+            &[crate::structs::Submission {
+                path: "job.json".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let status = manager
+            .destroy_job(Request::new(crate::structs::DestroyJobRequest {
+                name: "still-running".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a running job cannot be destroyed");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().contains("legion job stop still-running"),
+            "{}",
+            status.message()
+        );
+        Ok(())
+    }
+
     #[test]
     fn map_store_error_surfaces_raft_leader_hint() {
         let err = anyhow::Error::new(crate::storage::raft::driver::NotRaftLeader {
@@ -12889,6 +13395,36 @@ mod tests {
         Ok(())
     }
 
+    /// A worker that re-registers after its node was marked LOST must come
+    /// back schedulable (spot-check P0-6). `unavailable` is what loss sets,
+    /// not operator intent, so keeping it registered an `active` node that
+    /// every placement then skipped ("No nodes available").
+    #[tokio::test]
+    async fn re_registration_after_loss_makes_the_node_schedulable() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let register = || {
+            tonic::Request::new(WorkerRegisterRequest {
+                name: "lost-node".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                ..Default::default()
+            })
+        };
+        manager.worker_register(register()).await?;
+        store.mark_nodes_as_lost(&["lost-node".to_string()])?;
+        assert_eq!(store.get_node("lost-node")?.availability, "unavailable");
+
+        manager.worker_register(register()).await?;
+        let node = store.get_node("lost-node")?;
+        assert_eq!(node.status, "active");
+        assert_eq!(node.availability, "available");
+        assert!(store.available_node_ids()?.contains("lost-node"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn replace_instance_rejects_allocations_on_healthy_nodes() -> R<()> {
         let store = setup_store()?;
@@ -13101,6 +13637,10 @@ mod tests {
         }
     }
 
+    /// The restart is proxied over the mTLS worker plane: the manager dials
+    /// with its own certificate and verifies the node's name. A listener
+    /// serving another node's certificate at the registered address is
+    /// refused with an actionable message instead of receiving the call.
     #[tokio::test]
     async fn manager_forwards_worker_restart() -> R<()> {
         let store = setup_store()?;
@@ -13131,9 +13671,9 @@ mod tests {
             called: called.clone(),
         };
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            Server::builder()
+            tonic::transport::Server::builder()
                 .add_service(crate::structs::worker_server::WorkerServer::new(worker))
                 .serve_with_incoming_shutdown(
                     crate::cluster_tls::tls_incoming(listener, tls),
@@ -13165,7 +13705,6 @@ mod tests {
                 node_id: "node-1".into(),
             }))
             .await?;
-
         assert_eq!(response.into_inner().message, "ok");
         assert_eq!(
             called.lock().expect("mutex").as_deref(),
@@ -13217,10 +13756,73 @@ mod tests {
                 max_bytes: 0,
                 tail: false,
                 offset: 0,
+                include_removed: false,
             }))
             .await
             .expect_err("missing target should error");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        Ok(())
+    }
+
+    /// P1-9: once an allocation is removed, `legion job logs` still finds
+    /// it (job, task, node from the allocation history) and asks its node.
+    /// Here the node has no worker address, so the entry carries an error
+    /// rather than streams — but it is there, marked removed, with its cause,
+    /// instead of "No allocations found". A destroyed job's logs too.
+    #[tokio::test]
+    async fn get_allocation_logs_reaches_removed_allocations() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let alloc =
+            submit_and_place_identity_task(&store, "gone", TaskConfig::new("fetch", "noop"))?;
+        store.remove_allocs_for_job("gone")?;
+        assert!(store.allocs_for_job("gone")?.is_empty());
+
+        let request = |job: &str, allocation_id: Option<i64>| {
+            Request::new(GetAllocationLogsRequest {
+                job: job.into(),
+                allocation_id,
+                stream: "all".into(),
+                ..Default::default()
+            })
+        };
+        let reply = manager
+            .get_allocation_logs(request("gone", None))
+            .await?
+            .into_inner();
+        assert_eq!(reply.allocations.len(), 1, "{reply:?}");
+        let entry = &reply.allocations[0];
+        assert_eq!(entry.allocation_id, alloc.id);
+        assert!(entry.removed);
+        assert_eq!(entry.removal_cause, "stop");
+        assert_eq!(entry.task_name, "fetch");
+        assert_eq!(entry.node_id, "node-1");
+        assert!(entry.removed_at_unix > 0);
+        assert!(!entry.error.is_empty(), "node-1 has no worker address");
+
+        // By id.
+        let reply = manager
+            .get_allocation_logs(request("", Some(alloc.id)))
+            .await?
+            .into_inner();
+        assert_eq!(reply.allocations.len(), 1);
+        assert!(reply.allocations[0].removed);
+
+        // An id that never existed is still NotFound.
+        let status = manager
+            .get_allocation_logs(request("", Some(alloc.id + 1000)))
+            .await
+            .expect_err("unknown allocation");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+
+        // The job is destroyed; its removed allocations stay readable.
+        store.stop_job("gone")?;
+        store.destroy_job("gone")?;
+        let reply = manager
+            .get_allocation_logs(request("gone", None))
+            .await?
+            .into_inner();
+        assert_eq!(reply.allocations.len(), 1);
         Ok(())
     }
 
@@ -13237,6 +13839,7 @@ mod tests {
                 max_bytes: 0,
                 tail: false,
                 offset: 0,
+                include_removed: false,
             }))
             .await
             .expect_err("unknown job should error");
@@ -14800,18 +15403,23 @@ mod tests {
         )?;
         // The reschedule is enqueued from a spawned thread, so poll rather
         // than sleep a fixed 10ms, which flaked under a loaded machine.
+        // The freed capacity can also queue a capacity pass (`node_join`), in
+        // either order, so look for the reschedule rather than take the
+        // first eval.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let evals = loop {
-            let evals = store.get_evals()?;
-            if !evals.is_empty() || std::time::Instant::now() >= deadline {
-                break evals;
+        let eval = loop {
+            let reschedule = store
+                .get_evals()?
+                .into_iter()
+                .find(|eval| eval.kind == "job_reschedule");
+            if reschedule.is_some() || std::time::Instant::now() >= deadline {
+                break reschedule;
             }
             std::thread::sleep(Duration::from_millis(10));
         };
 
         assert!(store.get_allocation_by_id(allocation.id)?.is_none());
-        let eval = evals.first().context("missing eval")?;
-        assert_eq!(eval.kind, "job_reschedule");
+        let eval = eval.context("missing job_reschedule eval")?;
         assert_eq!(eval.job_config_id, job_config_id);
         assert_eq!(eval.node_name, "node-a");
 
@@ -15526,6 +16134,151 @@ mod tests {
             "complete"
         );
 
+        Ok(())
+    }
+
+    /// A terminal report for a task other tasks depend on queues the eval
+    /// that places them (they were held until it exited); a report for a
+    /// task nothing depends on queues nothing.
+    #[test]
+    fn a_terminal_report_queues_the_dependents_eval() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "dag-report".into(),
+            tasks: vec![
+                TaskConfig {
+                    lifecycle: crate::structs::TaskLifecycle::Batch,
+                    group: "prep".into(),
+                    ..TaskConfig::new("prep", "noop")
+                },
+                TaskConfig {
+                    group: "api".into(),
+                    depends_on: vec![crate::structs::TaskDependency {
+                        task: "prep".into(),
+                        condition: crate::structs::TaskDependencyCondition::Success,
+                    }],
+                    ..TaskConfig::new("api", "noop")
+                },
+            ],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let placed = crate::manager::scheduler::Scheduler::new(&store)?
+            .plan_and_apply(&job_config_id, crate::manager::scheduler::PlanMode::Fresh)?;
+        assert_eq!(placed.allocations.len(), 1, "api waits for prep");
+        assert_eq!(evals_of_kind(&store, "dag-report", "job_reschedule")?, 0);
+
+        handle_terminated_allocations(
+            &store,
+            "node-a",
+            &[crate::structs::TerminatedAllocation {
+                allocation_id: placed.allocations[0].id,
+                success: true,
+                exit_code: Some(0),
+                signal: None,
+                message: "exited with status 0".into(),
+            }],
+        )?;
+        assert_eq!(evals_of_kind(&store, "dag-report", "job_reschedule")?, 1);
+        Ok(())
+    }
+
+    /// Re-running the unchanged spec of a stopped job starts it again (it
+    /// used to reply "no update needed" and place nothing). A job that is
+    /// running keeps the old answer.
+    #[tokio::test]
+    async fn rerunning_an_unchanged_stopped_job_starts_it_again() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        insert_node(&store, "node-a")?;
+        let jobspec = json!({
+            "name": "revive",
+            "task": { "runtime": "exec", "config": { "command": ["true"] } }
+        })
+        .to_string();
+        let run = || {
+            manager.run_job(Request::new(RunJobRequest {
+                parsed_jobspec: jobspec.clone(),
+                submissions: vec![submission()],
+                priority: None,
+                force_reschedule: false,
+                idempotency_key: None,
+            }))
+        };
+
+        run().await?;
+        let job_config_id = store.get_job_config("revive")?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        store.place_alloc("node-a", task_id)?;
+        let running = run().await?.into_inner();
+        assert!(
+            running.message.contains("no update needed"),
+            "{}",
+            running.message
+        );
+        assert_eq!(evals_of_kind(&store, "revive", "job_update")?, 0);
+
+        store.stop_job("revive")?;
+        store.remove_allocs_for_job("revive")?;
+        let revived = run().await?.into_inner();
+        assert!(
+            revived.message.contains("starting it again"),
+            "{}",
+            revived.message
+        );
+        assert_eq!(store.get_job("revive")?.status, "active");
+        assert_eq!(evals_of_kind(&store, "revive", "job_update")?, 1);
+        Ok(())
+    }
+
+    /// GetJobInfo reports what the job is doing, not the stored `active`.
+    #[tokio::test]
+    async fn job_info_reports_the_derived_status() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "status-job".into(),
+            tasks: vec![TaskConfig::new("api", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        async fn status_of(manager: &ManagerDaemonService) -> R<String> {
+            let reply = manager
+                .get_job_info(Request::new(GetJobInfoRequest {
+                    name: "status-job".into(),
+                }))
+                .await?;
+            Ok(reply.into_inner().job.expect("job").status)
+        }
+        assert_eq!(
+            status_of(&manager).await?,
+            "pending",
+            "accepted, nothing placed yet"
+        );
+
+        let job_config_id = store.get_job_config("status-job")?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        store.place_alloc("node-a", task_id)?;
+        assert_eq!(status_of(&manager).await?, "running");
+
+        let listed = manager
+            .list_jobs(Request::new(ListJobsRequest::default()))
+            .await?
+            .into_inner();
+        assert_eq!(listed.jobs[0].status, "running");
+        assert_eq!(listed.status_counts.get("running"), Some(&1));
+
+        store.stop_job("status-job")?;
+        assert_eq!(status_of(&manager).await?, "stopped");
         Ok(())
     }
 

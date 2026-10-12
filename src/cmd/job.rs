@@ -25,6 +25,7 @@ pub fn config() -> Command {
         .arg(
             Arg::new("path")
                 .value_name("PATH")
+                .required(true)
                 .help("Path or URL to the job specification to run (.ncl Nickel, or .json)")
                 .value_hint(ValueHint::AnyPath),
         )
@@ -217,6 +218,15 @@ pub fn config() -> Command {
                 .long("follow")
                 .short('f')
                 .help("Stream new log output until interrupted (incompatible with --json)")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("include-removed")
+                .long("include-removed")
+                .help(
+                    "Also show the job's allocations removed in the last 24 hours (shown \
+                     anyway when the job has no live allocation)",
+                )
                 .action(ArgAction::SetTrue),
         )
         .arg(json_flag());
@@ -1143,6 +1153,7 @@ async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
         .unwrap_or(0);
     let tail = arg_matches.get_flag("tail");
     let follow = arg_matches.get_flag("follow");
+    let include_removed = arg_matches.get_flag("include-removed");
 
     if name.is_none() && allocation_id.is_none() {
         return Err(output::fail_local(
@@ -1169,7 +1180,7 @@ async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
                 ),
             ));
         }
-        return follow_logs(&mut client, &job, allocation_id, &stream).await;
+        return follow_logs(&mut client, &job, allocation_id, &stream, include_removed).await;
     }
 
     let request = tonic::Request::new(GetAllocationLogsRequest {
@@ -1179,6 +1190,7 @@ async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
         max_bytes,
         tail,
         offset: 0,
+        include_removed,
     });
     let response = output::resolve(
         format,
@@ -1198,12 +1210,7 @@ async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
     }
 
     for alloc in &response.allocations {
-        println!(
-            "== allocation {} (task {}) on {} ==",
-            alloc.allocation_id,
-            task_label(&alloc.task_name),
-            alloc.node_id
-        );
+        println!("{}", allocation_header(alloc));
         if !alloc.error.is_empty() {
             println!("  error: {}", alloc.error);
             continue;
@@ -1223,6 +1230,37 @@ async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
         }
     }
     Ok(())
+}
+
+/// `== allocation 12 (task web) on node-a ==`, plus why and when for a
+/// removed allocation, so its output is never mistaken for a live one's.
+fn allocation_header(alloc: &crate::structs::AllocationLog) -> String {
+    let mut header = format!(
+        "== allocation {} (task {}) on {}",
+        alloc.allocation_id,
+        task_label(&alloc.task_name),
+        alloc.node_id
+    );
+    if alloc.removed {
+        let cause = if alloc.removal_cause.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", alloc.removal_cause)
+        };
+        let when = time::OffsetDateTime::from_unix_timestamp(alloc.removed_at_unix)
+            .ok()
+            .and_then(|at| {
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .map(|at| format!(" at {at}"))
+            .unwrap_or_default();
+        header.push_str(&format!(" [removed{cause}{when}]"));
+    } else if crate::constants::allocation_status_is_terminal(&alloc.status) {
+        header.push_str(&format!(" [{}]", alloc.status));
+    }
+    header.push_str(" ==");
+    header
 }
 
 fn task_label(task_name: &str) -> String {
@@ -1251,6 +1289,7 @@ async fn follow_logs(
     job: &str,
     allocation_id: Option<i64>,
     stream: &str,
+    include_removed: bool,
 ) -> R<()> {
     use std::collections::{HashMap, HashSet};
 
@@ -1267,6 +1306,7 @@ async fn follow_logs(
             max_bytes: 0,
             tail: true,
             offset: 0,
+            include_removed,
         });
         let response = match client.get_allocation_logs(request).await {
             Ok(resp) => resp.into_inner(),
@@ -1307,12 +1347,7 @@ async fn follow_logs(
 
                 if !new_text.is_empty() {
                     if header_shown.insert(alloc.allocation_id) {
-                        println!(
-                            "== allocation {} (task {}) on {} ==",
-                            alloc.allocation_id,
-                            task_label(&alloc.task_name),
-                            alloc.node_id
-                        );
+                        println!("{}", allocation_header(alloc));
                     }
                     print!("[{}] ", s.stream);
                     print_stream_content(&new_text);
@@ -1344,8 +1379,59 @@ mod tests {
     #[test]
     fn priority_conflicts_with_asap() {
         let cmd = config();
-        let result = cmd.try_get_matches_from(["job", "run", "--priority", "75", "--asap"]);
-        assert!(result.is_err());
+        let result =
+            cmd.try_get_matches_from(["job", "run", "spec.ncl", "--priority", "75", "--asap"]);
+        let err = result.expect_err("--priority and --asap conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// P2-1: `job run` with no path used to read `./configs/jobs/demo.ncl`,
+    /// which only exists in a repo checkout. The spec is now required.
+    #[test]
+    fn run_requires_a_spec_path() {
+        let err = config()
+            .try_get_matches_from(["job", "run"])
+            .expect_err("a spec path is required");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn logs_take_include_removed() {
+        let matches = config()
+            .try_get_matches_from(["job", "logs", "demo", "--include-removed", "--json"])
+            .expect("parses");
+        let (_, logs) = matches.subcommand().expect("logs");
+        assert!(logs.get_flag("include-removed"));
+    }
+
+    #[test]
+    fn a_removed_allocation_header_says_so() {
+        let alloc = crate::structs::AllocationLog {
+            allocation_id: 12,
+            node_id: "node-a".into(),
+            task_name: "fetch".into(),
+            removed: true,
+            removal_cause: "stop".into(),
+            removed_at_unix: 0,
+            status: "failed".into(),
+            ..Default::default()
+        };
+        let header = allocation_header(&alloc);
+        assert!(
+            header.starts_with("== allocation 12 (task fetch) on node-a [removed, stop at "),
+            "{header}"
+        );
+        let live = crate::structs::AllocationLog {
+            allocation_id: 13,
+            node_id: "node-a".into(),
+            task_name: "fetch".into(),
+            status: "placed".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            allocation_header(&live),
+            "== allocation 13 (task fetch) on node-a =="
+        );
     }
 
     #[test]
@@ -1973,7 +2059,8 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
 
     let job_path = arg_matches
         .get_one::<String>("path")
-        .map_or("./configs/jobs/demo.ncl", String::as_str);
+        .map(String::as_str)
+        .context("Must provide the job spec path")?;
     let priority = priority_from_matches(arg_matches);
     let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
     let vars = config_vars_from_matches(arg_matches)?;
@@ -2333,8 +2420,34 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     if format.is_json() {
         print_json(&response.into_inner().job);
     } else {
-        let printable_job: JobPrint = response.into_inner().job.context("no job found")?.into();
+        let job = response.into_inner().job.context("no job found")?;
+        let blocked = job.blocked.clone();
+        let printable_job: JobPrint = job.into();
         print_table(vec![printable_job]);
+        // What a blocked job waits for (docs/scheduler-and-eval-loop.md,
+        // "Blocked evals"): it places on its own when that capacity appears.
+        if let Some(blocked) = blocked {
+            let mut shortfall: Vec<String> = blocked
+                .shortfall
+                .iter()
+                .map(|(resource, amount)| format!("{resource} {amount}"))
+                .collect();
+            shortfall.sort();
+            println!(
+                "Blocked on {} since {}: task {} needs {} per placement",
+                blocked.key,
+                chrono::DateTime::from_timestamp(blocked.since, 0)
+                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                    .unwrap_or_else(|| blocked.since.to_string()),
+                blocked.task,
+                if shortfall.is_empty() {
+                    "room".to_string()
+                } else {
+                    shortfall.join(", ")
+                }
+            );
+            println!("  {}", blocked.message);
+        }
     }
 
     Ok(())

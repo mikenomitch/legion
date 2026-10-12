@@ -54,6 +54,14 @@ in a container with a read-only `/sys/fs/cgroup` both land here. On macOS
 the switch measures sandboxes for usage reports and idle policies and
 confines nothing.
 
+A Linux worker that does enforce logs, once at startup, `Resource enforcement
+enabled: governed tasks run in worker-owned cgroups` with the cgroup root and
+the usable CPU list. That line is logged by the governor itself after it has
+checked the node, so its absence (with one of the warnings above in its
+place) means tasks run unconfined. Once a governed task is running,
+`/sys/fs/cgroup/<cgroupParent>/share/` (or `reserve/`) holds a
+`legion-<allocation>` leaf with the task's `memory.max`.
+
 ## What each field means
 
 | Jobspec | Kernel meaning (Linux, enforcement on) |

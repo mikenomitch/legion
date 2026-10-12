@@ -61,7 +61,10 @@
         command = ["nginx", "-c", "/legion/task/nginx.conf", "-g", "daemon off;"],
       },
       network = {
-        ports = [{ name = "https", static = 9443, to = 443 }],
+        # nginx listens on the advertised port itself. A `to` remap would
+        # only apply on macOS (Apple container); on Linux the container
+        # shares the host's network, so it must bind 9443 directly.
+        ports = [{ name = "https", static = 9443 }],
       },
       files = [
         {
@@ -92,7 +95,7 @@
               events {}
               http {
                 server {
-                  listen 443 ssl;
+                  listen 9443 ssl;
                   ssl_certificate     /legion/task/tls/bundle.pem;
                   ssl_certificate_key /legion/task/tls/bundle.pem;
                   location / { return 200 "hello over TLS\n"; }

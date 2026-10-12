@@ -217,7 +217,14 @@ creates and destroys by name. Submitting the job places nothing, and `count`
 doesn't apply. An instance keeps its id, its volume, and its checkpoint across
 reschedules and suspends. Ids are never recycled, so a destroyed user's data
 can't leak into a new instance that reuses the name. See
-[keyed mode](../stateful-workloads.md#keyed-mode-the-management-api).
+[keyed mode](../stateful-workloads.md#keyed-mode-the-management-api), and
+[Choosing a mode](../stateful-workloads.md#choosing-a-mode) for why a sandbox
+is keyed rather than a `count` or a `slot` pool. Keyed is the mode with a
+durable record per sandbox: once `instance create` returns, the sandbox is
+placed through a manager failover and through a full cluster, and it is
+replaced after a node loss. That record is also what each sandbox costs the
+control plane; [Sandboxes at scale](../sandboxes-at-scale.md) has the
+numbers.
 
 **`requireId = true`** makes `--id` required. Your platform already has
 user or session ids, so let them be the instance ids rather than mapping
@@ -596,6 +603,18 @@ agent should hold it (see [Security](#security)). See
 [agent readiness](../agent-readiness.md#1-mcp-server-legion-mcp-serve).
 
 ## Capacity
+
+When the cluster is full, a new sandbox does not fail: `instance create`
+returns, the instance stays `pending`, and its job waits **blocked** until a
+node that can host it joins or frees room, then places on its own.
+`legion job info agents -j` names what it waits for (`blocked.key`, the
+task, and its per-sandbox `shortfall`). See
+[Sandboxes at scale](../sandboxes-at-scale.md#when-capacity-runs-out).
+
+How many sandboxes a cluster can start, suspend, and resume per second, and
+what each one costs the control plane, are in
+[Sandboxes at scale](../sandboxes-at-scale.md), with the load generator and
+the AWS campaign that measure them on your own hardware.
 
 ### Reading `legion node usage`
 
@@ -1096,5 +1115,8 @@ and [the limits of the pressure response](../resource-enforcement.md#limits-of-t
   oversubscription, the pressure steps
 - [The sandbox runtime](../task-runtime-sandbox.md): microVMs, guest size,
   checkpoints
-- [Stateful workloads](../stateful-workloads.md): keyed instances
+- [Stateful workloads](../stateful-workloads.md): keyed instances, and
+  choosing a mode
+- [Sandboxes at scale](../sandboxes-at-scale.md): lifecycle costs, delivery,
+  blocked creates, and measuring a cluster's sandbox throughput
 - [Running Postgres](postgres.md): the same stateful machinery for a database

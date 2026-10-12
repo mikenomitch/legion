@@ -106,7 +106,28 @@ pub fn config() -> Command {
                 .requires("simulate")
                 .help("Registration ramp in nodes/second (default: 100)"),
         )
-        .arg(crate::cmd::join::advertise_addr_arg());
+        .arg(crate::cmd::join::advertise_addr_arg())
+        .arg(
+            Arg::new("sim-no-work-stream")
+                .long("sim-no-work-stream")
+                .action(ArgAction::SetTrue)
+                .requires("simulate")
+                .help(
+                    "Take work from the heartbeat's desired set instead of `StreamWork`, \
+                     the delivery a worker without the work stream gets",
+                ),
+        )
+        .arg(
+            Arg::new("sim-checkpoints")
+                .long("sim-checkpoints")
+                .action(ArgAction::SetTrue)
+                .requires("simulate")
+                .help(
+                    "Fake the checkpoint channel: advertise `checkpoint`, fingerprint as a \
+                     sandbox host, and answer every capture, delete, and restore as done, \
+                     so suspend, resume, and fork can be load tested",
+                ),
+        );
 
     Command::new("start")
         .about("Start a daemon")
@@ -133,11 +154,8 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             run_worker(token, name, advertise).await
         }
         Some(("manager", arg_matches)) => {
-            let config_path = arg_matches
-                .get_one::<String>("config")
-                .map_or(DEF_CONFIG_PATH, String::as_str);
             let run_worker = arg_matches.get_flag("run-worker");
-            let config = parse_config(config_path)?;
+            let config = load_config(arg_matches.get_one::<String>("config"))?;
             // Restore runs BEFORE the store (and any raft engine) starts:
             // the backup becomes the initial state the engine adopts (plan
             // §A5; docs/upgrades.md "Backup and restore").
@@ -159,12 +177,19 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             crate::manager::daemon::run_manager_with(config, run_worker, restore_from).await
         }
         _ => {
-            let config_path = sub_matches
-                .get_one::<String>("config")
-                .map_or(DEF_CONFIG_PATH, String::as_str);
-            let config = parse_config(config_path)?;
+            let config = load_config(sub_matches.get_one::<String>("config"))?;
             run_manager(config, false).await
         }
+    }
+}
+
+/// The manager config: the file `-c` names, or the built-in defaults when
+/// there is no `-c`. Nothing is read from the working directory implicitly,
+/// so `legion start manager` behaves the same wherever it is run.
+fn load_config(config_path: Option<&String>) -> R<ManagerConfig> {
+    match config_path {
+        Some(path) => parse_config(path),
+        None => Ok(serde_json::from_str("{}")?),
     }
 }
 
@@ -204,6 +229,9 @@ fn simulate_options(count: usize, arg_matches: &ArgMatches) -> R<SimulateOptions
             .cloned()
             .or(defaults.advertise_host),
         identity_dir: None,
+        checkpoints: arg_matches.get_flag("sim-checkpoints"),
+        observer: None,
+        work_stream: !arg_matches.get_flag("sim-no-work-stream"),
     })
 }
 
@@ -212,6 +240,32 @@ fn config_path_arg() -> Arg {
         .short('c')
         .long("config")
         .value_name("CONFIG")
-        .help("Path to the manager configuration file")
+        .help("Path to the manager configuration file (default: built-in defaults)")
         .value_hint(ValueHint::FilePath)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P2-1: `legion start manager` with no `-c` must not read
+    /// `./configs/manager.ncl` (which only exists in a repo checkout).
+    #[test]
+    fn no_config_flag_uses_the_built_in_defaults() -> R<()> {
+        let config = load_config(None)?;
+        let full = config.with_defaults();
+        assert_eq!(full.server.port, DEF_MANAGER_SERVER_PORT);
+        assert!(
+            full.worker_config_path.is_empty(),
+            "no worker config directory unless one is configured"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_explicit_config_that_does_not_exist_is_an_error() {
+        let missing = "/nonexistent/legion/manager.ncl".to_string();
+        let err = load_config(Some(&missing)).expect_err("a named file must exist");
+        assert!(format!("{err:#}").contains("manager.ncl"), "{err:#}");
+    }
 }

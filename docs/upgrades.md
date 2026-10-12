@@ -41,11 +41,16 @@ The whole sequence fits in Kubernetes' default 30-second termination grace
 period. A second SIGTERM or SIGINT during the drain skips the rest and exits
 immediately.
 
-Raft leadership is not handed off before exit. openraft 0.9 has no
-leadership-transfer API, so the remaining managers elect a new leader after
-their election timeout, the same as after a crash. Writes to lanes the
-stopped manager led pause for that window, so restart managers one at a
-time and wait for `legion raft status` to show a leader before the next.
+Stopping a manager does not hand off raft leadership: the remaining managers
+elect a new leader after their election timeout, the same as after a crash,
+and writes to lanes the stopped manager led pause for that window. To avoid
+the pause when stopping the leader, run `legion raft command step-down` (or
+`transfer-leader --target <manager>`) first; see
+[raft-operations.md](raft-operations.md#moving-leadership). Restart managers
+one at a time and wait for `legion raft status` to show a leader before the
+next. A restarted manager rejoins as a follower without forcing an election.
+Workers move to another manager while one is down
+([Managers a worker can reach](architecture-managers-workers.md#managers-a-worker-can-reach)).
 
 A manager whose gRPC listener fails to bind (the port is taken, or the TLS
 certificate can't be loaded) or stops serving exits with a non-zero status
@@ -101,7 +106,7 @@ keep that hot path lean. The check runs once per registration.
 
 | Version | Added | Behavior with an older worker |
 | --- | --- | --- |
-| 3 | The authenticated worker plane: the worker serves `Worker` over mutual TLS with a node certificate it requested by CSR, binds all interfaces, and advertises a reachable `https://` address ([Managers and Workers](architecture-managers-workers.md#the-worker-plane)). Join tokens are format v2 and pin the cluster CA | Managers never dial a worker in plaintext. A protocol-2 worker keeps registering, heartbeating, and running the work its heartbeat replies carry, but exec, actions, logs, and restart against it fail with an error naming its protocol version until it is upgraded. Push dispatch to it is skipped (the heartbeat delivers the work one interval later). Join tokens minted by an older manager (format v1) are refused; mint new ones |
+| 3 | The authenticated worker plane: the worker serves `Worker` over mutual TLS with a node certificate it requested by CSR (the `IssueNodeCertificate` reply no longer carries a key), binds all interfaces, and advertises a reachable `https://` address ([Managers and Workers](architecture-managers-workers.md#the-worker-plane)). Join tokens are format v2 and pin the cluster CA | Managers never dial a worker in plaintext. A protocol-2 worker keeps registering, heartbeating, and running the work its heartbeat replies carry, but exec, actions, logs, and restart against it fail with an error naming its protocol version until it is upgraded. Push dispatch to it is skipped (the heartbeat delivers the work one interval later), and its mesh certificate requests are refused (no CSR), so `certFrom = "legion"` flows on that node stop until it is upgraded. Join tokens minted by an older manager (format v1) are refused; mint new ones. Upgrade workers promptly after the managers, and allow TCP 4848 from every manager (and edge router) to every worker first |
 | 2 | Workers report task-process exits (`terminated_allocations` on the heartbeat), so a batch task's `Success` comes from its exit code. See [Task Supervision](task-supervision.md) | The manager reads the node's advertised `protocolVersion` and keeps the pre-2 behavior for batch tasks placed there: the task is marked `Success` at placement, as before. Nothing stalls mid-rollout. New placements get exit-code-based status once the worker is upgraded. |
 | 1 | The versioned handshake itself | Workers reporting `0` are pre-versioning builds and are accepted with a warning |
 

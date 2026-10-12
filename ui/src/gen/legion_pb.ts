@@ -225,9 +225,11 @@ export class WorkerPreRegisterRequest extends Message<WorkerPreRegisterRequest> 
   /**
    * Join token secret (the `secret` field of a decoded join token).
    *
-   * Required when ACLs are enforced: the manager validates it against its
-   * stored join tokens before serving worker configuration. Ignored when
-   * ACLs are disabled.
+   * When ACLs are enforced the caller must present either this (validated
+   * against the manager's stored join tokens) or an already-issued node
+   * token as its bearer credential, with this field left unset — the path a
+   * restarted worker takes, so it does not depend on its join token still
+   * being valid. Ignored when ACLs are disabled.
    *
    * @generated from field: optional string join_token = 2;
    */
@@ -429,6 +431,25 @@ export class WorkerConfig extends Message<WorkerConfig> {
   edgeBoot = "";
 
   /**
+   * JSON-encoded `container` runtime settings for this worker type (see
+   * docs/task-runtime-container.md, "Capabilities"). Shape:
+   * `{"allowCaps":["CAP_CHOWN","CAP_NET_RAW",...]}` or `{"allowCaps":["ALL"]}`.
+   *
+   * `allowCaps` is the set of Linux capabilities a `container` task on this
+   * node may end up with after its `security.capabilities` adjustments (the
+   * default set, less `drop`, plus `add`). A task whose effective set holds
+   * anything outside it fails at start on this node, with a message naming
+   * each refused capability and this field. The manager writes the names
+   * normalized (`CAP_` prefixed, sorted); `["ALL"]` allows every capability.
+   *
+   * Default: empty string (the default set: Docker's default capabilities
+   * less `CAP_NET_RAW`, so jobs may drop capabilities but add none).
+   *
+   * @generated from field: string container = 14;
+   */
+  container = "";
+
+  /**
    * JSON-encoded security settings for workers of this type, folded by the
    * manager from the worker config's top-level blocks
    * (docs/network-handlers.md, "The host guard"):
@@ -441,7 +462,7 @@ export class WorkerConfig extends Message<WorkerConfig> {
    *
    * Default: empty string (the default guard, no overrides).
    *
-   * @generated from field: string security = 14;
+   * @generated from field: string security = 15;
    */
   security = "";
 
@@ -466,7 +487,8 @@ export class WorkerConfig extends Message<WorkerConfig> {
     { no: 11, name: "heartbeat_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 12, name: "resource_enforcement", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "edge_boot", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 14, name: "security", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 14, name: "container", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 15, name: "security", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerConfig {
@@ -582,7 +604,10 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
   /**
    * Join token secret (the `secret` field of a decoded join token).
    *
-   * Required when ACLs are enforced. Ignored when ACLs are disabled.
+   * When ACLs are enforced, a registration must present either this or the
+   * node's own current node token as its bearer credential (with this field
+   * left unset). A node token can re-register only its own node, in its
+   * current pool. Ignored when ACLs are disabled.
    *
    * @generated from field: optional string join_token = 6;
    */
@@ -693,9 +718,22 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
 
   /**
    * Per-node credential for subsequent worker-plane calls (Heartbeat,
-   * HealthCheck). Minted only when ACLs are enforced; re-registering
-   * rotates it (the previous node token is revoked). Workers attach it as
-   * a bearer credential exactly like an ACL token.
+   * HealthCheck, and the identity, certificate, and credential issuers).
+   * Workers attach it as a bearer credential exactly like an ACL token.
+   *
+   * Minted only when ACLs are enforced, and only when the caller registered
+   * with a join token (or a management token): that registration rotates it
+   * (the node's previous node token is revoked). A worker that re-registers
+   * by presenting its CURRENT node token as its bearer credential — what a
+   * restarted worker does, from the token it persisted with mode 0600 in its
+   * state directory — gets no new token here: absent means "keep using the
+   * one you presented". That is what lets a worker restart after its join
+   * token has expired or been revoked, and it removes the window in which a
+   * crash between the manager's rotation and the worker's write would lose
+   * the only valid credential.
+   *
+   * Node tokens do not expire. Removing the node or resetting ACL state
+   * revokes it; the worker then falls back to its join token.
    *
    * @generated from field: optional string node_token = 2;
    */
@@ -724,6 +762,16 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
    */
   managerProtocolVersion = 0;
 
+  /**
+   * Every manager in the cluster, in the same form and with the same
+   * semantics as `HeartbeatReply.manager_addresses`: delivered at
+   * registration so a worker knows its failover set before its first
+   * heartbeat. Empty outside `persistence.type = "raft"`.
+   *
+   * @generated from field: repeated string manager_addresses = 5;
+   */
+  managerAddresses: string[] = [];
+
   constructor(data?: PartialMessage<WorkerRegisterReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -736,6 +784,7 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
     { no: 2, name: "node_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 3, name: "manager_build_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "manager_protocol_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "manager_addresses", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterReply {
@@ -925,8 +974,15 @@ export class RunJobReply extends Message<RunJobReply> {
    * - `"Job submit success"`
    * - `"Rollout started"`
    * - `"Rollout created; waiting for manual start"`
-   * - `"Job config unchanged; no update needed"`
+   * - `"Job config unchanged; no update needed (the job is running; use
+   *   --force-reschedule to restart it)"`
    * - `"Job config unchanged; forced reschedule queued"`
+   * - `"Job config unchanged; job was stopped, starting it again"`
+   * - `"Job config unchanged; job had failed, starting it again"`
+   * - `"Job config unchanged; job was not running, starting it again"`
+   *
+   * An unchanged spec restarts the job (a `job_update` eval) when the job was
+   * stopped or failed, or when nothing of it is running or queued to run.
    *
    * @generated from field: string message = 1;
    */
@@ -8794,9 +8850,14 @@ export class Job extends Message<Job> {
    *   restart it).
    * - `running`: at least one allocation of any version of the job is live
    *   (placed and not yet terminal).
+   * - `blocked`: nothing is live, and the job's eval found no room for a
+   *   placement and waits for capacity that could help (docs/
+   *   scheduler-and-eval-loop.md, "Blocked evals"). It places on its own when
+   *   that capacity appears; `blocked` below says what it waits for. Takes
+   *   the place `pending` would have.
    * - `pending`: nothing is live, and a task that wants an allocation has not
-   *   finished: it is waiting to be placed (no node fits, or no node is up)
-   *   or waiting on a `dependsOn` condition.
+   *   finished: it is waiting to be placed or waiting on a `dependsOn`
+   *   condition.
    * - `scheduled`: nothing is live, nothing is pending, and a cron task
    *   (`schedule`) finished its last run and waits for the next one.
    * - `complete`: nothing is live, and every task that wants an allocation
@@ -8852,6 +8913,17 @@ export class Job extends Message<Job> {
    */
   priority = "";
 
+  /**
+   * Set while the job has an eval blocked on capacity
+   * (docs/scheduler-and-eval-loop.md, "Blocked evals"), whatever `status`
+   * reads: a job with a live allocation reads `running` and still says here
+   * what its other placements wait for; with nothing live it reads
+   * `blocked`. Unset for a job stopped or failed by its lifecycle.
+   *
+   * @generated from field: optional legion.JobBlocked blocked = 7;
+   */
+  blocked?: JobBlocked;
+
   constructor(data?: PartialMessage<Job>) {
     super();
     proto3.util.initPartial(data, this);
@@ -8866,6 +8938,7 @@ export class Job extends Message<Job> {
     { no: 4, name: "created_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 5, name: "updated_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "priority", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "blocked", kind: "message", T: JobBlocked, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {
@@ -8882,6 +8955,93 @@ export class Job extends Message<Job> {
 
   static equals(a: Job | PlainMessage<Job> | undefined, b: Job | PlainMessage<Job> | undefined): boolean {
     return proto3.util.equals(Job, a, b);
+  }
+}
+
+/**
+ * What a blocked job waits for.
+ *
+ * @generated from message legion.JobBlocked
+ */
+export class JobBlocked extends Message<JobBlocked> {
+  /**
+   * The blocking key: `class:pool=<pool>[,<attr>=<value>...]` (any node of
+   * that pool whose attributes match the task's `=` constraints can help),
+   * `node:<id>` (a resume pinned to the node holding its checkpoint or
+   * node-local storage), or `escaped` (the cluster had no schedulable node at
+   * all; any capacity wakes it).
+   *
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * The task that could not place.
+   *
+   * @generated from field: string task = 2;
+   */
+  task = "";
+
+  /**
+   * What one placement of `task` asks for that no eligible node had free:
+   * `cpu` (e.g. `500MHz`) and `memory` (e.g. `512MiB`), for the resources the
+   * task declares. Per placement, not the job's total.
+   *
+   * @generated from field: map<string, string> shortfall = 3;
+   */
+  shortfall: { [key: string]: string } = {};
+
+  /**
+   * The scheduler's diagnosis, the message the eval used to fail with.
+   *
+   * @generated from field: string message = 4;
+   */
+  message = "";
+
+  /**
+   * Unix timestamp (seconds) when the eval blocked.
+   *
+   * @generated from field: int64 since = 5;
+   */
+  since = protoInt64.zero;
+
+  /**
+   * The blocked eval's id.
+   *
+   * @generated from field: string eval_id = 6;
+   */
+  evalId = "";
+
+  constructor(data?: PartialMessage<JobBlocked>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobBlocked";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "shortfall", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 4, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "since", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "eval_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobBlocked {
+    return new JobBlocked().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobBlocked {
+    return new JobBlocked().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobBlocked {
+    return new JobBlocked().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobBlocked | PlainMessage<JobBlocked> | undefined, b: JobBlocked | PlainMessage<JobBlocked> | undefined): boolean {
+    return proto3.util.equals(JobBlocked, a, b);
   }
 }
 
@@ -9792,7 +9952,10 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
   id = "";
 
   /**
-   * Allocation IDs currently known/running on worker.
+   * Allocation IDs currently known/running on worker. Informational: the
+   * manager decides the desired set from its own rows, not from this list.
+   * A worker that reports `work_stream` leaves it empty (the digest stands
+   * in for it).
    *
    * Default: empty list.
    *
@@ -9810,7 +9973,12 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
   failedAllocations: FailedAllocation[] = [];
 
   /**
-   * Latest per-allocation health snapshots from worker.
+   * Per-allocation health snapshots from worker. A worker without
+   * `work_stream` sends every allocation's health on every beat. A worker
+   * on the stream sends only the snapshots that changed since the last
+   * reply that set `HeartbeatReply.desired_via_stream`, and everything again
+   * after any other reply. Either way the manager writes only the rows whose
+   * values changed, so a steady beat writes nothing.
    *
    * Default: empty list.
    *
@@ -9973,6 +10141,21 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
   contentLocations?: ContentLocationReport;
 
   /**
+   * The worker's `StreamWork` position and a digest of the desired set it
+   * holds, sent instead of `allocation_ids` by a worker that receives its
+   * work over the stream (sandbox-scaling plan, Phase 2). The manager
+   * compares the digest with its own for the node once every message up to
+   * `seq` has been applied, and answers `HeartbeatReply.work_resync` when
+   * they differ, so a delta lost to a bug is caught within one beat.
+   *
+   * Absent from workers that do not stream, which get today's full desired
+   * set in every reply.
+   *
+   * @generated from field: optional legion.WorkStreamState work_stream = 15;
+   */
+  workStream?: WorkStreamState;
+
+  /**
    * Direct exec sessions this worker has finished since its last heartbeat
    * (docs/exec-and-actions.md, "Direct exec"): one record per redeemed exec
    * ticket, so the manager's `exec_audit` log holds direct sessions as it
@@ -9982,7 +10165,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    *
    * Default: empty list.
    *
-   * @generated from field: repeated legion.ExecAuditRecord exec_audit = 15;
+   * @generated from field: repeated legion.ExecAuditRecord exec_audit = 16;
    */
   execAudit: ExecAuditRecord[] = [];
 
@@ -9994,7 +10177,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    *
    * Default: empty list.
    *
-   * @generated from field: repeated legion.ExecSessionRef exec_sessions = 16;
+   * @generated from field: repeated legion.ExecSessionRef exec_sessions = 17;
    */
   execSessions: ExecSessionRef[] = [];
 
@@ -10006,7 +10189,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    *
    * Default: empty (the worker does not admit exec tickets).
    *
-   * @generated from field: string exec_keys_version = 17;
+   * @generated from field: string exec_keys_version = 18;
    */
   execKeysVersion = "";
 
@@ -10032,9 +10215,10 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 12, name: "pressure_actions", kind: "message", T: PressureAction, repeated: true },
     { no: 13, name: "snapshot_reports", kind: "message", T: SnapshotReport, repeated: true },
     { no: 14, name: "content_locations", kind: "message", T: ContentLocationReport, opt: true },
-    { no: 15, name: "exec_audit", kind: "message", T: ExecAuditRecord, repeated: true },
-    { no: 16, name: "exec_sessions", kind: "message", T: ExecSessionRef, repeated: true },
-    { no: 17, name: "exec_keys_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 15, name: "work_stream", kind: "message", T: WorkStreamState, opt: true },
+    { no: 16, name: "exec_audit", kind: "message", T: ExecAuditRecord, repeated: true },
+    { no: 17, name: "exec_sessions", kind: "message", T: ExecSessionRef, repeated: true },
+    { no: 18, name: "exec_keys_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -10051,6 +10235,322 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
 
   static equals(a: HeartbeatRequest | PlainMessage<HeartbeatRequest> | undefined, b: HeartbeatRequest | PlainMessage<HeartbeatRequest> | undefined): boolean {
     return proto3.util.equals(HeartbeatRequest, a, b);
+  }
+}
+
+/**
+ * Where a worker's `StreamWork` delivery stands, as its heartbeat reports
+ * it.
+ *
+ * @generated from message legion.WorkStreamState
+ */
+export class WorkStreamState extends Message<WorkStreamState> {
+  /**
+   * The `StreamWorkReply.epoch` of the messages the worker applied.
+   *
+   * @generated from field: uint64 epoch = 1;
+   */
+  epoch = protoInt64.zero;
+
+  /**
+   * The highest `StreamWorkReply.seq` the worker applied.
+   *
+   * @generated from field: uint64 seq = 2;
+   */
+  seq = protoInt64.zero;
+
+  /**
+   * Digest of the allocation ids in the worker's desired set after `seq`:
+   * `<count>:<xor of splitmix64(id)>`, both in lowercase hex. Order
+   * independent, so either side can update it per delta.
+   *
+   * @generated from field: string digest = 3;
+   */
+  digest = "";
+
+  constructor(data?: PartialMessage<WorkStreamState>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.WorkStreamState";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "epoch", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "seq", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkStreamState {
+    return new WorkStreamState().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): WorkStreamState {
+    return new WorkStreamState().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): WorkStreamState {
+    return new WorkStreamState().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: WorkStreamState | PlainMessage<WorkStreamState> | undefined, b: WorkStreamState | PlainMessage<WorkStreamState> | undefined): boolean {
+    return proto3.util.equals(WorkStreamState, a, b);
+  }
+}
+
+/**
+ * One frame from the worker on `StreamWork`.
+ *
+ * @generated from message legion.StreamWorkRequest
+ */
+export class StreamWorkRequest extends Message<StreamWorkRequest> {
+  /**
+   * @generated from oneof legion.StreamWorkRequest.frame
+   */
+  frame: {
+    /**
+     * The first frame, and only the first.
+     *
+     * @generated from field: legion.StreamWorkOpen open = 1;
+     */
+    value: StreamWorkOpen;
+    case: "open";
+  } | {
+    /**
+     * Every later frame: the highest message the worker has applied.
+     *
+     * @generated from field: legion.StreamWorkAck ack = 2;
+     */
+    value: StreamWorkAck;
+    case: "ack";
+  } | { case: undefined; value?: undefined } = { case: undefined };
+
+  constructor(data?: PartialMessage<StreamWorkRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StreamWorkRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "open", kind: "message", T: StreamWorkOpen, oneof: "frame" },
+    { no: 2, name: "ack", kind: "message", T: StreamWorkAck, oneof: "frame" },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamWorkRequest {
+    return new StreamWorkRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StreamWorkRequest {
+    return new StreamWorkRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StreamWorkRequest {
+    return new StreamWorkRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StreamWorkRequest | PlainMessage<StreamWorkRequest> | undefined, b: StreamWorkRequest | PlainMessage<StreamWorkRequest> | undefined): boolean {
+    return proto3.util.equals(StreamWorkRequest, a, b);
+  }
+}
+
+/**
+ * Opens a `StreamWork` stream.
+ *
+ * @generated from message legion.StreamWorkOpen
+ */
+export class StreamWorkOpen extends Message<StreamWorkOpen> {
+  /**
+   * The worker's node id. Must match the caller's node credential.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * The `epoch` of the last message the worker applied, or 0 when it holds
+   * nothing (a fresh worker process). A value other than the manager's
+   * current epoch gets a full resync.
+   *
+   * @generated from field: uint64 last_epoch = 2;
+   */
+  lastEpoch = protoInt64.zero;
+
+  /**
+   * The `seq` of the last message the worker applied, or 0. The manager
+   * replays everything after it when it still holds those messages, and
+   * resyncs otherwise.
+   *
+   * @generated from field: uint64 last_seq = 3;
+   */
+  lastSeq = protoInt64.zero;
+
+  constructor(data?: PartialMessage<StreamWorkOpen>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StreamWorkOpen";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "last_epoch", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "last_seq", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamWorkOpen {
+    return new StreamWorkOpen().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StreamWorkOpen {
+    return new StreamWorkOpen().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StreamWorkOpen {
+    return new StreamWorkOpen().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StreamWorkOpen | PlainMessage<StreamWorkOpen> | undefined, b: StreamWorkOpen | PlainMessage<StreamWorkOpen> | undefined): boolean {
+    return proto3.util.equals(StreamWorkOpen, a, b);
+  }
+}
+
+/**
+ * Acknowledges every `StreamWork` message up to `seq`, so the manager can
+ * prune them.
+ *
+ * @generated from message legion.StreamWorkAck
+ */
+export class StreamWorkAck extends Message<StreamWorkAck> {
+  /**
+   * @generated from field: uint64 epoch = 1;
+   */
+  epoch = protoInt64.zero;
+
+  /**
+   * @generated from field: uint64 seq = 2;
+   */
+  seq = protoInt64.zero;
+
+  constructor(data?: PartialMessage<StreamWorkAck>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StreamWorkAck";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "epoch", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "seq", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamWorkAck {
+    return new StreamWorkAck().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StreamWorkAck {
+    return new StreamWorkAck().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StreamWorkAck {
+    return new StreamWorkAck().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StreamWorkAck | PlainMessage<StreamWorkAck> | undefined, b: StreamWorkAck | PlainMessage<StreamWorkAck> | undefined): boolean {
+    return proto3.util.equals(StreamWorkAck, a, b);
+  }
+}
+
+/**
+ * One message on `StreamWork`.
+ *
+ * @generated from message legion.StreamWorkReply
+ */
+export class StreamWorkReply extends Message<StreamWorkReply> {
+  /**
+   * The manager process's delivery epoch: a random non-zero value chosen
+   * when the manager starts. Positions from another epoch cannot be
+   * resumed.
+   *
+   * @generated from field: uint64 epoch = 1;
+   */
+  epoch = protoInt64.zero;
+
+  /**
+   * This message's position in the node's sequence. Starts at 1 and grows
+   * by one per message.
+   *
+   * @generated from field: uint64 seq = 2;
+   */
+  seq = protoInt64.zero;
+
+  /**
+   * `true` when `upserts` is the node's whole desired set and replaces
+   * everything the worker holds. `stops` is empty on a resync.
+   *
+   * @generated from field: bool resync = 3;
+   */
+  resync = false;
+
+  /**
+   * Allocations added to or changed in the node's desired set, as full
+   * payloads (the same `TaskAllocation` the heartbeat's desired set carries,
+   * restore payload and band included). The worker launches the new ones
+   * at once and replaces its copy of the rest.
+   *
+   * @generated from field: repeated legion.TaskAllocation upserts = 4;
+   */
+  upserts: TaskAllocation[] = [];
+
+  /**
+   * Allocations that left the node's desired set: stopped, removed,
+   * suspended, preempted. `cause` is the stop notice's cause, empty when
+   * the manager recorded none. A message carrying stops (or a resync, or a
+   * changed payload) makes the worker run its reconcile at once, which
+   * stops anything the desired set no longer lists.
+   *
+   * @generated from field: repeated legion.StopNotice stops = 5;
+   */
+  stops: StopNotice[] = [];
+
+  /**
+   * The digest of the worker's desired set after applying this message, in
+   * the `WorkStreamState.digest` form.
+   *
+   * @generated from field: string digest = 6;
+   */
+  digest = "";
+
+  constructor(data?: PartialMessage<StreamWorkReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StreamWorkReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "epoch", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "seq", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "upserts", kind: "message", T: TaskAllocation, repeated: true },
+    { no: 5, name: "stops", kind: "message", T: StopNotice, repeated: true },
+    { no: 6, name: "digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamWorkReply {
+    return new StreamWorkReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StreamWorkReply {
+    return new StreamWorkReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StreamWorkReply {
+    return new StreamWorkReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StreamWorkReply | PlainMessage<StreamWorkReply> | undefined, b: StreamWorkReply | PlainMessage<StreamWorkReply> | undefined): boolean {
+    return proto3.util.equals(StreamWorkReply, a, b);
   }
 }
 
@@ -11296,13 +11796,67 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
   contentResync = false;
 
   /**
+   * The desired set was left out of this reply because the worker receives
+   * it over `StreamWork` (sandbox-scaling plan, Phase 2): `desired_allocations`
+   * and `stop_notices` are empty and must not be read as "run nothing". Set
+   * only when the request carried `work_stream` in the epoch of a stream
+   * this manager is serving for the node.
+   *
+   * @generated from field: bool desired_via_stream = 11;
+   */
+  desiredViaStream = false;
+
+  /**
+   * The worker's `work_stream.digest` disagreed with the manager's at the
+   * same `seq`: the manager will send a full resync on the stream. Never set
+   * while messages the worker has not applied are in flight.
+   *
+   * @generated from field: bool work_resync = 12;
+   */
+  workResync = false;
+
+  /**
+   * Every manager in the cluster, as `scheme://host:port` addresses the
+   * worker can dial, so a worker is not tied to the one manager its join
+   * token names.
+   *
+   * Populated from the replicated raft membership (voters and learners): each
+   * entry is a member's raft `advertiseAddr`, which is the same listener as
+   * its Manager API (the raft transport shares it), prefixed with the scheme
+   * of the answering manager's own API listener (`https` when `server.tls`
+   * is enabled, `http` otherwise). The
+   * worker persists the list beside its state (`managers.json` in the worker
+   * state directory) and, after consecutive transport failures to its
+   * current manager, moves to the next one in the list — and on to the next
+   * after that, wrapping around, so it returns to a recovered manager the
+   * same way. Any manager accepts any worker-plane call: a manager that does
+   * not lead the owning raft lane forwards the write to the leader. A
+   * restarted worker reads the persisted list, so it comes up even when the
+   * manager named in its token is down.
+   *
+   * The list is a snapshot, not a delta: the worker replaces its copy
+   * wholesale whenever it changes, and always keeps the address from its
+   * join token as a last resort. Addresses must be reachable from workers;
+   * when managers advertise a raft address workers cannot reach, the worker
+   * tries each one in turn and keeps the ones that answer.
+   *
+   * Default: empty on a manager that does not run `persistence.type = "raft"`
+   * (there is no other manager to fail over to) or that predates this
+   * field; an empty list leaves the worker's known set unchanged.
+   * See docs/architecture-managers-workers.md.
+   *
+   * @generated from field: repeated string manager_addresses = 13;
+   */
+  managerAddresses: string[] = [];
+
+  /**
    * The pin (`sha256:<hex>`) of the cluster CA the managers sign with now.
    * A worker whose CA bundle does not contain it re-issues its node
    * certificate at once instead of waiting for its refresh timer: that is
    * how a `legion net ca rotate` reaches every node within one heartbeat.
    * Empty when no cluster CA exists yet.
    *
-   * @generated from field: string cluster_ca_pin = 11;
+   * @generated from field: string cluster_ca_pin = 14;
    */
   clusterCaPin = "";
 
@@ -11316,7 +11870,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    *
    * Default: empty list.
    *
-   * @generated from field: repeated legion.RevokedExecSession revoked_exec_sessions = 12;
+   * @generated from field: repeated legion.RevokedExecSession revoked_exec_sessions = 15;
    */
   revokedExecSessions: RevokedExecSession[] = [];
 
@@ -11327,7 +11881,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    * so a deleted key stops working on its next heartbeat. Empty with a
    * changed version means no keys.
    *
-   * @generated from field: repeated legion.ExecKey exec_keys = 13;
+   * @generated from field: repeated legion.ExecKey exec_keys = 16;
    */
   execKeys: ExecKey[] = [];
 
@@ -11335,7 +11889,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    * The version `exec_keys` describes. Empty when the request carried no
    * version.
    *
-   * @generated from field: string exec_keys_version = 14;
+   * @generated from field: string exec_keys_version = 17;
    */
   execKeysVersion = "";
 
@@ -11357,10 +11911,13 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 8, name: "net_policies", kind: "message", T: AllocNetPolicy, repeated: true },
     { no: 9, name: "checkpoint_requests", kind: "message", T: CheckpointRequest, repeated: true },
     { no: 10, name: "content_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
-    { no: 11, name: "cluster_ca_pin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 12, name: "revoked_exec_sessions", kind: "message", T: RevokedExecSession, repeated: true },
-    { no: 13, name: "exec_keys", kind: "message", T: ExecKey, repeated: true },
-    { no: 14, name: "exec_keys_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "desired_via_stream", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 12, name: "work_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 13, name: "manager_addresses", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 14, name: "cluster_ca_pin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 15, name: "revoked_exec_sessions", kind: "message", T: RevokedExecSession, repeated: true },
+    { no: 16, name: "exec_keys", kind: "message", T: ExecKey, repeated: true },
+    { no: 17, name: "exec_keys_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -20173,9 +20730,15 @@ export class Eval extends Message<Eval> {
   id = "";
 
   /**
-   * Eval status (for example: pending, in_flight, failed).
+   * Eval status: `pending`, `in_flight`, `blocked`, or `failed`.
    *
-   * Newly enqueued evals start as `pending`.
+   * Newly enqueued evals start as `pending`. `in_flight` is reported only by
+   * the manager whose eval worker has claimed the eval: a claim is that
+   * manager's memory, and every other manager shows the row as `pending`.
+   * `blocked` means the eval's plan found no room and it waits, under a key
+   * (`class:pool=…`, `node:<id>`, `escaped`), for capacity that could help;
+   * it returns to `pending` on its own (docs/scheduler-and-eval-loop.md,
+   * "Blocked evals"). `failed` evals are never retried.
    *
    * @generated from field: string status = 2;
    */
@@ -22005,6 +22568,16 @@ export class GetAllocationLogsRequest extends Message<GetAllocationLogsRequest> 
    */
   offset = protoInt64.zero;
 
+  /**
+   * Also return the job's recently removed allocations (newest first, at
+   * most 10, removed within the last 24 hours) after its live ones. Without
+   * it they are returned only when the job has no live allocation. Ignored
+   * when `allocation_id` is set, which reaches a removed allocation anyway.
+   *
+   * @generated from field: bool include_removed = 7;
+   */
+  includeRemoved = false;
+
   constructor(data?: PartialMessage<GetAllocationLogsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -22019,6 +22592,7 @@ export class GetAllocationLogsRequest extends Message<GetAllocationLogsRequest> 
     { no: 4, name: "max_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 5, name: "tail", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 6, name: "offset", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 7, name: "include_removed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAllocationLogsRequest {
@@ -22079,6 +22653,40 @@ export class AllocationLog extends Message<AllocationLog> {
    */
   error = "";
 
+  /**
+   * True when the allocation was already removed (stopped, replaced,
+   * rescheduled, its job destroyed) and its logs were read from the node's
+   * retained files. A removed allocation's output is final.
+   *
+   * @generated from field: bool removed = 6;
+   */
+  removed = false;
+
+  /**
+   * Why a removed allocation was removed: a stop cause such as `stop`,
+   * `update`, `node_lost`, `preempted`, `destroy`, `scale_in`. Empty for a
+   * live allocation, or when the removal named no cause.
+   *
+   * @generated from field: string removal_cause = 7;
+   */
+  removalCause = "";
+
+  /**
+   * When a removed allocation was removed, in unix seconds. 0 for a live
+   * allocation.
+   *
+   * @generated from field: int64 removed_at_unix = 8;
+   */
+  removedAtUnix = protoInt64.zero;
+
+  /**
+   * The allocation's status: `placed`, `complete`, or `failed` for a live
+   * row; for a removed one, its status at removal.
+   *
+   * @generated from field: string status = 9;
+   */
+  status = "";
+
   constructor(data?: PartialMessage<AllocationLog>) {
     super();
     proto3.util.initPartial(data, this);
@@ -22092,6 +22700,10 @@ export class AllocationLog extends Message<AllocationLog> {
     { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "streams", kind: "message", T: TaskLogStream, repeated: true },
     { no: 5, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "removed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "removal_cause", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "removed_at_unix", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 9, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AllocationLog {
@@ -22474,6 +23086,51 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   identityEpoch = protoInt64.zero;
 
+  /**
+   * The task's `lifecycle` as declared in the jobspec: `service`, `batch`,
+   * or `sidecar`.
+   *
+   * Carried because the worker never sees a jobspec: it rebuilds the task
+   * from the fields on this message, and the lifecycle decides what a process
+   * exit means there. Together with `task_restart` it selects the restart
+   * policy the worker's task supervisor applies (docs/task-supervision.md):
+   * a `batch` task defaults to `onFailure`, so an exit with a status in
+   * `restart.successExitCodes` (default `[0]`) ends the allocation and is
+   * reported once in `HeartbeatRequest.terminated_allocations` with
+   * `success = true`, which the manager records as allocation status
+   * `complete` and task status `success`. A `batch` task on a runtime that
+   * tracks no process (`noop`) is reported complete at start instead.
+   * `service` and `sidecar` default to `always`: they are relaunched in place
+   * on any exit.
+   *
+   * Always set by the manager. An empty string (a payload built by hand, or
+   * by a manager that predates the field) is read as `service`, which is the
+   * jobspec default.
+   *
+   * @generated from field: string task_lifecycle = 26;
+   */
+  taskLifecycle = "";
+
+  /**
+   * The task's `restart` block as JSON, exactly as declared:
+   * `{"policy":"onFailure","delay":"5s","successExitCodes":[0,2]}`.
+   *
+   * `policy` is `always`, `onFailure`, or `never`; `delay` is the wait before
+   * an in-place relaunch (defaults to `on_unhealthy.restart_delay`);
+   * `successExitCodes` lists the exit statuses that count as success. The
+   * worker's supervisor applies it on every observed exit, sharing one
+   * restart budget (`on_unhealthy.restart_count` within `restart_period`)
+   * with health-check restarts; a wanted restart the budget refuses fails the
+   * allocation, which the manager then reschedules.
+   *
+   * Empty string when the task declares no `restart` block, which is NOT the
+   * same as declaring `always`: the policy then follows `task_lifecycle`
+   * (`onFailure` for `batch`, `always` otherwise).
+   *
+   * @generated from field: string task_restart = 27;
+   */
+  taskRestart = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -22507,6 +23164,8 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 23, name: "task_suspend", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 24, name: "task_snapshots", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 25, name: "identity_epoch", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 26, name: "task_lifecycle", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 27, name: "task_restart", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {
@@ -25550,6 +26209,106 @@ export class StartClaimReply extends Message<StartClaimReply> {
 
   static equals(a: StartClaimReply | PlainMessage<StartClaimReply> | undefined, b: StartClaimReply | PlainMessage<StartClaimReply> | undefined): boolean {
     return proto3.util.equals(StartClaimReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RaftTransport.TriggerElection.
+ *
+ * @generated from message legion.TriggerElectionRequest
+ */
+export class TriggerElectionRequest extends Message<TriggerElectionRequest> {
+  /**
+   * The requesting manager's raft `nodeId`, recorded in the target's raft
+   * history so the campaign is attributable.
+   *
+   * @generated from field: string requested_by = 1;
+   */
+  requestedBy = "";
+
+  /**
+   * The actor the operator command named (`legion raft command --actor`),
+   * for the same history entry. Empty means "api".
+   *
+   * @generated from field: string actor = 2;
+   */
+  actor = "";
+
+  constructor(data?: PartialMessage<TriggerElectionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TriggerElectionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "requested_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "actor", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TriggerElectionRequest {
+    return new TriggerElectionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TriggerElectionRequest {
+    return new TriggerElectionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TriggerElectionRequest {
+    return new TriggerElectionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TriggerElectionRequest | PlainMessage<TriggerElectionRequest> | undefined, b: TriggerElectionRequest | PlainMessage<TriggerElectionRequest> | undefined): boolean {
+    return proto3.util.equals(TriggerElectionRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RaftTransport.TriggerElection.
+ *
+ * @generated from message legion.TriggerElectionReply
+ */
+export class TriggerElectionReply extends Message<TriggerElectionReply> {
+  /**
+   * The answering manager's raft `nodeId` — the one now campaigning.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Raft groups (lane wire names) on which the campaign was started.
+   *
+   * @generated from field: repeated string lanes = 2;
+   */
+  lanes: string[] = [];
+
+  constructor(data?: PartialMessage<TriggerElectionReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TriggerElectionReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "lanes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TriggerElectionReply {
+    return new TriggerElectionReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TriggerElectionReply {
+    return new TriggerElectionReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TriggerElectionReply {
+    return new TriggerElectionReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TriggerElectionReply | PlainMessage<TriggerElectionReply> | undefined, b: TriggerElectionReply | PlainMessage<TriggerElectionReply> | undefined): boolean {
+    return proto3.util.equals(TriggerElectionReply, a, b);
   }
 }
 

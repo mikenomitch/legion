@@ -42,7 +42,9 @@ architecture and behavior docs are public.
   and macOS: what works, eight P0s (batch tasks never finish, DAG ordering,
   HA strands workers, stock images fail in Linux containers, and more), and
   the shims the run needed. The rig and runbook are in
-  [`tests/spot-check/`](../tests/spot-check/README.md).
+  [`tests/spot-check/`](../tests/spot-check/README.md). Every finding is fixed in #17;
+  outcomes and deferrals are in
+  [launch-spot-check-fixes-plan.md](plans/launch-spot-check-fixes-plan.md).
 - [aws-phase1-findings.md](aws-phase1-findings.md) — the first real AWS
   benchmark run (2026-08-02/03): phase 1 passed, and it surfaced a
   manager heartbeat ceiling that was fsync-bound through raft. Start here
@@ -138,6 +140,7 @@ When one is required and what goes in it:
 | [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md) | **shipped** 2026-08-03 (D8: heartbeats leave raft — leader-memory liveness, transitions-only replication, failover grace, digest, display checkpoint); phase 1's AWS measurement is not run |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (phases 0-2 run on real AWS; phases 3-5 blocked on the scheduler, not the rig — see [aws-phase2-findings.md](aws-phase2-findings.md)) |
 | [worker-simulation-plan.md](plans/worker-simulation-plan.md) | shipped (2026-07-30) |
+| [launch-spot-check-fixes-plan.md](plans/launch-spot-check-fixes-plan.md) | in execution (every 2026-10-11 spot-check finding fixed in #17, open; P1-5 in part; deferrals in §8.7; AWS re-run pending) |
 | [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) | in execution: Phases 0 to 8 built; hardware verification open (launch blocker: workers on other hosts lose exec, logs, and the mesh. Also owns local workload isolation: ACLs on by default, the host guard, gated containers by default, the container privilege floor, and the `host` grant for host-level jobs. Carries the sandbox-exec plan's ticket caller class) |
 | [scheduler-diagnosis-tooling-plan.md](plans/scheduler-diagnosis-tooling-plan.md) | planned (`legion scheduler diagnose` + the metric gaps that blocked the 2026-08-04 diagnosis) |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
@@ -158,7 +161,7 @@ When one is required and what goes in it:
 | [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | superseded in part by suspend-resume-and-oversubscription (§0 convergence shipped; mechanics still the reference) |
 | [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | in execution (Phases 1-7 shipped, Phase 8 deferred, KVM checks pending) |
 | [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | in execution (Phases 1-3 and 7a shipped, KVM checks pending) |
-| [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md) | planned (very large session counts: measure raft writes and latency SLOs per lifecycle, group commit, sequenced delivery, blocked work keyed by its blocker, then idle sessions as content-store manifests, running sessions as node-owned soft state in a new `session` instance mode, and wake on request through a gateway; Phase 0 is a gate) |
+| [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md) | in execution: Phases 0–3 shipped (measurement, group commit and write trimming, `StreamWork` delivery, blocked evals); Phases 4+ planned (very large session counts: measure raft writes and latency SLOs per lifecycle, group commit, sequenced delivery, blocked work keyed by its blocker, then idle sessions as content-store manifests, running sessions as node-owned soft state in a new `session` instance mode, and wake on request through a gateway; Phase 0 is a gate) |
 | [sandbox-exec-plan.md](plans/sandbox-exec-plan.md) | in execution: Phases 1 to 3 built and Phase 0 measured on one host; KVM and rig verification open (exec into Linux microVMs over the guest agent's vsock, and direct exec with worker-verified tickets as a third caller class on the worker-plane-auth listener; implemented together with worker-plane-auth, which it amends in §9) |
 | [suspend-resume-ui-plan.md](plans/suspend-resume-ui-plan.md) | shipped (UI-1 to UI-6, with the §7.3 server reads: ListNodeUsage, GetNodeContent, last_stop, checkpoint_support) |
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
@@ -209,6 +212,7 @@ by project impact. The full template and a worked example:
 - [kv-encryption-plan_calls.md](calls/kv-encryption-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [kv-cert-delivery-plan_calls.md](calls/kv-cert-delivery-plan_calls.md)
+- [launch-spot-check-fixes-plan_calls.md](calls/launch-spot-check-fixes-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)
 - [manager-contention-instrumentation_calls.md](calls/manager-contention-instrumentation_calls.md)
 - [manager-reverse-proxy-plan_calls.md](calls/manager-reverse-proxy-plan_calls.md)

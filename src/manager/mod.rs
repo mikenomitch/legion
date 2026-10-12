@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod auth_method;
+pub mod blocked;
 pub mod bootstrap_token;
 pub mod cadence;
 pub mod concurrency;
@@ -9,6 +10,7 @@ pub mod edge_boot;
 pub mod exec;
 pub mod exec_ws;
 pub mod job_templates;
+pub mod leader_forward;
 pub mod mesh_ca;
 pub mod oidc_http;
 pub mod origin;

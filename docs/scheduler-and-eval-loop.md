@@ -15,7 +15,8 @@ At manager startup:
 
 - `start_eval_loop` creates `eval_threads` workers (minimum 1).
 - Any worker that exits is immediately restarted.
-- Startup recovery calls `requeue_in_flight_evals()`.
+- Startup recovery calls `requeue_in_flight_evals()`, which forgets every
+  claim this manager held and arms the blocked-eval wake replay (below).
 
 Each worker loop:
 
@@ -23,21 +24,43 @@ Each worker loop:
    ([adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md)).
    With the controller `off`, and with today's default `observe`, this never
    refuses.
-2. `claim_evals()` atomically marks a **batch** of `pending` evals as
-   `in_flight`. A worker the gate refused claims only eval kinds that cannot
-   conflict (today, `job_stop`).
+2. `claim_evals()` claims a **batch** of `pending` evals. A claim is a mark
+   in the manager's memory, not a write: the rows stay `pending` in the
+   store, and listings on the claiming manager show them as `in_flight`. A
+   worker the gate refused claims only eval kinds that cannot conflict
+   (today, `job_stop`).
 3. Executes `Eval::handle(store)` for each one, in claim order, one at a
    time, holding the permit across the whole batch, conflict-retry backoffs
    included.
-4. `complete_evals_and_claim_next()` writes every outcome and claims the
-   next batch in one operation. Success deletes the eval row, failure sets
-   status `failed`, and a transient rejection returns the row to `pending`
-   after a delay. The permit is released, and asked for again at the next
-   batch.
+4. `complete_evals_and_claim_next()` writes every outcome in one operation
+   and claims the next batch (in memory). Success deletes the eval row,
+   failure sets status `failed`, a placement that found no room sets status
+   `blocked` (see [Blocked evals](#blocked-evals)), and a transient
+   rejection returns the row to `pending` after a delay. The permit is
+   released, and asked for again at the next batch.
+
+**An eval can settle with its own plan.** A `job_reschedule` whose plan is
+its last write (no scheduled batch task needs a follow-up) carries its
+settle into that plan's apply: the applied plan deletes the eval row,
+deletes the duplicates its claim subsumed, and records `eval.completed` in
+the same entry. The worker then has nothing to write for it. On an idle
+cluster this makes a placement one scheduler-lane entry (the plan) instead
+of three (claim, plan, settle). A plan that is rejected or places nothing
+leaves the eval to the ordinary settle.
+
+**Why claims are memory.** A claim used to be a replicated write
+(`pending → in_flight`). The only thing it bought was recovery: a new
+leader recognized a dead leader's half-handled evals as `in_flight` and
+moved them back to `pending`. An unclaimed `pending` row gets that for
+free, because the next leader simply runs it. Handlers are idempotent
+convergence steps, so running an eval again after a failover wastes work
+but never duplicates effects; the old recovery relied on the same property.
+The batch cap bounds how much one crash makes repeat.
 
 When the queue is empty, workers block on either:
 
-- `Notify` wake-up (`enqueue_eval` of zero-delay work), or
+- `Notify` wake-up (an eval became claimable: an enqueue of zero-delay
+  work, a release, or a blocked eval woken), or
 - timeout until next delayed eval `ready_at`, or
 - (when throttled) the admission gate releasing a permit.
 
@@ -61,11 +84,12 @@ introduces, is in
 
 ### Batching
 
-Steps 1 and 3 are fixed costs paid per round, not per eval. On a replicated
-(raft) manager each is a quorum round on the scheduler lane, and that lane
-drains through a single pipeline thread. Without batching, a cluster doing a
-little work per eval hits a ceiling set by those rounds instead of by the
-work itself. Taking N evals through one cycle divides those two rounds by N.
+Step 4 is a fixed cost paid per round, not per eval. On a replicated
+(raft) manager it is a quorum round on the scheduler lane, and that lane
+drains through a single pipeline thread. Taking N evals through one cycle
+divides that round by N, and a batch whose every member settled with its
+own plan writes nothing at all. (Claims were the other fixed round until
+they moved to memory.)
 
 The batch is sized to the queue, not to a timer:
 
@@ -89,26 +113,24 @@ riding in someone else's batch.
 
 **Failure isolation.** Only outcomes the worker observed are written. If
 one eval's handler panics or is cancelled, the others in the batch still
-settle normally and that eval is left out. Its row stays `in_flight` and
-returns to the queue via `requeue_in_flight_evals()` (run on startup and on
-raft leadership acquisition). The same applies to the whole batch if the
-terminal write fails, or if the worker or manager dies mid-batch: nothing
-is written, every row stays `in_flight`, and recovery requeues them. An eval
-is never marked failed based on an unknown outcome, because failed evals
-are not retried.
+settle normally and that eval is left out. Its claim is released and its
+row, still `pending`, runs again. The same applies to the whole batch if
+the terminal write fails, or if the worker or manager dies mid-batch:
+nothing is written, and the rows are still `pending` for whichever manager
+leads next. An eval is never marked failed based on an unknown outcome,
+because failed evals are not retried.
 
 The cost of that safety is bounded re-execution. An eval handled inside a
-batch whose terminal write never lands runs again after recovery. Eval
-handlers are idempotent convergence steps, so this wastes work but does not
-duplicate effects. The batch cap limits how much work a single crash can
-cause to repeat.
+batch whose terminal write never lands runs again. Eval handlers are
+idempotent convergence steps, so this wastes work but does not duplicate
+effects. The batch cap limits how much work a single crash can cause to
+repeat.
 
 **Leadership.** A worker that loses scheduler-lane leadership partway
-through a batch stops there. It leaves the rest `in_flight` for the new
-leader instead of running work whose writes cannot commit. A batch can
-never be half-applied across a leadership change, because the terminal
-write for the whole batch is a single replicated operation that either
-commits or does not.
+through a batch stops there and releases its claims; a manager that is not
+the scheduler-lane leader holds none. A batch can never be half-applied
+across a leadership change, because the terminal write for the whole batch
+is a single replicated operation that either commits or does not.
 
 ## Eval Queue Semantics
 
@@ -126,7 +148,9 @@ Eval ordering:
 
 Dedup-on-claim behavior:
 
-After claiming an eval, other pending evals are deleted when all of these hold:
+A claim subsumes the other pending evals that match all of these. They are
+held with the claim (no other worker can take them) and deleted by its
+settle, in the same write:
 
 - same kind,
 - same scope: the same `job_id`, `job_config_id`, and `node_id` (an empty
@@ -172,6 +196,15 @@ config fresh. Two guards keep that from leaving a job at zero:
   config is queued 5 seconds out, so the eval's failure is not the end of
   it. A rollback that cannot place the previous version back queues the same
   retry for that version.
+
+A `job_update` also resets the config's task statuses to `pending` (only for
+a config with `dependsOn` edges), so a restarted DAG runs from its first
+step instead of finding the previous run's `success` statuses.
+
+A `job_reschedule` that carries a node (queued after an allocation failed
+there) **avoids** that node: it plans without it first, then plans whatever
+that pass could not place with the node allowed. On a cluster where the
+failed node is the only one with room, the replacement returns to it.
 
 ## Scheduler Entry Points
 
@@ -473,6 +506,74 @@ whether a contended placement lands. Port assignments are re-read in the
 apply transaction too, so availability, constraints, resources, and ports
 all get the same apply-time check.
 
+### Partial placement
+
+A plan places what fits. When no node has room for a replica (capacity, a
+static port, a `distinct` rule, a stateful instance's pinned node), the
+planner stops placing that task and reports the remaining replicas as
+**unplaced**, with the reason, instead of failing the whole plan. The other
+tasks of the job, and the replicas of this task that did fit, are applied.
+
+- The eval succeeds and says what it left undone:
+  `Job web rescheduled with 1 placements; 1 unplaced (Failed to place task
+  web: static port 8080 is already in use on every node it is allowed on that
+  has room for it. ...)`. A plan log line at `warn` carries the same reasons.
+- A plan that can place **nothing** does not fail its eval: the eval
+  blocks on what the first unplaced task needs and wakes when capacity that
+  could help appears (see [Blocked evals](#blocked-evals)). The error it
+  blocks with carries the same message, so `job plan`, the eval outcome and
+  the `eval.blocked` event all name the same reason.
+- A **partially placed** plan succeeds, and its unplaced remainder is placed
+  by the next pass that has room: the **capacity pass**, a `node_join` eval
+  with no node that re-plans every active job short of its count. It is
+  queued when a node registers or is uncordoned, and, while some plan has
+  left replicas unplaced, whenever capacity frees up: a worker reports an
+  allocation finished, a failed allocation is removed, a job stops, or a job
+  scales in. One pass covers any number of frees (it is not queued again
+  while one is pending), and when nothing is waiting a free queues nothing.
+- Only the manager that leads the scheduler lane queues the pass. After a
+  restart or a leadership change the first freed capacity runs one pass,
+  which finds out whether anything is waiting.
+- A job with an eval already queued, or blocked, is skipped by the pass
+  (that eval runs against the new capacity anyway).
+- A batch task is retried only while it has not finished (its status is not
+  `success`, `complete`, or `failed`).
+
+Tasks in a multi-task group (co-placed on one node) stay all-or-nothing: a
+member that cannot fit fails the plan. `legion job plan` also keeps
+all-or-nothing, so a dry run reports the first replica that would not fit as
+its error.
+
+### Static ports
+
+A task that declares a static port (`network.ports[].static`, or an upstream
+`localPort`) can run once per node. The planner reads the host ports each
+node's allocations already hold, plus the ports this plan has claimed so
+far, and a node where one of the task's static ports is taken is not a
+candidate for it. The apply transaction makes the same check, so the planner
+no longer builds plans the apply has to reject.
+
+What this means in practice:
+
+- `count = 2` with a static port on a one-node cluster places one replica
+  and reports the other unplaced, naming the port. It used to reject the
+  whole plan, requeue the eval about twice a second, and place nothing.
+- A replica on a node that is already running the port (another job's, or
+  another replica's) is placed on a node where the port is free, or not at
+  all.
+- Preemption never targets a port-blocked node: evicting work frees
+  capacity, not a port.
+- A rollout that cannot place a replacement because the version it replaces
+  holds the port stops the old allocation first (see
+  [rollouts.md](rollouts.md#static-ports-and-surge)).
+
+Ports a Fresh plan's own previous allocations hold count as taken until the
+handler removes those rows, matching what the apply sees. Ports assigned
+dynamically by this same plan are not known until apply, so a static port
+inside the dynamic range can still collide at apply time with a dynamic port
+handed out in the same plan; the candidate walk then falls back to the next
+candidate.
+
 ### Conflict handling
 
 A rejected plan raises a conflict error, which the eval handler retries
@@ -483,8 +584,9 @@ keeps the hard node-epoch check.
 
 Running out of that in-handler retry budget does not fail the eval. The
 eval goes back to the pending queue with a jittered delay (`eval.requeued`
-event) and runs again. Conflicts are short-lived by nature. Non-conflict
-errors still fail the eval (for example, a pool with no capacity left).
+event) and runs again. Conflicts are short-lived by nature. A plan that
+finds no room at all blocks the eval instead (see
+[Blocked evals](#blocked-evals)); other errors still fail it.
 
 ### Tuning conflict retries
 
@@ -535,10 +637,10 @@ node changed while it was being built. `legion_scheduler_node_list_rebuilds_tota
 counts rebuilds ([metrics.md](metrics.md)). It should sit near zero while the
 fleet is stable.
 
-A plan that excludes nodes (a reschedule away from a failed node) shares the
-cached set unless an excluded node is actually in it. Only then does it build a
-filtered copy, which costs O(fleet). In practice the excluded node is usually
-already unavailable.
+A plan that excludes nodes (the first pass of a reschedule away from a failed
+node, or a rollout's in-place pass) shares the cached set unless an excluded
+node is actually in it. Only then does it build a filtered copy, which costs
+O(fleet).
 
 The read model also keeps a per-job index of allocations by node,
 maintained by the same writes that maintain the per-node allocation lists.
@@ -661,15 +763,155 @@ heard from score `0`, which costs placement quality and never correctness.
 
 ## Dependency-Aware Task Readiness
 
-Before placement, tasks are filtered via dependency graph and current task-status map:
+Before placement, tasks are filtered via the dependency graph and the task
+statuses workers reported:
 
 - topological ordering rejects cycles
 - dependency conditions:
-  - `start`
-  - `complete`
-  - `success`
+  - `start`: the dependency started, or is placed in this pass
+  - `complete`: the dependency's worker reported it finished, either way
+  - `success`: the dependency's worker reported a successful exit
 
-Only ready tasks are considered in that scheduler pass.
+Only ready tasks are considered in that scheduler pass. The others are
+**held**: reported on the plan outcome (`waiting on dependencies: ...` in the
+eval's outcome), not counted as unplaced, and not a capacity block for a
+rollout. A batch dependency that is merely placed in the same pass does not
+satisfy `complete` or `success`; only a reported exit does. The dry run
+(`legion job plan`) is the exception: it treats batch dependencies as
+satisfied so it can show the whole job.
+
+When a worker reports a terminal exit for a task that other tasks depend on,
+the manager queues an eval for the job (a `rollout_tick` while a rollout
+targets the config, a `job_reschedule` otherwise), which places what the exit
+made ready. See [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#task-lists-and-dependency-readiness).
+
+## Blocked evals
+
+A placement that finds no room does not fail its eval. The eval is written
+`status = 'blocked'`, keyed by what it waits for, in the same write that
+used to mark it `failed`, and it returns to `pending` on its own when
+capacity that could help appears. Nothing else re-plans it, so a node
+joining one pool costs evals only for the jobs blocked on that pool, and a
+job never stays short just because no event happened to re-run it.
+
+### What blocks
+
+The job evals that place work block: `job_submit`, `job_update`,
+`job_reschedule`, and `job_scale`. They block when the plan finds no node
+for a task:
+
+- no node the task may run on has room, after preemption had its chance
+  (the same diagnosis the failure used to carry, which still names
+  whether preemption was off, in observe mode, or found no victim);
+- no node has free disk for the task's node-local volumes;
+- no node has room for a memory checkpoint of a task that suspends to
+  memory;
+- the node holding an instance's node-local storage, or a resume's
+  checkpoint, is unavailable;
+- the cluster has no schedulable node at all.
+
+Node-scoped passes (`node_lost_reschedule`, `node_drain`, the capacity pass)
+already queue a per-job `job_reschedule` for each job they could not place,
+and that reschedule is what blocks. A `rollout_tick` that cannot place still
+fails its rollout, as before. A pending keyed instance is covered like any
+other placement: its `job_reschedule` blocks, and wakes when room appears.
+
+**One blocked eval per job.** A job that blocks again (another instance was
+created, the job was updated) replaces its older blocked eval in the same
+write, and any eval of the job that succeeds deletes it: the job has
+nothing left to wait for.
+
+### Keys
+
+The key says what the eval waits for:
+
+| Key | Meaning | Woken by |
+| --- | --- | --- |
+| `class:pool=<pool>[,<attr>=<value>...]` | The task's pool and the attributes its constraints pin with `=`. `pool=*` when the permit's pool rule is not a plain `=` | Capacity on a node the task's permit and constraints accept |
+| `node:<id>` | A resume or restore pinned to the node holding its checkpoint or node-local storage | Capacity on that node only |
+| `escaped` | No schedulable node at all, so no class to wait on | Any capacity anywhere |
+
+The match is exact rather than by key string: the wake pass re-runs the
+blocked task's own permit and constraint checks against the node whose
+capacity changed, so operators the key cannot spell (`>`, `matches`,
+`version_matches`, `contains`) still wake only on nodes that satisfy them.
+Whether the room is *enough* is not checked: the plan that runs next
+decides that, and blocks again if not.
+
+### Wake events
+
+A capacity event is any committed change that may have made room:
+
+- a node registering (`register`);
+- a node's pool, availability (an uncordon), or attributes changing
+  (`node`);
+- a node's liveness status changing, as when it returns to `ready`
+  (`ready`);
+- allocations leaving a node: a stop, a destroy, a suspend, a preemption
+  (`freed`).
+
+The changeset projection records these on every manager. The scheduler-lane
+leader's wake pass runs within 50 ms of an event (a burst costs one pass),
+matches the events against the blocked evals, and returns every eval a node
+could help to `pending` in one scheduler-lane entry, with an
+`eval.unblocked` event each. The eval loop then runs them like any other
+work. An event on a node that is not available (cordoned, drained) wakes
+nothing.
+
+**An unblock during the job's own eval is not lost.** A claim records the
+event log's position. An eval that is about to block first checks the
+events since its claim: if capacity a node could help with appeared while
+its plan ran, it goes straight back to `pending` (`eval.unblocked` with
+cause `missed`) instead of blocking on a picture that is already stale.
+
+**Leadership changes and restarts.** The blocked rows are replicated
+state. The event log is in memory, but every manager keeps its own copy. A
+manager that takes the scheduler lane replays the last 60 seconds of events
+against the blocked rows, which covers whatever the old leader had not
+acted on when it died. A manager process that starts as the scheduler's
+writer has no log to replay, so it returns every blocked eval to `pending`
+once (`eval.unblocked` cause `startup`); each blocked job costs one
+re-plan, and blocks again if there is still no room.
+
+### Seeing it
+
+`legion job info <job>` and `ListJobs` report a `blocked` block for a job
+with a blocked eval, and `status: blocked` where the
+[derived job status](jobs-tasks-and-scheduling.md) would otherwise read
+`pending` (nothing of the job is live). A job with live allocations keeps
+`running` and still carries the block. The human table prints the block as
+a line under the job:
+
+```console
+$ legion job info agents -j
+{"ok":true,"data":{"id":"agents","name":"agents","status":"blocked",
+ "blocked":{"key":"class:pool=agents","task":"workspace",
+  "shortfall":{"cpu":"500MHz","memory":"3000MiB"},
+  "message":"Failed to place task workspace: no available nodes matching constraints, permit, or resources; ...",
+  "since":1791836651,"evalId":"42"}, ...}}
+```
+
+`shortfall` is what one placement of the task asks for, not the job's total.
+Both are read-side overlays: nothing is stored on the job, and a stopped
+job never shows `blocked`. The UI's job page shows
+the same block as a note, the MCP `legion_job_info` tool returns it, and
+`legion eval list` shows the eval with status `blocked`.
+
+Events: `eval.blocked` (warn, with the key and detail) when an eval blocks,
+and `eval.unblocked` (info, with the cause and node) when it wakes. Metrics:
+`legion_evals_blocked{key_kind}`, `legion_evals_unblocked_total{event}`, and
+`legion_blocked_wait_seconds` (see [metrics](metrics.md)).
+
+### Limitations
+
+- A checkpoint budget report and a completed `snapshot warm` do not wake
+  evals blocked on checkpoint room: those are worker reports, not store
+  changes. A node event on the same node (allocations leaving it) does.
+- A blocked eval for a job whose stored status is `failed` (for example, a
+  KV-reference failure) still wakes and runs; it changes nothing the failure
+  did not.
+- A stale blocked eval (its config superseded by a newer submit) is removed
+  by the stale-eval prune that runs on leadership acquisition, not at once.
 
 ## Eval Triggers into Scheduling
 
@@ -677,8 +919,16 @@ Typical triggers:
 
 - `run_job` -> enqueue `job_submit` / `job_update` / `rollout_tick`.
 - Worker failure heartbeat -> enqueue delayed `job_reschedule`.
+- Worker terminal report for a task with dependents -> enqueue
+  `job_reschedule` (or `rollout_tick` during a rollout).
 - Dynamic node updates -> enqueue `job_update` for affected jobs.
 - Rollout engine -> enqueue delayed `rollout_tick` while active.
+- A node registering or being uncordoned -> one cluster-wide `node_join`
+  capacity pass, which re-plans only jobs short of their count that have no
+  pending or blocked eval (a backstop: a job that could not place normally
+  has a blocked eval, which the wake pass handles).
+- Capacity events -> blocked evals back to `pending` (see
+  [Blocked evals](#blocked-evals)).
 
 ## Observability: the Scheduler Event Stream
 
@@ -699,4 +949,5 @@ patterns.
   node collapse even when they were enqueued for different reasons.
 - With a replicated (raft) store, the eval queue is replicated, but only the
   scheduler lane's leader claims and runs evals. Other managers do not share
-  eval work.
+  eval work. Claims are in that leader's memory, so `legion eval list` on
+  another manager shows a claimed eval as `pending`.

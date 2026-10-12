@@ -147,6 +147,15 @@ youki (the default), runc, and crun:
 - It keeps only `CAP_AUDIT_WRITE`, `CAP_KILL`, and `CAP_NET_BIND_SERVICE`, with
   `noNewPrivileges` (`oci_bundle.rs:646-652`). That is tighter than Docker's
   default of 14 capabilities, so capabilities need no work.
+  > **Update (spot-check fixes, 2026-10):** three capabilities broke stock
+  > images (nginx, the Postgres entrypoint), so containers now get Docker's
+  > default set less `CAP_NET_RAW`, adjustable per task with
+  > `security.capabilities = { add, drop }`. `noNewPrivileges` is unchanged.
+  > The `security` block §6.14 proposes holds `capabilities` next to
+  > Phase 6's `userNamespace` and `seccomp`. A capability `add` inside the
+  > user namespace does not make a task host-level, so it needs no `host`
+  > grant; the node's `container.allowCaps` bounds it. See
+  > `docs/task-runtime-container.md` ("Capabilities" and "Security").
 - It has **no seccomp profile** (no `linux.seccomp` in the spec, and OCI runtimes
   apply only what the spec asks for), no AppArmor or SELinux label, and no
   cgroup namespace.
@@ -1054,7 +1063,8 @@ container:
   - Volumes mount with idmapped mounts, so a volume reattached to a new
     allocation (with a new range) keeps working. A node or runtime that
     can't do idmapped mounts fails a volume-backed start with a named reason.
-  - The three capabilities and `noNewPrivileges` stay as they are. Inside a
+  - The capability set and `noNewPrivileges` stay as they are (the set is
+    now Docker's default less `CAP_NET_RAW`; see the update above). Inside a
     user namespace they apply to that namespace only.
 
 The surface is a `security` block on the container config, shown with its
@@ -1248,6 +1258,43 @@ Closes: any task, on any node, owning the cluster through the manager API.
 
 Closes: the multi-host launch blocker, and any process on a node driving
 `ExecTask`, `GetTaskLogs`, `PostWork`, or `RestartWorker`.
+
+#### Phase 1 as shipped
+
+Phase 1 shipped twice. A first cut landed on 2026-10-12 in
+[#17](https://github.com/mikenomitch/legion/pull/17) (pre-launch spot-check
+finding P0-1): bind and advertise, the mTLS listener with caller classes,
+manager certificates and the one client factory, CSR issuance, and protocol
+3, with the CA pin, two-step rotation, the `ticket` class, and the
+reachability probe deferred. This plan's own implementation (PR
+[#32](https://github.com/mikenomitch/legion/pull/32)) was built in parallel
+from the same design, ships all of Phase 1 and Phases 0 and 2 to 8, and
+replaced the first cut when the branches merged (calls entry 45 says which
+pieces of #17 survived). As merged:
+
+- [x] Bind and advertise (§6.6): `0.0.0.0:4848` by default,
+  `LEGION_WORKER_HOST`, `LEGION_WORKER_PORT`, `LEGION_WORKER_ADVERTISE_ADDR`,
+  `--advertise-addr` on `legion join`, `legion start worker`, and the
+  simulator (calls entry 26), route-based detection, the startup log line,
+  and an `https://` `workerAddress`. The in-process worker of
+  `--run-worker` advertises the manager's routable `server.advertiseAddr`
+  (from #17). Code: `src/worker/plane.rs`.
+- [x] The mTLS listener with per-RPC caller classes (§6.1), including the
+  `ticket` class on `ExecTask` behind `exec.direct` (sandbox-exec plan).
+- [x] Manager certificates (§6.2) and the one `WorkerPlane` factory (§6.3),
+  channels cached per (CA, address, name). Code:
+  `src/manager/worker_plane.rs`.
+- [x] CSR issuance, eager at registration, persisted under
+  `<state-dir>/identity/` mode `0600` (§6.4). The mesh uses the same
+  identity.
+- [x] The CA pin in join tokens, token v2 (§6.5).
+- [x] Two-step CA rotation by cross-signing (§6.9).
+- [x] The simulator's fleet certificate, `<prefix>.fleet.legion` (open
+  question 4, calls entry 21).
+- [x] `PROTOCOL_VERSION = 3`; `tests/worker_plane_classes.rs` classifies
+  every `Worker` RPC.
+- [ ] Two workers on `127.0.0.2`/`127.0.0.3` in one test process, and the
+  AWS 1,000-node throughput comparison (§9).
 
 **Phase 2: the host guard in the datapath.** §6.11.
 

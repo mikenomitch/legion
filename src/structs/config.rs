@@ -2394,6 +2394,39 @@ pub struct WorkerConfigAlt {
     /// "Direct exec"). Absent = manager-proxied exec only.
     #[serde(default)]
     pub exec: Option<WorkerExecConfig>,
+    /// What `container` tasks may do on workers of this type (see
+    /// docs/task-runtime-container.md, "Capabilities"). Absent means the
+    /// defaults: container tasks may end up with at most the default
+    /// capability set.
+    #[serde(default)]
+    pub container: Option<WorkerContainerConfig>,
+}
+
+/// Worker-type `container` block. Carried to the worker as JSON in
+/// `WorkerConfig.container`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerContainerConfig {
+    /// The Linux capabilities a `container` task on this worker type may end
+    /// up with, after its `security.capabilities` adjustments (Nomad's
+    /// `allow_caps`). A task whose effective set holds anything else fails at
+    /// start on this node. Names are case-insensitive with an optional `CAP_`
+    /// prefix; `["ALL"]` allows every capability. Absent: the default set
+    /// (Docker's defaults less `NET_RAW`), so jobs can drop capabilities but
+    /// not add any.
+    #[serde(default)]
+    pub allow_caps: Option<Vec<String>>,
+}
+
+impl WorkerContainerConfig {
+    /// Parses the `WorkerConfig.container` payload. Empty means the
+    /// defaults.
+    pub fn from_payload(raw: &str) -> R<Self> {
+        if raw.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_str(raw).context("parse worker container config")
+    }
 }
 
 /// The worker-type security blocks, carried to the worker as one JSON

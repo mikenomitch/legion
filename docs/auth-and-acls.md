@@ -403,10 +403,18 @@ fingerprinting. The join token pins which template applies.
 
 When ACLs are enforced:
 
-- `WorkerPreRegister`/`WorkerRegister` require a valid join secret.
-- Registration mints a per-node **worker token** (returned in the reply) that
-  the worker attaches to `Heartbeat`/`HealthCheck`. Node tokens grant nothing
-  on the user-facing API.
+- `WorkerPreRegister`/`WorkerRegister` require a valid join secret, or the
+  node's own node token (see below).
+- Registration with a join secret mints a per-node **node token** (returned
+  in the reply) that the worker attaches to every worker-plane call. Node
+  tokens grant nothing on the user-facing API, and they do not expire.
+- The worker persists its node token in its state directory
+  (`$LEGION_DATA_DIR/workers/<node>/node_token`, mode `0600`, in a directory
+  only the worker's user can enter) and is never logged. A restarted worker
+  re-registers with that node token instead of its join secret, so **a join
+  token is only needed to introduce a node**: once the node has joined, its
+  join token can expire or be revoked and the node still restarts, reboots,
+  and upgrades normally.
 - A join token only admits its own worker type. Pre-registering as another
   type, or registering into a pool other than that type's pool, fails with
   `PermissionDenied`.
@@ -416,12 +424,21 @@ When ACLs are enforced:
   issuers) refuses a node id that does not match the token with
   `PermissionDenied`. A node token can re-register its own node in its current
   pool, but not any other node. Management tokens act for any node.
-- Re-registering rotates the node token. If a heartbeat comes back
-  `Unauthenticated`, the worker automatically re-registers using its join
-  secret.
+- Registering with a join secret rotates the node token (the old one stops
+  working). Re-registering with the node token keeps it: the reply carries no
+  new token, so a crash during a restart can never leave the worker holding
+  a revoked one.
+- If the manager refuses the persisted node token (the node was removed, or
+  ACL state was reset), or a heartbeat comes back `Unauthenticated`, the
+  worker discards it and registers with its join secret. If that is gone
+  too, the worker exits with `Unauthenticated: unknown or revoked join
+  token`; mint a new join token for that host and run `legion join` again.
 - A join token admits any node name, including the name of a node that is
   already registered. Treat join secrets like node credentials: give them
-  short TTLs and revoke them once the fleet has joined.
+  short TTLs (minutes to a day, long enough to bring the hosts up) and
+  revoke them once the fleet has joined. Restarts do not need them. Treat
+  the node token file like the node's private key: it lets its holder act as
+  that node.
 - In `auditOnly` mode, workers without join tokens are admitted but logged,
   and so are the worker-type, pool, and node-id mismatches above. The two
   identity-token issuers refuse a foreign node id even in audit-only mode.

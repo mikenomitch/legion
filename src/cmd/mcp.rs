@@ -123,13 +123,13 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_list",
-            description: "List jobs and their status, optionally only those in one status. The reply's status_counts gives the per-status totals.",
+            description: "List jobs and their status, optionally only those in one status. The reply's statusCounts gives the per-status totals.",
             input_schema: job_list_schema,
             mutates: false,
         },
         ToolDef {
             name: "legion_job_info",
-            description: "Inspect a single job's current state.",
+            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears.",
             input_schema: name_arg_schema,
             mutates: false,
         },
@@ -158,7 +158,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_plan",
-            description: "Dry-run a rendered jobspec: which nodes its allocations would land on, and — the reason to run this before submitting — which RUNNING allocations the submit would preempt, with their job, task, priority band and grace window. A non-empty `preemptions` list means the submit costs somebody else something; treat it as requiring confirmation. `preemption_mode` says whether an empty list means \"nothing would be displaced\" or \"preemption is off\".",
+            description: "Dry-run a rendered jobspec: which nodes its allocations would land on, and — the reason to run this before submitting — which RUNNING allocations the submit would preempt, with their job, task, priority band and grace window. A non-empty `preemptions` list means the submit costs somebody else something; treat it as requiring confirmation. `preemptionMode` says whether an empty list means \"nothing would be displaced\" or \"preemption is off\".",
             input_schema: || json!({
                 "type": "object",
                 "properties": { "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." } },
@@ -193,7 +193,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_list",
-            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `cold_boot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`cold_boot.reason` says why).",
+            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `coldBoot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`coldBoot.reason` says why).",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -207,7 +207,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_get",
-            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle). For suspend: `checkpoint_id`, `suspend_reason` (manual, idle, or pressure), and, while the task's suspend.idle policy is watching a running instance, `idle_since` and `idle_after_seconds`. `cold_boot` (snapshot_id, reason, at) is set when the last resume or restore failed and the instance booted fresh on its volume under onRestoreFailure = \"cold\": its running processes and memory are gone, so do not assume a resumed session survived. Also reports a live PROVISIONAL claim when a node has started this instance but the placement is not durable yet (docs/edge-boot.md) — do not build on a provisional instance, it may still be killed.",
+            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle). For suspend: `checkpointId`, `suspendReason` (manual, idle, or pressure), and, while the task's suspend.idle policy is watching a running instance, `idleSince` and `idleAfterSeconds`. `coldBoot` (snapshotId, reason, at) is set when the last resume or restore failed and the instance booted fresh on its volume under onRestoreFailure = \"cold\": its running processes and memory are gone, so do not assume a resumed session survived. Also reports a live PROVISIONAL claim when a node has started this instance but the placement is not durable yet (docs/edge-boot.md) — do not build on a provisional instance, it may still be killed.",
             input_schema: || json!({
                 "type": "object",
                 "properties": { "instance_id": { "type": "string", "description": "Instance id." } },
@@ -372,7 +372,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_node_list",
-            description: "List worker nodes and their health. Each node carries `heartbeat_source`: `live` means the answering manager observed the beat itself, `checkpoint` means the timestamp comes from a periodic replicated checkpoint and is up to `liveness.checkpointInterval` (30s) behind, empty means none has been observed. The node's `status` is exact either way (docs/node-liveness.md).",
+            description: "List worker nodes and their health. Each node carries `heartbeatSource`: `live` means the answering manager observed the beat itself, `checkpoint` means the timestamp comes from a periodic replicated checkpoint and is up to `liveness.checkpointInterval` (30s) behind, empty means none has been observed. The node's `status` is exact either way (docs/node-liveness.md).",
             input_schema: empty_schema,
             mutates: false,
         },
@@ -384,7 +384,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_node_usage",
-            description: "Show one node's memory and CPU: schedulable capacity, the sum of reservations placed on it, and what its allocations actually use, per allocation (memory_current_bytes, memory_peak_bytes, memory_anon_bytes, cpu_millicores, idle_seconds). Usage comes from cgroup reports that workers with resourceEnforcement.enabled send every 10 seconds; `usage_reported: false` means none reached this manager, and `report_age_seconds` well above 10 means the node stopped reporting. Each allocation also carries `band`, `memory_max_mib`, and its place in the node's memory pressure order (`pressure_rank`, 1 = acted on first, 0 = never; `pressure_steps`, e.g. [\"reclaim\", \"evict-bursting\"], or [\"reclaim\", \"suspend\"] for a task that sets suspend.onPressure, which is suspended with its state instead of stopped), and `memory` carries `oversubscribe_ratio` and `pressure_response` (whether the node is under pressure now). Use it to compare reservations with real use before resizing a job, and to see which allocations a short node would stop first (docs/resource-enforcement.md).",
+            description: "Show one node's memory and CPU: schedulable capacity, the sum of reservations placed on it, and what its allocations actually use, per allocation (memoryCurrentBytes, memoryPeakBytes, memoryAnonBytes, cpuMillicores, idleSeconds). Usage comes from cgroup reports that workers with resourceEnforcement.enabled send every 10 seconds; `usageReported: false` means none reached this manager, and `reportAgeSeconds` well above 10 means the node stopped reporting. Each allocation also carries `band`, `memoryMaxMib`, and its place in the node's memory pressure order (`pressureRank`, 1 = acted on first, 0 = never; `pressureSteps`, e.g. [\"reclaim\", \"evict-bursting\"], or [\"reclaim\", \"suspend\"] for a task that sets suspend.onPressure, which is suspended with its state instead of stopped), and `memory` carries `oversubscribeRatio` and `pressureResponse` (whether the node is under pressure now). Use it to compare reservations with real use before resizing a job, and to see which allocations a short node would stop first (docs/resource-enforcement.md).",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -397,7 +397,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_node_usage_list",
-            description: "Show memory and CPU for many nodes in one call: per node, schedulable capacity (with `oversubscribe_ratio`), the sum of reservations, measured use, `usage_reported`, and `memory.pressure_response` (whether the node is under memory pressure now). CPU carries `cores` and `used_millicores`, which are filled even on nodes that report no clock speed. Per-allocation rows are omitted unless `include_allocations` is true. Empty `node_ids` means every node (up to 500; `truncated` says when there were more). Use it to find tight or pressured nodes before drilling in with legion_node_usage (docs/resource-enforcement.md).",
+            description: "Show memory and CPU for many nodes in one call: per node, schedulable capacity (with `oversubscribeRatio`), the sum of reservations, measured use, `usageReported`, and `memory.pressureResponse` (whether the node is under memory pressure now). CPU carries `cores` and `usedMillicores`, which are filled even on nodes that report no clock speed. Per-allocation rows are omitted unless `include_allocations` is true. Empty `node_ids` means every node (up to 500; `truncated` says when there were more). Use it to find tight or pressured nodes before drilling in with legion_node_usage (docs/resource-enforcement.md).",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -410,7 +410,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_node_content",
-            description: "Show what one node holds for content locality: the content its worker advertises to the manager's location index (digest, bytes, how many nodes hold it, and the snapshot and part role it belongs to when known), whether the worker can publish and checkpoint, and the node's snapshots (captured there, or published elsewhere with parts fetched or warmed there) with `parts_here`/`parts_total`. `index_reported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork (docs/artifacts.md, \"Content locality\").",
+            description: "Show what one node holds for content locality: the content its worker advertises to the manager's location index (digest, bytes, how many nodes hold it, and the snapshot and part role it belongs to when known), whether the worker can publish and checkpoint, and the node's snapshots (captured there, or published elsewhere with parts fetched or warmed there) with `partsHere`/`partsTotal`. `indexReported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork (docs/artifacts.md, \"Content locality\").",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -515,7 +515,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_events",
-            description: "List recent scheduler events (evals, placements, node/job lifecycle, rollouts). Poll with after_id set to the returned latest_id to tail the stream incrementally.",
+            description: "List recent scheduler events (evals, placements, node/job lifecycle, rollouts). Poll with after_id set to the returned latestId to tail the stream incrementally.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -534,15 +534,16 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_logs",
-            description: "Fetch captured stdout/stderr for a job's allocations (or one allocation). Use this to diagnose task failures.",
+            description: "Fetch captured stdout/stderr for a job's allocations (or one allocation). Use this to diagnose task failures. Allocations removed in the last 24 hours (failed and rescheduled, stopped, the job destroyed) are still readable: a job with no live allocation returns its most recently removed ones, each marked `removed` with its `removalCause`.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Job name to gather allocation logs for." },
-                    "allocation_id": { "type": "integer", "description": "Optional: read a single allocation id instead of a whole job." },
+                    "allocation_id": { "type": "integer", "description": "Optional: read a single allocation id (live, or removed in the last 24 hours) instead of a whole job." },
                     "stream": { "type": "string", "enum": ["stdout", "stderr", "all"], "description": "Which stream to read (default all)." },
                     "max_bytes": { "type": "integer", "description": "Max bytes per stream (0 = worker default cap)." },
-                    "tail": { "type": "boolean", "description": "Return trailing bytes instead of leading bytes." }
+                    "tail": { "type": "boolean", "description": "Return trailing bytes instead of leading bytes." },
+                    "include_removed": { "type": "boolean", "description": "Also return the job's recently removed allocations when it has live ones (default false)." }
                 },
                 "additionalProperties": false
             }),
@@ -876,7 +877,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_start",
-            description: "Start a stopped keyed-mode instance (re-place it with the same id and retained storage handle), or resume a suspended one from its checkpoint (cold=true discards the checkpoint and boots fresh). The owning job must be running. Returns at once; poll legion_instance_get for state=active and no pending_op, then check `cold_boot`: when set, the restore failed and the instance booted fresh (onRestoreFailure = \"cold\", the default), losing its running processes. Mutating.",
+            description: "Start a stopped keyed-mode instance (re-place it with the same id and retained storage handle), or resume a suspended one from its checkpoint (cold=true discards the checkpoint and boots fresh). The owning job must be running. Returns at once; poll legion_instance_get for state=active and no pendingOp, then check `coldBoot`: when set, the restore failed and the instance booted fresh (onRestoreFailure = \"cold\", the default), losing its running processes. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -906,7 +907,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_fork",
-            description: "Fork a running keyed-mode instance into `count` new instances (docs/suspend-and-resume.md, \"Fork\"). The origin is checkpointed live and keeps running (a memory checkpoint pauses it for `pause_ms`). Each fork is a new instance `<origin>-f<n>` with its own cloned volume and its own identity (allocation id, hostname, token, entropy, MAC/TAP), pinned to the origin's node, or with spread=true each on its own node once the checkpoint is published. Returns the fork ids at once; poll legion_snapshot_get on `snapshot` for state=local (forks released for placement; published for a spread fork) or failed (origin keeps running, forks terminated). Retry-safe with idempotency_key. Mutating; needs job:write and snapshot:write.",
+            description: "Fork a running keyed-mode instance into `count` new instances (docs/suspend-and-resume.md, \"Fork\"). The origin is checkpointed live and keeps running (a memory checkpoint pauses it for `pauseMs`). Each fork is a new instance `<origin>-f<n>` with its own cloned volume and its own identity (allocation id, hostname, token, entropy, MAC/TAP), pinned to the origin's node, or with spread=true each on its own node once the checkpoint is published. Returns the fork ids at once; poll legion_snapshot_get on `snapshot` for state=local (forks released for placement; published for a spread fork) or failed (origin keeps running, forks terminated). Retry-safe with idempotency_key. Mutating; needs job:write and snapshot:write.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -962,7 +963,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_action_run",
-            description: "Run a declared action against a running allocation and return its combined output and exit code. One-shot (no interactive tty). Mutating.",
+            description: "Run a declared action against a running allocation and return `exitCode`, `stdout`, `stderr`, and `message`. One-shot (no interactive tty). Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -979,7 +980,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_exec_run",
-            description: "Run a one-shot command inside a running allocation and return its stdout, stderr, and exit code. No interactive tty. Mutating; requires exec:write.",
+            description: "Run a one-shot command inside a running allocation and return `exitCode`, `stdout`, `stderr`, and `message`. No interactive tty. Mutating; requires exec:write.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -1787,6 +1788,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let stream = opt_str_arg(&args, "stream").unwrap_or_else(|| "all".to_string());
             let max_bytes = args.get("max_bytes").and_then(Value::as_i64).unwrap_or(0);
             let tail = args.get("tail").and_then(Value::as_bool).unwrap_or(false);
+            let include_removed = args
+                .get("include_removed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let mut client = connect().await?;
             grpc(client.get_allocation_logs(GetAllocationLogsRequest {
                 job,
@@ -1795,6 +1800,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 max_bytes,
                 tail,
                 offset: 0,
+                include_removed,
             }))
             .await
         }
@@ -2175,7 +2181,7 @@ async fn run_exec_oneshot(
     }
 
     Ok(json!({
-        "exit_code": exit_code,
+        "exitCode": exit_code,
         "stdout": String::from_utf8_lossy(&stdout),
         "stderr": String::from_utf8_lossy(&stderr),
         "message": exit_message,

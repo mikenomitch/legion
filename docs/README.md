@@ -7,6 +7,14 @@ Legion, and for contributors reading the code.
 Plans, roadmaps, to-do lists, and development notes live in
 [`internal_docs/`](../internal_docs/README.md) instead.
 
+## Installing
+
+- [Installing Legion and Its Runtimes](installation.md): the `legion` binary,
+  then what each runtime needs on a worker host: youki (or runc/crun) for
+  containers on Linux; `/dev/kvm`, cloud-hypervisor, and a guest kernel for
+  microVM sandboxes (including AWS nested virtualization); Apple `container`
+  on macOS.
+
 ## Architecture
 
 - [Configuration Language](configuration-language.md): Nickel syntax
@@ -43,7 +51,9 @@ Plans, roadmaps, to-do lists, and development notes live in
   hardening.
 - [Task Runtime Plugins](task-runtime-plugins.md): the task-runtime plugin contract.
 - [Task Runtime: exec](task-runtime-exec.md)
-- [Task Runtime: container](task-runtime-container.md)
+- [Task Runtime: container](task-runtime-container.md): OCI images on youki,
+  runc, or crun (Linux) and Apple `container` (macOS). Capabilities, ulimits,
+  layer ownership, stdio, and the per-node image cache.
 - [Task Runtime: sandbox](task-runtime-sandbox.md): OCI images in microVMs for
   untrusted code and agent workspaces.
 - [Task Runtime: noop](task-runtime-noop.md)
@@ -54,7 +64,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   variables, guided submission, and template-scoped delegation.
 - [Artifacts](artifacts.md): declaring, fetching, verifying, and staging inputs.
 - [Stateful Workloads & Instance Identity](stateful-workloads.md): slot and
-  keyed instances, storage handles, fencing.
+  keyed instances, storage handles, fencing, and choosing a mode.
+- [Sandboxes at Scale](sandboxes-at-scale.md): running many keyed sandboxes:
+  what each lifecycle step costs the control plane, delivery within a round
+  trip, blocked creates when capacity runs out, and measuring it.
 - [Volumes](volumes.md): persistent storage for stateful tasks. Covers plugins,
   the driver contract, node pinning, and reclaim.
 - [Suspend and Resume](suspend-and-resume.md): suspending a keyed instance to

@@ -10,13 +10,15 @@ It is available from the CLI, the MCP server, the UI, and raw gRPC.
 | Kind | Level | When |
 | --- | --- | --- |
 | `scheduler.started` | info | Eval loop started (manager startup). |
-| `scheduler.recovered` | warn | Stale in-flight evals were requeued at startup. |
+| `scheduler.recovered` | warn | Stale in-flight evals were requeued at startup (a store migrated from a version that wrote claims; claims are leader memory now, so a current manager never has any). |
 | `scheduler.concurrency_adjusted` | info | The adaptive concurrency controller moved the number of planners it admits. Emitted on the change, never per tick (docs/adaptive-scheduler-concurrency.md). |
 | `scheduler.concurrency_saturated` | warn | Backing off did not improve goodput, so the cluster's plan conflicts are capacity-driven rather than concurrency-driven. Add nodes; waiting will not help. |
 | `eval.enqueued` | info | An eval was added to the queue. |
 | `eval.completed` | info | An eval handler finished successfully. |
 | `eval.failed` | error | An eval handler returned an error. |
 | `eval.requeued` | warn | An eval used up its plan-conflict retries and was released back to pending with a delay instead of failing. See [Late-binding plan apply](late-binding-plan-apply.md). |
+| `eval.blocked` | warn | An eval's plan found no room, so the eval waits blocked instead of failing. Metadata carries the blocking `key` (`class:pool=...`, `node:<id>`, `escaped`) and the `detail` (task, cpu, memory, message). See [Blocked evals](scheduler-and-eval-loop.md#blocked-evals). |
+| `eval.unblocked` | info | A blocked eval is back in the pending queue. Metadata carries the `key` and the `cause`: `register`, `node`, `ready`, `freed` (capacity on the node the event names), `missed` (capacity appeared while the eval was still running, so it never blocked), or `startup`. |
 | `allocation.placed` | info | A plan was applied. One event per apply, with placement details in metadata, including `candidateRank` per placement (0 = first choice) and a `fallbacks` count. |
 | `allocation.removed` | info/warn | Allocations were removed (job stop/update: info, node loss: warn). Metadata carries `cause`: `stop`, `update`, `drain`, `reschedule`, `destroy`, `node_lost`, `scale_in`, `preempted`, `node_pressure`, `restore`, or `suspended`. It is omitted when no cause was recorded. See [Graceful Stop](graceful-stop.md). |
 | `allocation.stopping` | info | Allocations entered their grace window. Metadata carries `cause`, `maxGraceSeconds`, and per-allocation `graceSeconds`. The window is the manager's expectation. The worker's clock starts when it delivers the signal. See [Graceful Stop](graceful-stop.md). |
@@ -102,7 +104,8 @@ legion events follow --kind rollout --json   # NDJSON: one envelope per line
 ```
 
 `--kind` matches exactly or by category prefix. For example, `--kind eval`
-matches `eval.enqueued`, `eval.completed`, `eval.failed`, and `eval.requeued`.
+matches `eval.enqueued`, `eval.completed`, `eval.failed`, `eval.requeued`,
+`eval.blocked`, and `eval.unblocked`.
 
 ### Events about one instance or one allocation
 

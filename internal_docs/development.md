@@ -36,17 +36,18 @@ login finds cargo fine.
 
 <!-- Run the manager -->
 cargo run -- start manager -c configs/manager.ncl
-<!-- Join the cluster as a worker node (note the port and lack of tls) -->
-LEGION_ADDR=http://127.0.0.1:4748 cargo run -- join -a
-<!-- Now you can make calls to legion (note that the port is different, should be TLS in the future) -->
+<!-- Join the cluster as a worker node: `-a` mints a join token through the API, then joins with it -->
+LEGION_ADDR=http://127.0.0.1:4747 cargo run -- join -a
+<!-- Now you can make calls to legion -->
 LEGION_ADDR=http://127.0.0.1:4747 cargo run -- ledger
 
 ### Running a second cluster on one machine
 
-A worker serves its own gRPC endpoint on port 4848 and advertises that address
-to the manager, so two workers on one host collide (the manager dispatches both
-allocations to whichever process owns the port). Set `LEGION_WORKER_PORT` to
-give a second worker its own. Point the manager at a free port, and give both
+A worker serves its worker plane (mTLS gRPC) on `0.0.0.0:4848` and advertises
+that port to the manager, so two workers on one host collide: the second one
+cannot bind it, and its exec, logs, and push dispatch fail (the manager
+verifies each node's name, so nothing is misrouted). Set `LEGION_WORKER_PORT`
+to give a second worker its own. Point the manager at a free port, and give both
 processes their own `LEGION_DATA_DIR` so they share no state with your main
 cluster (see `docs/data-directory.md`):
 
@@ -80,7 +81,7 @@ mise run join --linux
 mise run join --linux --count 3
 ```
 
-By default Linux workers connect to `http://192.168.64.1:4748` (the default `container` host gateway for the default network). If your setup differs, pass `--manager-addr`. Run `mise run join --help` for additional options (platform, custom manager address, container name prefix, startup log tail behavior, and forwarded join args).
+By default Linux workers connect to `http://192.168.64.1:4747` (the default `container` host gateway for the default network). If your setup differs, pass `--manager-addr`. Run `mise run join --help` for additional options (platform, custom manager address, container name prefix, startup log tail behavior, and forwarded join args).
 
 ### Building a shipping binary (`--profile dist`)
 

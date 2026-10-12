@@ -1075,7 +1075,7 @@ impl Store {
         let snapshot = Self::get_snapshot_on(&tx, snapshot_id)?
             .ok_or_else(|| StorageError::not_found("snapshot", snapshot_id))?;
         if !snapshot.state.is_restorable() {
-            bail!(StorageError::ForeignKey {
+            bail!(StorageError::FailedPrecondition {
                 message: format!(
                     "snapshot {snapshot_id} is {}, not local or published; only a captured \
                      snapshot can be restored",
@@ -1093,7 +1093,7 @@ impl Store {
         match state.as_deref() {
             None => bail!(StorageError::not_found("instance", instance_id)),
             Some("pending" | "active" | "rescheduling") => {}
-            Some(other) => bail!(StorageError::ForeignKey {
+            Some(other) => bail!(StorageError::FailedPrecondition {
                 message: format!(
                     "instance {instance_id} is {other}; start it before restoring a snapshot"
                 ),

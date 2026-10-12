@@ -101,7 +101,7 @@ impl Store {
             bail!(StorageError::not_found("instance", &new.instance_id));
         };
         if mode != "keyed" || state != "active" || current != Some(new.allocation_id) {
-            bail!(StorageError::ForeignKey {
+            bail!(StorageError::FailedPrecondition {
                 message: format!(
                     "instance {} changed while the fork was being prepared (it is {state}); retry",
                     new.instance_id
@@ -109,7 +109,7 @@ impl Store {
             });
         }
         if let Some(pending) = pending {
-            bail!(StorageError::ForeignKey {
+            bail!(StorageError::FailedPrecondition {
                 message: format!(
                     "instance {} has a {pending} in flight; fork it once that finishes",
                     new.instance_id
@@ -544,7 +544,7 @@ impl Store {
                     snapshot.state,
                     SnapshotState::Local | SnapshotState::Published
                 ) {
-                    bail!(StorageError::ForeignKey {
+                    bail!(StorageError::FailedPrecondition {
                         message: format!(
                             "snapshot {snapshot_id} is {}; only a captured (local or published) \
                              snapshot can seed new instances",
@@ -627,7 +627,7 @@ impl Store {
                 });
             }
             if let Some(reason) = alias_target_problem(&snapshot) {
-                bail!(StorageError::ForeignKey { message: reason });
+                bail!(StorageError::FailedPrecondition { message: reason });
             }
             let previous: Option<String> = tx
                 .query_row(

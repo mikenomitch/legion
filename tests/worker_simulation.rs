@@ -114,6 +114,7 @@ async fn launch_fleet(
         register_rate: 1000.0,
         advertise_host: Some("127.0.0.1".into()),
         identity_dir: Some(dir.path().join("fleet-identity")),
+        ..Default::default()
     };
     launch_simulated_fleet(
         manager_addr,
@@ -347,6 +348,29 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
         .await
         .expect_err("sim workers have no logs");
     assert_eq!(status.code(), tonic::Code::Unimplemented);
+
+    // The stub enforces the same caller classes as a real worker: a client
+    // that trusts the CA but presents no manager certificate is refused.
+    let ca = store.ensure_mesh_ca()?;
+    let tls = tonic::transport::ClientTlsConfig::new()
+        .ca_certificate(tonic::transport::Certificate::from_pem(ca.bundle_pem()))
+        .domain_name(legion::manager::mesh_ca::fleet_dns_name("sim-it"));
+    let anonymous = tonic::transport::Endpoint::from_shared(fleet.worker_address().to_string())?
+        .tls_config(tls)?
+        .connect()
+        .await?;
+    let status = legion::structs::worker_client::WorkerClient::new(anonymous)
+        .post_work(PostWorkRequest {
+            allocation: Some(TaskAllocation {
+                provisional: None,
+                allocation_id: 999,
+                node_id: "sim-it-web-0".into(),
+                ..TaskAllocation::default()
+            }),
+        })
+        .await
+        .expect_err("dispatch without a manager certificate must be refused");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
     fleet.abort();
     Ok(())

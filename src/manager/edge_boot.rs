@@ -60,16 +60,42 @@ pub struct ClaimRatification<'a> {
     pub gate: Gate,
 }
 
+/// The ticket a ratification redeems: its `jti` and the time the spend is
+/// judged against.
+#[derive(Debug, Clone)]
+pub struct TicketSpend {
+    pub jti: String,
+    pub now_unix: i64,
+}
+
 /// Ratify a claim by committing its placement.
 ///
 /// Refusals are classified rather than returned as errors: the node needs a
 /// machine-readable reason to decide between killing the work and retrying
 /// inside its lease, and an on-call responder needs to tell "id taken" from
 /// "no capacity" without reading manager logs.
+///
+/// **One scheduler-lane entry** (sandbox-scaling plan, Phase 1): the ticket
+/// spend, the instance row when the ticket names an id that has never
+/// existed, the one-placement plan apply, and the `alloc.ratified` event
+/// all commit together, group-committed with other instance writes. They
+/// used to be four entries on two lanes, and the spend came first, so a
+/// ratification refused for capacity still burned a single-use ticket and
+/// the node's retry inside its lease could only fail. Now a refusal commits
+/// nothing and the ticket stays redeemable. The status-lane `task_status`
+/// projection follows the entry, as it follows every plan apply.
 #[instrument(skip_all, fields(claim_id = claim.claim_id, node_id = claim.node_id))]
-pub fn ratify(store: &Store, claim: &ClaimRatification<'_>) -> R<Verdict> {
-    let Some(task_config_id) = task_config_id_for(store, claim.job_config_id, claim.task_name)?
-    else {
+pub fn ratify(
+    store: &Store,
+    claim: &ClaimRatification<'_>,
+    spend: Option<TicketSpend>,
+    started: std::time::Instant,
+) -> R<Verdict> {
+    let task = store
+        .get_task_configs_for_job_config(claim.job_config_id)?
+        .into_iter()
+        .find(|(_, task)| task.name == claim.task_name);
+    let Some((task_config_id, task)) = task else {
         return Ok(Verdict::refuse(
             RefusalReason::UnknownTarget,
             format!(
@@ -77,6 +103,31 @@ pub fn ratify(store: &Store, claim: &ClaimRatification<'_>) -> R<Verdict> {
                 claim.job_config_id, claim.task_name
             ),
         ));
+    };
+    let job_id = store
+        .job_id_for_job_config(claim.job_config_id)?
+        .unwrap_or_default();
+
+    // A ticket may name an instance that does not exist yet: the edge start
+    // is then the create. Only a keyed task's id that has NEVER existed
+    // qualifies — a tombstone is a row, so a destroyed id is refused by the
+    // bind below exactly as before, and ids are never recycled.
+    let create = if claim.instance_id.is_empty()
+        || store.get_instance(claim.instance_id)?.is_some()
+        || task
+            .stateful
+            .as_ref()
+            .is_none_or(|stateful| stateful.mode != crate::structs::InstanceMode::Keyed)
+    {
+        None
+    } else {
+        if let Err(err) = crate::structs::instance::validate_keyed_instance_id(claim.instance_id) {
+            return Ok(Verdict::refuse(
+                RefusalReason::UnknownTarget,
+                format!("instance id {:?} is invalid: {err}", claim.instance_id),
+            ));
+        }
+        Some((job_id.clone(), task.group.clone(), task.name.clone()))
     };
 
     // Sampled immediately before the submit, exactly as the scheduler does:
@@ -87,31 +138,73 @@ pub fn ratify(store: &Store, claim: &ClaimRatification<'_>) -> R<Verdict> {
         store.allocation_version_vector_for_candidates(claim.job_config_id, &[claim.node_id])?;
     let placements = vec![(claim.node_id.to_string(), task_config_id)];
 
-    let outcome = store.submit_and_apply_plan_for_instance(
-        claim.job_config_id,
-        "reschedule",
-        &placements,
-        &expected_versions,
-        &[],
-        claim.instance_id,
-    );
+    let job_config_id = claim.job_config_id.to_string();
+    let instance_id = claim.instance_id.to_string();
+    let node_id = claim.node_id.to_string();
+    let claim_id = claim.claim_id.to_string();
+    let gate = claim.gate.as_str().to_string();
+    let fused = store.scheduler_group_commit("ratify_claim", move |s| {
+        s.within_savepoint(|s| {
+            if let Some(spend) = &spend {
+                if !s.spend_boot_ticket(&spend.jti, spend.now_unix)? {
+                    return Ok(Err((
+                        RefusalReason::TicketInvalid,
+                        format!(
+                            "boot ticket {} has no redemptions left (single-use tickets are \
+                             spent by the first ratification, even if it has since exited)",
+                            spend.jti
+                        ),
+                    )));
+                }
+            }
+            if let Some((job_id, group, task_name)) = &create {
+                s.create_keyed_instance(job_id, group, task_name, Some(&instance_id))?;
+            }
+            let (_, outcome) = s.submit_and_apply_plan_for_instance(
+                &job_config_id,
+                "reschedule",
+                &placements,
+                &expected_versions,
+                &[],
+                &instance_id,
+            )?;
+            let allocation_id = match &outcome {
+                PlanApplyOutcome::Applied(applied) => match applied.allocations.first() {
+                    Some(allocation) => allocation.id,
+                    // An applied plan that placed nothing means the placement
+                    // was silently dropped, which the apply path does not do;
+                    // treat it as internal rather than pretending it
+                    // succeeded.
+                    None => {
+                        return Ok(Err((
+                            RefusalReason::Internal,
+                            "plan applied without producing an allocation".to_string(),
+                        )))
+                    }
+                },
+                PlanApplyOutcome::Rejected { reason, .. } => {
+                    return Ok(Err((classify(reason), reason.clone())));
+                }
+            };
+            s.events().provisional_ratified(
+                &claim_id,
+                allocation_id,
+                &node_id,
+                &job_id,
+                &instance_id,
+                &gate,
+                started.elapsed().as_millis() as u64,
+            );
+            Ok(Ok((allocation_id, outcome)))
+        })
+    });
 
-    match outcome {
-        Ok((_, PlanApplyOutcome::Applied(applied))) => match applied.allocations.first() {
-            Some(allocation) => Ok(Verdict::Confirmed {
-                allocation_id: allocation.id,
-            }),
-            // An applied plan that placed nothing means the placement was
-            // silently dropped, which the apply path does not do; treat it as
-            // internal rather than pretending it succeeded.
-            None => Ok(Verdict::refuse(
-                RefusalReason::Internal,
-                "plan applied without producing an allocation",
-            )),
-        },
-        Ok((_, PlanApplyOutcome::Rejected { reason, .. })) => {
-            Ok(Verdict::refuse(classify(&reason), reason))
+    match fused {
+        Ok(Ok((allocation_id, outcome))) => {
+            store.plan_apply_bookkeeping(&outcome)?;
+            Ok(Verdict::Confirmed { allocation_id })
         }
+        Ok(Err((reason, detail))) => Ok(Verdict::refuse(reason, detail)),
         Err(err) => {
             let detail = format!("{err:#}");
             Ok(Verdict::refuse(classify(&detail), detail))
@@ -144,14 +237,6 @@ fn classify(reason: &str) -> RefusalReason {
     } else {
         RefusalReason::Internal
     }
-}
-
-fn task_config_id_for(store: &Store, job_config_id: &str, task_name: &str) -> R<Option<i64>> {
-    Ok(store
-        .get_task_configs_for_job_config(job_config_id)?
-        .into_iter()
-        .find(|(_, task)| task.name == task_name)
-        .map(|(id, _)| id))
 }
 
 /// Everything a mint needs, already validated.
@@ -301,32 +386,24 @@ pub fn mint(
     })
 }
 
-/// Re-verify a ticket presented with a ratification, and spend it when it is
-/// single-use.
+/// Re-verify a ticket presented with a ratification: its signature, its
+/// lifetime, and that it authorizes this instance in this node's pool.
 ///
 /// The node already verified this ticket offline; the manager verifies it
 /// again because nodes are honest but are not trusted to be the *only*
-/// holder. This is where globally-single-use is enforced — the node-local
-/// check can only stop the same ticket being presented twice to the same
-/// node.
-pub fn verify_and_spend(
-    store: &Store,
+/// holder. The spend — where globally-single-use is enforced, since the
+/// node-local check can only stop the same ticket being presented twice to
+/// the same node — happens inside the ratification's own entry
+/// ([`ratify`]), so a refused ratification does not burn the ticket.
+pub fn verify_ticket(
     identity: &WorkloadIdentityState,
     ticket: &str,
     instance_id: &str,
     node_pool: &str,
-    now_unix: i64,
 ) -> R<BootTicketClaims> {
     let claims = identity.verify(ticket, crate::structs::edge_boot::BOOT_TICKET_AUDIENCE)?;
     let claims = BootTicketClaims::from_claims(&claims)?;
     claims.authorizes(instance_id, node_pool)?;
-    if !store.spend_boot_ticket(&claims.jti, now_unix)? {
-        bail!(
-            "boot ticket {} has no redemptions left (single-use tickets are spent by the first \
-             ratification, even if it has since exited)",
-            claims.jti
-        );
-    }
     Ok(claims)
 }
 

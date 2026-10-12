@@ -934,8 +934,56 @@ fn parse_warm_constraints(raw: &[String]) -> Result<crate::constraints::Constrai
 /// Apply a heartbeat's snapshot reports and emit their events. Never fails
 /// the heartbeat: a report that cannot be applied now is re-sent by the
 /// worker as long as the manager keeps re-sending the request.
+///
+/// Every report a heartbeat carries, and the events each one emits, commit
+/// as one scheduler-lane entry, group-committed with other nodes' reports
+/// and instance writes (sandbox-scaling plan, Phase 1). Each report used to
+/// be an entry of its own plus one per event: a suspend's capture report
+/// was three. A report that fails rolls back alone inside the entry. A
+/// manager that does not lead the scheduler lane falls back to applying
+/// them one by one, each forwarded to the leader as before.
 pub(super) fn apply_snapshot_reports(store: &Store, node_id: &str, reports: &[SnapshotReport]) {
-    for report in reports {
+    // Warms advance an in-memory queue, not a row, so they stay out of the
+    // replicated entry.
+    let (warms, rows): (Vec<&SnapshotReport>, Vec<&SnapshotReport>) =
+        reports.iter().partition(|report| report.op == "warm");
+    for report in warms {
+        apply_one_snapshot_report(store, node_id, report);
+    }
+    if rows.is_empty() {
+        return;
+    }
+    let node = node_id.to_string();
+    let batch: Vec<SnapshotReport> = rows.iter().map(|report| (*report).clone()).collect();
+    let fused = store.scheduler_group_commit("apply_snapshot_reports", move |s| {
+        for report in &batch {
+            apply_one_snapshot_report(s, &node, report);
+        }
+        Ok(())
+    });
+    match fused {
+        Ok(()) => {}
+        Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+            for report in rows {
+                apply_one_snapshot_report(store, node_id, report);
+            }
+        }
+        Err(err) => {
+            warn!(
+                node_id,
+                reports = rows.len(),
+                error = ?err,
+                "Failed applying snapshot reports; the worker will re-send them"
+            );
+        }
+    }
+}
+
+/// One report: advance its row and emit its event. Inside the fused entry
+/// both land in the same changeset; outside it (the fallback) each is its
+/// own op, as before.
+fn apply_one_snapshot_report(store: &Store, node_id: &str, report: &SnapshotReport) {
+    {
         // A warm has no row to advance: clear it from the queue and say how
         // it went. Duplicates (a re-sent report) find nothing queued and
         // emit nothing.
@@ -975,7 +1023,7 @@ pub(super) fn apply_snapshot_reports(store: &Store, node_id: &str, reports: &[Sn
                     &report.error,
                 );
             }
-            continue;
+            return;
         }
         let record = SnapshotReportRecord::from(report);
         let outcome = match store.apply_snapshot_report(node_id, &record) {
@@ -988,7 +1036,7 @@ pub(super) fn apply_snapshot_reports(store: &Store, node_id: &str, reports: &[Sn
                     error = ?err,
                     "Failed applying snapshot report; the worker will re-send it"
                 );
-                continue;
+                return;
             }
         };
         match outcome {

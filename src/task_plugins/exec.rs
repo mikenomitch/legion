@@ -368,7 +368,14 @@ impl TaskPlugin for ExecTaskPlugin {
         // join — which is the honest semantic for the `exec` runtime.
         let config = self.parse_config(&task.config)?;
 
-        let mut env = instance.extra_env.clone();
+        // The same layering `start` uses: Legion's allocation env (identity,
+        // `LEGION_PORT_*` / `LEGION_ADDR_*`, upstreams), then worker-injected
+        // env (task dir, artifacts, volumes, identities), then the task's own.
+        // A session without the first layer could not find the task's ports.
+        let mut env = crate::task_plugins::allocation_env(allocation, task)
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        env.extend(instance.extra_env.clone());
         for (k, v) in &config.env {
             env.insert(k.clone(), v.clone());
         }
@@ -427,18 +434,11 @@ impl TaskPlugin for ExecTaskPlugin {
             .context("exec task command must include at least one entry")?;
 
         let mut linux_options = config.linux_options()?;
-        // A gated allocation runs inside the namespace the worker created
-        // for it (docs/network-handlers.md). Its absence is a hard stop, not
-        // a silent fall back to host networking.
-        if crate::task_plugins::allocation_is_gated(allocation) {
-            let path = crate::worker::netd::netns::netns_path(allocation.id);
-            if !path.exists() {
-                bail!(
-                    "gated network namespace {} is not ready; the worker creates it before start \
-                     and retries on its next heartbeat",
-                    path.display()
-                );
-            }
+        // A gated allocation runs inside its own namespace
+        // (docs/network-handlers.md), created here if the heartbeat has not
+        // made it yet. Failing to create it is a hard stop, not a silent fall
+        // back to host networking.
+        if let Some(path) = crate::task_plugins::ensure_gated_namespace(allocation)? {
             linux_options.netns = Some(path);
         }
         // Worker-owned resource enforcement: worker core already created this

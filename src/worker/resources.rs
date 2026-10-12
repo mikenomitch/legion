@@ -232,14 +232,28 @@ impl NodeResourceGovernor {
         })
     }
 
-    /// Build the governor from the worker's `resourceEnforcement` config (via
-    /// the env the daemon exports).
-    ///
-    /// Enforcement is on by default. A node that cannot enforce (no cgroup
-    /// v2) degrades to `disabled` rather than failing every allocation; the
-    /// daemon already warned about it at start.
+    /// Build the governor from the env the daemon exports for task runtimes
+    /// (`LEGION_RESOURCE_ENFORCEMENT`, `LEGION_CGROUP_PARENT`). The worker
+    /// itself configures its governor explicitly with
+    /// [`Self::from_settings`]; this is for code that only has the env.
     pub fn from_env() -> Self {
-        if !crate::task_plugins::exec_isolation::enforcement_enabled() {
+        Self::from_settings(
+            crate::task_plugins::exec_isolation::enforcement_enabled(),
+            &crate::task_plugins::exec_isolation::cgroup_parent(),
+        )
+    }
+
+    /// Build the governor from the worker's `resourceEnforcement` settings:
+    /// whether enforcement is on, and the cgroup parent (relative to
+    /// [`CGROUP_ROOT`]) its hierarchy lives under.
+    ///
+    /// Enforcement is on by default. A node that cannot enforce (not Linux,
+    /// no cgroup v2, no usable CPUs) degrades to `disabled` rather than
+    /// failing every allocation, and says so. The "enabled" line is logged
+    /// here and only here, once the governor really is enabled, so the
+    /// worker log never claims enforcement a node is not doing.
+    pub fn from_settings(enabled: bool, cgroup_parent: &str) -> Self {
+        if !enabled {
             return Self::labels_only_from_env().unwrap_or_else(Self::disabled);
         }
         if !cfg!(target_os = "linux") {
@@ -254,7 +268,8 @@ impl NodeResourceGovernor {
             return Self::disabled();
         }
 
-        let root = PathBuf::from(crate::task_plugins::exec_isolation::cgroup_parent());
+        let parent = cgroup_parent.trim().trim_matches('/');
+        let root = PathBuf::from(if parent.is_empty() { "legion" } else { parent });
         let usable_cores = fingerprint_usable_cores();
         if usable_cores.is_empty() {
             warn!(

@@ -1,3 +1,5 @@
+use crate::cmd::helpers::json_flag;
+use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::task_plugins::render_builtin_task_plugin_schemas_markdown;
 
@@ -11,7 +13,8 @@ pub fn config() -> Command {
                 .value_name("PATH")
                 .value_hint(ValueHint::FilePath)
                 .help("Write Markdown output to a file instead of stdout"),
-        );
+        )
+        .arg(json_flag());
 
     Command::new("docs")
         .about("Generate documentation from in-code schemas")
@@ -29,12 +32,19 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 }
 
 fn generate_task_schema_docs(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
     let markdown = render_builtin_task_plugin_schemas_markdown()?;
 
     if let Some(path) = arg_matches.get_one::<String>("output") {
         std::fs::write(path, &markdown)
             .with_context(|| format!("failed to write task schema docs to {}", path))?;
-        println!("Wrote task plugin schema docs to {}", path);
+        if format.is_json() {
+            output::print_success(&json!({ "path": path }));
+        } else {
+            println!("Wrote task plugin schema docs to {}", path);
+        }
+    } else if format.is_json() {
+        output::print_success(&json!({ "markdown": markdown }));
     } else {
         println!("{markdown}");
     }

@@ -14,11 +14,12 @@ use crate::structs::{
     manager_client::ManagerClient, GetArtifactCredentialRequest, IssueNodeIdentityTokenRequest,
 };
 
-/// Fetch-time credential resolver backed by the worker's manager channel.
+/// Fetch-time credential resolver backed by the worker's manager set.
 /// Calls run on staging threads (blocking), so each lookup connects on a
-/// private current-thread runtime.
+/// private current-thread runtime — to whichever manager the worker is
+/// currently talking to, so a fetch follows a manager failover.
 pub struct ManagerCredentialSource {
-    manager_addr: String,
+    managers: std::sync::Arc<crate::worker::managers::ManagerEndpoints>,
     node_id: String,
     /// Worker-plane credentials; credential fetches require the node token
     /// when ACLs are enforced.
@@ -27,12 +28,12 @@ pub struct ManagerCredentialSource {
 
 impl ManagerCredentialSource {
     pub fn new(
-        manager_addr: String,
+        managers: std::sync::Arc<crate::worker::managers::ManagerEndpoints>,
         node_id: String,
         credentials: std::sync::Arc<crate::worker::daemon::WorkerCredentials>,
     ) -> Self {
         Self {
-            manager_addr,
+            managers,
             node_id,
             credentials,
         }
@@ -46,7 +47,7 @@ impl CredentialSource for ManagerCredentialSource {
             .enable_all()
             .build()
             .context("build credential fetch runtime")?;
-        let manager_addr = self.manager_addr.clone();
+        let manager_addr = self.managers.active();
         let request = self
             .credentials
             .attach(tonic::Request::new(GetArtifactCredentialRequest {
@@ -81,7 +82,7 @@ impl CredentialSource for ManagerCredentialSource {
             .enable_all()
             .build()
             .context("build node-identity fetch runtime")?;
-        let manager_addr = self.manager_addr.clone();
+        let manager_addr = self.managers.active();
         let request = self
             .credentials
             .attach(tonic::Request::new(IssueNodeIdentityTokenRequest {

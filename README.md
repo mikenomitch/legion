@@ -40,7 +40,7 @@ cargo install legion-rs
 ```
 
 Start a manager with a worker running in the same process. The defaults work
-without a config file.
+without a config file, from any directory.
 
 ```bash
 legion start manager --run-worker
@@ -110,11 +110,13 @@ legion join lgnjoin_...
 
 The token pins your cluster's CA, so the new worker refuses anything that
 answers at the manager's address but isn't your manager. Managers reach
-workers over mutual TLS on port 4848, so allow 4848 from the managers to the
-workers (and 4747 from the workers to the managers). The worker advertises
-its address on the route to the manager; set `--advertise-addr` if that
-isn't the address managers should dial (see
-[Managers and Workers](docs/architecture-managers-workers.md#ports-and-addresses)).
+workers over mutual TLS on port 4848 for `legion exec`, `legion job logs`,
+and dispatch, so allow TCP 4848 from the managers to the workers (and 4747
+from the workers to the managers). The worker advertises its address on the
+route to the manager; if managers must dial it somewhere else (NAT, a second
+interface), pass `--advertise-addr 10.0.1.7` or set
+`LEGION_WORKER_ADVERTISE_ADDR` (see
+[Managers and Workers](docs/architecture-managers-workers.md#ports-and-who-dials-whom)).
 
 ### Example job specs
 
@@ -259,6 +261,12 @@ they should. Legion handles all three.
 - **Boot at the edge, ahead of the scheduler.** [Edge boot](docs/edge-boot.md)
   lets a worker start a sandbox before its placement is durable. You can hold
   its network shut until the manager confirms it is the only instance.
+- **A shell in any sandbox, with or without the manager in the path.**
+  `legion exec` reaches into Linux microVM sandboxes through the guest
+  agent. For high session counts, a platform mints single-use
+  [exec tickets](docs/exec-and-actions.md#direct-exec) (or signs its own
+  with a [delegated key](docs/exec-and-actions.md#delegated-minting-keys)),
+  and the session runs client to worker with no manager on the data path.
 - **Simple egress control.** [Network handlers](docs/network-handlers.md)
   give each task its own egress allowlist and proxy middleware, so you
   can customize what traffic is allowed or inject secrets safely.
@@ -270,6 +278,23 @@ they should. Legion handles all three.
   pack the active ones tighter, and fork copies a running sandbox for an
   agent to explore from. See the
   [agent sandboxes guide](docs/guides/agent-sandboxes.md).
+- **Sandboxes that scale.** Every sandbox is a durable, named instance:
+  it survives node loss, suspends and resumes, forks, and its id is never
+  reused. A full lifecycle (create, run, suspend, resume, destroy) costs the
+  control plane 8 replicated writes, down from 22. Concurrent creates and
+  suspends share a single write, so the cost per sandbox falls under load.
+  See [Sandboxes at scale](docs/sandboxes-at-scale.md).
+- **Work lands in one round trip.** Each node holds one stream to its
+  manager, so a placement reaches it as soon as it commits, at any
+  heartbeat interval. A node running 10,000 sandboxes sends a heartbeat of a
+  few dozen bytes, where it used to exchange about 4.6 MB per beat.
+- **Full clusters don't fail creates.** A sandbox that finds no room waits,
+  and places itself the moment a node that can host it joins or frees
+  capacity. `legion job info` shows what it's waiting for.
+- **Measure it yourself.** `legion-loadgen --mode instances` drives
+  sandbox lifecycles against any cluster. A standalone AWS campaign runs a
+  3-manager cluster on four boxes for about $1/hour and reports the
+  ceiling, latencies, cost per million lifecycles, and resident capacity.
 
 ### DevEx for humans and agents
 
@@ -328,6 +353,11 @@ on a network you don't trust. Known gaps:
   TLS pinned to the cluster CA, and managers reach workers over mutual TLS,
   but peer managers talk to each other in the clear. Keep managers on a
   network you trust.
+- **Revoking access ends a direct exec session within a heartbeat, not at
+  once.** Deleting the token behind a [direct exec](docs/exec-and-actions.md#direct-exec)
+  session, or the delegated key that signed its ticket, closes the session
+  on the worker's next heartbeat: 2 seconds up to 2,500 nodes, longer on
+  larger fleets, where the heartbeat interval grows.
 
 ### What's next
 
@@ -341,8 +371,6 @@ add:
   node-reported state, idle sessions in object storage that wake on
   request, and sequenced delivery of work, so raft holds only what must be
   durable ([plan](internal_docs/plans/sandbox-scaling-plan.md)).
-- **Exec into microVM sandboxes**, and exec sessions that skip the manager
-  ([plan](internal_docs/plans/sandbox-exec-plan.md)).
 - **Built-in ingress gateway, autoscaler, cert-manager, and GitOps tools**, or
   a more omakase starting experience.
 - **Resource registry for sharing and pulling jobs, templates, and plugins.**
@@ -360,6 +388,8 @@ add:
 The full index lives at **[docs/README.md](docs/README.md)**. Good places to
 start:
 
+- **Installing:** [Legion and its runtimes](docs/installation.md) (youki,
+  cloud-hypervisor, a guest kernel, Apple `container`)
 - **Concepts:** [Managers and Workers](docs/architecture-managers-workers.md) ·
   [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md) ·
   [Configuration Language](docs/configuration-language.md) ·
@@ -374,7 +404,8 @@ start:
 - **Guides:** [Running Postgres](docs/guides/postgres.md) ·
   [Running Redis](docs/guides/redis.md) ·
   [Serving TLS Certificates from KV](docs/guides/tls-certificates.md) ·
-  [Running Agent Sandboxes](docs/guides/agent-sandboxes.md)
+  [Running Agent Sandboxes](docs/guides/agent-sandboxes.md) ·
+  [Sandboxes at Scale](docs/sandboxes-at-scale.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md)

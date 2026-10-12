@@ -1858,6 +1858,52 @@ fn migration_list() -> Vec<M<'static>> {
         // checkpoint. Scheduler lane, like `instance`.
         M::up("ALTER TABLE instance ADD COLUMN identity_epoch INTEGER NOT NULL DEFAULT 0;")
             .down(""),
+        // Blocked evals (sandbox-scaling plan, Phase 3;
+        // docs/scheduler-and-eval-loop.md, "Blocked evals"): an eval that
+        // found no room for a placement is written `status = 'blocked'` with
+        // what it waits for, in the entry that used to fail it, and returns to
+        // `pending` when capacity that could help appears. `blocked_key` is
+        // the key (`class:pool=…`, `node:<id>`, `escaped`), `blocked_detail`
+        // the JSON of what could not place and what it asks for, and
+        // `blocked_at` when it blocked (RFC 3339). Scheduler lane, like `eval`.
+        M::up(
+            "ALTER TABLE eval ADD COLUMN blocked_key TEXT;
+             ALTER TABLE eval ADD COLUMN blocked_detail TEXT;
+             ALTER TABLE eval ADD COLUMN blocked_at TEXT;",
+        )
+        .down(""),
+        // Removed allocations, remembered for `ALLOCATION_HISTORY_RETENTION_SECS`
+        // so `legion job logs` can still find where a removed allocation ran
+        // (docs/logging.md, "Logs of removed allocations"). Written by every
+        // allocation-removal op in the transaction that deletes the row, and
+        // expired by those same transactions, so it is a scheduler-lane
+        // table like `allocation_stop_notice`. No foreign keys: the rows it
+        // describes are gone, and a destroyed job's history outlives it.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_history (
+            allocation_id INTEGER PRIMARY KEY,
+            job_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            task_config_id INTEGER NOT NULL,
+            task_name STRING NOT NULL DEFAULT '',
+            node_id STRING NOT NULL,
+            status STRING NOT NULL,
+            cause STRING NOT NULL DEFAULT '',
+            removed_at_unix INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_allocation_history_job
+            ON allocation_history(job_id, removed_at_unix);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_allocation_history_job;
+        DROP TABLE IF EXISTS allocation_history;",
+        ),
+        // Worker-type `container` settings (docs/task-runtime-container.md,
+        // "Capabilities"): the capability allowlist container tasks on the
+        // type's nodes are held to. JSON like `edge_boot`; empty on every
+        // existing row, which reads as the default allowlist. Control lane,
+        // like the rest of `worker_type`.
+        M::up("ALTER TABLE worker_type ADD COLUMN container TEXT NOT NULL DEFAULT '';").down(""),
         // Worker-type security settings (`hostGuard`, ...), folded by the
         // manager into one JSON column like `edge_boot`.
         M::up("ALTER TABLE worker_type ADD COLUMN security TEXT NOT NULL DEFAULT '';").down(""),

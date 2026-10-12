@@ -628,6 +628,9 @@ pub async fn run_exec_session(
         }
     });
 
+    // A worker that cannot be reached at all gets a message naming the
+    // node, its address, and the port; an answer from the worker (a missing
+    // allocation, a refused command) passes through with its own code.
     let worker_stream = worker
         .exec_task(ReceiverStream::new(fwd_rx))
         .await

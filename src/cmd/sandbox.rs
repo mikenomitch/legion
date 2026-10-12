@@ -84,6 +84,8 @@ pub fn config() -> Command {
 
     Command::new("sandbox")
         .about("Start workloads directly on edge nodes (docs/edge-boot.md)")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
         .subcommand(start_cmd)
 }
 

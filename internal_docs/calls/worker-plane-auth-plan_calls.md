@@ -8,7 +8,10 @@ also an open invitation to argue in review. Entries 1, 2, 4, 6, 7, 10, 13,
 14, and 16 were added on 2026-10-11 when the plan took on local workload
 isolation and folded in the sandbox-exec plan's amendments, which also
 extended entry 12. Entry 16 reverses the plan's earlier call to keep a
-plaintext path for one release.
+plaintext path for one release. Entries 45 to 47 were added when this
+branch merged `main`, which had shipped a first cut of Phase 1 in #17; they
+rank below the design calls because neither side changes what the plan
+promises a user.
 
 ## 1. ACLs are on by default, and the first token is minted at first start
 
@@ -1044,3 +1047,90 @@ metadata.
 details type means a new dependency on every client. A metadata key is one
 line on each side and extends to the next server-named code. **Simplicity
 won.**
+
+## 45. The merge keeps this branch's worker plane over #17's first cut
+
+`main` shipped a first cut of Phase 1 in
+[#17](https://github.com/mikenomitch/legion/pull/17) while this branch built
+all nine phases from the same plan. The two touched the same files
+(`src/manager/worker_plane.rs`, `src/worker/plane.rs`, `mesh_ca.rs`, the
+simulator) with different APIs. The merge keeps this branch's modules and
+ports #17's other work onto them.
+
+#17's calls doc recorded nine calls for its cut. Where each one stands:
+
+| #17 entry | What it decided | After the merge |
+| --- | --- | --- |
+| 10 | CA pin deferred to Phase 4 | Shipped in Phase 1, checked against the TLS handshake (entries 9, 32, 34) |
+| 11 | One-step rotation; a refused handshake makes a node re-issue | Two-step rotation by cross-signing (entry 20) |
+| 15 | `ExecTask` admits only managers | The `ticket` class ships with direct exec (sandbox-exec plan) |
+| 20 | Channels keyed by (node name, address) | Same idea: keyed by (CA, address, name); the log fetch's per-request map now keys by name too |
+| 21 | Sim fleet verified through `workerPlaneName` | One fleet certificate, `<prefix>.fleet.legion` (entry 21) |
+| 22 | No probe; the failing call explains itself | `Worker/Probe` and `WORKER_UNREACHABLE` (entries 43, 44) |
+| 23 | Listener waits for its certificate | Same (entry 24) |
+| 24 | Manager mints its certificate on first dial | Same |
+| 25 | One `--advertise-addr`, through a process-wide flag | One `--advertise-addr`, passed as a parameter (entry 26) |
+
+What survived from #17: the in-process worker of `--run-worker`
+advertising the manager's routable address (now passed on `WorkerJoin`
+instead of a process-wide flag), the simulation test that dials the fleet
+without a manager certificate, and everything outside the worker plane
+(manager failover, node-token persistence, container capabilities and
+ulimits, blocked evals, the work stream).
+
+**Alternative.** Keep #17's modules and rebuild this branch's later phases
+(pin, rotation, ticket class, probe, encrypted channel) on its API.
+
+**Trade-off.** Users of #17's surface see two changes:
+`legion sandbox start --ca-cert` is `--ca` (with `--node-name`), and a
+simulated node carries `workerFleet` instead of `workerPlaneName`.
+`tests/worker_plane.rs` is gone; `tests/worker_plane_classes.rs` covers the
+same cases (classification, a request per class, foreign CA, wrong node).
+
+**Why.** Every call #17 deferred is built here, on one set of modules. Two
+factories and two listener paths would be the drift AGENTS.md rules out, and
+porting nine phases onto #17's API is more code, and more risk, than porting
+#17's few non-plane changes onto this one. **Simplicity won.**
+
+## 46. Worker failover dials through one TLS connector, not a balanced channel
+
+`main`'s manager failover (`src/worker/managers.rs`) kept a balanced tonic
+channel and swapped its endpoints on failover, all plaintext. Phase 4 needs
+every worker-to-manager connection to be TLS naming `manager.legion`,
+verified against the token's pin or the cluster bundle. The merge keeps
+failover's behavior (one active manager, move after two transport failures,
+the persisted `managers.json`) and replaces the channel with one lazy
+channel whose connector dials whichever manager is active, over TLS.
+
+**Alternative.** Keep the balanced channel and give each endpoint a TLS
+config.
+
+**Trade-off.** No connection is open to a standby manager, so a failover
+pays one TLS handshake. That is what the balanced channel cost too, since
+only the active endpoint was in it.
+
+**Why.** tonic's `ClientTlsConfig` cannot take a custom verifier, and the
+pin check is a custom verifier. One connector holds the pin logic in one
+place, and every client cloned from the channel follows a failover.
+**Simplicity won, and the security rule stays in one function.**
+
+## 47. `legion-loadgen` needs `--join-token` for its embedded fleet
+
+The instances-mode load generator embeds a simulated fleet. That fleet now
+pins the cluster CA like any worker, and only a join token carries the pin,
+so `--join-secret` is removed and `--join-token` is required with
+`--simulate`. Without it the fleet refuses to start:
+
+```text
+no cluster CA pin for the manager at http://10.0.1.5:4747; start the fleet with a token from `legion join-token create`
+```
+
+**Alternative.** Fetch the CA from the manager on first contact and trust
+it (trust on first use) when no token is given.
+
+**Trade-off.** One more argument on a benchmark command line. The AWS
+campaign script already passes a token.
+
+**Why.** A benchmark that dials the manager the way a real worker does
+measures what a real worker costs. Trust on first use would be a second
+trust path that exists only for a tool. **Simplicity won.**

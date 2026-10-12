@@ -452,12 +452,16 @@ first DNS SAN, or else its CN. `identity` rules and `requireIdentity` match
 against that string.
 
 **The mesh (`certFrom = "legion"`).** The manager keeps one cluster **mesh
-CA**, created on first use and replicated with the control lane. It issues
-each worker node a short-lived **node certificate** over the authenticated
-worker channel (`IssueNodeCertificate`). The certificate has the SANs
-`<node>.node.legion` and `legion://node/<node id>`, is valid for 24 hours,
-and the worker refreshes it after 8. Nothing is written to disk on the node.
-Then:
+CA**, created on first use and replicated with the control lane. Every
+worker node holds a short-lived **node certificate** from it: the worker
+generates its own key, sends a CSR (`IssueNodeCertificate`, authorized by its
+node token) right after registration, and the manager signs it with the SANs
+`<node>.node.legion` and `legion://node/<node id>`, valid for 24 hours. The
+worker refreshes it after 8. The same certificate serves the node's worker
+plane ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)), and the key
+and certificate persist under `<state-dir>/identity/` (mode `0600`) so a
+restarted node has its mesh identity before it reaches a manager. The
+private key never leaves the node. Then:
 
 - A task whose ingress chain sets `mode = "mutual", certFrom = "legion"` has
   its advertised port terminate **node-to-node mTLS**. The catalog marks the
@@ -589,6 +593,18 @@ allocation's resolver (at `127.42.<b>.1:53` with a VIP block, else at
 `network` namespace entry). An `exec` task enters it with `setns` before
 exec, before dropping privileges. The worker dials out from the host
 namespace, so the listeners are the only way out.
+
+The worker's heartbeat creates the namespace ahead of the reconcile that
+starts the task. An allocation the manager pushes straight to the worker can
+start before any heartbeat lists it (at once, or as soon as its artifacts are
+staged), so the start creates the namespace itself when it is missing; the two
+paths are serialized and idempotent. The datapath listeners inside it are
+bound on the worker's next heartbeat, so for up to one heartbeat interval a
+pushed task has a namespace with loopback only: its egress and upstream
+connections fail until the listeners exist. A worker that cannot
+create namespaces (no `CAP_SYS_ADMIN`, or not Linux) fails the start with
+`allocation <id> is network.mode = "gated" but its network namespace could not
+be created`, and never falls back to host networking.
 
 Inside, the task gets:
 

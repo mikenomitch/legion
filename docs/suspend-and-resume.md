@@ -57,7 +57,7 @@ $ legion instance create agents --id user-42
 $ legion instance suspend user-42 --wait -j
 {"ok":true,"data":{"instance":"user-42","state":"suspended",
  "checkpoint":"snap-91c2a0b3d4e5f601","kind":"memory","bytes":1918893056,
- "duration_ms":740,"node":"w-03","durability":"local", ...}}
+ "durationMs":740,"node":"w-03","durability":"local", ...}}
 
 $ legion instance list agents
 ID       STATE      ...  CHECKPOINT
@@ -65,7 +65,7 @@ user-42  suspended  ...  snap-91c2a0b3d4e5f601 (memory, local w-03)
 
 $ legion instance start user-42 --wait -j
 {"ok":true,"data":{"instance":"user-42","state":"active",
- "resumed_from":"snap-91c2a0b3d4e5f601","node":"w-03","restore_ms":212, ...}}
+ "resumedFrom":"snap-91c2a0b3d4e5f601","node":"w-03","restoreMs":212, ...}}
 ```
 
 While `user-42` is suspended it holds no allocation and no reservation, which
@@ -494,13 +494,13 @@ resumed cold at 2026-10-10T12:03:24Z: restore from snap-91c2a0b3d4e5f601 failed 
 needs TAP device lgf3c1d...: creating it failed: ...). Running processes were lost, the
 volume was kept
 
-$ legion instance get user-42 -j | jq .data.instance.cold_boot
-{ "snapshot_id": "snap-91c2a0b3d4e5f601", "reason": "restore needs TAP device ...",
+$ legion instance get user-42 -j | jq .data.instance.coldBoot
+{ "snapshotId": "snap-91c2a0b3d4e5f601", "reason": "restore needs TAP device ...",
   "at": "2026-10-10T12:03:24Z" }
 ```
 
 `instance start --wait` prints the same `resumed cold at ...` line and returns
-`cold_boot` in its `-j` output. The UI's instances card shows a **resumed
+`coldBoot` in its `-j` output. The UI's instances card shows a **resumed
 cold** badge with the reason, and the MCP tools return the field. An explicit
 `start --cold` sets nothing, since that cold boot was asked for. The same
 record covers a fork or `from_snapshot` instance whose restore failed, and a
@@ -764,12 +764,12 @@ From then on:
 $ legion instance suspend user-42 --wait -j
 {"ok":true,"data":{"instance":"user-42","state":"suspended",
  "checkpoint":"snap-5b10e2c7a9d04f31","kind":"memory","node":"w-03",
- "durability":"store","checkpoint_state":"local", ...}}
+ "durability":"store","checkpointState":"local", ...}}
 
 # w-03 dies. It stops heartbeating and is marked lost.
 $ legion instance start user-42 -j
 {"ok":true,"data":{"instance":"user-42","state":"pending",
- "resuming_from":"snap-5b10e2c7a9d04f31", ...}}
+ "resumingFrom":"snap-5b10e2c7a9d04f31", ...}}
 # "Resuming instance user-42 from published snap-5b10e2c7a9d04f31 on any compatible node"
 ```
 
@@ -916,14 +916,14 @@ See [workload identity on sandboxes](workload-identity.md#sandboxes).
 - **Where did it come from?** `forked_from` names the instance a fork was
   forked from, for the fork's whole life (the fork checkpoint itself is
   reclaimed once every fork has restored).
-- **Did its last resume keep its running state?** `cold_boot` is set when a
+- **Did its last resume keep its running state?** `coldBoot` is set when a
   restore failed and the instance booted fresh on its volume instead (see
   [When a resume cannot restore](#when-a-resume-cannot-restore)).
 
 ```console
-$ legion instance get user-17 -j | jq .data.last_stop
+$ legion instance get user-17 -j | jq .data.instance.lastStop
 { "cause": "node_pressure", "detail": "evicted by evict-bursting on w-03: using 1.9 GiB of a 400 MiB reservation ...",
-  "hint": "raise resources.memory toward real usage", "at": "2026-10-10T06:12:44Z", "allocation_id": 1063, "node_id": "w-03" }
+  "hint": "raise resources.memory toward real usage", "at": "2026-10-10T06:12:44Z", "allocationId": 1063, "nodeId": "w-03" }
 ```
 
 For the full history, `legion events list --instance <id>` returns every
@@ -1311,9 +1311,9 @@ keeps running.
 ```console
 $ legion instance fork run-17 --count 3 --wait -j
 {"ok":true,"data":{"origin":"run-17","snapshot":"snap-c0de4a1b2c3d4e5f",
- "pause_ms":610,"instances":["run-17-f1","run-17-f2","run-17-f3"],
+ "pauseMs":610,"instances":["run-17-f1","run-17-f2","run-17-f3"],
  "kind":"memory","node":"w-03","durability":"local",
- "checkpoint_state":"local","deduplicated":false}}
+ "checkpointState":"local","deduplicated":false}}
 ```
 
 A fork is three things Legion already does, plus one rule:
@@ -1420,9 +1420,9 @@ memory or CPU than one node has, or that should not share a failure domain:
 ```console
 $ legion instance fork run-17 --count 3 --spread --wait -j
 {"ok":true,"data":{"origin":"run-17","snapshot":"snap-7e1a90c4b2d35f68",
- "pause_ms":640,"instances":["run-17-f1","run-17-f2","run-17-f3"],
+ "pauseMs":640,"instances":["run-17-f1","run-17-f2","run-17-f3"],
  "kind":"memory","node":"w-03","durability":"store",
- "checkpoint_state":"published","deduplicated":false}}
+ "checkpointState":"published","deduplicated":false}}
 ```
 
 A spread fork is a fork whose checkpoint is published, the same way

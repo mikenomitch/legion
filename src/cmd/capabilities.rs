@@ -107,9 +107,11 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "job.logs",
-            cli: "legion job logs [<NAME>] [--allocation <ID>] [--follow]",
+            cli: "legion job logs [<NAME>] [--allocation <ID>] [--include-removed] [--follow]",
             grpc: Some("Manager/GetAllocationLogs"),
-            summary: "Fetch captured stdout/stderr for a job's allocations.",
+            summary: "Fetch captured stdout/stderr for a job's allocations. Allocations removed \
+                 in the last 24 hours stay readable: a job with none live returns its newest \
+                 removed ones, each marked `removed` with its `removalCause`.",
             mutates: false,
             read_only_safe: true,
         },
@@ -718,7 +720,8 @@ pub fn catalog() -> Vec<Capability> {
             name: "kv.get",
             cli: "legion kv get <KEY>",
             grpc: Some("Manager/GetKv"),
-            summary: "Read a value from the KV store.",
+            summary: "Read a value from the KV store. A missing key is a `NotFound` error \
+                 (non-zero exit), so `kv get || kv put` works.",
             mutates: false,
             read_only_safe: true,
         },
@@ -1037,6 +1040,68 @@ pub fn catalog() -> Vec<Capability> {
                  the failing one; also reports the service's connect intentions.",
             mutates: false,
             read_only_safe: true,
+        },
+        // --- Exec & actions ---
+        Capability {
+            name: "exec.run",
+            cli: "legion exec <ALLOC> --json -- <CMD> [ARGS...]",
+            grpc: Some("Manager/ExecAllocation"),
+            summary: "Run a command inside a running allocation. `--json` collects the output \
+                 into one envelope (`exitCode`, `stdout`, `stderr`); the process exits with \
+                 the remote exit code.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "action.list",
+            cli: "legion action list <JOB>",
+            grpc: Some("Manager/ListJobActions"),
+            summary: "List the actions declared on a job's tasks, with their parameters.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "action.run",
+            cli: "legion action run <JOB> <ACTION> [--alloc <ID>] [--param k=v] --json",
+            grpc: Some("Manager/ExecAllocation"),
+            summary: "Run a declared action against a running allocation; `--json` returns \
+                 its exit code and output.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        // --- Raft (manager control plane) ---
+        Capability {
+            name: "raft.status",
+            cli: "legion raft status",
+            grpc: Some("Manager/GetRaftStatus"),
+            summary: "The answering manager's raft status: role, leader, term, indexes, \
+                 voters, and per-lane quorum health with any advisory.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "raft.history",
+            cli: "legion raft history [--limit <N>]",
+            grpc: Some("Manager/ListRaftHistory"),
+            summary: "Recent raft events (elections, membership changes, operator commands).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "raft.command",
+            cli: "legion raft command <COMMAND> [--target <NODE_ID>]",
+            grpc: Some("Manager/IssueRaftCommand"),
+            summary: "Issue an operator raft command such as trigger-election.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "raft.join-token",
+            cli: "legion raft join-token",
+            grpc: Some("Manager/GetRaftJoinToken"),
+            summary: "Mint a join token for adding a manager to the raft cluster.",
+            mutates: true,
+            read_only_safe: false,
         },
         // --- Discovery ---
         Capability {

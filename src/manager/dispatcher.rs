@@ -42,7 +42,14 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         Vec::with_capacity(allocations.len());
     let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
 
+    let work_log = store.work_log();
     for allocation in allocations {
+        // A node streaming its work from this manager gets the placement on
+        // its stream within a round trip of the commit (sandbox-scaling plan
+        // §6.13); a push would only race it.
+        if work_log.streaming(&allocation.node_id) {
+            continue;
+        }
         if !task_cache.contains_key(&allocation.job_config_id) {
             // The read model's shared list: task configs are immutable per
             // `job_config_id`, and this used to be a SQL query (plus row
@@ -98,7 +105,18 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         // previous mounts, and never re-derives storage from a jobspec.
         let volumes =
             store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
-        let task_allocation = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+        let mut task_allocation =
+            build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+        // The push must carry everything the heartbeat's desired set does:
+        // a worker launches from whichever copy reaches it first, and a
+        // resumed instance launched from a push without its restore payload
+        // boots cold and never restores.
+        task_allocation.priority_band = store
+            .cached_band_for_job_config(&allocation.job_config_id)?
+            .as_str()
+            .to_string();
+        task_allocation.restore =
+            crate::manager::server::snapshot_restore_payload(store, instance.as_ref());
         let request = crate::structs::PostWorkRequest {
             allocation: Some(task_allocation),
         };
@@ -309,7 +327,9 @@ fn speculative_claim_for(
     };
 
     let node = store.get_node(node_id)?;
-    if worker_protocol_version(&node) < MIN_PROVISIONAL_PROTOCOL_VERSION {
+    if crate::manager::worker_plane::worker_protocol_version(&node)
+        < MIN_PROVISIONAL_PROTOCOL_VERSION
+    {
         debug!(
             node_id,
             "Node predates provisional dispatch; falling back to post-commit dispatch"
@@ -462,16 +482,6 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
     })
 }
 
-/// The protocol version a node reported at registration. `0` when the node
-/// predates the field, which fences it out of provisional dispatch.
-fn worker_protocol_version(node: &crate::structs::Node) -> u64 {
-    node.config_attrs
-        .as_object()
-        .and_then(|attrs| attrs.get("protocolVersion"))
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0)
-}
-
 fn run_dispatch_future<F>(future: F) -> R<()>
 where
     F: std::future::Future<Output = R<()>>,
@@ -611,6 +621,15 @@ pub fn build_task_allocation_with(
         }
         None => String::new(),
     };
+    // Lifecycle and restart decide what the worker's supervisor does when the
+    // process exits. Without them every task ran as a service with
+    // `restart = always`, so a batch task that exited 0 was relaunched forever
+    // and never reported success. The restart block stays empty when
+    // undeclared: the worker then derives the policy from the lifecycle.
+    let task_restart = match task.restart.as_ref() {
+        Some(restart) => serde_json::to_string(restart).context("Failed to serialize restart")?,
+        None => String::new(),
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -641,6 +660,8 @@ pub fn build_task_allocation_with(
         task_suspend,
         task_snapshots,
         identity_epoch: instance.map_or(0, |instance| instance.identity_epoch),
+        task_lifecycle: task.lifecycle.to_string(),
+        task_restart,
     })
 }
 
@@ -1310,13 +1331,22 @@ mod tests {
             dynamic_attrs: json!({}),
             health_checks: json!({}),
         };
-        assert!(worker_protocol_version(&old) < MIN_PROVISIONAL_PROTOCOL_VERSION);
+        let version = crate::manager::worker_plane::worker_protocol_version;
+        assert!(version(&old) < MIN_PROVISIONAL_PROTOCOL_VERSION);
 
+        // Registration records the version in the node's dynamic attributes
+        // (where a real worker's lands); reading only `config_attrs` fenced
+        // every real worker out of provisional dispatch.
         let current = crate::structs::Node {
+            dynamic_attrs: json!({ "protocolVersion": 2 }),
+            ..old.clone()
+        };
+        assert!(version(&current) >= MIN_PROVISIONAL_PROTOCOL_VERSION);
+        let configured = crate::structs::Node {
             config_attrs: json!({ "protocolVersion": 2 }),
             ..old
         };
-        assert!(worker_protocol_version(&current) >= MIN_PROVISIONAL_PROTOCOL_VERSION);
+        assert!(version(&configured) >= MIN_PROVISIONAL_PROTOCOL_VERSION);
     }
 
     #[test]
@@ -1328,15 +1358,15 @@ mod tests {
             availability: "available".into(),
             last_heartbeat: "now".into(),
             heartbeat_source: String::new(),
-            config_attrs: json!({"workerAddress": "http://127.0.0.1:4848"}),
+            config_attrs: json!({"workerAddress": "https://10.0.1.7:4848"}),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),
             health_checks: json!({}),
         };
 
         assert_eq!(
-            worker_address_for_node(&node),
-            Some("http://127.0.0.1:4848".to_string())
+            crate::manager::worker_plane::worker_address(&node),
+            Some("https://10.0.1.7:4848".to_string())
         );
     }
 

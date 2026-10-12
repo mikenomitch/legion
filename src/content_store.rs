@@ -495,6 +495,29 @@ type FreeSpaceProbe = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 /// The node content store. Cheap to share behind an `Arc`; every method takes
 /// `&self` and is safe to call from many threads. Methods block (file I/O and
 /// sqlite), so call them from blocking threads, not the async runtime.
+/// The worker's node content store, registered once it opens, for code that
+/// runs below the staging pipeline and has no handle threaded to it: the
+/// image pull a `container` or `sandbox` task makes when its image was not
+/// staged as an artifact ([`crate::task_plugins`]' `oci_image`). `None` when
+/// the store is disabled or this process is not a worker.
+static NODE_STORE: std::sync::RwLock<Option<std::sync::Arc<ContentStore>>> =
+    std::sync::RwLock::new(None);
+
+/// Registers (or, with `None`, clears) this process's node content store.
+pub fn set_node_store(store: Option<std::sync::Arc<ContentStore>>) {
+    *NODE_STORE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = store;
+}
+
+/// This process's node content store, when a worker registered one.
+pub fn node_store() -> Option<std::sync::Arc<ContentStore>> {
+    NODE_STORE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 pub struct ContentStore {
     root: PathBuf,
     config: ContentStoreConfig,
@@ -555,7 +578,14 @@ impl ContentStore {
              CREATE TABLE IF NOT EXISTS published(
                digest TEXT PRIMARY KEY,
                url TEXT NOT NULL,
-               published_at INTEGER NOT NULL);",
+               published_at INTEGER NOT NULL);
+             -- The manifest digest each image tag last resolved to on this
+             -- node (src/artifacts/fetchers/oci.rs). Lets a start reuse
+             -- cached layers when the registry cannot be reached.
+             CREATE TABLE IF NOT EXISTS image_ref(
+               reference TEXT PRIMARY KEY,
+               digest TEXT NOT NULL,
+               resolved_at INTEGER NOT NULL);",
         )
         .context("initialize content index")?;
         let seq: i64 = db.query_row("SELECT COALESCE(MAX(use_seq), 0) FROM entry", [], |r| {
@@ -975,6 +1005,36 @@ impl ContentStore {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// Record that the image `reference` (a tag) resolved to the manifest
+    /// `digest` just now, replacing any earlier record.
+    pub fn record_image_ref(&self, reference: &str, digest: &ContentDigest) -> R<()> {
+        let inner = self.inner.lock().expect("content store");
+        inner.db.execute(
+            "INSERT INTO image_ref(reference, digest, resolved_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(reference) DO UPDATE SET digest = excluded.digest,
+               resolved_at = excluded.resolved_at",
+            params![reference, digest.as_str(), now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// The manifest digest `reference` last resolved to on this node, and
+    /// when (Unix seconds). Says nothing about whether its blobs are still
+    /// held; look each one up.
+    pub fn image_ref(&self, reference: &str) -> R<Option<(ContentDigest, i64)>> {
+        let inner = self.inner.lock().expect("content store");
+        let row: Option<(String, i64)> = inner
+            .db
+            .query_row(
+                "SELECT digest, resolved_at FROM image_ref WHERE reference = ?1",
+                params![reference],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(digest, at)| Ok((ContentDigest::parse(&digest)?, at)))
+            .transpose()
     }
 
     /// Bytes used, pinned, and budgeted per class.

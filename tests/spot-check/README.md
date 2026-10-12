@@ -35,7 +35,7 @@ check whether it is still needed). The hunk is marked `SPOT-CHECK SHIM`:
 The worker address shim is gone: workers bind `LEGION_WORKER_HOST` and
 advertise `LEGION_WORKER_ADVERTISE_ADDR` natively, and managers reach them
 over mutual TLS
-([architecture-managers-workers.md](../../docs/architecture-managers-workers.md#ports-and-addresses)).
+([architecture-managers-workers.md](../../docs/architecture-managers-workers.md#ports-and-who-dials-whom)).
 The rig still opens port 4848 only to the managers' security group.
 
 ## Layout

@@ -581,7 +581,7 @@ kept below as the record of what this plan asked for.
 
 Folding them in added one dependency: a worker builds a ticket verifier only
 when it fetches the cluster JWKS over TLS that pins the cluster CA, which is
-worker-plane-auth Phase 4 (its §6.1 and §6.8, calls entry 13). So direct exec
+worker-plane-auth Phase 4 (its §6.1 and §6.8, calls entry 16). So direct exec
 (Phase 2 here) needs worker-plane-auth Phases 1 and 4.
 
 1. **A third caller class in §6.1's table.**

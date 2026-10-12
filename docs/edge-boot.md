@@ -62,7 +62,7 @@ platform's own API ──(user auth)──► platform control plane
                                         │
                                   signed ticket (JWT, ~minutes)
                                         ▼
-   user request ──► edge router ──► legion sandbox start --node <addr>
+   user request ──► edge router ──► legion sandbox start --node https://<addr>
                                         │ verified offline, admitted locally,
                                         │ booted to the gate level
                                         ▼
@@ -286,15 +286,19 @@ booted
 ratified
 ```
 
-The worker plane is always mutual TLS. The CLI verifies the worker's node
-certificate against the cluster CA bundle, which it fetches from the manager
-with your token (`legion net ca show`, `net:read`) or reads from `--ca
-<file>`. With `--node-name`, the certificate must name that node
-(`w-17.node.legion`); without it, any node certificate of the cluster is
-accepted. The router presents no certificate: the ticket is its credential,
-and the worker ignores a client certificate on `StartClaim`. A router of your
-own must do the same: trust the bundle from `legion net ca show`, and verify
-`<node>.node.legion`.
+`--node` is the node's `workerAddress` (`legion node info` shows it), always
+`https://`. The worker plane is always mutual TLS
+([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). The CLI verifies the
+worker's node certificate against the cluster CA bundle before it sends the
+ticket. It fetches the bundle from the manager with your token (`legion net
+ca show`, `net:read`) or reads it from `--ca <file>` (save it once with
+`legion net ca show > ca.pem`). With `--node-name`, the certificate must name
+that node (`w-17.node.legion`); without it, any node certificate of the
+cluster is accepted. The router presents no certificate: the ticket is its
+credential, and the worker ignores a client certificate on `StartClaim`. A
+router of your own must do the same: trust the bundle from `legion net ca
+show`, and verify `<node>.node.legion`. Routers must be able to reach 4848
+on edge nodes.
 
 The stream reports each transition. A router may start routing at `booted`,
 but must handle `refused` at any point until `ratified`. `--dry-run` verifies
@@ -326,6 +330,20 @@ use by spending the `jti` in one conditional update, so the second
 ratification is refused even if the first workload has since exited. Nodes
 are expected to behave correctly, but Legion does not trust any node to be
 the only holder of a ticket.
+
+**The ratification is one write.** The ticket spend, the instance bind, the
+allocation, and the `provisional.ratified` event commit in a single
+scheduler-lane entry, all or nothing. A ratification that is refused (the
+node no longer fits, another node won the instance) therefore leaves the
+ticket unspent: a single-use ticket is consumed only by the start that
+actually ratifies.
+
+**The edge start can be the create.** A ticket that names a keyed instance
+id that has never existed creates the instance in that same entry, so a
+platform does not have to call `CreateInstance` first. A destroyed id is a
+tombstone, not "never existed", and is refused (`instance_claimed`): ids
+are never recycled. An id that is not a valid keyed instance id is refused
+with `unknown_target`.
 
 **Revocation is by TTL only.** The fast path cannot check a revocation list
 without adding the round trip the ticket exists to avoid. If you need fast
@@ -482,6 +500,12 @@ Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
 
 ## Known limitations
 
+- **The JWKS is fetched over the plaintext worker-to-manager channel** unless
+  the manager serves `server.tls`. Someone on the path between an edge node
+  and its manager could swap the keys that verify boot tickets. Keep that
+  path on a trusted network until encrypted worker connections ship
+  ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). The router-to-node
+  hop (`StartClaim` on 4848) is TLS, verified against the cluster CA.
 - **No island mode.** An unratified start that cannot reach a manager dies
   when its lease expires. Edge boot does not keep work running through a long
   control-plane outage.

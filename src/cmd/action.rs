@@ -8,19 +8,22 @@ use std::collections::HashMap;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
-use crate::cmd::exec::run_action_session;
-use crate::cmd::helpers::{connect_manager_client, friendly_status};
+use crate::cmd::exec::{newest_running_allocation, reject_interactive_json, run_action_session};
+use crate::cmd::helpers::{connect_manager_client, json_flag};
+use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
-use crate::structs::{ExecStart, GetLedgerRequest, ListJobActionsRequest};
+use crate::structs::{ExecStart, ListJobActionsRequest};
 
 pub fn config() -> Command {
     Command::new("action")
         .about("List and run declared actions against an allocation")
         .subcommand_required(true)
+        .arg_required_else_help(true)
         .subcommand(
             Command::new("list")
                 .about("List actions declared on a job's tasks")
-                .arg(Arg::new("job").help("Job name").required(true)),
+                .arg(Arg::new("job").help("Job name").required(true))
+                .arg(json_flag()),
         )
         .subcommand(
             Command::new("run")
@@ -61,7 +64,11 @@ pub fn config() -> Command {
                         .long("stdin")
                         .help("Forward local stdin to the action")
                         .action(ArgAction::SetTrue),
-                ),
+                )
+                .arg(json_flag().help(
+                    "Collect the output and print one JSON envelope with the exit code \
+                     (not with --tty or --stdin)",
+                )),
         )
 }
 
@@ -75,12 +82,20 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 
 async fn list(matches: &ArgMatches) -> R<()> {
     let job = matches.get_one::<String>("job").expect("required");
+    let format = OutputFormat::from_matches(matches);
     let mut client = connect_manager_client().await?;
-    let reply = client
-        .list_job_actions(ListJobActionsRequest { job: job.clone() })
-        .await
-        .map_err(|e| friendly_status("action", e))?
-        .into_inner();
+    let reply = output::resolve(
+        format,
+        "failed to list actions",
+        client
+            .list_job_actions(ListJobActionsRequest { job: job.clone() })
+            .await,
+    )?
+    .into_inner();
+    if format.is_json() {
+        output::print_success(&reply.actions);
+        return Ok(());
+    }
 
     if reply.actions.is_empty() {
         println!("No actions declared on job `{job}`.");
@@ -127,14 +142,19 @@ async fn run(matches: &ArgMatches) -> R<()> {
         .expect("required")
         .clone();
     let tty = matches.get_flag("tty");
+    let format = OutputFormat::from_matches(matches);
+    reject_interactive_json(format, tty, matches.get_flag("stdin"))?;
     let want_stdin = matches.get_flag("stdin") || tty;
+    let invalid = |message: String| {
+        output::fail_local(format, CliError::local("InvalidArgument", message, None))
+    };
 
     let mut params: HashMap<String, String> = HashMap::new();
     if let Some(values) = matches.get_many::<String>("param") {
         for raw in values {
             let (k, v) = raw
                 .split_once('=')
-                .ok_or_else(|| anyhow!("--param must be key=value, got `{raw}`"))?;
+                .ok_or_else(|| invalid(format!("--param must be key=value, got `{raw}`")))?;
             params.insert(k.to_string(), v.to_string());
         }
     }
@@ -148,9 +168,9 @@ async fn run(matches: &ArgMatches) -> R<()> {
     let allocation_id = match matches.get_one::<String>("alloc") {
         Some(raw) => raw
             .parse::<i64>()
-            .with_context(|| format!("invalid allocation id `{raw}`"))?,
+            .map_err(|_| invalid(format!("invalid allocation id `{raw}`")))?,
         None if !instance_id.is_empty() => 0,
-        None => newest_alloc_for_job(&mut client, &job).await?,
+        None => newest_running_allocation(&mut client, &job, format).await?,
     };
 
     let start = ExecStart {
@@ -166,31 +186,5 @@ async fn run(matches: &ArgMatches) -> R<()> {
         exec_ticket: String::new(),
     };
 
-    run_action_session(&mut client, start, want_stdin, tty).await
-}
-
-async fn newest_alloc_for_job(
-    client: &mut crate::cmd::helpers::AuthedManagerClient,
-    job: &str,
-) -> R<i64> {
-    let ledger = client
-        .get_ledger(GetLedgerRequest {})
-        .await
-        .map_err(|e| friendly_status("action", e))?
-        .into_inner();
-    let mut best: Option<i64> = None;
-    for node in ledger.nodes {
-        for alloc in node.allocations {
-            if alloc.job_id == job
-                && (alloc.status == "placed"
-                    || alloc.status == "active"
-                    || alloc.status == "running")
-            {
-                best = Some(best.map_or(alloc.id, |b| b.max(alloc.id)));
-            }
-        }
-    }
-    best.ok_or_else(|| {
-        anyhow!("no running allocation found for job `{job}`; pass --alloc <id> explicitly")
-    })
+    run_action_session(&mut client, start, want_stdin, tty, format).await
 }
