@@ -343,7 +343,7 @@ fn admit_ticket(
             }
         }
     }
-    claims.allows(&start.command, start.tty).map_err(&refuse)?;
+    claims.allows(&start.command, start.tty).map_err(refuse)?;
     verifier
         .redeem(claims, now)
         .map_err(|err| refuse(format!("{err:#}")))?;
