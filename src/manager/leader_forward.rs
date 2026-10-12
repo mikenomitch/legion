@@ -61,7 +61,7 @@ const MANAGER_SERVICE_PREFIX: &str = "/legion.Manager/";
 /// Manager RPCs with a streaming REQUEST, which cannot be buffered and
 /// replayed. Kept in sync with `proto/legion.proto` by
 /// `streaming_rpcs_match_the_proto`.
-const CLIENT_STREAMING_RPCS: &[&str] = &["ExecAllocation"];
+const CLIENT_STREAMING_RPCS: &[&str] = &["ExecAllocation", "StreamWork"];
 
 /// Largest request body buffered for a possible replay. Above tonic's 4 MiB
 /// default decode limit, so anything the handler would accept fits.
