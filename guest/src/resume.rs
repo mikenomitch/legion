@@ -576,6 +576,7 @@ mod tests {
             }],
             guest_addr: None,
             ingress_ports: Vec::new(),
+            upstreams: Vec::new(),
         }
     }
 
@@ -843,14 +844,27 @@ mod tests {
         }
 
         let host = Recorder::default();
-        // The restore also names an ingress port the job added while the
-        // instance was suspended: the agent starts listening on it.
-        let added = std::net::TcpListener::bind("127.0.0.1:0")?
-            .local_addr()?
-            .port();
+        // The restore also names an ingress port and an upstream the job
+        // added while the instance was suspended: the agent starts
+        // listening on both.
+        let free = || -> R<u16> {
+            Ok(std::net::TcpListener::bind("127.0.0.1:0")?
+                .local_addr()?
+                .port())
+        };
+        let (added, upstream) = (free()?, free()?);
         let hook = |identity: &ResumeIdentity| {
-            let (_, failed) = started.restored(&identity.ingress_ports);
-            assert!(failed.is_empty(), "{failed:?}");
+            let restored = started.restored(identity);
+            assert!(
+                restored.ingress_failed.is_empty(),
+                "{:?}",
+                restored.ingress_failed
+            );
+            assert!(
+                restored.upstream_failed.is_empty(),
+                "{:?}",
+                restored.upstream_failed
+            );
         };
         let mut watcher = Watcher::new(&host, &hook);
         watcher.observe(restored(7));
@@ -858,11 +872,20 @@ mod tests {
         assert!(matches!(
             watcher.observe(ResumeIdentity {
                 ingress_ports: vec![added],
+                upstreams: vec![crate::identity::GuestUpstream {
+                    port: upstream,
+                    vsock_port: None,
+                    vip: None,
+                }],
                 ..restored(8)
             }),
             Observed::Restored { alloc_id: 8, .. }
         ));
         assert_eq!(started.ingress.ports(), vec![added]);
+        assert_eq!(
+            started.upstreams.addresses(),
+            vec![std::net::SocketAddr::from(([127, 0, 0, 1], upstream))]
+        );
 
         // The client sees its connection end at once, not at a timeout.
         client.set_read_timeout(Some(Duration::from_secs(5)))?;

@@ -14,6 +14,13 @@
 //! - `127.0.0.1:53/udp` answers DNS: each query is framed as DNS-over-TCP
 //!   (two-byte length prefix) over a vsock stream to host port 53 and the
 //!   answer is relayed back.
+//! - For each declared upstream, `127.0.0.1:<local port>` (what
+//!   `LEGION_UPSTREAM_<KEY>` names) and its VIP (what `<key>.svc.legion`
+//!   resolves to) are TCP listeners relayed to host vsock port
+//!   `<local port>`, where the node's upstream listener for it is, so HTTP
+//!   mode, policy, and handlers apply exactly as for a container
+//!   ([`Upstreams`]). The local port must not be 1080 or 53, which the
+//!   egress relays hold on the host side (refused at submit).
 //!
 //! Nothing here decides anything — policy, handlers, identity and the graph
 //! all run on the host side of the vsock, which is what keeps the guest
@@ -50,14 +57,19 @@
 //! keeps the ports it was captured with, so the datapath of the restoring
 //! allocation dials the same vsock ports. A port the restore adds arrives
 //! on the identity disk (`ResumeIdentity::ingress_ports`), and the resume
-//! watch hands it to [`Ingress::ensure`].
+//! watch hands it to [`Ingress::ensure`]. Upstreams run the other way: the
+//! workload keeps dialing the loopback ports it was captured with, and the
+//! identity disk (`ResumeIdentity::upstreams`) names the vsock port the
+//! restoring allocation listens on for each, which [`Upstreams::ensure`]
+//! retargets the existing listeners to (and adds the new VIPs).
 
+use crate::identity::{GuestUpstream, ResumeIdentity};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -433,6 +445,114 @@ impl Ingress {
     }
 }
 
+/// The agent's upstream side: for each upstream the task declares
+/// (`connect.upstreams`), a loopback listener on the port the workload
+/// dials (`LEGION_UPSTREAM_<KEY>`), and one on the upstream's VIP so
+/// `<key>.svc.legion` works, each relaying to the host vsock port where the
+/// node datapath's upstream listener is (see the module docs). Its relays
+/// are tracked in the shared [`Relays`].
+///
+/// An upstream is known by its loopback port, which a restore never
+/// changes. The vsock port behind it is the current allocation's local
+/// port, which a restore into another allocation does change: every
+/// listener of that upstream (the loopback one and each VIP it ever had)
+/// reads its target per connection, so retargeting is one store.
+pub struct Upstreams {
+    dial: Arc<dyn HostDial>,
+    relays: Arc<Relays>,
+    state: Mutex<UpstreamState>,
+}
+
+#[derive(Default)]
+struct UpstreamState {
+    /// Addresses listened on.
+    bound: BTreeSet<SocketAddr>,
+    /// Each upstream's host vsock port, by its loopback port.
+    targets: HashMap<u16, Arc<AtomicU32>>,
+}
+
+impl Upstreams {
+    pub fn new(dial: Arc<dyn HostDial>, relays: Arc<Relays>) -> Arc<Self> {
+        Arc::new(Upstreams {
+            dial,
+            relays,
+            state: Mutex::new(UpstreamState::default()),
+        })
+    }
+
+    /// Point every upstream in `upstreams` at its host vsock port, and
+    /// listen on each of its addresses not listened on yet. Like
+    /// [`Ingress::ensure`], nothing is ever unbound: a restored guest's
+    /// listeners survive the restore, and its workload keeps dialing the
+    /// ports (and, until its resolver cache expires, the VIPs) it was
+    /// captured with. Returns the addresses it could not listen on, with
+    /// why.
+    pub fn ensure(&self, upstreams: &[GuestUpstream]) -> Vec<(SocketAddr, io::Error)> {
+        let mut failed = Vec::new();
+        for upstream in upstreams {
+            let target = {
+                let mut state = self.lock();
+                let target = state
+                    .targets
+                    .entry(upstream.port)
+                    .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+                    .clone();
+                target.store(u32::from(upstream.host_port()), Ordering::SeqCst);
+                target
+            };
+            let mut addresses = vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                upstream.port,
+            )];
+            addresses.extend(upstream.vip.map(SocketAddr::V4));
+            for address in addresses {
+                if self.lock().bound.contains(&address) {
+                    continue;
+                }
+                let listener = match TcpListener::bind(address) {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        failed.push((address, err));
+                        continue;
+                    }
+                };
+                let dial = self.dial.clone();
+                let relays = self.relays.clone();
+                let target = target.clone();
+                match thread::Builder::new()
+                    .name(format!("legion-guest-upstream-{}", upstream.port))
+                    .spawn(move || relay_tcp(listener, dial, target, relays))
+                {
+                    Ok(_) => {
+                        self.lock().bound.insert(address);
+                    }
+                    Err(err) => failed.push((address, err)),
+                }
+            }
+        }
+        failed
+    }
+
+    /// The addresses listened on now.
+    pub fn addresses(&self) -> Vec<SocketAddr> {
+        self.lock().bound.iter().copied().collect()
+    }
+
+    /// The host vsock port the upstream on loopback `port` relays to.
+    pub fn target(&self, port: u16) -> Option<u32> {
+        self.lock()
+            .targets
+            .get(&port)
+            .map(|target| target.load(Ordering::SeqCst))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, UpstreamState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// What to run.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -447,6 +567,10 @@ pub struct AgentConfig {
     /// Ports the node datapath fronts: the agent listens on each as a vsock
     /// port and relays to the workload's loopback port of the same number.
     pub ingress_ports: Vec<u16>,
+    /// The task's upstreams: the agent listens on each one's loopback port
+    /// (and VIP) and relays to its host vsock port (at boot, the same
+    /// number).
+    pub upstreams: Vec<GuestUpstream>,
 }
 
 impl Default for AgentConfig {
@@ -457,6 +581,7 @@ impl Default for AgentConfig {
             dns_listen: Some("127.0.0.1:53".parse().expect("static")),
             dns_port: DNS_PORT,
             ingress_ports: Vec::new(),
+            upstreams: Vec::new(),
         }
     }
 }
@@ -473,16 +598,34 @@ pub struct Started {
     /// Ingress ports the agent could not listen on, with why. The rest of
     /// the agent runs regardless: egress never depends on ingress.
     pub ingress_errors: Vec<(u16, io::Error)>,
+    /// The upstream side, so the resume watch can add the upstreams a
+    /// restore names.
+    pub upstreams: Arc<Upstreams>,
+    /// Upstream addresses the agent could not listen on, with why.
+    pub upstream_errors: Vec<(SocketAddr, io::Error)>,
+}
+
+/// What a restore did to the agent's relays and listeners.
+#[derive(Debug, Default)]
+pub struct Restored {
+    /// Relays the capture left dead, now closed.
+    pub closed: usize,
+    /// Ingress ports the restore added that could not be listened on.
+    pub ingress_failed: Vec<(u16, io::Error)>,
+    /// Upstream addresses the restore added that could not be listened on.
+    pub upstream_failed: Vec<(SocketAddr, io::Error)>,
 }
 
 impl Started {
     /// What the agent does when its resume watch sees a restore: close
-    /// every relay the capture left dead (egress and ingress), then listen
-    /// on any ingress port the restore added. Returns how many relays it
-    /// closed and the ports it could not listen on.
-    pub fn restored(&self, ingress_ports: &[u16]) -> (usize, Vec<(u16, io::Error)>) {
-        let closed = self.relays.close_all();
-        (closed, self.ingress.ensure(ingress_ports))
+    /// every relay the capture left dead (egress, upstream, and ingress),
+    /// then listen on any ingress port or upstream the restore added.
+    pub fn restored(&self, identity: &ResumeIdentity) -> Restored {
+        Restored {
+            closed: self.relays.close_all(),
+            ingress_failed: self.ingress.ensure(&identity.ingress_ports),
+            upstream_failed: self.upstreams.ensure(&identity.upstreams),
+        }
     }
 }
 
@@ -500,12 +643,14 @@ pub fn start(
     let relays = Arc::new(Relays::default());
     let ingress = Ingress::new(listen, relays.clone());
     let ingress_errors = ingress.ensure(&config.ingress_ports);
+    let upstreams = Upstreams::new(dial.clone(), relays.clone());
+    let upstream_errors = upstreams.ensure(&config.upstreams);
     {
         let dial = dial.clone();
         let relays = relays.clone();
         thread::Builder::new()
             .name("legion-guest-proxy".into())
-            .spawn(move || relay_tcp(tcp, dial, proxy_port, relays))?;
+            .spawn(move || relay_tcp(tcp, dial, Arc::new(AtomicU32::new(proxy_port)), relays))?;
     }
     let dns_addr = match config.dns_listen {
         Some(bind) => {
@@ -525,11 +670,19 @@ pub fn start(
         relays,
         ingress,
         ingress_errors,
+        upstreams,
+        upstream_errors,
     })
 }
 
-/// Accept guest connections forever and relay each to the host port.
-fn relay_tcp(listener: TcpListener, dial: Arc<dyn HostDial>, port: u32, relays: Arc<Relays>) {
+/// Accept guest connections forever and relay each to the host port,
+/// read per connection so an upstream can be retargeted ([`Upstreams`]).
+fn relay_tcp(
+    listener: TcpListener,
+    dial: Arc<dyn HostDial>,
+    port: Arc<AtomicU32>,
+    relays: Arc<Relays>,
+) {
     for accepted in listener.incoming() {
         let Ok(client) = accepted else {
             thread::sleep(Duration::from_millis(50));
@@ -537,6 +690,7 @@ fn relay_tcp(listener: TcpListener, dial: Arc<dyn HostDial>, port: u32, relays: 
         };
         let dial = dial.clone();
         let relays = relays.clone();
+        let port = port.load(Ordering::SeqCst);
         let _ = thread::Builder::new()
             .name("legion-guest-relay".into())
             .spawn(move || {
@@ -827,6 +981,119 @@ mod tests {
         let mut buf = [0u8; 4];
         let read = host.read(&mut buf);
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        Ok(())
+    }
+
+    fn free_port() -> io::Result<u16> {
+        Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+    }
+
+    /// A node upstream listener stand-in on the host socket for vsock
+    /// `port`: answers each line upper-cased and prefixed with `tag`.
+    fn node_listener(base: &std::path::Path, port: u16, tag: &'static str) -> io::Result<()> {
+        let node = UnixListener::bind(host_socket_path(base, u32::from(port)))?;
+        thread::spawn(move || {
+            for stream in node.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut line = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while stream.read(&mut byte).unwrap_or(0) == 1 {
+                        line.push(byte[0]);
+                        if byte[0] == b'\n' {
+                            let mut answer = tag.as_bytes().to_vec();
+                            answer.extend(line.to_ascii_uppercase());
+                            let _ = stream.write_all(&answer);
+                            line.clear();
+                        }
+                    }
+                });
+            }
+        });
+        Ok(())
+    }
+
+    /// One request through `address`: what the node listener answered.
+    fn ask(address: &SocketAddr) -> io::Result<String> {
+        let mut workload = TcpStream::connect(address)?;
+        workload.set_read_timeout(Some(Duration::from_secs(5)))?;
+        workload.write_all(b"select 1\n")?;
+        let mut answer = [0u8; 10];
+        workload.read_exact(&mut answer)?;
+        Ok(String::from_utf8_lossy(&answer).to_string())
+    }
+
+    /// A gated guest's upstream: what the workload sends to its loopback
+    /// port, or to the upstream's VIP, reaches the host socket for vsock
+    /// port `<local port>` (the node's upstream listener), and the answer
+    /// comes back. Listeners are added once, an address that cannot be
+    /// bound is reported, and the relays are tracked for a restore. A
+    /// restore into an allocation with another local port retargets every
+    /// listener of the upstream, the old VIP's too, and adds the new VIP.
+    #[test]
+    fn upstreams_relay_the_workload_to_the_host_vsock_port() -> io::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let base = dir.path().join("vsock.sock");
+        let port = free_port()?;
+        node_listener(&base, port, "a")?;
+        let relays = Arc::new(Relays::default());
+        let upstreams = Upstreams::new(Arc::new(UnixDial { base: base.clone() }), relays.clone());
+        // The VIP stands in on loopback with another port: on a guest it is
+        // `127.42.<b>.<n>:<canonical port>`.
+        let vip: std::net::SocketAddrV4 = format!("127.0.0.1:{}", free_port()?).parse().unwrap();
+        let upstream = GuestUpstream {
+            port,
+            vsock_port: None,
+            vip: Some(vip),
+        };
+        assert!(upstreams.ensure(&[upstream]).is_empty());
+        // Already listening: nothing is bound twice.
+        assert!(upstreams.ensure(&[upstream]).is_empty());
+        let mut expected = vec![
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            SocketAddr::V4(vip),
+        ];
+        expected.sort();
+        assert_eq!(upstreams.addresses(), expected);
+        assert_eq!(upstreams.target(port), Some(u32::from(port)));
+
+        for address in &expected {
+            assert_eq!(ask(address)?, "aSELECT 1\n", "through {address}");
+            wait_until("the relay is tracked", || relays.open_count() >= 1);
+        }
+        assert!(relays.close_all() >= 1);
+
+        // Restored into an allocation whose local port for it is another,
+        // with another VIP: the workload's port stays, every listener
+        // follows the new vsock port, and the new VIP is added.
+        let moved = free_port()?;
+        node_listener(&base, moved, "b")?;
+        let new_vip: std::net::SocketAddrV4 =
+            format!("127.0.0.1:{}", free_port()?).parse().unwrap();
+        let restored = GuestUpstream {
+            port,
+            vsock_port: Some(moved),
+            vip: Some(new_vip),
+        };
+        assert!(upstreams.ensure(&[restored]).is_empty());
+        assert_eq!(upstreams.target(port), Some(u32::from(moved)));
+        expected.push(SocketAddr::V4(new_vip));
+        expected.sort();
+        assert_eq!(upstreams.addresses(), expected);
+        for address in &expected {
+            assert_eq!(ask(address)?, "bSELECT 1\n", "through {address}");
+        }
+
+        // Something in the guest already holds an upstream's port.
+        let squatter = TcpListener::bind("127.0.0.1:0")?;
+        let taken = squatter.local_addr()?.port();
+        let failed = upstreams.ensure(&[GuestUpstream {
+            port: taken,
+            vsock_port: None,
+            vip: None,
+        }]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, SocketAddr::from(([127, 0, 0, 1], taken)));
         Ok(())
     }
 }

@@ -629,6 +629,10 @@ pub(crate) struct GuestPayload {
     /// `--ingress-port`: it listens on each as a vsock port and relays the
     /// node datapath's connections to the workload on the same port.
     pub ingress_ports: Vec<u16>,
+    /// A gated sandbox's upstreams, passed to the agent as `--upstream
+    /// PORT[=VIP:PORT]`: it listens on each loopback port (and VIP) and
+    /// relays to the node datapath's vsock socket for the port.
+    pub upstreams: Vec<legion_guest::identity::GuestUpstream>,
     /// A sandbox launched for memory checkpoints (or with token files):
     /// init starts the resume handler in the background, which watches the
     /// identity disk and refreshes the guest after every restore (new
@@ -721,6 +725,12 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
             .iter()
             .map(|port| format!(" --ingress-port {port}"))
             .collect();
+        // Each upstream: the agent listens on its loopback port and VIP and
+        // relays to the datapath's vsock socket for the port. The argument
+        // is digits, dots, a colon, and `=`, so it needs no quoting.
+        for upstream in &payload.upstreams {
+            flags.push_str(&format!(" --upstream {}", upstream.to_arg()));
+        }
         if payload.resume_watch {
             flags.push_str(" --resume-watch");
         }
@@ -1392,14 +1402,27 @@ mod tests {
         assert!(!script.contains("guest-resume"), "{script}");
     }
 
-    /// Gated plan §6.10: a gated guest's advertised ports reach the agent
-    /// as flags, which the guest crate's own parser accepts.
+    /// Gated plan §6.10: a gated guest's advertised ports and upstreams
+    /// reach the agent as flags, which the guest crate's own parser accepts.
     #[test]
     fn a_gated_guest_hands_its_ports_to_the_agent() {
+        let upstreams = vec![
+            legion_guest::identity::GuestUpstream {
+                port: 20003,
+                vsock_port: None,
+                vip: Some("127.42.0.2:5432".parse().unwrap()),
+            },
+            legion_guest::identity::GuestUpstream {
+                port: 20004,
+                vsock_port: None,
+                vip: None,
+            },
+        ];
         let script = render_init_script(&GuestPayload {
             command: vec!["/bin/sh".into()],
             guest_agent: true,
             ingress_ports: vec![8080, 20001],
+            upstreams: upstreams.clone(),
             resume_watch: true,
             ..GuestPayload::default()
         });
@@ -1410,7 +1433,8 @@ mod tests {
         assert_eq!(
             line.trim(),
             "/legion/legion guest-agent --ingress-port 8080 --ingress-port 20001 \
-             --resume-watch >/dev/console 2>&1 &"
+             --upstream 20003=127.42.0.2:5432 --upstream 20004 --resume-watch \
+             >/dev/console 2>&1 &"
         );
         let words: Vec<String> = line
             .split_whitespace()
@@ -1421,6 +1445,7 @@ mod tests {
         match legion_guest::cli::parse(&words).unwrap() {
             legion_guest::cli::Invocation::Agent(args) => {
                 assert_eq!(args.ingress_ports, vec![8080, 20001]);
+                assert_eq!(args.upstreams, upstreams);
                 assert!(args.resume_watch.is_some());
             }
             other => panic!("{other:?}"),
@@ -1488,6 +1513,7 @@ mod tests {
             guest_binary: None,
             resolvers: Vec::new(),
             ingress_ports: Vec::new(),
+            upstreams: Vec::new(),
         };
         let script = render_init_script(&payload);
 
@@ -1537,6 +1563,7 @@ mod tests {
             guest_binary: None,
             resolvers: Vec::new(),
             ingress_ports: Vec::new(),
+            upstreams: Vec::new(),
         };
 
         let dir = tempfile::tempdir()?;

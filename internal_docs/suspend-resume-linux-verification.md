@@ -1994,8 +1994,9 @@ the Phase 3c/6 `HostTaps` calls, already covered by
 ## Gated sandboxes
 
 The [gated sandbox checkpoints plan](plans/gated-sandbox-checkpoints-plan.md)
-(Phases 0 to 5). Built on a Linux host **without KVM**: the vsock retarget,
-the guest agent's relay drop, the datapath's attribution, the idle signals,
+(Phases 0 to 5, and upstreams after it). Built on a Linux host **without
+KVM**: the vsock retarget, the guest agent's relay drop, its ingress and
+upstream relays, the datapath's attribution, the idle signals,
 the gated default, and TAP addressing ran against fakes, fixture trees, Unix
 sockets standing in for vsock, and (for the guest's netlink re-addressing) a
 veth pair in a throwaway network namespace. No guest booted. Phase 0 is the
@@ -2227,11 +2228,44 @@ legion instance fork g-1 --wait && curl -sv http://<fork address>:<fork port>/
 - **Firecracker #6100:** on Firecracker 1.16, take a live `snapshot create
   --memory g-1` and `curl` the origin repeatedly for a minute. Record
   whether inbound connections stall; on 1.17 they must not. The result
-  decides the ingress floor (calls entry 17).
+  decides the ingress floor (calls entry 20).
 - **Repeat on a TAP sandbox** (`config.network = { mode = "tap", bridge =
   "br0" }`, the workload bound on `0.0.0.0`): the same `curl`s work through
   the node's address, and after a fork the datapath dials the fork's new
   lease.
+
+### G5.2 Upstreams
+
+A keyed gated sandbox with `connect = { upstreams = [{ service = "web" }]
+}`, where `web` is any HTTP service in the catalog, `network = { mode =
+"gated", egress = { policy = "allow" } }`, and `suspend.checkpoint =
+"memory"`. From an exec or console in the guest (or a command that loops
+over these and prints the results):
+
+```bash
+wget -qO- "http://$LEGION_UPSTREAM_WEB/"
+wget -qO- "http://$LEGION_UPSTREAM_VIP_WEB/"                  # the VIP and canonical port
+wget -qO- "http://web.svc.legion:<web's declared port>/"         # the name, through the resolver
+legion net doctor <alloc> -j | jq '.data'                        # capture_ready, no unbound upstream
+legion instance suspend g-2 --wait && legion instance resume g-2 --wait
+# the same two requests, from the restored workload, with its old env
+legion instance fork g-2 --wait
+# the same two requests in the fork
+```
+
+- **Pass:** both requests answer from `web` at boot, after the resume, and
+  in the fork. After the resume, `legion alloc get` shows a different
+  `localPort` for the upstream than before (pin it with a placement on
+  another node if it happens to match) and the requests still answer: the
+  agent relays the captured port to the new socket from the first
+  connection, without waiting for a heartbeat.
+- **Also:** with `egress = { policy = "deny" }` and no rule for `web`, the
+  upstream still answers (declared upstreams are not subject to
+  `gated-default`), and with an `http` block on the upstream the request
+  carries its retries and timeout. A spec with `localPort = 53` on the
+  upstream is refused at submit.
+- **Not expected to work:** the same spec on a TAP sandbox; the dial is
+  refused in the guest (tracked in TODO.md).
 
 ### Ignored tests
 

@@ -171,9 +171,11 @@ root disk as `/legion/legion`:
 
 - **The gated datapath's relay** (`guest-agent`), on a gated sandbox. It
   relays the guest's loopback proxy and resolver ports to the node over
-  vsock, and relays the node's inbound connections on each advertised port
+  vsock, relays the node's inbound connections on each advertised port
   (`--ingress-port <port>` on its command line) to the workload's loopback
-  port ([network-handlers.md](network-handlers.md#sandboxes)).
+  port, and relays each upstream's loopback port and VIP (`--upstream
+  <port>=<vip>:<port>`) to the node's listener for it
+  ([network-handlers.md](network-handlers.md#sandboxes)).
 - **The resume handler**, on a sandbox launched for memory checkpoints or
   with identity token files. It refreshes the guest's identity, RNG, clock,
   token files, and a TAP guest's address after a restore and runs `onResume`
@@ -567,6 +569,15 @@ binds the port as on any runtime, on loopback or every address. Health
 checks, the catalog, and consumers all use the advertised port. See
 [Ingress into a sandbox](network-handlers.md#ingress-into-a-sandbox).
 
+A gated sandbox reaches its `connect.upstreams` as a container does:
+`$LEGION_UPSTREAM_<KEY>` and `<key>.svc.legion` both work in the guest. The
+guest agent listens on each upstream's loopback port and VIP and relays to
+the node's upstream listener over the vsock, so HTTP mode, policy, and
+handlers apply as on any runtime. Submit refuses an upstream `localPort` of
+1080 or 53, and an advertised port the guest would bind on 1080, because the
+agent holds those. A TAP-wired or loopback-only sandbox cannot reach its
+upstreams. See [network-handlers.md](network-handlers.md#sandboxes).
+
 A gated sandbox takes memory checkpoints like any other: suspend, resume,
 snapshots, forks, and publish. Every restore moves the guest's vsock onto the
 restoring allocation's own socket, so the restored guest is judged by the new
@@ -838,6 +849,10 @@ memory restore, since the device rides the snapshot.
   Firecracker that includes a running origin's, for a live snapshot or a
   fork. Retry interrupted calls. See
   [suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
+- **Only a gated sandbox reaches its upstreams.** On a TAP-wired or
+  loopback-only sandbox, `LEGION_UPSTREAM_<KEY>` names the guest's own
+  loopback, where nothing listens, so every dial is refused. Use
+  `network.mode = "gated"` for a sandbox with `connect.upstreams`.
 - **A gated sandbox's socket path must fit a Unix socket.** The datapath
   listens on `<worker state>/allocs/<id>/.sandbox/vsock.sock_1080`, and a
   path over 107 bytes fails the start or restore with `gated sandbox socket

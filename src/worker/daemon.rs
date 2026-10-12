@@ -1917,7 +1917,7 @@ async fn apply_upstreams(
     reply: &HeartbeatReply,
     alloc_root: &std::path::Path,
 ) {
-    let specs = upstream_specs(&reply.desired_allocations);
+    let specs = upstream_specs(&reply.desired_allocations, alloc_root);
     forwarder.sync(&specs).await;
     if let Some(dns) = forwarder.dns() {
         dns.sync(&dns_specs(&reply.desired_allocations, alloc_root))
@@ -2568,7 +2568,14 @@ async fn apply_net_policies(
 /// the loopback ports those upstreams were *assigned* live on the allocation's
 /// network, next to its host ports, because both come out of the same per-node
 /// port space. Allocations that declare no upstreams cost one string check.
-fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
+///
+/// A gated sandbox's upstream listens on its VMM's vsock host socket for
+/// the upstream's local port, which the guest agent relays the workload's
+/// connections to; the VIP is the guest's to serve. A guest restored from
+/// a memory checkpoint still dials the loopback port it was captured with,
+/// and its agent relays that to this allocation's local port, so nothing
+/// here depends on the guest's history.
+fn upstream_specs(desired: &[TaskAllocation], alloc_root: &std::path::Path) -> Vec<UpstreamSpec> {
     let mut specs = Vec::new();
     for allocation in desired {
         if allocation.task_connect.trim().is_empty() || allocation.network.trim().is_empty() {
@@ -2591,14 +2598,22 @@ fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
         // the same way the assigned loopback ports are.
         let declared: crate::structs::ConnectConfig =
             serde_json::from_str(&allocation.task_connect).unwrap_or_default();
-        let netns = network
-            .is_gated()
+        let sandbox = is_gated_sandbox(allocation);
+        let netns = (network.is_gated() && !sandbox)
             .then(|| crate::worker::netd::netns::netns_path(allocation.allocation_id));
+        let scratch = sandbox.then(|| {
+            crate::task_plugins::sandbox_dir_for(
+                &alloc_root.join(allocation.allocation_id.to_string()),
+            )
+        });
         for upstream in &network.upstreams {
             let declaration = declared
                 .upstreams
                 .iter()
                 .find(|candidate| candidate.key() == upstream.service);
+            let vsock = scratch
+                .as_deref()
+                .map(|scratch| sandbox_upstream_socket(scratch, upstream));
             specs.push(UpstreamSpec {
                 allocation_id: allocation.allocation_id,
                 service: upstream.service.clone(),
@@ -2610,13 +2625,30 @@ fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
                 credentials: declaration
                     .map(|d| d.credentials.clone())
                     .unwrap_or_default(),
-                vip: upstream.vip.clone(),
-                canonical_port: upstream.canonical_port,
+                vip: if sandbox { None } else { upstream.vip.clone() },
+                canonical_port: if sandbox {
+                    None
+                } else {
+                    upstream.canonical_port
+                },
                 netns: netns.clone(),
+                vsock,
             });
         }
     }
     specs
+}
+
+/// The vsock host socket a gated sandbox's upstream listens on, in its
+/// sandbox dir: `vsock.sock_<local port>` (see [`upstream_specs`]).
+fn sandbox_upstream_socket(
+    scratch: &std::path::Path,
+    upstream: &crate::structs::AllocUpstream,
+) -> PathBuf {
+    crate::worker::netd::guest_agent::host_socket_path(
+        &crate::task_plugins::vsock_socket_base(scratch),
+        u32::from(upstream.local_port),
+    )
 }
 
 /// The per-allocation resolvers a desired set implies: one per allocation
@@ -2641,7 +2673,7 @@ fn dns_specs(
         let sandbox = is_gated_sandbox(allocation);
         // Every gated sandbox gets a resolver on its vsock socket, VIP block
         // or not: without one, a guest with no upstreams has no DNS at all
-        // (gated plan §6.5, calls entry 25). Everything else needs a block.
+        // (gated plan §6.5, calls entry 29). Everything else needs a block.
         if resolver.is_none() && !sandbox {
             continue;
         }
@@ -3110,6 +3142,23 @@ fn net_status(
                 upstreams.len(),
                 expected_upstreams
             ));
+            // A gated sandbox's upstreams are vsock host sockets: name the
+            // unbound ones, as for the proxy and the resolver.
+            if vsock_sandbox {
+                let scratch =
+                    crate::task_plugins::sandbox_dir_for(&alloc_root.join(id.to_string()));
+                for upstream in network
+                    .upstreams
+                    .iter()
+                    .filter(|upstream| !upstreams.contains(&upstream.service))
+                {
+                    problems.push(format!(
+                        "upstream {} is not bound on the guest's vsock socket {}",
+                        upstream.service,
+                        sandbox_upstream_socket(&scratch, upstream).display()
+                    ));
+                }
+            }
         }
         if vsock_sandbox && !resolver_ready {
             problems.push(format!(
@@ -3125,8 +3174,8 @@ fn net_status(
                 "allocation resolver is not bound (port 53 needs CAP_NET_BIND_SERVICE)".into(),
             );
         }
-        // A gated sandbox's capture is both vsock host sockets: the proxy and
-        // the resolver.
+        // A gated sandbox's capture is its vsock host sockets: the proxy, the
+        // resolver, and one per declared upstream (counted with the rest).
         let capture_ready = if gated {
             namespace_ready
                 && proxy_ready
@@ -4268,7 +4317,7 @@ mod tests {
         }
     }
 
-    /// Gated plan §6.5, calls entry 25: every gated sandbox gets a resolver
+    /// Gated plan §6.5, calls entry 29: every gated sandbox gets a resolver
     /// on its vsock socket even with no upstreams (and so no VIP block),
     /// and never binds an address. A gated container still needs a block
     /// (its namespace resolver gap is tracked separately).
@@ -4334,7 +4383,7 @@ mod tests {
 
     #[test]
     fn upstream_specs_come_from_the_allocation_network() {
-        let specs = upstream_specs(&[connect_allocation(11, "db", 20003)]);
+        let specs = upstream_specs(&[connect_allocation(11, "db", 20003)], Path::new("/allocs"));
         assert_eq!(
             specs,
             vec![UpstreamSpec {
@@ -4349,6 +4398,7 @@ mod tests {
                 vip: None,
                 canonical_port: None,
                 netns: None,
+                vsock: None,
             }]
         );
     }
@@ -4384,10 +4434,104 @@ mod tests {
             ]
         );
         assert!(declared_credentials(&[without]).is_empty());
-        let specs = upstream_specs(&[with]);
+        let specs = upstream_specs(&[with], Path::new("/allocs"));
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].credentials.len(), 2);
         assert_eq!(specs[0].credentials[0].prefix.as_deref(), Some("Bearer "));
+    }
+
+    /// A gated sandbox's upstream listens on its VMM's vsock host socket for
+    /// its local port, never in a namespace or on a VIP (the guest serves
+    /// the VIP). A restored guest's boot record, which says the workload
+    /// still dials the loopback port it was captured with, does not move
+    /// it: the guest agent relays that port to this one.
+    #[test]
+    fn a_gated_sandboxs_upstreams_listen_on_its_vsock_socket() {
+        let root = TempDir::new().unwrap();
+        let mut allocation = connect_allocation(7, "db", 20003);
+        allocation.task_runtime = "sandbox".into();
+        allocation.task_config = json!({ "image": "a" }).to_string();
+        allocation.network = json!({
+            "mode": "gated",
+            "upstreams": [{
+                "service": "db",
+                "localPort": 20003,
+                "balance": "least_conn",
+                "vip": "127.42.0.2",
+                "canonicalPort": 5432,
+            }],
+        })
+        .to_string();
+        let scratch = crate::task_plugins::sandbox_dir_for(&root.path().join("7"));
+        let socket = |port: u16| {
+            crate::worker::netd::guest_agent::host_socket_path(
+                &crate::task_plugins::vsock_socket_base(&scratch),
+                u32::from(port),
+            )
+        };
+        let specs = upstream_specs(std::slice::from_ref(&allocation), root.path());
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].vsock.as_deref(), Some(socket(20003).as_path()));
+        assert!(specs[0]
+            .vsock
+            .as_ref()
+            .unwrap()
+            .ends_with(".sandbox/vsock.sock_20003"));
+        assert_eq!(
+            (&specs[0].netns, &specs[0].vip, specs[0].canonical_port),
+            (&None, &None, None)
+        );
+
+        std::fs::create_dir_all(&scratch).unwrap();
+        crate::task_plugins::write_guest_upstreams_record(&scratch, &[("db", 20009)]).unwrap();
+        let restored = upstream_specs(&[allocation], root.path());
+        assert_eq!(restored, specs);
+    }
+
+    /// A gated sandbox's capture includes a vsock socket per upstream:
+    /// `net doctor` names each unbound one, and binding it clears that
+    /// problem (the proxy and the resolver, not bound here, still hold
+    /// `capture_ready` down).
+    #[tokio::test]
+    async fn net_status_names_a_gated_sandboxs_unbound_upstream_socket() {
+        let root = TempDir::new().unwrap();
+        let mut allocation = connect_allocation(7, "db", 20003);
+        allocation.task_runtime = "sandbox".into();
+        allocation.task_config = json!({ "image": "a" }).to_string();
+        allocation.network = json!({
+            "mode": "gated",
+            "upstreams": [{ "service": "db", "localPort": 20003, "balance": "least_conn" }],
+        })
+        .to_string();
+        let desired = vec![allocation];
+        let forwarder = UpstreamForwarder::new();
+        let socket = crate::worker::netd::guest_agent::host_socket_path(
+            &sandbox_vsock_base(root.path(), 7),
+            20003,
+        );
+        let unbound = format!(
+            "upstream db is not bound on the guest's vsock socket {}",
+            socket.display()
+        );
+
+        let status = net_status(&forwarder, &desired, root.path());
+        assert_eq!(status.len(), 1);
+        assert!(!status[0].capture_ready);
+        assert!(
+            status[0].problems.contains(&unbound),
+            "{:?}",
+            status[0].problems
+        );
+
+        forwarder.sync(&upstream_specs(&desired, root.path())).await;
+        assert!(socket.exists());
+        let status = net_status(&forwarder, &desired, root.path());
+        assert!(!status[0].problems.contains(&unbound));
+        assert!(!status[0]
+            .problems
+            .iter()
+            .any(|problem| problem.contains("upstream listeners bound")));
+        assert!(!status[0].capture_ready, "the proxy is not bound here");
     }
 
     /// Gated plan §6.10: how the ingress listener reaches each task. A task
@@ -4507,7 +4651,7 @@ mod tests {
             network: "{not json".into(),
             ..TaskAllocation::default()
         };
-        assert!(upstream_specs(&[plain, unplaced, corrupt]).is_empty());
+        assert!(upstream_specs(&[plain, unplaced, corrupt], Path::new("/allocs")).is_empty());
     }
 
     #[test]
@@ -4604,6 +4748,7 @@ mod tests {
                 vip: None,
                 canonical_port: None,
                 netns: None,
+                vsock: None,
             }]
         );
         // The listener is live on the loopback port the task will dial.

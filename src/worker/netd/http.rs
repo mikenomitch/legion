@@ -1679,6 +1679,7 @@ mod integration {
                 vip: None,
                 canonical_port: None,
                 netns: None,
+                vsock: None,
             }])
             .await;
         assert_eq!(forwarder.active().len(), 1, "listener bound");
@@ -1900,6 +1901,7 @@ mod integration {
                 vip: None,
                 canonical_port: None,
                 netns: None,
+                vsock: None,
             }])
             .await;
         let (status, _, body) =

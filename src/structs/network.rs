@@ -211,12 +211,16 @@ pub fn validate_gated_sandbox(
             ));
         }
     }
+    let runs_gated = task_runs_gated(task, sandbox_gated_default);
+    if runs_gated {
+        validate_gated_guest_ports(task)?;
+    }
     let ports = task
         .network
         .as_ref()
         .map(|network| network.ports.len())
         .unwrap_or(0);
-    if ports == 0 || task_runs_gated(task, sandbox_gated_default) {
+    if ports == 0 || runs_gated {
         return Ok(());
     }
     let config_mode = task
@@ -244,6 +248,48 @@ pub fn validate_gated_sandbox(
          wire the guest to a bridge (config.network = {{ mode = \"tap\", bridge = \"br0\" }})",
         task.name
     ))
+}
+
+/// Ports a gated guest cannot give its workload, because the guest agent
+/// holds them: `127.0.0.1:1080` is its egress proxy relay, and host vsock
+/// ports 1080 and 53 are the egress proxy and the resolver, which an
+/// upstream (relayed to the host vsock port of its own `localPort`) would
+/// collide with. Dynamic ports come from far above both.
+fn validate_gated_guest_ports(task: &crate::structs::TaskConfig) -> Result<(), String> {
+    const PROXY: u16 = 1080;
+    const RESOLVER: u16 = 53;
+    let proxy_port = task.network.as_ref().and_then(|network| {
+        network
+            .ports
+            .iter()
+            .find(|port| port.to.or(port.static_port) == Some(PROXY))
+    });
+    if let Some(port) = proxy_port {
+        return Err(format!(
+            "task {:?} binds network.ports {:?} on port {PROXY} in its guest, but in a gated \
+             sandbox guest 127.0.0.1:{PROXY} is the guest agent's egress proxy\nHint: pick \
+             another port, or drop static and to to take a dynamic one",
+            task.name, port.name
+        ));
+    }
+    let upstream = task.connect.as_ref().and_then(|connect| {
+        connect
+            .upstreams
+            .iter()
+            .find(|upstream| matches!(upstream.local_port, Some(PROXY | RESOLVER)))
+    });
+    if let Some(upstream) = upstream {
+        return Err(format!(
+            "task {:?} connect.upstreams entry {:?} sets localPort {}, but a gated sandbox's \
+             upstreams are relayed to the node on vsock ports of the same number, and {PROXY} \
+             and {RESOLVER} are the guest's egress proxy and resolver\nHint: pick another \
+             localPort, or drop it to take a dynamic one",
+            task.name,
+            upstream.key(),
+            upstream.local_port.unwrap_or_default()
+        ));
+    }
+    Ok(())
 }
 
 /// Why a sandbox that runs without Legion's egress policy because of its
@@ -2208,6 +2254,68 @@ mod tests {
             true
         )
         .is_ok());
+    }
+
+    /// A gated guest's agent holds 127.0.0.1:1080 (its egress proxy) and
+    /// relays each upstream to the host vsock port of its `localPort`, where
+    /// 1080 and 53 are the proxy and the resolver: a task that would collide
+    /// is refused at submit. The same task off gated networking passes.
+    #[test]
+    fn gated_sandboxes_refuse_the_guest_agents_ports() {
+        let plain = json!({ "image": "a", "command": ["sh"] });
+        let with_connect = |network: Value, upstream: Value| {
+            let mut task = task_of("sandbox", Some(network), plain.clone());
+            task.connect =
+                Some(serde_json::from_value(json!({ "upstreams": [upstream] })).unwrap());
+            task
+        };
+        let gated = json!({ "mode": "gated" });
+        for port in [1080, 53] {
+            let task = with_connect(gated.clone(), json!({ "service": "db", "localPort": port }));
+            let err = validate_gated_sandbox(&task, false).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "task \"workspace\" connect.upstreams entry \"db\" sets localPort {port}, but a \
+                     gated sandbox's upstreams are relayed to the node on vsock ports of the same \
+                     number, and 1080 and 53 are the guest's egress proxy and resolver\nHint: pick \
+                     another localPort, or drop it to take a dynamic one"
+                )
+            );
+        }
+        let fine = with_connect(gated.clone(), json!({ "service": "db", "localPort": 5432 }));
+        assert!(validate_gated_sandbox(&fine, false).is_ok());
+        // Off gated networking the agent relays nothing.
+        let tap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "tap" } });
+        let mut on_tap = task_of("sandbox", None, tap);
+        on_tap.connect = fine.connect.clone();
+        on_tap.connect.as_mut().unwrap().upstreams[0].local_port = Some(1080);
+        assert!(validate_gated_sandbox(&on_tap, false).is_ok());
+
+        for port in [
+            json!({ "name": "socks", "static": 1080 }),
+            json!({ "name": "socks", "to": 1080 }),
+        ] {
+            let task = task_of(
+                "sandbox",
+                Some(json!({ "mode": "gated", "ports": [port] })),
+                plain.clone(),
+            );
+            let err = validate_gated_sandbox(&task, false).unwrap_err();
+            assert_eq!(
+                err,
+                "task \"workspace\" binds network.ports \"socks\" on port 1080 in its guest, but in \
+                 a gated sandbox guest 127.0.0.1:1080 is the guest agent's egress proxy\nHint: \
+                 pick another port, or drop static and to to take a dynamic one"
+            );
+        }
+        // A default sandbox runs gated once the default is, and is checked.
+        let default = task_of(
+            "sandbox",
+            Some(json!({ "ports": [{ "name": "socks", "static": 1080 }] })),
+            plain,
+        );
+        assert!(validate_gated_sandbox(&default, true).is_err());
     }
 
     /// Gated plan §6.6: a default sandbox on a dev backend says it runs

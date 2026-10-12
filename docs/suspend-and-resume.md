@@ -1237,6 +1237,21 @@ connection close and reconnects. While the instance is suspended, nothing
 serves its advertised port. With `connections` in the idle signals, an open
 ingress connection keeps a gated sandbox awake like an open egress one.
 
+**Upstreams keep working.** The workload in the restored memory still dials
+the upstream loopback ports it was captured with. The checkpoint records
+them, and the restore tells the guest agent which local port the new
+allocation was assigned for each, which is where the new allocation's
+upstream listener is. The agent relays the old port to it from the first
+connection. The agent also listens on the new allocation's VIPs, and keeps
+relaying the old ones, so a resolver cache that still holds an old
+`<key>.svc.legion` answer works too. In `/legion/resume.env`,
+`LEGION_UPSTREAM_<KEY>` and `LEGION_UPSTREAM_PORT_<KEY>` name the loopback
+port the restored workload dials, and `LEGION_UPSTREAM_VIP_<KEY>` the new
+VIP. An upstream the job added while the instance was suspended gets its
+listener in the guest on restore. One the job removed stops working: its
+loopback port in the guest stays open, but the new allocation has no
+listener behind it.
+
 **Open connections reset.** A memory checkpoint closes every connection the
 guest has open through the datapath:
 

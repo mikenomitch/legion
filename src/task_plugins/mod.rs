@@ -30,11 +30,11 @@ pub use sandbox::{
     sandbox_config_is_tap, sandbox_dir_for, sandbox_guest_address, sandbox_guest_port,
     sandbox_usage_source, vsock_socket_base, vsock_socket_base_for, SandboxUsageSource,
 };
-#[cfg(test)]
-pub(crate) use sandbox_checkpoint::write_guest_ports_record;
 pub use sandbox_checkpoint::{
     firecracker_needs_api_socket, sandbox_checkpoint_support, sandbox_vmm_attrs, IDENTITY_DRIVE_ID,
 };
+#[cfg(test)]
+pub(crate) use sandbox_checkpoint::{write_guest_ports_record, write_guest_upstreams_record};
 mod schema_docs;
 mod vmm_api;
 

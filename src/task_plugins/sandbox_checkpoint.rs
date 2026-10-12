@@ -172,6 +172,52 @@ pub(crate) struct SandboxCheckpointState {
     /// before sandbox ingress, which then use the restoring allocation's.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub guest_ports: BTreeMap<String, u16>,
+    /// The loopback port a gated guest's workload dials per declared
+    /// upstream (`LEGION_UPSTREAM_<KEY>` inside the guest), by upstream key.
+    /// Fixed at first boot like [`Self::guest_ports`]: a restore tells the
+    /// guest agent to relay each of these to the restoring allocation's own
+    /// local port for the key, where its datapath listens. Empty for TAP
+    /// and loopback-only guests and on checkpoints taken before gated
+    /// upstreams.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub guest_upstreams: BTreeMap<String, u16>,
+}
+
+/// The loopback ports a freshly booted gated guest's workload dials for
+/// its upstreams: each upstream's local port, by key.
+pub(crate) fn boot_guest_upstreams(
+    network: Option<&crate::structs::AllocNetwork>,
+) -> BTreeMap<String, u16> {
+    network
+        .filter(|network| network.is_gated())
+        .map(|network| {
+            network
+                .upstreams
+                .iter()
+                .map(|upstream| (upstream.service.clone(), upstream.local_port))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The upstream ports a gated guest restored from `manifest` into an
+/// allocation with `network` dials: what the checkpoint recorded for each
+/// key the allocation still declares, and the allocation's own local port
+/// for a key the checkpoint does not know.
+pub(crate) fn restored_guest_upstreams(
+    manifest: &SnapshotManifest,
+    network: Option<&crate::structs::AllocNetwork>,
+) -> BTreeMap<String, u16> {
+    let recorded = serde_json::from_value::<SandboxCheckpointState>(manifest.runtime_state.clone())
+        .map(|state| state.guest_upstreams)
+        .unwrap_or_default();
+    boot_guest_upstreams(network)
+        .into_iter()
+        .map(|(key, port)| {
+            let port = recorded.get(&key).copied().unwrap_or(port);
+            (key, port)
+        })
+        .collect()
 }
 
 /// The ports a freshly booted guest's workload binds: each advertised
@@ -237,6 +283,31 @@ pub(crate) fn write_guest_ports_record(scratch: &Path, ports: &[(&str, u16)]) ->
             guest_ports: ports
                 .iter()
                 .map(|(label, port)| (label.to_string(), *port))
+                .collect(),
+            guest_upstreams: BTreeMap::new(),
+        },
+    )
+}
+
+/// For tests elsewhere in the crate: a boot record that says only which
+/// loopback ports the gated guest in `scratch` dials for its upstreams.
+#[cfg(test)]
+pub(crate) fn write_guest_upstreams_record(scratch: &Path, upstreams: &[(&str, u16)]) -> R<()> {
+    write_boot_record(
+        scratch,
+        &SandboxCheckpointState {
+            vmm: "firecracker".into(),
+            link_key: "sbx-test".into(),
+            volume_count: 0,
+            vcpus: 1,
+            memory_mib: 128,
+            tap: None,
+            network: Some(GuestNetwork::Gated),
+            guest_address: None,
+            guest_ports: BTreeMap::new(),
+            guest_upstreams: upstreams
+                .iter()
+                .map(|(key, port)| (key.to_string(), *port))
                 .collect(),
         },
     )
@@ -421,6 +492,7 @@ pub(crate) fn boot_identity(
         // The boot agent learns its ingress ports from its command line; the
         // identity only carries them on a restore.
         ingress_ports: Vec::new(),
+        upstreams: Vec::new(),
     }
 }
 
@@ -491,6 +563,7 @@ pub(crate) fn prepare_checkpoint_launch(
         guest_address: crate::task_plugins::sandbox_addr::read_lease(scratch)
             .map(|lease| lease.address.to_string()),
         guest_ports: boot_guest_ports(allocation.network.as_ref()),
+        guest_upstreams: boot_guest_upstreams(allocation.network.as_ref()),
     };
     let identity_path = scratch.join(IDENTITY_FILE);
     write_identity_disk(
@@ -1165,7 +1238,7 @@ fn retarget_cloud_hypervisor_config(
 }
 
 /// How long a gated restore waits for the datapath's egress proxy socket
-/// before resuming the guest anyway (gated plan §6.3, calls entry 30).
+/// before resuming the guest anyway (gated plan §6.3, calls entry 34).
 pub(crate) const DATAPATH_WAIT: Duration = Duration::from_secs(5);
 
 /// Wait up to `timeout` for the egress proxy's socket beside a gated guest's
@@ -1502,6 +1575,7 @@ pub(crate) fn restore_microvm(
             .as_ref()
             .map(|addr| addr.address.clone()),
         guest_ports: restored_guest_ports(manifest, target.allocation.network.as_ref()),
+        guest_upstreams: restored_guest_upstreams(manifest, target.allocation.network.as_ref()),
         ..state.clone()
     };
 
@@ -1674,6 +1748,53 @@ mod tests {
         }
     }
 
+    /// A restored guest keeps the ports and upstream ports it was captured
+    /// with; a label or key the checkpoint does not know (added while the
+    /// instance was suspended) takes the restoring allocation's own, and
+    /// one the allocation no longer declares is dropped. Upstreams are
+    /// recorded for gated guests only.
+    #[test]
+    fn a_restored_guest_keeps_its_captured_ports_and_upstreams() {
+        let state = SandboxCheckpointState {
+            vmm: "firecracker".into(),
+            link_key: "sbx-k".into(),
+            volume_count: 0,
+            vcpus: 1,
+            memory_mib: 128,
+            tap: None,
+            network: Some(GuestNetwork::Gated),
+            guest_address: None,
+            guest_ports: [("http".to_string(), 20001), ("gone".to_string(), 20002)].into(),
+            guest_upstreams: [("db".to_string(), 20011), ("old".to_string(), 20012)].into(),
+        };
+        let manifest = manifest_for(&state, MemoryParts::default());
+        let network: crate::structs::AllocNetwork = serde_json::from_value(serde_json::json!({
+            "mode": "gated",
+            "ports": [
+                { "name": "http", "hostPort": 30001 },
+                { "name": "admin", "hostPort": 30002, "privatePort": 9000 },
+            ],
+            "upstreams": [
+                { "service": "db", "localPort": 30003, "balance": "least_conn" },
+                { "service": "cache", "localPort": 30004, "balance": "least_conn" },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            restored_guest_ports(&manifest, Some(&network)),
+            [("http".to_string(), 20001), ("admin".to_string(), 9000)].into()
+        );
+        assert_eq!(
+            restored_guest_upstreams(&manifest, Some(&network)),
+            [("db".to_string(), 20011), ("cache".to_string(), 30004)].into()
+        );
+        let host = crate::structs::AllocNetwork {
+            mode: None,
+            ..network
+        };
+        assert!(restored_guest_upstreams(&manifest, Some(&host)).is_empty());
+    }
+
     #[test]
     fn restore_refuses_another_vmm_or_guest_shape() {
         let state = SandboxCheckpointState {
@@ -1686,6 +1807,7 @@ mod tests {
             network: None,
             guest_address: None,
             guest_ports: BTreeMap::new(),
+            guest_upstreams: BTreeMap::new(),
         };
         let allocation = alloc(9);
         let fc = Backend::Firecracker {
@@ -2285,6 +2407,7 @@ mod tests {
             network,
             guest_address: None,
             guest_ports: BTreeMap::new(),
+            guest_upstreams: BTreeMap::new(),
         };
         let target = |tap: Option<&str>, bridge: Option<&str>, gated: bool| RestoreTarget {
             backend: &fc,
@@ -2513,7 +2636,7 @@ mod tests {
         Ok(())
     }
 
-    /// Gated plan §6.3, calls entry 30: a restore whose datapath has not
+    /// Gated plan §6.3, calls entry 34: a restore whose datapath has not
     /// bound the egress proxy socket waits, then resumes the guest anyway
     /// (fail-closed: each dial is reset) instead of failing into a cold boot.
     #[test]
@@ -2540,6 +2663,7 @@ mod tests {
             network: Some(GuestNetwork::Gated),
             guest_address: None,
             guest_ports: BTreeMap::new(),
+            guest_upstreams: BTreeMap::new(),
         };
         let memory = MemoryParts {
             parts: out.seal(&[("rootfs", parts::ROOTFS), ("vm-config", parts::CH_CONFIG)])?,
@@ -2602,7 +2726,7 @@ mod tests {
         Ok(())
     }
 
-    /// Gated plan §6.2, calls entry 15: a Firecracker too old to move the
+    /// Gated plan §6.2, calls entry 18: a Firecracker too old to move the
     /// vsock refuses the capture before pausing, so the guest never stops
     /// for a checkpoint it could not restore.
     #[test]
@@ -3043,6 +3167,7 @@ mod tests {
             network: None,
             guest_address: None,
             guest_ports: BTreeMap::new(),
+            guest_upstreams: BTreeMap::new(),
         };
         let memory = MemoryParts {
             parts: out.seal(&[("rootfs", parts::ROOTFS)])?,

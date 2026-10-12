@@ -86,6 +86,100 @@ pub struct ResumeIdentity {
     /// script hands the agent its first ports).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress_ports: Vec<u16>,
+    /// The upstreams a gated guest reaches through the node datapath after
+    /// this restore (`connect.upstreams`). For each, the guest agent
+    /// listens on `127.0.0.1:<port>` (and on the VIP, so `<key>.svc.legion`
+    /// works) and relays every connection to the host vsock port where the
+    /// restoring allocation's upstream listener is. Like
+    /// [`Self::ingress_ports`], a restored guest keeps the loopback ports it
+    /// was captured with; what moves is the vsock port behind each, and the
+    /// agent retargets the listeners it already has. Empty for TAP and
+    /// loopback-only guests and on the boot identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstreams: Vec<GuestUpstream>,
+}
+
+/// One upstream a gated guest's agent relays to the node datapath.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestUpstream {
+    /// The loopback port the workload dials (`LEGION_UPSTREAM_<KEY>` is
+    /// `127.0.0.1:<port>`). It names the upstream for the life of the
+    /// guest: a restore never changes it.
+    pub port: u16,
+    /// The host vsock port the agent relays the upstream to: the current
+    /// allocation's local port for it. Absent means `port`, which is always
+    /// so at boot; a guest restored into an allocation that was assigned
+    /// another local port carries it here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vsock_port: Option<u16>,
+    /// The upstream's VIP and canonical port (`<key>.svc.legion` resolves
+    /// to the VIP), which the agent also listens on. Absent when the
+    /// allocation has no VIP block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip: Option<std::net::SocketAddrV4>,
+}
+
+impl GuestUpstream {
+    /// The host vsock port the agent dials for this upstream.
+    pub fn host_port(&self) -> u16 {
+        self.vsock_port.unwrap_or(self.port)
+    }
+
+    /// The `--upstream` argument form: `PORT[@VSOCKPORT][=VIP:VIPPORT]`,
+    /// with `@VSOCKPORT` only when it differs from `PORT`.
+    pub fn to_arg(&self) -> String {
+        let mut arg = self.port.to_string();
+        if self.host_port() != self.port {
+            arg.push_str(&format!("@{}", self.host_port()));
+        }
+        if let Some(vip) = self.vip {
+            arg.push_str(&format!("={vip}"));
+        }
+        arg
+    }
+
+    /// Parse [`Self::to_arg`]'s form.
+    pub fn parse_arg(raw: &str) -> Result<GuestUpstream> {
+        let (ports, vip) = match raw.split_once('=') {
+            Some((ports, vip)) => (ports, Some(vip)),
+            None => (raw, None),
+        };
+        let (port, vsock) = match ports.split_once('@') {
+            Some((port, vsock)) => (port, Some(vsock)),
+            None => (ports, None),
+        };
+        let port = parse_upstream_port(raw, port)?;
+        let vsock_port = vsock
+            .map(|vsock| parse_upstream_port(raw, vsock))
+            .transpose()?
+            .filter(|vsock| *vsock != port);
+        let vip = vip
+            .map(|vip| {
+                vip.trim()
+                    .parse::<std::net::SocketAddrV4>()
+                    .with_context(|| {
+                        format!("--upstream {raw:?}: {vip:?} is not an IPv4 address and port")
+                    })
+            })
+            .transpose()?;
+        Ok(GuestUpstream {
+            port,
+            vsock_port,
+            vip,
+        })
+    }
+}
+
+fn parse_upstream_port(raw: &str, port: &str) -> Result<u16> {
+    let parsed: u16 = port
+        .trim()
+        .parse()
+        .with_context(|| format!("--upstream {raw:?}: {port:?} is not a port"))?;
+    if parsed == 0 {
+        bail!("--upstream {raw:?}: the port must be from 1 to 65535");
+    }
+    Ok(parsed)
 }
 
 /// One IPv4 address Legion leased a TAP guest from its bridge's pool

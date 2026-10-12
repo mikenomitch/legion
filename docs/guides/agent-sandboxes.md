@@ -389,6 +389,16 @@ for it. A loopback-only sandbox has nothing to dial, so submit
 refuses ports on it. See
 [Ingress into a sandbox](../network-handlers.md#ingress-into-a-sandbox).
 
+A gated sandbox also reaches the services it declares in
+`connect.upstreams`, the same way a container does:
+`$LEGION_UPSTREAM_<KEY>` and `<key>.svc.legion` both work in the guest, and
+they keep working after a resume or a fork. That is how a sandbox calls a
+platform service (a tool server, a model gateway) through Legion's policy
+and handlers without an egress rule for it. Only gated sandboxes have
+this. On a TAP or loopback-only sandbox the upstream env names the guest's
+own loopback, where nothing listens. See
+[Sandboxes](../network-handlers.md#sandboxes).
+
 Pick by what the sandbox needs from the network. If egress must be judged
 per sandbox by Legion's policy, run it gated. If the guest needs raw
 networking (a protocol the proxy can't carry, L2 adjacency, bulk

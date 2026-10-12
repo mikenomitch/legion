@@ -14,10 +14,11 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::agent::{self, AgentConfig, VsockDial, VsockListen, HOST_CID};
+use crate::identity::GuestUpstream;
 
 const USAGE: &str = "\
 usage: legion-guest guest-agent [--proxy-port PORT] [--dns-port PORT] [--host-cid CID]
-                                [--ingress-port PORT]...
+                                [--ingress-port PORT]... [--upstream PORT[@VSOCK][=VIP:PORT]]...
                                 [--resume-watch [--identity DEVICE] [--poll-ms MS]]
        legion-guest guest-resume [--identity DEVICE] [--poll-ms MS]
 
@@ -34,6 +35,11 @@ pub struct AgentArgs {
     /// agent listens on each as a vsock port and relays to the workload's
     /// loopback port of the same number.
     pub ingress_ports: Vec<u16>,
+    /// The task's upstreams (`--upstream PORT[@VSOCK][=VIP:PORT]`,
+    /// repeated): the agent listens on `127.0.0.1:PORT` and the VIP,
+    /// relaying to host vsock port VSOCK (PORT when absent, as at every
+    /// boot).
+    pub upstreams: Vec<GuestUpstream>,
     /// Also run the resume watch in this process (a gated sandbox launched
     /// for memory checkpoints), so a restore can close the relays it holds.
     pub resume_watch: Option<ResumeArgs>,
@@ -46,6 +52,7 @@ impl Default for AgentArgs {
             dns_port: agent::DNS_PORT as u16,
             host_cid: HOST_CID,
             ingress_ports: Vec::new(),
+            upstreams: Vec::new(),
             resume_watch: None,
         }
     }
@@ -128,6 +135,13 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
                             parsed.ingress_ports.push(port);
                         }
                     }
+                    "--upstream" => {
+                        let upstream = GuestUpstream::parse_arg(value(flag, &mut rest)?)
+                            .map_err(|err| anyhow::anyhow!("{err:#}\n{USAGE}"))?;
+                        if !parsed.upstreams.contains(&upstream) {
+                            parsed.upstreams.push(upstream);
+                        }
+                    }
                     "--resume-watch" => resume_watch = true,
                     "--identity" => {
                         watch.identity = Some(PathBuf::from(value(flag, &mut rest)?));
@@ -190,6 +204,7 @@ fn run_agent(args: &AgentArgs) -> Result<()> {
             .transpose()?,
         dns_port: u32::from(args.dns_port),
         ingress_ports: args.ingress_ports.clone(),
+        upstreams: args.upstreams.clone(),
     };
     let started = agent::start(
         config,
@@ -207,16 +222,24 @@ fn run_agent(args: &AgentArgs) -> Result<()> {
         port_list(&started.ingress.ports()),
     );
     log_ingress_failures(&started.ingress_errors);
+    if !started.upstreams.addresses().is_empty() {
+        eprintln!(
+            "legion-guest-agent: upstreams on {}",
+            address_list(&started.upstreams.addresses())
+        );
+    }
+    log_upstream_failures(&started.upstream_errors);
     if let Some(watch) = args.resume_watch.as_ref() {
         return run_agent_watch(watch, &|identity: &crate::identity::ResumeIdentity| {
-            let (closed, failed) = started.restored(&identity.ingress_ports);
-            if closed > 0 {
+            let restored = started.restored(identity);
+            if restored.closed > 0 {
                 eprintln!(
-                    "legion-guest-agent: restored; closed {closed} connection(s) the capture \
-                     left dead"
+                    "legion-guest-agent: restored; closed {} connection(s) the capture left dead",
+                    restored.closed
                 );
             }
-            log_ingress_failures(&failed);
+            log_ingress_failures(&restored.ingress_failed);
+            log_upstream_failures(&restored.upstream_failed);
         });
     }
     // The relays run on their own threads; this one only keeps the process
@@ -243,6 +266,24 @@ fn port_list(ports: &[u16]) -> String {
 fn log_ingress_failures(failed: &[(u16, std::io::Error)]) {
     for (port, err) in failed {
         eprintln!("legion-guest-agent: cannot listen on vsock port {port} for ingress: {err}");
+    }
+}
+
+/// `127.0.0.1:20003, 127.42.0.2:5432`.
+fn address_list(addresses: &[std::net::SocketAddr]) -> String {
+    addresses
+        .iter()
+        .map(std::net::SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One console line per upstream address the agent could not listen on.
+/// The workload's connections to it are then refused, and the console
+/// says why.
+fn log_upstream_failures(failed: &[(std::net::SocketAddr, std::io::Error)]) {
+    for (address, err) in failed {
+        eprintln!("legion-guest-agent: cannot listen on {address} for an upstream: {err}");
     }
 }
 
@@ -366,6 +407,83 @@ mod tests {
         );
         let err = parse(&args(&["guest-agent", "--ingress-port", "0"])).unwrap_err();
         assert!(err.to_string().contains("from 1 to 65535"), "{err}");
+        // A gated sandbox with upstreams: the loopback port, and the VIP
+        // when the allocation has a block. Both flag forms, de-duplicated.
+        assert_eq!(
+            parse(&args(&[
+                "guest-agent",
+                "--upstream",
+                "20003=127.42.0.2:5432",
+                "--upstream=20004",
+                "--upstream",
+                "20003=127.42.0.2:5432",
+            ]))
+            .unwrap(),
+            Invocation::Agent(AgentArgs {
+                upstreams: vec![
+                    GuestUpstream {
+                        port: 20003,
+                        vsock_port: None,
+                        vip: Some("127.42.0.2:5432".parse().unwrap()),
+                    },
+                    GuestUpstream {
+                        port: 20004,
+                        vsock_port: None,
+                        vip: None,
+                    },
+                ],
+                ..AgentArgs::default()
+            })
+        );
+        for (bad, why) in [
+            ("0", "from 1 to 65535"),
+            ("x", "is not a port"),
+            ("20003@0", "from 1 to 65535"),
+            ("20003@y=127.42.0.2:5432", "is not a port"),
+            (
+                "20003=db.svc.legion:5432",
+                "is not an IPv4 address and port",
+            ),
+        ] {
+            let err = parse(&args(&["guest-agent", "--upstream", bad])).unwrap_err();
+            assert!(err.to_string().contains(why), "{bad}: {err}");
+        }
+        // Every form round-trips; a vsock port equal to the loopback port
+        // is the same upstream as none.
+        let vip = Some("127.42.0.2:5432".parse().unwrap());
+        for (upstream, arg) in [
+            (
+                GuestUpstream {
+                    port: 20003,
+                    vsock_port: None,
+                    vip,
+                },
+                "20003=127.42.0.2:5432",
+            ),
+            (
+                GuestUpstream {
+                    port: 20003,
+                    vsock_port: Some(30003),
+                    vip,
+                },
+                "20003@30003=127.42.0.2:5432",
+            ),
+            (
+                GuestUpstream {
+                    port: 20003,
+                    vsock_port: Some(30003),
+                    vip: None,
+                },
+                "20003@30003",
+            ),
+        ] {
+            assert_eq!(upstream.to_arg(), arg);
+            assert_eq!(GuestUpstream::parse_arg(arg).unwrap(), upstream);
+        }
+        assert_eq!(
+            GuestUpstream::parse_arg("20003@20003").unwrap(),
+            GuestUpstream::parse_arg("20003").unwrap()
+        );
         let err = parse(&args(&["guest-agent", "--identity", "/dev/vdc"])).unwrap_err();
         assert!(
             err.to_string().contains("only applies with --resume-watch"),

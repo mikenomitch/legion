@@ -471,7 +471,8 @@ behave the same whichever one the task dials. The loopback port and
 resolv.conf for `exec` tasks, so point your tool at `LEGION_DNS` to use the
 allocation's resolver. A gated `sandbox` uses the guest
 agent's relay as its resolver (`nameserver 127.0.0.1` in the guest's
-`resolv.conf`, see "Sandboxes").
+`resolv.conf`), and the agent also listens on each upstream's VIP in the
+guest, so `<key>.svc.legion` works there too (see "Sandboxes").
 
 **macOS** configures only `127.0.0.1` on `lo0`, so no VIP block is assigned
 there. Upstreams keep their loopback ports and env vars, and there is no
@@ -899,6 +900,32 @@ connection to the workload's `127.0.0.1:<port>`. The node datapath opens
 those connections after its ingress chain has run (see
 [Ingress into a sandbox](#ingress-into-a-sandbox)).
 
+**Upstreams.** A gated sandbox's `connect.upstreams` work as they do in a
+container, through the same listener. For each upstream, the agent listens
+on `127.0.0.1:<local port>` in the guest (what `LEGION_UPSTREAM_<KEY>`
+names) and relays every connection to host vsock port `<local port>`. The
+worker binds that upstream's listener on
+`<alloc dir>/.sandbox/vsock.sock_<local port>` instead of on the node's
+loopback. So balancing, HTTP mode, the egress chain, and the upstream's
+`handlers` all apply unchanged, and the listener fails closed while the
+allocation's policy is pending. Names work too. The
+resolver on vsock port 53 answers `<key>.svc.legion` with the upstream's
+VIP, and the agent also listens on `<vip>:<canonical port>` in the guest
+(the guest's `lo` holds all of 127/8), relaying to the same vsock port.
+`LEGION_UPSTREAM_VIP_<KEY>` and `LEGION_UPSTREAM_HOST_<KEY>` are set as for
+a container.
+
+```nickel
+connect = {
+    upstreams = [{ service = "db" }],
+},
+network = { mode = "gated" },
+```
+
+In the guest, `psql -h db.svc.legion -p 5432` and
+`psql "postgres://$LEGION_UPSTREAM_DB"` reach the same listener on the
+node.
+
 **The guest agent binary.** The worker copies `legion-guest`, a statically
 linked build of the agent and the resume handler, into the rootfs as
 `/legion/legion`, so it runs on any image, `alpine:latest` and busybox
@@ -930,9 +957,24 @@ What is and is not enforced:
   listeners check, so a provisional sandbox has no network until it is
   ratified.
 - `legion net doctor` and the UI report the sandbox like any gated
-  allocation. `capture_ready` means both host sockets are bound, and an
-  unbound one is named: `egress proxy is not bound on the guest's vsock
-  socket <path>`.
+  allocation. `capture_ready` means every host socket is bound: the egress
+  proxy, the resolver, and one per declared upstream. An unbound one is
+  named: `egress proxy is not bound on the guest's vsock socket <path>`, or
+  `upstream db is not bound on the guest's vsock socket <path>`.
+- The agent holds two ports in a gated guest. `127.0.0.1:1080` is its egress
+  proxy relay, and host vsock ports 1080 and 53 are the egress proxy and the
+  resolver. Submit refuses an advertised port the guest would bind on 1080
+  (`task "workspace" binds network.ports "socks" on port 1080 in its guest,
+  but in a gated sandbox guest 127.0.0.1:1080 is the guest agent's egress
+  proxy`), and an upstream `localPort` of 1080 or 53 (`task "workspace"
+  connect.upstreams entry "db" sets localPort 53, but a gated sandbox's
+  upstreams are relayed to the node on vsock ports of the same number, and
+  1080 and 53 are the guest's egress proxy and resolver`). Dynamic ports
+  never collide with either.
+- Upstreams reach the guest only on gated networking. A TAP-wired or
+  loopback-only sandbox that declares `connect.upstreams` is placed and
+  gets the env vars, but they name the guest's own loopback, where nothing
+  listens, so every dial is refused.
 - Every gated guest uses vsock CID 3. Both VMMs implement vsock over Unix
   sockets in user space, so a CID is private to its guest, and the datapath
   attributes a connection by the socket it arrived on, never by anything the
@@ -947,15 +989,21 @@ are bound before the restore, so a restored or forked guest's traffic is
 attributed to the new allocation and judged by the policy in force at
 restore. A checkpoint closes the guest's open connections: the guest agent
 closes the relays it holds when it sees the restore, so clients get a prompt
-close rather than a hang. See
+close rather than a hang. Upstreams keep working across a restore. The
+restored workload still dials the loopback ports it was captured with, and
+the restore tells the agent which local port the new allocation was
+assigned for each, so the agent relays to the new allocation's listener
+from the first connection. It also starts listening on the new VIPs. The
+old VIPs keep relaying too, for a resolver cache that still holds them. See
 [suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
 
 Current status: the host side (VMM configuration, listeners, the ingress
-dial and its handshake, status, the restore-time socket move) and the agent
-(egress and ingress relays) are implemented and unit-tested over Unix
-sockets with the VMMs' naming, and against fake VMMs. This repository's CI
-has no KVM, so it does not run an end-to-end boot, restore, or inbound
-connection with a real VMM. `auto` resolves to `host` for sandboxes, as it does for
+dial and its handshake, upstream listeners on vsock sockets, status, the
+restore-time socket move) and the agent (egress, ingress, and upstream
+relays) are implemented and unit-tested over Unix sockets with the VMMs'
+naming, and against fake VMMs. This repository's CI has no KVM, so it does
+not run an end-to-end boot, restore, inbound connection, or upstream dial
+with a real VMM. `auto` resolves to `host` for sandboxes, as it does for
 every runtime.
 If the guest binary cannot run on the image (the glibc fallback on a musl
 image), init reports it on the console and the guest has no network. This
@@ -1117,7 +1165,8 @@ Limits:
 - An ingress `proxy` hop hands the connection to your proxy, which cannot
   reach a port inside a sandbox guest, as with a gated task's private port.
 - In a gated guest, `127.0.0.1:1080` belongs to the agent's egress proxy
-  relay, so the workload cannot serve on port 1080.
+  relay, so the workload cannot serve on port 1080, and submit refuses an
+  advertised port that would bind it there.
 - Firecracker 1.17 fixes host-initiated vsock connections that stop
   receiving after a VM is paused and resumed in place (Firecracker #6100),
   which a live `snapshot create --memory` or a fork does to the origin.
@@ -1304,9 +1353,10 @@ This section lists what that covers and what it does not.
   (a hostname reaches a denied range), and a root `exec` task can leave the
   namespace. Don't rely on `gated` to contain untrusted code yet. On macOS, egress stays cooperative, and
   there are no VIPs, per-allocation resolvers, or gated namespaces. A gated
-  `sandbox` is captured over vsock. That path is implemented and
-  unit-tested but not exercised on a real VMM in CI. `auto` resolves to
-  `host` for every runtime, so set `gated` explicitly.
+  `sandbox` is captured over vsock, upstreams included. That path is
+  implemented and unit-tested but not exercised on a real VMM in CI. A
+  TAP-wired or loopback-only sandbox cannot reach its upstreams. `auto`
+  resolves to `host` for every runtime, so set `gated` explicitly.
 - **Ingress is enforced everywhere it applies.** The datapath owns the
   advertised port and the task binds a private twin, on every runtime and
   platform. A gated or TAP-wired sandbox's ports are always fronted, over

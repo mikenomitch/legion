@@ -888,6 +888,15 @@
             # and submit refuses ports on it.
             # "auto" is "host" until the vsock path is exercised on a real
             # VMM.
+            # A gated sandbox reaches its upstreams as a container does:
+            # the guest agent listens on $LEGION_UPSTREAM_API and on the
+            # VIP api.svc.legion resolves to, and relays to the node's
+            # upstream listener over vsock ("Sandboxes"). Submit refuses a
+            # localPort of 1080 or 53 here (the agent's proxy and resolver).
+            # A sandbox that is not gated cannot reach its upstreams.
+            connect = {
+                upstreams = [{ service = "api" }],
+            },
             network = {
                 mode = "gated",
                 ports = [{ name = "http" }],

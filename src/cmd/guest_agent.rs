@@ -1,7 +1,8 @@
 //! `legion guest-agent` — the datapath's foothold inside a gated sandbox
 //! (docs/network-handlers.md, "Sandboxes"). Started by the generated guest
 //! init, never run by an operator. Relays the guest's loopback proxy and
-//! resolver ports to the host datapath over vsock and then parks.
+//! resolver ports and its upstreams to the host datapath over vsock, and the
+//! datapath's inbound connections to the workload, and then parks.
 //!
 //! The guest normally runs the static `legion-guest` binary instead; this
 //! subcommand is the fallback when the worker has none, so its arguments go
@@ -12,7 +13,7 @@ use clap::{Arg, ArgMatches, Command};
 
 pub fn config() -> Command {
     Command::new("guest-agent")
-        .about("Sandbox guest agent: relay loopback proxy and DNS ports to the host over vsock (started by the guest init, not by hand)")
+        .about("Sandbox guest agent: relay loopback proxy, DNS, upstream, and ingress ports between the guest and the host over vsock (started by the guest init, not by hand)")
         .hide(true)
         .disable_help_flag(true)
         .arg(
@@ -20,7 +21,10 @@ pub fn config() -> Command {
                 .num_args(0..)
                 .trailing_var_arg(true)
                 .allow_hyphen_values(true)
-                .help("--proxy-port PORT, --dns-port PORT (0 disables), --host-cid CID"),
+                .help(
+                    "--proxy-port PORT, --dns-port PORT (0 disables), --host-cid CID, \
+                     --ingress-port PORT, --upstream PORT[@VSOCK][=VIP:PORT], --resume-watch",
+                ),
         )
 }
 
