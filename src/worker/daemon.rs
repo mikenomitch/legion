@@ -2030,6 +2030,9 @@ async fn heartbeat_tick(
         )
         .await;
         apply_ingress_certificates(forwarder, &mut client_clone, credentials, name, &reply).await;
+        // Upstream credentials, from the same desired set (the reply's, or
+        // the StreamWork mirror's when the work arrives over the stream).
+        apply_upstream_credentials(forwarder, &mut client_clone, credentials, name, &reply).await;
         *LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner()) = reply.desired_allocations.clone();
         persist_datapath(forwarder, &reply);
         // Allocations whose launch was dispatched this tick. Their refresh
@@ -2243,7 +2246,7 @@ async fn apply_upstreams(
     reply: &HeartbeatReply,
     alloc_root: &std::path::Path,
 ) {
-    let specs = upstream_specs(&reply.desired_allocations);
+    let specs = upstream_specs(&reply.desired_allocations, alloc_root);
     forwarder.sync(&specs).await;
     if let Some(dns) = forwarder.dns() {
         dns.sync(&dns_specs(&reply.desired_allocations, alloc_root))
@@ -2256,7 +2259,7 @@ async fn apply_upstreams(
     }
     if let Some(ingress) = forwarder.ingress() {
         ingress
-            .sync(&ingress_specs(&reply.desired_allocations))
+            .sync(&ingress_specs(&reply.desired_allocations, alloc_root))
             .await;
     }
     let context = forwarder.context();
@@ -2716,6 +2719,134 @@ async fn apply_ingress_certificates(
     }
 }
 
+/// Every credential header the desired set declares, as
+/// (allocation, upstream key, lower-cased header): what the node fetches
+/// and what its credential store may keep.
+fn declared_credentials(
+    desired: &[TaskAllocation],
+) -> Vec<crate::worker::forwarder::CredentialKey> {
+    let mut keys = Vec::new();
+    for allocation in desired {
+        if allocation.task_connect.trim().is_empty() {
+            continue;
+        }
+        let Ok(connect) =
+            serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
+        else {
+            continue;
+        };
+        for upstream in &connect.upstreams {
+            for credential in &upstream.credentials {
+                keys.push((
+                    allocation.allocation_id,
+                    upstream.key().to_string(),
+                    credential.header.trim().to_ascii_lowercase(),
+                ));
+            }
+        }
+    }
+    keys
+}
+
+/// Keep `connect.upstreams[].credentials` current (docs/network-handlers.md,
+/// "Credential injection"): one `GetUpstreamCredentials` call per heartbeat,
+/// only while an allocation on the node declares credentials, carrying the
+/// version already held (a KV version, or an identity token's expiry) so an
+/// unchanged value costs nothing on the wire. Values live in the forwarder's memory only — never in
+/// `netd_state.json`, never in a log line. Fail-static: a failed call or a
+/// transient error keeps the value in hand; an `absent` answer (the key was
+/// deleted, or the declaration is gone) drops it, so requests on that
+/// upstream fail closed with a `503`.
+async fn apply_upstream_credentials(
+    forwarder: &UpstreamForwarder,
+    client: &mut ManagerClient<Channel>,
+    worker_credentials: &Arc<WorkerCredentials>,
+    node_id: &str,
+    reply: &HeartbeatReply,
+) {
+    let context = forwarder.context();
+    let declared = declared_credentials(&reply.desired_allocations);
+    // Credentials for allocations that left, or that no longer declare a
+    // header, are forgotten before anything else.
+    context.retain_credentials(&declared.iter().cloned().collect());
+    if declared.is_empty() {
+        return;
+    }
+    let known: Vec<crate::structs::UpstreamCredentialKnown> = declared
+        .iter()
+        .map(
+            |(allocation_id, upstream, header)| crate::structs::UpstreamCredentialKnown {
+                allocation_id: *allocation_id,
+                upstream: upstream.clone(),
+                header: header.clone(),
+                version: context.credential_version(*allocation_id, upstream, header),
+            },
+        )
+        .collect();
+    let request = worker_credentials.attach(tonic::Request::new(
+        crate::structs::GetUpstreamCredentialsRequest {
+            node_id: node_id.to_string(),
+            known,
+        },
+    ));
+    let values = match client.get_upstream_credentials(request).await {
+        Ok(response) => response.into_inner().credentials,
+        Err(status) => {
+            warn!(
+                code = ?status.code(),
+                message = status.message(),
+                "Failed to fetch upstream credentials; keeping the current ones"
+            );
+            return;
+        }
+    };
+    for value in values {
+        let header = value.header.trim().to_ascii_lowercase();
+        if !value.error.is_empty() {
+            if value.absent {
+                warn!(
+                    allocation_id = value.allocation_id,
+                    upstream = %value.upstream,
+                    header = %header,
+                    source = %value.source,
+                    error = %value.error,
+                    "Upstream credential is gone; requests on this upstream fail closed"
+                );
+            }
+            context.set_credential_error(
+                value.allocation_id,
+                &value.upstream,
+                &header,
+                &value.source,
+                value.error,
+                value.absent,
+            );
+            continue;
+        }
+        if value.unchanged {
+            context.clear_credential_error(value.allocation_id, &value.upstream, &header);
+            continue;
+        }
+        context.set_credential(
+            value.allocation_id,
+            &value.upstream,
+            &header,
+            &value.source,
+            value.version,
+            crate::worker::forwarder::SecretValue::new(value.value),
+        );
+        // The source and version only: never the value.
+        info!(
+            allocation_id = value.allocation_id,
+            upstream = %value.upstream,
+            header = %header,
+            source = %value.source,
+            version = value.version,
+            "Installed upstream credential"
+        );
+    }
+}
+
 /// Apply the reply's network-policy assignments to the datapath's cache and
 /// fetch any body the node has not seen. Fail-static: a fetch that fails
 /// leaves the allocation on whatever policy it had (or none, in which case a
@@ -2775,7 +2906,14 @@ async fn apply_net_policies(
 /// the loopback ports those upstreams were *assigned* live on the allocation's
 /// network, next to its host ports, because both come out of the same per-node
 /// port space. Allocations that declare no upstreams cost one string check.
-fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
+///
+/// A gated sandbox's upstream listens on its VMM's vsock host socket for
+/// the upstream's local port, which the guest agent relays the workload's
+/// connections to; the VIP is the guest's to serve. A guest restored from
+/// a memory checkpoint still dials the loopback port it was captured with,
+/// and its agent relays that to this allocation's local port, so nothing
+/// here depends on the guest's history.
+fn upstream_specs(desired: &[TaskAllocation], alloc_root: &std::path::Path) -> Vec<UpstreamSpec> {
     let mut specs = Vec::new();
     for allocation in desired {
         if allocation.task_connect.trim().is_empty() || allocation.network.trim().is_empty() {
@@ -2798,14 +2936,22 @@ fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
         // the same way the assigned loopback ports are.
         let declared: crate::structs::ConnectConfig =
             serde_json::from_str(&allocation.task_connect).unwrap_or_default();
-        let netns = network
-            .is_gated()
+        let sandbox = is_gated_sandbox(allocation);
+        let netns = (network.is_gated() && !sandbox)
             .then(|| crate::worker::netd::netns::netns_path(allocation.allocation_id));
+        let scratch = sandbox.then(|| {
+            crate::task_plugins::sandbox_dir_for(
+                &alloc_root.join(allocation.allocation_id.to_string()),
+            )
+        });
         for upstream in &network.upstreams {
             let declaration = declared
                 .upstreams
                 .iter()
                 .find(|candidate| candidate.key() == upstream.service);
+            let vsock = scratch
+                .as_deref()
+                .map(|scratch| sandbox_upstream_socket(scratch, upstream));
             specs.push(UpstreamSpec {
                 allocation_id: allocation.allocation_id,
                 service: upstream.service.clone(),
@@ -2814,13 +2960,33 @@ fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
                 to: upstream.to.clone(),
                 http: declaration.and_then(|d| d.http.clone()),
                 handlers: declaration.map(|d| d.handlers.clone()).unwrap_or_default(),
-                vip: upstream.vip.clone(),
-                canonical_port: upstream.canonical_port,
+                credentials: declaration
+                    .map(|d| d.credentials.clone())
+                    .unwrap_or_default(),
+                vip: if sandbox { None } else { upstream.vip.clone() },
+                canonical_port: if sandbox {
+                    None
+                } else {
+                    upstream.canonical_port
+                },
                 netns: netns.clone(),
+                vsock,
             });
         }
     }
     specs
+}
+
+/// The vsock host socket a gated sandbox's upstream listens on, in its
+/// sandbox dir: `vsock.sock_<local port>` (see [`upstream_specs`]).
+fn sandbox_upstream_socket(
+    scratch: &std::path::Path,
+    upstream: &crate::structs::AllocUpstream,
+) -> PathBuf {
+    crate::worker::netd::guest_agent::host_socket_path(
+        &crate::task_plugins::vsock_socket_base(scratch),
+        u32::from(upstream.local_port),
+    )
 }
 
 /// The per-allocation resolvers a desired set implies: one per allocation
@@ -2845,7 +3011,7 @@ fn dns_specs(
         let sandbox = is_gated_sandbox(allocation);
         // Every gated sandbox gets a resolver on its vsock socket, VIP block
         // or not: without one, a guest with no upstreams has no DNS at all
-        // (gated plan §6.5, calls entry 20). Everything else needs a block.
+        // (gated plan §6.5, calls entry 29). Everything else needs a block.
         if resolver.is_none() && !sandbox {
             continue;
         }
@@ -3109,11 +3275,20 @@ fn proxy_specs(
     specs
 }
 
-/// The ingress listeners a desired set implies: one per advertised port
-/// that was given a private twin at placement (the task has an ingress
-/// chain), bound in the host namespace and dialing the private port inside
-/// the task's namespace when it has one.
-fn ingress_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::ingress::IngressSpec> {
+/// The ingress listeners a desired set implies, all bound in the host
+/// namespace:
+///
+/// - one per advertised port that was given a private twin at placement
+///   (the task has an ingress chain), dialing the twin on loopback, inside
+///   the task's namespace when it is gated;
+/// - one per advertised port of a gated or TAP-wired sandbox, with or
+///   without a chain: the guest has its own port space, which nothing else
+///   on the node reaches. A gated guest is dialed over host-initiated vsock
+///   on its VMM's socket, a TAP guest at its leased address on the bridge.
+fn ingress_specs(
+    desired: &[TaskAllocation],
+    alloc_root: &std::path::Path,
+) -> Vec<crate::worker::netd::ingress::IngressSpec> {
     let mut specs = Vec::new();
     for allocation in desired {
         if allocation.network.trim().is_empty() {
@@ -3122,24 +3297,69 @@ fn ingress_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::ingress
         let Ok(network) = serde_json::from_str::<AllocNetwork>(&allocation.network) else {
             continue;
         };
-        let netns = network
-            .is_gated()
-            .then(|| crate::worker::netd::netns::netns_path(allocation.allocation_id));
-        for port in &network.ports {
-            let Some(private_port) = port.private_port else {
-                continue;
+        specs.extend(allocation_ingress_specs(allocation, &network, alloc_root));
+    }
+    specs
+}
+
+/// [`ingress_specs`] for one allocation whose network is already parsed.
+fn allocation_ingress_specs(
+    allocation: &TaskAllocation,
+    network: &AllocNetwork,
+    alloc_root: &std::path::Path,
+) -> Vec<crate::worker::netd::ingress::IngressSpec> {
+    use crate::worker::netd::ingress::{IngressSpec, TaskDial};
+    if network.ports.is_empty() {
+        return Vec::new();
+    }
+    let sandbox_dial = sandbox_ingress_dial(allocation, network, alloc_root);
+    let netns = network
+        .is_gated()
+        .then(|| crate::worker::netd::netns::netns_path(allocation.allocation_id));
+    network
+        .ports
+        .iter()
+        .filter_map(|port| {
+            let dial = match (&sandbox_dial, port.private_port) {
+                (Some(dial), _) => dial.clone(),
+                (None, Some(_)) => TaskDial::Loopback {
+                    netns: netns.clone(),
+                },
+                (None, None) => return None,
             };
-            specs.push(crate::worker::netd::ingress::IngressSpec {
+            Some(IngressSpec {
                 allocation_id: allocation.allocation_id,
                 label: port.name.clone(),
                 host_port: port.host_port,
-                private_port,
-                netns: netns.clone(),
+                private_port: port.bind_port(),
+                dial,
                 bind: None,
-            });
-        }
+            })
+        })
+        .collect()
+}
+
+/// How the datapath reaches a sandbox guest's ports: over vsock when it is
+/// gated, at its bridge address when it is TAP-wired. `None` for every
+/// other allocation, including a loopback-only sandbox, whose ports nothing
+/// can reach (submit refuses them).
+fn sandbox_ingress_dial(
+    allocation: &TaskAllocation,
+    network: &AllocNetwork,
+    alloc_root: &std::path::Path,
+) -> Option<crate::worker::netd::ingress::TaskDial> {
+    use crate::worker::netd::ingress::TaskDial;
+    if allocation.task_runtime != "sandbox" {
+        return None;
     }
-    specs
+    let scratch = crate::task_plugins::sandbox_dir_for(
+        &alloc_root.join(allocation.allocation_id.to_string()),
+    );
+    if network.is_gated() {
+        return Some(TaskDial::Vsock { scratch });
+    }
+    let config: Value = serde_json::from_str(&allocation.task_config).ok()?;
+    crate::task_plugins::sandbox_config_is_tap(&config).then_some(TaskDial::Bridge { scratch })
 }
 
 /// What the datapath reports about each desired allocation on the next
@@ -3211,11 +3431,7 @@ fn net_status(
         };
         let gated = network.is_gated();
         let expected_upstreams = network.upstreams.len();
-        let expected_ingress = network
-            .ports
-            .iter()
-            .filter(|p| p.private_port.is_some())
-            .count();
+        let expected_ingress = allocation_ingress_specs(allocation, &network, alloc_root).len();
         if !gated
             && expected_upstreams == 0
             && expected_ingress == 0
@@ -3264,6 +3480,23 @@ fn net_status(
                 upstreams.len(),
                 expected_upstreams
             ));
+            // A gated sandbox's upstreams are vsock host sockets: name the
+            // unbound ones, as for the proxy and the resolver.
+            if vsock_sandbox {
+                let scratch =
+                    crate::task_plugins::sandbox_dir_for(&alloc_root.join(id.to_string()));
+                for upstream in network
+                    .upstreams
+                    .iter()
+                    .filter(|upstream| !upstreams.contains(&upstream.service))
+                {
+                    problems.push(format!(
+                        "upstream {} is not bound on the guest's vsock socket {}",
+                        upstream.service,
+                        sandbox_upstream_socket(&scratch, upstream).display()
+                    ));
+                }
+            }
         }
         if vsock_sandbox && !resolver_ready {
             problems.push(format!(
@@ -3279,8 +3512,8 @@ fn net_status(
                 "allocation resolver is not bound (port 53 needs CAP_NET_BIND_SERVICE)".into(),
             );
         }
-        // A gated sandbox's capture is both vsock host sockets: the proxy and
-        // the resolver.
+        // A gated sandbox's capture is its vsock host sockets: the proxy, the
+        // resolver, and one per declared upstream (counted with the rest).
         let capture_ready = if gated {
             namespace_ready
                 && proxy_ready
@@ -3303,6 +3536,10 @@ fn net_status(
             ));
         }
         problems.extend(TEMPLATES.problems(id));
+        // Credential injection: a header with no value fails its upstream's
+        // requests with a 503; one whose refresh failed still injects the
+        // previous value.
+        problems.extend(forwarder.context().credential_problems(id));
         if network.ingress_tls.as_deref() == Some("legion")
             && forwarder.context().mesh_identity().is_none()
         {
@@ -4431,7 +4668,7 @@ mod tests {
         }
     }
 
-    /// Gated plan §6.5, calls entry 20: every gated sandbox gets a resolver
+    /// Gated plan §6.5, calls entry 29: every gated sandbox gets a resolver
     /// on its vsock socket even with no upstreams (and so no VIP block),
     /// and never binds an address. A gated container still needs a block
     /// (its namespace resolver gap is tracked separately).
@@ -4497,7 +4734,7 @@ mod tests {
 
     #[test]
     fn upstream_specs_come_from_the_allocation_network() {
-        let specs = upstream_specs(&[connect_allocation(11, "db", 20003)]);
+        let specs = upstream_specs(&[connect_allocation(11, "db", 20003)], Path::new("/allocs"));
         assert_eq!(
             specs,
             vec![UpstreamSpec {
@@ -4508,10 +4745,237 @@ mod tests {
                 to: None,
                 http: None,
                 handlers: Vec::new(),
+                credentials: Vec::new(),
                 vip: None,
                 canonical_port: None,
                 netns: None,
+                vsock: None,
             }]
+        );
+    }
+
+    /// The node fetches exactly the headers its desired set declares, and the
+    /// forwarder's upstream spec carries them so HTTP mode injects them.
+    #[test]
+    fn declared_credentials_follow_the_desired_set_test() {
+        let connect = json!({ "upstreams": [
+            { "service": "db" },
+            { "name": "openai", "to": "https://api.openai.com", "credentials": [
+                { "header": "authorization", "prefix": "Bearer ", "from": { "kv": "secrets/openai" } },
+                { "header": "openai-organization", "from": { "kv": "secrets/org" } },
+            ] },
+        ] })
+        .to_string();
+        let with = TaskAllocation {
+            provisional: None,
+            allocation_id: 21,
+            task_connect: connect,
+            network: json!({ "upstreams": [
+                { "service": "openai", "localPort": 20010, "balance": "round_robin", "to": "https://api.openai.com" },
+            ] })
+            .to_string(),
+            ..TaskAllocation::default()
+        };
+        let without = connect_allocation(22, "db", 20011);
+        assert_eq!(
+            declared_credentials(&[with.clone(), without.clone()]),
+            vec![
+                (21, "openai".to_string(), "authorization".to_string()),
+                (21, "openai".to_string(), "openai-organization".to_string()),
+            ]
+        );
+        assert!(declared_credentials(&[without]).is_empty());
+        let specs = upstream_specs(&[with], Path::new("/allocs"));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].credentials.len(), 2);
+        assert_eq!(specs[0].credentials[0].prefix.as_deref(), Some("Bearer "));
+    }
+
+    /// A gated sandbox's upstream listens on its VMM's vsock host socket for
+    /// its local port, never in a namespace or on a VIP (the guest serves
+    /// the VIP). A restored guest's boot record, which says the workload
+    /// still dials the loopback port it was captured with, does not move
+    /// it: the guest agent relays that port to this one.
+    #[test]
+    fn a_gated_sandboxs_upstreams_listen_on_its_vsock_socket() {
+        let root = TempDir::new().unwrap();
+        let mut allocation = connect_allocation(7, "db", 20003);
+        allocation.task_runtime = "sandbox".into();
+        allocation.task_config = json!({ "image": "a" }).to_string();
+        allocation.network = json!({
+            "mode": "gated",
+            "upstreams": [{
+                "service": "db",
+                "localPort": 20003,
+                "balance": "least_conn",
+                "vip": "127.42.0.2",
+                "canonicalPort": 5432,
+            }],
+        })
+        .to_string();
+        let scratch = crate::task_plugins::sandbox_dir_for(&root.path().join("7"));
+        let socket = |port: u16| {
+            crate::worker::netd::guest_agent::host_socket_path(
+                &crate::task_plugins::vsock_socket_base(&scratch),
+                u32::from(port),
+            )
+        };
+        let specs = upstream_specs(std::slice::from_ref(&allocation), root.path());
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].vsock.as_deref(), Some(socket(20003).as_path()));
+        assert!(specs[0]
+            .vsock
+            .as_ref()
+            .unwrap()
+            .ends_with(".sandbox/vsock.sock_20003"));
+        assert_eq!(
+            (&specs[0].netns, &specs[0].vip, specs[0].canonical_port),
+            (&None, &None, None)
+        );
+
+        std::fs::create_dir_all(&scratch).unwrap();
+        crate::task_plugins::write_guest_upstreams_record(&scratch, &[("db", 20009)]).unwrap();
+        let restored = upstream_specs(&[allocation], root.path());
+        assert_eq!(restored, specs);
+    }
+
+    /// A gated sandbox's capture includes a vsock socket per upstream:
+    /// `net doctor` names each unbound one, and binding it clears that
+    /// problem (the proxy and the resolver, not bound here, still hold
+    /// `capture_ready` down).
+    #[tokio::test]
+    async fn net_status_names_a_gated_sandboxs_unbound_upstream_socket() {
+        let root = TempDir::new().unwrap();
+        let mut allocation = connect_allocation(7, "db", 20003);
+        allocation.task_runtime = "sandbox".into();
+        allocation.task_config = json!({ "image": "a" }).to_string();
+        allocation.network = json!({
+            "mode": "gated",
+            "upstreams": [{ "service": "db", "localPort": 20003, "balance": "least_conn" }],
+        })
+        .to_string();
+        let desired = vec![allocation];
+        let forwarder = UpstreamForwarder::new();
+        let socket = crate::worker::netd::guest_agent::host_socket_path(
+            &sandbox_vsock_base(root.path(), 7),
+            20003,
+        );
+        let unbound = format!(
+            "upstream db is not bound on the guest's vsock socket {}",
+            socket.display()
+        );
+
+        let status = net_status(&forwarder, &desired, root.path());
+        assert_eq!(status.len(), 1);
+        assert!(!status[0].capture_ready);
+        assert!(
+            status[0].problems.contains(&unbound),
+            "{:?}",
+            status[0].problems
+        );
+
+        forwarder.sync(&upstream_specs(&desired, root.path())).await;
+        assert!(socket.exists());
+        let status = net_status(&forwarder, &desired, root.path());
+        assert!(!status[0].problems.contains(&unbound));
+        assert!(!status[0]
+            .problems
+            .iter()
+            .any(|problem| problem.contains("upstream listeners bound")));
+        assert!(!status[0].capture_ready, "the proxy is not bound here");
+    }
+
+    /// Gated plan §6.10: how the ingress listener reaches each task. A task
+    /// with an ingress chain is dialed on its private twin; a gated sandbox
+    /// over its VMM's vsock and a TAP sandbox at its leased address, chain
+    /// or not; a loopback-only sandbox and a chainless task are not fronted.
+    #[test]
+    fn ingress_specs_pick_how_each_task_is_reached() {
+        use crate::worker::netd::ingress::TaskDial;
+        let root = std::path::Path::new("/var/lib/legion/allocs");
+        let port = |host: u16, private: Option<u16>| {
+            let mut port = json!({ "name": "http", "hostPort": host });
+            if let Some(private) = private {
+                port["privatePort"] = json!(private);
+            }
+            port
+        };
+        let allocation = |id: i64, runtime: &str, network: Value, config: Value| TaskAllocation {
+            provisional: None,
+            allocation_id: id,
+            task_runtime: runtime.into(),
+            network: network.to_string(),
+            task_config: config.to_string(),
+            ..TaskAllocation::default()
+        };
+        let desired = vec![
+            allocation(
+                1,
+                "exec",
+                json!({ "ports": [port(20000, Some(20001))] }),
+                json!({}),
+            ),
+            allocation(
+                2,
+                "exec",
+                json!({ "ports": [port(20002, None)] }),
+                json!({}),
+            ),
+            allocation(
+                3,
+                "sandbox",
+                json!({ "mode": "gated", "ports": [port(20004, None)] }),
+                json!({ "image": "a" }),
+            ),
+            allocation(
+                4,
+                "sandbox",
+                json!({ "ports": [port(20006, Some(20007))] }),
+                json!({ "image": "a", "network": { "mode": "tap", "bridge": "br0" } }),
+            ),
+            allocation(
+                5,
+                "sandbox",
+                json!({ "ports": [port(20008, None)] }),
+                json!({ "image": "a" }),
+            ),
+        ];
+        let specs = ingress_specs(&desired, root);
+        let reached: Vec<(i64, u16, u16, TaskDial)> = specs
+            .into_iter()
+            .map(|spec| {
+                (
+                    spec.allocation_id,
+                    spec.host_port,
+                    spec.private_port,
+                    spec.dial,
+                )
+            })
+            .collect();
+        let scratch = |id: i64| crate::task_plugins::sandbox_dir_for(&root.join(id.to_string()));
+        assert_eq!(
+            reached,
+            vec![
+                (1, 20000, 20001, TaskDial::Loopback { netns: None }),
+                // No twin: the guest binds the advertised number itself,
+                // and the vsock port is that number.
+                (
+                    3,
+                    20004,
+                    20004,
+                    TaskDial::Vsock {
+                        scratch: scratch(3)
+                    }
+                ),
+                (
+                    4,
+                    20006,
+                    20007,
+                    TaskDial::Bridge {
+                        scratch: scratch(4)
+                    }
+                ),
+            ]
         );
     }
 
@@ -4538,7 +5002,7 @@ mod tests {
             network: "{not json".into(),
             ..TaskAllocation::default()
         };
-        assert!(upstream_specs(&[plain, unplaced, corrupt]).is_empty());
+        assert!(upstream_specs(&[plain, unplaced, corrupt], Path::new("/allocs")).is_empty());
     }
 
     #[test]
@@ -4635,9 +5099,11 @@ mod tests {
                 to: None,
                 http: None,
                 handlers: Vec::new(),
+                credentials: Vec::new(),
                 vip: None,
                 canonical_port: None,
                 netns: None,
+                vsock: None,
             }]
         );
         // The listener is live on the loopback port the task will dial.

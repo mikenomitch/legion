@@ -24,13 +24,20 @@
 //!   connections, or a poisoned lock degrades this listener only; it can never
 //!   take down the heartbeat loop or the worker.
 //!
+//! A gated sandbox has no loopback on the node to bind: its upstream
+//! listener is the VMM's vsock host socket for the local port
+//! (`<alloc>/.sandbox/vsock.sock_<local_port>`, [`UpstreamSpec::vsock`]),
+//! which the guest agent relays the workload's `127.0.0.1:<local_port>` to.
+//! The listener state, policy, and HTTP mode are the same; only the accept
+//! side differs.
+//!
 //! Choosing *which* endpoint a connection goes to is [`crate::worker::balance`].
 
 use crate::prelude::*;
 use crate::structs::netpolicy::HandlerConfig;
 use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
-use crate::structs::UpstreamHttpConfig;
 use crate::structs::{parse_upstream_target, UpstreamTarget, UPSTREAM_LOOPBACK_ADDR};
+use crate::structs::{UpstreamCredential, UpstreamHttpConfig};
 use crate::worker::balance::{balancer, default_balancer, Balancer, Endpoint};
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::http::HttpSettings;
@@ -44,7 +51,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::task::JoinHandle;
 
 /// How long a single upstream dial may take before the forwarder gives up on
@@ -83,6 +90,9 @@ pub struct UpstreamSpec {
     pub http: Option<UpstreamHttpConfig>,
     /// `connect.upstreams[].handlers` — run in HTTP mode.
     pub handlers: Vec<HandlerConfig>,
+    /// `connect.upstreams[].credentials` — headers injected in HTTP mode,
+    /// with values from [`ForwarderContext`]'s credential store.
+    pub credentials: Vec<UpstreamCredential>,
     /// Name-is-config: the VIP (`127.42.b.n`) and canonical port this
     /// upstream is also served on, so `<key>.svc.legion:<port>` reaches the
     /// same listener state. `None` on platforms without 127/8 routing.
@@ -92,6 +102,12 @@ pub struct UpstreamSpec {
     /// binds in the host namespace. A gated listener fails closed while its
     /// policy is pending or its edge-boot gate is shut.
     pub netns: Option<PathBuf>,
+    /// A gated sandbox's listener: the VMM's vsock host socket for
+    /// `local_port` (`<alloc>/.sandbox/vsock.sock_<local_port>`), which the
+    /// guest agent relays this upstream to, bound instead of a loopback
+    /// port. Gated like a namespace. The VIP is the guest's to serve, so
+    /// none is bound on the node.
+    pub vsock: Option<PathBuf>,
 }
 
 impl UpstreamSpec {
@@ -116,9 +132,10 @@ struct UpstreamShared {
     target: Option<UpstreamTarget>,
     /// Policy, denial ledger, and TLS shared by every listener.
     context: Arc<ForwarderContext>,
-    /// The upstream's `http` block and handlers, as declared.
+    /// The upstream's `http` block, handlers, and credentials, as declared.
     http_config: Option<UpstreamHttpConfig>,
     handlers: Vec<HandlerConfig>,
+    credentials: Vec<UpstreamCredential>,
     /// HTTP-mode state, built on first use (an upstream can enter HTTP mode
     /// through its own declaration or through the effective policy's
     /// `protocol = "http"`, which is only known once policy arrives).
@@ -139,6 +156,44 @@ type IngressTlsConfigs =
 #[derive(Debug, Default, Clone)]
 pub struct KvCertState {
     pub cert: Option<Arc<crate::worker::netd::tls::KvCertificate>>,
+    pub error: Option<String>,
+}
+
+/// A secret value held for credential injection. Debug never prints it, so
+/// a stray `{:?}` on a containing struct cannot leak it into a log.
+#[derive(Clone)]
+pub struct SecretValue(Arc<str>);
+
+impl SecretValue {
+    pub fn new(value: impl Into<Arc<str>>) -> Self {
+        SecretValue(value.into())
+    }
+
+    /// The secret itself. Only the request builder should call this.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretValue(<redacted>)")
+    }
+}
+
+/// Identifies one injected header: (allocation, upstream key, header,
+/// lower-cased).
+pub type CredentialKey = (i64, String, String);
+
+/// One injected header's state: the last good value (kept through a failed
+/// fetch or a rejected value, dropped when the manager says the key is
+/// gone) and the latest fetch problem.
+#[derive(Debug, Default, Clone)]
+pub struct CredentialState {
+    /// Where the value comes from (`kv secrets/openai`, `identity api`).
+    pub source: String,
+    pub version: i64,
+    pub value: Option<SecretValue>,
     pub error: Option<String>,
 }
 
@@ -180,6 +235,10 @@ pub struct ForwarderContext {
     /// `certFrom = { kv }` material per allocation, from
     /// `GetIngressCertificates`. In memory only.
     kv_certs: Mutex<HashMap<i64, KvCertState>>,
+    /// `connect.upstreams[].credentials` values, from
+    /// `GetUpstreamCredentials`. In memory only: never persisted, never
+    /// logged, never handed to the task.
+    credentials: Mutex<HashMap<CredentialKey, CredentialState>>,
     /// Service-graph samples since the last heartbeat.
     edges: Arc<crate::worker::netd::graph::EdgeLedger>,
     /// Ingress connections and bytes per allocation, for the idle policy.
@@ -254,6 +313,7 @@ impl ForwarderContext {
             mesh_wanted: AtomicBool::new(false),
             ingress_tls: Mutex::new(HashMap::new()),
             kv_certs: Mutex::new(HashMap::new()),
+            credentials: Mutex::new(HashMap::new()),
             edges: Arc::new(crate::worker::netd::graph::EdgeLedger::new()),
             activity: Arc::new(crate::worker::netd::activity::ActivityLedger::new()),
             host_guard: Some(Arc::new(default_host_guard())),
@@ -436,6 +496,130 @@ impl ForwarderContext {
         lock(&self.handler_health).retain(|(id, _), _| live.contains(id));
         lock(&self.ingress_tls).retain(|(id, _), _| live.contains(id));
         lock(&self.kv_certs).retain(|id, _| live.contains(id));
+        lock(&self.credentials).retain(|(id, _, _), _| live.contains(id));
+    }
+
+    // ----- credential injection -----------------------------------------
+
+    /// The version of the credential held for a header (0 for none): the KV
+    /// version, or an identity token's expiry. What `GetUpstreamCredentials`
+    /// compares against.
+    pub fn credential_version(&self, allocation_id: i64, upstream: &str, header: &str) -> i64 {
+        lock(&self.credentials)
+            .get(&(allocation_id, upstream.to_string(), header.to_string()))
+            .filter(|state| state.value.is_some())
+            .map(|state| state.version)
+            .unwrap_or(0)
+    }
+
+    /// Install a freshly fetched value. Requests that start after this use
+    /// it; requests in flight (and their retries) keep the one they read.
+    pub fn set_credential(
+        &self,
+        allocation_id: i64,
+        upstream: &str,
+        header: &str,
+        source: &str,
+        version: i64,
+        value: SecretValue,
+    ) {
+        lock(&self.credentials).insert(
+            (allocation_id, upstream.to_string(), header.to_string()),
+            CredentialState {
+                source: source.to_string(),
+                version,
+                value: Some(value),
+                error: None,
+            },
+        );
+    }
+
+    /// Record a fetch problem. `absent` (the key is gone, or the
+    /// allocation no longer declares it) drops the value, so a deleted key
+    /// revokes the credential; anything else keeps the last good value.
+    pub fn set_credential_error(
+        &self,
+        allocation_id: i64,
+        upstream: &str,
+        header: &str,
+        source: &str,
+        error: String,
+        absent: bool,
+    ) {
+        let mut credentials = lock(&self.credentials);
+        let state = credentials
+            .entry((allocation_id, upstream.to_string(), header.to_string()))
+            .or_default();
+        if !source.is_empty() {
+            state.source = source.to_string();
+        }
+        state.error = Some(error);
+        if absent {
+            state.value = None;
+            state.version = 0;
+        }
+    }
+
+    /// Clear a fetch problem after an `unchanged` reply.
+    pub fn clear_credential_error(&self, allocation_id: i64, upstream: &str, header: &str) {
+        if let Some(state) = lock(&self.credentials).get_mut(&(
+            allocation_id,
+            upstream.to_string(),
+            header.to_string(),
+        )) {
+            state.error = None;
+        }
+    }
+
+    /// Forget credentials no desired allocation declares any more.
+    pub fn retain_credentials(&self, declared: &std::collections::HashSet<CredentialKey>) {
+        lock(&self.credentials).retain(|key, _| declared.contains(key));
+    }
+
+    /// The value to inject for one header, or why there is none. A header
+    /// that was never fetched is "not fetched yet", never an empty value:
+    /// the forwarder fails the request closed rather than sending it
+    /// without the credential.
+    pub fn credential_value(
+        &self,
+        allocation_id: i64,
+        upstream: &str,
+        credential: &UpstreamCredential,
+    ) -> Result<SecretValue, String> {
+        let header = credential.header.to_ascii_lowercase();
+        match lock(&self.credentials).get(&(allocation_id, upstream.to_string(), header)) {
+            Some(CredentialState {
+                value: Some(value), ..
+            }) => Ok(value.clone()),
+            Some(CredentialState {
+                error: Some(error), ..
+            }) => Err(error.clone()),
+            _ => Err(format!("{} not fetched yet", credential.source())),
+        }
+    }
+
+    /// Human-readable credential problems for one allocation, for the
+    /// datapath status (`problems`): a missing value (requests fail with
+    /// `503`), or a fetch error while the previous value still serves.
+    pub fn credential_problems(&self, allocation_id: i64) -> Vec<String> {
+        let mut problems: Vec<String> = lock(&self.credentials)
+            .iter()
+            .filter(|((id, _, _), _)| *id == allocation_id)
+            .filter_map(|((_, upstream, header), state)| {
+                let error = state.error.as_deref()?;
+                Some(if state.value.is_some() {
+                    format!(
+                        "upstream {upstream} credential {header}: injecting the previous value; {error}"
+                    )
+                } else {
+                    format!(
+                        "upstream {upstream} credential {header}: {error} (requests on this upstream get 503)"
+                    )
+                })
+            })
+            .collect();
+        problems.sort();
+        problems
     }
 
     /// The KV version of the certificate held for an allocation (0 for none),
@@ -881,15 +1065,19 @@ impl UpstreamShared {
             context,
             http_config: spec.http.clone(),
             handlers: spec.handlers.clone(),
+            credentials: spec.credentials.clone(),
             http: OnceLock::new(),
-            gated: spec.netns.is_some(),
+            gated: spec.netns.is_some() || spec.vsock.is_some(),
         }
     }
 
     /// Whether this upstream declares HTTP itself (an `http` block, an
-    /// `http://`/`https://` target, or handlers that need bodies).
+    /// `http://`/`https://` target, handlers that need bodies, or
+    /// credentials, which need a request head to go in: an upstream with
+    /// credentials is never spliced).
     fn declares_http(&self) -> bool {
         self.http_config.is_some()
+            || !self.credentials.is_empty()
             || self.target.as_ref().is_some_and(|t| t.http)
             || self
                 .handlers
@@ -912,7 +1100,7 @@ impl UpstreamShared {
         Some(
             self.http
                 .get_or_init(|| {
-                    Arc::new(HttpSettings::new(
+                    let mut settings = HttpSettings::new(
                         self.allocation_id,
                         self.service.clone(),
                         self.target.clone(),
@@ -923,7 +1111,9 @@ impl UpstreamShared {
                         self.endpoints.clone(),
                         self.inflight.clone(),
                         self.context.log_dir_for(self.allocation_id),
-                    ))
+                    );
+                    settings.credentials = self.credentials.clone();
+                    Arc::new(settings)
                 })
                 .clone(),
         )
@@ -1168,16 +1358,32 @@ impl UpstreamForwarder {
         let addr: SocketAddr = format!("{UPSTREAM_LOOPBACK_ADDR}:{}", spec.local_port)
             .parse()
             .expect("loopback socket address");
-        match crate::worker::netd::netns::bind_tcp(spec.netns.clone(), addr).await {
-            Ok(socket) => {
+        let bound = match spec.vsock.as_deref() {
+            Some(path) => bind_vsock_host_socket(path).map(|socket| {
                 debug!(
                     allocation_id = spec.allocation_id,
                     service = %spec.service,
-                    local_port = spec.local_port,
+                    path = %path.display(),
                     balance = %shared.balancer.name(),
-                    "Started upstream forwarder listener"
+                    "Started upstream forwarder listener on vsock host socket"
                 );
-                let task = tokio::spawn(run_listener(socket, shared.clone()));
+                tokio::spawn(run_unix_listener(socket, shared.clone()))
+            }),
+            None => crate::worker::netd::netns::bind_tcp(spec.netns.clone(), addr)
+                .await
+                .map(|socket| {
+                    debug!(
+                        allocation_id = spec.allocation_id,
+                        service = %spec.service,
+                        local_port = spec.local_port,
+                        balance = %shared.balancer.name(),
+                        "Started upstream forwarder listener"
+                    );
+                    tokio::spawn(run_listener(socket, shared.clone()))
+                }),
+        };
+        match bound {
+            Ok(task) => {
                 let vip_task = bind_vip(&spec, &shared).await;
                 lock(&self.listeners).insert(
                     key,
@@ -1227,6 +1433,17 @@ impl UpstreamForwarder {
             }
         }
     }
+}
+
+/// Bind a gated sandbox's vsock host socket, replacing a stale one a
+/// previous listener (or worker) left behind. The VMM connects the guest's
+/// streams for that port here.
+fn bind_vsock_host_socket(path: &std::path::Path) -> R<UnixListener> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(path);
+    UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))
 }
 
 /// Bind the upstream's VIP listener (`<vip>:<canonical port>`), when it has
@@ -1300,8 +1517,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[instrument(skip_all, fields(allocation_id = shared.allocation_id, service = %shared.service))]
 async fn run_listener(socket: TcpListener, shared: Arc<UpstreamShared>) {
     loop {
-        let client = match socket.accept().await {
-            Ok((client, _peer)) => client,
+        let (client, peer) = match socket.accept().await {
+            Ok(accepted) => accepted,
             Err(err) => {
                 debug!(error = ?err, "Upstream forwarder accept failed");
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
@@ -1310,7 +1527,28 @@ async fn run_listener(socket: TcpListener, shared: Arc<UpstreamShared>) {
         };
         let shared = shared.clone();
         tokio::spawn(async move {
-            forward_connection(client, shared).await;
+            forward_connection(client, Some(peer), shared).await;
+        });
+    }
+}
+
+/// [`run_listener`] for a gated sandbox's vsock host socket. A stream from
+/// the VMM carries no peer address; the socket it arrived on is the
+/// attribution.
+#[instrument(skip_all, fields(allocation_id = shared.allocation_id, service = %shared.service))]
+async fn run_unix_listener(socket: UnixListener, shared: Arc<UpstreamShared>) {
+    loop {
+        let client = match socket.accept().await {
+            Ok((client, _)) => client,
+            Err(err) => {
+                debug!(error = ?err, "Upstream forwarder accept failed");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            forward_connection(client, None, shared).await;
         });
     }
 }
@@ -1328,14 +1566,25 @@ async fn run_listener(socket: TcpListener, shared: Arc<UpstreamShared>) {
 /// spliced.
 ///
 /// Per-connection logging stays at `debug` — this is the hot path.
-async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) {
+///
+/// `client` is a loopback TCP connection, or a stream from a gated
+/// sandbox's VMM; `peer` is the TCP peer, for a `proxy` hop's PROXY header.
+async fn forward_connection<C>(mut client: C, peer: Option<SocketAddr>, shared: Arc<UpstreamShared>)
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // HTTP mode parses requests instead of splicing; see `netd::http`.
     if let Some(settings) = shared.http_settings() {
-        crate::worker::netd::http::serve(client, settings).await;
+        crate::worker::netd::http::serve_with(
+            client,
+            settings,
+            crate::worker::netd::http::ConnInfo::default(),
+        )
+        .await;
         return;
     }
     if let Some(target) = shared.target.clone() {
-        forward_external(client, shared, target).await;
+        forward_external(client, peer, shared, target).await;
         return;
     }
 
@@ -1402,7 +1651,7 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
                 return;
             }
             HopOutcome::Proxy(target) => {
-                hand_off(&shared, client, &hop_facts, target, addr).await;
+                hand_off(&shared, client, peer, &hop_facts, target, addr).await;
                 return;
             }
         }
@@ -1443,7 +1692,7 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
             true,
         );
         if endpoint.mesh_tls {
-            mesh_splice(&shared, client, upstream, &endpoint, &hop_facts).await;
+            mesh_splice(&shared, client, peer, upstream, &endpoint, &hop_facts).await;
             return;
         }
         net_metrics::connection("egress", PROTOCOL_TCP, "allow");
@@ -1467,11 +1716,14 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
 
 /// Dial an external upstream's fixed destination, originating TLS when the
 /// scheme asks for it.
-async fn forward_external(
-    mut client: TcpStream,
+async fn forward_external<C>(
+    mut client: C,
+    peer: Option<SocketAddr>,
     shared: Arc<UpstreamShared>,
     target: UpstreamTarget,
-) {
+) where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     let destination = target.addr();
     // The boot gate before anything else, as everywhere in the datapath.
     if shared.gated && crate::worker::netd::netns::gate_is_shut(shared.allocation_id) {
@@ -1563,7 +1815,7 @@ async fn forward_external(
         }
         HopOutcome::Proxy(proxy_target) => {
             let resolved = handlers::resolve_addr(&destination).await;
-            hand_off(&shared, client, &hop_facts, proxy_target, resolved).await;
+            hand_off(&shared, client, peer, &hop_facts, proxy_target, resolved).await;
             return;
         }
     }
@@ -1784,13 +2036,16 @@ fn deny_connection(
 
 /// Hand a flow to a `proxy` handler: dial it, write the PROXY v2 header
 /// naming the workload and the original destination, then splice.
-async fn hand_off(
+async fn hand_off<C>(
     shared: &Arc<UpstreamShared>,
-    mut client: TcpStream,
+    mut client: C,
+    peer: Option<SocketAddr>,
     facts: &HopFacts<'_>,
     target: ProxyTarget,
     destination: Option<SocketAddr>,
-) {
+) where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     let mut proxy =
         match crate::worker::netd::guard::dial_guarded(&shared.context, &target.addr, DIAL_TIMEOUT)
             .await
@@ -1817,8 +2072,7 @@ async fn hand_off(
             }
         };
     if target.proxy_protocol {
-        let header =
-            handlers::proxy_header(&shared.context, facts, client.peer_addr().ok(), destination);
+        let header = handlers::proxy_header(&shared.context, facts, peer, destination);
         if proxy.write_all(&header).await.is_err() {
             net_metrics::connection("egress", PROTOCOL_TCP, "error");
             let _ = client.shutdown().await;
@@ -1831,13 +2085,16 @@ async fn hand_off(
 
 /// Dial a mesh endpoint: TLS with this node's certificate, verify the peer
 /// node, name the workload in a PROXY v2 header, then splice.
-async fn mesh_splice(
+async fn mesh_splice<C>(
     shared: &Arc<UpstreamShared>,
-    mut client: TcpStream,
+    mut client: C,
+    peer: Option<SocketAddr>,
     upstream: TcpStream,
     endpoint: &Endpoint,
     facts: &HopFacts<'_>,
-) {
+) where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     let Some(connector) = shared.context.mesh_connector() else {
         debug!(
             allocation_id = shared.allocation_id,
@@ -1862,12 +2119,8 @@ async fn mesh_splice(
     };
     match tokio::time::timeout(DIAL_TIMEOUT, connector.connect(server_name, upstream)).await {
         Ok(Ok(mut tls)) => {
-            let header = handlers::proxy_header(
-                &shared.context,
-                facts,
-                client.peer_addr().ok(),
-                endpoint.addr.parse().ok(),
-            );
+            let header =
+                handlers::proxy_header(&shared.context, facts, peer, endpoint.addr.parse().ok());
             if tls.write_all(&header).await.is_err() {
                 net_metrics::connection("egress", PROTOCOL_TCP, "error");
                 let _ = client.shutdown().await;
@@ -1894,12 +2147,13 @@ async fn mesh_splice(
     }
 }
 
-async fn splice<U>(
+async fn splice<C, U>(
     shared: &Arc<UpstreamShared>,
     destination: &str,
-    mut client: TcpStream,
+    mut client: C,
     mut upstream: U,
 ) where
+    C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     let tag = shared
@@ -1985,9 +2239,11 @@ mod tests {
             to: None,
             http: None,
             handlers: Vec::new(),
+            credentials: Vec::new(),
             vip: None,
             canonical_port: None,
             netns: None,
+            vsock: None,
         }
     }
 
@@ -2195,6 +2451,77 @@ mod tests {
             0,
             "forwarder must close connections while it has no endpoints"
         );
+    }
+
+    /// A gated sandbox's upstream listens on its VMM's vsock host socket
+    /// (replacing a stale one), never on the node's loopback, fails closed
+    /// while the sandbox's policy is pending, and forwards like any other
+    /// upstream once it has arrived.
+    #[tokio::test]
+    async fn a_vsock_upstream_listens_on_the_host_socket_and_fails_closed() {
+        use crate::structs::netpolicy::{merge_policies, InlinePolicy, NetPolicyObject};
+        use crate::structs::AllocNetPolicy;
+        use tokio::net::UnixStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sandbox").join("vsock.sock_20003");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"stale").unwrap();
+        let live = spawn_echo("a").await;
+        let cache = Arc::new(crate::worker::netd::NetPolicyCache::new());
+        let context = Arc::new(ForwarderContext::new(
+            cache.clone(),
+            Arc::new(Denials::new()),
+        ));
+        let forwarder = UpstreamForwarder::with_context(context);
+        let mut vsock = spec(free_port().await, "round_robin");
+        vsock.vsock = Some(path.clone());
+        forwarder.sync(std::slice::from_ref(&vsock)).await;
+        assert_eq!(forwarder.active(), vec![vsock.clone()]);
+        forwarder.set_endpoints(7, "db", vec![endpoint(&live)]);
+        assert!(
+            TcpListener::bind(("127.0.0.1", vsock.local_port))
+                .await
+                .is_ok(),
+            "a vsock upstream must not hold the node's loopback port"
+        );
+
+        // Policy pending: the connection is closed before anything is dialed.
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(TEST_TIMEOUT, client.read(&mut buf))
+            .await
+            .expect("a pending policy must close the connection promptly");
+        assert_eq!(read.expect("read from forwarder"), 0);
+
+        let mut object: NetPolicyObject = serde_json::from_value(serde_json::json!({
+            "name": "out", "enforcement": "require", "egress": { "policy": "allow" }
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let body = merge_policies(&[object], InlinePolicy::default());
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id: 7,
+            policy_hash: body.hash.clone(),
+        }]);
+        cache.insert_body(&body.hash.clone(), body).unwrap();
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, client.read_exact(&mut buf))
+            .await
+            .expect("the endpoint did not serve the connection in time")
+            .expect("read endpoint tag");
+        assert_eq!(&buf, b"a");
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        tokio::time::timeout(TEST_TIMEOUT, client.read_exact(&mut echoed))
+            .await
+            .expect("no echo in time")
+            .expect("read echo");
+        assert_eq!(&echoed, b"ping");
+
+        forwarder.sync(&[]).await;
+        assert!(forwarder.active().is_empty());
     }
 
     #[tokio::test]

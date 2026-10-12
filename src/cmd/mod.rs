@@ -93,6 +93,7 @@ mod tests {
         "legion start",
         "legion start manager",
         "legion start worker",
+        "legion start gateway",
         "legion join",
         "legion mcp serve",
         "legion guest-agent",

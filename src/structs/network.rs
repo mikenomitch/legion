@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::prelude::{bail, R};
+use crate::prelude::{anyhow, bail, R};
 
 /// Inclusive dynamic port range used when a port has no `static` value.
 pub const DYNAMIC_PORT_MIN: u16 = 20000;
@@ -244,9 +244,11 @@ pub fn task_runs_gated(task: &crate::structs::TaskConfig, sandbox_gated_default:
 ///
 /// - An explicit `network.mode = "gated"` with a `config.network`: a gated
 ///   guest has no NIC (and `none` has no vsock), so the two contradict.
-/// - Advertised ports (`network.ports`) on a sandbox that runs gated: the
-///   guest has no NIC and the datapath does not dial into a guest yet, so
-///   nothing could reach them.
+/// - Advertised ports (`network.ports`) on a sandbox whose guest nothing can
+///   reach: the node datapath fronts a gated guest's ports over vsock and a
+///   TAP guest's on its bridge address, and a guest that is neither has
+///   loopback only (`config.network = { mode = "none" }`, or no network
+///   config while `auto` resolves to `host`).
 pub fn validate_gated_sandbox(
     task: &crate::structs::TaskConfig,
     sandbox_gated_default: bool,
@@ -274,18 +276,99 @@ pub fn validate_gated_sandbox(
             ));
         }
     }
+    let runs_gated = task_runs_gated(task, sandbox_gated_default);
+    if runs_gated {
+        validate_gated_guest_ports(task)?;
+    }
     let ports = task
         .network
         .as_ref()
         .map(|network| network.ports.len())
         .unwrap_or(0);
-    if ports > 0 && task_runs_gated(task, sandbox_gated_default) {
+    if ports == 0 || runs_gated {
+        return Ok(());
+    }
+    let config_mode = task
+        .config
+        .get("network")
+        .filter(|value| !value.is_null())
+        .map(|network| {
+            network
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("none")
+                .trim()
+                .to_ascii_lowercase()
+        });
+    let why = match config_mode.as_deref() {
+        Some("tap") => return Ok(()),
+        Some(_) => "config.network = { mode = \"none\" } gives the guest no network device",
+        None => {
+            "with no config.network and network.mode not \"gated\", the guest has loopback only"
+        }
+    };
+    Err(format!(
+        "task {:?} declares network.ports, but nothing can reach a port in its guest: {why}\n\
+         Hint: set network.mode = \"gated\" to serve the ports through the node datapath, or \
+         wire the guest to a bridge (config.network = {{ mode = \"tap\", bridge = \"br0\" }})",
+        task.name
+    ))
+}
+
+/// Ports a gated guest cannot give its workload, because the guest agent
+/// holds them: `127.0.0.1:1080` is its egress proxy relay, guest vsock port
+/// 1100 is its exec listener (an advertised port is served on the guest
+/// vsock port of the same number), and host vsock ports 1080 and 53 are the
+/// egress proxy and the resolver, which an upstream (relayed to the host
+/// vsock port of its own `localPort`) would collide with. Dynamic ports come
+/// from far above all three.
+fn validate_gated_guest_ports(task: &crate::structs::TaskConfig) -> Result<(), String> {
+    const PROXY: u16 = 1080;
+    const RESOLVER: u16 = 53;
+    /// `legion_guest::exec::EXEC_PORT`.
+    const EXEC: u16 = 1100;
+    let held = task.network.as_ref().and_then(|network| {
+        network
+            .ports
+            .iter()
+            .find_map(|port| match port.to.or(port.static_port) {
+                Some(PROXY) => Some((
+                    port,
+                    PROXY,
+                    "127.0.0.1:1080 is the guest agent's egress proxy",
+                )),
+                Some(EXEC) => Some((
+                    port,
+                    EXEC,
+                    "the node serves each port on the guest vsock port of the same number, and \
+                     vsock port 1100 is the guest agent's exec listener",
+                )),
+                _ => None,
+            })
+    });
+    if let Some((port, number, why)) = held {
         return Err(format!(
-            "task {:?} declares network.ports on a gated sandbox, but ingress into a gated \
-             sandbox is not supported yet: the guest has no NIC, and the datapath does not dial \
-             into a guest, so nothing could reach those ports\nHint: wire the guest to a TAP \
-             (config.network = {{ mode = \"tap\", ... }}) to serve ports, or drop network.ports",
-            task.name
+            "task {:?} binds network.ports {:?} on port {number} in its guest, but in a gated \
+             sandbox guest {why}\nHint: pick another port, or drop static and to to take a \
+             dynamic one",
+            task.name, port.name
+        ));
+    }
+    let upstream = task.connect.as_ref().and_then(|connect| {
+        connect
+            .upstreams
+            .iter()
+            .find(|upstream| matches!(upstream.local_port, Some(PROXY | RESOLVER)))
+    });
+    if let Some(upstream) = upstream {
+        return Err(format!(
+            "task {:?} connect.upstreams entry {:?} sets localPort {}, but a gated sandbox's \
+             upstreams are relayed to the node on vsock ports of the same number, and {PROXY} \
+             and {RESOLVER} are the guest's egress proxy and resolver\nHint: pick another \
+             localPort, or drop it to take a dynamic one",
+            task.name,
+            upstream.key(),
+            upstream.local_port.unwrap_or_default()
         ));
     }
     Ok(())
@@ -593,6 +676,213 @@ pub struct UpstreamConfig {
     /// policy and before the dial.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handlers: Vec<crate::structs::netpolicy::HandlerConfig>,
+    /// Credential injection (docs/network-handlers.md, "Credential
+    /// injection"): headers the node sets on every request it sends to an
+    /// external `https://` upstream, with values the task never sees.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<UpstreamCredential>,
+}
+
+/// One injected header on an external `https://` upstream. Whatever value
+/// the task sent for `header` is dropped and replaced with `prefix` + the
+/// secret, so a placeholder the task's SDK insists on is harmless.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpstreamCredential {
+    /// The request header to set (`x-api-key`, `Authorization`). Stored
+    /// lower-cased; HTTP header names are case-insensitive.
+    pub header: String,
+    /// Text placed before the secret (`"Bearer "`). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Where the secret comes from.
+    pub from: CredentialFrom,
+}
+
+/// The provider behind one credential. Exactly one field is set. Each
+/// provider is a sibling field, so a new one (a webhook) slots in without
+/// reshaping the jobspec.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialFrom {
+    /// A KV path whose value is the secret. The node fetches it with
+    /// `GetUpstreamCredentials` and keeps it in memory only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv: Option<String>,
+    /// The name of one of the task's `identities`: the manager mints that
+    /// workload-identity token for the allocation and the node injects it,
+    /// refreshed before it expires. The identity needs no `env` or `file`
+    /// delivery, in which case the token never reaches the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+}
+
+impl UpstreamCredential {
+    /// The KV path this credential reads, when it is KV-backed.
+    pub fn kv_path(&self) -> Option<&str> {
+        self.from
+            .kv
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    }
+
+    /// The task identity this credential injects, when it is
+    /// identity-backed.
+    pub fn identity_name(&self) -> Option<&str> {
+        self.from
+            .identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Where the value comes from, as the jobspec names it, for status
+    /// lines and logs: `kv secrets/openai` or `identity api`.
+    pub fn source(&self) -> String {
+        match (self.kv_path(), self.identity_name()) {
+            (Some(path), _) => format!("kv {path}"),
+            (None, Some(name)) => format!("identity {name}"),
+            (None, None) => "no provider".to_string(),
+        }
+    }
+}
+
+/// Headers a credential may not name: hop-by-hop headers are stripped
+/// between hops, and `host` (plus the framing headers) is the datapath's to
+/// set. Injecting any of them would either vanish or corrupt the request.
+const CREDENTIAL_RESERVED_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+];
+
+/// Whether `name` is a syntactically valid HTTP header name (RFC 9110
+/// token characters).
+fn is_header_token(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Validate one upstream's `credentials`: only on an external `https://`
+/// upstream, a valid non-reserved header named at most once, a provider.
+fn validate_upstream_credentials(task_name: &str, upstream: &UpstreamConfig) -> R<()> {
+    if upstream.credentials.is_empty() {
+        return Ok(());
+    }
+    let key = upstream.key();
+    let what = format!("task {task_name} connect.upstreams entry '{key}' credentials");
+    if !upstream.is_external() {
+        bail!(
+            "{what}: credentials need an external https:// upstream (name + to); a catalog \
+             service upstream is reached over the mesh, not the public internet. Hint: declare \
+             {{ name = \"{key}\", to = \"https://<host>\", credentials = [...] }}, or have the \
+             service read the secret itself"
+        );
+    }
+    let to = upstream.to.as_deref().unwrap_or_default();
+    let scheme = to
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .unwrap_or_default();
+    match scheme.as_str() {
+        "https" => {}
+        "http" => bail!(
+            "{what}: to = '{to}' is plaintext, so the injected secret would cross the network \
+             in the clear. Hint: use https:// (the node originates TLS; the task still speaks \
+             plain HTTP to its loopback port)"
+        ),
+        _ => bail!(
+            "{what}: to = '{to}' is not HTTP, so there is no request head to put a header in. \
+             Hint: credentials need an https:// upstream; for a tcp:// or tls:// destination, \
+             deliver the secret to the task (env or a KV file) instead"
+        ),
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    for (index, credential) in upstream.credentials.iter().enumerate() {
+        let header = credential.header.trim().to_ascii_lowercase();
+        let at = format!("{what}[{index}]");
+        if header.is_empty() {
+            bail!("{at}: header is required (e.g. header = \"x-api-key\")");
+        }
+        if !is_header_token(&header) {
+            bail!(
+                "{at}: '{}' is not a valid HTTP header name",
+                credential.header
+            );
+        }
+        if CREDENTIAL_RESERVED_HEADERS.contains(&header.as_str()) {
+            bail!(
+                "{at}: header '{}' is a hop-by-hop or framing header the datapath owns and \
+                 cannot be injected",
+                credential.header
+            );
+        }
+        if !seen.insert(header.clone()) {
+            bail!("{what}: header '{header}' is injected more than once");
+        }
+        if let Some(prefix) = credential.prefix.as_deref() {
+            if prefix.chars().any(|c| c == '\r' || c == '\n' || c == '\0') {
+                bail!("{at}: prefix must not contain CR, LF, or NUL");
+            }
+        }
+        match (
+            credential.from.kv.as_deref(),
+            credential.from.identity.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                bail!("{at}: from names two providers (kv and identity); set exactly one")
+            }
+            (Some(path), None) if !path.trim().is_empty() => {}
+            (Some(_), None) => bail!("{at}: from.kv must name a KV path"),
+            (None, Some(name)) => {
+                crate::structs::workload_identity::validate_identity_name(name.trim())
+                    .map_err(|err| anyhow!("{at}: from.identity: {err}"))?;
+                if name.trim() == crate::structs::workload_identity::CONTROL_PLANE_IDENTITY_NAME {
+                    bail!(
+                        "{at}: from.identity = \"{}\" is the control-plane identity, which \
+                         authenticates to Legion itself; injecting it would hand a Legion \
+                         credential to {to}. Hint: declare an identity whose audience is \
+                         that origin",
+                        name.trim()
+                    );
+                }
+            }
+            (None, None) => bail!(
+                "{at}: from needs a provider: {{ kv = \"<path>\" }} or \
+                 {{ identity = \"<task identity name>\" }}, e.g. \
+                 from = {{ kv = \"secrets/{key}\" }}"
+            ),
+        }
+    }
+    Ok(())
 }
 
 impl UpstreamConfig {
@@ -1528,6 +1818,7 @@ pub fn validate_task_connect(
         if let Some(http) = upstream.http.as_ref() {
             validate_upstream_http(task_name, upstream.key(), http)?;
         }
+        validate_upstream_credentials(task_name, upstream)?;
         for (index, handler) in upstream.handlers.iter().enumerate() {
             let mut handler = handler.clone();
             crate::structs::netpolicy::normalize_handler(
@@ -1651,6 +1942,15 @@ pub fn normalize_task_connect(task_name: &str, connect: &mut Option<ConnectConfi
         }
         if let Some(to) = upstream.to.as_mut() {
             *to = to.trim().to_string();
+        }
+        for credential in upstream.credentials.iter_mut() {
+            credential.header = credential.header.trim().to_ascii_lowercase();
+            if let Some(path) = credential.from.kv.as_mut() {
+                *path = path.trim().to_string();
+            }
+            if let Some(name) = credential.from.identity.as_mut() {
+                *name = name.trim().to_string();
+            }
         }
         let is_http = upstream.is_http();
         let key = upstream.key().to_string();
@@ -2084,8 +2384,10 @@ mod tests {
         ));
     }
 
-    /// Gated plan §6.8: gated plus `config.network`, and ports on a gated
-    /// sandbox, are refused at submit with the fix.
+    /// Gated plan §6.8: gated plus `config.network` is refused at submit
+    /// with the fix. Since Phase 5 the datapath serves a gated sandbox's
+    /// ports, so only ports nothing can reach are refused: a loopback-only
+    /// guest's.
     #[test]
     fn contradictory_gated_sandboxes_are_refused_at_submit() {
         let gated = Some(json!({ "mode": "gated" }));
@@ -2102,22 +2404,38 @@ mod tests {
         assert!(validate_gated_sandbox(&task_of("sandbox", gated.clone(), none), false).is_err());
 
         let plain = json!({ "image": "a", "command": ["sh"] });
+        // Gated plan Phase 5: ports on a gated sandbox are served.
         let ports = Some(json!({ "mode": "gated", "ports": [{ "name": "http" }] }));
-        let err =
-            validate_gated_sandbox(&task_of("sandbox", ports, plain.clone()), false).unwrap_err();
-        assert!(
-            err.contains("ingress into a gated sandbox is not supported yet"),
-            "{err}"
-        );
-        assert!(err.contains("Hint: wire the guest to a TAP"), "{err}");
-        // A default sandbox with ports: refused only once the default is
-        // gated, and never one that declares its own network.
+        assert!(validate_gated_sandbox(&task_of("sandbox", ports, plain.clone()), false).is_ok());
+        // A default sandbox with ports: loopback only while `auto` is
+        // `host`, so refused with both ways to serve them; served once the
+        // default is gated.
         let auto_ports = Some(json!({ "ports": [{ "name": "http" }] }));
         let default = task_of("sandbox", auto_ports.clone(), plain.clone());
-        assert!(validate_gated_sandbox(&default, false).is_ok());
-        assert!(validate_gated_sandbox(&default, true).is_err());
+        let err = validate_gated_sandbox(&default, false).unwrap_err();
+        assert_eq!(
+            err,
+            "task \"workspace\" declares network.ports, but nothing can reach a port in its \
+             guest: with no config.network and network.mode not \"gated\", the guest has \
+             loopback only\nHint: set network.mode = \"gated\" to serve the ports through the \
+             node datapath, or wire the guest to a bridge (config.network = { mode = \"tap\", \
+             bridge = \"br0\" })"
+        );
+        assert!(validate_gated_sandbox(&default, true).is_ok());
+        // A TAP guest's ports are served on its bridge address, gated
+        // default or not.
         let tap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "tap" } });
-        assert!(validate_gated_sandbox(&task_of("sandbox", auto_ports, tap), true).is_ok());
+        let on_tap = task_of("sandbox", auto_ports.clone(), tap);
+        assert!(validate_gated_sandbox(&on_tap, false).is_ok());
+        assert!(validate_gated_sandbox(&on_tap, true).is_ok());
+        // An air-gapped guest has no door at all.
+        let air_gap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "none" } });
+        let err =
+            validate_gated_sandbox(&task_of("sandbox", auto_ports, air_gap), true).unwrap_err();
+        assert!(
+            err.contains("config.network = { mode = \"none\" } gives the guest no network device"),
+            "{err}"
+        );
         // Other runtimes and plain gated sandboxes pass.
         assert!(
             validate_gated_sandbox(&task_of("sandbox", gated.clone(), plain.clone()), true).is_ok()
@@ -2131,6 +2449,81 @@ mod tests {
             true
         )
         .is_ok());
+    }
+
+    /// A gated guest's agent holds 127.0.0.1:1080 (its egress proxy) and
+    /// relays each upstream to the host vsock port of its `localPort`, where
+    /// 1080 and 53 are the proxy and the resolver: a task that would collide
+    /// is refused at submit. The same task off gated networking passes.
+    #[test]
+    fn gated_sandboxes_refuse_the_guest_agents_ports() {
+        let plain = json!({ "image": "a", "command": ["sh"] });
+        let with_connect = |network: Value, upstream: Value| {
+            let mut task = task_of("sandbox", Some(network), plain.clone());
+            task.connect =
+                Some(serde_json::from_value(json!({ "upstreams": [upstream] })).unwrap());
+            task
+        };
+        let gated = json!({ "mode": "gated" });
+        for port in [1080, 53] {
+            let task = with_connect(gated.clone(), json!({ "service": "db", "localPort": port }));
+            let err = validate_gated_sandbox(&task, false).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "task \"workspace\" connect.upstreams entry \"db\" sets localPort {port}, but a \
+                     gated sandbox's upstreams are relayed to the node on vsock ports of the same \
+                     number, and 1080 and 53 are the guest's egress proxy and resolver\nHint: pick \
+                     another localPort, or drop it to take a dynamic one"
+                )
+            );
+        }
+        let fine = with_connect(gated.clone(), json!({ "service": "db", "localPort": 5432 }));
+        assert!(validate_gated_sandbox(&fine, false).is_ok());
+        // Off gated networking the agent relays nothing.
+        let tap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "tap" } });
+        let mut on_tap = task_of("sandbox", None, tap);
+        on_tap.connect = fine.connect.clone();
+        on_tap.connect.as_mut().unwrap().upstreams[0].local_port = Some(1080);
+        assert!(validate_gated_sandbox(&on_tap, false).is_ok());
+
+        for port in [
+            json!({ "name": "socks", "static": 1080 }),
+            json!({ "name": "socks", "to": 1080 }),
+        ] {
+            let task = task_of(
+                "sandbox",
+                Some(json!({ "mode": "gated", "ports": [port] })),
+                plain.clone(),
+            );
+            let err = validate_gated_sandbox(&task, false).unwrap_err();
+            assert_eq!(
+                err,
+                "task \"workspace\" binds network.ports \"socks\" on port 1080 in its guest, but in \
+                 a gated sandbox guest 127.0.0.1:1080 is the guest agent's egress proxy\nHint: \
+                 pick another port, or drop static and to to take a dynamic one"
+            );
+        }
+        let task = task_of(
+            "sandbox",
+            Some(json!({ "mode": "gated", "ports": [{ "name": "api", "static": 1100 }] })),
+            plain.clone(),
+        );
+        assert_eq!(
+            validate_gated_sandbox(&task, false).unwrap_err(),
+            "task \"workspace\" binds network.ports \"api\" on port 1100 in its guest, but in a \
+             gated sandbox guest the node serves each port on the guest vsock port of the same \
+             number, and vsock port 1100 is the guest agent's exec listener\nHint: pick another \
+             port, or drop static and to to take a dynamic one"
+        );
+        assert_eq!(u32::from(1100u16), legion_guest::exec::EXEC_PORT);
+        // A default sandbox runs gated once the default is, and is checked.
+        let default = task_of(
+            "sandbox",
+            Some(json!({ "ports": [{ "name": "socks", "static": 1080 }] })),
+            plain,
+        );
+        assert!(validate_gated_sandbox(&default, true).is_err());
     }
 
     /// Gated plan §6.6: a default sandbox on a dev backend says it runs
@@ -2480,6 +2873,98 @@ mod tests {
             json!([{ "service": "api", "http": { "timeout": "3s", "retries": { "attempts": 2, "budget": "20%" }, "outlier": { "consecutive5xx": 5, "ejectFor": "30s" } } }]),
         );
         validate_task_connect("api", None, Some(&ok), None).unwrap();
+    }
+
+    #[test]
+    fn upstream_credentials_validate_test() {
+        let check = |upstreams: Value| -> Result<(), String> {
+            let mut config = Some(connect(upstreams));
+            normalize_task_connect("api", &mut config).map_err(|e| e.to_string())?;
+            validate_task_connect("api", None, config.as_ref(), None).map_err(|e| e.to_string())
+        };
+        let cred = |header: &str| json!({ "header": header, "from": { "kv": "secrets/openai" } });
+
+        // An external https:// upstream takes credentials, normalized.
+        check(json!([{
+            "name": "openai", "to": "https://api.openai.com",
+            "credentials": [
+                { "header": "Authorization", "prefix": "Bearer ", "from": { "kv": "secrets/openai" } },
+                cred("x-org"),
+            ],
+        }]))
+        .unwrap();
+        let mut normalized = Some(connect(
+            json!([{ "name": "a", "to": "https://x", "credentials": [{ "header": " X-Api-Key ", "from": { "kv": " secrets/a " } }] }]),
+        ));
+        normalize_task_connect("api", &mut normalized).unwrap();
+        let credential = &normalized.unwrap().upstreams[0].credentials[0];
+        assert_eq!(credential.header, "x-api-key");
+        assert_eq!(credential.kv_path(), Some("secrets/a"));
+
+        // Plaintext, non-HTTP, and catalog-service upstreams are refused.
+        let err = check(json!([{ "name": "o", "to": "http://api.openai.com", "credentials": [cred("x-api-key")] }])).unwrap_err();
+        assert!(
+            err.contains("in the clear") && err.contains("Hint"),
+            "{err}"
+        );
+        for to in ["tcp://db:5432", "tls://db:5432"] {
+            let err = check(json!([{ "name": "o", "to": to, "credentials": [cred("x-api-key")] }]))
+                .unwrap_err();
+            assert!(err.contains("no request head"), "{err}");
+        }
+        let err =
+            check(json!([{ "service": "db", "credentials": [cred("x-api-key")] }])).unwrap_err();
+        assert!(err.contains("external https://"), "{err}");
+
+        // Header names: valid, not hop-by-hop or host, at most once.
+        for header in [
+            "connection",
+            "Host",
+            "proxy-authorization",
+            "transfer-encoding",
+        ] {
+            let err =
+                check(json!([{ "name": "o", "to": "https://x", "credentials": [cred(header)] }]))
+                    .unwrap_err();
+            assert!(err.contains("cannot be injected"), "{header}: {err}");
+        }
+        let err =
+            check(json!([{ "name": "o", "to": "https://x", "credentials": [cred("bad header")] }]))
+                .unwrap_err();
+        assert!(err.contains("not a valid HTTP header name"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [cred("")] }]))
+            .unwrap_err();
+        assert!(err.contains("header is required"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [cred("X-Api-Key"), cred("x-api-key")] }])).unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
+
+        // A provider is required, and its path non-empty.
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "kv": "  " } }] }])).unwrap_err();
+        assert!(err.contains("must name a KV path"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": {} }] }])).unwrap_err();
+        assert!(err.contains("needs a provider"), "{err}");
+        // Unknown providers are a parse error, not silently ignored.
+        assert!(serde_json::from_value::<ConnectConfig>(json!({ "upstreams": [{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "vault": "a" } }] }] })).is_err());
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "prefix": "a\r\nb", "from": { "kv": "k" } }] }])).unwrap_err();
+        assert!(err.contains("CR, LF"), "{err}");
+
+        // The identity provider: a valid name, one provider at a time, and
+        // never the control-plane identity.
+        check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "authorization", "prefix": "Bearer ", "from": { "identity": "api" } }] }]))
+            .unwrap();
+        let mut normalized = Some(connect(
+            json!([{ "name": "a", "to": "https://x", "credentials": [{ "header": "authorization", "from": { "identity": " api " } }] }]),
+        ));
+        normalize_task_connect("api", &mut normalized).unwrap();
+        let credential = &normalized.unwrap().upstreams[0].credentials[0];
+        assert_eq!(credential.identity_name(), Some("api"));
+        assert_eq!(credential.source(), "identity api");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "kv": "k", "identity": "api" } }] }])).unwrap_err();
+        assert!(err.contains("two providers"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "identity": "../x" } }] }])).unwrap_err();
+        assert!(err.contains("from.identity"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "identity": "legion" } }] }])).unwrap_err();
+        assert!(err.contains("control-plane identity"), "{err}");
     }
 
     #[test]

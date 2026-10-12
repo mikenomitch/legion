@@ -173,11 +173,15 @@ the root disk as `/legion/legion` and started by init (`guest-agent`):
 - **The exec listener**, on every microVM. It takes `legion exec` and action
   sessions on guest vsock port 1100 ([Exec](#exec)).
 - **The gated datapath's relay**, on a gated sandbox. It relays the guest's
-  loopback proxy and resolver ports to the node over vsock
-  ([network-handlers.md](network-handlers.md#sandboxes)). On a TAP or `none`
-  sandbox the agent runs `--no-relay`: no loopback listeners, and the node
-  binds nothing the guest could dial, so the guest still cannot reach the
-  host.
+  loopback proxy and resolver ports to the node over vsock, relays the
+  node's inbound connections on each advertised port (`--ingress-port
+  <port>` on its command line) to the workload's loopback port, and relays
+  each upstream's loopback port and VIP (`--upstream <port>=<vip>:<port>`)
+  to the node's listener for it
+  ([network-handlers.md](network-handlers.md#sandboxes)). On a TAP or
+  `none` sandbox the agent runs `--no-relay`: no loopback listeners, and the
+  node binds nothing the guest could dial, so the guest still cannot reach
+  the host.
 - **The resume handler**, on a sandbox launched for memory checkpoints or
   with identity token files. It refreshes the guest's identity, RNG, clock,
   token files, and a TAP guest's address after a restore and runs `onResume`
@@ -426,7 +430,7 @@ A sandbox's network is one of three shapes:
 
 | Shape | How | What the guest gets |
 | --- | --- | --- |
-| Loopback only | The default (`config.network` unset, or `{ mode = "none" }`) | No NIC. Suits compute sandboxes |
+| Loopback only | The default (`config.network` unset, or `{ mode = "none" }`) | No NIC. Suits compute sandboxes. Nothing can reach its ports, so submit refuses `network.ports` |
 | Gated | The task's `network.mode = "gated"` (see [Gated networking](#gated-networking) below) | No NIC. A vsock to the node datapath, where policy, handlers, and identity judge every connection |
 | TAP | `config.network = { mode = "tap", bridge = "br0" }` | A NIC on a host bridge, with an address Legion leases it |
 
@@ -555,8 +559,15 @@ runs a DHCP server for other hosts, keep its pool outside `range`. The bridge
 itself, its gateway address, and any NAT behind it are the operator's: Legion
 only attaches TAPs to it and leases addresses on it.
 
-`LEGION_PORT_*` and `LEGION_ADDR_*` are still exported into the guest, but
-nothing maps host ports into the VM yet.
+**Ports.** A TAP guest's advertised ports are served at the address the
+catalog advertises. The node datapath owns `<node address>:<host port>` and,
+for each connection its ingress chain allows (every connection, without a
+chain), dials `<guest address>:$LEGION_PORT_<label>`, reading the lease per
+connection so a restore's new address applies at once. The guest binds
+`$LEGION_PORT_<label>` on its bridge address or on every address
+(`0.0.0.0`); a loopback-only bind is unreachable. See
+[Ingress into a sandbox](network-handlers.md#ingress-into-a-sandbox).
+`LEGION_ADDR_*` names the node's address, which is what consumers dial.
 
 ### Idle detection and the boot gate
 
@@ -593,8 +604,25 @@ A gated guest that no policy covers denies every destination
 [Default deny](network-handlers.md#default-deny)), so open what the guest
 needs in `network.egress.allow`. Every gated sandbox gets a resolver, and the
 guest's proxy variables come in both cases plus `NODE_USE_ENV_PROXY=1`.
-Submit refuses a gated sandbox that also sets `config.network`, and one that
-declares `network.ports` (ingress into a gated guest is not supported yet).
+Submit refuses a gated sandbox that also sets `config.network`.
+
+A gated sandbox serves the ports it declares in `network.ports`. The node
+datapath owns each advertised port on the node and, for every connection
+the ingress chain allows, dials into the guest through the VMM's vsock
+socket (`CONNECT <port>`). The guest agent listens on that vsock port and
+relays to the workload's `127.0.0.1:$LEGION_PORT_<label>`, so the workload
+binds the port as on any runtime, on loopback or every address. Health
+checks, the catalog, and consumers all use the advertised port. See
+[Ingress into a sandbox](network-handlers.md#ingress-into-a-sandbox).
+
+A gated sandbox reaches its `connect.upstreams` as a container does:
+`$LEGION_UPSTREAM_<KEY>` and `<key>.svc.legion` both work in the guest. The
+guest agent listens on each upstream's loopback port and VIP and relays to
+the node's upstream listener over the vsock, so HTTP mode, policy, and
+handlers apply as on any runtime. Submit refuses an upstream `localPort` of
+1080 or 53, and an advertised port the guest would bind on 1080 or 1100,
+because the agent holds those. A TAP-wired or loopback-only sandbox cannot reach its
+upstreams. See [network-handlers.md](network-handlers.md#sandboxes).
 
 A gated sandbox takes memory checkpoints like any other: suspend, resume,
 snapshots, forks, and publish. Every restore moves the guest's vsock onto the
@@ -603,6 +631,16 @@ allocation's identity and current policy, and forks never share a door. On
 Firecracker this needs 1.16.1 or later. A memory checkpoint closes the
 guest's open connections. See
 [suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
+
+**Upstreams and credentials.** Because a gated sandbox's upstreams run
+through the node's listener,
+[credential injection](network-handlers.md#credential-injection) applies to
+them: the node adds the API key (from KV, or a workload-identity token) on
+the way to the origin, so the key is never in the guest and never in a
+memory checkpoint, fork, or published snapshot. A TAP-wired or
+loopback-only sandbox cannot reach its upstreams, so it cannot use
+injection. HTTPS through the gated proxy is a `CONNECT` tunnel, and no
+credential is injected into it.
 
 ## Artifacts Support
 
@@ -860,6 +898,10 @@ memory restore, since the device rides the snapshot.
   Firecracker that includes a running origin's, for a live snapshot or a
   fork. Retry interrupted calls. See
   [suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
+- **Only a gated sandbox reaches its upstreams.** On a TAP-wired or
+  loopback-only sandbox, `LEGION_UPSTREAM_<KEY>` names the guest's own
+  loopback, where nothing listens, so every dial is refused. Use
+  `network.mode = "gated"` for a sandbox with `connect.upstreams`.
 - **A gated sandbox's socket path must fit a Unix socket.** The datapath
   listens on `<worker state>/allocs/<id>/.sandbox/vsock.sock_1080`, and a
   path over 107 bytes fails the start or restore with `gated sandbox socket

@@ -306,6 +306,19 @@ mod tests {
                 dns: vec!["10.88.0.1".into()],
                 bridge: "br0".into(),
             }),
+            ingress_ports: vec![8080, 20001],
+            upstreams: vec![
+                legion_guest::identity::GuestUpstream {
+                    port: 20003,
+                    vsock_port: Some(30003),
+                    vip: Some("127.42.0.2:5432".parse().unwrap()),
+                },
+                legion_guest::identity::GuestUpstream {
+                    port: 20004,
+                    vsock_port: None,
+                    vip: None,
+                },
+            ],
         }
     }
 

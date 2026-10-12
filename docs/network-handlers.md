@@ -246,6 +246,196 @@ The `http` block on an upstream (`timeout`, `retries`, `split`, `outlier`)
 turns on HTTP mode with traffic management. Per-upstream `handlers` run
 there too. See [What the datapath does today](#what-the-datapath-does-today).
 
+### Credential injection
+
+An external `https://` upstream can carry the API key itself, so the task
+never holds it. The node's forwarder sets the header on every request it
+sends to the destination, with a value from one of two providers:
+
+| Provider | `from` | The value |
+| --- | --- | --- |
+| KV | `{ kv = "secrets/openai" }` | the KV value at that path |
+| Workload identity | `{ identity = "api" }` | a signed token for the task's identity named `api`, minted for this allocation and refreshed before it expires |
+
+A KV-backed key looks like this:
+
+```nickel
+connect = {
+  upstreams = [{
+    name = "anthropic",
+    to = "https://api.anthropic.com",
+    credentials = [
+      { header = "x-api-key", from = { kv = "secrets/anthropic" } },
+    ],
+  }, {
+    name = "openai",
+    to = "https://api.openai.com",
+    credentials = [
+      { header = "Authorization", prefix = "Bearer ", from = { kv = "secrets/openai" } },
+    ],
+  }],
+},
+```
+
+```bash
+legion kv put secrets/openai "sk-..."
+```
+
+Point the client at the upstream, as for any external upstream. An SDK that
+refuses to start without a key gets a placeholder:
+
+```sh
+export OPENAI_BASE_URL="http://$LEGION_UPSTREAM_OPENAI/v1"
+export OPENAI_API_KEY=placeholder          # replaced on the way out
+export ANTHROPIC_BASE_URL="http://$LEGION_UPSTREAM_ANTHROPIC"
+export ANTHROPIC_API_KEY=placeholder
+```
+
+An origin that trusts Legion's OIDC issuer (a cloud STS, an internal API
+that verifies JWTs) can take a [workload identity](workload-identity.md)
+token instead of a stored key. Declare the identity with the origin's
+audience and name it in `from`. It needs no `env` or `file` delivery, and
+without one the token never enters the task:
+
+```nickel
+identities = [{ name = "api", audience = ["https://api.internal.example"], ttl = "15m" }],
+connect = {
+  upstreams = [{
+    name = "api",
+    to = "https://api.internal.example",
+    credentials = [
+      { header = "Authorization", prefix = "Bearer ", from = { identity = "api" } },
+    ],
+  }],
+},
+```
+
+The manager mints the token from the scheduling record, exactly like a
+delivered one (the identity's audience, TTL, `sub` template, and extra
+claims; see [Workload identity](workload-identity.md)), and the node injects
+it. The node asks for a new one once less than half the TTL is left, so the
+origin always receives an unexpired token and nothing in the task refreshes
+anything. An identity that also sets `env` or `file` is delivered to the
+task as well, as usual.
+
+**How it works without intercepting TLS.** With an `https://` upstream the
+task already speaks plain HTTP to its loopback port, and the node opens TLS to
+the destination (see the table above). So the node reads the request head
+anyway; injecting a credential is setting one more header on the request it
+builds for the origin. Legion holds no certificate authority, terminates no
+TLS the task opened, and never sees inside a `CONNECT` tunnel.
+
+**Where the secret is, and is not.** The value lives in the worker's memory
+and on the TLS connection from the node to the origin. It is never in the
+task's environment, files, or memory, so it is never in a `sandbox`'s
+memory checkpoints, forks, or published snapshots either. The worker never
+writes it to disk (including `netd_state.json`) or to a log line; the access
+log records no headers. After a worker restart, the node fetches it again on
+its first heartbeat, and until then requests on that upstream get a `503`.
+
+**Semantics.**
+
+- **Overwrite.** Whatever the task sent for the header (any case, any number
+  of times) is dropped, and the header is set to `prefix` + the value. A
+  placeholder is harmless; so is no header at all.
+- **Every request.** The value is read once per request and sent on every
+  attempt of it: retries, and a [`proxy` handler](#proxy--bring-your-own-proxy)
+  hand-off. A proxy hop sees the credential, because it has to reach the
+  origin with it. The hand-off is plain HTTP to the proxy (it opens TLS to
+  the origin), so a proxy on another node receives the key over the network
+  unencrypted: prefer a `node`- or `port`-local proxy target, and run only
+  proxies you would trust with the key.
+- **`authz` hops never see it.** They run before injection, and they receive
+  the task's own headers (minus `authorization`, `cookie`, and
+  `proxy-authorization`, as always), so a placeholder at most.
+- **Fail closed.** A request whose credential the node does not hold (never
+  fetched, or the key was deleted) is answered locally, without dialing:
+
+  ```http
+  HTTP/1.1 503 Service Unavailable
+  Legion-Denied-By: credential-unavailable
+  Legion-Denied-Reason: credential-unavailable: upstream openai header authorization: kv secrets/openai not found
+
+  {"legion":{"error":"credential-unavailable: upstream openai header authorization: kv secrets/openai not found","source":"credential-unavailable","upstream":"openai"}}
+  ```
+
+  An unauthenticated request never leaves, so a missing key cannot turn
+  into a burst of `401`s, or into requests that succeed against an origin
+  that allows anonymous access.
+- **Rotation.** `legion kv put secrets/openai ...` reaches every node on its
+  next heartbeat (`GetUpstreamCredentials`, asked only for versions newer
+  than the one held). Requests already in flight keep the old value. Nothing
+  restarts. Deleting the key revokes it on the next heartbeat. An identity
+  token is replaced on the first heartbeat after half its TTL has passed.
+- **Fail-static.** An unreachable manager, a KV read error, or a failed
+  token mint keeps the last good value. A value no header can carry (a line
+  break or NUL inside it; one trailing newline is trimmed) is rejected and
+  the previous value stays. An identity token held through a long manager
+  outage still expires at the origin, which then answers `401`.
+- **Status.** Problems are reported per allocation, and `legion net doctor`
+  shows them on the datapath layer:
+  `upstream openai credential authorization: kv secrets/openai not found (requests on this upstream get 503)`,
+  or `... injecting the previous value; kv secrets/openai could not be read`.
+
+**Validation.** Submit refuses credentials that could not work, or would
+leak:
+
+| Declaration | Result |
+| --- | --- |
+| `to = "http://..."` | refused: the secret would cross the network in the clear. Use `https://` |
+| `to = "tcp://..."` or `"tls://..."` | refused: there is no request head to put a header in. Deliver the secret to the task instead |
+| a catalog `service` upstream | refused: credentials are for external destinations |
+| `header` = `host`, `content-length`, `transfer-encoding`, or a hop-by-hop header | refused: the datapath owns these |
+| the same header twice on one upstream | refused |
+| `from = { kv = "" }`, no provider, or both `kv` and `identity` | refused |
+| `from = { identity = "api" }` with no identity named `api` on the task | refused, naming the identities it does declare |
+| `from = { identity = "legion" }` | refused: the control-plane identity authenticates to Legion itself and must not be handed to another origin |
+| an identity with neither `env` nor `file`, that no credential names | refused: nothing would receive it |
+| `changeMode` or `changeSignal` on an identity with neither `env` nor `file` | refused: only the node holds that token, so there is nothing to signal or restart |
+
+Header names are case-insensitive and stored lower-cased.
+
+**Access.** Naming a key in `credentials` sends its value to a host the job
+author chose, so it needs the right to read it: `RunJob` and template runs
+require `kv:read` on every credential path, in addition to `job:write`.
+Without it the submit fails with `PermissionDenied`:
+`... (connect.upstreams[openai].credentials names kv secrets/openai; the submitter needs kv read on it)`.
+An identity credential needs no extra right: declaring an identity is
+already part of submitting the job. A node can only fetch a credential that
+an allocation placed on it declares. It names (allocation, upstream,
+header), and the manager derives each KV path or identity from the
+allocation's own declaration.
+
+**Identity provider prerequisites.** The manager must run with
+`workloadIdentity.enabled: true`. When it does not, the node holds no token
+and requests on that upstream get the `503` above, with the reason
+`workload identity is not enabled on this manager`.
+
+**Gated tasks.** A gated `container` or `exec` task reaches its upstreams
+inside its namespace, and declared upstreams are an explicit allowance, so
+[default deny](#default-deny) does not block them. HTTPS a client sends
+through the egress proxy (`HTTPS_PROXY`, `CONNECT`) is an opaque tunnel, so
+**no credential is ever injected on proxy traffic**. Set the client's base
+URL to the upstream instead, as above.
+
+**Sandboxes.** A gated `sandbox` reaches its upstreams over vsock, through
+the same listener (see [Sandboxes](#sandboxes)), so injection works there
+unchanged: the guest calls `http://$LEGION_UPSTREAM_OPENAI/v1` with a
+placeholder, and the key is added on the node. It is never in the guest's
+memory, so never in its memory checkpoints, forks, or published snapshots.
+
+**Limits.**
+
+- The providers are `kv` and `identity`. There is no webhook provider (a
+  token exchange, for example), and a credential can only be a request
+  header: not a query parameter or basic-auth pair.
+- HTTP/1.1 only, like the rest of HTTP mode. A client that needs HTTP/2 to
+  the origin cannot use an upstream.
+- A TAP-wired or loopback-only `sandbox` cannot reach its upstreams, so
+  injection reaches `exec`, `container`, and gated `sandbox` tasks only.
+- There is no per-request audit event for an injected credential; the
+  access log (if on) records the request, not which credential it carried.
+
 ## Name-is-config: `<key>.svc.legion`
 
 On Linux, every allocation that declares upstreams gets its own loopback /24
@@ -288,7 +478,8 @@ resolv.conf for `exec` tasks, so point your tool at `LEGION_DNS` to use the
 allocation's resolver; on a host whose `resolv.conf` names systemd-resolved's
 `127.0.0.53`, a gated `exec` task reaches its own resolver without that. A gated `sandbox` uses the guest
 agent's relay as its resolver (`nameserver 127.0.0.1` in the guest's
-`resolv.conf`, see "Sandboxes").
+`resolv.conf`), and the agent also listens on each upstream's VIP in the
+guest, so `<key>.svc.legion` works there too (see "Sandboxes").
 
 **macOS** configures only `127.0.0.1` on `lo0`, so no VIP block is assigned
 there. Upstreams keep their loopback ports and env vars, and there is no
@@ -628,6 +819,11 @@ The proxy supports three protocols:
   origin form, one request per connection.
 - SOCKS5 `CONNECT`, with domain-name targets checked by name.
 
+Nothing is added to traffic through the proxy. In particular, a
+[credential](#credential-injection) is only injected on a declared
+`https://` upstream, never into a `CONNECT` tunnel, which the node cannot
+read. Point a client that needs one at its upstream, not the proxy.
+
 Every denial is a `403` with `Legion-Denied-By` (or a SOCKS "connection not
 allowed") and a `net.denied` event. **A tool that ignores the proxy
 variables has no route and fails.** That failure is how the policy is
@@ -713,6 +909,38 @@ proxy variables and the same `resolv.conf` a gated container gets work
 unchanged. The node checks every connection (the [host guard](#the-host-guard)
 first, then policy), and the guest has no other way out.
 
+The agent also carries the other direction. For every port the task
+advertises, it listens on that vsock port in the guest and relays each
+connection to the workload's `127.0.0.1:<port>`. The node datapath opens
+those connections after its ingress chain has run (see
+[Ingress into a sandbox](#ingress-into-a-sandbox)).
+
+**Upstreams.** A gated sandbox's `connect.upstreams` work as they do in a
+container, through the same listener. For each upstream, the agent listens
+on `127.0.0.1:<local port>` in the guest (what `LEGION_UPSTREAM_<KEY>`
+names) and relays every connection to host vsock port `<local port>`. The
+worker binds that upstream's listener on
+`<alloc dir>/.sandbox/vsock.sock_<local port>` instead of on the node's
+loopback. So balancing, HTTP mode, the egress chain, and the upstream's
+`handlers` all apply unchanged, and the listener fails closed while the
+allocation's policy is pending. Names work too. The
+resolver on vsock port 53 answers `<key>.svc.legion` with the upstream's
+VIP, and the agent also listens on `<vip>:<canonical port>` in the guest
+(the guest's `lo` holds all of 127/8), relaying to the same vsock port.
+`LEGION_UPSTREAM_VIP_<KEY>` and `LEGION_UPSTREAM_HOST_<KEY>` are set as for
+a container.
+
+```nickel
+connect = {
+    upstreams = [{ service = "db" }],
+},
+network = { mode = "gated" },
+```
+
+In the guest, `psql -h db.svc.legion -p 5432` and
+`psql "postgres://$LEGION_UPSTREAM_DB"` reach the same listener on the
+node.
+
 **The guest agent binary.** The worker copies `legion-guest`, a statically
 linked build of the agent and the resume handler, into the rootfs as
 `/legion/legion`, so it runs on any image, `alpine:latest` and busybox
@@ -735,17 +963,37 @@ What is and is not enforced:
   to drop one of them. It also needs a microVM backend. With `hypervisor =
   "dev"` (a container standing in for a VM), the start fails with that
   reason instead of running unprotected.
-- Ingress into a gated sandbox is not supported yet: the guest has no NIC,
-  and the datapath does not dial into a guest. Submit refuses
-  `network.ports` on a gated sandbox (`ingress into a gated sandbox is not
-  supported yet`). Wire the guest to a TAP to serve ports.
+- Advertised ports work. The datapath owns each one on the node and dials
+  into the guest over the VMM's vsock socket, so every inbound connection
+  passes the ingress chain first. A gated guest fails closed on ingress like
+  any gated allocation (see
+  [Ingress into a sandbox](#ingress-into-a-sandbox)).
 - The edge-boot `boot` gate uses the same policy-withheld marker the vsock
   listeners check, so a provisional sandbox has no network until it is
   ratified.
 - `legion net doctor` and the UI report the sandbox like any gated
-  allocation. `capture_ready` means both host sockets are bound, and an
-  unbound one is named: `egress proxy is not bound on the guest's vsock
-  socket <path>`.
+  allocation. `capture_ready` means every host socket is bound: the egress
+  proxy, the resolver, and one per declared upstream. An unbound one is
+  named: `egress proxy is not bound on the guest's vsock socket <path>`, or
+  `upstream db is not bound on the guest's vsock socket <path>`.
+- The agent holds three ports in a gated guest. `127.0.0.1:1080` is its
+  egress proxy relay, guest vsock port 1100 is its exec listener (each
+  advertised port is served on the guest vsock port of the same number),
+  and host vsock ports 1080 and 53 are the egress proxy and the resolver.
+  Submit refuses an advertised port the guest would bind on 1080 (`task
+  "workspace" binds network.ports "socks" on port 1080 in its guest, but in
+  a gated sandbox guest 127.0.0.1:1080 is the guest agent's egress proxy`)
+  or on 1100 (`... but in a gated sandbox guest the node serves each port on
+  the guest vsock port of the same number, and vsock port 1100 is the guest
+  agent's exec listener`), and an upstream `localPort` of 1080 or 53 (`task
+  "workspace" connect.upstreams entry "db" sets localPort 53, but a gated
+  sandbox's upstreams are relayed to the node on vsock ports of the same
+  number, and 1080 and 53 are the guest's egress proxy and resolver`).
+  Dynamic ports never collide with any of them.
+- Upstreams reach the guest only on gated networking. A TAP-wired or
+  loopback-only sandbox that declares `connect.upstreams` is placed and
+  gets the env vars, but they name the guest's own loopback, where nothing
+  listens, so every dial is refused.
 - Every gated guest uses vsock CID 3. Both VMMs implement vsock over Unix
   sockets in user space, so a CID is private to its guest, and the datapath
   attributes a connection by the socket it arrived on, never by anything the
@@ -760,13 +1008,20 @@ are bound before the restore, so a restored or forked guest's traffic is
 attributed to the new allocation and judged by the policy in force at
 restore. A checkpoint closes the guest's open connections: the guest agent
 closes the relays it holds when it sees the restore, so clients get a prompt
-close rather than a hang. See
+close rather than a hang. Upstreams keep working across a restore. The
+restored workload still dials the loopback ports it was captured with, and
+the restore tells the agent which local port the new allocation was
+assigned for each, so the agent relays to the new allocation's listener
+from the first connection. It also starts listening on the new VIPs. The
+old VIPs keep relaying too, for a resolver cache that still holds them. See
 [suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
 
-Current status: the host side (VMM configuration, listeners, status, the
-restore-time socket move) and the agent are implemented and unit-tested over
-Unix sockets with the VMMs' naming, and against fake VMM APIs. This
-repository's CI has no KVM, so it does not run an end-to-end boot or restore
+Current status: the host side (VMM configuration, listeners, the ingress
+dial and its handshake, upstream listeners on vsock sockets, status, the
+restore-time socket move) and the agent (egress, ingress, and upstream
+relays) are implemented and unit-tested over Unix sockets with the VMMs'
+naming, and against fake VMMs. This repository's CI has no KVM, so it does
+not run an end-to-end boot, restore, inbound connection, or upstream dial
 with a real VMM. `auto` resolves to `host` for sandboxes, as it does for
 every runtime.
 If the guest binary cannot run on the image (the glibc fallback on a musl
@@ -1066,6 +1321,78 @@ events, and an ingress `proxy` hop receives it in the PROXY v2 header. There
 is one listener per advertised port per allocation. The cluster edge and per-tag routing on ingress are not part of
 this feature.
 
+### Ingress into a sandbox
+
+A sandbox guest has its own network stack, so a port it listens on is not
+on the node's loopback. The datapath fronts **every** port a sandbox
+advertises, with or without an ingress chain: it owns `<address>:<host
+port>` on the node, as it does for any fronted port, and dials into the
+guest for each connection it allows.
+
+| The sandbox's network | How the datapath reaches the guest |
+| --- | --- |
+| `network.mode = "gated"` (no NIC) | Through the VMM's vsock socket for the allocation, `<alloc dir>/.sandbox/vsock.sock`, with the host-initiated handshake both Firecracker and cloud-hypervisor implement: it writes `CONNECT <port>\n`, expects `OK <n>\n`, then splices. Anything else (a closed stream, an error line, silence for two seconds) is a failed dial. In the guest, the agent listens on vsock port `<port>` and relays to `127.0.0.1:<port>`. |
+| `config.network = { mode = "tap", ... }` | TCP to the guest's leased bridge address, `<guest address>:<port>`. |
+| Neither (`config.network = { mode = "none" }`, or no network config while `auto` is `host`) | Nothing can reach the guest's loopback, so submit refuses `network.ports`. |
+
+```nickel
+network = {
+    mode = "gated",
+    ports = [{ name = "http" }],
+    egress = { allow = ["pypi.org"] },
+},
+```
+
+The workload binds `$LEGION_PORT_HTTP` as on every runtime: a gated guest
+on loopback or every address (`0.0.0.0`), a TAP guest on its bridge address
+or every address. That is the advertised port's own number when there is no
+ingress chain (the guest's stack is its own, so it does not collide with
+the datapath's listener on the node), and the private twin when there is
+one. The vsock port is the same number, so one number names both ends.
+
+Everything else is unchanged: the ingress chain, TLS termination, the
+access log, `net.denied`, the activity ledger behind the `connections`
+idle signal, and `legion net doctor`. A gated guest fails closed on
+ingress like any gated allocation: while its policy is pending or its
+boot gate is shut, nothing is accepted.
+
+**Across a memory checkpoint.** A suspended, resumed, or forked sandbox
+keeps serving its ports through the restoring allocation's listeners. The
+restored workload still listens on the ports it was captured with, even
+when the new placement assigned different numbers. The checkpoint records
+those ports, and the datapath dials them. A port the new placement adds is
+added to the guest agent by the restore's identity. A TAP guest is dialed
+at the address the restore leased it. Connections open at capture are
+closed, as on egress.
+
+Failure modes:
+
+- **Nothing listens in the guest yet.** The agent closes the stream at
+  once (a gated guest), or the dial is refused (a TAP guest). The client
+  sees its connection close, and a health check through the port fails
+  until the workload is up.
+- **The guest agent is not running** (the glibc fallback on a musl image).
+  The VMM closes the handshake, so every inbound connection closes. The
+  guest has no egress either, so this fails closed.
+- **A TAP guest has no lease yet.** The dial fails with `the sandbox guest
+  has no address leased in <dir> yet`.
+
+Limits:
+
+- An ingress `proxy` hop hands the connection to your proxy, which cannot
+  reach a port inside a sandbox guest, as with a gated task's private port.
+- In a gated guest, `127.0.0.1:1080` belongs to the agent's egress proxy
+  relay and guest vsock port 1100 to its exec listener, so the workload
+  cannot serve on port 1080 or 1100, and submit refuses an advertised port
+  that would bind either.
+- Firecracker 1.17 fixes host-initiated vsock connections that stop
+  receiving after a VM is paused and resumed in place (Firecracker #6100),
+  which a live `snapshot create --memory` or a fork does to the origin.
+  Legion does not require 1.17 yet. Run 1.17 or later for gated sandboxes
+  that serve ports.
+- CI has no KVM, so the vsock path is tested against a fake VMM and a fake
+  guest, not a real microVM.
+
 **Rollouts.** A task with a `service` block drains before it stops. It
 leaves the catalog, keeps serving for one heartbeat interval (or
 [`stop.drain`](graceful-stop.md)), and only then begins its normal stop. A
@@ -1216,6 +1543,13 @@ A cluster-wide policy (no pools in its selector) and `ca rotate` need
 unscoped `net:write`. `IssueNodeCertificate` is worker-plane, and a node may
 only mint its own certificate.
 
+Naming a KV key in a job needs `kv:read` on it, because the datapath hands
+the value out: `certFrom = { kv }` on an ingress chain
+([Certificates from KV](#certificates-from-kv)) and
+`connect.upstreams[].credentials` ([Credential injection](#credential-injection)).
+`GetIngressCertificates` and `GetUpstreamCredentials` are worker-plane, and a
+node only receives values that allocations placed on it declare.
+
 ## Current scope and limitations
 
 What ships now is the **policy and upstream layer on the connect datapath**.
@@ -1238,14 +1572,16 @@ This section lists what that covers and what it does not.
   off the node's Legion ports, the metadata service, and other allocations'
   listeners where it runs. On macOS, egress stays cooperative, and
   there are no VIPs, per-allocation resolvers, or gated namespaces. A gated
-  `sandbox` is captured over vsock. That path is implemented and
-  unit-tested but not exercised on a real VMM in CI. `auto` resolves to
-  `gated` for containers on Linux nodes and to `host` for everything else,
-  so set `gated` explicitly for an `exec` task.
+  `sandbox` is captured over vsock, upstreams included. That path is
+  implemented and unit-tested but not exercised on a real VMM in CI. A
+  TAP-wired or loopback-only sandbox cannot reach its upstreams. `auto`
+  resolves to `gated` for containers on Linux nodes and to `host` for
+  everything else, so set `gated` explicitly for an `exec` task.
 - **Ingress is enforced everywhere it applies.** The datapath owns the
   advertised port and the task binds a private twin, on every runtime and
-  platform. TCP only. The task sees the datapath as the peer, not the
-  original client.
+  platform. A gated or TAP-wired sandbox's ports are always fronted, over
+  vsock or at the guest's bridge address. TCP only. The task sees the
+  datapath as the peer, not the original client.
 - **TLS**: ingress chains terminate `server`/`mutual` TLS with your files, a
   certificate held in KV (swapped live on renewal), or the mesh certificate.
   Legion stores and serves certificates but does not issue public ones: a
@@ -1253,9 +1589,12 @@ This section lists what that covers and what it does not.
   workload identity, never per-workload certificates. There is no kTLS fast
   path (a terminated connection is copied in user space), no revocation
   beyond the 24-hour lifetime, and an ingress `proxy` hop cannot reach a
-  gated task's private port.
+  gated task's private port or a port inside a sandbox guest.
 - **No HTTP/2 or HTTP/3** (`protocol = "h2"` is rejected with that reason),
   no UDP, no WASM handlers, and no TLS interception. Legion will not add TLS
-  interception. Use external upstreams when policy needs to see the body.
+  interception. Use external upstreams when policy needs to see the body,
+  or when the node should add a credential the task never holds
+  ([Credential injection](#credential-injection)): both work because the
+  task speaks plaintext to the node and the node opens TLS itself.
 - **Legion has no job namespaces.** Every job is in `default`, so
   `selector.namespaces` either matches every job or none.
