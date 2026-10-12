@@ -548,11 +548,16 @@ CreateInstance ──> pending ──placed──> active ──alloc dies──
                                                              for the job's lifetime)
 ```
 
-- **Create** registers the instance (state `pending`) and enqueues placement.
-  The scheduler sets a keyed task's desired allocation count from its live
-  (pending, active, or rescheduling) instances. Keyed tasks define no
+- **Create** registers the instance (state `pending`) and enqueues placement,
+  in one write (concurrent creates group-commit into one write between
+  them). The scheduler sets a keyed task's desired allocation count from its
+  live (pending, active, or rescheduling) instances. Keyed tasks define no
   `count`, and a keyed task with zero instances runs zero allocations.
-  Stopped instances are **not** in the desired set.
+  Stopped instances are **not** in the desired set. An instance that finds
+  no room stays `pending` while its job's eval waits
+  [blocked](scheduler-and-eval-loop.md#blocked-evals) under the task's
+  class, and places on its own when a node it can run on joins or frees
+  room; `legion job info` reports the job as `blocked` meanwhile.
 - **Placement** binds the new allocation to an unbound live instance, inside
   the same transaction that inserts the allocation (the same path slot mode
   uses). If the task declares `stateful.storage`, the storage handle is
@@ -585,7 +590,9 @@ CreateInstance ──> pending ──placed──> active ──alloc dies──
 - **Destroy** stops the instance's allocation through the normal
   allocation-stop path, **drops the storage handle**, and keeps the row as a
   `terminated` tombstone for the lifetime of the job. Destroying the job
-  clears it.
+  clears it. Stop and destroy are each one write that removes the
+  allocation directly; they queue no eval, and the capacity they free wakes
+  any job blocked on that node's class.
 
 ### API / CLI
 

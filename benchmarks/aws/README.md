@@ -468,6 +468,14 @@ and tear it down when the campaign is over.
 
 ## Known limitations (also see docs/worker-simulation.md)
 
+- **Legion sim fleets changed shape on 2026-10-12** (sandbox-scaling plan
+  Phases 0–2). Simulated nodes now report allocation health, as real
+  workers do, and take their work over `Manager.StreamWork` instead of the
+  heartbeat's desired set and `PostWork` pushes. Cells run before that date
+  understate the heartbeat path's write load and pay full-set heartbeats;
+  do not compare their heartbeat-path or dispatch numbers with later cells.
+  Adding `--sim-no-work-stream` to the `legion start worker --simulate`
+  unit `start-sim-fleet.sh` writes reproduces the old delivery path.
 - Sim fleets share one dispatch address per instance, so per-node
   connection-establishment cost on the manager is understated at large
   N (same trade in nodesim/KWOK).

@@ -22439,6 +22439,18 @@ mod tests {
         )?;
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].kind, "job_stop");
+        // Claims are leader memory: the duplicate is held with the claim, so
+        // no other claim can take it, and the settle deletes it.
+        assert!(
+            store
+                .claim_evals(
+                    EvalBatchLimits { max: 1, workers: 1 },
+                    ClaimScope::NonPlanning
+                )?
+                .is_empty(),
+            "the duplicate stop rides the claim"
+        );
+        store.complete_eval(&claimed[0].id, true)?;
         let pending = store
             .get_evals()?
             .into_iter()

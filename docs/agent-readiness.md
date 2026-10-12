@@ -54,7 +54,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | --- | --- | --- |
 | `legion_capabilities` | no | List the operation catalog. |
 | `legion_job_list` | no | List jobs, optionally only those in one `status`. The reply's `status_counts` gives per-status totals. |
-| `legion_job_info` | no | Inspect one job. |
+| `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
 | `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
 | `legion_job_validate` | no | Validate a rendered jobspec (JSON). |

@@ -220,20 +220,31 @@ When a job group contains multiple tasks:
 
 ### Node Added
 
-Two paths exist:
+A plan that finds no capacity does not fail its eval: the eval waits
+**blocked**, keyed by what it needs (the task's pool and pinned attributes,
+the node a resume is pinned to, or `escaped` when there was no node at
+all), and new capacity on a node that could host it returns it to the
+queue. Capacity means a node registering, a node being uncordoned or having
+its pool or attributes change, a node returning to `ready`, or allocations
+leaving a node (a stop, a destroy, a scale-in, a suspend, a preemption). A
+node in another pool wakes nothing. `legion job info` reports such a job as
+`blocked` with what it waits for. The full model, its keys, and its
+limitations are in
+[Blocked evals](scheduler-and-eval-loop.md#blocked-evals).
 
-A plan that finds no capacity fails its eval, and nothing retries it on a
-timer. New capacity is what retries it:
+The capacity pass remains as a backstop for jobs that are short without a
+blocked eval:
 
 - Worker registration (`worker_register`) inserts the node, then queues a
   capacity pass: one `node_join` eval with no node. Uncordoning a node
   (`legion node uncordon`) queues the same pass.
 - The pass re-evaluates, with a `Reschedule` plan, every active job that has
-  no live rollout and nothing already queued, when its config has a
-  `count.per` task or a service or sidecar task with fewer allocations than
-  its effective count. It also tops up rollouts that completed incomplete.
-  After a failed or cancelled rollout it converges what the rollout left
-  running, never the rolled-back version (see
+  no live rollout and nothing already queued or blocked, when its config has
+  a `count.per` task, a service or sidecar task with fewer allocations than
+  its effective count, or a keyed instance waiting for placement. It also
+  tops up rollouts that completed incomplete. After a failed or cancelled
+  rollout it converges what the rollout left running, never the rolled-back
+  version (see
   [rollouts.md](rollouts.md#after-a-rollout-fails-rolls-back-or-is-stopped)).
 - One pass covers any number of joins. While a pass is pending, further
   registrations queue nothing, so a burst of new workers costs one pass.
@@ -242,12 +253,11 @@ timer. New capacity is what retries it:
 
 Known limitations:
 
-- Batch tasks are not re-evaluated, because a batch task that already ran
-  to completion looks the same as one that never placed.
-- Capacity freed by stopping or scaling in another job, or by a lost node
-  heartbeating again, does not queue the pass. The next registration or
-  uncordon does, and so does a manager leadership change, whose
-  reconciliation reschedules every active job.
+- Batch tasks are not re-evaluated by the pass, because a batch task that
+  already ran to completion looks the same as one that never placed. A
+  batch task whose placement blocked is woken like any other.
+- A rollout tick that cannot place still fails its rollout rather than
+  blocking.
 
 ### Node Lost
 

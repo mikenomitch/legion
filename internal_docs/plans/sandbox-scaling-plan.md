@@ -2,7 +2,14 @@
 
 > **Judgement calls:** [`calls/sandbox-scaling-plan_calls.md`](../calls/sandbox-scaling-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-11). Nothing here is built. Phase 0 is a
+**Status: IN EXECUTION** (written 2026-10-11; Phases 0–3 shipped
+2026-10-12). Phase 0's measurements, their method, and each shipped phase's
+result against its target are in [§14](#14-results-phases-0-3). Phases 4
+and later are planned and unchanged by the Phase 0 numbers except where
+§14 says so. Shipped with deliberate gaps, each in `TODO.md`: edge-boot
+provisional deltas on the stream (calls entry 29), checkpoint budget
+reports and `snapshot warm` as blocked-eval wake events (calls entry 32),
+and the AWS-rig run of the Phase 0 matrix (calls entry 13). Phase 0 is a
 gate: it measures what every later phase assumes, and its numbers can
 reorder or cancel phases. Deliberately deferred and named: cell sharding of
 promoted instances (Phase 10, built only past a measured trigger), a
@@ -443,7 +450,7 @@ this plan is that sessions start fast and come back.
   more through federation.
 - **A pluggable external session registry** (DynamoDB, FoundationDB,
   Spanner) as a default or a Phase. It turns a self-hosted scheduler into
-  a distributed system with a cloud dependency (calls entry 12).
+  a distributed system with a cloud dependency (calls entry 19).
 - **Gossip.** Managers already receive every heartbeat.
 - **Changing `keyed` or `slot` semantics.** Existing jobs keep exact
   listing, tombstones, and at-most-one.
@@ -628,11 +635,11 @@ This plan adopts it with two amendments, each a judgement call:
   invisible to the scheduler. A session-mode task reserves capacity per
   node as an ordinary allocation (Borg's alloc), and sessions fill it.
   The scheduler, quotas, preemption, and `node usage` keep working
-  unchanged (calls entry 6).
+  unchanged (calls entry 7).
 - **Idle manifests land before ephemeral running sessions.** Phase 5 works
   for today's keyed instances with `durability = "store"`, and idle
   sessions are the larger count. It ships value without a new mode
-  (calls entry 5).
+  (calls entry 6).
 
 ### 6.2 A third instance mode: `session`
 
@@ -735,7 +742,7 @@ the boot ticket stands in for the lease: the ticket names the job, task,
 pool, and an instance prefix. The manager records the pair (ticket `jti`,
 session id) in the soft index on the next heartbeat. Ticket single-use
 enforcement stays as it is for tickets with `uses = 1`. A prefix ticket
-with many uses is the session-mode shape and spends once (calls entry 14).
+with many uses is the session-mode shape and spends once (calls entry 21).
 
 The lease is a capability document. It proves which credential
 authorized a session, for identity issuance and audit, and it never
@@ -907,7 +914,7 @@ allocations placed on it. With edge-started sessions it can mint tokens
 for any session id it invents under a job its ticket names. That is the
 same blast radius edge boot already accepted ("runs anything a live ticket
 names", `docs/edge-boot.md`), applied to identity. Promoted sessions keep
-today's boundary. Calls entry 16 records the trade.
+today's boundary. Calls entry 24 records the trade.
 
 ### 6.9 Composition with gated networking and suspend
 
@@ -1093,7 +1100,7 @@ once the guest is ready. Three plans touch this, and each owns one part:
   guest over host-initiated vsock.
 - **This plan owns wake for idle sessions in the bucket.** The waker lives
   off-node, in the stateless gateway tier, `legion start gateway`. The exec
-  plan's Phase 4 adds exec to the same tier (calls entry 7).
+  plan's Phase 4 adds exec to the same tier (calls entry 8).
 
 **The surface.**
 
@@ -1181,7 +1188,7 @@ region" ([filter and rank](https://www.tensorlake.ai/blog/multi-cloud-scheduling
 
 **Design.** An eval that cannot place goes `blocked` instead of `failed`,
 with a **blocking key**, and the leader keeps an index from key to blocked
-evals (calls entry 8):
+evals (calls entry 9):
 
 - **Keys.** The node class the placement could use (pool plus the
   attributes its constraints read, Nomad's computed class), the resource
@@ -1259,7 +1266,7 @@ applied to the soft index) would start.
 
 ### 7.2 Latency SLOs
 
-Throughput alone hides the number a user feels (calls entry 10). Phase 0
+Throughput alone hides the number a user feels (calls entry 15). Phase 0
 measures each of these at p50 and p99, on an idle cluster and at 80% of the measured
 throughput ceiling, and every later phase states its effect on them.
 
