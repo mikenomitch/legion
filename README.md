@@ -269,11 +269,14 @@ they should. Legion handles all three.
   and the session runs client to worker with no manager on the data path.
 - **Simple egress control.** [Network handlers](docs/network-handlers.md)
   give each task its own egress allowlist and proxy middleware, so you
-  can customize what traffic is allowed or inject secrets safely.
+  can customize what traffic is allowed, and
+  [inject API keys](docs/network-handlers.md#credential-injection) on the
+  way out so the sandbox never holds them.
 - **Agent sandboxes that park when idle.** A sandbox
   [suspends](docs/suspend-and-resume.md) to a memory checkpoint after a few
   quiet minutes, frees its reservation (or keeps a share, so the resume
-  finds room), and resumes in place with its processes intact. `memoryMax` and an
+  finds room), and resumes in place with its processes intact, by hand or
+  when the next request for it reaches the [gateway](docs/gateway.md). `memoryMax` and an
   [oversubscription ratio](docs/resource-enforcement.md#oversubscription)
   pack the active ones tighter, and fork copies a running sandbox for an
   agent to explore from. See the
@@ -400,7 +403,8 @@ start:
   [Scaling Jobs](docs/autoscaling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
   [Resource Enforcement](docs/resource-enforcement.md) ·
-  [Suspend and Resume](docs/suspend-and-resume.md)
+  [Suspend and Resume](docs/suspend-and-resume.md) ·
+  [Gateway: Wake on Request](docs/gateway.md)
 - **Guides:** [Running Postgres](docs/guides/postgres.md) ·
   [Running Redis](docs/guides/redis.md) ·
   [Serving TLS Certificates from KV](docs/guides/tls-certificates.md) ·

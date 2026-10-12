@@ -1051,6 +1051,10 @@ origin's memory.
 
 ### 6.10 Composition: wake on connect (sketch, Phase 8)
 
+> **Update 2026-10-12:** wake through a gateway shipped as
+> [wake-on-request-plan.md](wake-on-request-plan.md). The node-local parked
+> listener sketched here remains open as that plan's Phase 4.
+
 A suspended instance with a local checkpoint keeps its ingress port
 reservation on its node. The worker holds a **parked listener** on that port.
 On the first connection it holds the socket, asks the manager to resume the

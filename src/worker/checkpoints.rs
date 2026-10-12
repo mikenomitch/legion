@@ -1026,6 +1026,10 @@ pub fn resume_identity(
         // A TAP guest's address is leased by the sandbox runtime on the
         // restoring node, from its bridge's pool.
         guest_addr: None,
+        // A gated guest's ingress ports are filled in by the sandbox runtime
+        // on the restoring node, from the allocation's network.
+        ingress_ports: Vec::new(),
+        upstreams: Vec::new(),
     }
 }
 

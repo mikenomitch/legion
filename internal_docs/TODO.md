@@ -326,6 +326,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#31](https://github.com/mikenomitch/legion/pull/31) | Wake on request (`legion start gateway`, `suspend.wake`), credential injection on egress (`connect.upstreams[].credentials`, KV and identity providers), ingress into gated and TAP sandboxes, and upstreams in gated sandboxes | [wake plan](plans/wake-on-request-plan.md) · [credential plan](plans/egress-credential-injection-plan.md) · [gated plan](plans/gated-sandbox-checkpoints-plan.md) Phase 5; KVM checks G5.1 and G5.2 pending |
 | [#28](https://github.com/mikenomitch/legion/pull/28) | Streaming persistence: one credential path for replica, takeover restore and lease (platform identity by default, keys in `persistence.streaming.credentials`), boot checks, and the object-storage lease that could never be acquired on real S3 | Breaking: lease keys and `LITESTREAM_*` key vars removed; [plan](plans/manager-workload-identity-plan.md) · [calls](calls/manager-workload-identity-plan_calls.md) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
@@ -1823,11 +1824,30 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] Phase 6: `stateful.mode = "session"`: envelopes, the session
         router, leases, node session logs, the leader index, and
         `PromoteInstance`. Its user docs are drafted in plan §15.
-  - [ ] Phase 7: wake on request through `legion start gateway` and
-        `suspend.wake` (plan §6.14). The suspend plan's Phase 8 keeps
-        node-local wake on connect.
+  - [ ] Phase 7: wake on request for **sessions**. Shipped early for keyed
+        instances by the [wake-on-request plan](plans/wake-on-request-plan.md)
+        (see below); waking sessions from manifests is that plan's Phase 3,
+        after Phase 6 here.
   - [ ] Phases 8 to 10: snapshot-clone density (with suspend plan Phase 8),
         a sub-VM tier seam, and cells only past the plan §6.11 trigger.
+- [ ] **Wake on request**: [plan](plans/wake-on-request-plan.md) (IN
+      EXECUTION) · [calls](calls/wake-on-request-plan_calls.md) ·
+      [docs](../docs/gateway.md). Phase 1 (the gateway) is done, below.
+  - [ ] Phase 2: gateway metrics (`legion_gateway_requests_total{outcome}`,
+        wake latency, held requests) on a `/metrics` listener. Today the
+        gateway only logs.
+  - [ ] Phase 3: wake `session`-mode sessions from bucket manifests, after
+        sandbox-scaling Phase 6.
+  - [ ] Phase 4: node-local wake on connect (suspend plan §6.10), for
+        clusters without a gateway tier.
+  - [ ] Pass the client address to the instance (`Forwarded`). The gateway
+        splices after the first head, so it cannot add a header to later
+        requests on a kept-alive connection (plan §11).
+  - [ ] Reload the gateway's TLS certificate without a restart (from a file
+        watch or `certFrom = { kv }` like ingress chains).
+  - [ ] A real microVM resume behind the gateway on KVM hardware; CI only
+        runs the gateway against a real manager with a simulated worker
+        (`tests/wake_integration.rs`).
 - [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (IN EXECUTION) ·
       [calls](calls/sandbox-exec-plan_calls.md). Exec into Linux microVM
       sandboxes, and exec sessions that skip the manager. Implemented
@@ -1941,9 +1961,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         plan's Phase 6.
 - [ ] **Gated sandboxes by default, with memory checkpoints**:
       [plan](plans/gated-sandbox-checkpoints-plan.md) (IN EXECUTION) ·
-      [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Phases 1 to 4
-      are built (see Done, Task runtimes) on a host without KVM, in PR
-      [#24](https://github.com/mikenomitch/legion/pull/24). What is left:
+      [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Phases 1 to 5
+      and upstreams in gated sandboxes are built (see Done, Task runtimes) on a host without KVM, Phases 1
+      to 4 merged in PR [#24](https://github.com/mikenomitch/legion/pull/24).
+      What is left:
   - [ ] Phase 0, the gate: boot a gated sandbox on a real VMM for the first
         time. On a KVM host with Firecracker 1.16.1+, cloud-hypervisor v52+,
         a kernel with `CONFIG_VIRTIO_VSOCKETS=y` and `CONFIG_IP_PNP=y`, and
@@ -1961,10 +1982,33 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         ([calls entry 2](calls/gated-sandbox-checkpoints-plan_calls.md#2-the-flip-to-gated-by-default-is-built-but-held-closed-until-phase-0-passes)).
   - [ ] Run the KVM checks for the built phases: G1.1 to G1.5 (gated memory
         checkpoints on both VMMs), G2.1 (glibc and musl images), G3.1
-        (model-call wake), G4.1 (TAP re-addressing), and record them in the
-        verification doc.
-  - [ ] Phase 5: ingress into gated sandboxes over host-initiated vsock,
-        lifting the submit refusal of `network.ports` on a gated sandbox.
+        (model-call wake), G4.1 (TAP re-addressing), G5.1 (`curl` an
+        advertised port of a gated sandbox, suspend, resume, `curl` again;
+        repeat on a TAP sandbox), G5.2 (a gated sandbox reaches an upstream
+        by `LEGION_UPSTREAM_<KEY>` and by `<key>.svc.legion` across suspend,
+        resume, and a fork), and record them in the verification doc.
+  - [ ] Found while building Phase 5: decide the Firecracker floor for
+        ingress. 1.17 fixes host-initiated RX sticking after a bare pause
+        and resume (#6100), which a live memory snapshot or fork does to
+        the origin; nothing enforces it yet, and G5.1 should measure it
+        ([calls entry 20](calls/gated-sandbox-checkpoints-plan_calls.md#20-ingress-takes-no-firecracker-117-floor-until-phase-0-measures-6100)).
+  - [ ] Found while building Phase 5: an ingress `proxy` hop cannot reach a
+        port inside a sandbox guest (the same gap as a gated task's private
+        port; [docs](../docs/network-handlers.md#ingress-into-a-sandbox)).
+  - [ ] TAP-wired and loopback-only sandboxes cannot reach their
+        `connect.upstreams` (nor, so, use credential injection), and submit
+        does not refuse them. Serve a TAP guest's upstreams on its bridge
+        address, or refuse at submit
+        ([calls entry 25](calls/gated-sandbox-checkpoints-plan_calls.md#25-upstreams-on-tap-and-loopback-only-sandboxes-stay-unreachable-and-are-not-refused)).
+  - [ ] An upstream removed from the job while an instance is suspended
+        leaves a dead listener in the restored guest (the agent retargets
+        the upstreams it is told about and never drops one)
+        ([calls entry 14](calls/gated-sandbox-checkpoints-plan_calls.md#14-a-restore-retargets-the-guest-agents-upstream-relays-not-the-nodes-listener)).
+  - [ ] Found while building Phase 5: after a restore that moved a port,
+        the new allocation's own `LEGION_PORT_<label>` (its env, and what
+        `alloc get` shows) differs from the port the restored guest listens
+        on; `resume.env` and the datapath use the recorded port
+        ([calls entry 13](calls/gated-sandbox-checkpoints-plan_calls.md#13-a-restored-sandbox-keeps-the-ports-it-was-captured-with-and-the-datapath-dials-those)).
   - [ ] Found during the plan: gated `container` and `exec` tasks without
         upstreams get no VIP block and so no resolver
         ([plan §6.5](plans/gated-sandbox-checkpoints-plan.md#65-gated-is-the-sandbox-default-and-it-denies-by-default)).
@@ -1978,7 +2022,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] Found while building: a gated resolver forwards queries while the
         allocation's policy is still pending (the first heartbeat after
         placement), a narrow DNS channel the proxy does not have
-        ([calls entry 15](calls/gated-sandbox-checkpoints-plan_calls.md#15-a-gated-resolver-forwards-while-the-allocations-policy-is-pending)).
+        ([calls entry 22](calls/gated-sandbox-checkpoints-plan_calls.md#22-a-gated-resolver-forwards-while-the-allocations-policy-is-pending)).
         Revisit if boot-time resolution failures turn out to be rare.
   - [ ] Found while building: TAP guests are IPv4 only (`sandbox.bridges`
         takes an IPv4 subnet), and a guest kernel without `CONFIG_IP_PNP`
@@ -2951,6 +2995,31 @@ Still unplanned, and not covered by the plan:
       Only worth it once the cluster edge above exists. Until then, the
       renewer job in `configs/jobs/cert-renewer.ncl` covers it.
 
+Credential injection: [egress-credential-injection-plan.md](plans/egress-credential-injection-plan.md)
+· calls: [egress-credential-injection-plan_calls.md](calls/egress-credential-injection-plan_calls.md)
+· docs: [network-handlers.md#credential-injection](../docs/network-handlers.md#credential-injection).
+Phases 1 and 2 shipped (see Done, KV & secrets).
+
+- [x] **Reach `connect.upstreams` from a gated `sandbox` guest**, so
+      credential injection keeps API keys out of gated sandboxes and their
+      memory checkpoints (vsock relays; see Task runtimes, gated sandboxes).
+      TAP-wired and loopback-only sandboxes are still open there
+      ([calls #11](calls/egress-credential-injection-plan_calls.md)).
+- [ ] Credential injection Phase 3: webhook provider
+      (`from = { handler = "<name>" }`) and non-header placements (query
+      parameter, basic auth).
+- [ ] Credential injection Phase 4: opt-in per-request
+      `net.credential_used` audit events.
+- [ ] **HTTP `proxy` hand-offs travel in plaintext.** A request handed to a
+      `service =` proxy on another node goes as plain HTTP in absolute form
+      (`attempt_request` in `src/worker/netd/http.rs` skips TLS and the mesh
+      when `hand_off` is set), so an injected credential crosses the network
+      unencrypted. Send hand-offs over the mesh when the proxy endpoint is
+      remote ([calls #10](calls/egress-credential-injection-plan_calls.md)).
+- [ ] Credentials on policy objects (one key for every sandbox on a pool),
+      with `UpsertNetPolicy` enforcing `kv:read` as it does for `certFrom`
+      (plan §11).
+
 ## Persistence & cluster operations
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md), [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
@@ -3636,6 +3705,14 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       is scheduled. Not caused by the plan-apply work — `src/worker/task_manager.rs`
       is untouched by it. Make the assertion independent of the child actually
       having started, or gate on an observed start.
+- [ ] **`simulated_fleet_feeds_the_worker_metric_registry` asserts a
+      process-global gauge.** `tests/worker_simulation.rs` checks
+      `simulated_nodes >= 4` while the binary's other tests run fleets of
+      their own, so another fleet shutting down can pull the gauge under 4.
+      Failed once in a full local run (2026-10-12, PR #31, which does not
+      touch the simulator) and passed three reruns. Its counters are
+      already asserted as deltas; read the gauge from this fleet, or
+      serialize the tests that run fleets.
 - [ ] **`acked_write_survives_any_single_node_loss` is bimodally flaky on
       small hosts.** Seen 2026-08-07 on a 4-core shared VM, debug build:
       either the whole test completes in ~1s or a round's survivors never
@@ -4076,7 +4153,15 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Rename "task kind" → "task runtime"
       ([plan](plans/task-runtime-rename-plan.md), single-pass, no shim)
 - [x] A **noop** runtime ([docs](../docs/task-runtime-noop.md))
-- [x] **Gated sandboxes, Phases 1 to 4** of the
+- [x] **Wake on request, Phase 1**: `suspend.wake = { port, timeout }`,
+      `legion start gateway` (host, `Legion-Instance`, `CONNECT`, and
+      `POST /v1/wake/<id>` routing; held requests with one resume per burst;
+      `503` + `Retry-After` past the timeout; optional TLS; running
+      instances reachable through a manager outage), and `InstanceInfo.wake`
+      and `endpoints` on `GetInstance`.
+      [plan](plans/wake-on-request-plan.md) ·
+      [docs](../docs/gateway.md)
+- [x] **Gated sandboxes, Phases 1 to 5** of the
       [gated sandbox checkpoints plan](plans/gated-sandbox-checkpoints-plan.md)
       ([calls](calls/gated-sandbox-checkpoints-plan_calls.md)), built on a
       host without KVM and tested against fake VMMs, Unix sockets standing
@@ -4094,7 +4179,8 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         runtime, a resolver for every gated sandbox, lower-case proxy vars
         and `NODE_USE_ENV_PROXY`, the static `legion-guest` agent (workspace
         crate `guest/`), submit refusals for gated plus TAP and for ingress
-        ports on a gated sandbox, `net policy show` resolving `auto`, and the
+        ports on a gated sandbox (the latter lifted by Phase 5), `net policy
+        show` resolving `auto`, and the
         shipped `configs/policies/agent-sandbox-egress.ncl`. The `auto` to
         `gated` flip is built and held (open above).
         [docs](../docs/network-handlers.md#default-deny)
@@ -4108,6 +4194,29 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         attribute and implicit constraint, and `config.network.tap` and
         `mac` removed (disk forks of TAP sandboxes allowed).
         [docs](../docs/task-runtime-sandbox.md#addressing)
+  - [x] Phase 5: ingress into sandboxes. The ingress listener dials a gated
+        guest through the VMM's base vsock socket (`CONNECT <port>` / `OK
+        <n>`, `src/worker/netd/vsock.rs`), the guest agent listens on a
+        vsock port per advertised port and relays to the workload's
+        loopback, a TAP guest's ports are fronted at its leased address,
+        the guest's ports ride the checkpoint so a restore dials the ports
+        the restored workload holds, and submit refuses ports only on a
+        loopback-only sandbox. G5.1 is open above.
+        [docs](../docs/network-handlers.md#ingress-into-a-sandbox) ·
+        [plan §6.10](plans/gated-sandbox-checkpoints-plan.md#610-ingress-into-a-gated-sandbox-phase-5)
+  - [x] Found while building Phase 5, now fixed: a gated guest's
+        `127.0.0.1:1080` is the agent's proxy relay, so submit refuses an
+        advertised port the guest would bind on 1080, and an upstream
+        `localPort` of 1080 or 53
+        ([calls entry 38](calls/gated-sandbox-checkpoints-plan_calls.md#38-an-upstream-localport-of-1080-or-53-and-a-guest-port-of-1080-or-1100-are-refused-on-a-gated-sandbox)).
+  - [x] Upstreams in gated sandboxes: the guest agent listens on each
+        upstream's loopback port and VIP and relays over vsock to the
+        node's own upstream listener (bound on
+        `<alloc>/.sandbox/vsock.sock_<local port>`), so HTTP mode, policy,
+        handlers, and credential injection apply unchanged; a restore
+        retargets the agent's relays to the new allocation's ports. G5.2 is
+        open above. [docs](../docs/network-handlers.md#sandboxes) ·
+        [plan §6.10, "As built"](plans/gated-sandbox-checkpoints-plan.md#610-ingress-into-a-gated-sandbox-phase-5)
 - [x] **Sandbox guest size follows `resources`** (`memoryMax`, else
       `memory`), so the scheduler's reservation and the VM's size can no
       longer drift apart
@@ -4273,6 +4382,30 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       path needs `kv:read` on it.
 - [x] Example renewer and consumer jobs: `configs/jobs/cert-renewer.ncl`
       (lego, DNS-01, KV as the only state) and `configs/jobs/tls-edge.ncl`.
+
+[plan](plans/egress-credential-injection-plan.md) ·
+[calls](calls/egress-credential-injection-plan_calls.md) ·
+[docs](../docs/network-handlers.md#credential-injection)
+
+- [x] **Credential injection on egress, Phase 1** (2026-10-12):
+      `connect.upstreams[].credentials = [{ header, prefix?, from = { kv } }]`
+      on external `https://` upstreams. The node's forwarder replaces the
+      task's header with the KV value on every request (retries and `proxy`
+      hand-offs included), so the key never enters the workload. No TLS
+      interception. A worker-plane `GetUpstreamCredentials` RPC derives the
+      path from the allocation's own declaration and sends each value once
+      per version; values stay in worker memory. A missing value answers a
+      local `503 credential-unavailable` without dialing; deleting the key
+      revokes it. Naming a path needs `kv:read`. Gated sandboxes are
+      covered through their vsock upstreams; TAP-wired and loopback-only
+      sandboxes are not.
+- [x] **Credential injection, Phase 2: the identity provider** (2026-10-12):
+      `from = { identity = "<task identity>" }` injects a workload-identity
+      token the manager mints in `GetUpstreamCredentials` (the token's expiry
+      is its version; a new one once half the TTL is left). An identity named
+      this way may skip `env`/`file`, and the worker then never sees it; the
+      control-plane `legion` identity cannot be injected
+      ([calls #6 to #8](calls/egress-credential-injection-plan_calls.md)).
 
 [encryption plan](plans/kv-encryption-plan.md) · [docs](../docs/kv-encryption.md)
 

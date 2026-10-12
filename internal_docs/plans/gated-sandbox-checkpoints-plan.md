@@ -2,7 +2,7 @@
 
 > **Judgement calls:** [`calls/gated-sandbox-checkpoints-plan_calls.md`](../calls/gated-sandbox-checkpoints-plan_calls.md)
 
-Status: **IN EXECUTION** (written 2026-10-11, Phases 1 to 4 built
+Status: **IN EXECUTION** (written 2026-10-11, Phases 1 to 5 built
 2026-10-12 on a Linux host without KVM).
 
 - **Phase 0 (the gate): pending.** No gated guest has booted. The opt-in
@@ -25,7 +25,21 @@ Status: **IN EXECUTION** (written 2026-10-11, Phases 1 to 4 built
   netlink re-addressing on restore (run for real in a network namespace),
   the implicit bridge constraint, and `config.network.tap` and `mac`
   removed. G4.1 pending.
-- **Phase 5 (ingress): not started.**
+- **Phase 5 (ingress): built.** The ingress listener dials a gated guest
+  through the VMM's base vsock socket (`CONNECT <port>`), the guest agent
+  listens on a vsock port per advertised port and relays to loopback, and
+  the submit refusal is lifted. Deviations, each a calls entry: TAP
+  sandboxes' ports are fronted in the same change (dialed at the leased
+  guest address), the guest's ports ride the checkpoint so a restore dials
+  the ports the restored workload holds, and only a loopback-only
+  sandbox's ports are still refused. Unit-tested against a fake VMM and a
+  fake guest; G5.1 pending.
+- **Added after Phase 5: upstreams in gated sandboxes, built.** The guest
+  agent listens on each `connect.upstreams` entry's loopback port and VIP
+  and relays to host vsock port `<local port>`, where the worker binds the
+  upstream's ordinary listener; a restore retargets the agent's relays to
+  the new allocation's local ports. TAP and loopback-only sandboxes still
+  cannot reach their upstreams (calls entries 12, 14, 16, 25, and 38).
 
 Deliberately deferred and named:
 transparent capture inside the guest, UDP and ICMP through the datapath,
@@ -192,7 +206,7 @@ until a policy selects a pod. Default-deny is a pattern you add. Consul's
 service mesh with `default_policy = "deny"` denies until an intention
 allows, and its transparent proxy redirects traffic with iptables inside the
 pod's namespace so unmodified tools work. We take Consul's default and
-reject transparent redirect for now (§4, calls entry 28). Inside a microVM
+reject transparent redirect for now (§4, calls entry 39). Inside a microVM
 it would be safe, since the vsock stays the only door, and it is the
 leading follow-on.
 
@@ -553,7 +567,7 @@ If it never appears, the guest resumes anyway with no door (each dial gets a
 vsock reset, which the agent turns into a closed connection), the
 allocation reports `net_capture_unavailable`, and `legion net doctor` names
 the unbound socket. Fail closed, never a failed restore over a transient
-bind error (calls entry 25).
+bind error (calls entry 34).
 
 **In-flight connections are reset.** A memory checkpoint closes every open
 guest connection:
@@ -568,7 +582,7 @@ guest connection:
   VMM closes its side, and the upstream connections close with them.
 
 The guest agent makes this uniform. It takes over the resume handler's
-identity-disk watch (one process, `legion guest-agent`, calls entry 26), and
+identity-disk watch (one process, `legion guest-agent`, calls entry 35), and
 when it sees a restore it closes every relay it holds. A guest client
 therefore gets a prompt connection reset on every VMM version, never a hang.
 New connections dial a fresh vsock stream, which reaches the new
@@ -841,7 +855,7 @@ this plan, each is impossible or refused before it can bite.
 | A memory checkpoint of a gated sandbox on a VMM that cannot retarget vsock | Not reachable (all refused) | Refused before capture, with the version and the fix (§6.2) |
 | Restoring a gated checkpoint into a TAP config, or the reverse | Not reachable | Refused by name, then `onRestoreFailure` |
 | `connections` on a gated sandbox that can never see a connection | Accepted, never fires | Counts egress too (§6.9), and ingress after Phase 5 |
-| Ingress ports on a gated sandbox before Phase 5 | Accepted, the dial fails at runtime | Refused at submit until Phase 5 ships: `ingress into a gated sandbox is not supported yet` |
+| Ingress ports on a gated sandbox before Phase 5 | Accepted, the dial fails at runtime | Refused at submit until Phase 5 ships: `ingress into a gated sandbox is not supported yet`. Phase 5 lifted it; only ports on a loopback-only sandbox are refused now (`nothing can reach a port in its guest`) |
 
 `hypervisor = "dev"` with explicit `gated` stays a start failure rather than
 a submit refusal, since only the node knows whether `auto` resolves to a
@@ -888,6 +902,34 @@ Phase 0 measures to set this phase's floor.
 This gives a platform a way to reach its sandbox (a harness API, a preview
 of the dev server the agent started) without a TAP, and it makes
 `connections` see ingress on gated sandboxes too.
+
+**As built.** The handshake is `src/worker/netd/vsock.rs` (`OK <n>` or a
+failed dial, two-second budget); `TaskDial::{Loopback, Vsock, Bridge}` in
+`src/worker/netd/ingress.rs` is how every ingress connection reaches its
+task, and HTTP mode dials through the same target. The port written in
+`CONNECT` is the port the workload binds (`AllocPort::bind_port`), so the
+vsock port and the guest's loopback port are one number (calls entry 15).
+The boot ports reach the agent as `--ingress-port` flags in the generated
+init and a restore's as `ResumeIdentity::ingress_ports`; the agent's vsock
+listeners are guest memory, so they survive a restore and the identity only
+adds. A restored workload keeps the ports it was captured with, so the
+checkpoint's runtime state records `guest_ports` per label and the datapath
+dials those, read per connection (calls entry 13). TAP sandboxes' ports are
+fronted in the same change, at the leased guest address (calls entry 11).
+
+**Upstreams, added after Phase 5.** The same agent carries a gated
+sandbox's `connect.upstreams` the other way. For each upstream it listens on
+`127.0.0.1:<local port>` and the VIP, and relays to host vsock port `<local
+port>`, where `src/worker/forwarder.rs` binds the upstream's listener state
+on a `UnixListener` (`UpstreamSpec::vsock`) instead of a loopback port, so
+HTTP mode, policy, and handlers are shared (calls entry 12). The VIP makes
+`<key>.svc.legion` work in the guest (calls entry 16). The checkpoint
+records `guest_upstreams`, and a restore hands the agent each upstream's new
+local port on the identity disk (`GuestUpstream::vsock_port`), which it
+retargets every listener of that upstream to (calls entry 14). Submit
+refuses a `localPort` of 1080 or 53 and a guest port of 1080 on a gated
+sandbox (calls entry 38). Upstreams on TAP and loopback-only sandboxes are
+deferred (calls entry 25).
 
 ## 7. Proto, struct, config, and persistence changes
 
@@ -1007,10 +1049,21 @@ Independent of Phases 1 to 3.
 
 ### Phase 5: ingress into gated sandboxes
 
+Status: built 2026-10-12 (G5.1 pending). See §6.10, "As built".
+
 - Host-initiated vsock from the ingress listener, the agent's vsock
   listeners, the ports on the identity disk (§6.10).
 - Lift the Phase 2 refusal of ingress ports on gated sandboxes.
 - Docs: `docs/network-handlers.md` (Ingress, Sandboxes), the guide.
+- Added in execution: TAP sandboxes' advertised ports are fronted by the
+  same listeners, dialed at the leased guest address; the guest's ports are
+  recorded in the boot record and the checkpoint so a restore dials the
+  ports the restored workload holds; ports on a loopback-only sandbox are
+  refused at submit instead.
+- Added after Phase 5: a gated sandbox's `connect.upstreams` are relayed by
+  the agent to the node's upstream listeners over vsock, VIPs and
+  `<key>.svc.legion` included, and retargeted on restore. G5.2 covers it.
+  TAP sandboxes' upstreams are deferred.
 
 ## 9. Testing plan
 

@@ -887,6 +887,21 @@ impl WorkloadIdentityState {
         Ok(self.read_issuer()?.jwks())
     }
 
+    /// How long a token minted now for `identity` lives: its own `ttl` or
+    /// the cluster default, clamped to the rotation overlap the way
+    /// [`Issuer::issue`] clamps `exp`. Used to decide when a token the node
+    /// holds for upstream injection is due for a refresh (half of this).
+    pub fn token_lifetime(&self, identity: &WorkloadIdentity) -> std::time::Duration {
+        let default_ttl = self.config.parsed_default_ttl();
+        let overlap = self.config.parsed_rotation_age().max(default_ttl);
+        identity
+            .parsed_ttl()
+            .ok()
+            .flatten()
+            .unwrap_or(default_ttl)
+            .min(overlap)
+    }
+
     /// Sign a token for `claims` under `identity` with the active key.
     pub fn issue(
         &self,

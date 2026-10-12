@@ -129,11 +129,29 @@ pub fn config() -> Command {
                 ),
         );
 
+    let gateway_cmd = Command::new("gateway")
+        .about(
+            "Start a gateway that routes requests to keyed instances and resumes suspended ones \
+             on demand (docs/gateway.md)",
+        )
+        .arg(
+            Arg::new("listen")
+                .long("listen")
+                .value_name("ADDR")
+                .default_value("0.0.0.0:4780")
+                .help("Address to listen on"),
+        )
+        .arg(Arg::new("domain").long("domain").value_name("DOMAIN").help(
+            "Wildcard domain: requests for <instance>.<DOMAIN> go to that instance. \
+                     Without it, requests name the instance with the Legion-Instance header",
+        ));
+
     Command::new("start")
         .about("Start a daemon")
         .arg(config_path_arg())
         .subcommand(manager_cmd)
         .subcommand(worker_cmd)
+        .subcommand(gateway_cmd)
 }
 
 #[instrument(skip_all)]
@@ -152,6 +170,24 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 .get_one::<String>("advertise-addr")
                 .map(String::as_str);
             run_worker(token, name, advertise).await
+        }
+        Some(("gateway", arg_matches)) => {
+            let listen = arg_matches
+                .get_one::<String>("listen")
+                .map(String::as_str)
+                .unwrap_or("0.0.0.0:4780");
+            let listen = listen
+                .parse()
+                .with_context(|| format!("invalid --listen address: {listen}"))?;
+            crate::gateway::run_gateway(crate::gateway::GatewayConfig {
+                listen,
+                domain: arg_matches.get_one::<String>("domain").cloned(),
+                tls: arg_matches
+                    .get_one::<String>("tls-cert")
+                    .cloned()
+                    .zip(arg_matches.get_one::<String>("tls-key").cloned()),
+            })
+            .await
         }
         Some(("manager", arg_matches)) => {
             let run_worker = arg_matches.get_flag("run-worker");

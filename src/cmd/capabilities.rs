@@ -966,10 +966,12 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion guest-agent",
             grpc: None,
             summary: "Internal: the gated sandbox guest agent, started by the generated guest \
-                 init inside a microVM to relay the guest's loopback proxy and DNS ports to the \
-                 node datapath over vsock. On a sandbox launched for memory checkpoints it also \
-                 runs the resume watch and closes its relays on a restore. Not for operators or \
-                 agents to run.",
+                 init inside a microVM to relay the guest's loopback proxy and DNS ports, and \
+                 each declared upstream's loopback port and VIP, to the node datapath over \
+                 vsock, and the datapath's inbound connections to the workload's advertised \
+                 ports. On a sandbox launched for memory checkpoints it also runs the resume \
+                 watch, closes its relays on a restore, and retargets its upstreams. Not for \
+                 operators or agents to run.",
             mutates: false,
             read_only_safe: false,
         },

@@ -34,6 +34,7 @@ pub mod proxy;
 pub mod proxyproto;
 pub mod state;
 pub mod tls;
+pub mod vsock;
 
 pub use policy::{Denials, NetPolicyCache, PolicyLookup};
 

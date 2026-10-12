@@ -300,6 +300,28 @@
                                 onError = "deny",
                             },
                         ],
+                        # Credential injection (docs/network-handlers.md,
+                        # "Credential injection"): the node sets these headers
+                        # on every request to the origin, replacing whatever
+                        # the task sent, with values fetched from KV. The task
+                        # never holds the key (give its SDK a placeholder).
+                        # https:// external upstreams only; the submitter
+                        # needs kv:read on each path.
+                        credentials = [
+                            { header = "Authorization", prefix = "Bearer ", from = { kv = "secrets/openai" } },
+                            { header = "OpenAI-Organization", from = { kv = "secrets/openai-org" } },
+                        ],
+                    },
+                    {
+                        name = "billing",
+                        to = "https://billing.internal.example",
+                        # The identity provider: the manager mints this
+                        # task's "billing" workload identity for the
+                        # allocation and the node injects it, asking for a
+                        # new one once half its TTL has passed.
+                        credentials = [
+                            { header = "Authorization", prefix = "Bearer ", from = { identity = "billing" } },
+                        ],
                     },
                 ],
                 # Config files rendered from the upstreams and their live
@@ -346,6 +368,14 @@
                         mode = "0400",
                     },
                     changeMode = "noop",
+                },
+                {
+                    # Injection only: no env or file, because the "billing"
+                    # upstream's credential names it (from = { identity }).
+                    # The node holds the token; the task never sees it.
+                    name = "billing",
+                    audience = ["https://billing.internal.example"],
+                    ttl = "10m",
                 },
             ],
             # Task-level KV policy defaults; entries override field-by-field
@@ -692,6 +722,10 @@
             config = {
                 command = ["sleep", "600"],
             },
+            # The port `suspend.wake` routes gateway requests to.
+            network = {
+                ports = [{ name = "http" }],
+            },
             # How `legion instance suspend` checkpoints this keyed task and
             # how `legion instance start` resumes it
             # (docs/suspend-and-resume.md). Keyed stateful tasks only.
@@ -743,8 +777,9 @@
                     # ["network", "cpu", "exec"]. "connections" also counts
                     # an open ingress connection through the node datapath
                     # that sends nothing (a client waiting on a slow
-                    # response). A sandbox that is not gated has no datapath
-                    # ingress, so "connections" is refused there, as is
+                    # response). A sandbox that is not gated sends its own
+                    # traffic around the datapath, so "connections" is
+                    # refused there, as is
                     # "exec" on a sandbox pinned to a VMM (a microVM takes no
                     # exec sessions). On a sandbox, "network" also counts
                     # bytes the guest sends on its TAP or Apple container
@@ -759,6 +794,19 @@
                 # instance (the `suspend` step) before it evicts anything.
                 # Default false.
                 onPressure = true,
+                # Wake on request (docs/gateway.md): `legion start gateway`
+                # routes requests for this instance to `port` (a
+                # network.ports label), and a request for a suspended
+                # instance resumes it and is held until the instance
+                # accepts connections. Without it the gateway refuses the
+                # instance.
+                wake = {
+                    port = "http",
+                    # How long the gateway holds a request while the
+                    # instance resumes, then 503 with Retry-After. Default
+                    # "30s", from "1s" to "5m".
+                    timeout = "30s",
+                },
             },
             resources = {
                 cpu = 250,
@@ -841,11 +889,26 @@
             # where the egress policy decides (docs/network-handlers.md,
             # "Sandboxes"). A gated task that nothing allows denies every
             # destination (`gated-default`), so list what it needs.
-            # Ingress ports are refused on a gated sandbox (no NIC to reach).
+            # Advertised ports work on a gated sandbox: the node datapath
+            # owns the port on the node and dials into the guest over vsock,
+            # where the guest agent relays to the workload's
+            # 127.0.0.1:$LEGION_PORT_HTTP ("Ingress into a sandbox"). A
+            # sandbox that is neither gated nor on a TAP has loopback only,
+            # and submit refuses ports on it.
             # "auto" is "host" until the vsock path is exercised on a real
             # VMM.
+            # A gated sandbox reaches its upstreams as a container does:
+            # the guest agent listens on $LEGION_UPSTREAM_API and on the
+            # VIP api.svc.legion resolves to, and relays to the node's
+            # upstream listener over vsock ("Sandboxes"). Submit refuses a
+            # localPort of 1080 or 53 here (the agent's proxy and resolver).
+            # A sandbox that is not gated cannot reach its upstreams.
+            connect = {
+                upstreams = [{ service = "api" }],
+            },
             network = {
                 mode = "gated",
+                ports = [{ name = "http" }],
                 egress = { allow = ["pypi.org", "files.pythonhosted.org"] },
             },
             # Opt into snapshots (`legion snapshot`, docs/suspend-and-resume.md).

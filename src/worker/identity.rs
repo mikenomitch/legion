@@ -434,11 +434,18 @@ impl WorkerIdentityManager {
 }
 
 /// Parse the JSON-encoded identity list off a [`TaskAllocation`].
+/// The identities the worker delivers to the task (env or file). One that is
+/// only named by a `connect.upstreams` credential is left out: the manager
+/// mints it for the node's forwarder through `GetUpstreamCredentials`, and
+/// nothing is written into the task for it.
 pub fn parse_identities(raw: &str) -> R<Vec<WorkloadIdentity>> {
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }
-    serde_json::from_str(raw).context("invalid task identities JSON")
+    let mut identities: Vec<WorkloadIdentity> =
+        serde_json::from_str(raw).context("invalid task identities JSON")?;
+    identities.retain(WorkloadIdentity::is_delivered);
+    Ok(identities)
 }
 
 /// Where the refreshable copy of this identity's token lives: the declared
@@ -1561,5 +1568,13 @@ mod tests {
         assert!(parse_identities("").unwrap().is_empty());
         assert!(parse_identities("[]").unwrap().is_empty());
         assert!(parse_identities("not json").is_err());
+        // An injection-only identity (no env, no file) is the forwarder's,
+        // not the task's.
+        let parsed = parse_identities(
+            r#"[{"name":"api","audience":["a"]},{"name":"aws","audience":["b"],"file":{"path":"aws/token"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "aws");
     }
 }
