@@ -3324,6 +3324,8 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                          VMM process always needs some memory of its own"
                     );
                 }
+                crate::task_plugins::sandbox_addr::validate_bridges(&sandbox.bridges)
+                    .with_context(|| format!("invalid worker config {path_str}"))?;
                 enforcement.sandbox = Some(sandbox.clone());
             }
             serde_json::to_string(&enforcement)?

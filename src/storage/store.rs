@@ -1245,6 +1245,10 @@ pub struct Store {
     // applying a changeset — any unclassified write path fails loudly instead
     // of silently diverging replicas (JC-14).
     raft_mode: Arc<AtomicBool>,
+    // Whether placement resolves a sandbox's `network.mode = "auto"` to
+    // `gated` on a microVM node (gated plan Phase 2). Held off until Phase
+    // 0 passes; see `crate::structs::network::SANDBOX_GATED_BY_DEFAULT`.
+    sandbox_gated_default: Arc<AtomicBool>,
     // Replication pipeline handle, installed by the raft engine at start
     // (phase A-1). Until it is set, `replicated()` in raft mode errors.
     replication: Arc<OnceLock<ReplicationHandle>>,
@@ -1899,6 +1903,9 @@ impl Store {
             status_projection_tx: Arc::new(OnceLock::new()),
             event_tx: broadcast::channel(EVENT_BROADCAST_CAPACITY).0,
             raft_mode: Arc::new(AtomicBool::new(false)),
+            sandbox_gated_default: Arc::new(AtomicBool::new(
+                crate::structs::network::sandbox_gated_by_default(),
+            )),
             replication: Arc::new(OnceLock::new()),
             durable_sync: raft_enabled,
             node_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -12472,6 +12479,19 @@ impl Store {
             }))
     }
 
+    /// Open or close the gated-default gate on this store (gated plan Phase
+    /// 2; `crate::structs::network::SANDBOX_GATED_BY_DEFAULT`). The manager
+    /// sets it from the constant and its verification override at start, and
+    /// tests open it to exercise the resolution before it ships.
+    pub fn set_sandbox_gated_default(&self, open: bool) {
+        self.sandbox_gated_default.store(open, Ordering::Relaxed);
+    }
+
+    /// Whether this store resolves a sandbox's `auto` to `gated`.
+    pub fn sandbox_gated_default(&self) -> bool {
+        self.sandbox_gated_default.load(Ordering::Relaxed)
+    }
+
     /// The `network.mode` an allocation runs in: the task's declared mode
     /// (`auto` resolved per runtime), overridden by the highest-priority
     /// matching `require` policy that sets one. Resolved at placement — a
@@ -12496,7 +12516,41 @@ impl Store {
             None => return Ok(None),
         };
         let declared = network.map(|n| n.mode.as_str()).unwrap_or("auto");
-        let mut mode = crate::structs::resolve_network_mode(declared, &runtime);
+        let auto = declared.trim().is_empty()
+            || declared
+                .trim()
+                .eq_ignore_ascii_case(crate::structs::netpolicy::MODE_AUTO);
+        let mut mode =
+            if auto && runtime == "sandbox" && self.sandbox_gated_default.load(Ordering::Relaxed) {
+                // Gated plan Phase 2: a sandbox's `auto` depends on its own
+                // `config.network` and `hypervisor` and on the node's default
+                // VMM. Only paid by sandbox placements while the gate is open.
+                let config: Value = tx
+                    .query_row(
+                        "SELECT config FROM task_config WHERE id = ?;",
+                        [task_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(Value::Null);
+                let node_attrs: Value = tx
+                    .query_row(
+                        "SELECT fingerprint_attrs FROM node WHERE id = ?;",
+                        [node_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(Value::Null);
+                let facts = crate::structs::network::AutoModeFacts {
+                    node_vmm: node_attrs
+                        .get(crate::structs::checkpoint::ATTR_SANDBOX_VMM)
+                        .and_then(Value::as_str),
+                    ..crate::structs::network::AutoModeFacts::from_config(&config)
+                };
+                crate::structs::network::resolve_network_mode_with(declared, &runtime, &facts, true)
+            } else {
+                crate::structs::resolve_network_mode(declared, &runtime)
+            };
         // Stored policies are rare on the placement path; the generation
         // check makes a cluster without any of them pay one indexed read.
         if self.net_policy_generation().unwrap_or(0) > 0 {

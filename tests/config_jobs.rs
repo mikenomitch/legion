@@ -223,7 +223,9 @@ fn maximal_job_spec_parse() {
         snapshots.ttl,
         Some(std::time::Duration::from_secs(7 * 86_400))
     );
-    assert!(!snapshots.memory);
+    // Gated, and memory snapshots work on gated sandboxes (gated plan
+    // Phase 1).
+    assert!(snapshots.memory);
 
     // No stateful task may sit under a createFirst (replace-before-stop)
     // rollout: that would double-bind one instance id + storage handle (see

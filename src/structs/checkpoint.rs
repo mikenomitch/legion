@@ -301,70 +301,10 @@ impl SnapshotManifest {
     }
 }
 
-/// Who a restored allocation is. A restored guest wakes up believing it is
-/// the allocation that was captured; this is the identity it must take on
-/// instead. The sandbox runtime writes it to the guest's identity disk, and
-/// the guest agent's resume handler (suspend plan Phase 4) re-reads it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResumeIdentity {
-    /// The new allocation id (`LEGION_ALLOC_ID`).
-    pub alloc_id: i64,
-    /// The instance the allocation serves (`LEGION_INSTANCE_ID`). A fork has
-    /// a new one, a resume keeps the old one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance_id: Option<String>,
-    pub job_id: String,
-    pub task_name: String,
-    /// Guest hostname.
-    pub hostname: String,
-    /// A fresh workload-identity token, when the task requests one. Secret:
-    /// never logged, and the identity disk is mode 0600 on the host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    /// MAC for the guest NIC, when the restore assigns a new one (forks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mac: Option<String>,
-    /// Extra env the guest agent re-exports after resume.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
-    /// Fresh bytes for the guest to mix into its entropy pool, so forks of
-    /// one snapshot never share an RNG state. Hex-encoded.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub entropy: String,
-    /// The host's wall clock when this identity was written, in Unix
-    /// milliseconds. A restored guest's clock is wherever it was at capture;
-    /// the resume handler steps it forward to this (plus however long the
-    /// handler took to notice). 0 on identities written before the field.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub host_time_unix_ms: i64,
-    /// argv the guest agent runs after refreshing identity on a restore
-    /// (`suspend.onResume`). Empty at first boot and when the task sets none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub on_resume: Vec<String>,
-    /// Phase 6: the restore is into a NEW instance (a fork, or a create from
-    /// a snapshot), so the host gives the guest NIC its own TAP device. Host
-    /// side only: never written to the identity disk.
-    #[serde(skip)]
-    pub fork: bool,
-    /// File-delivered workload-identity tokens the guest keeps under
-    /// `/legion/identity/` (`identities[].file` on a sandbox). The worker
-    /// rewrites the identity disk in place on every refresh, and the guest's
-    /// handler rewrites these files with no restart. Secret, like `token`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub files: Vec<GuestTokenFile>,
-}
-
-/// One token file inside a sandbox guest.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GuestTokenFile {
-    /// Absolute guest path, under `/legion/identity/`.
-    pub path: String,
-    /// File mode, `0o400` unless the identity's `file.mode` says otherwise.
-    pub mode: u32,
-    pub token: String,
-}
+/// Who a restored allocation is, and one token file inside its guest. The
+/// guest's resume handler reads these off the identity disk, so they live in
+/// the `legion-guest` crate the guest binary is built from.
+pub use legion_guest::identity::{GuestAddr, GuestTokenFile, ResumeIdentity};
 
 /// Never prints the key bytes (build.rs turns off the generated Debug).
 impl fmt::Debug for crate::structs::CheckpointPartKey {
@@ -375,38 +315,6 @@ impl fmt::Debug for crate::structs::CheckpointPartKey {
             .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
             .finish()
     }
-}
-
-impl std::fmt::Debug for GuestTokenFile {
-    // Never print the token: these structs reach debug logs.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GuestTokenFile")
-            .field("path", &self.path)
-            .field("mode", &format_args!("{:o}", self.mode))
-            .finish_non_exhaustive()
-    }
-}
-
-impl ResumeIdentity {
-    /// The workload-identity tokens this identity carries: the env-delivered
-    /// ones (keys not starting `LEGION_`) and the file-delivered ones. A
-    /// change in these alone, with the same allocation and host time, is a
-    /// token refresh rather than a restore.
-    pub fn tokens_differ(&self, other: &ResumeIdentity) -> bool {
-        let tokens = |identity: &ResumeIdentity| {
-            identity
-                .env
-                .iter()
-                .filter(|(key, _)| !key.starts_with("LEGION_"))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect::<Vec<_>>()
-        };
-        tokens(self) != tokens(other) || self.files != other.files
-    }
-}
-
-fn is_zero(value: &i64) -> bool {
-    *value == 0
 }
 
 /// Why a node cannot restore a checkpoint.

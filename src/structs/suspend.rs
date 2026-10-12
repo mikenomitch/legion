@@ -33,8 +33,9 @@ use crate::structs::snapshot::SnapshotDurability;
 /// Default `suspend.resumeTimeout`.
 pub const DEFAULT_RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default timeout for `suspend.onResume` inside the guest.
-pub const ON_RESUME_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for `suspend.onResume` inside the guest. The guest's
+/// resume handler enforces it, so it is defined there.
+pub use legion_guest::resume::ON_RESUME_TIMEOUT;
 
 /// Default `suspend.idle.after`.
 pub const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(180);
@@ -52,7 +53,8 @@ pub const DEFAULT_IDLE_CPU_BELOW: f64 = 0.02;
 pub enum IdleSignal {
     /// Bytes through any Legion-owned listener or proxy (the node datapath).
     Network,
-    /// Any open ingress connection through the datapath, even a quiet one.
+    /// Any open connection through the datapath, even a quiet one: ingress
+    /// the datapath fronts, and egress through a gated allocation's proxy.
     Connections,
     /// CPU use above `cpuBelow` of the task's `cpu`.
     Cpu,
@@ -84,8 +86,9 @@ impl IdleSignal {
                 "suspend.idle.signals \"hint\" is not implemented yet: the workload's own \
                  busy/idle signal ships in suspend plan Phase 8\nHint: remove \"hint\". To keep \
                  an instance awake through a quiet call, add \"connections\" (any open \
-                 ingress connection through the node datapath counts as activity; a sandbox \
-                 sees it only on gated networking)"
+                 connection through the node datapath, inbound or out through a gated \
+                 task's egress proxy, counts as activity; a sandbox has one only on gated \
+                 networking)"
                     .to_string(),
             ),
             other => Err(format!(
@@ -547,9 +550,7 @@ pub fn disk_only_runtime_error(subject: &str, runtime: &str, at_submit: bool) ->
     )
 }
 
-/// Submit-time checks for a task's `suspend` block. The gated-network check
-/// is shared with snapshots
-/// ([`crate::structs::snapshot::validate_memory_checkpoint_network`]).
+/// Submit-time checks for a task's `suspend` block.
 pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String> {
     let Some(suspend) = task.suspend.as_ref() else {
         return Ok(());
@@ -678,10 +679,11 @@ fn sandbox_is_always_microvm(task: &crate::structs::TaskConfig) -> bool {
 /// accepted and never fired (docs/suspend-and-resume.md, "What each signal
 /// sees on a sandbox").
 ///
-/// - `connections` counts ingress connections the node datapath fronts. A
-///   sandbox's traffic crosses the datapath only when it is gated, so on
-///   `none`, `tap`, or a dev-mode container it would never fire, and a
-///   harness waiting on a quiet model call would still be suspended.
+/// - `connections` counts connections through the node datapath: ingress
+///   it fronts, and egress through a gated allocation's proxy. A sandbox's
+///   traffic crosses the datapath only when it is gated, so on `none`,
+///   `tap`, or a dev-mode container it would never fire, and a harness
+///   waiting on a quiet model call would still be suspended.
 /// - `exec`, listed explicitly, on a task pinned to a microVM VMM: a
 ///   microVM takes no exec sessions. (Listed by default, or on `auto`,
 ///   it is a warning instead: see [`sandbox_submit_warnings`].)
@@ -694,15 +696,18 @@ fn validate_sandbox_idle_signals(
         return Ok(());
     }
     if idle.signals.contains(&IdleSignal::Connections)
-        && !crate::structs::snapshot::task_declares_gated_network(task)
+        && !crate::structs::network::task_runs_gated(
+            task,
+            crate::structs::network::sandbox_gated_by_default(),
+        )
     {
         return Err(format!(
-            "task {:?}: suspend.idle.signals \"connections\" counts open ingress connections \
-             through the node datapath, and this sandbox's traffic never crosses it (it is not \
-             network.mode = \"gated\", so clients reach the guest directly or not at all)\n\
-             Hint: remove \"connections\". To keep a sandbox awake through a quiet model call, \
-             set idle.after longer than the call, or suspend from your platform, which knows \
-             when a call is in flight",
+            "task {:?}: suspend.idle.signals \"connections\" counts open connections through \
+             the node datapath, and this sandbox's traffic never crosses it (it is not \
+             network.mode = \"gated\", so it reaches the network on its own NIC or not at all)\n\
+             Hint: remove \"connections\", or run the sandbox gated, where a quiet model call \
+             through the egress proxy keeps it awake. Otherwise set idle.after longer than the \
+             call, or suspend from your platform, which knows when a call is in flight",
             task.name
         ));
     }
@@ -1012,8 +1017,9 @@ mod tests {
         task
     }
 
-    /// `connections` counts datapath ingress, which a sandbox only has when
-    /// it is gated. Anywhere else it is refused, with what to do instead.
+    /// `connections` counts datapath connections, which a sandbox only has
+    /// when it is gated. Anywhere else it is refused, with what to do
+    /// instead.
     #[test]
     fn connections_on_a_sandbox_off_the_datapath_is_refused() {
         let idle = serde_json::json!({
@@ -1022,7 +1028,7 @@ mod tests {
         });
         let err = validate_suspend(&task("sandbox", true, idle.clone())).unwrap_err();
         assert!(
-            err.contains("\"connections\" counts open ingress connections"),
+            err.contains("\"connections\" counts open connections through the node datapath"),
             "{err}"
         );
         assert!(err.contains("Hint: remove \"connections\""), "{err}");

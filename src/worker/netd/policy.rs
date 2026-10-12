@@ -201,6 +201,36 @@ pub fn egress_connect_verdict(
     }
 }
 
+/// Evaluate an egress connection for a **gated** allocation: like
+/// [`egress_connect_verdict`], except that an allocation no egress chain
+/// covers is denied with [`SOURCE_GATED_DEFAULT`] instead of allowed. Gated
+/// means nothing leaves unless a rule says so.
+///
+/// [`SOURCE_GATED_DEFAULT`]: crate::structs::netpolicy::SOURCE_GATED_DEFAULT
+pub fn gated_egress_connect_verdict(
+    policy: Option<&EffectivePolicy>,
+    facts: &ConnectFacts<'_>,
+) -> Verdict {
+    match policy.and_then(|p| p.egress.as_ref()) {
+        Some(chain) => evaluate_connect(chain, facts),
+        None => {
+            let destination = match (facts.host, facts.ip) {
+                (Some(host), _) if facts.port > 0 => format!("{host}:{}", facts.port),
+                (Some(host), _) => host.to_string(),
+                (None, Some(ip)) if facts.port > 0 => format!("{ip}:{}", facts.port),
+                (None, Some(ip)) => ip.to_string(),
+                (None, None) => "this destination".to_string(),
+            };
+            Verdict::Deny {
+                source: crate::structs::netpolicy::SOURCE_GATED_DEFAULT.to_string(),
+                reason: Some(crate::structs::netpolicy::gated_default_reason(
+                    &destination,
+                )),
+            }
+        }
+    }
+}
+
 /// Evaluate an ingress connection for an allocation.
 pub fn ingress_connect_verdict(
     policy: Option<&EffectivePolicy>,

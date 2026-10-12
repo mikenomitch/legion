@@ -12,6 +12,14 @@ counts as a pass.
 Record results (date, kernel version, VMM version, pass or fail) under each
 item when you run it. Open a TODO.md item for every failure.
 
+**Runs so far.** 2026-10-12, on a Linux 6.18 cloud VM without `/dev/kvm` and
+with the cgroup memory controller on v1: 1.1 (partial), 3a.1, 3a.2 (after a
+message fix), and 3b.5 (reflink on a loop XFS) ran, with results under each.
+Nothing that needs KVM (3b to 6, Track 1, [Gated sandboxes](#gated-sandboxes))
+or cgroup v2 (1.2 to 1.8, Phase 2, Phase 5's balloon) could run there, and
+neither could the MinIO items (7a, 7b). The container items (4.7, 6.5) wait
+on the OCI runtime tests in TODO.md.
+
 ## Phase 1
 
 What shipped: sandbox VMMs in the worker cgroup, per-allocation usage on the
@@ -80,6 +88,15 @@ Pass:
 
 Fail: a test fails, or the reader reports PSI as available on a kernel
 without `/proc/pressure/memory`.
+
+**Results.**
+
+- 2026-10-12, kernel 6.18.44 (x86_64, a cloud VM with no `/dev/kvm`, cgroup v1 hybrid with the memory controller on v1): **partial.** `reads_this_machines_proc_meminfo` and
+  the `worker::usage` fixture tests pass, and `/proc/pressure/memory` has a
+  `some avg10=` line. `reads_this_processs_own_cgroup` cannot run here
+  (`memory.current is readable` fails: the memory controller is bound to the
+  v1 hierarchy, so the v2 mount at `/sys/fs/cgroup/unified` has none). Rerun
+  on a cgroup v2 host.
 
 ### 1.2 Usage for an `exec` task within 10%
 
@@ -531,6 +548,19 @@ cargo run -q -- job rollout status --id <job> --json | jq '.. | .artifact_states
   status row has `"cache": "miss"`, the second's `"cache": "hit"`.
   The task's copy is writable and is not a hardlink (`stat -c %h` is 1).
 
+**Results.**
+
+- 2026-10-12, kernel 6.18.44 (x86_64, a cloud VM with no `/dev/kvm`, cgroup v1 hybrid with the memory controller on v1), an isolated manager (`:5947`) and worker (`:5958`)
+  with the worker state on a 1.2 GB ext4 loop filesystem, a 4 MiB artifact
+  over plain HTTP (`allowedSchemes` opted in): **pass.** One entry
+  (`sha256:e923…`, class `artifacts`, mode `0444`). The origin served it
+  once. The second allocation logged `Staged artifact from node content
+  store` and its rollout status row shows `"cache": "hit"`. The task's copy
+  is `0644` with one link. A stopped-then-rerun job with an unchanged spec
+  is not re-placed (`Job config unchanged`), so the rerun needs a new
+  version, and a first placement has no rollout, so the `miss` row only
+  shows in the worker log.
+
 ### 3a.2 `minFreeDisk` on a real filesystem
 
 Fill the loopback filesystem to within `minFreeDisk` of full
@@ -540,6 +570,19 @@ digest-pinned artifact.
 - **Pass:** the store evicts unpinned entries first, then refuses the new
   entry, and the artifact is staged straight from origin. The worker logs the
   refusal with the free bytes `statvfs` reported, which match `df -B1`.
+
+**Results.**
+
+- 2026-10-12, kernel 6.18.44 (x86_64, a cloud VM with no `/dev/kvm`, cgroup v1 hybrid with the memory controller on v1), same cluster, `minFreeDisk = "700MiB"` on the 1.2 GB
+  loop filesystem filled to about 704 MiB free: **pass after a fix.** The
+  store evicted the unpinned `blob.bin` (`Evicted content (minFreeDisk)`),
+  refused the new 6 MiB entry, and staged it from origin. The refusal named
+  only the floor, not the free bytes, so it now reads `node disk is below
+  content.minFreeDisk (723292160 bytes free, floor 734003200 bytes) ...`;
+  `df -B1` read 735875072 a moment later, after the stopped allocation's
+  copy was removed. Budgets on so small a disk are clamped above the disk's
+  size (`artifacts_budget_bytes: 1073741824`, `snapshots: 2147483648` on
+  1.2 GB), which `minFreeDisk` covers.
 
 ## Phase 3b
 
@@ -657,6 +700,16 @@ the snapshot ref's `attrs.method`:
   ext4 it reports `copy` and `du -h` of the snapshot shows only written
   blocks.
 
+**Results.**
+
+- 2026-10-12, kernel 6.18.44 (x86_64, a cloud VM with no `/dev/kvm`, cgroup v1 hybrid with the memory controller on v1), a 2 GiB loop XFS (`mkfs.xfs -m reflink=1`) used as
+  `TMPDIR` and `--dir`: **pass, timing not measured.** The local-dir tests
+  pass, and the block-mode conformance run passes every check with
+  `snapshot ... (268435456 bytes, reflink)`. On the host's ext4 it reports
+  `copy`. A 4 GiB run did not finish in 20 minutes in a debug build (the
+  suite fingerprints the whole image several times), so the multi-GiB
+  timing needs a release build.
+
 ## Phase 3c
 
 The manager side of snapshots: `legion snapshot create|list|get|delete|restore`,
@@ -771,42 +824,38 @@ cargo run -q -- snapshot create user-42 --memory --wait -j | jq .data.snapshot.d
 
 ### 3c.4 TAP restore behavior
 
-Change the jobspec to attach a TAP device:
+Change the jobspec to attach a TAP device (gated plan Phase 4: every TAP is
+per instance, on a bridge with a pool in the worker config, see [Gated
+sandboxes](#gated-sandboxes) prereqs):
 
 ```nickel
-network = { mode = "tap", tap = "tap-ws42", mac = "02:00:00:00:00:42" },
+network = { mode = "tap", bridge = "br0" },
 ```
 
-and create it first: `ip tuntap add dev tap-ws42 mode tap && ip link set
-tap-ws42 up`. Restart the instance, then take a memory snapshot.
+Restart the instance, note its device (`cat <alloc dir>/.sandbox/tap-device`,
+`lgf...`, below as `$TAP`), then take a memory snapshot.
 
 1. Restore with the TAP present and free. **Pass:** `snapshot.restored`, and
-   `ip -d link show tap-ws42` shows the VMM attached (carrier up).
-2. Stop the instance, `ip link delete tap-ws42`, start it again and restore.
+   `ip -d link show $TAP` shows the VMM attached (carrier up).
+2. Stop the instance (destroy deletes `$TAP`), start it again and restore.
    **Pass:** the worker logs `Created the TAP device a sandbox restore needs`,
-   `ip link show tap-ws42` exists and is UP, and after `legion instance destroy`
-   the device is gone again.
+   `ip link show $TAP` exists, is UP, and is `master br0`, and after `legion
+   instance destroy` the device is gone again.
 3. Hold the TAP with another process (`ip tuntap add` a second time is not
    enough: start a second Firecracker on it, or
-   `python3 -c "import fcntl,os,struct;f=os.open('/dev/net/tun',os.O_RDWR);fcntl.ioctl(f,0x400454ca,struct.pack('16sH','tap-ws42'.encode(),0x1002));input()"`)
+   `python3 -c "import fcntl,os,struct;f=os.open('/dev/net/tun',os.O_RDWR);fcntl.ioctl(f,0x400454ca,struct.pack('16sH','$TAP'.encode(),0x1002));input()"`)
    and restore. **Pass:** `snapshot.restore_failed` with
-   `restore needs TAP device tap-ws42: it exists and another process holds it`,
+   `restore needs TAP device lgf...: it exists and another process holds it`,
    and the instance then boots cold (no VMM started on the busy device).
 4. Run the worker as a non-root user without `CAP_NET_ADMIN` and restore
-   with the TAP missing. **Pass:** `restore needs TAP device tap-ws42: creating
+   with the TAP missing. **Pass:** `restore needs TAP device lgf...: creating
    it failed: ...` naming the `ip` error.
 
-### 3c.5 A gated sandbox is refused, a policy-gated one at call time
+### 3c.5 Superseded: gated sandboxes take memory checkpoints
 
-```bash
-# network = { mode = "gated" } plus the snapshots block:
-cargo run -q -- job validate /tmp/workspace-gated.ncl
-```
-
-- **Pass:** fails with `task "workspace" asks for memory checkpoints, but
-  sandbox memory checkpoints don't support gated networking yet` and
-  `Hint: set snapshots.memory = false ...`. With `memory = false` it
-  validates, and `legion snapshot create user-42 --disk --wait` succeeds.
+Gated sandboxes take memory checkpoints since the gated sandbox checkpoints
+plan, so the submit refusal this item checked is gone. Verify the gated
+paths with [Gated sandboxes](#gated-sandboxes) G1.1 to G1.5 instead.
 
 ### 3c.6 Restored VMM is governed
 
@@ -1212,9 +1261,9 @@ this phase.
   guest kernel, and a glibc guest image.
 - **Firecracker 1.12 or later** for the TAP items (6.3), since forks move the
   restored NIC with `network_overrides`. Record `firecracker --version`.
-- A Linux bridge for 6.3: `ip link add br0 type bridge && ip link set br0 up`,
-  then `ip tuntap add dev tap0 mode tap && ip link set tap0 master br0 && ip
-  link set tap0 up`.
+- A Linux bridge for 6.3: `ip link add br0 type bridge && ip addr add
+  10.77.0.1/24 dev br0 && ip link set br0 up`, and its pool in the worker
+  config (`sandbox.bridges.br0`, see [Gated sandboxes](#gated-sandboxes)).
 
 Use the Phase 4 jobspec with a `snapshots` block added (so `snapshot create
 --memory` works for item 6.4), and change the command so every line shows
@@ -1313,19 +1362,21 @@ Decode each token's payload (`cut -d. -f2 | base64 -d`).
 
 ### 6.3 Each fork gets its own TAP on the origin's bridge
 
-Add `network = { mode = "tap", tap = "tap0" }` to the task's `config`, rerun
-the job, recreate `run-17`, and fork it twice.
+Add `network = { mode = "tap", bridge = "br0" }` to the task's `config`
+(with the [Gated sandboxes](#gated-sandboxes) pool on the worker), rerun the
+job, recreate `run-17`, and fork it twice.
 
 ```bash
 cargo run -q -- instance fork run-17 --count 2 --wait -j
-ip -br link | grep -E 'tap0|lgf'
-bridge link show | grep -E 'tap0|lgf'
+ip -br link | grep lgf
+bridge link show | grep lgf
 ```
 
-- **Pass:** two `lgf<12 hex>` TAP devices exist, both `master br0`, both
-  up, and both held by a Firecracker process (`ls -l /proc/<pid>/fd | grep
-  tun`). `tap0` is still held by the origin's VMM. Destroying a fork
-  (`legion instance destroy run-17-f1`) removes its `lgf...` device.
+- **Pass:** two new `lgf<12 hex>` TAP devices exist beside the origin's,
+  both `master br0`, both up, and both held by a Firecracker process (`ls -l
+  /proc/<pid>/fd | grep tun`). The origin's device is still held by its VMM.
+  Destroying a fork (`legion instance destroy run-17-f1`) removes its
+  `lgf...` device. Each fork's address is G4.1's.
 - **Fail, `restore needs TAP device lgf...`:** read the rest of the message.
   `creating it failed` points at `ip tuntap` permissions. `attaching it to
   bridge br0 failed` points at the bridge.
@@ -1333,7 +1384,7 @@ bridge link show | grep -E 'tap0|lgf'
   than 1.12. The manager should have refused the fork first: check the
   node's `sandbox.vmm.version` fingerprint.
 - Repeat with `hypervisor = "cloud-hypervisor"`. **Pass:** same devices.
-  **Fail, the fork comes up on `tap0` or fails to open it:** cloud-hypervisor
+  **Fail, the fork comes up on the origin's device or fails to open it:** cloud-hypervisor
   did not take the TAP name from the rewritten `config.json` on restore. Record
   the cloud-hypervisor version, and switch that path to `net_fds` on restore.
 - With Firecracker 1.11 on the node, `legion instance fork run-17
@@ -1391,8 +1442,8 @@ cargo run -q -- instance create agents --from-snapshot agent-golden -j
 Needs the Phase 7b prereqs too: two KVM workers A and B with matching CPUs,
 both with a `contentStore` on MinIO, and a third C for the waiting case. Use
 `/tmp/fork.ncl` without `stateful.storage` (a spread fork carries no volume)
-and with `network = { mode = "tap", tap = "tap0" }`, where every node has
-`tap0` on a bridge `br0`.
+and with `network = { mode = "tap", bridge = "br0" }`, where every node has a
+bridge `br0` and a `sandbox.bridges.br0` pool.
 
 ```bash
 cargo run -q -- instance fork run-17 --count 3 --spread --wait -j | tee /tmp/spread.json
@@ -1414,20 +1465,20 @@ bridge link show | grep lgf    # on each node
 - **Fail:** two forks on one node, a fork placed before the publish lands,
   or a fork on B that comes up with no network and no error.
 
-### 6.8 Named TAP failures (integration)
+### 6.8 TAP forks that boot cold (integration)
 
-On one node with `tap0` held by `run-17` (the TAP spec from 6.3):
+On one node with `run-17` running on the TAP spec from 6.3:
 
-- `legion instance fork run-17 --checkpoint disk` fails at the API with
-  `a disk fork boots each fork fresh on the task's configured TAP` and a
-  hint naming `--checkpoint memory`. **Pass** when nothing is created.
+- `legion instance fork run-17 --checkpoint disk --wait`. **Pass:** accepted
+  (gated plan Phase 4 removed the disk-fork refusal), and each fork boots on
+  its own `lgf...` device with its own address.
 - Force a memory fork's restore to fail (delete the checkpoint's `memory`
   part from the node content store before the fork restores), with
-  `onRestoreFailure = "cold"`. **Pass:** the fork's allocation fails with
-  `sandbox needs TAP device tap0 ..., but another process holds it`, not an
-  opaque Firecracker error.
-- On a node B with no `tap0` and no bridge, a spread fork restore fails with
-  `restore needs TAP device lgf...: ... the fork would have no network`.
+  `onRestoreFailure = "cold"`. **Pass:** the fork boots cold on its own
+  `lgf...` device, never the origin's.
+- On a node B whose worker declares no `sandbox.bridges.br0`, a spread fork
+  is never placed there (the implicit `sandbox.bridges contains "br0"`
+  constraint).
 
 ### Ignored tests
 
@@ -1802,7 +1853,7 @@ None new.
 
 ## Track 1
 
-The agent-sandbox use case: auto TAPs, idle detection from a guest's TAP,
+The agent-sandbox use case: per-instance TAPs, idle detection from a guest's TAP,
 sandbox identity refresh through the identity disk, and the payload fix
 that carries `suspend` and `snapshots` to the worker. On macOS the TAP
 creation, counters, and identity disk rewrite ran against fakes and fixture
@@ -1814,13 +1865,16 @@ running VMM's identity disk.
 ### Prereqs
 
 - Everything in [Phase 4 prereqs](#phase-4): KVM, Firecracker and
-  cloud-hypervisor, the guest kernel, and a glibc guest image with a DHCP
-  client (busybox `udhcpc` is enough) that runs it on `eth0` at boot.
-- A bridge with DHCP on it:
+  cloud-hypervisor, and a guest kernel with `CONFIG_IP_PNP=y`. Any image
+  works: Legion addresses the guest (gated plan Phase 4).
+- A bridge, and its pool in the worker config:
 
   ```bash
   ip link add br0 type bridge && ip addr add 10.77.0.1/24 dev br0 && ip link set br0 up
-  dnsmasq --interface=br0 --bind-interfaces --dhcp-range=10.77.0.10,10.77.0.200,12h
+  ```
+
+  ```nickel
+  sandbox = { bridges = { br0 = { subnet = "10.77.0.0/24", gateway = "10.77.0.1", range = "10.77.0.128/25" } } },
   ```
 
 - A worker run as root (`CAP_NET_ADMIN`, `ip` on `PATH`) with
@@ -1840,7 +1894,7 @@ Save as `/tmp/t1.ncl`:
     config = {
       image = "<your glibc image>",
       command = ["/bin/sh", "-c", "while true; do date; cat /legion/identity/platform 2>/dev/null | cut -c1-24; sleep 30; done"],
-      network = { mode = "tap", tap = "auto", bridge = "br0" },
+      network = { mode = "tap", bridge = "br0" },
     },
     suspend = {
       checkpoint = "memory",
@@ -1856,7 +1910,7 @@ Save as `/tmp/t1.ncl`:
 }
 ```
 
-### T1.1 Many auto-TAP sandboxes on one node
+### T1.1 Many TAP sandboxes on one node
 
 ```bash
 legion job run /tmp/t1.ncl
@@ -1864,11 +1918,13 @@ for i in 1 2 3 4 5; do legion instance create agents --id user-$i; done
 ip -br link show master br0
 ```
 
-Pass: five `lgf...` devices, all `UP`, all with `master br0`, and
-`dnsmasq`'s leases list five MACs starting `02:4c:`. Each allocation dir
-holds `.sandbox/tap-device` naming its device and `.sandbox/restored-tap`.
+Pass: five `lgf...` devices, all `UP`, all with `master br0`, five MACs
+starting `02:4c:`, and five distinct `address:` lines in `legion instance
+get user-$i`, each from `10.77.0.128/25` and each answering `ping` from the
+host. Each allocation dir holds `.sandbox/tap-device` naming its device,
+`.sandbox/restored-tap`, and `.sandbox/guest-addr.json` naming its address.
 Fail: a boot error naming `sandbox needs TAP device lgf...`, or a guest with
-no lease.
+no address (check the console for the kernel's `IP-Config` line).
 
 ### T1.2 Resume recreates the TAP on the bridge
 
@@ -1914,7 +1970,7 @@ Then set `changeMode = "restart"` on the identity and run `legion job
 validate /tmp/t1.ncl`: it prints the `reboots this sandbox's guest`
 warning.
 
-### T1.5 Forks of an auto-TAP sandbox
+### T1.5 Forks of a TAP sandbox
 
 ```bash
 legion instance fork user-3 --count 2 --wait
@@ -1922,8 +1978,8 @@ ip -br link show master br0 | grep lgf
 ```
 
 Pass: two more `lgf` devices on `br0`, named for `user-3-f1` and
-`user-3-f2`, and each fork gets its own DHCP lease after `onResume` renews
-it. Fail: `restore needs TAP device lgf...`.
+`user-3-f2`, and each fork answers on its own address (G4.1). Fail:
+`restore needs TAP device lgf...`.
 
 ### Ignored tests
 
@@ -1934,3 +1990,222 @@ cargo test --test apple_container_idle -- --ignored   # macOS only
 The Linux paths above have no ignored tests of their own: the TAP calls are
 the Phase 3c/6 `HostTaps` calls, already covered by
 `cargo test -- --ignored sandbox` on a KVM host.
+
+## Gated sandboxes
+
+The [gated sandbox checkpoints plan](plans/gated-sandbox-checkpoints-plan.md)
+(Phases 0 to 4). Built on a Linux host **without KVM**: the vsock retarget,
+the guest agent's relay drop, the datapath's attribution, the idle signals,
+the gated default, and TAP addressing ran against fakes, fixture trees, Unix
+sockets standing in for vsock, and (for the guest's netlink re-addressing) a
+veth pair in a throwaway network namespace. No guest booted. Phase 0 is the
+gate: until G0.1 passes on both VMMs, `SANDBOX_GATED_BY_DEFAULT` in
+`src/structs/network.rs` stays `false`, and nothing here is claimed as
+boot-tested.
+
+Status: **pending** (no KVM host has run any item below). Record each run
+with the date, `uname -r`, `firecracker --version`, `cloud-hypervisor
+--version`, and the guest kernel's config.
+
+### Prereqs
+
+- x86_64 or aarch64 with `/dev/kvm`, and the worker run as root.
+- **Firecracker 1.16.1 or later** (the `vsock_override` floor), and
+  **cloud-hypervisor v52 or later**, plus one older cloud-hypervisor for the
+  half-open check in G1.2. One Firecracker 1.15 binary for G1.5.
+- A guest kernel with `CONFIG_VIRTIO_VSOCKETS=y` (gated) and
+  `CONFIG_IP_PNP=y` (TAP addressing), at `/var/lib/legion/kernels/vmlinux` or
+  `LEGION_SANDBOX_KERNEL`.
+- The static guest binary beside the worker:
+
+  ```bash
+  rustup target add x86_64-unknown-linux-musl
+  cargo build -p legion-guest --profile dist --target x86_64-unknown-linux-musl
+  cp target/x86_64-unknown-linux-musl/dist/legion-guest "$(dirname "$(command -v legion)")/"
+  # or, for the ignored tests:
+  export LEGION_GUEST_BINARY=$PWD/target/x86_64-unknown-linux-musl/dist/legion-guest
+  ```
+
+- Outbound HTTP from the host (the datapath dials from the host), and the
+  hosts the items name (`example.com`, `example.org`, `pypi.org`).
+- For G4.1, a bridge with NAT and a pool:
+
+  ```bash
+  ip link add br0 type bridge && ip addr add 10.88.0.1/16 dev br0 && ip link set br0 up
+  iptables -t nat -A POSTROUTING -s 10.88.0.0/16 ! -o br0 -j MASQUERADE
+  ```
+
+  ```nickel
+  # worker config
+  sandbox = { bridges = { br0 = { subnet = "10.88.0.0/16", gateway = "10.88.0.1", range = "10.88.128.0/17" } } },
+  ```
+
+- A local cluster on isolated ports (never 4747 or 4848), for example a
+  manager on `127.0.0.1:5947` and a worker joined to it, with
+  `resourceEnforcement.enabled = true` for G3.1.
+- To exercise the Phase 2 default before the flip, start the manager with
+  `LEGION_SANDBOX_GATED_DEFAULT=1` (verification only, not a supported
+  setting).
+
+### G0.1 Boot
+
+```bash
+LEGION_SANDBOX_KERNEL=/var/lib/legion/kernels/vmlinux \
+LEGION_GUEST_BINARY=$PWD/target/x86_64-unknown-linux-musl/dist/legion-guest \
+cargo test --lib sandbox_gated_boots -- --ignored --nocapture --test-threads 1
+```
+
+The test binds the datapath (egress proxy and resolver) on the guest's vsock
+host sockets with a policy allowing only `example.com` (override with
+`LEGION_GATED_TEST_ALLOW` and `LEGION_GATED_TEST_DENY`), boots an
+`alpine:latest` guest, and checks from inside it.
+
+- **Pass:** both `sandbox_gated_boots_firecracker` and
+  `sandbox_gated_boots_cloud_hypervisor` pass. The console shows `guest
+  agent started`, `ALLOWED-OK` (wget through `HTTP_PROXY`), `DENIED-OK` (a
+  `403` with `Legion-Denied-By`), `DNS-OK` (`nslookup` through the relay),
+  and `RAW-BLOCKED` (`nc 1.1.1.1 443` with no proxy fails).
+- **Fail, `guest agent missing`:** the guest binary did not reach the root
+  disk, or does not run on the image (check `LEGION_GUEST_BINARY`).
+- **Fail, the fetch hangs:** the VMM did not forward guest-initiated vsock
+  to `<base>_1080`. Record the VMM version and the socket names under the
+  allocation's `.sandbox/`.
+- **Also record (spikes):** two gated guests on one node both use CID 3 with
+  no conflict; the `sun_path` length of the default state path
+  (`/var/lib/legion/allocs/<id>/.sandbox/vsock.sock_1080`) stays under 108.
+
+### G0.2 Throughput
+
+From inside a gated guest, and from a TAP guest on `br0`:
+
+```bash
+time wget -O /dev/null http://<a host serving a 1 GiB file>/1g.bin   # through HTTP_PROXY when gated
+```
+
+- **Pass:** a recorded number for each VMM, not a threshold. Record
+  single-stream MB/s and the connect latency of `wget -O /dev/null
+  http://example.com/` for both paths, so the public doc can say how much
+  slower the proxy path is.
+
+### G1.1 Resume keeps a RAM-only counter and its network
+
+Jobspec: a keyed gated sandbox with `suspend.checkpoint = "memory"`,
+`network = { mode = "gated", egress = { allow = ["example.com"] } }`, and a
+command that counts in a shell variable and fetches `http://example.com/`
+every 5 seconds, printing `counter=N fetch=<status>`.
+
+```bash
+legion job run /tmp/gated.ncl && legion instance create agents --id g-1 --wait
+legion instance suspend g-1 --wait && legion instance start g-1 --wait
+legion job logs agents --follow
+legion net doctor -j | jq '.. | objects | select(.allocationId?)'
+```
+
+- **Pass:** the counter continues from where it stopped, the first fetch
+  after the resume succeeds, and the access log and `net doctor` attribute
+  it to the new allocation id.
+
+### G1.2 Open connections reset, never hang
+
+Hold a slow download through the proxy (`wget --limit-rate=10k` of a large
+file), then take a live `legion snapshot create g-1 --memory --wait`.
+
+- **Pass on Firecracker:** the snapshot prints the `resets its open network
+  connections` note, the origin's download fails promptly, and a retry
+  succeeds.
+- **Pass on each cloud-hypervisor version:** the origin's download
+  continues. Restore that snapshot (`legion instance create agents --id g-2
+  --from-snapshot <id>`): the restored guest's client fails promptly (the
+  agent closes its relays), never hangs. Record the version where the VMM
+  starts resetting on its own (v52).
+
+### G1.3 Policy at resume
+
+Suspend `g-1`, apply a `require` policy denying `example.com/**`, resume.
+
+- **Pass:** the first post-resume fetch is denied (`403`,
+  `Legion-Denied-By: <policy>`), and the `net.denied` event names the new
+  allocation.
+
+### G1.4 Three forks
+
+```bash
+legion instance fork g-1 --count 3 --wait -j
+legion instance fork g-1 --count 1 --spread --wait -j   # second node, published checkpoint
+legion instance stop g-1
+```
+
+- **Pass:** each fork's fetches are attributed to its own allocation and
+  instance, and stopping the origin does not affect them.
+
+### G1.5 Version floor
+
+On a node whose Firecracker is 1.15:
+
+```bash
+legion instance suspend g-1 --checkpoint memory
+```
+
+- **Pass:** refused before capture with `node <n> runs Firecracker 1.15.0,
+  which cannot move a restored guest's vsock ... Hint: upgrade Firecracker on
+  the node, or use --checkpoint disk`, and the guest keeps running.
+
+### G2.1 Default
+
+With the manager started with `LEGION_SANDBOX_GATED_DEFAULT=1`, submit a
+sandbox with no network config whose command is `pip install requests`
+(image `python:3.12-slim`).
+
+- **Pass:** `legion net doctor` shows `mode gated`, the install fails with a
+  `gated-default` denial for `pypi.org`, and succeeds after adding
+  `network.egress.allow = ["pypi.org", "files.pythonhosted.org"]`. Repeat
+  with `alpine:latest` (`apk add curl` with
+  `dl-cdn.alpinelinux.org` allowed): the static agent runs on musl.
+- When this and G0.1 pass, flip `SANDBOX_GATED_BY_DEFAULT` to `true` and
+  update the plan's status line and TODO.md.
+
+### G3.1 Model-call wake
+
+`idle = { after = "1m", signals = ["connections", "cpu"] }` on a gated
+sandbox. From the guest, hold a connection through the proxy that sends
+nothing for two minutes (`nc` to an allowed host's port 80 with no input),
+then close it.
+
+- **Pass:** no suspend while it is open (`instance get` shows idle since
+  holding still), then a suspend about a minute after it closes, with
+  `suspend_reason idle`.
+
+### G4.1 Re-addressing
+
+A keyed TAP sandbox on `network = { mode = "tap", bridge = "br0" }` with the
+pool above and `suspend.checkpoint = "memory"`:
+
+```bash
+legion instance create agents --id t-1 --wait
+legion instance fork t-1 --count 3 --wait
+for i in t-1 t-1-f1 t-1-f2 t-1-f3; do legion instance get $i -j | jq -r '.data.instance.guestAddress'; done
+```
+
+- **Pass:** four distinct addresses from `10.88.128.0/17`, each matching
+  `instance get`'s `address:` line and the guest's `LEGION_GUEST_ADDR`, and
+  each answering `ping` from the host. Suspend and resume `t-1` on the same
+  node: it gets its old address back.
+- **Repeat** with an image whose own init sets a static IP on `eth0` (or
+  `kernel_args = "ip=10.88.200.5::10.88.0.1:255.255.0.0::eth0:off"` after
+  Legion's argument, which the kernel honors last): after a fork, Legion's
+  lease wins.
+- **Also:** `legion job validate` refuses `network = { mode = "tap", tap =
+  "tap0" }` with `config.network.tap is gone` and the bridge hint, and a
+  pool with every address leased fails the next start with `bridge br0's
+  sandbox range ... is full`.
+
+### Ignored tests
+
+```bash
+LEGION_SANDBOX_KERNEL=/path/to/vmlinux LEGION_GUEST_BINARY=/path/to/legion-guest \
+  cargo test --lib sandbox_gated_boots -- --ignored --nocapture --test-threads 1
+```
+
+Run without KVM, `cargo test -p legion-guest` runs the netlink
+re-addressing test in a throwaway network namespace when it is root and has
+the `ip` tool (it skips otherwise).

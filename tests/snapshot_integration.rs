@@ -789,12 +789,15 @@ async fn snapshot_preconditions_fail_with_actionable_reasons() -> R<()> {
     Ok(())
 }
 
+/// Gated plan Phase 1: a memory snapshot of a gated sandbox needs a VMM
+/// that can move the restored guest's vsock (Firecracker 1.16.1 or any
+/// cloud-hypervisor). On an older Firecracker it is refused at call time with
+/// the version and the fix; on a new one it is taken, with a note that the
+/// live capture resets the guest's open connections.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_memory_snapshot_of_a_gated_sandbox_is_refused_at_call_time() -> R<()> {
+async fn a_memory_snapshot_of_a_gated_sandbox_needs_firecracker_1_16_1() -> R<()> {
     let mut cluster = Cluster::new()?;
     cluster.add_node(NODE, CPU_MODEL, json!(["checkpoint"]))?;
-    // Submitted straight to the store, as if gating came from somewhere job
-    // validation cannot see (a stored policy imposing `gated`).
     cluster.submit(workspace_job(
         "sandbox",
         Some(SnapshotsConfig::default()),
@@ -803,45 +806,39 @@ async fn a_memory_snapshot_of_a_gated_sandbox_is_refused_at_call_time() -> R<()>
     cluster.active_instance("user-42")?;
     let err = create(&cluster, "memory", None).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
-    assert!(
-        err.message().contains(
-            "asks for memory checkpoints, but sandbox memory checkpoints don't support gated \
-             networking yet"
-        ),
-        "{}",
-        err.message()
+    assert_eq!(
+        err.message(),
+        "instance user-42 is gated, and node snap-node runs Firecracker 1.7.0, which cannot \
+         move a restored guest's vsock to a new socket (that needs Firecracker 1.16.1 or \
+         later)\nHint: upgrade Firecracker on the node, or use --disk"
     );
-    assert!(err.message().contains("\nHint: "), "{}", err.message());
-    assert!(
-        err.message().contains("drop network gating"),
-        "{}",
-        err.message()
+
+    let mut node = cluster.store().get_node(NODE)?;
+    node.fingerprint_attrs["sandbox.vmm.version"] = json!("1.16.1");
+    node.fingerprint_attrs["sandbox.vmm.firecracker.version"] = json!("1.16.1");
+    cluster.store().insert_node(NodeMsg::from(node))?;
+    let reply = create(&cluster, "memory", None).await?;
+    assert_eq!(
+        reply.notes,
+        vec![
+            "instance user-42 is gated on Firecracker, so this capture resets its open network \
+             connections (the guest keeps running)"
+                .to_string()
+        ]
     );
     Ok(())
 }
 
+/// Gated plan Phase 1: `job validate` accepts a gated sandbox that asks for
+/// memory checkpoints.
 #[test]
-fn job_validation_refuses_memory_checkpoints_on_a_gated_sandbox() {
+fn job_validation_accepts_memory_checkpoints_on_a_gated_sandbox() {
     let job = workspace_job(
         "sandbox",
         Some(SnapshotsConfig::default()),
         Some(json!({ "mode": "gated" })),
     );
-    let err = legion::task_plugins::validate_job_config(&job).unwrap_err();
-    let text = format!("{err:#}");
-    assert!(
-        text.contains(
-            "task \"workspace\" asks for memory checkpoints, but sandbox memory checkpoints \
-             don't support gated networking yet"
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "Hint: set snapshots.memory = false for disk-only snapshots, or drop network gating"
-        ),
-        "{text}"
-    );
+    legion::task_plugins::validate_job_config(&job).expect("gated memory snapshots validate");
 
     // Disk-only snapshots on the same task are fine.
     let job = workspace_job(

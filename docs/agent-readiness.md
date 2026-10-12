@@ -307,9 +307,37 @@ When a request is denied in HTTP mode, the response says why: a `403` with
 `Legion-Denied-By: <policy>/<rule>` and a JSON body naming the rule and reason.
 An agent inside a sandbox can then change its approach instead of retrying.
 
+**`gated-default`** is the source when nothing allowed the destination at all:
+the task is gated (`network.mode = "gated"`) and no task block or policy
+object covers its egress, so everything is denied
+([Default deny](network-handlers.md#default-deny)). It is not a rule someone
+wrote, so retrying or rephrasing the request never helps. An agent inside the
+sandbox should report the blocked host to whoever owns the spec. An agent
+driving Legion can read the fix off `net policy test`, whose reply carries a
+`hint`:
+
+```bash
+legion net policy test agents --to https://pypi.org -j
+# → {"ok":true,"data":{"verdict":"deny","source":"gated-default",
+#     "reason":"task workspace is gated and nothing allows pypi.org",
+#     "hint":"add \"pypi.org\" to network.egress.allow, or apply a policy object; …"}}
+```
+
+A gated guest's resolver answers a name nothing allows with `NXDOMAIN`, and
+records the same denial, so a tool that resolves before connecting fails
+fast with a name error rather than a timeout.
+
 `legion net policy apply` (and `legion_net_policy_apply`) mutates and is gated
 behind `--allow-write`. `--dry-run` / `dry_run` validates the object and lists
 the running allocations whose effective policy would change, without writing.
+
+**A TAP sandbox's address is something Legion reports**, not something an
+agent discovers by probing. A sandbox on `config.network = { mode = "tap",
+bridge = "br0" }` gets its address leased from the bridge's pool at boot and
+on every restore and fork. A platform agent reads it from `legion instance
+get <id> -j` (`guest_address`, `guest_bridge`), and the harness inside the
+guest reads `LEGION_GUEST_ADDR`. A fork never shares its origin's address. See
+[Addressing](task-runtime-sandbox.md#addressing).
 
 ## 5. Idempotency keys
 

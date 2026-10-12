@@ -5427,6 +5427,17 @@ export class ForkInstanceReply extends Message<ForkInstanceReply> {
    */
   durability = "";
 
+  /**
+   * One-line notes about side effects of the fork's capture on the origin,
+   * printed by `legion instance fork` as `note: ...`. Today: a memory fork
+   * of a gated sandbox on Firecracker resets the origin's open network
+   * connections (the origin keeps running). Empty when there is nothing to
+   * say, and on a deduplicated reply.
+   *
+   * @generated from field: repeated string notes = 9;
+   */
+  notes: string[] = [];
+
   constructor(data?: PartialMessage<ForkInstanceReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5443,6 +5454,7 @@ export class ForkInstanceReply extends Message<ForkInstanceReply> {
     { no: 6, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 8, name: "durability", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "notes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ForkInstanceReply {
@@ -5909,6 +5921,30 @@ export class InstanceInfo extends Message<InstanceInfo> {
    */
   coldBoot?: InstanceColdBoot;
 
+  /**
+   * The IPv4 address the running allocation's guest holds, for a `sandbox`
+   * on `config.network = { mode = "tap", bridge = ... }`. Legion leases it
+   * from the bridge's pool in the node's worker config
+   * (`sandbox.bridges.<bridge>`) at boot, and leases a fresh one on every
+   * restore and fork, which the guest applies before its workload runs
+   * again: a fork never answers on its origin's address, and a resume on
+   * the same node gets its previous address back when it is still free.
+   * From the node's latest network status report, so unset for a few
+   * seconds after a start, and unset for gated and loopback-only sandboxes
+   * and every other runtime. See docs/task-runtime-sandbox.md, "Addressing".
+   *
+   * @generated from field: optional string guest_address = 35;
+   */
+  guestAddress?: string;
+
+  /**
+   * The bridge `guest_address` belongs to (`br0`). Set exactly when
+   * `guest_address` is.
+   *
+   * @generated from field: optional string guest_bridge = 36;
+   */
+  guestBridge?: string;
+
   constructor(data?: PartialMessage<InstanceInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5951,6 +5987,8 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 32, name: "held_memory_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
     { no: 33, name: "held_cpu_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
     { no: 34, name: "cold_boot", kind: "message", T: InstanceColdBoot, opt: true },
+    { no: 35, name: "guest_address", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 36, name: "guest_bridge", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
@@ -6574,6 +6612,18 @@ export class CreateSnapshotReply extends Message<CreateSnapshotReply> {
    */
   deduplicated = false;
 
+  /**
+   * One-line notes about side effects of this capture the caller should
+   * know, printed by `legion snapshot create` as `note: ...`. Today: a live
+   * memory capture of a gated sandbox on Firecracker resets the guest's open
+   * network connections (Firecracker resets every vsock connection at
+   * snapshot time; the guest keeps running and new connections work). Empty
+   * when there is nothing to say, and on a deduplicated reply.
+   *
+   * @generated from field: repeated string notes = 3;
+   */
+  notes: string[] = [];
+
   constructor(data?: PartialMessage<CreateSnapshotReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6584,6 +6634,7 @@ export class CreateSnapshotReply extends Message<CreateSnapshotReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "snapshot", kind: "message", T: SnapshotInfo },
     { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "notes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateSnapshotReply {
@@ -26017,7 +26068,10 @@ export class ShowNetPolicyReply extends Message<ShowNetPolicyReply> {
   matchedPolicies: string[] = [];
 
   /**
-   * The task's declared `network.mode` and the mode the merge resolved.
+   * The task's declared `network.mode`, and the mode it resolves to: the one
+   * a matching `require` policy imposes, else the declared one with `auto`
+   * resolved for the task's runtime (assuming a microVM node for a sandbox;
+   * each allocation's node status carries the mode it actually runs in).
    *
    * @generated from field: string declared_mode = 3;
    */
@@ -26038,6 +26092,18 @@ export class ShowNetPolicyReply extends Message<ShowNetPolicyReply> {
    */
   nodeStatusJson: string[] = [];
 
+  /**
+   * Notes about how the task's network is actually enforced, beyond its
+   * mode, printed by `legion net doctor` as warnings. Today:
+   * `egress-unenforced: ...` for a sandbox that runs without Legion's
+   * egress policy only because its node is a dev backend (Apple
+   * `container`, a Linux OCI runtime) with no vsock to the datapath. Empty
+   * in the common case.
+   *
+   * @generated from field: repeated string notes = 6;
+   */
+  notes: string[] = [];
+
   constructor(data?: PartialMessage<ShowNetPolicyReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -26051,6 +26117,7 @@ export class ShowNetPolicyReply extends Message<ShowNetPolicyReply> {
     { no: 3, name: "declared_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "effective_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "node_status_json", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 6, name: "notes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ShowNetPolicyReply {
@@ -26175,7 +26242,9 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
 
   /**
    * The rule that decided (`policy/<name>#<index>`, `task#<index>`, or
-   * `fallthrough`); empty on allow-by-absence.
+   * `fallthrough`); empty on allow-by-absence. `gated-default` when the task
+   * runs gated and no task block or policy object covers its egress at all:
+   * gated denies everything nothing allows.
    *
    * @generated from field: string source = 2;
    */
@@ -26207,6 +26276,15 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
    */
   explanation = "";
 
+  /**
+   * How to change the verdict, when there is an obvious fix. Set for a
+   * `gated-default` denial: allow the destination in the task's
+   * `network.egress.allow`, or apply a policy object. Empty otherwise.
+   *
+   * @generated from field: string hint = 7;
+   */
+  hint = "";
+
   constructor(data?: PartialMessage<TestNetPolicyReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -26221,6 +26299,7 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
     { no: 4, name: "direction", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "protocol", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "explanation", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TestNetPolicyReply {
@@ -26616,6 +26695,24 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
    */
   meshIdentity = false;
 
+  /**
+   * A TAP-wired `sandbox`'s guest address, leased from its bridge's pool
+   * (`sandbox.bridges.<bridge>` in the worker config) at boot and on every
+   * restore and fork. Empty for every other allocation. The manager surfaces
+   * it as `InstanceInfo.guest_address`. A TAP sandbox is reported here even
+   * when it declares no ports, upstreams, or VIPs, with `mode = "host"`.
+   *
+   * @generated from field: string guest_address = 15;
+   */
+  guestAddress = "";
+
+  /**
+   * The bridge `guest_address` belongs to. Empty exactly when it is.
+   *
+   * @generated from field: string guest_bridge = 16;
+   */
+  guestBridge = "";
+
   constructor(data?: PartialMessage<NetAllocStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -26638,6 +26735,8 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
     { no: 12, name: "tls_ready", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 13, name: "tls_error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 14, name: "mesh_identity", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 15, name: "guest_address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "guest_bridge", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetAllocStatus {

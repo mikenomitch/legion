@@ -1,0 +1,25 @@
+[package]
+name = "legion-guest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The in-guest half of Legion's sandbox runtime: the gated datapath relay, the resume handler, and guest addressing"
+repository = "https://github.com/mikenomitch/legion"
+
+# Deliberately tiny: this crate is copied into every sandbox guest, and the
+# release build is a static musl binary (`legion-guest`) that has to run on
+# any image, busybox and Alpine included. No async runtime and no TLS. Every
+# dependency here is one more thing that must build for
+# `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`.
+[dependencies]
+anyhow = "1.0.100"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "legion-guest"
+path = "src/main.rs"

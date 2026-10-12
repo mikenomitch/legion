@@ -49,10 +49,12 @@
       command = ["/usr/local/bin/harness"],
       # A NIC per sandbox: the node creates a TAP device for each instance
       # (`lgf` plus a hash of its id), attaches it to br0, recreates it on
-      # resume, and deletes it with the allocation. Any number of these fit
-      # on a node, and each can take memory checkpoints. br0 and DHCP on it
-      # are the operator's. See the guide's "Networking".
-      network = { mode = "tap", tap = "auto", bridge = "br0" },
+      # resume, and deletes it with the allocation, and leases the guest an
+      # address from br0's pool in the worker config (sandbox.bridges.br0),
+      # a fresh one on every restore and fork. Any number of these fit on a
+      # node, and each can take memory checkpoints. The task only places on
+      # nodes that declare br0. See the guide's "Networking".
+      network = { mode = "tap", bridge = "br0" },
       # Guest vCPUs. This is the VM's shape, not a reservation: the host
       # schedules and weights the VMM's threads by resources.cpu below.
       vcpus = 2,

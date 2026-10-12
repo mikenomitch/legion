@@ -312,6 +312,9 @@ Things to know:
   declare `cpu` in MHz instead (for example `cpu = 500`).
 - `sandbox.vmmOverheadMiB = 0` is rejected when the manager loads the worker
   config. A VMM always needs some memory of its own.
+- The same `sandbox` block declares the address pools TAP-wired sandboxes
+  lease from (`sandbox.bridges`), which apply whether or not enforcement is
+  on. See [Addressing](task-runtime-sandbox.md#addressing).
 
 For a runtime whose task is a host process, adopting enforcement takes two
 lines:

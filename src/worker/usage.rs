@@ -203,9 +203,10 @@ pub fn read_target_sample(
 /// exec server saw. Read fresh for every report.
 #[derive(Debug, Clone, Default)]
 pub struct ActivityInputs {
-    /// Ingress connections and last-bytes times per allocation
+    /// Open datapath connections (ingress, and egress through a gated
+    /// allocation's proxy) and last-bytes times per allocation
     /// (`src/worker/netd/activity.rs`).
-    pub ingress: HashMap<i64, crate::worker::netd::activity::IngressActivity>,
+    pub datapath: HashMap<i64, crate::worker::netd::activity::DatapathActivity>,
     /// Exec sessions open per allocation (`src/worker/exec.rs`).
     pub exec_sessions: HashMap<i64, u32>,
 }
@@ -384,16 +385,18 @@ impl UsageSampler {
                     (elapsed_ms > 0).then(|| used / elapsed_ms as u64)
                 })
                 .unwrap_or(0);
-            let ingress = inputs
-                .ingress
+            let datapath = inputs
+                .datapath
                 .get(&target.allocation_id)
                 .copied()
                 .unwrap_or_default();
-            // Bytes through an ingress connection since the previous sample
-            // (in whole seconds, so a stamp in the same second counts).
-            let ingress_bytes = ingress.last_bytes_unix > 0
+            // Bytes through a datapath connection (ingress, or a gated
+            // allocation's egress proxy) since the previous sample, stamped
+            // as they move (in whole seconds, so a stamp in the same second
+            // counts).
+            let datapath_bytes = datapath.last_bytes_unix > 0
                 && previous.is_none_or(|previous| {
-                    ingress.last_bytes_unix >= previous.sampled_at_unix_ms / 1000
+                    datapath.last_bytes_unix >= previous.sampled_at_unix_ms / 1000
                 });
             // Bytes the guest sent on its own NIC (a TAP, an Apple
             // container) since the previous sample. The first sample has
@@ -406,9 +409,9 @@ impl UsageSampler {
             let interval = crate::worker::idle::IntervalActivity {
                 cpu_millicores,
                 network_bytes: self.network_activity.contains(&target.allocation_id)
-                    || ingress_bytes
+                    || datapath_bytes
                     || guest_sent,
-                open_connections: ingress.open_connections,
+                open_connections: datapath.open_connections,
                 exec_sessions: inputs
                     .exec_sessions
                     .get(&target.allocation_id)
@@ -593,12 +596,12 @@ mod tests {
 
     /// With an idle policy, the report carries idle-since from the signals
     /// that policy counts: an open exec session keeps it awake, a quiet open
-    /// ingress connection does not (without `connections`), and ingress
-    /// bytes do.
+    /// datapath connection does not (without `connections`), and bytes
+    /// through one do.
     #[test]
     fn idle_since_follows_the_policys_signals() {
         use crate::structs::suspend::IdleSignal;
-        use crate::worker::netd::activity::IngressActivity;
+        use crate::worker::netd::activity::DatapathActivity;
         let mut sampler = UsageSampler::default();
         let start = Instant::now();
         let mut idle_target = target(1);
@@ -621,9 +624,9 @@ mod tests {
 
         // A quiet open connection: still idle since 100.
         let mut inputs = ActivityInputs::default();
-        inputs.ingress.insert(
+        inputs.datapath.insert(
             1,
-            IngressActivity {
+            DatapathActivity {
                 open_connections: 1,
                 last_bytes_unix: 95,
             },
@@ -632,12 +635,12 @@ mod tests {
         assert_eq!(held.allocations[0].idle_since_unix, 100);
 
         // Bytes through it: awake at 120.
-        inputs.ingress.get_mut(&1).unwrap().last_bytes_unix = 118;
+        inputs.datapath.get_mut(&1).unwrap().last_bytes_unix = 118;
         let talked = sampler.sample_with(at(2), 120_000, &targets, quiet, None, &inputs);
         assert_eq!(talked.allocations[0].idle_since_unix, 120);
 
         // An exec session: awake at 130.
-        inputs.ingress.clear();
+        inputs.datapath.clear();
         inputs.exec_sessions.insert(1, 1);
         let shell = sampler.sample_with(at(3), 130_000, &targets, quiet, None, &inputs);
         assert_eq!(shell.allocations[0].idle_since_unix, 130);

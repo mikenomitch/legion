@@ -250,6 +250,8 @@ async fn run_worker_with_manager(
     let enforcement_config =
         usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
     apply_resource_enforcement_env(&enforcement_config);
+    let sandbox_bridges = apply_sandbox_bridges_env(enforcement_config.sandbox.as_ref());
+    crate::task_plugins::warn_if_no_static_guest_binary();
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
         manager.load_builtin_plugins();
@@ -397,6 +399,15 @@ async fn run_worker_with_manager(
         warn!(
             "resourceEnforcement.oversubscribe is set but this node cannot enforce (no cgroup \
              v2, or not Linux); registering at physical capacity"
+        );
+    }
+    // The bridges a TAP sandbox can join here: a task on `bridge = "br0"`
+    // carries an implicit `sandbox.bridges contains "br0"` constraint, so it
+    // never places on a node that could not address its guest.
+    if !sandbox_bridges.is_empty() {
+        config_attrs.insert(
+            crate::task_plugins::sandbox_addr::BRIDGES_ATTR.into(),
+            json!(sandbox_bridges),
         );
     }
     config_attrs.insert(
@@ -678,6 +689,27 @@ fn apply_resource_enforcement_env(config: &crate::structs::WorkerResourceEnforce
         std::env::remove_var(crate::constants::ENV_CGROUP_PARENT);
         std::env::remove_var(crate::constants::ENV_SANDBOX_VMM_OVERHEAD_MIB);
     }
+}
+
+/// Publishes the worker's `sandbox.bridges` pools into the environment for
+/// the sandbox runtime, which leases TAP guests their addresses from them
+/// (docs/task-runtime-sandbox.md, "Addressing"). Returns the bridge names,
+/// which the node advertises. Unlike the VMM overhead, this does not depend
+/// on resource enforcement.
+fn apply_sandbox_bridges_env(sandbox: Option<&crate::structs::WorkerSandboxConfig>) -> Vec<String> {
+    let env = crate::task_plugins::sandbox_addr::BRIDGES_ENV;
+    let Some(bridges) = sandbox
+        .map(|sandbox| &sandbox.bridges)
+        .filter(|bridges| !bridges.is_empty())
+    else {
+        std::env::remove_var(env);
+        return Vec::new();
+    };
+    match serde_json::to_string(bridges) {
+        Ok(json) => std::env::set_var(env, json),
+        Err(err) => warn!(error = %err, "Failed to publish sandbox.bridges to the sandbox runtime"),
+    }
+    bridges.keys().cloned().collect()
 }
 
 /// Parses the worker config's `artifacts` JSON payload (empty = defaults):
@@ -1200,7 +1232,7 @@ async fn heartbeat_tick(
                 let activity = forwarder.context().activity();
                 activity.retain(&targets.iter().map(|target| target.allocation_id).collect());
                 let inputs = crate::worker::usage::ActivityInputs {
-                    ingress: activity.snapshot(),
+                    datapath: activity.snapshot(),
                     exec_sessions: crate::worker::exec::open_sessions(),
                 };
                 // One `container stats` call covers every Apple container
@@ -1258,8 +1290,13 @@ async fn heartbeat_tick(
         let pressure_actions_for_redrive = pressure_actions.clone();
         // The datapath's status for the allocations it was last told about.
         let net_status = {
+            let alloc_root = task_manager
+                .lock()
+                .expect("task manager")
+                .alloc_root()
+                .to_path_buf();
             let last = LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner());
-            net_status(forwarder, &last)
+            net_status(forwarder, &last, &alloc_root)
         };
         // A gated allocation whose capture is not ready has no network: say
         // so in its health, so rollouts and `doctor` see it rather than a
@@ -2301,7 +2338,8 @@ fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
 
 /// The per-allocation resolvers a desired set implies: one per allocation
 /// that was assigned a VIP block, answering `<key>.svc.legion` with that
-/// allocation's upstream VIPs.
+/// allocation's upstream VIPs, and one per gated sandbox, on its vsock
+/// socket, with or without a block.
 fn dns_specs(
     desired: &[TaskAllocation],
     alloc_root: &std::path::Path,
@@ -2314,12 +2352,16 @@ fn dns_specs(
         let Ok(network) = serde_json::from_str::<AllocNetwork>(&allocation.network) else {
             continue;
         };
-        let Some(resolver) = network
+        let resolver = network
             .resolver_address()
-            .and_then(|addr| addr.parse::<std::net::Ipv4Addr>().ok())
-        else {
+            .and_then(|addr| addr.parse::<std::net::Ipv4Addr>().ok());
+        let sandbox = is_gated_sandbox(allocation);
+        // Every gated sandbox gets a resolver on its vsock socket, VIP block
+        // or not: without one, a guest with no upstreams has no DNS at all
+        // (gated plan §6.5, calls entry 20). Everything else needs a block.
+        if resolver.is_none() && !sandbox {
             continue;
-        };
+        }
         let names = network
             .vip_names()
             .into_iter()
@@ -2327,7 +2369,6 @@ fn dns_specs(
                 Some((key, (vip.parse::<std::net::Ipv4Addr>().ok()?, port)))
             })
             .collect();
-        let sandbox = is_gated_sandbox(allocation);
         specs.push(crate::worker::netd::dns::DnsSpec {
             allocation_id: allocation.allocation_id,
             resolver,
@@ -2620,6 +2661,7 @@ fn ingress_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::ingress
 fn net_status(
     forwarder: &UpstreamForwarder,
     desired: &[TaskAllocation],
+    alloc_root: &std::path::Path,
 ) -> Vec<crate::structs::NetAllocStatus> {
     let bound_upstreams: HashMap<i64, Vec<String>> =
         forwarder
@@ -2650,15 +2692,36 @@ fn net_status(
     let cache = forwarder.context().cache();
     let mut out = Vec::new();
     for allocation in desired {
+        let id = allocation.allocation_id;
+        // A TAP sandbox's leased guest address (docs/task-runtime-sandbox.md,
+        // "Addressing"), which makes the allocation worth reporting even with
+        // nothing else on the datapath.
+        let lease = (allocation.task_runtime == "sandbox")
+            .then(|| {
+                crate::task_plugins::sandbox_addr::read_lease(
+                    &alloc_root.join(id.to_string()).join(".sandbox"),
+                )
+            })
+            .flatten();
         let network: Option<AllocNetwork> = if allocation.network.trim().is_empty() {
             None
         } else {
             serde_json::from_str(&allocation.network).ok()
         };
         let Some(network) = network else {
+            if let Some(lease) = lease {
+                out.push(crate::structs::NetAllocStatus {
+                    allocation_id: id,
+                    mode: crate::structs::netpolicy::MODE_HOST.to_string(),
+                    capture_ready: true,
+                    tls_ready: true,
+                    guest_address: lease.address.to_string(),
+                    guest_bridge: lease.bridge,
+                    ..Default::default()
+                });
+            }
             continue;
         };
-        let id = allocation.allocation_id;
         let gated = network.is_gated();
         let expected_upstreams = network.upstreams.len();
         let expected_ingress = network
@@ -2666,7 +2729,11 @@ fn net_status(
             .iter()
             .filter(|p| p.private_port.is_some())
             .count();
-        if !gated && expected_upstreams == 0 && expected_ingress == 0 && network.vip_block.is_none()
+        if !gated
+            && expected_upstreams == 0
+            && expected_ingress == 0
+            && network.vip_block.is_none()
+            && lease.is_none()
         {
             continue;
         }
@@ -2689,7 +2756,20 @@ fn net_status(
             problems.push("gated network namespace does not exist yet".into());
         }
         if gated && !proxy_ready {
-            problems.push("egress proxy is not bound inside the namespace".into());
+            problems.push(if vsock_sandbox {
+                // A restored guest resumes fail-closed without it (gated
+                // plan §6.3); this is how `net doctor` names the socket.
+                format!(
+                    "egress proxy is not bound on the guest's vsock socket {}",
+                    crate::worker::netd::guest_agent::host_socket_path(
+                        &sandbox_vsock_base(alloc_root, id),
+                        crate::worker::netd::guest_agent::PROXY_PORT,
+                    )
+                    .display()
+                )
+            } else {
+                "egress proxy is not bound inside the namespace".into()
+            });
         }
         if upstreams.len() < expected_upstreams {
             problems.push(format!(
@@ -2698,13 +2778,27 @@ fn net_status(
                 expected_upstreams
             ));
         }
-        if network.vip_block.is_some() && !resolver_ready {
+        if vsock_sandbox && !resolver_ready {
+            problems.push(format!(
+                "allocation resolver is not bound on the guest's vsock socket {}",
+                crate::worker::netd::guest_agent::host_socket_path(
+                    &sandbox_vsock_base(alloc_root, id),
+                    crate::worker::netd::guest_agent::DNS_PORT,
+                )
+                .display()
+            ));
+        } else if network.vip_block.is_some() && !resolver_ready {
             problems.push(
                 "allocation resolver is not bound (port 53 needs CAP_NET_BIND_SERVICE)".into(),
             );
         }
+        // A gated sandbox's capture is both vsock host sockets: the proxy and
+        // the resolver.
         let capture_ready = if gated {
-            namespace_ready && proxy_ready && upstreams.len() >= expected_upstreams
+            namespace_ready
+                && proxy_ready
+                && (!vsock_sandbox || resolver_ready)
+                && upstreams.len() >= expected_upstreams
         } else {
             true
         };
@@ -2758,6 +2852,11 @@ fn net_status(
             tls_ready,
             tls_error,
             mesh_identity: forwarder.context().mesh_identity().is_some(),
+            guest_address: lease
+                .as_ref()
+                .map(|lease| lease.address.to_string())
+                .unwrap_or_default(),
+            guest_bridge: lease.map(|lease| lease.bridge).unwrap_or_default(),
         });
     }
     out
@@ -3614,6 +3713,32 @@ mod tests {
             .to_string(),
             ..TaskAllocation::default()
         }
+    }
+
+    /// Gated plan §6.5, calls entry 20: every gated sandbox gets a resolver
+    /// on its vsock socket even with no upstreams (and so no VIP block),
+    /// and never binds an address. A gated container still needs a block
+    /// (its namespace resolver gap is tracked separately).
+    #[test]
+    fn every_gated_sandbox_gets_a_resolver_on_its_vsock_socket_test() {
+        let alloc_root = std::path::Path::new("/var/lib/legion/allocs");
+        let gated = |allocation_id: i64, runtime: &str| TaskAllocation {
+            allocation_id,
+            task_runtime: runtime.into(),
+            network: json!({ "mode": "gated" }).to_string(),
+            ..TaskAllocation::default()
+        };
+        let specs = dns_specs(&[gated(7, "sandbox"), gated(8, "container")], alloc_root);
+        assert_eq!(specs.len(), 1, "{specs:?}");
+        assert_eq!(specs[0].allocation_id, 7);
+        assert_eq!(specs[0].resolver, None, "no address to bind");
+        assert_eq!(specs[0].netns, None);
+        assert_eq!(
+            specs[0].unix.as_deref(),
+            Some(std::path::Path::new(
+                "/var/lib/legion/allocs/7/.sandbox/vsock.sock_53"
+            ))
+        );
     }
 
     #[test]

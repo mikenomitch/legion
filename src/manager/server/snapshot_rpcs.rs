@@ -207,10 +207,14 @@ pub(crate) fn snapshot_precondition(
                     node_vmm.unwrap_or("no VMM")
                 ));
             }
-            if crate::task_plugins::allocation_is_gated(allocation) {
-                return Some(crate::structs::snapshot::gated_memory_checkpoint_error(
-                    &task.name, None,
-                ));
+            if let Some(refusal) = super::suspend_rpcs::gated_capture_refusal(
+                task,
+                allocation,
+                node,
+                &format!("instance {}", instance.instance_id),
+                "use --disk",
+            ) {
+                return Some(refusal);
             }
             if crate::structs::snapshot::memory_checkpoint_ask(task).is_none() {
                 return Some(format!(
@@ -278,6 +282,7 @@ impl ManagerDaemonService {
             return Ok(Response::new(CreateSnapshotReply {
                 snapshot: Some(snapshot_info(snapshot, false)),
                 deduplicated: true,
+                notes: Vec::new(),
             }));
         }
 
@@ -394,9 +399,22 @@ impl ManagerDaemonService {
         self.store
             .idempotency_record(&idempotency_key, "create_snapshot", &snapshot.snapshot_id)
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let notes = if kind == SnapshotKind::Memory {
+            super::suspend_rpcs::gated_capture_note(
+                &task,
+                &allocation,
+                &node,
+                &instance.instance_id,
+            )
+            .into_iter()
+            .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Response::new(CreateSnapshotReply {
             snapshot: Some(snapshot_info(snapshot, false)),
             deduplicated: false,
+            notes,
         }))
     }
 

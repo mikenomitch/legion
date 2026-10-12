@@ -51,8 +51,15 @@ const KVM_DEVICE: &str = "/dev/kvm";
 /// not use it.
 pub(crate) const GUEST_INIT_PATH: &str = "/legion/init";
 pub(crate) const GUEST_ENV_PATH: &str = "/legion/env";
-/// The worker's own binary, copied in for a gated sandbox's guest agent.
+/// The guest binary (the static `legion-guest`, or the worker's own binary
+/// as a fallback), copied in for the guest agent and the resume handler.
 pub(crate) const GUEST_AGENT_PATH: &str = "/legion/legion";
+
+/// Names the static guest binary, overriding the default: `legion-guest`
+/// beside the worker's own executable.
+pub(crate) const GUEST_BINARY_ENV: &str = "LEGION_GUEST_BINARY";
+/// The static guest binary's file name, beside the worker.
+const GUEST_BINARY_NAME: &str = "legion-guest";
 pub(crate) const GUEST_ARTIFACT_DIR: &str = "/legion/artifacts";
 
 /// Guest block devices, in attach order: root disk first, then every attached
@@ -364,19 +371,45 @@ impl VmSpec {
     }
 }
 
-/// The vsock device of a gated sandbox: the guest's context id and the
-/// host-side Unix socket base both VMMs multiplex guest ports onto
-/// (`<socket>_<port>`).
+/// The vsock device of a gated sandbox: the host-side Unix socket base both
+/// VMMs multiplex guest ports onto (`<socket>_<port>`). The guest's context
+/// id is always [`GATED_GUEST_CID`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VsockSpec {
-    pub cid: u32,
     pub socket: PathBuf,
 }
 
-/// A guest context id for an allocation: 3 upward (0–2 are reserved), unique
-/// per node because allocation ids are.
-pub(crate) fn vsock_cid(allocation_id: i64) -> u32 {
-    3 + (allocation_id.unsigned_abs() % u64::from(u32::MAX - 3)) as u32
+/// Every gated guest's vsock context id (0 to 2 are reserved). Both VMMs
+/// implement vsock in user space over Unix sockets, so a CID is visible only
+/// inside its own guest and needs no host-wide uniqueness, and the guest
+/// agent dials the host (CID 2) without ever reading its own. Firecracker
+/// cannot change a CID on snapshot load, so a per-allocation CID would be
+/// stale after every restore and shared by every fork anyway (gated plan
+/// §6.2).
+pub(crate) const GATED_GUEST_CID: u32 = 3;
+
+/// The longest path a Unix socket can bind: `sun_path` holds 108 bytes,
+/// one of them the terminating NUL.
+pub(crate) const MAX_UNIX_SOCKET_PATH: usize = 107;
+
+/// Refuse a gated sandbox whose datapath sockets cannot exist: the longest
+/// is `<base>_1080`, and a path over [`MAX_UNIX_SOCKET_PATH`] bytes fails
+/// inside the VMM or the worker's listener with an opaque error. Checked at
+/// launch and at restore, where the base is the allocation's own.
+pub(crate) fn check_vsock_socket_path(base: &Path) -> R<()> {
+    let longest = crate::worker::netd::guest_agent::host_socket_path(
+        base,
+        crate::worker::netd::guest_agent::PROXY_PORT,
+    );
+    let bytes = longest.as_os_str().len();
+    if bytes > MAX_UNIX_SOCKET_PATH {
+        bail!(
+            "gated sandbox socket path {} is {bytes} bytes, over the {MAX_UNIX_SOCKET_PATH}-byte \
+             Unix socket limit: shorten the worker's state path",
+            longest.display()
+        );
+    }
+    Ok(())
 }
 
 /// One block device handed to the guest: the host path of a raw device or
@@ -487,8 +520,7 @@ pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
     if let Some(vsock) = spec.vsock.as_ref() {
         args.push("--vsock".to_string());
         args.push(format!(
-            "cid={},socket={}",
-            vsock.cid,
+            "cid={GATED_GUEST_CID},socket={}",
             vsock.socket.display()
         ));
     }
@@ -545,7 +577,7 @@ pub(crate) fn firecracker_config(spec: &VmSpec) -> Value {
     }
     if let Some(vsock) = spec.vsock.as_ref() {
         config["vsock"] = json!({
-            "guest_cid": vsock.cid,
+            "guest_cid": GATED_GUEST_CID,
             "uds_path": vsock.socket.display().to_string(),
         });
     }
@@ -589,15 +621,24 @@ pub(crate) struct GuestPayload {
     /// Volume disks init mounts before the command runs, in
     /// [`VmSpec::volume_disks`] attach order.
     pub disk_mounts: Vec<GuestDiskMount>,
-    /// A gated sandbox: init starts `/legion/legion guest-agent` (the
-    /// worker's own binary, copied into the rootfs) before the command, and
-    /// the resolver is the agent on loopback.
+    /// A gated sandbox: init starts `/legion/legion guest-agent` (the guest
+    /// binary, copied into the rootfs) before the command, and the resolver
+    /// is the agent on loopback.
     pub guest_agent: bool,
-    /// A sandbox launched for memory checkpoints: init starts
-    /// `/legion/legion guest-resume` in the background, which watches the
+    /// A sandbox launched for memory checkpoints (or with token files):
+    /// init starts the resume handler in the background, which watches the
     /// identity disk and refreshes the guest after every restore (new
     /// allocation id and token, reseeded RNG, resynced clock, `onResume`).
+    /// On a gated sandbox the agent runs it (`guest-agent --resume-watch`),
+    /// so a restore closes the agent's dead relays in the same process.
     pub resume_watch: bool,
+    /// The binary copied in as `/legion/legion` when the guest needs the
+    /// agent or the resume handler. `None` resolves it at install
+    /// ([`guest_binary`]).
+    pub guest_binary: Option<GuestBinary>,
+    /// A TAP guest's resolvers, from its bridge's pool (`sandbox.bridges.<name>.dns`),
+    /// written to `/etc/resolv.conf`. Empty leaves the image's own file.
+    pub resolvers: Vec<std::net::Ipv4Addr>,
 }
 
 /// One volume disk mount inside the guest. A volume with no declared `path`
@@ -613,22 +654,9 @@ pub(crate) struct GuestDiskMount {
     pub read_only: bool,
 }
 
-/// POSIX single-quote escaping: wrap in `'…'` and close/reopen around any
-/// embedded quote. Safe for arbitrary bytes, including newlines.
-fn sh_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-/// `/legion/env`, sourced by the init script. Values may be secrets (KV
-/// injection, identity tokens), so this content is never logged.
-pub(crate) fn render_env_file(env: &BTreeMap<String, String>) -> String {
-    let mut out =
-        String::from("# Generated by Legion (sandbox task runtime). Sourced by /legion/init.\n");
-    for (key, value) in env {
-        out.push_str(&format!("export {key}={}\n", sh_quote(value)));
-    }
-    out
-}
+/// `/legion/env`'s format and quoting are shared with the guest's resume
+/// handler, which writes `/legion/resume.env` the same way.
+pub(crate) use legion_guest::env::{render_env_file, sh_quote};
 
 /// `/legion/init` — PID 1 in the guest.
 ///
@@ -679,17 +707,23 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
     if payload.guest_agent {
         // The datapath's foothold: relays 127.0.0.1:1080 and :53 to the host
         // over vsock. Without it a gated guest has loopback and nothing else,
-        // which is the fail-closed outcome the mode promises.
+        // which is the fail-closed outcome the mode promises. When the guest
+        // also needs the resume watch, the agent runs it.
+        let watch = if payload.resume_watch {
+            " --resume-watch"
+        } else {
+            ""
+        };
         script.push_str(&format!(
             "if [ -x {GUEST_AGENT_PATH} ]; then\n\
-             \x20   {GUEST_AGENT_PATH} guest-agent >/dev/console 2>&1 &\n\
+             \x20   {GUEST_AGENT_PATH} guest-agent{watch} >/dev/console 2>&1 &\n\
              \x20   echo \"legion: guest agent started (gated network over vsock)\"\n\
              else\n\
              \x20   echo \"legion: guest agent missing at {GUEST_AGENT_PATH}; the sandbox has no network\" >&2\n\
              fi\n\n"
         ));
     }
-    if payload.resume_watch {
+    if payload.resume_watch && !payload.guest_agent {
         // Restores happen with the guest frozen mid-instruction, so nothing
         // in the guest runs on its own afterward. This watcher notices the
         // identity disk change and refreshes what a restore made stale.
@@ -771,23 +805,123 @@ pub(crate) fn install_guest_payload(
                 etc.join("resolv.conf"),
                 "# Generated by Legion: the guest agent relays DNS to the node datapath.\nnameserver 127.0.0.1\noptions ndots:1\n",
             );
+        } else if !payload.resolvers.is_empty() {
+            // A TAP guest resolves through its bridge's resolvers. The
+            // image's file may be a symlink (systemd-resolved), so it is
+            // replaced rather than written through.
+            let path = etc.join("resolv.conf");
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::write(
+                &path,
+                legion_guest::netconf::resolv_conf(&payload.resolvers),
+            );
         }
     }
     if payload.guest_agent || payload.resume_watch {
-        install_guest_agent(rootfs)?;
+        let binary = match payload.guest_binary.clone() {
+            Some(binary) => binary,
+            None => guest_binary()?,
+        };
+        install_guest_agent(rootfs, &binary)?;
     }
     Ok(())
 }
 
-/// Copy this binary into the rootfs as `/legion/legion`. The agent is a
-/// subcommand of the same executable, so a node ships exactly one artifact;
-/// an image whose libc cannot run it is reported by init at boot (the guest
-/// then has no network, which is the gated mode's promise).
-fn install_guest_agent(rootfs: &Path) -> R<()> {
+/// The binary a guest runs as `/legion/legion`: its guest agent and resume
+/// handler (calls entry 10 of the gated plan).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuestBinary {
+    pub path: PathBuf,
+    /// The static `legion-guest`, which runs on any image (busybox, Alpine).
+    /// False for the fallback, the worker's own binary, which needs the
+    /// image to have a compatible glibc.
+    pub is_static: bool,
+    /// Size and modification time, so a new binary rebuilds the root disk
+    /// rather than reusing one that carries the old agent.
+    pub fingerprint: String,
+}
+
+impl GuestBinary {
+    fn at(path: PathBuf, is_static: bool) -> R<Self> {
+        let metadata =
+            std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        Ok(GuestBinary {
+            fingerprint: format!("{}:{}:{modified}", path.display(), metadata.len()),
+            path,
+            is_static,
+        })
+    }
+}
+
+/// Find the guest binary: [`GUEST_BINARY_ENV`] when set (and it must exist),
+/// else `legion-guest` beside the worker's executable, else the worker's
+/// own executable, which every guest can still try to run.
+pub(crate) fn guest_binary() -> R<GuestBinary> {
+    let worker = std::env::current_exe().context("locating the legion binary")?;
+    guest_binary_from(
+        std::env::var(GUEST_BINARY_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        &worker,
+    )
+}
+
+fn guest_binary_from(configured: Option<PathBuf>, worker: &Path) -> R<GuestBinary> {
+    if let Some(path) = configured {
+        if !path.is_file() {
+            bail!(
+                "{GUEST_BINARY_ENV} names {}, which does not exist: install the static \
+                 legion-guest binary there, or unset it",
+                path.display()
+            );
+        }
+        return GuestBinary::at(path, true);
+    }
+    let beside = worker.with_file_name(GUEST_BINARY_NAME);
+    if beside.is_file() {
+        return GuestBinary::at(beside, true);
+    }
+    GuestBinary::at(worker.to_path_buf(), false)
+}
+
+/// At worker start: say once when sandbox guests will get the worker's own
+/// binary, which a musl image (`alpine:latest`) cannot run, so its gated
+/// guest has no network and its restores keep their old identity.
+pub(crate) fn warn_if_no_static_guest_binary() {
+    if installed_vmms().is_empty() {
+        // No microVM monitor: this node runs dev-mode sandboxes only, which
+        // never get the guest binary.
+        return;
+    }
+    match guest_binary() {
+        Ok(binary) if binary.is_static => {
+            info!(path = %binary.path.display(), "Sandbox guests run the static legion-guest binary");
+        }
+        Ok(binary) => warn!(
+            worker = %binary.path.display(),
+            "No static legion-guest binary beside the worker (or {GUEST_BINARY_ENV}); sandbox guests get a copy of the worker itself, which runs only on images with a compatible glibc. On a musl image a gated sandbox has no network and a restore keeps its old identity"
+        ),
+        Err(err) => {
+            warn!(error = %err, "The sandbox guest binary is unusable; sandbox guests that need it will fail to build")
+        }
+    }
+}
+
+/// Copy the guest binary into the rootfs as `/legion/legion`. An image that
+/// cannot run it is reported by init at boot (a gated guest then has no
+/// network, which is the gated mode's promise).
+fn install_guest_agent(rootfs: &Path, binary: &GuestBinary) -> R<()> {
     let target = rootfs.join(GUEST_AGENT_PATH.trim_start_matches('/'));
-    let source = std::env::current_exe().context("locating the legion binary")?;
-    std::fs::copy(&source, &target)
-        .with_context(|| format!("copy {} to {}", source.display(), target.display()))?;
+    std::fs::copy(&binary.path, &target)
+        .with_context(|| format!("copy {} to {}", binary.path.display(), target.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1103,17 +1237,42 @@ mod tests {
         assert_eq!(args[serial_at + 1], "tty");
         assert!(args.contains(&"tap=tap0,mac=02:00:00:00:00:01".to_string()));
 
-        // A gated sandbox gets its vsock device on both VMMs.
+        // A gated sandbox gets its vsock device on both VMMs, always as
+        // guest CID 3.
         spec.vsock = Some(VsockSpec {
-            cid: vsock_cid(7),
             socket: PathBuf::from("/allocs/7/.sandbox/vsock.sock"),
         });
         let args = cloud_hypervisor_args(&spec);
         let at = args.iter().position(|a| a == "--vsock").expect("--vsock");
-        assert_eq!(args[at + 1], "cid=10,socket=/allocs/7/.sandbox/vsock.sock");
+        assert_eq!(args[at + 1], "cid=3,socket=/allocs/7/.sandbox/vsock.sock");
         let config = firecracker_config(&spec);
-        assert_eq!(config["vsock"]["guest_cid"], 10);
+        assert_eq!(config["vsock"]["guest_cid"], 3);
         assert_eq!(config["vsock"]["uds_path"], "/allocs/7/.sandbox/vsock.sock");
+    }
+
+    /// `sun_path` holds 107 bytes plus a NUL, and the longest datapath
+    /// socket is `<base>_1080`.
+    #[test]
+    fn a_gated_socket_path_over_the_unix_limit_is_refused_by_name() {
+        assert!(
+            check_vsock_socket_path(Path::new("/var/lib/legion/allocs/7/.sandbox/vsock.sock"))
+                .is_ok()
+        );
+        // 102 bytes of base + "_1080" is exactly 107.
+        let base = format!("/{}", "a".repeat(101));
+        assert_eq!(base.len(), 102);
+        assert!(check_vsock_socket_path(Path::new(&base)).is_ok());
+        let base = format!("/{}", "a".repeat(102));
+        let err = check_vsock_socket_path(Path::new(&base)).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("is 108 bytes, over the 107-byte Unix socket limit"),
+            "{message}"
+        );
+        assert!(
+            message.contains("shorten the worker's state path"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1152,8 +1311,75 @@ mod tests {
         let command_at = script.find("'/bin/sh'").expect("command");
         assert!(agent_at < command_at, "the agent starts first");
         assert!(script.contains("the sandbox has no network"));
+        assert!(!script.contains("--resume-watch"));
         let plain = render_init_script(&GuestPayload::default());
         assert!(!plain.contains("guest-agent"));
+    }
+
+    /// A gated sandbox launched for checkpoints runs one process: the agent
+    /// owns the resume watch, so a restore can close its relays.
+    /// Gated plan §6.5, calls entry 10: the static `legion-guest` beside the
+    /// worker wins, an explicit override must exist, and with neither the
+    /// worker copies itself (the glibc fallback).
+    #[test]
+    fn the_static_guest_binary_is_preferred_over_the_worker() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let worker = dir.path().join("legion");
+        std::fs::write(&worker, b"worker")?;
+        let fallback = guest_binary_from(None, &worker)?;
+        assert_eq!(fallback.path, worker);
+        assert!(!fallback.is_static);
+
+        std::fs::write(dir.path().join("legion-guest"), b"static guest")?;
+        let beside = guest_binary_from(None, &worker)?;
+        assert_eq!(beside.path, dir.path().join("legion-guest"));
+        assert!(beside.is_static);
+        assert_ne!(beside.fingerprint, fallback.fingerprint);
+
+        let elsewhere = dir.path().join("opt-legion-guest");
+        std::fs::write(&elsewhere, b"another static guest")?;
+        assert_eq!(
+            guest_binary_from(Some(elsewhere.clone()), &worker)?.path,
+            elsewhere
+        );
+        let err = guest_binary_from(Some(dir.path().join("missing")), &worker).unwrap_err();
+        assert!(
+            err.to_string().contains("LEGION_GUEST_BINARY names"),
+            "{err}"
+        );
+
+        // What lands in the guest is the chosen binary.
+        let rootfs = tempfile::tempdir()?;
+        install_guest_payload(
+            rootfs.path(),
+            &GuestPayload {
+                command: vec!["/bin/sh".into()],
+                guest_agent: true,
+                guest_binary: Some(beside),
+                ..GuestPayload::default()
+            },
+            "legion-sbx-3",
+        )?;
+        assert_eq!(
+            std::fs::read(rootfs.path().join("legion/legion"))?,
+            b"static guest"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_gated_checkpointable_guest_runs_the_watch_inside_the_agent() {
+        let script = render_init_script(&GuestPayload {
+            command: vec!["/bin/sh".into()],
+            guest_agent: true,
+            resume_watch: true,
+            ..GuestPayload::default()
+        });
+        assert!(
+            script.contains("/legion/legion guest-agent --resume-watch"),
+            "{script}"
+        );
+        assert!(!script.contains("guest-resume"), "{script}");
     }
 
     #[test]
@@ -1214,6 +1440,8 @@ mod tests {
             ],
             guest_agent: false,
             resume_watch: false,
+            guest_binary: None,
+            resolvers: Vec::new(),
         };
         let script = render_init_script(&payload);
 
@@ -1260,6 +1488,8 @@ mod tests {
             }],
             guest_agent: false,
             resume_watch: false,
+            guest_binary: None,
+            resolvers: Vec::new(),
         };
 
         let dir = tempfile::tempdir()?;
@@ -1375,6 +1605,51 @@ mod tests {
                 & 0o777;
             assert_eq!(env_mode, 0o600, "env must be owner-only, got {env_mode:o}");
         }
+        Ok(())
+    }
+
+    /// Gated plan §6.7: a TAP guest resolves through its bridge's
+    /// resolvers, replacing the image's file even when it is a symlink. A
+    /// guest with no resolvers keeps the image's own.
+    #[test]
+    fn a_tap_guest_gets_its_bridge_resolvers() -> R<()> {
+        let rootfs = tempfile::tempdir()?;
+        std::fs::create_dir_all(rootfs.path().join("etc"))?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "/run/systemd/resolve/stub-resolv.conf",
+            rootfs.path().join("etc/resolv.conf"),
+        )?;
+        let payload = GuestPayload {
+            command: vec!["/bin/true".into()],
+            resolvers: vec!["10.88.0.1".parse()?, "1.1.1.1".parse()?],
+            ..GuestPayload::default()
+        };
+        install_guest_payload(rootfs.path(), &payload, "legion-sbx-3")?;
+        let resolv = std::fs::read_to_string(rootfs.path().join("etc/resolv.conf"))?;
+        assert!(
+            resolv.contains("nameserver 10.88.0.1\nnameserver 1.1.1.1\n"),
+            "{resolv}"
+        );
+
+        let untouched = tempfile::tempdir()?;
+        std::fs::create_dir_all(untouched.path().join("etc"))?;
+        std::fs::write(
+            untouched.path().join("etc/resolv.conf"),
+            "nameserver 9.9.9.9\n",
+        )?;
+        install_guest_payload(
+            untouched.path(),
+            &GuestPayload {
+                command: vec!["/bin/true".into()],
+                ..GuestPayload::default()
+            },
+            "legion-sbx-4",
+        )?;
+        assert_eq!(
+            std::fs::read_to_string(untouched.path().join("etc/resolv.conf"))?,
+            "nameserver 9.9.9.9\n"
+        );
         Ok(())
     }
 

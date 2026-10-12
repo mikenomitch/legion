@@ -86,6 +86,8 @@ impl Cluster {
                 "node_id": id,
                 "maxAllocations": 20,
                 "resources": { "memory": 65536, "cpu": 40000 },
+                // The bridge a TAP sandbox's implicit constraint asks for.
+                "sandbox.bridges": ["br0"],
             }),
             fingerprint_attrs: json!({
                 "arch": "x86_64",
@@ -625,7 +627,7 @@ async fn unsupported_forks_are_refused_with_a_hint() -> R<()> {
         "image": "alpine",
         "command": ["sleep", "60"],
         "hypervisor": "firecracker",
-        "network": { "mode": "tap", "tap": "auto", "bridge": "br0" },
+        "network": { "mode": "tap", "bridge": "br0" },
     });
     sandbox.snapshots = Some(Default::default());
     cluster.submit(job(sandbox))?;
@@ -1243,10 +1245,8 @@ async fn unsupported_spread_and_tap_forks_are_refused_with_a_hint() -> R<()> {
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert!(status.message().contains("--checkpoint disk"), "{status:?}");
 
-    // A disk fork of a fixed-TAP sandbox would boot every fork on the TAP
-    // device the origin holds. Submit refuses this spec now, so it reaches
-    // the API only from a job stored before that rule (this harness skips
-    // validation).
+    // Every TAP is per instance, so a disk fork of a TAP sandbox boots
+    // each fork on its own device with its own address, and is accepted.
     let cluster = Cluster::new()?;
     cluster.add_node(ALL_OPS, "1.12.0")?;
     let mut sandbox = task("sandbox", true);
@@ -1254,35 +1254,7 @@ async fn unsupported_spread_and_tap_forks_are_refused_with_a_hint() -> R<()> {
         "image": "alpine",
         "command": ["sleep", "60"],
         "hypervisor": "firecracker",
-        "network": { "mode": "tap", "tap": "tap0" },
-    });
-    cluster.submit(job(sandbox))?;
-    cluster.active_origin()?;
-    let status = cluster
-        .fork_with(ForkInstanceRequest {
-            instance_id: ORIGIN.into(),
-            checkpoint: Some("disk".into()),
-            ..Default::default()
-        })
-        .await
-        .expect_err("a disk fork would share tap0");
-    assert_eq!(status.code(), Code::FailedPrecondition);
-    assert!(
-        status.message().contains("tap0") && status.message().contains("--checkpoint memory"),
-        "{status:?}"
-    );
-    assert_eq!(cluster.store().list_instances(JOB)?.len(), 1);
-
-    // On `tap = "auto"` each fork boots on its own device, so a disk fork
-    // is accepted.
-    let cluster = Cluster::new()?;
-    cluster.add_node(ALL_OPS, "1.12.0")?;
-    let mut sandbox = task("sandbox", true);
-    sandbox.config = json!({
-        "image": "alpine",
-        "command": ["sleep", "60"],
-        "hypervisor": "firecracker",
-        "network": { "mode": "tap", "tap": "auto", "bridge": "br0" },
+        "network": { "mode": "tap", "bridge": "br0" },
     });
     cluster.submit(job(sandbox))?;
     cluster.active_origin()?;
@@ -1293,7 +1265,7 @@ async fn unsupported_spread_and_tap_forks_are_refused_with_a_hint() -> R<()> {
             ..Default::default()
         })
         .await
-        .expect("an auto-TAP disk fork boots on its own device");
+        .expect("a TAP sandbox's disk fork boots on its own device");
     Ok(())
 }
 
