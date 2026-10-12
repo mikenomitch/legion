@@ -226,6 +226,12 @@ async fn run_worker_with_manager(
     apply_resource_enforcement_env(&enforcement_config);
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
+        // Worker core's own governor takes the config directly, before any
+        // allocation is restored or started. It used to read the env above
+        // from the task manager's constructor, which ran before the env was
+        // set, so enforcement never turned on. The governor logs whether it
+        // really enforces (and why not, when it cannot).
+        manager.configure_resource_enforcement(&enforcement_config);
         manager.load_builtin_plugins();
         manager.configure_volumes(&name, host_volumes);
         // Before `configure_artifacts`, which hands the store to the stager.
@@ -600,12 +606,10 @@ fn usable_resource_enforcement(
 /// the task runtimes read (see `docs/resource-enforcement.md`).
 fn apply_resource_enforcement_env(config: &crate::structs::WorkerResourceEnforcementConfig) {
     if config.enabled {
-        if cfg!(target_os = "linux") {
-            info!(
-                cgroup_parent = %config.cgroup_parent,
-                "Resource enforcement enabled: exec and sandbox tasks run in worker-owned cgroups"
-            );
-        } else {
+        // On Linux the governor logs "enabled" once it really is
+        // (`NodeResourceGovernor::from_settings`), so this function does not
+        // claim it on the governor's behalf.
+        if !cfg!(target_os = "linux") {
             // No cgroups here: the switch measures (Apple container sandboxes,
             // through `container stats`) and enforces nothing.
             info!(

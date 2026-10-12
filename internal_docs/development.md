@@ -36,9 +36,9 @@ login finds cargo fine.
 
 <!-- Run the manager -->
 cargo run -- start manager -c configs/manager.ncl
-<!-- Join the cluster as a worker node (note the port and lack of tls) -->
-LEGION_ADDR=http://127.0.0.1:4748 cargo run -- join -a
-<!-- Now you can make calls to legion (note that the port is different, should be TLS in the future) -->
+<!-- Join the cluster as a worker node: `-a` mints a join token through the API, then joins with it -->
+LEGION_ADDR=http://127.0.0.1:4747 cargo run -- join -a
+<!-- Now you can make calls to legion -->
 LEGION_ADDR=http://127.0.0.1:4747 cargo run -- ledger
 
 ### Running a second cluster on one machine
@@ -80,7 +80,7 @@ mise run join --linux
 mise run join --linux --count 3
 ```
 
-By default Linux workers connect to `http://192.168.64.1:4748` (the default `container` host gateway for the default network). If your setup differs, pass `--manager-addr`. Run `mise run join --help` for additional options (platform, custom manager address, container name prefix, startup log tail behavior, and forwarded join args).
+By default Linux workers connect to `http://192.168.64.1:4747` (the default `container` host gateway for the default network). If your setup differs, pass `--manager-addr`. Run `mise run join --help` for additional options (platform, custom manager address, container name prefix, startup log tail behavior, and forwarded join args).
 
 ### Building a shipping binary (`--profile dist`)
 

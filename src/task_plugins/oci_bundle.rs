@@ -8,14 +8,398 @@
 //!
 //! The conversion is deliberately self-contained (no external `umoci`/`skopeo`
 //! dependency): read the image manifest + config from the layout, extract each
-//! layer tarball into `rootfs/` (honoring overlayfs whiteouts), and synthesize
-//! a runtime spec that merges the image config (env, working dir, user) with
-//! the task's command and env.
+//! layer tarball into `rootfs/` (honoring overlayfs whiteouts, and keeping each
+//! file's owner, mode, and file capabilities), and synthesize a runtime spec
+//! that merges the image config (env, working dir, user) with the task's
+//! command and env.
+//!
+//! The spec's process privileges follow Docker's defaults, because stock
+//! images are written against them: Docker's capability set (less
+//! `CAP_NET_RAW`, see [`DEFAULT_CAPABILITIES`]) and a high `RLIMIT_NOFILE`.
+//! A container task adjusts either through its config
+//! (`security.capabilities`, `ulimits`).
 
 use crate::prelude::*;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
+
+/// The capabilities a container gets when its jobspec adjusts nothing:
+/// Docker's default set (moby `oci/caps/defaults.go`) without `CAP_NET_RAW`.
+///
+/// Stock images assume these. The official nginx and Postgres entrypoints
+/// `chown` their directories and drop to an unprivileged user with
+/// `setuid`/`setgid` (`gosu`, `su-exec`), which needs `CAP_CHOWN`,
+/// `CAP_SETUID`, and `CAP_SETGID`.
+///
+/// `CAP_NET_RAW` is the one deliberate difference. A Docker container has its
+/// own network namespace, so raw sockets there see only its own traffic. A
+/// Legion container shares the node's network namespace unless it is gated,
+/// and `CAP_NET_RAW` there means sniffing and spoofing on the node's
+/// interfaces. Nomad's Docker driver drops it from its default for the same
+/// reason. A task that needs it (`ping`, `traceroute`) adds it back with
+/// `security.capabilities.add = ["NET_RAW"]`.
+pub(crate) const DEFAULT_CAPABILITIES: &[&str] = &[
+    "CAP_AUDIT_WRITE",
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FOWNER",
+    "CAP_FSETID",
+    "CAP_KILL",
+    "CAP_MKNOD",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_SETFCAP",
+    "CAP_SETGID",
+    "CAP_SETPCAP",
+    "CAP_SETUID",
+    "CAP_SYS_CHROOT",
+];
+
+/// Every capability Linux defines, through 5.9's `CAP_CHECKPOINT_RESTORE`.
+/// The vocabulary `security.capabilities` is validated against, and what
+/// `add = ["ALL"]` expands to.
+pub(crate) const ALL_CAPABILITIES: &[&str] = &[
+    "CAP_AUDIT_CONTROL",
+    "CAP_AUDIT_READ",
+    "CAP_AUDIT_WRITE",
+    "CAP_BLOCK_SUSPEND",
+    "CAP_BPF",
+    "CAP_CHECKPOINT_RESTORE",
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_DAC_READ_SEARCH",
+    "CAP_FOWNER",
+    "CAP_FSETID",
+    "CAP_IPC_LOCK",
+    "CAP_IPC_OWNER",
+    "CAP_KILL",
+    "CAP_LEASE",
+    "CAP_LINUX_IMMUTABLE",
+    "CAP_MAC_ADMIN",
+    "CAP_MAC_OVERRIDE",
+    "CAP_MKNOD",
+    "CAP_NET_ADMIN",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_NET_BROADCAST",
+    "CAP_NET_RAW",
+    "CAP_PERFMON",
+    "CAP_SETFCAP",
+    "CAP_SETGID",
+    "CAP_SETPCAP",
+    "CAP_SETUID",
+    "CAP_SYSLOG",
+    "CAP_SYS_ADMIN",
+    "CAP_SYS_BOOT",
+    "CAP_SYS_CHROOT",
+    "CAP_SYS_MODULE",
+    "CAP_SYS_NICE",
+    "CAP_SYS_PACCT",
+    "CAP_SYS_PTRACE",
+    "CAP_SYS_RAWIO",
+    "CAP_SYS_RESOURCE",
+    "CAP_SYS_TIME",
+    "CAP_SYS_TTY_CONFIG",
+    "CAP_WAKE_ALARM",
+];
+
+/// Normalizes one capability name from a jobspec: case-insensitive, with or
+/// without the `CAP_` prefix (`net_admin`, `NET_ADMIN`, and `CAP_NET_ADMIN`
+/// are the same capability), plus the `ALL` keyword. `field` names the list
+/// for the error.
+fn normalize_capability(raw: &str, field: &str) -> R<String> {
+    let upper = raw.trim().to_ascii_uppercase();
+    if upper == "ALL" {
+        return Ok(upper);
+    }
+    let name = if upper.starts_with("CAP_") {
+        upper
+    } else {
+        format!("CAP_{upper}")
+    };
+    if ALL_CAPABILITIES.contains(&name.as_str()) {
+        Ok(name)
+    } else {
+        bail!(
+            "unknown capability {raw:?} in security.capabilities.{field}: use a Linux capability \
+             name such as NET_ADMIN (the CAP_ prefix is optional), or ALL"
+        )
+    }
+}
+
+/// The container's capability set from the jobspec's adjustments, with
+/// Docker's `--cap-add` / `--cap-drop` semantics:
+///
+/// - `add` containing `ALL`: every capability except those `drop` names;
+/// - `drop` containing `ALL`: exactly the capabilities `add` names;
+/// - otherwise: [`DEFAULT_CAPABILITIES`], less `drop`, plus `add` (a name in
+///   both lists ends up granted, as in Docker).
+///
+/// Names are validated, so a typo fails at submit instead of starting a
+/// container that quietly lacks the capability it needs. `ALL` in both lists
+/// is rejected as contradictory.
+pub(crate) fn resolve_capabilities(add: &[String], drop: &[String]) -> R<Vec<String>> {
+    let add = add
+        .iter()
+        .map(|raw| normalize_capability(raw, "add"))
+        .collect::<R<Vec<_>>>()?;
+    let drop = drop
+        .iter()
+        .map(|raw| normalize_capability(raw, "drop"))
+        .collect::<R<Vec<_>>>()?;
+    let add_all = add.iter().any(|cap| cap == "ALL");
+    let drop_all = drop.iter().any(|cap| cap == "ALL");
+    let mut caps: Vec<String> = match (add_all, drop_all) {
+        (true, true) => bail!(
+            "security.capabilities lists ALL in both add and drop; keep ALL in one list and name \
+             the exceptions in the other"
+        ),
+        (true, false) => ALL_CAPABILITIES
+            .iter()
+            .filter(|cap| !drop.iter().any(|dropped| dropped == *cap))
+            .map(|cap| cap.to_string())
+            .collect(),
+        (false, true) => add,
+        (false, false) => DEFAULT_CAPABILITIES
+            .iter()
+            .filter(|cap| !drop.iter().any(|dropped| dropped == *cap))
+            .map(|cap| cap.to_string())
+            .chain(add)
+            .collect(),
+    };
+    caps.sort();
+    caps.dedup();
+    Ok(caps)
+}
+
+/// The default capability set, as owned strings.
+pub(crate) fn default_capabilities() -> Vec<String> {
+    DEFAULT_CAPABILITIES
+        .iter()
+        .map(|cap| cap.to_string())
+        .collect()
+}
+
+/// One `process.rlimits` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Rlimit {
+    /// `RLIMIT_NOFILE` and friends.
+    pub(crate) kind: String,
+    pub(crate) soft: u64,
+    pub(crate) hard: u64,
+}
+
+/// `RLIM_INFINITY`, which is what `"unlimited"` in a jobspec means.
+const RLIM_INFINITY: u64 = u64::MAX;
+
+/// The open-file limit a container gets by default: 1048576 (2^20), the
+/// value Docker containers ran with for years (containerd's systemd unit set
+/// `LimitNOFILE=infinity`, which the kernel caps at `fs.nr_open`), and what
+/// CRI-O sets. The OCI runtime's own default is a hard 1024, which servers
+/// like Redis warn about at start and which a busy proxy exhausts.
+pub(crate) const DEFAULT_NOFILE: u64 = 1_048_576;
+
+/// The rlimit names `ulimits` accepts, as `(jobspec name, OCI type)`. The
+/// same names `docker run --ulimit` and Compose's `ulimits` take.
+const RLIMIT_NAMES: &[(&str, &str)] = &[
+    ("as", "RLIMIT_AS"),
+    ("core", "RLIMIT_CORE"),
+    ("cpu", "RLIMIT_CPU"),
+    ("data", "RLIMIT_DATA"),
+    ("fsize", "RLIMIT_FSIZE"),
+    ("locks", "RLIMIT_LOCKS"),
+    ("memlock", "RLIMIT_MEMLOCK"),
+    ("msgqueue", "RLIMIT_MSGQUEUE"),
+    ("nice", "RLIMIT_NICE"),
+    ("nofile", "RLIMIT_NOFILE"),
+    ("nproc", "RLIMIT_NPROC"),
+    ("rss", "RLIMIT_RSS"),
+    ("rtprio", "RLIMIT_RTPRIO"),
+    ("rttime", "RLIMIT_RTTIME"),
+    ("sigpending", "RLIMIT_SIGPENDING"),
+    ("stack", "RLIMIT_STACK"),
+];
+
+/// The default open-file limit for this host: [`DEFAULT_NOFILE`], lowered to
+/// the kernel's `fs.nr_open` when that is smaller (a hard limit above it
+/// fails `setrlimit` and the container with it), and to this process's own
+/// hard limit when the worker is not root (raising a hard limit needs
+/// `CAP_SYS_RESOURCE`).
+fn default_nofile() -> u64 {
+    let mut limit = DEFAULT_NOFILE;
+    if let Some(nr_open) = std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        limit = limit.min(nr_open);
+    }
+    #[cfg(unix)]
+    if !running_as_root() {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes the struct it is handed.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) } == 0 {
+            limit = limit.min(current.rlim_max as u64);
+        }
+    }
+    limit
+}
+
+/// The rlimits a container gets when its jobspec sets no `ulimits`.
+pub(crate) fn default_rlimits() -> Vec<Rlimit> {
+    let nofile = default_nofile();
+    vec![Rlimit {
+        kind: "RLIMIT_NOFILE".to_string(),
+        soft: nofile,
+        hard: nofile,
+    }]
+}
+
+/// One `ulimits` value: a number or `"unlimited"`.
+fn rlimit_amount(name: &str, which: &str, value: &Value) -> R<u64> {
+    match value {
+        Value::Number(number) => number.as_u64().with_context(|| {
+            format!("ulimits.{name}{which} must be a non-negative whole number or \"unlimited\"")
+        }),
+        Value::String(word) if word == "unlimited" => Ok(RLIM_INFINITY),
+        _ => bail!("ulimits.{name}{which} must be a non-negative whole number or \"unlimited\""),
+    }
+}
+
+/// The container's rlimits: the defaults, with each `ulimits` entry the
+/// jobspec declares replacing the default of the same kind.
+///
+/// An entry is a number (soft and hard both), `"unlimited"`, or
+/// `{ soft, hard }`, with `soft <= hard`. Names are the lowercase rlimit
+/// names (`nofile`, `nproc`, `memlock`, ...), validated so a typo fails at
+/// submit.
+pub(crate) fn resolve_rlimits(ulimits: &BTreeMap<String, Value>) -> R<Vec<Rlimit>> {
+    let mut declared: Vec<Rlimit> = Vec::new();
+    for (name, value) in ulimits {
+        let Some((_, kind)) = RLIMIT_NAMES.iter().find(|(known, _)| known == name) else {
+            let known: Vec<&str> = RLIMIT_NAMES.iter().map(|(known, _)| *known).collect();
+            bail!(
+                "unknown ulimit {name:?}; expected one of {}",
+                known.join(", ")
+            );
+        };
+        let (soft, hard) = match value {
+            Value::Object(pair) => {
+                if let Some(extra) = pair.keys().find(|key| *key != "soft" && *key != "hard") {
+                    bail!("ulimits.{name} has an unknown field {extra:?}; use {{ soft, hard }}");
+                }
+                let soft = pair
+                    .get("soft")
+                    .with_context(|| format!("ulimits.{name} needs both soft and hard"))?;
+                let hard = pair
+                    .get("hard")
+                    .with_context(|| format!("ulimits.{name} needs both soft and hard"))?;
+                (
+                    rlimit_amount(name, ".soft", soft)?,
+                    rlimit_amount(name, ".hard", hard)?,
+                )
+            }
+            single => {
+                let amount = rlimit_amount(name, "", single)?;
+                (amount, amount)
+            }
+        };
+        if soft > hard {
+            bail!("ulimits.{name}: soft ({soft}) must not exceed hard ({hard})");
+        }
+        declared.push(Rlimit {
+            kind: kind.to_string(),
+            soft,
+            hard,
+        });
+    }
+    let mut rlimits: Vec<Rlimit> = default_rlimits()
+        .into_iter()
+        .filter(|default| !declared.iter().any(|set| set.kind == default.kind))
+        .collect();
+    rlimits.extend(declared);
+    Ok(rlimits)
+}
+
+/// The privileges and limits of the container's process: its capability set
+/// and its rlimits. [`Default`] is what a task that adjusts nothing gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessPolicy {
+    /// Granted as the bounding, effective, and permitted sets, as Docker
+    /// does. The inheritable and ambient sets stay empty, so a non-root
+    /// process keeps none of them across `execve`.
+    pub(crate) capabilities: Vec<String>,
+    pub(crate) rlimits: Vec<Rlimit>,
+}
+
+impl Default for ProcessPolicy {
+    fn default() -> Self {
+        Self {
+            capabilities: default_capabilities(),
+            rlimits: default_rlimits(),
+        }
+    }
+}
+
+/// Whether this process runs as root, which decides whether extraction can
+/// keep a layer's owners and whether the task's log files can be handed to
+/// the container's user.
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Hands the task's captured `stdout.log` / `stderr.log` to the container's
+/// user, so a non-root process can reopen its own output by path.
+///
+/// The container's stdout and stderr are these files, opened by the worker.
+/// A process that writes to them through its inherited descriptors needs
+/// nothing more, but many images reopen them: nginx symlinks
+/// `/var/log/nginx/access.log` to `/dev/stdout`, and `/dev/stdout` is
+/// `/proc/self/fd/1`. Reopening goes through the file's own permission check,
+/// so a root-owned file refuses a non-root user with `EACCES`, and nginx (or
+/// any image with a `USER`) fails to start. Docker avoids this by chowning the
+/// stdio pipes it hands the container to the container's user (moby's
+/// `IoUid`/`IoGid`).
+///
+/// The log directory itself stays owner-only (0700, root): reopening through
+/// `/proc/self/fd` does not traverse it, so the container gains access to its
+/// own two files and nothing else. Re-run at every start, because an
+/// in-place restart may run a different image user. A no-op when the worker
+/// is not root (it cannot chown), or when the task has no log directory.
+pub(crate) fn hand_task_logs_to(log_dir: Option<&Path>, uid: u32, gid: u32) {
+    let Some(log_dir) = log_dir else {
+        return;
+    };
+    if !running_as_root() {
+        return;
+    }
+    for file in [
+        crate::task_plugins::STDOUT_LOG_FILE,
+        crate::task_plugins::STDERR_LOG_FILE,
+    ] {
+        let path = log_dir.join(file);
+        #[cfg(unix)]
+        if let Err(err) = std::os::unix::fs::chown(&path, Some(uid), Some(gid)) {
+            warn!(
+                path = %path.display(),
+                uid,
+                gid,
+                error = %err,
+                "Could not hand the task log to the container user; a non-root container cannot \
+                 reopen /dev/stdout or /dev/stderr"
+            );
+        }
+    }
+}
 
 /// Image config fields we carry from the OCI layout into the runtime spec,
 /// plus the ordered layer blob paths to extract.
@@ -62,15 +446,16 @@ pub(crate) fn materialize_rootfs(oci_layout: &Path, rootfs: &Path) -> R<ImageCon
 /// [`BundleContext`]). Shared with the sandbox kind's dev mode, which runs an
 /// OCI bundle too. The bundle is rebuilt from scratch each call.
 ///
-/// Returns the image's declared `StopSignal`, when it has one, for the
-/// container runtime's stop-signal default chain.
+/// Returns what the caller needs from the image: its declared `StopSignal`
+/// (for the container runtime's stop-signal default chain) and the uid/gid
+/// the process runs as (to hand it the task's log files).
 pub(crate) fn build_bundle(
     oci_layout: &Path,
     bundle_dir: &Path,
     command: &[String],
     env: &std::collections::HashMap<String, String>,
     ctx: &BundleContext<'_>,
-) -> R<Option<String>> {
+) -> R<BuiltBundle> {
     if command.is_empty() {
         bail!("container command must include at least one entry");
     }
@@ -106,12 +491,29 @@ pub(crate) fn build_bundle(
         resolver: ctx.resolver,
         resolv_conf: resolv_conf.as_deref(),
         netns: ctx.netns,
+        policy: ctx.policy,
     };
     let spec = build_spec(command, env, &image, &user, &ctx);
     let config_path = bundle_dir.join("config.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
         .with_context(|| format!("write {}", config_path.display()))?;
-    Ok(image.stop_signal)
+    Ok(BuiltBundle {
+        stop_signal: image.stop_signal,
+        uid: user.uid,
+        gid: user.gid,
+    })
+}
+
+/// What [`build_bundle`] learned from the image that its caller acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BuiltBundle {
+    /// The image's declared `StopSignal`, when it has one.
+    pub(crate) stop_signal: Option<String>,
+    /// The uid the container's process runs as (the image's `User`,
+    /// resolved against its rootfs).
+    pub(crate) uid: u32,
+    /// The gid the container's process runs as.
+    pub(crate) gid: u32,
 }
 
 fn read_json(path: &Path) -> R<Value> {
@@ -208,7 +610,31 @@ fn safe_relative(path: &Path) -> Option<PathBuf> {
 /// Extracts one image layer over `rootfs`, applying overlayfs whiteouts:
 /// `.wh.<name>` deletes `<name>`, and `.wh..wh..opq` clears the directory's
 /// existing contents (an opaque directory) before later entries land.
+///
+/// Each entry keeps what the image recorded for it, the way Docker's
+/// extraction does:
+///
+/// - **Owner (uid/gid)**, when the worker runs as root. An image that runs as
+///   a non-root `USER` relies on it: `RUN chown nginx /var/cache/nginx` is how
+///   nginx's image lets its workers write there, and a rootfs where every
+///   file is `0:0` breaks it. A non-root worker cannot chown, so there every
+///   file belongs to the worker's user (and the container runtime runs
+///   rootless anyway).
+/// - **Mode, including setuid/setgid/sticky.** Ownership is applied before
+///   the mode, because `chown` clears the setuid bits.
+/// - **File capabilities and other extended attributes** (PAX
+///   `SCHILY.xattr.*` records), best effort and only as root. `security.capability`
+///   is what lets an image grant `cap_net_bind_service` to one binary.
+///   `security.selinux` and `trusted.*` are skipped: labels belong to the
+///   host's policy, and `trusted.overlay.*` is overlayfs bookkeeping, not
+///   image content. A filesystem that refuses an attribute logs and moves on.
 fn extract_layer(blob: &Path, rootfs: &Path) -> R<()> {
+    extract_layer_as(blob, rootfs, running_as_root())
+}
+
+/// [`extract_layer`] with the ownership decision made by the caller, so tests
+/// can exercise both paths.
+fn extract_layer_as(blob: &Path, rootfs: &Path, preserve_owners: bool) -> R<()> {
     let mut file = std::fs::File::open(blob)?;
     let mut magic = [0u8; 4];
     let read = file.read(&mut magic)?;
@@ -225,6 +651,7 @@ fn extract_layer(blob: &Path, rootfs: &Path) -> R<()> {
     };
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
+    archive.set_preserve_ownerships(preserve_owners);
     archive.set_overwrite(true);
 
     for entry in archive.entries()? {
@@ -257,11 +684,82 @@ fn extract_layer(blob: &Path, rootfs: &Path) -> R<()> {
             continue;
         }
 
+        // Read before unpacking: the PAX records sit in the header, and the
+        // entry's data is consumed by the unpack.
+        let xattrs = if preserve_owners {
+            entry_xattrs(&mut entry)
+        } else {
+            Vec::new()
+        };
         // `unpack_in` re-validates the path against the rootfs and resolves
-        // hardlink/symlink targets safely.
-        entry.unpack_in(rootfs)?;
+        // hardlink/symlink targets safely. It applies the owner, then the
+        // mode, so setuid bits survive.
+        if entry.unpack_in(rootfs)? && !xattrs.is_empty() {
+            // After the chown, which would clear `security.capability`.
+            apply_xattrs(&rootfs.join(&rel), &xattrs);
+        }
     }
     Ok(())
+}
+
+/// The PAX `SCHILY.xattr.<name>` records on a tar entry, minus the ones that
+/// must not be copied onto the host: `security.selinux` (the host's policy
+/// labels files, not the image) and `trusted.*` (overlayfs bookkeeping).
+fn entry_xattrs<T: Read>(entry: &mut tar::Entry<'_, T>) -> Vec<(String, Vec<u8>)> {
+    let Ok(Some(extensions)) = entry.pax_extensions() else {
+        return Vec::new();
+    };
+    extensions
+        .filter_map(Result::ok)
+        .filter_map(|extension| {
+            let name = extension.key().ok()?.strip_prefix("SCHILY.xattr.")?;
+            if name == "security.selinux" || name.starts_with("trusted.") {
+                return None;
+            }
+            Some((name.to_string(), extension.value_bytes().to_vec()))
+        })
+        .collect()
+}
+
+/// Sets extended attributes on an extracted path, best effort: a filesystem
+/// that does not support one (or a kernel that refuses it) costs the image
+/// that attribute, not the whole start.
+fn apply_xattrs(path: &Path, xattrs: &[(String, Vec<u8>)]) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return;
+        };
+        for (name, value) in xattrs {
+            let Ok(c_name) = std::ffi::CString::new(name.as_bytes()) else {
+                continue;
+            };
+            // SAFETY: both strings are NUL-terminated and outlive the call;
+            // `value` is a valid buffer of `value.len()` bytes.
+            let rc = unsafe {
+                libc::lsetxattr(
+                    c_path.as_ptr(),
+                    c_name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            if rc != 0 {
+                debug!(
+                    path = %path.display(),
+                    xattr = %name,
+                    error = %std::io::Error::last_os_error(),
+                    "Skipping an image layer's extended attribute this host refuses"
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, xattrs);
+    }
 }
 
 /// Removes the contents of a directory (used for opaque whiteouts) without
@@ -559,6 +1057,9 @@ pub(crate) struct BundleContext<'a> {
     /// created by the worker before start and holding loopback plus the
     /// datapath's listeners only.
     pub(crate) netns: Option<&'a Path>,
+    /// The process's capability set and rlimits: the defaults, or the
+    /// container task's `security.capabilities` / `ulimits`.
+    pub(crate) policy: &'a ProcessPolicy,
 }
 
 fn build_spec(
@@ -635,6 +1136,19 @@ fn build_spec(
         }
     }
 
+    // Docker's model: one set as bounding, effective, and permitted; nothing
+    // inheritable or ambient, so a process running as a non-root user keeps
+    // no capabilities across `execve`. `noNewPrivileges` stays on: it stops
+    // setuid binaries and file capabilities from *raising* privileges at
+    // exec, and does not stop a root entrypoint from dropping to another
+    // user with setuid(2)/setgid(2) — which is all `gosu` and `su-exec` do.
+    let capabilities = &ctx.policy.capabilities;
+    let rlimits: Vec<Value> = ctx
+        .policy
+        .rlimits
+        .iter()
+        .map(|limit| json!({ "type": limit.kind, "soft": limit.soft, "hard": limit.hard }))
+        .collect();
     let mut spec = json!({
         "ociVersion": "1.0.2",
         "process": {
@@ -644,11 +1158,11 @@ fn build_spec(
             "env": env,
             "cwd": cwd,
             "capabilities": {
-                "bounding": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
-                "effective": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
-                "permitted": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"]
+                "bounding": capabilities,
+                "effective": capabilities,
+                "permitted": capabilities
             },
-            "rlimits": [{ "type": "RLIMIT_NOFILE", "hard": 1024, "soft": 1024 }],
+            "rlimits": rlimits,
             "noNewPrivileges": true
         },
         "root": { "path": "rootfs", "readonly": false },
@@ -747,6 +1261,7 @@ mod tests {
             resolver: Some("127.42.0.1"),
             resolv_conf: None,
             netns: Some(netns),
+            policy: &ProcessPolicy::default(),
         };
         let spec = build_spec(
             &["true".to_string()],
@@ -911,6 +1426,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                policy: &ProcessPolicy::default(),
             },
         );
 
@@ -976,6 +1492,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                policy: &ProcessPolicy::default(),
             },
         )
     }
@@ -1091,6 +1608,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                policy: &ProcessPolicy::default(),
             },
         );
 
@@ -1152,6 +1670,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                policy: &ProcessPolicy::default(),
             },
         );
         let env = spec["process"]["env"].as_array().unwrap();

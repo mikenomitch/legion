@@ -119,7 +119,7 @@ pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: Tas
                 manager.set_allocation_health(
                     exit.allocation_id,
                     false,
-                    format!("{}; restarting", exit.describe()),
+                    format!("{}; restarting", exit.describe_with_output()),
                 );
             }
             tokio::time::sleep(delay).await;
@@ -141,7 +141,7 @@ pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: Tas
                 let mut manager = task_manager.lock().expect("task manager");
                 manager.record_failure(
                     exit.allocation_id,
-                    format!("{}; restart failed: {err}", exit.describe()),
+                    format!("{}; restart failed: {err}", exit.describe_with_output()),
                 );
             }
         }
@@ -163,7 +163,9 @@ pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: Tas
                 "Task failed"
             );
             let mut manager = task_manager.lock().expect("task manager");
-            manager.record_failure(exit.allocation_id, exit.describe());
+            // The reason the user reads (`allocation.failed`), so it carries
+            // the task's own last words; the log line above does not.
+            manager.record_failure(exit.allocation_id, exit.describe_with_output());
         }
     }
 }
@@ -187,6 +189,7 @@ mod task_supervisor_test {
             exit_code: code,
             signal: None,
             oom_killed_at_bytes: None,
+            stderr_tail: None,
         }
     }
 

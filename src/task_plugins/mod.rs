@@ -975,6 +975,34 @@ pub fn allocation_is_gated(allocation: &Allocation) -> bool {
         .is_some_and(|network| network.is_gated())
 }
 
+/// The network namespace a gated allocation joins, created now when it does
+/// not exist yet. `None` for an allocation that is not gated.
+///
+/// The worker's heartbeat creates gated namespaces ahead of its reconcile,
+/// but that is not the only way an allocation starts: the manager also
+/// pushes new allocations straight to the worker (`Worker.PostWork`), and
+/// those start before any heartbeat has listed them — at once when they
+/// have no artifacts, or the moment staging finishes. Refusing to start
+/// then failed the allocation outright (the manager rescheduled it, and on
+/// a small cluster could find nowhere to put it), so the start creates what
+/// it needs instead. Creation is idempotent and serialized with the
+/// heartbeat's (`netd::netns::create`). A namespace that cannot be created
+/// (no `CAP_SYS_ADMIN`, not Linux) is still a hard stop, never a silent fall
+/// back to host networking.
+pub fn ensure_gated_namespace(allocation: &Allocation) -> R<Option<PathBuf>> {
+    if !allocation_is_gated(allocation) {
+        return Ok(None);
+    }
+    let path = crate::worker::netd::netns::create(allocation.id).with_context(|| {
+        format!(
+            "allocation {} is network.mode = \"gated\" but its network namespace could not \
+             be created",
+            allocation.id
+        )
+    })?;
+    Ok(Some(path))
+}
+
 /// The edge-boot gate for a gated allocation is "policy withheld": a marker
 /// the datapath checks per connection (`netd::netns::set_gate`). Host
 /// runtimes call this from `set_network_gate`; it is a no-op for allocations

@@ -171,6 +171,28 @@ impl RaftTransportRegistry {
     ) -> Option<&openraft::Raft<types::TypeConfig>> {
         self.lanes.get(&Lane::from_wire_name(group_id)?)
     }
+
+    /// The raft GROUP that carries `lane` on this manager: the lane itself
+    /// under `lanes` topology, and the one control group under `single`,
+    /// where every lane rides it. This is the space a `ForwardLaneWrite`
+    /// envelope's `group_id` lives in — senders address the group that
+    /// commits the op, not the op's logical lane — so a receiver must
+    /// compare in the same space.
+    pub(crate) fn group_for(&self, lane: Lane) -> Lane {
+        physical_group(self.lanes.len(), lane)
+    }
+}
+
+/// The raft group that commits `lane` when `active_groups` groups run:
+/// `single` topology has exactly one (control), which carries every lane.
+/// Shared by the forwarding sender and receiver so they can never disagree
+/// about which space a `group_id` is in.
+pub(crate) fn physical_group(active_groups: usize, lane: Lane) -> Lane {
+    if active_groups <= 1 {
+        Lane::Control
+    } else {
+        lane
+    }
 }
 
 impl std::fmt::Debug for RaftTransportRegistry {

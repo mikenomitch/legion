@@ -6698,11 +6698,17 @@ impl Manager for ManagerDaemonService {
         .to_string();
 
         // Re-registration (a worker restart, or a token rotation) keeps the
-        // operator's availability: a drained or ineligible node must not
-        // silently become schedulable again. Only a new node starts
+        // operator's availability: a drained node must not silently become
+        // schedulable again. `unavailable` is NOT operator intent — node
+        // loss sets it — and a registering worker is by definition alive,
+        // so it returns to `available` here, the same way a recovering
+        // heartbeat does. Keeping it registered the node `active` but
+        // unschedulable, which the scheduler then reported as "No nodes
+        // available" (spot-check P0-6). Only a new node starts
         // `available`. The value is resolved here, not in the store's apply
         // step, so every replica applies the same explicit value.
         let availability = match self.store.get_node(&node_id) {
+            Ok(existing) if existing.availability == "unavailable" => "available".to_string(),
             Ok(existing) => existing.availability,
             Err(err)
                 if matches!(
@@ -11957,6 +11963,36 @@ mod tests {
         store.set_node_availability("drained-node", "drained")?;
         manager.worker_register(register()).await?;
         assert_eq!(store.get_node("drained-node")?.availability, "drained");
+        Ok(())
+    }
+
+    /// A worker that re-registers after its node was marked LOST must come
+    /// back schedulable (spot-check P0-6). `unavailable` is what loss sets,
+    /// not operator intent, so keeping it registered an `active` node that
+    /// every placement then skipped ("No nodes available").
+    #[tokio::test]
+    async fn re_registration_after_loss_makes_the_node_schedulable() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let register = || {
+            tonic::Request::new(WorkerRegisterRequest {
+                name: "lost-node".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                ..Default::default()
+            })
+        };
+        manager.worker_register(register()).await?;
+        store.mark_nodes_as_lost(&["lost-node".to_string()])?;
+        assert_eq!(store.get_node("lost-node")?.availability, "unavailable");
+
+        manager.worker_register(register()).await?;
+        let node = store.get_node("lost-node")?;
+        assert_eq!(node.status, "active");
+        assert_eq!(node.availability, "available");
+        assert!(store.available_node_ids()?.contains("lost-node"));
         Ok(())
     }
 

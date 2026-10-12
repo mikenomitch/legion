@@ -235,14 +235,24 @@ impl RaftTransport for RaftTransportService {
                     "undecodable ForwardLaneWrite payload (mixed manager protocol versions?): {e}"
                 ))
             })?;
-        // Sanity: the envelope's lane must be the op's own lane — a mismatch
-        // is a bug on the sending side, not a leadership question.
-        if envelope.group_id != op.lane().wire_name() {
+        // Sanity: the envelope names the raft GROUP that commits the op (the
+        // sender addresses a group active on this receiver). Compare in that
+        // same space: under `single` topology every lane rides the control
+        // group, so a status-lane heartbeat arrives as `control`. Comparing
+        // against the op's logical lane instead rejected every forwarded
+        // status-lane write in the recommended topology, which left workers
+        // that dial a follower marked lost (spot-check P0-5). A mismatch in
+        // group space is a bug on the sending side, not a leadership
+        // question.
+        let expected_group = registry.group_for(op.lane());
+        if envelope.group_id != expected_group.wire_name() {
             return Err(Status::invalid_argument(format!(
-                "ForwardLaneWrite lane mismatch: envelope says `{}`, op `{}` belongs to `{}`",
+                "ForwardLaneWrite lane mismatch: envelope says `{}`, op `{}` belongs to the \
+                 `{}` lane, which this manager commits through the `{}` group",
                 envelope.group_id,
                 op.op_name(),
-                op.lane().wire_name()
+                op.lane().wire_name(),
+                expected_group.wire_name()
             )));
         }
         // The op is blocking store work (capture + quorum commit + local

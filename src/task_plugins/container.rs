@@ -837,22 +837,11 @@ impl TaskPlugin for ContainerTaskPlugin {
                     .network
                     .as_ref()
                     .and_then(|network| network.resolver_address());
-                // A gated allocation joins the namespace the worker created
-                // for it (docs/network-handlers.md); its absence is a hard
-                // stop rather than a silent fall back to host networking.
-                let gated_netns = if crate::task_plugins::allocation_is_gated(allocation) {
-                    let path = crate::worker::netd::netns::netns_path(allocation.id);
-                    if !path.exists() {
-                        bail!(
-                            "gated network namespace {} is not ready; the worker creates it before \
-                             start and retries on its next heartbeat",
-                            path.display()
-                        );
-                    }
-                    Some(path)
-                } else {
-                    None
-                };
+                // A gated allocation joins its own namespace
+                // (docs/network-handlers.md), created here if the heartbeat
+                // has not made it yet; failing to create it is a hard stop
+                // rather than a silent fall back to host networking.
+                let gated_netns = crate::task_plugins::ensure_gated_namespace(allocation)?;
                 let image_stop_signal = oci_bundle::build_bundle(
                     &layout,
                     &bundle,

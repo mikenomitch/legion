@@ -294,6 +294,23 @@ impl LivenessTable {
         self.lock().seen.get(node_id).copied()
     }
 
+    /// Whether this manager has HEARD from `node_id` (a beat it received, or
+    /// a peer's digest naming it) since it became responsible for liveness.
+    ///
+    /// The acquisition seed does not count: it is placed at exactly
+    /// `responsible_since` and only means "not yet known to be dead". This is
+    /// the evidence the availability reconciler needs before it puts a node
+    /// back in the scheduling pool — the replicated status says `active`, and
+    /// this says the node is actually talking to the control plane right now.
+    /// Always false on a manager that is not responsible.
+    pub fn observed_since_responsible(&self, node_id: &str) -> bool {
+        let state = self.lock();
+        match (state.responsible_since, state.seen.get(node_id)) {
+            (Some(since), Some(beat)) => beat.at > since,
+            _ => false,
+        }
+    }
+
     /// First sighting of a node the table has never seen — a node that
     /// registered after this manager became responsible. Seeded at `now` and
     /// therefore never lost on the tick that discovers it.
@@ -514,6 +531,30 @@ mod liveness_table_test {
         // Past the grace, a genuinely-gone manager's nodes become eligible.
         let at = start + Duration::from_secs(31);
         assert!(!table.peer_gap_at(at).suppressed.contains("c-1"));
+    }
+
+    #[test]
+    fn only_a_beat_after_acquisition_counts_as_observed_test() {
+        let table = table();
+        let start = Instant::now();
+        // A beat from before responsibility began, and the seed itself, are
+        // not evidence the node is talking to THIS leader.
+        table.observe_at("early", start, 0);
+        assert!(!table.observed_since_responsible("early"), "not responsible yet");
+        let since = start + Duration::from_secs(1);
+        table.become_responsible_at(&["early".into(), "seeded".into()], since, 1);
+        assert!(!table.observed_since_responsible("early"));
+        assert!(!table.observed_since_responsible("seeded"));
+        assert!(!table.observed_since_responsible("unknown"));
+
+        table.observe_at("seeded", since + Duration::from_millis(10), 2);
+        assert!(table.observed_since_responsible("seeded"));
+        // A peer manager's digest counts too: that node dials a follower.
+        table.observe_peer_at("mgr-b", vec!["via-peer".into()], since + Duration::from_secs(1), 3);
+        assert!(table.observed_since_responsible("via-peer"));
+
+        table.relinquish();
+        assert!(!table.observed_since_responsible("seeded"));
     }
 
     #[test]

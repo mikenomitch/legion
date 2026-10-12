@@ -64,11 +64,29 @@ pub struct TaskExit {
     /// exit code 137 on its own sends the job author hunting through dmesg —
     /// this is what lets [`Self::describe`] name the limit that fired.
     pub oom_killed_at_bytes: Option<u64>,
+    /// The last few lines the process wrote to stderr before an
+    /// *unsuccessful* exit (bounded: [`STDERR_TAIL_LINES`] lines,
+    /// [`STDERR_TAIL_MAX_CHARS`] characters). `None` for a successful exit,
+    /// a silent one, or a runtime that captures no logs.
+    ///
+    /// A process that dies at start usually says why on stderr — a registry
+    /// that refused an image pull, a missing input file — and before this
+    /// rode along, the only reason the user saw was whatever the health
+    /// checks noticed next (`tcp check failed: Connection refused`).
+    pub stderr_tail: Option<String>,
 }
 
+/// How many trailing stderr lines a failed exit carries into its reason.
+pub const STDERR_TAIL_LINES: usize = 3;
+/// Cap on the carried stderr tail, in characters. The end is kept: the
+/// error is usually the last thing a crashing process prints.
+pub const STDERR_TAIL_MAX_CHARS: usize = 400;
+/// How far back from the end of `stderr.log` the tail is looked for.
+const STDERR_TAIL_READ_BYTES: u64 = 4096;
+
 impl TaskExit {
-    /// Human-readable rendering used in health status, failure reasons, and
-    /// the terminal report.
+    /// Human-readable rendering of the exit status, used in worker logs and
+    /// the terminal report. Never includes task output.
     pub fn describe(&self) -> String {
         let status = match (self.exit_code, self.signal) {
             (Some(code), _) => format!("exited with status {code}"),
@@ -83,6 +101,81 @@ impl TaskExit {
             None => status,
         }
     }
+
+    /// [`Self::describe`] plus the task's last stderr lines, when it exited
+    /// unsuccessfully: `exited with status 1; last stderr: Error: pull
+    /// access denied`. This is what the user reads as the allocation's
+    /// status and failure reason (and so in `allocation.failed` events). The
+    /// worker's own log lines use [`Self::describe`]: they have no business
+    /// copying task output, which can carry anything.
+    pub fn describe_with_output(&self) -> String {
+        match self.stderr_tail.as_deref() {
+            Some(tail) => format!("{}; last stderr: {tail}", self.describe()),
+            None => self.describe(),
+        }
+    }
+}
+
+/// The last [`STDERR_TAIL_LINES`] non-empty lines of `stderr.log` in
+/// `log_dir` written at or after byte `from` (where the current process
+/// started writing), capped at [`STDERR_TAIL_MAX_CHARS`] characters and
+/// joined with ` | ` so the result stays one line in an event. `None` when
+/// the process wrote nothing.
+///
+/// A file shorter than `from` was rotated or truncated since; the tail is
+/// then read from what is there.
+fn stderr_tail(log_dir: &std::path::Path, from: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(log_dir.join(crate::task_plugins::STDERR_LOG_FILE)).ok()?;
+    let len = file.metadata().ok()?.len();
+    let from = if from > len { 0 } else { from };
+    let start = from.max(len.saturating_sub(STDERR_TAIL_READ_BYTES));
+    if start >= len {
+        return None;
+    }
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(len - start).read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let tail = lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..].join(" | ");
+    if tail.is_empty() {
+        return None;
+    }
+    let chars = tail.chars().count();
+    if chars <= STDERR_TAIL_MAX_CHARS {
+        return Some(tail);
+    }
+    let kept = tail
+        .chars()
+        .skip(chars - STDERR_TAIL_MAX_CHARS)
+        .collect::<String>();
+    Some(format!("…{kept}"))
+}
+
+/// Remove a failed gated allocation's namespace mount and gate marker.
+/// Best-effort: a namespace that will not unmount is logged, and the
+/// heartbeat's own teardown retries it while it still tracks the allocation.
+fn release_gated_namespace(allocation_id: i64) {
+    if !crate::worker::netd::netns::netns_exists(allocation_id) {
+        return;
+    }
+    if let Err(err) = crate::worker::netd::netns::destroy(allocation_id) {
+        warn!(allocation_id, error = ?err, "Failed to remove gated network namespace");
+    }
+    let _ = crate::worker::netd::netns::set_gate(allocation_id, false);
+}
+
+/// The current length of `stderr.log` in `log_dir`, 0 when it does not
+/// exist yet: where a process about to start begins writing.
+fn stderr_len(log_dir: &std::path::Path) -> u64 {
+    std::fs::metadata(log_dir.join(crate::task_plugins::STDERR_LOG_FILE))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
 }
 
 /// One allocation inside its grace window: signalled, not yet reaped.
@@ -315,6 +408,10 @@ pub struct WorkerTaskManager {
     /// gets `on_unhealthy.restart_count` restarts in total rather than that
     /// many per path.
     restart_history: HashMap<i64, Vec<std::time::Instant>>,
+    /// Length of each allocation's `stderr.log` when its current process was
+    /// launched, so a failed exit reports what *that* process printed rather
+    /// than an earlier run's output (the file is appended across restarts).
+    stderr_marks: HashMap<i64, u64>,
     // Per-allocation self-fence windows (stateful tasks only; see
     // `TaskAllocation.self_terminate_after_seconds`). The watchdog kills any
     // allocation whose window is exceeded by the time since the last
@@ -450,6 +547,7 @@ impl WorkerTaskManager {
             terminated_reports: Vec::new(),
             terminated: HashMap::new(),
             restart_history: HashMap::new(),
+            stderr_marks: HashMap::new(),
             self_fence_windows: HashMap::new(),
             stop_causes: HashMap::new(),
             bands: HashMap::new(),
@@ -480,7 +578,10 @@ impl WorkerTaskManager {
             volume_specs: HashMap::new(),
             claims: ClaimTable::new(),
             ledger: LocalLedger::default(),
-            resources: NodeResourceGovernor::from_env(),
+            // Configured explicitly by the daemon from the worker config
+            // (`configure_resource_enforcement`), never inferred here: this
+            // constructor runs before the daemon has read that config.
+            resources: NodeResourceGovernor::disabled(),
             launching: HashMap::new(),
             cancelled_launches: std::collections::HashSet::new(),
             next_launch_generation: 0,
@@ -808,6 +909,27 @@ impl WorkerTaskManager {
     /// Phase 7b publishes snapshot parts through this (`durability = "store"`).
     pub fn content_publishing(&self) -> Option<Arc<crate::content_publish::ContentPublishing>> {
         self.content_publishing.clone()
+    }
+
+    /// Turn on resource enforcement from the worker's `resourceEnforcement`
+    /// settings (docs/resource-enforcement.md). Call before any allocation is
+    /// started or restored: a task placed while the governor is disabled runs
+    /// unconfined for its whole life.
+    ///
+    /// Returns whether the governor actually enforces, which is less than
+    /// `config.enabled` on a node that cannot (not Linux, no cgroup v2, no
+    /// usable CPUs); the governor logs which.
+    pub fn configure_resource_enforcement(
+        &mut self,
+        config: &crate::structs::WorkerResourceEnforcementConfig,
+    ) -> bool {
+        self.resources = NodeResourceGovernor::from_settings(config.enabled, &config.cgroup_parent);
+        self.resources.enabled()
+    }
+
+    /// Whether this worker's resource governor enforces limits.
+    pub fn resource_enforcement_enabled(&self) -> bool {
+        self.resources.enabled()
     }
 
     pub fn load_builtin_plugins(&mut self) {
@@ -1337,12 +1459,27 @@ impl WorkerTaskManager {
                             (crate::worker::resources::oom_kill_count(assignment) > 0)
                                 .then_some(limit)
                         });
+                // Why it died, in its own words — only for an exit the task
+                // does not count as success, where it is the actual cause.
+                let succeeded = self
+                    .task_configs
+                    .get(&allocation_id)
+                    .is_some_and(|task| task.exit_code_is_success(exit_code));
+                let stderr_tail = if succeeded {
+                    None
+                } else {
+                    instance.log_dir.as_deref().and_then(|log_dir| {
+                        let from = self.stderr_marks.get(&allocation_id).copied();
+                        stderr_tail(log_dir, from.unwrap_or(0))
+                    })
+                };
                 exits.push(TaskExit {
                     allocation_id,
                     task_name,
                     exit_code,
                     signal,
                     oom_killed_at_bytes,
+                    stderr_tail,
                 });
             }
         }
@@ -1356,6 +1493,18 @@ impl WorkerTaskManager {
     /// The task config for a live allocation, if this worker still holds it.
     pub fn task_config(&self, allocation_id: i64) -> Option<&TaskConfig> {
         self.task_configs.get(&allocation_id)
+    }
+
+    /// The exit an allocation's process made, while it is down: between the
+    /// supervisor noticing the exit and the relaunch (or for good, once the
+    /// allocation is terminal). `None` while the process runs.
+    ///
+    /// The health monitor reads this to stand aside: a check against a dead
+    /// process can only fail, and failing the allocation for it would report
+    /// `Connection refused` where the real story is the exit (and the
+    /// stderr) the supervisor is already acting on.
+    pub fn process_exit(&self, allocation_id: i64) -> Option<&TaskExit> {
+        self.terminated.get(&allocation_id)
     }
 
     /// Clear an allocation's terminal flag so the supervisor watches it again.
@@ -1421,6 +1570,7 @@ impl WorkerTaskManager {
                 exit_code: None,
                 signal: None,
                 oom_killed_at_bytes: None,
+                stderr_tail: None,
             },
         );
         self.set_allocation_health(allocation_id, true, message.clone());
@@ -1579,6 +1729,10 @@ impl WorkerTaskManager {
         if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
             monitor.shutdown();
         }
+        let gated = self
+            .allocations
+            .get(&allocation_id)
+            .is_some_and(crate::task_plugins::allocation_is_gated);
         // A launch still inside its runtime call is cancelled rather than
         // destroyed here: its launch thread owns the real instance and tears
         // it down (runtime, volumes, cores) once the call returns.
@@ -1619,6 +1773,7 @@ impl WorkerTaskManager {
         self.terminated.remove(&allocation_id);
         self.terminating.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
+        self.stderr_marks.remove(&allocation_id);
         // A task that failed on its own was never stopped by the platform,
         // so any pending notice for it describes a stop that will not happen.
         self.stop_causes.remove(&allocation_id);
@@ -1628,6 +1783,14 @@ impl WorkerTaskManager {
         let artifact_states = self.artifact_status.snapshot_json(allocation_id);
         self.artifact_status.remove(allocation_id);
         self.cleanup_alloc_dir(allocation_id);
+        // The start may have created the gated namespace itself (a pushed
+        // allocation, see `task_plugins::ensure_gated_namespace`). One that
+        // fails before any heartbeat listed it is never in the heartbeat's
+        // set of namespaces to tear down, so release it here. Idempotent with
+        // the heartbeat's own teardown.
+        if gated {
+            release_gated_namespace(allocation_id);
+        }
         self.failed.push(FailedAllocationReport {
             allocation_id,
             reason,
@@ -2182,6 +2345,7 @@ impl WorkerTaskManager {
         self.resources.release(allocation_id, assignment);
 
         self.preemptors.remove(&allocation_id);
+        self.stderr_marks.remove(&allocation_id);
         if remove_dirs {
             self.volume_specs.remove(&allocation_id);
             self.cleanup_alloc_dir(allocation_id);
@@ -2502,6 +2666,11 @@ impl WorkerTaskManager {
                 );
             }
             plugin.set_network_gate(allocation, task, instance, false)?;
+        }
+
+        if let Some(log_dir) = instance.log_dir.as_deref() {
+            self.stderr_marks
+                .insert(allocation.id, stderr_len(log_dir));
         }
 
         if let Some(restore) = self.checkpoints.restores.get(&allocation.id).cloned() {
@@ -3131,7 +3300,10 @@ impl WorkerTaskManager {
                     task.name
                 )
             })?;
-        instance.log_dir = Some(self.state_store.allocation_log_dir(allocation.id));
+        let log_dir = self.state_store.allocation_log_dir(allocation.id);
+        self.stderr_marks
+            .insert(allocation.id, stderr_len(&log_dir));
+        instance.log_dir = Some(log_dir);
         // Launch ready for memory checkpoints when the task asks for them
         // and the runtime can take them here (see
         // `prepare_registered_allocation`).
@@ -3392,6 +3564,10 @@ impl WorkerTaskManager {
             .context("Task plugin missing for restart")?;
 
         plugin.stop(allocation, task, instance)?;
+        if let Some(log_dir) = instance.log_dir.as_deref() {
+            self.stderr_marks
+                .insert(allocation_id, stderr_len(log_dir));
+        }
         plugin.start(allocation, task, instance)?;
         // A relaunched process is a live process again: drop the terminal flag
         // so the supervisor resumes watching this allocation.
@@ -4085,11 +4261,14 @@ fn spawn_provisional_staging_thread(
     let gate = job.gate;
     let manager_for_thread = manager.clone();
     let claim_for_thread = claim_id.clone();
+    let runtime = current_runtime();
     let spawned = std::thread::Builder::new()
         .name(format!("provisional-staging-{allocation_id}"))
         .spawn(move || {
             let manager = manager_for_thread;
             let result = job.stage();
+            // See `spawn_staging_thread`: the health monitor is a tokio task.
+            let _runtime = enter_runtime(runtime.as_ref());
 
             let started = {
                 let mut guard = manager.lock().expect("task manager");
@@ -4131,14 +4310,41 @@ fn spawn_provisional_staging_thread(
     }
 }
 
+/// The async runtime the caller runs on, captured before work moves to a
+/// dedicated OS thread, so the thread can [`enter_runtime`] it.
+///
+/// Staging and provisional launches run on plain threads (a pull or a fetch
+/// can take minutes, which would pin a blocking-pool thread), and those
+/// threads end by starting the allocation's health monitor, identity
+/// refreshes and other tokio tasks. A plain thread has no runtime: the first
+/// `tokio::spawn` on it panics, killing the thread before the monitor exists,
+/// and the allocation sat at `health checks starting` forever. Every
+/// production caller runs inside the worker's runtime (a `spawn_blocking`
+/// closure or an RPC handler), so there is always a handle to capture.
+pub(crate) fn current_runtime() -> Option<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current().ok()
+}
+
+/// Enter `handle` on the current thread for as long as the guard lives —
+/// the same context a `spawn_blocking` closure has.
+pub(crate) fn enter_runtime(
+    handle: Option<&tokio::runtime::Handle>,
+) -> Option<tokio::runtime::EnterGuard<'_>> {
+    handle.map(tokio::runtime::Handle::enter)
+}
+
 fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob) {
     let allocation_id = job.allocation.id;
     let manager_for_thread = manager.clone();
+    let runtime = current_runtime();
     let spawned = std::thread::Builder::new()
         .name(format!("artifact-staging-{allocation_id}"))
         .spawn(move || {
             let manager = manager_for_thread;
             let result = job.stage();
+            // Staging is plain blocking work. What follows is not: the start
+            // hands the allocation to its health monitor, a tokio task.
+            let _runtime = enter_runtime(runtime.as_ref());
 
             const START_FAILED: &str = "start after artifact staging failed: ";
             let launch = {
@@ -4315,6 +4521,25 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
                 .context("Invalid task snapshots JSON")?,
         )
     };
+    // Lifecycle and restart policy: what the supervisor does when the process
+    // exits. An empty lifecycle is the jobspec default (`service`); an empty
+    // restart block means "derive the policy from the lifecycle", which is
+    // why it stays `None` rather than becoming an explicit `always`.
+    let lifecycle = if allocation.task_lifecycle.trim().is_empty() {
+        crate::structs::TaskLifecycle::default()
+    } else {
+        allocation
+            .task_lifecycle
+            .trim()
+            .parse()
+            .map_err(|err: String| anyhow!(err))
+            .context("Invalid task lifecycle")?
+    };
+    let restart = if allocation.task_restart.trim().is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&allocation.task_restart).context("Invalid task restart JSON")?)
+    };
     // The instance this allocation serves, from the env the manager
     // injected at dispatch: the pressure response only suspends instances,
     // and a sandbox's identity disk names its instance.
@@ -4336,6 +4561,8 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         stop,
         suspend,
         snapshots,
+        lifecycle,
+        restart,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_runtime)
     };
     let alloc = Allocation {

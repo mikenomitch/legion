@@ -569,3 +569,151 @@ fn a_silent_peer_manager_does_not_kill_its_nodes() -> R<()> {
     assert_eq!(lost, vec!["mine".to_string(), "theirs".to_string()]);
     Ok(())
 }
+
+/// A node with real capacity, so the scheduler can actually place on it.
+fn register_with_capacity(store: &Store, id: &str, availability: &str) -> R<()> {
+    store.insert_node(NodeMsg {
+        id: id.to_string(),
+        pool: "default".into(),
+        status: "active".into(),
+        availability: availability.into(),
+        config_attrs: json!({ "maxAllocations": 20 }).to_string(),
+        fingerprint_attrs: json!({
+            "memory_total": "8589934592",
+            "cpus": { "cpu-1": { "frequency": "2400" }, "cpu-2": { "frequency": "2400" } }
+        })
+        .to_string(),
+        dynamic_attrs: "{}".into(),
+        health_checks: "{}".into(),
+        last_heartbeat: String::new(),
+        heartbeat_source: String::new(),
+    })?;
+    Ok(())
+}
+
+/// Submit a one-task service job and run its `job_submit` eval inline.
+fn submit_and_place(store: &Store, name: &str) -> R<usize> {
+    use legion::structs::job::{JobConfig, TaskConfig, TaskCount};
+    use legion::structs::{Eval, Submission};
+    let job = JobConfig {
+        priority: Default::default(),
+        rollout: None,
+        rollout_by_group: Default::default(),
+        name: name.to_string(),
+        tasks: vec![TaskConfig {
+            count: TaskCount::new(1),
+            config: json!({ "message": "hi" }),
+            resources: json!({ "memory": 128, "cpu": 100 }),
+            ..TaskConfig::new(format!("{name}-task"), "service")
+        }],
+        version: None,
+    };
+    let submissions = vec![Submission {
+        path: format!("{name}.json"),
+        content: name.to_string(),
+        is_primary: true,
+    }];
+    store.handle_job_submit(&job, &submissions)?;
+    let job_config_id = store.get_job_config(name)?.id();
+    let eval = Eval {
+        id: format!("eval-{name}"),
+        status: "pending".into(),
+        kind: "job_submit".into(),
+        job_id: name.to_string(),
+        job_config_id,
+        node_name: String::new(),
+        priority: 50,
+    };
+    // A placement failure is the thing under test, not a harness error.
+    let _ = eval.handle(store);
+    Ok(store.allocs_for_job(name)?.len())
+}
+
+/// Spot-check P0-6: an old leader marked the node lost (`unavailable`), the
+/// node's liveness came back on a path that did not also restore
+/// schedulability (an older manager's re-registration kept `unavailable`),
+/// and a NEW leader — which holds liveness only in memory and replicates
+/// only transitions — never wrote the missing half. `legion node list`
+/// said active; every placement said "No nodes available".
+///
+/// The liveness owner now reconciles the two halves every tick, on evidence:
+/// only once it has actually heard from the node.
+#[test]
+fn a_new_leader_returns_a_heartbeating_node_to_the_pool() -> R<()> {
+    let store = setup_store(5)?;
+    register_with_capacity(&store, "node-1", "available")?;
+    // The old leader's loss: both halves.
+    store.mark_nodes_as_lost(&["node-1".to_string()])?;
+    // Liveness came back without the availability half.
+    register_with_capacity(&store, "node-1", "unavailable")?;
+    let node = store.get_node("node-1")?;
+    assert_eq!((node.status.as_str(), node.availability.as_str()), ("active", "unavailable"));
+    assert_eq!(submit_and_place(&store, "before")?, 0, "the scheduler skips it");
+
+    // The new leader takes responsibility. A seed is not evidence.
+    store.liveness().become_responsible(&["node-1".into()]);
+    assert_eq!(store.reconcile_node_availability()?, (0, 0));
+    assert_eq!(store.get_node("node-1")?.availability, "unavailable");
+
+    // It hears from the node (directly, or through a peer's digest)...
+    std::thread::sleep(Duration::from_millis(5));
+    store.liveness().observe("node-1");
+    // ...and the stored row now agrees with liveness.
+    assert_eq!(store.reconcile_node_availability()?, (1, 0));
+    assert_eq!(store.get_node("node-1")?.availability, "available");
+    assert_eq!(submit_and_place(&store, "after")?, 1, "placement succeeds");
+    // Idempotent: nothing left to repair.
+    assert_eq!(store.reconcile_node_availability()?, (0, 0));
+    Ok(())
+}
+
+/// The reconcile pass never overrides an operator: a cordoned (`drained`)
+/// node stays cordoned however its liveness moves.
+#[test]
+fn the_availability_reconcile_leaves_a_cordon_alone() -> R<()> {
+    let store = setup_store(5)?;
+    register_with_capacity(&store, "node-1", "available")?;
+    store.set_node_availability("node-1", "drained")?;
+    store.liveness().become_responsible(&["node-1".into()]);
+    std::thread::sleep(Duration::from_millis(5));
+    store.liveness().observe("node-1");
+    assert_eq!(store.reconcile_node_availability()?, (0, 0));
+    assert_eq!(store.get_node("node-1")?.availability, "drained");
+    Ok(())
+}
+
+/// A half-applied LOSS (status `lost`, availability still `available`) is
+/// withdrawn from placement, unless this manager is hearing from the node.
+#[test]
+fn a_half_applied_loss_is_withdrawn_from_placement() -> R<()> {
+    let store = setup_store(5)?;
+    register_with_capacity(&store, "node-1", "available")?;
+    store.mark_nodes_as_lost(&["node-1".to_string()])?;
+    // Simulate the control half never landing.
+    store.set_node_availability("node-1", "available")?;
+    assert_eq!(store.get_node("node-1")?.status, "lost");
+    store.liveness().become_responsible(&[]);
+    assert_eq!(store.reconcile_node_availability()?, (0, 1));
+    assert_eq!(store.get_node("node-1")?.availability, "unavailable");
+    Ok(())
+}
+
+/// Loss and recovery own `available`/`unavailable` only. Before, a cordoned
+/// node that went lost was rewritten to `unavailable`, and the recovery then
+/// rewrote that to `available` — silently undoing the cordon.
+#[test]
+fn a_cordoned_node_stays_cordoned_through_loss_and_recovery() -> R<()> {
+    let store = setup_store(5)?;
+    register(&store, "node-1", None)?;
+    store.set_node_availability("node-1", "drained")?;
+    store.mark_nodes_as_lost(&["node-1".to_string()])?;
+    let node = store.get_node("node-1")?;
+    assert_eq!(node.status, "lost");
+    assert_eq!(node.availability, "drained", "loss must not erase a cordon");
+
+    store.update_node_heartbeat("node-1".to_string())?;
+    let node = store.get_node("node-1")?;
+    assert_eq!(node.status, "active");
+    assert_eq!(node.availability, "drained", "recovery must not uncordon");
+    Ok(())
+}

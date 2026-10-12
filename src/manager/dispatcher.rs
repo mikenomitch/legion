@@ -624,6 +624,15 @@ pub fn build_task_allocation_with(
         }
         None => String::new(),
     };
+    // Lifecycle and restart decide what the worker's supervisor does when the
+    // process exits. Without them every task ran as a service with
+    // `restart = always`, so a batch task that exited 0 was relaunched forever
+    // and never reported success. The restart block stays empty when
+    // undeclared: the worker then derives the policy from the lifecycle.
+    let task_restart = match task.restart.as_ref() {
+        Some(restart) => serde_json::to_string(restart).context("Failed to serialize restart")?,
+        None => String::new(),
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -654,6 +663,8 @@ pub fn build_task_allocation_with(
         task_suspend,
         task_snapshots,
         identity_epoch: instance.map_or(0, |instance| instance.identity_epoch),
+        task_lifecycle: task.lifecycle.to_string(),
+        task_restart,
     })
 }
 

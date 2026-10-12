@@ -7205,12 +7205,19 @@ impl Store {
         {
             let conn = self.write_connection()?;
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            // Leaving 'drained' also clears the drain-eviction intent flag
-            // (the sync paths never SET 'drained', only ready/lost flips).
+            // Liveness owns exactly two values: `available` and
+            // `unavailable`. `drained` is operator intent (`node cordon` /
+            // `drain`), so this sync never overwrites it: a cordoned node
+            // that goes lost stays cordoned, and therefore stays cordoned
+            // when it comes back (before this guard, loss rewrote `drained`
+            // to `unavailable` and the recovery then rewrote that to
+            // `available`, silently undoing the cordon). Leaving 'drained'
+            // also clears the drain-eviction intent flag (the sync paths
+            // never SET 'drained', only ready/lost flips).
             let sql = format!(
                 "UPDATE node SET availability = ?1,
                         drain_evict = CASE WHEN ?1 = 'drained' THEN drain_evict ELSE 0 END
-                 WHERE id IN ({placeholders});"
+                 WHERE id IN ({placeholders}) AND availability != 'drained';"
             );
             let mut params: Vec<&dyn rusqlite::ToSql> = vec![&availability];
             for id in ids {
@@ -8074,6 +8081,74 @@ impl Store {
                 "Could not read node to restore its availability after recovery"
             ),
         }
+    }
+
+    /// Make every node's stored schedulability agree with its liveness, on
+    /// the manager responsible for liveness (the status-lane leader's tick).
+    ///
+    /// Node loss and recovery are each two replicated writes: the status lane
+    /// records `lost`/`active`, the control lane flips `node.availability`
+    /// between `unavailable` and `available`, and the scheduler places only
+    /// on `available`. Any path that lands one half and not the other — a
+    /// leadership change between the two writes, a forward that failed, an
+    /// older manager's re-registration that kept `unavailable` — leaves a
+    /// node `legion node list` shows as `active` while every placement says
+    /// "No nodes available" (spot-check P0-6). Liveness lives in the leader's
+    /// memory and only transitions are replicated, so nothing re-derives the
+    /// missing half on its own; this pass does, every tick:
+    ///
+    /// - **`active` + `unavailable`, and this manager has heard from the node
+    ///   since it took responsibility** → `available`. The observation
+    ///   requirement means a node is returned to the pool on evidence, not
+    ///   on a stale row.
+    /// - **`lost` + `available`, and this manager has NOT heard from it** →
+    ///   `unavailable`, so a half-applied loss cannot keep attracting
+    ///   placements.
+    ///
+    /// `drained` is never touched (operator intent; see
+    /// [`Self::sync_node_availability`]). Reads the scheduler's own read
+    /// model, so what it repairs is exactly what placement sees. Returns
+    /// `(revived, retired)` node counts.
+    #[instrument(err, skip_all)]
+    pub fn reconcile_node_availability(&self) -> R<(usize, usize)> {
+        let (revive, retire) = {
+            let guard = self.read_model_reader()?;
+            let mut revive: Vec<String> = Vec::new();
+            let mut retire: Vec<String> = Vec::new();
+            for (id, node) in guard.nodes.iter() {
+                match (node.status.as_str(), node.availability.as_str()) {
+                    ("active", "unavailable") if self.liveness.observed_since_responsible(id) => {
+                        revive.push(id.clone())
+                    }
+                    ("lost", "available") if !self.liveness.observed_since_responsible(id) => {
+                        retire.push(id.clone())
+                    }
+                    _ => {}
+                }
+            }
+            revive.sort();
+            retire.sort();
+            (revive, retire)
+        };
+        if !revive.is_empty() {
+            self.sync_node_availability(&revive, "available")?;
+            info!(
+                nodes = ?revive,
+                "Nodes reported active and heartbeating but stored as unavailable; returned \
+                 them to the scheduling pool"
+            );
+            crate::manager::telemetry::metrics()
+                .nodes_recovered_total
+                .inc_by(&["reconcile"], revive.len() as u64);
+        }
+        if !retire.is_empty() {
+            self.sync_node_availability(&retire, "unavailable")?;
+            warn!(
+                nodes = ?retire,
+                "Nodes marked lost were still schedulable; withdrew them from placement"
+            );
+        }
+        Ok((revive.len(), retire.len()))
     }
 
     /// The liveness soft-state table (liveness plan §6.2).

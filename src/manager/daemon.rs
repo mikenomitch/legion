@@ -1301,6 +1301,29 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                     store.liveness().forget(id);
                 }
             }
+            // Availability reconcile: liveness lives here, in memory, and
+            // only transitions are replicated, so a node whose loss or
+            // recovery landed only one of its two halves (status vs.
+            // `node.availability`) would otherwise stay that way — active in
+            // `legion node list`, invisible to the scheduler (spot-check
+            // P0-6). One read-model scan in steady state; it proposes only
+            // when it finds a disagreement.
+            {
+                let store_for_reconcile = store.clone();
+                match tokio::task::spawn_blocking(move || {
+                    store_for_reconcile.reconcile_node_availability()
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        warn!(error = ?err, "Failed reconciling node availability; will retry next tick")
+                    }
+                    Err(join_error) => {
+                        warn!("Node availability reconcile task failed: {join_error:?}")
+                    }
+                }
+            }
 
             // Cadence: recompute what to serve, warn when the fleet is not
             // sustaining it, and keep the per-node windows honest.

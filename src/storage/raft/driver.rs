@@ -1051,12 +1051,10 @@ impl MultiRaftDriver {
         let engine = self.engine()?;
         let lane = op.lane();
         // In `single` topology every lane rides the one control group; the
-        // envelope's group_id must name a group ACTIVE on the receiver.
-        let group = if engine.lanes.len() == 1 {
-            Lane::Control
-        } else {
-            lane
-        };
+        // envelope's group_id must name a group ACTIVE on the receiver, and
+        // the receiver checks it in the same (group) space via the same
+        // helper.
+        let group = crate::storage::raft::physical_group(engine.lanes.len(), lane);
         let hint = self.not_leader_error(lane);
         let Some(leader_addr) = hint.leader_addr.clone() else {
             return Err(anyhow::Error::new(hint).context(format!(

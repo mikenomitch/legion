@@ -7826,6 +7826,43 @@ message TaskAllocation {
   // forked or snapshotted. A worker that predates the field ignores it and
   // refreshes on its normal schedule.
   uint64 identity_epoch = 25;
+
+  // The task's `lifecycle` as declared in the jobspec: `service`, `batch`,
+  // or `sidecar`.
+  //
+  // Carried because the worker never sees a jobspec: it rebuilds the task
+  // from the fields on this message, and the lifecycle decides what a process
+  // exit means there. Together with `task_restart` it selects the restart
+  // policy the worker's task supervisor applies (docs/task-supervision.md):
+  // a `batch` task defaults to `onFailure`, so an exit with a status in
+  // `restart.successExitCodes` (default `[0]`) ends the allocation and is
+  // reported once in `HeartbeatRequest.terminated_allocations` with
+  // `success = true`, which the manager records as allocation status
+  // `complete` and task status `success`. A `batch` task on a runtime that
+  // tracks no process (`noop`) is reported complete at start instead.
+  // `service` and `sidecar` default to `always`: they are relaunched in place
+  // on any exit.
+  //
+  // Always set by the manager. An empty string (a payload built by hand, or
+  // by a manager that predates the field) is read as `service`, which is the
+  // jobspec default.
+  string task_lifecycle = 26;
+
+  // The task's `restart` block as JSON, exactly as declared:
+  // `{"policy":"onFailure","delay":"5s","successExitCodes":[0,2]}`.
+  //
+  // `policy` is `always`, `onFailure`, or `never`; `delay` is the wait before
+  // an in-place relaunch (defaults to `on_unhealthy.restart_delay`);
+  // `successExitCodes` lists the exit statuses that count as success. The
+  // worker's supervisor applies it on every observed exit, sharing one
+  // restart budget (`on_unhealthy.restart_count` within `restart_period`)
+  // with health-check restarts; a wanted restart the budget refuses fails the
+  // allocation, which the manager then reschedules.
+  //
+  // Empty string when the task declares no `restart` block, which is NOT the
+  // same as declaring `always`: the policy then follows `task_lifecycle`
+  // (`onFailure` for `batch`, `always` otherwise).
+  string task_restart = 27;
 }
 
 // Request payload for PostWork.
