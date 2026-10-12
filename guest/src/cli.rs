@@ -17,6 +17,7 @@ use crate::agent::{self, AgentConfig, VsockDial, HOST_CID};
 
 const USAGE: &str = "\
 usage: legion-guest guest-agent [--proxy-port PORT] [--dns-port PORT] [--host-cid CID]
+                                [--resume-watch [--identity DEVICE] [--poll-ms MS]]
        legion-guest guest-resume [--identity DEVICE] [--poll-ms MS]
 
 Started by the sandbox guest's init, not by hand.";
@@ -28,6 +29,9 @@ pub struct AgentArgs {
     /// 0 disables the DNS relay.
     pub dns_port: u16,
     pub host_cid: u32,
+    /// Also run the resume watch in this process (a gated sandbox launched
+    /// for memory checkpoints), so a restore can close the relays it holds.
+    pub resume_watch: Option<ResumeArgs>,
 }
 
 impl Default for AgentArgs {
@@ -36,6 +40,7 @@ impl Default for AgentArgs {
             proxy_port: agent::PROXY_PORT as u16,
             dns_port: agent::DNS_PORT as u16,
             host_cid: HOST_CID,
+            resume_watch: None,
         }
     }
 }
@@ -98,6 +103,9 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
     match command.as_str() {
         "guest-agent" => {
             let mut parsed = AgentArgs::default();
+            let mut watch = ResumeArgs::default();
+            let mut resume_watch = false;
+            let mut watch_flag = None;
             while let Some(flag) = rest.next() {
                 match flag.as_str() {
                     "--proxy-port" => {
@@ -105,10 +113,23 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
                     }
                     "--dns-port" => parsed.dns_port = number(flag, value(flag, &mut rest)?)?,
                     "--host-cid" => parsed.host_cid = number(flag, value(flag, &mut rest)?)?,
+                    "--resume-watch" => resume_watch = true,
+                    "--identity" => {
+                        watch.identity = Some(PathBuf::from(value(flag, &mut rest)?));
+                        watch_flag = Some("--identity");
+                    }
+                    "--poll-ms" => {
+                        watch.poll = Duration::from_millis(number(flag, value(flag, &mut rest)?)?);
+                        watch_flag = Some("--poll-ms");
+                    }
                     "-h" | "--help" => return Ok(Invocation::Help),
                     other => bail!("unknown guest-agent argument {other:?}\n{USAGE}"),
                 }
             }
+            if let (false, Some(flag)) = (resume_watch, watch_flag) {
+                bail!("guest-agent {flag} only applies with --resume-watch\n{USAGE}");
+            }
+            parsed.resume_watch = resume_watch.then_some(watch);
             Ok(Invocation::Agent(parsed))
         }
         "guest-resume" => {
@@ -164,11 +185,38 @@ fn run_agent(args: &AgentArgs) -> Result<()> {
             .unwrap_or_else(|| "off".into()),
         args.host_cid
     );
+    if let Some(watch) = args.resume_watch.as_ref() {
+        let relays = started.relays.clone();
+        return run_agent_watch(watch, &move || {
+            let closed = relays.close_all();
+            if closed > 0 {
+                eprintln!(
+                    "legion-guest-agent: restored; closed {closed} connection(s) the capture \
+                     left dead"
+                );
+            }
+        });
+    }
     // The relays run on their own threads; this one only keeps the process
     // alive.
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }
+}
+
+/// The agent's resume watch: the resume handler's loop, closing the agent's
+/// relays first on every restore.
+#[cfg(target_os = "linux")]
+fn run_agent_watch(args: &ResumeArgs, on_restore: &(dyn Fn() + Sync)) -> Result<()> {
+    let device = identity_device(args.identity.as_ref())?;
+    eprintln!("legion-guest-resume: watching {}", device.display());
+    crate::resume::watch_with(&device, &crate::resume::LinuxGuest, args.poll, on_restore)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_agent_watch(args: &ResumeArgs, _on_restore: &(dyn Fn() + Sync)) -> Result<()> {
+    let _ = identity_device(args.identity.as_ref());
+    bail!("guest-agent --resume-watch runs inside a Linux sandbox guest only")
 }
 
 /// The identity disk: the flag, else `legion.identity=` on the kernel
@@ -232,6 +280,28 @@ mod tests {
             })
         );
         assert_eq!(parse(&[]).unwrap(), Invocation::Help);
+        // A gated sandbox launched for checkpoints: one process.
+        assert_eq!(
+            parse(&args(&[
+                "guest-agent",
+                "--resume-watch",
+                "--poll-ms",
+                "100"
+            ]))
+            .unwrap(),
+            Invocation::Agent(AgentArgs {
+                resume_watch: Some(ResumeArgs {
+                    identity: None,
+                    poll: Duration::from_millis(100),
+                }),
+                ..AgentArgs::default()
+            })
+        );
+        let err = parse(&args(&["guest-agent", "--identity", "/dev/vdc"])).unwrap_err();
+        assert!(
+            err.to_string().contains("only applies with --resume-watch"),
+            "{err}"
+        );
     }
 
     #[test]

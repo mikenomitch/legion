@@ -537,8 +537,12 @@ async fn fork_instance(arg_matches: &ArgMatches) -> R<()> {
             "durability": reply.durability,
             "checkpoint_state": state.unwrap_or_else(|| "capturing".into()),
             "deduplicated": reply.deduplicated,
+            "notes": reply.notes,
         }));
     } else {
+        for note in &reply.notes {
+            println!("note: {note}");
+        }
         println!(
             "Forking {} into {} ({} checkpoint {} on {})",
             reply.origin,

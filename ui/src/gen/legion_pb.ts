@@ -5427,6 +5427,17 @@ export class ForkInstanceReply extends Message<ForkInstanceReply> {
    */
   durability = "";
 
+  /**
+   * One-line notes about side effects of the fork's capture on the origin,
+   * printed by `legion instance fork` as `note: ...`. Today: a memory fork
+   * of a gated sandbox on Firecracker resets the origin's open network
+   * connections (the origin keeps running). Empty when there is nothing to
+   * say, and on a deduplicated reply.
+   *
+   * @generated from field: repeated string notes = 9;
+   */
+  notes: string[] = [];
+
   constructor(data?: PartialMessage<ForkInstanceReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5443,6 +5454,7 @@ export class ForkInstanceReply extends Message<ForkInstanceReply> {
     { no: 6, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 8, name: "durability", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "notes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ForkInstanceReply {
@@ -6574,6 +6586,18 @@ export class CreateSnapshotReply extends Message<CreateSnapshotReply> {
    */
   deduplicated = false;
 
+  /**
+   * One-line notes about side effects of this capture the caller should
+   * know, printed by `legion snapshot create` as `note: ...`. Today: a live
+   * memory capture of a gated sandbox on Firecracker resets the guest's open
+   * network connections (Firecracker resets every vsock connection at
+   * snapshot time; the guest keeps running and new connections work). Empty
+   * when there is nothing to say, and on a deduplicated reply.
+   *
+   * @generated from field: repeated string notes = 3;
+   */
+  notes: string[] = [];
+
   constructor(data?: PartialMessage<CreateSnapshotReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6584,6 +6608,7 @@ export class CreateSnapshotReply extends Message<CreateSnapshotReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "snapshot", kind: "message", T: SnapshotInfo },
     { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "notes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateSnapshotReply {

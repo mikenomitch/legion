@@ -390,6 +390,14 @@ over the vsock. See [network-handlers.md](network-handlers.md#sandboxes) for
 the mechanics, what is enforced, and current status. It is unit-tested over
 Unix sockets but not yet boot-tested on a VMM in CI.
 
+A gated sandbox takes memory checkpoints like any other: suspend, resume,
+snapshots, forks, and publish. Every restore moves the guest's vsock onto the
+restoring allocation's own socket, so the restored guest is judged by the new
+allocation's identity and current policy, and forks never share a door. On
+Firecracker this needs 1.16.1 or later. A memory checkpoint closes the
+guest's open connections. See
+[suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
+
 This single, operator-owned interface also makes `sandbox` the only runtime
 whose [edge boot](edge-boot.md) `boot` gate is a true network boundary. A
 guest started before its placement is durable boots with the TAP device
@@ -634,13 +642,18 @@ memory restore, since the device rides the snapshot.
   script. Scratch and distroless images do not work yet.
 - The guest's exit status is reported on the console, not as the VMM's exit
   code. Restart policies see the VMM exit, and health checks work as usual.
-- **Memory checkpoints of gated sandboxes are refused.** The guest's vsock
-  socket path is part of its saved state. A task that declares
-  `network.mode = "gated"` and a `snapshots` block without `memory = false`,
-  or a `suspend` block without `checkpoint = "disk"`, fails job validation
-  with that reason and a hint. When gating comes from a
-  stored policy, the sandbox launches without checkpoint support, and
-  `legion snapshot create --memory` fails with the same reason.
+- **Memory checkpoints of a gated sandbox need Firecracker 1.16.1 or later**
+  (or cloud-hypervisor). On an older Firecracker, a memory suspend, snapshot,
+  or fork is refused before capture with the node's version and the fix.
+- **A memory checkpoint closes a gated guest's open connections.** On
+  Firecracker that includes a running origin's, for a live snapshot or a
+  fork. Retry interrupted calls. See
+  [suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
+- **A gated sandbox's socket path must fit a Unix socket.** The datapath
+  listens on `<worker state>/allocs/<id>/.sandbox/vsock.sock_1080`, and a
+  path over 107 bytes fails the start or restore with `gated sandbox socket
+  path ... is N bytes, over the 107-byte Unix socket limit: shorten the
+  worker's state path`.
 - **Running processes keep their old environment after a restore.** The
   resume handler refreshes the hostname, RNG, clock, and the identity files,
   but a process's env is fixed at exec. Read the new token from

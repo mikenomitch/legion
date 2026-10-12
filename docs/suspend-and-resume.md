@@ -131,9 +131,6 @@ Hint: suspend applies to keyed instances (stateful.mode = "keyed"); for stateles
 Error: task "api" cannot take a memory checkpoint: runtime "container" supports "disk" only
 Hint: set suspend.checkpoint = "disk", or run this task with runtime = "sandbox"
 
-Error: task "workspace" asks for memory checkpoints, but sandbox memory checkpoints don't support gated networking yet
-Hint: set suspend.checkpoint = "disk" to suspend with a disk checkpoint, or drop network gating for this task
-
 Error: task "workspace": suspend.reserve 1.5 is out of range: a ratio is between 0 and 1 (0.25 holds a quarter of the instance's memory and cpu while it is suspended)
 Hint: use true to hold everything, or a fixed amount like { memory = "1GiB", cpu = 100 }
 
@@ -1160,20 +1157,83 @@ node makes sure that TAP device is there:
 
 A restore never comes up without the network its guest was captured with.
 
-Gated networking (`network.mode = "gated"`) does not support memory snapshots
-yet: the guest's vsock datapath is part of its saved state. Legion refuses the
-combination where it can see it:
+### Gated sandboxes
+
+A gated sandbox (`network.mode = "gated"`, see
+[network-handlers.md](network-handlers.md#sandboxes)) has no NIC. Its only
+door is a vsock whose host end is `<alloc dir>/.sandbox/vsock.sock`, where
+the node datapath listens. Every restore of a gated checkpoint (a resume, a
+rollback, a fork, a create from a snapshot, on the same node or another)
+moves the guest onto the **restoring allocation's own** socket:
+
+- Firecracker gets `vsock_override` on `PUT /snapshot/load`.
+- cloud-hypervisor gets the socket rewritten in the restore's own copy of
+  the snapshot's `config.json`, the same rewrite a fork's TAP uses.
+
+The datapath has already bound that allocation's listeners by the time the
+restore starts, and it judges every connection by the listener it arrived
+on. So the restored guest's traffic is attributed to the new allocation and
+judged by the policy in force **now**: a `require` policy applied while the
+instance was suspended applies to its first connection after the resume. A
+fork is its own allocation with its own socket, so its traffic, denials, and
+service-graph edges are its own, and forks cannot collide on the network
+because there is no guest address to collide on.
+
+Before resuming the guest, the restore waits up to 5 seconds for the egress
+proxy socket (`vsock.sock_1080`). It is normally there already. If it never
+appears, the guest resumes anyway with no working door (each connection is
+reset), the allocation reports `net_capture_unavailable`, and `legion net
+doctor` names the unbound socket. A transient bind error never turns a
+resume into a cold boot.
+
+**Open connections reset.** A memory checkpoint closes every connection the
+guest has open through the datapath:
+
+- Firecracker resets the guest's vsock connections when it takes the
+  snapshot. That includes a live `snapshot create --memory` and a fork's
+  capture, so the **running origin** loses its open connections too, though
+  it keeps running. Both commands print a note when this applies:
+
+  ```text
+  note: instance user-42 is gated on Firecracker, so this capture resets its open network connections (the guest keeps running)
+  ```
+
+- cloud-hypervisor v52 and later reset them in the restored guest.
+- Older cloud-hypervisor releases can leave half-open connections in the
+  restored guest. The guest agent closes every relay it holds when it sees
+  the restore, so a client in the guest gets a prompt close, never a hang.
+
+New connections after the restore work at once. A harness mid-way through a
+model call sees the stream end, so retry interrupted calls.
+
+**Firecracker 1.16.1 or later.** Moving the vsock needs Firecracker 1.16.0's
+`vsock_override`, and 1.16.1 fixes guest-to-host connections timing out after
+a restore, which is exactly the gated datapath's traffic. A memory suspend,
+snapshot, or fork of a gated sandbox on an older Firecracker is refused
+before anything is captured:
 
 ```text
-$ legion job run workspace.ncl
-Error: task "workspace" asks for memory checkpoints, but sandbox memory checkpoints don't support gated networking yet
-Hint: set snapshots.memory = false for disk-only snapshots, or drop network gating for this task
+$ legion instance suspend user-42 --checkpoint memory
+Error: instance user-42 is gated, and node w-03 runs Firecracker 1.15.0, which cannot move a restored guest's vsock to a new socket (that needs Firecracker 1.16.1 or later)
+Hint: upgrade Firecracker on the node, or use --checkpoint disk
 ```
 
-`job validate` and `job plan` report the same error. When gating comes from a
-stored network policy rather than the jobspec, `legion snapshot create
---memory` fails with `FailedPrecondition` and the same hint. Disk snapshots of
-gated sandboxes work.
+The sandbox still boots ready for checkpoints there, so upgrading the VMM
+and restarting the instance is the whole fix. When neither the call nor the
+task's `suspend.checkpoint` names a kind, a suspend on that node takes a
+disk checkpoint instead. With `checkpoint = "memory"`, the idle sweep skips
+the instance and logs why. The node refuses its own pressure suspend the
+same way before pausing the guest. cloud-hypervisor has no floor beyond
+Legion's own (v35).
+
+A gated checkpoint restores only into a gated task, and a TAP or
+loopback-only checkpoint never into a gated one, since both VMMs restore
+exactly the devices they saved. A restore into the other shape fails by
+name, and `onRestoreFailure` decides what happens next:
+
+```text
+restore needs gated networking: the checkpoint's guest has a vsock datapath and no NIC, but task workspace is now wired to bridge br0; restore a snapshot taken with this network config, or restart the instance cold
+```
 
 ## Listing, inspecting, and deleting
 
@@ -1500,7 +1560,7 @@ Fork refuses what it cannot do, at the API, before creating anything:
 | `does not support \`clone\`` / `does not support \`snapshot\`` | The instance volume's driver cannot copy the volume per fork |
 | `supports "disk" only` | A memory fork of a runtime other than `sandbox`. Use `--checkpoint disk` |
 | `was not launched for memory checkpoints` | Add a `suspend` or `snapshots` block and restart the origin, or use `--checkpoint disk` |
-| `don't support gated networking yet` | Gated sandboxes take disk forks only |
+| `is gated, and node w-03 runs Firecracker 1.15.0, which cannot move a restored guest's vsock` | A memory fork of a gated sandbox needs Firecracker 1.16.1 or later. Upgrade it, or use `--checkpoint disk` |
 | `runs Firecracker 1.11.0, which cannot move a restored NIC` | Upgrade Firecracker to 1.12 or later, or use `--checkpoint disk` |
 | `count 65 is above the limit of 64` | Fork in smaller batches |
 | `a disk fork boots each fork fresh on the task's configured TAP` | A disk fork of a TAP-wired sandbox would share the origin's TAP. Use `--checkpoint memory` |
@@ -1536,8 +1596,10 @@ works with `--id` too, and needs `snapshot:read` on the job as well as
 The snapshot must be a `local` or `published`, `manual` snapshot of the same
 job and task. A suspend checkpoint belongs to its instance, and a fork
 checkpoint to its forks, so neither can seed new instances. A memory snapshot
-cannot seed a task that now declares gated networking. One call creates at
-most 64 instances.
+seeds only a task with the same network shape: a gated snapshot into a gated
+task, a TAP or loopback one into a task without gated networking. The other
+way round fails each restore by name (`restore needs gated networking: ...`),
+and `onRestoreFailure` decides. One call creates at most 64 instances.
 
 ### Named snapshots
 
@@ -1898,8 +1960,14 @@ See [metrics](metrics.md#suspend-and-resume).
   keeps the checkpoint on the node until it is started (and restores) or is
   destroyed.
 - **Memory snapshots need a `sandbox` on Firecracker or cloud-hypervisor**,
-  with the same VMM version, CPU, and guest size at restore. Gated networking
-  is not supported.
+  with the same VMM version, CPU, and guest size at restore. A gated sandbox
+  on Firecracker needs 1.16.1 or later.
+- **A memory checkpoint closes a gated guest's open connections.** On
+  Firecracker that includes the running origin of a live snapshot or a fork.
+  New connections work at once. See [Gated sandboxes](#gated-sandboxes).
+- **Gated restores have not run on a real VMM yet.** The vsock move on both
+  VMMs is tested against fake VMM APIs that check the requests Legion sends,
+  not against Firecracker or cloud-hypervisor themselves.
 - **The worker task-manager lock is held while the VMM writes guest memory.**
   Heartbeats from that node wait for it. For a guest of a few GiB on slow disk
   this can approach the heartbeat interval.

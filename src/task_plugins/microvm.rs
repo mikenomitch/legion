@@ -364,19 +364,45 @@ impl VmSpec {
     }
 }
 
-/// The vsock device of a gated sandbox: the guest's context id and the
-/// host-side Unix socket base both VMMs multiplex guest ports onto
-/// (`<socket>_<port>`).
+/// The vsock device of a gated sandbox: the host-side Unix socket base both
+/// VMMs multiplex guest ports onto (`<socket>_<port>`). The guest's context
+/// id is always [`GATED_GUEST_CID`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VsockSpec {
-    pub cid: u32,
     pub socket: PathBuf,
 }
 
-/// A guest context id for an allocation: 3 upward (0–2 are reserved), unique
-/// per node because allocation ids are.
-pub(crate) fn vsock_cid(allocation_id: i64) -> u32 {
-    3 + (allocation_id.unsigned_abs() % u64::from(u32::MAX - 3)) as u32
+/// Every gated guest's vsock context id (0 to 2 are reserved). Both VMMs
+/// implement vsock in user space over Unix sockets, so a CID is visible only
+/// inside its own guest and needs no host-wide uniqueness, and the guest
+/// agent dials the host (CID 2) without ever reading its own. Firecracker
+/// cannot change a CID on snapshot load, so a per-allocation CID would be
+/// stale after every restore and shared by every fork anyway (gated plan
+/// §6.2).
+pub(crate) const GATED_GUEST_CID: u32 = 3;
+
+/// The longest path a Unix socket can bind: `sun_path` holds 108 bytes,
+/// one of them the terminating NUL.
+pub(crate) const MAX_UNIX_SOCKET_PATH: usize = 107;
+
+/// Refuse a gated sandbox whose datapath sockets cannot exist: the longest
+/// is `<base>_1080`, and a path over [`MAX_UNIX_SOCKET_PATH`] bytes fails
+/// inside the VMM or the worker's listener with an opaque error. Checked at
+/// launch and at restore, where the base is the allocation's own.
+pub(crate) fn check_vsock_socket_path(base: &Path) -> R<()> {
+    let longest = crate::worker::netd::guest_agent::host_socket_path(
+        base,
+        crate::worker::netd::guest_agent::PROXY_PORT,
+    );
+    let bytes = longest.as_os_str().len();
+    if bytes > MAX_UNIX_SOCKET_PATH {
+        bail!(
+            "gated sandbox socket path {} is {bytes} bytes, over the {MAX_UNIX_SOCKET_PATH}-byte \
+             Unix socket limit: shorten the worker's state path",
+            longest.display()
+        );
+    }
+    Ok(())
 }
 
 /// One block device handed to the guest: the host path of a raw device or
@@ -487,8 +513,7 @@ pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
     if let Some(vsock) = spec.vsock.as_ref() {
         args.push("--vsock".to_string());
         args.push(format!(
-            "cid={},socket={}",
-            vsock.cid,
+            "cid={GATED_GUEST_CID},socket={}",
             vsock.socket.display()
         ));
     }
@@ -545,7 +570,7 @@ pub(crate) fn firecracker_config(spec: &VmSpec) -> Value {
     }
     if let Some(vsock) = spec.vsock.as_ref() {
         config["vsock"] = json!({
-            "guest_cid": vsock.cid,
+            "guest_cid": GATED_GUEST_CID,
             "uds_path": vsock.socket.display().to_string(),
         });
     }
@@ -589,14 +614,16 @@ pub(crate) struct GuestPayload {
     /// Volume disks init mounts before the command runs, in
     /// [`VmSpec::volume_disks`] attach order.
     pub disk_mounts: Vec<GuestDiskMount>,
-    /// A gated sandbox: init starts `/legion/legion guest-agent` (the
-    /// worker's own binary, copied into the rootfs) before the command, and
-    /// the resolver is the agent on loopback.
+    /// A gated sandbox: init starts `/legion/legion guest-agent` (the guest
+    /// binary, copied into the rootfs) before the command, and the resolver
+    /// is the agent on loopback.
     pub guest_agent: bool,
-    /// A sandbox launched for memory checkpoints: init starts
-    /// `/legion/legion guest-resume` in the background, which watches the
+    /// A sandbox launched for memory checkpoints (or with token files):
+    /// init starts the resume handler in the background, which watches the
     /// identity disk and refreshes the guest after every restore (new
     /// allocation id and token, reseeded RNG, resynced clock, `onResume`).
+    /// On a gated sandbox the agent runs it (`guest-agent --resume-watch`),
+    /// so a restore closes the agent's dead relays in the same process.
     pub resume_watch: bool,
 }
 
@@ -666,17 +693,23 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
     if payload.guest_agent {
         // The datapath's foothold: relays 127.0.0.1:1080 and :53 to the host
         // over vsock. Without it a gated guest has loopback and nothing else,
-        // which is the fail-closed outcome the mode promises.
+        // which is the fail-closed outcome the mode promises. When the guest
+        // also needs the resume watch, the agent runs it.
+        let watch = if payload.resume_watch {
+            " --resume-watch"
+        } else {
+            ""
+        };
         script.push_str(&format!(
             "if [ -x {GUEST_AGENT_PATH} ]; then\n\
-             \x20   {GUEST_AGENT_PATH} guest-agent >/dev/console 2>&1 &\n\
+             \x20   {GUEST_AGENT_PATH} guest-agent{watch} >/dev/console 2>&1 &\n\
              \x20   echo \"legion: guest agent started (gated network over vsock)\"\n\
              else\n\
              \x20   echo \"legion: guest agent missing at {GUEST_AGENT_PATH}; the sandbox has no network\" >&2\n\
              fi\n\n"
         ));
     }
-    if payload.resume_watch {
+    if payload.resume_watch && !payload.guest_agent {
         // Restores happen with the guest frozen mid-instruction, so nothing
         // in the guest runs on its own afterward. This watcher notices the
         // identity disk change and refreshes what a restore made stale.
@@ -1090,17 +1123,42 @@ mod tests {
         assert_eq!(args[serial_at + 1], "tty");
         assert!(args.contains(&"tap=tap0,mac=02:00:00:00:00:01".to_string()));
 
-        // A gated sandbox gets its vsock device on both VMMs.
+        // A gated sandbox gets its vsock device on both VMMs, always as
+        // guest CID 3.
         spec.vsock = Some(VsockSpec {
-            cid: vsock_cid(7),
             socket: PathBuf::from("/allocs/7/.sandbox/vsock.sock"),
         });
         let args = cloud_hypervisor_args(&spec);
         let at = args.iter().position(|a| a == "--vsock").expect("--vsock");
-        assert_eq!(args[at + 1], "cid=10,socket=/allocs/7/.sandbox/vsock.sock");
+        assert_eq!(args[at + 1], "cid=3,socket=/allocs/7/.sandbox/vsock.sock");
         let config = firecracker_config(&spec);
-        assert_eq!(config["vsock"]["guest_cid"], 10);
+        assert_eq!(config["vsock"]["guest_cid"], 3);
         assert_eq!(config["vsock"]["uds_path"], "/allocs/7/.sandbox/vsock.sock");
+    }
+
+    /// `sun_path` holds 107 bytes plus a NUL, and the longest datapath
+    /// socket is `<base>_1080`.
+    #[test]
+    fn a_gated_socket_path_over_the_unix_limit_is_refused_by_name() {
+        assert!(
+            check_vsock_socket_path(Path::new("/var/lib/legion/allocs/7/.sandbox/vsock.sock"))
+                .is_ok()
+        );
+        // 102 bytes of base + "_1080" is exactly 107.
+        let base = format!("/{}", "a".repeat(101));
+        assert_eq!(base.len(), 102);
+        assert!(check_vsock_socket_path(Path::new(&base)).is_ok());
+        let base = format!("/{}", "a".repeat(102));
+        let err = check_vsock_socket_path(Path::new(&base)).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("is 108 bytes, over the 107-byte Unix socket limit"),
+            "{message}"
+        );
+        assert!(
+            message.contains("shorten the worker's state path"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1139,8 +1197,26 @@ mod tests {
         let command_at = script.find("'/bin/sh'").expect("command");
         assert!(agent_at < command_at, "the agent starts first");
         assert!(script.contains("the sandbox has no network"));
+        assert!(!script.contains("--resume-watch"));
         let plain = render_init_script(&GuestPayload::default());
         assert!(!plain.contains("guest-agent"));
+    }
+
+    /// A gated sandbox launched for checkpoints runs one process: the agent
+    /// owns the resume watch, so a restore can close its relays.
+    #[test]
+    fn a_gated_checkpointable_guest_runs_the_watch_inside_the_agent() {
+        let script = render_init_script(&GuestPayload {
+            command: vec!["/bin/sh".into()],
+            guest_agent: true,
+            resume_watch: true,
+            ..GuestPayload::default()
+        });
+        assert!(
+            script.contains("/legion/legion guest-agent --resume-watch"),
+            "{script}"
+        );
+        assert!(!script.contains("guest-resume"), "{script}");
     }
 
     #[test]

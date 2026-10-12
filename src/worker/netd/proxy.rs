@@ -1377,6 +1377,146 @@ mod tests {
         assert!(denials.drain().iter().any(|d| d.path == "/secret"));
     }
 
+    /// One policy body per allocation, each allowing `allow` over HTTP.
+    fn gated_context(policies: &[(i64, &[&str])]) -> (Arc<ForwarderContext>, Arc<Denials>) {
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let mut assignments = Vec::new();
+        for (allocation_id, allow) in policies {
+            let mut object: NetPolicyObject = serde_json::from_value(json!({
+                "name": "p", "enforcement": "require",
+                "egress": { "protocol": "http", "allow": allow }
+            }))
+            .unwrap();
+            object.normalize_and_validate().unwrap();
+            let policy = merge_policies(&[object], InlinePolicy::default());
+            assignments.push(AllocNetPolicy {
+                allocation_id: *allocation_id,
+                policy_hash: policy.hash.clone(),
+            });
+            let hash = policy.hash.clone();
+            cache.insert_body(&hash, policy).unwrap();
+        }
+        cache.apply_assignments(&assignments);
+        (
+            Arc::new(ForwarderContext::new(cache, denials.clone())),
+            denials,
+        )
+    }
+
+    /// A gated sandbox's proxy on its own allocation's vsock socket.
+    fn vsock_spec(root: &std::path::Path, allocation_id: i64) -> ProxySpec {
+        let base =
+            crate::task_plugins::vsock_socket_base_for(&root.join(allocation_id.to_string()));
+        ProxySpec {
+            allocation_id,
+            netns: None,
+            listen: None,
+            unix: Some(crate::worker::netd::guest_agent::host_socket_path(
+                &base,
+                crate::worker::netd::guest_agent::PROXY_PORT,
+            )),
+        }
+    }
+
+    async fn get_via(socket: &std::path::Path, origin_port: u16, path: &str) -> String {
+        let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        stream
+            .write_all(
+                format!("GET http://127.0.0.1:{origin_port}{path} HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out)).await;
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    /// Gated plan §6.3, scenario 2: a resume is a new allocation, and its
+    /// restored guest's traffic arrives on that allocation's own listener,
+    /// so it is judged by the policy in force at resume. Here a policy that
+    /// stopped allowing `/poll` while the instance slept denies the first
+    /// post-resume request, attributed to the new allocation and never to
+    /// the suspended one.
+    #[tokio::test]
+    async fn a_resumed_gated_sandbox_is_judged_by_its_new_allocations_policy() {
+        let origin_port = origin().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (context, denials) =
+            gated_context(&[(7, &["127.0.0.1/**"]), (8, &["127.0.0.1/health"])]);
+        let proxies = EgressProxies::new(context);
+        let before = vsock_spec(dir.path(), 7);
+        proxies.sync(std::slice::from_ref(&before)).await;
+        let response = get_via(before.unix.as_deref().unwrap(), origin_port, "/poll").await;
+        assert!(response.contains("200 OK"), "{response}");
+
+        // Suspended: allocation 7 leaves the node. Resumed as 8.
+        let after = vsock_spec(dir.path(), 8);
+        proxies.sync(std::slice::from_ref(&after)).await;
+        assert!(!proxies.is_running(7));
+        let response = get_via(after.unix.as_deref().unwrap(), origin_port, "/poll").await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        let drained = denials.drain();
+        assert!(!drained.is_empty());
+        assert!(
+            drained.iter().all(|denial| denial.allocation_id == 8),
+            "{drained:?}"
+        );
+    }
+
+    /// Gated plan §9, fork attribution: three forks of a gated sandbox each
+    /// run on their own allocation's socket, so every connection, denial,
+    /// and service-graph edge carries the fork's own allocation (which the
+    /// manager maps to its instance). Stopping the origin leaves the forks
+    /// working, and nothing is ever attributed to the origin.
+    #[tokio::test]
+    async fn forks_of_a_gated_sandbox_are_attributed_to_their_own_allocations() {
+        let origin_port = origin().await;
+        let dir = tempfile::tempdir().unwrap();
+        let allow: &[&str] = &["127.0.0.1/ok/**"];
+        let (context, denials) =
+            gated_context(&[(7, allow), (11, allow), (12, allow), (13, allow)]);
+        let proxies = EgressProxies::new(context.clone());
+        let specs: Vec<ProxySpec> = [7, 11, 12, 13]
+            .into_iter()
+            .map(|id| vsock_spec(dir.path(), id))
+            .collect();
+        proxies.sync(&specs).await;
+        let forks = &specs[1..];
+        for fork in forks {
+            let socket = fork.unix.as_deref().unwrap();
+            let response = get_via(socket, origin_port, "/ok/work").await;
+            assert!(response.contains("200 OK"), "{response}");
+            let response = get_via(socket, origin_port, "/secret").await;
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        }
+        let edges = context.edges().drain();
+        let mut edge_allocations: Vec<i64> = edges.iter().map(|edge| edge.allocation_id).collect();
+        edge_allocations.dedup();
+        assert_eq!(edge_allocations, vec![11, 12, 13], "{edges:?}");
+        let mut denied: Vec<i64> = denials
+            .drain()
+            .iter()
+            .map(|denial| denial.allocation_id)
+            .collect();
+        denied.sort();
+        assert_eq!(denied, vec![11, 12, 13]);
+
+        // The origin stops; its forks keep their doors.
+        proxies.sync(forks).await;
+        assert!(!proxies.is_running(7));
+        for fork in forks {
+            let response = get_via(fork.unix.as_deref().unwrap(), origin_port, "/ok/after").await;
+            assert!(response.contains("200 OK"), "{response}");
+        }
+        assert!(context
+            .edges()
+            .drain()
+            .iter()
+            .all(|edge| edge.allocation_id != 7));
+    }
+
     #[tokio::test]
     async fn socks5_connect_is_judged_by_name() {
         let origin_port = origin().await;

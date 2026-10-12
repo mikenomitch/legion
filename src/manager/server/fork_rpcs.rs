@@ -63,7 +63,8 @@ fn sandbox_uses_tap(task: &TaskConfig) -> bool {
 /// the FailedPrecondition message. `None` when it can.
 ///
 /// A memory fork needs what a memory suspend needs (a sandbox launched for
-/// memory checkpoints on a real VMM, without gated networking). Either kind
+/// memory checkpoints on a real VMM, which for a gated sandbox on
+/// Firecracker means 1.16.1 or later). Either kind
 /// needs the instance volume's driver to `snapshot` and `clone` it, so each
 /// fork gets its own copy, and a disk fork needs a volume to copy at all. A
 /// memory fork of a TAP-wired Firecracker sandbox also needs a Firecracker
@@ -276,6 +277,7 @@ impl ManagerDaemonService {
                 } else {
                     recorded.durability
                 },
+                notes: Vec::new(),
             }));
         }
 
@@ -438,6 +440,18 @@ impl ManagerDaemonService {
                 &serde_json::to_string(&recorded).unwrap_or_default(),
             )
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let notes = if kind == SnapshotKind::Memory {
+            super::suspend_rpcs::gated_capture_note(
+                &task,
+                &allocation,
+                &node,
+                &instance.instance_id,
+            )
+            .into_iter()
+            .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Response::new(ForkInstanceReply {
             origin: recorded.origin,
             snapshot: recorded.snapshot,
@@ -447,13 +461,15 @@ impl ManagerDaemonService {
             node_id: recorded.node_id,
             deduplicated: false,
             durability: recorded.durability,
+            notes,
         }))
     }
 
     /// Resolve and check the snapshot a `from_snapshot` create restores
     /// from: `snapshot:read` on the job, a snapshot of this task, usable as
-    /// a seed, at most [`MAX_FORK_COUNT`] instances, and no memory snapshot
-    /// into a task that now declares gated networking.
+    /// a seed, and at most [`MAX_FORK_COUNT`] instances. A memory snapshot
+    /// whose network shape the task no longer has (gated against a TAP) is
+    /// refused by the restore itself, by name, and `onRestoreFailure` decides.
     pub(super) fn resolve_seed_snapshot(
         &self,
         identity: &AclIdentity,
@@ -494,16 +510,6 @@ impl ManagerDaemonService {
         }
         if let Some(reason) = crate::storage::store::alias_target_problem(&snapshot) {
             return Err(Status::failed_precondition(reason));
-        }
-        if snapshot.kind == SnapshotKind::Memory
-            && crate::structs::snapshot::task_declares_gated_network(task)
-        {
-            return Err(Status::failed_precondition(format!(
-                "snapshot {} is a memory snapshot, and task {:?} now declares gated networking, \
-                 which sandbox memory checkpoints don't support yet\nHint: use a disk snapshot, \
-                 or drop network gating for this task",
-                snapshot.snapshot_id, task.name
-            )));
         }
         Ok(snapshot)
     }

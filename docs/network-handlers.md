@@ -636,13 +636,32 @@ What is and is not enforced:
   listeners check, so a provisional sandbox has no network until it is
   ratified.
 - `legion net doctor` and the UI report the sandbox like any gated
-  allocation. `capture_ready` means both host sockets are bound.
+  allocation. `capture_ready` means both host sockets are bound, and an
+  unbound one is named: `egress proxy is not bound on the guest's vsock
+  socket <path>`.
+- Every gated guest uses vsock CID 3. Both VMMs implement vsock over Unix
+  sockets in user space, so a CID is private to its guest, and the datapath
+  attributes a connection by the socket it arrived on, never by anything the
+  guest says.
 
-Current status: the host side (VMM configuration, listeners, status) and the
-agent are implemented and unit-tested over Unix sockets with the VMMs'
-naming. This repository's CI has no KVM, so it does not run an end-to-end
-boot with a real VMM. `auto` resolves to `host` for sandboxes, as it does
-for every runtime.
+**Memory checkpoints.** A gated sandbox suspends, resumes, snapshots, and
+forks with memory. The host socket path is derived from the allocation, and
+every restore moves the guest onto the restoring allocation's own socket
+(Firecracker's `vsock_override`, needing 1.16.1 or later, or
+cloud-hypervisor's restored `config.json`). The new allocation's listeners
+are bound before the restore, so a restored or forked guest's traffic is
+attributed to the new allocation and judged by the policy in force at
+restore. A checkpoint closes the guest's open connections: the guest agent
+closes the relays it holds when it sees the restore, so clients get a prompt
+close rather than a hang. See
+[suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
+
+Current status: the host side (VMM configuration, listeners, status, the
+restore-time socket move) and the agent are implemented and unit-tested over
+Unix sockets with the VMMs' naming, and against fake VMM APIs. This
+repository's CI has no KVM, so it does not run an end-to-end boot or restore
+with a real VMM. `auto` resolves to `host` for sandboxes, as it does for
+every runtime.
 If the copied binary cannot run on the image's libc, init reports it on the
 console and the guest has no network. This fails closed, and `net doctor`
 shows the proxy never connecting. UDP inside the guest and transparent

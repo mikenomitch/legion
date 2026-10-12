@@ -548,9 +548,7 @@ pub fn disk_only_runtime_error(subject: &str, runtime: &str, at_submit: bool) ->
     )
 }
 
-/// Submit-time checks for a task's `suspend` block. The gated-network check
-/// is shared with snapshots
-/// ([`crate::structs::snapshot::validate_memory_checkpoint_network`]).
+/// Submit-time checks for a task's `suspend` block.
 pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String> {
     let Some(suspend) = task.suspend.as_ref() else {
         return Ok(());

@@ -840,14 +840,15 @@
             # `ttl` deletes a snapshot this long after it was taken (unset:
             # never), `keep` caps snapshots per instance (default 5, the
             # oldest goes first). `memory` (default true) launches a sandbox
-            # on a real VMM ready for memory snapshots. This task is gated,
-            # and memory snapshots do not support gated networking yet, so
-            # it takes disk snapshots only; `memory = true` here would fail
-            # job validation with that reason.
+            # on a real VMM ready for memory snapshots. A gated sandbox takes
+            # them too: every restore moves its vsock onto the restoring
+            # allocation's own datapath socket (Firecracker 1.16.1 or later),
+            # and a memory snapshot closes the guest's open connections.
+            # `memory = false` takes disk snapshots only.
             snapshots = {
                 ttl = "7d",
                 keep = 5,
-                memory = false,
+                memory = true,
             },
             resources = {
                 cpu = 1000,

@@ -1234,8 +1234,13 @@ async fn heartbeat_tick(
         let pressure_actions_for_redrive = pressure_actions.clone();
         // The datapath's status for the allocations it was last told about.
         let net_status = {
+            let alloc_root = task_manager
+                .lock()
+                .expect("task manager")
+                .alloc_root()
+                .to_path_buf();
             let last = LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner());
-            net_status(forwarder, &last)
+            net_status(forwarder, &last, &alloc_root)
         };
         // A gated allocation whose capture is not ready has no network: say
         // so in its health, so rollouts and `doctor` see it rather than a
@@ -2486,6 +2491,7 @@ fn ingress_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::ingress
 fn net_status(
     forwarder: &UpstreamForwarder,
     desired: &[TaskAllocation],
+    alloc_root: &std::path::Path,
 ) -> Vec<crate::structs::NetAllocStatus> {
     let bound_upstreams: HashMap<i64, Vec<String>> =
         forwarder
@@ -2555,7 +2561,20 @@ fn net_status(
             problems.push("gated network namespace does not exist yet".into());
         }
         if gated && !proxy_ready {
-            problems.push("egress proxy is not bound inside the namespace".into());
+            problems.push(if vsock_sandbox {
+                // A restored guest resumes fail-closed without it (gated
+                // plan §6.3); this is how `net doctor` names the socket.
+                format!(
+                    "egress proxy is not bound on the guest's vsock socket {}",
+                    crate::worker::netd::guest_agent::host_socket_path(
+                        &sandbox_vsock_base(alloc_root, id),
+                        crate::worker::netd::guest_agent::PROXY_PORT,
+                    )
+                    .display()
+                )
+            } else {
+                "egress proxy is not bound inside the namespace".into()
+            });
         }
         if upstreams.len() < expected_upstreams {
             problems.push(format!(

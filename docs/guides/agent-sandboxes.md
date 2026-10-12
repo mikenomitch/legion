@@ -339,19 +339,21 @@ The options, side by side:
 | none (`config.network.mode = "none"`, the default) | Loopback only | Yes | Any number |
 | `config.network = { mode = "tap", tap = "auto", bridge = "br0" }` | A NIC on a TAP Legion creates per instance, on your bridge | Yes | Any number |
 | `config.network = { mode = "tap", tap = "tap0" }` | A NIC on a host TAP device you create | Yes | One per node. **Refused at submit** on a keyed task, so not for agent sandboxes |
-| `network = { mode = "gated", egress = { allow = [...] } }` | Egress through the node datapath, judged by policy | **No**, refused at submit | Any number |
+| `network = { mode = "gated", egress = { allow = [...] } }` | No NIC. Egress through the node datapath, judged by policy | Yes (Firecracker 1.16.1 or later) | Any number |
 
-Gated networking is the one with per-sandbox egress policy in Legion, and it
-can't take a memory checkpoint yet because the guest's vsock datapath is part
-of its saved state. A gated sandbox can still suspend with
-`checkpoint = "disk"`, which keeps `/workspace` and boots fresh on resume. See
-[A spec is rejected at submit](#a-spec-is-rejected-at-submit) and
+Gated networking is the one with per-sandbox egress policy in Legion. It
+takes memory checkpoints like the others: every restore moves the guest onto
+its new allocation's own datapath socket, so a resumed sandbox runs under
+today's policy and each fork's traffic is its own. A memory checkpoint closes
+the guest's open connections (on Firecracker, a live snapshot or fork closes
+the running origin's too), so a harness should retry an interrupted model
+call. See [Gated sandboxes](../suspend-and-resume.md#gated-sandboxes) and
 [sandbox networking](../task-runtime-sandbox.md#networking).
 
-Pick by what the sandbox must keep. If a resumed sandbox must continue its
-running processes, use an auto TAP and enforce egress on the bridge. If
-egress must be judged per sandbox by Legion's policy, run it gated with disk
-checkpoints.
+Pick by what the sandbox needs from the network. If egress must be judged
+per sandbox by Legion's policy, run it gated. If the guest needs raw
+networking (a protocol the proxy can't carry, L2 adjacency, bulk
+throughput), use an auto TAP and enforce egress on the bridge.
 
 ## The platform's lifecycle
 
@@ -932,31 +934,17 @@ suspend when idle
 
 ### A spec is rejected at submit
 
-Submit, `job validate`, and `job plan` refuse a spec that asks for memory
-checkpoints on a gated network:
+A gated sandbox with memory checkpoints validates. What the API refuses
+instead is a memory suspend, snapshot, or fork of a gated sandbox whose node
+runs a Firecracker too old to move the restored guest's vsock, before
+anything is captured:
 
 ```text
-$ legion job validate agents-gated.ncl
-Error: jobspec failed validation: task "workspace" asks for memory checkpoints, but
-sandbox memory checkpoints don't support gated networking yet (set snapshots.memory
-= false for disk-only snapshots, or drop network gating for this task) [code=InvalidArgument]
+$ legion instance suspend user-42 --checkpoint memory
+Error: instance user-42 is gated, and node w-03 runs Firecracker 1.15.0, which cannot move a
+restored guest's vsock to a new socket (that needs Firecracker 1.16.1 or later)
+Hint: upgrade Firecracker on the node, or use --checkpoint disk
 ```
-
-The spec asks twice, once in `snapshots` and once in `suspend`, and the hint
-names the first one it finds. Fixing that one surfaces the other:
-
-```text
-Error: jobspec failed validation: task "workspace" asks for memory checkpoints, but
-sandbox memory checkpoints don't support gated networking yet (set suspend.checkpoint
-= "disk" to suspend with a disk checkpoint, or drop network gating for this task)
-[code=InvalidArgument]
-```
-
-A gated sandbox with `snapshots.memory = false`, `suspend.checkpoint = "disk"`,
-and no `onResume` validates. It suspends by stopping and resumes by booting
-fresh on `/workspace`. When gating comes from a stored network policy rather
-than the spec, the sandbox launches without checkpoint support, and a memory
-suspend or snapshot fails with `FailedPrecondition` and the same hint.
 
 A fixed TAP device is refused too, because it fits one guest per node and a
 keyed task can put several on one node:
@@ -1042,9 +1030,10 @@ tokens refresh through a read-only bind mount at `/legion/identity`). See
   calls, the balloon, the guest's resume handler, auto TAPs and their
   counters) unit-tested against fixtures. Some of that code has not yet run against a real kernel and VMM,
   so expect rough edges on your first Linux hosts.
-- **Gated networking and memory checkpoints don't fit together yet.** An
-  auto TAP does, with egress enforced on your bridge rather than by Legion's
-  policy. See [Networking](#networking).
+- **A memory checkpoint closes a gated sandbox's open connections.** On
+  Firecracker, a live snapshot or a fork closes the running origin's too.
+  Retry an interrupted model call. Gated memory checkpoints need Firecracker
+  1.16.1 or later. See [Networking](#networking).
 - **Idle detection on a microVM sees CPU and the bytes the guest sends**,
   never an idle open connection, for the reasons in
   [An instance never goes idle](#an-instance-never-goes-idle-or-goes-idle-too-soon).

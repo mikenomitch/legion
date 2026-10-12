@@ -1098,10 +1098,6 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                 .map_err(|err| anyhow!("task {}: {err}", task.name))?;
         }
         crate::structs::suspend::validate_suspend(task).map_err(|err| anyhow!(err))?;
-        // One predicate decides "asks for memory checkpoints", so submit-time
-        // refusals and the worker's launch decision can never disagree.
-        crate::structs::snapshot::validate_memory_checkpoint_network(task)
-            .map_err(|err| anyhow!(err))?;
         let create_first = config
             .rollout_config_for_group(&task.group)
             .and_then(|rollout| rollout.replacement)

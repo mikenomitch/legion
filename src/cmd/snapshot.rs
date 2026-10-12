@@ -562,11 +562,15 @@ async fn create(matches: &ArgMatches) -> R<()> {
         output::print_success(&json!({
             "snapshot": snapshot,
             "deduplicated": reply.deduplicated,
+            "notes": reply.notes,
         }));
         return Ok(());
     }
     if reply.deduplicated {
         println!("(deduplicated: returning the snapshot this idempotency key created)");
+    }
+    for note in &reply.notes {
+        println!("note: {note}");
     }
     print_snapshot(&snapshot);
     if snapshot.state == "capturing" {

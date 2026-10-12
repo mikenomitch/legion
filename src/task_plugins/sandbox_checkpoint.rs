@@ -29,8 +29,22 @@
 //!   `crate::task_plugins::guest_resume`) polls the identity disk named by
 //!   `legion.identity=` on the kernel cmdline, and refreshes the guest's RNG,
 //!   clock, hostname, and identity files after every restore.
-//! - Gated sandboxes (vsock datapath) are not checkpointable yet: their vsock
-//!   socket path is baked into the snapshot as well.
+//!
+//! # Gated sandboxes: the vsock socket moves with the allocation
+//!
+//! A gated guest's only door is its vsock device, whose host end is
+//! `<alloc dir>/.sandbox/vsock.sock` (the datapath listens on `<base>_1080`
+//! and `<base>_53`). Both VMMs record that path in the saved state. Unlike a
+//! disk, which a VMM opens once at load, the VMM resolves `<base>_<port>` on
+//! every guest connect for the VM's whole life, so the path can never live
+//! in the shared device-link directory: after a fork repointed it, the
+//! origin's next connection would reach the fork's listener and be judged as
+//! the fork. Instead every restore moves the VM onto the restoring
+//! allocation's own path: Firecracker through `vsock_override` on
+//! `PUT /snapshot/load` (1.16.1 and later, checked at capture), and
+//! cloud-hypervisor through the restore's own copy of `config.json`, the
+//! same rewrite fork TAPs use. See
+//! `internal_docs/plans/gated-sandbox-checkpoints-plan.md` §6.2.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -94,6 +108,30 @@ mod parts {
     pub const ROOTFS: &str = "rootfs.img";
 }
 
+/// The shape of a guest's network, which a restore must match: both VMMs
+/// restore exactly the devices they saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum GuestNetwork {
+    /// Loopback only: no NIC and no vsock.
+    None,
+    /// A NIC on a host TAP device.
+    Tap,
+    /// No NIC, and a vsock device whose host end is the node datapath.
+    Gated,
+}
+
+impl GuestNetwork {
+    /// How a refusal describes this shape.
+    fn describe(self) -> &'static str {
+        match self {
+            GuestNetwork::None => "has no network device",
+            GuestNetwork::Tap => "has a NIC on a TAP device",
+            GuestNetwork::Gated => "has a vsock datapath and no NIC",
+        }
+    }
+}
+
 /// What a checkpointable launch recorded, and what a checkpoint carries in
 /// [`MemoryParts::runtime`] so a restore can rebuild the same device layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +150,23 @@ pub(crate) struct SandboxCheckpointState {
     /// needs a TAP of exactly this name (see [`ensure_restore_tap`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tap: Option<String>,
+    /// The guest's network shape. Absent on checkpoints taken before gated
+    /// sandboxes could be checkpointed, which read as `tap` when they record
+    /// a TAP and `none` otherwise ([`Self::network`]): no gated sandbox was
+    /// ever checkpointed before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<GuestNetwork>,
+}
+
+impl SandboxCheckpointState {
+    /// The guest's network shape, reading an older record by its TAP.
+    pub(crate) fn network(&self) -> GuestNetwork {
+        self.network.unwrap_or(if self.tap.is_some() {
+            GuestNetwork::Tap
+        } else {
+            GuestNetwork::None
+        })
+    }
 }
 
 /// The sandbox runtime's answer to
@@ -338,6 +393,13 @@ pub(crate) fn prepare_checkpoint_launch(
         vcpus: spec.vcpus,
         memory_mib: spec.memory_mib,
         tap: spec.tap.as_ref().map(|tap| tap.device.clone()),
+        network: Some(if spec.vsock.is_some() {
+            GuestNetwork::Gated
+        } else if spec.tap.is_some() {
+            GuestNetwork::Tap
+        } else {
+            GuestNetwork::None
+        }),
     };
     let identity_path = scratch.join(IDENTITY_FILE);
     write_identity_disk(
@@ -404,12 +466,6 @@ pub(crate) fn checkpoint_microvm(
     out: &CheckpointDir,
     then: AfterCheckpoint,
 ) -> R<MemoryParts> {
-    if crate::task_plugins::allocation_is_gated(allocation) {
-        bail!(
-            "sandbox task {task_name} is network.mode = \"gated\"; gated sandboxes cannot be \
-             memory-checkpointed yet (their vsock datapath is part of the VM state)"
-        );
-    }
     let state = read_boot_record(scratch).with_context(|| {
         format!(
             "sandbox allocation {} was not launched for memory checkpoints; enable suspend or \
@@ -427,6 +483,21 @@ pub(crate) fn checkpoint_microvm(
     }
     let socket = scratch.join("vmm.sock");
     let version = api_version(backend, &socket)?;
+    // A gated guest's restore must move its vsock to a new socket, which an
+    // old Firecracker cannot do. Refused before the pause, so the guest
+    // never stops for a checkpoint that could not be restored. The manager
+    // refuses the same thing first; this covers the node's own suspends.
+    if state.network() == GuestNetwork::Gated {
+        if let Some(refusal) = crate::structs::fork::gated_memory_checkpoint_refusal(
+            &format!("sandbox allocation {}", allocation.id),
+            &allocation.node_id,
+            backend.vmm_name(),
+            Some(&version),
+            "use a disk checkpoint",
+        ) {
+            bail!("{refusal}");
+        }
+    }
 
     let started = std::time::Instant::now();
     let pause = || match backend {
@@ -972,28 +1043,75 @@ pub(crate) fn release_restore_tap(taps: &dyn TapHost, scratch: &Path) {
     let _ = std::fs::remove_file(&record);
 }
 
-/// cloud-hypervisor reopens the TAP devices named in the snapshot's
-/// `config.json`. Rewrite that part, in the restore's own source directory
-/// (where it is a link into the content store, so it is replaced rather than
-/// edited), to name this fork's TAP.
-fn retarget_cloud_hypervisor_tap(source: &CheckpointDir, own: &str) -> R<()> {
+/// cloud-hypervisor reopens the TAP devices and the vsock socket named in
+/// the snapshot's `config.json`. Rewrite that part, in the restore's own
+/// source directory (where it is a link into the content store, so it is
+/// replaced rather than edited), to name this restore's own TAP (`tap`, a
+/// fork) and its own vsock socket (`vsock`, every gated restore), in one
+/// pass.
+fn retarget_cloud_hypervisor_config(
+    source: &CheckpointDir,
+    tap: Option<&str>,
+    vsock: Option<&Path>,
+) -> R<()> {
+    if tap.is_none() && vsock.is_none() {
+        return Ok(());
+    }
     let path = source.part_path(parts::CH_CONFIG);
     let raw = std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut config: serde_json::Value =
         serde_json::from_slice(&raw).with_context(|| format!("{} is not JSON", path.display()))?;
-    let Some(nets) = config
-        .get_mut("net")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        bail!("restore needs TAP device {own}: the checkpoint's config.json has no network device");
-    };
-    for net in nets {
-        net["tap"] = serde_json::Value::String(own.to_string());
+    if let Some(own) = tap {
+        let Some(nets) = config
+            .get_mut("net")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            bail!(
+                "restore needs TAP device {own}: the checkpoint's config.json has no network \
+                 device"
+            );
+        };
+        for net in nets {
+            net["tap"] = serde_json::Value::String(own.to_string());
+        }
+    }
+    if let Some(socket) = vsock {
+        let Some(device) = config.get_mut("vsock").filter(|device| device.is_object()) else {
+            bail!(
+                "restore needs gated networking: the checkpoint's config.json has no vsock device"
+            );
+        };
+        device["socket"] = serde_json::Value::String(socket.display().to_string());
     }
     let _ = std::fs::remove_file(&path);
     std::fs::write(&path, serde_json::to_vec(&config)?)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+/// How long a gated restore waits for the datapath's egress proxy socket
+/// before resuming the guest anyway (gated plan §6.3, calls entry 13).
+pub(crate) const DATAPATH_WAIT: Duration = Duration::from_secs(5);
+
+/// Wait up to `timeout` for the egress proxy's socket beside a gated guest's
+/// vsock base (`<base>_1080`). The heartbeat that delivered the restore
+/// binds it before reconcile starts the restore, so this is normally
+/// immediate. False when it never appeared.
+pub(crate) fn wait_for_datapath(base: &Path, timeout: Duration) -> bool {
+    let proxy = crate::worker::netd::guest_agent::host_socket_path(
+        base,
+        crate::worker::netd::guest_agent::PROXY_PORT,
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if proxy.exists() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// What [`restore_microvm`] needs about the task, resolved by the caller.
@@ -1012,6 +1130,26 @@ pub(crate) struct RestoreTarget<'a> {
     /// The bridge an auto TAP joins (`config.network.bridge`). A restore
     /// that has to recreate the device attaches it here.
     pub bridge: Option<String>,
+    /// The restoring allocation's own vsock socket base, when it is gated
+    /// (`<alloc>/.sandbox/vsock.sock`). Every gated restore moves the guest
+    /// onto it, and a gated checkpoint restores only into a gated task.
+    pub vsock: Option<PathBuf>,
+    /// How long to wait for the datapath's socket before resuming a gated
+    /// guest fail-closed ([`DATAPATH_WAIT`]; tests shorten it).
+    pub datapath_wait: Duration,
+}
+
+impl RestoreTarget<'_> {
+    /// The network shape the task's current config gives a guest.
+    fn network(&self) -> GuestNetwork {
+        if self.vsock.is_some() {
+            GuestNetwork::Gated
+        } else if self.tap.is_some() {
+            GuestNetwork::Tap
+        } else {
+            GuestNetwork::None
+        }
+    }
 }
 
 /// Phase 6: which TAP device a restore attaches the guest NIC to.
@@ -1075,6 +1213,30 @@ pub(crate) fn check_restorable(
             target.backend.vmm_name()
         );
     }
+    // A gated guest has no NIC to attach and a TAP guest has no vsock to
+    // move, so a restore into the other shape is refused by name and
+    // `onRestoreFailure` decides what happens next. TAP against no network
+    // is `ensure_restore_tap`'s, which names the devices.
+    let (saved, wanted) = (state.network(), target.network());
+    if saved != wanted && (saved == GuestNetwork::Gated || wanted == GuestNetwork::Gated) {
+        let now = match (wanted, target.bridge.as_deref(), target.tap.as_deref()) {
+            (GuestNetwork::Gated, _, _) => "is now gated (a vsock datapath and no NIC)".to_string(),
+            (_, Some(bridge), _) => format!("is now wired to bridge {bridge}"),
+            (_, None, Some(tap)) => format!("is now wired to TAP {tap}"),
+            _ => "now has no network device".to_string(),
+        };
+        let need = if saved == GuestNetwork::Gated {
+            "gated networking"
+        } else {
+            "the guest's network layout"
+        };
+        bail!(
+            "restore needs {need}: the checkpoint's guest {}, but task {} {now}; restore a \
+             snapshot taken with this network config, or restart the instance cold",
+            saved.describe(),
+            target.task_name
+        );
+    }
     if (state.vcpus, state.memory_mib) != (target.vcpus, target.memory_mib) {
         bail!(
             "checkpoint {} holds a {} vCPU / {} MiB guest, the task now asks for {} vCPU / {} MiB; \
@@ -1087,6 +1249,28 @@ pub(crate) fn check_restorable(
         );
     }
     Ok(state)
+}
+
+/// Before resuming a restored gated guest, give the datapath up to
+/// `target.datapath_wait` to bind the egress proxy on the new allocation's
+/// socket. A guest that resumes without it fails closed (each dial is
+/// reset) and the node reports the unbound socket on its next heartbeat,
+/// which is better than turning a transient bind error into a cold boot.
+fn await_datapath(target: &RestoreTarget<'_>) {
+    let Some(base) = target.vsock.as_deref() else {
+        return;
+    };
+    if !wait_for_datapath(base, target.datapath_wait) {
+        warn!(
+            allocation_id = target.allocation.id,
+            socket = %crate::worker::netd::guest_agent::host_socket_path(
+                base,
+                crate::worker::netd::guest_agent::PROXY_PORT
+            )
+            .display(),
+            "Resuming a restored gated sandbox before its egress proxy socket is bound; it has no network until the datapath binds it"
+        );
+    }
 }
 
 /// Launch a VMM from a memory checkpoint. Returns the spawned VMM command
@@ -1149,12 +1333,19 @@ pub(crate) fn restore_microvm(
                 own,
                 scratch,
             )?;
-            if matches!(target.backend, Backend::CloudHypervisor { .. }) {
-                retarget_cloud_hypervisor_tap(source, own)?;
-            }
             Some(own.clone())
         }
     };
+    // A gated guest moves onto this allocation's own vsock socket. The
+    // VMM binds the base itself, so a stale one from an earlier start is
+    // cleared; the datapath's `<base>_<port>` listeners are left alone.
+    if let Some(base) = target.vsock.as_deref() {
+        microvm::check_vsock_socket_path(base)?;
+        let _ = std::fs::remove_file(base);
+    }
+    if matches!(target.backend, Backend::CloudHypervisor { .. }) {
+        retarget_cloud_hypervisor_config(source, moved_to.as_deref(), target.vsock.as_deref())?;
+    }
     if let Some(device) = moved_to.as_deref().or(state.tap.as_deref()) {
         record_attached_tap(scratch, device)?;
     }
@@ -1228,14 +1419,19 @@ pub(crate) fn restore_microvm(
                     &memory,
                     false,
                     &overrides,
+                    target.vsock.as_deref(),
                 )?;
                 // Belt and braces: the link already points at the new disk,
                 // and the explicit repoint is what a fork relies on.
                 api.update_drive(IDENTITY_DRIVE_ID, &identity_link)?;
+                await_datapath(target);
                 api.resume()
             }
             // `--restore` loaded the state at launch, paused.
-            _ => CloudHypervisorApi::new(&socket).resume(),
+            _ => {
+                await_datapath(target);
+                CloudHypervisorApi::new(&socket).resume()
+            }
         }
     })();
     if let Err(err) = loaded {
@@ -1248,8 +1444,10 @@ pub(crate) fn restore_microvm(
         return Err(err.context(format!("restoring sandbox from checkpoint {}", manifest.id)));
     }
     // A later checkpoint of this guest records the TAP it is wired to now.
+    let network = state.network();
     let state = SandboxCheckpointState {
         tap: moved_to.or(state.tap),
+        network: Some(network),
         ..state
     };
     write_boot_record(scratch, &state)?;
@@ -1383,6 +1581,7 @@ mod tests {
             vcpus: 2,
             memory_mib: 1024,
             tap: None,
+            network: None,
         };
         let allocation = alloc(9);
         let fc = Backend::Firecracker {
@@ -1401,6 +1600,8 @@ mod tests {
             scratch: PathBuf::from("/nonexistent"),
             tap: None,
             bridge: None,
+            vsock: None,
+            datapath_wait: DATAPATH_WAIT,
         };
         let manifest = manifest_for(&state, MemoryParts::default());
 
@@ -1556,6 +1757,8 @@ mod tests {
             scratch: scratch.clone(),
             tap: None,
             bridge: None,
+            vsock: None,
+            datapath_wait: DATAPATH_WAIT,
         };
         restore_microvm(
             &target,
@@ -1670,6 +1873,8 @@ mod tests {
                 scratch: scratch.clone(),
                 tap: Some("tap0".into()),
                 bridge: None,
+                vsock: None,
+                datapath_wait: DATAPATH_WAIT,
             };
             restore_microvm(&target, &mut restored, &manifest, &out, &identity, &taps)?;
             let calls = vmm.drain();
@@ -1847,7 +2052,7 @@ mod tests {
         )?;
         let source = CheckpointDir::create(tmp.path().join("restore"))?;
         std::fs::hard_link(&store_blob, source.part_path(parts::CH_CONFIG))?;
-        retarget_cloud_hypervisor_tap(&source, "lgf0123456789ab")?;
+        retarget_cloud_hypervisor_config(&source, Some("lgf0123456789ab"), None)?;
         let rewritten: serde_json::Value =
             serde_json::from_slice(&std::fs::read(source.part_path(parts::CH_CONFIG))?)?;
         assert_eq!(rewritten["net"][0]["tap"], "lgf0123456789ab");
@@ -1856,6 +2061,426 @@ mod tests {
             original["net"][0]["tap"], "tap0",
             "the content-store blob the part links to is never edited"
         );
+        Ok(())
+    }
+
+    /// Gated plan §6.2: one rewrite of a restore's own `config.json` names
+    /// the fork's TAP and the restoring allocation's vsock socket, and a
+    /// gated restore of a config with no vsock device is refused by name.
+    #[test]
+    fn cloud_hypervisor_restores_rewrite_the_vsock_and_the_tap_in_one_pass() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let store_blob = tmp.path().join("blob-config.json");
+        std::fs::write(
+            &store_blob,
+            serde_json::to_vec(&json!({
+                "net": [{ "tap": "tap0" }],
+                "vsock": { "cid": 3, "socket": "/allocs/7/.sandbox/vsock.sock", "id": "_vsock0" },
+            }))?,
+        )?;
+        let source = CheckpointDir::create(tmp.path().join("restore"))?;
+        std::fs::hard_link(&store_blob, source.part_path(parts::CH_CONFIG))?;
+        retarget_cloud_hypervisor_config(
+            &source,
+            Some("lgf0123456789ab"),
+            Some(Path::new("/allocs/9/.sandbox/vsock.sock")),
+        )?;
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source.part_path(parts::CH_CONFIG))?)?;
+        assert_eq!(rewritten["net"][0]["tap"], "lgf0123456789ab");
+        assert_eq!(
+            rewritten["vsock"]["socket"],
+            "/allocs/9/.sandbox/vsock.sock"
+        );
+        assert_eq!(rewritten["vsock"]["cid"], 3, "the guest CID is left alone");
+        let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&store_blob)?)?;
+        assert_eq!(
+            original["vsock"]["socket"], "/allocs/7/.sandbox/vsock.sock",
+            "the content-store blob the part links to is never edited"
+        );
+
+        let no_vsock = CheckpointDir::create(tmp.path().join("plain"))?;
+        std::fs::write(
+            no_vsock.part_path(parts::CH_CONFIG),
+            serde_json::to_vec(&json!({ "net": [{ "tap": "tap0" }] }))?,
+        )?;
+        let err = retarget_cloud_hypervisor_config(
+            &no_vsock,
+            None,
+            Some(Path::new("/allocs/9/.sandbox/vsock.sock")),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("restore needs gated networking: the checkpoint's config.json"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    /// A gated checkpoint restores only into a gated task, and a TAP or
+    /// loopback-only one never into a gated task: both VMMs restore exactly
+    /// the devices they saved.
+    #[test]
+    fn a_gated_checkpoint_refuses_a_tap_config_and_the_reverse() {
+        let fc = Backend::Firecracker {
+            binary: "firecracker".into(),
+        };
+        let allocation = alloc(9);
+        let state = |network: Option<GuestNetwork>, tap: Option<&str>| SandboxCheckpointState {
+            vmm: "firecracker".into(),
+            link_key: "sbx-k".into(),
+            volume_count: 0,
+            vcpus: 1,
+            memory_mib: 256,
+            tap: tap.map(str::to_string),
+            network,
+        };
+        let target = |tap: Option<&str>, bridge: Option<&str>, gated: bool| RestoreTarget {
+            backend: &fc,
+            allocation: &allocation,
+            task_name: "workspace",
+            hostname: "legion-sbx-9".into(),
+            vcpus: 1,
+            memory_mib: 256,
+            scratch: PathBuf::from("/allocs/9/.sandbox"),
+            tap: tap.map(str::to_string),
+            bridge: bridge.map(str::to_string),
+            vsock: gated.then(|| PathBuf::from("/allocs/9/.sandbox/vsock.sock")),
+            datapath_wait: DATAPATH_WAIT,
+        };
+        let gated = manifest_for(
+            &state(Some(GuestNetwork::Gated), None),
+            MemoryParts::default(),
+        );
+        assert!(check_restorable(&gated, &target(None, None, true)).is_ok());
+        let err = check_restorable(&gated, &target(Some("lgf0"), Some("br0"), false)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "restore needs gated networking: the checkpoint's guest has a vsock datapath and no \
+             NIC, but task workspace is now wired to bridge br0; restore a snapshot taken with \
+             this network config, or restart the instance cold"
+        );
+        let err = check_restorable(&gated, &target(None, None, false)).unwrap_err();
+        assert!(
+            err.to_string().contains("now has no network device"),
+            "{err}"
+        );
+
+        let tap = manifest_for(&state(None, Some("lgf0")), MemoryParts::default());
+        let err = check_restorable(&tap, &target(None, None, true)).unwrap_err();
+        assert!(
+            err.to_string().starts_with(
+                "restore needs the guest's network layout: the checkpoint's guest has a NIC on \
+                 a TAP device, but task workspace is now gated (a vsock datapath and no NIC)"
+            ),
+            "{err}"
+        );
+        let loopback = manifest_for(&state(None, None), MemoryParts::default());
+        assert!(check_restorable(&loopback, &target(None, None, true)).is_err());
+        assert!(check_restorable(&loopback, &target(None, None, false)).is_ok());
+    }
+
+    /// Checkpoints taken before the network field existed read as `tap`
+    /// when they recorded a TAP and `none` otherwise.
+    #[test]
+    fn older_checkpoint_states_read_their_network_from_the_tap() -> R<()> {
+        let old: SandboxCheckpointState = serde_json::from_value(json!({
+            "vmm": "firecracker", "linkKey": "sbx-k", "volumeCount": 0, "vcpus": 1,
+            "memoryMib": 256, "tap": "tap0",
+        }))?;
+        assert_eq!(old.network(), GuestNetwork::Tap);
+        let old: SandboxCheckpointState = serde_json::from_value(json!({
+            "vmm": "firecracker", "linkKey": "sbx-k", "volumeCount": 0, "vcpus": 1,
+            "memoryMib": 256,
+        }))?;
+        assert_eq!(old.network(), GuestNetwork::None);
+        let gated = SandboxCheckpointState {
+            network: Some(GuestNetwork::Gated),
+            ..old
+        };
+        assert_eq!(serde_json::to_value(&gated)?["network"], "gated");
+        Ok(())
+    }
+
+    fn fake_firecracker_at(version: &'static str) -> impl Fn(&Seen) -> (u16, String) + Send {
+        move |seen| match seen.path.as_str() {
+            "/version" => (200, format!(r#"{{"firecracker_version":"{version}"}}"#)),
+            _ => fake_firecracker(seen),
+        }
+    }
+
+    /// A gated sandbox launched for checkpoints: [`launched`] with the vsock
+    /// device a gated launch adds.
+    fn launched_gated(
+        root: &Path,
+        id: i64,
+        backend: &Backend,
+    ) -> R<(TaskInstance, PathBuf, VmSpec)> {
+        let instance = TaskInstance {
+            alloc_dir: Some(root.join("allocs").join(id.to_string())),
+            checkpoint_launch: true,
+            ..TaskInstance::default()
+        };
+        let scratch = instance.alloc_dir.clone().unwrap().join(".sandbox");
+        std::fs::create_dir_all(&scratch)?;
+        std::fs::write(scratch.join("rootfs.img"), b"root disk contents")?;
+        let mut spec = VmSpec {
+            name: format!("legion-sbx-{id}"),
+            kernel: PathBuf::from("/vmlinux"),
+            extra_cmdline: None,
+            root_disk: scratch.join("rootfs.img"),
+            volume_disks: Vec::new(),
+            vcpus: 1,
+            memory_mib: 256,
+            tap: None,
+            api_socket: scratch.join("vmm.sock"),
+            vsock: Some(microvm::VsockSpec {
+                socket: scratch.join("vsock.sock"),
+            }),
+            identity_disk: None,
+            balloon: None,
+        };
+        prepare_checkpoint_launch(
+            backend,
+            &alloc(id),
+            "box",
+            &instance,
+            &scratch,
+            &mut spec,
+            &GuestTokens::default(),
+        )?;
+        Ok((instance, scratch, spec))
+    }
+
+    /// Gated plan §6.2 and §9, the device-link trap: fork one gated
+    /// Firecracker checkpoint twice. Each restore moves the guest's vsock
+    /// onto its own allocation's socket (where its own datapath listens),
+    /// never into the shared `.vmdev/<key>/` directory, so a later fork can
+    /// never redirect another guest's connections. Each waits for its
+    /// datapath before resuming, and records `gated` for its next capture.
+    #[test]
+    fn gated_forks_restore_onto_their_own_allocations_sockets() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let fc = Backend::Firecracker {
+            binary: "/usr/bin/true".into(),
+        };
+        let (mut origin, origin_scratch, spec) = launched_gated(tmp.path(), 7, &fc)?;
+        assert_eq!(
+            spec.vsock.as_ref().unwrap().socket,
+            origin_scratch.join("vsock.sock"),
+            "the vsock is never behind a device link"
+        );
+        let vmm = FakeVmm::start_at(
+            origin_scratch.join("vmm.sock"),
+            false,
+            fake_firecracker_at("1.16.1"),
+        );
+        let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
+        let parts = checkpoint_microvm(
+            &fc,
+            &alloc(7),
+            "box",
+            &mut origin,
+            &origin_scratch,
+            &out,
+            AfterCheckpoint::Resume,
+        )?;
+        drop(vmm);
+        let state: SandboxCheckpointState = serde_json::from_value(parts.runtime.clone())?;
+        assert_eq!(state.network(), GuestNetwork::Gated);
+        let manifest = manifest_for(&state, parts);
+        let vmdev = tmp.path().join("allocs/.vmdev");
+
+        let mut sockets = std::collections::HashSet::new();
+        for (n, id) in [(1, 8), (2, 9)] {
+            let scratch = tmp.path().join(format!("allocs/{id}/.sandbox"));
+            std::fs::create_dir_all(&scratch)?;
+            std::fs::write(scratch.join("vmm.sock"), b"stale")?;
+            // A stale base from an earlier boot is cleared for the VMM; the
+            // datapath's own listener beside it is left alone.
+            std::fs::write(scratch.join("vsock.sock"), b"stale")?;
+            std::fs::write(scratch.join("vsock.sock_1080"), b"proxy listener")?;
+            let vmm = FakeVmm::start_at(scratch.join("vmm.sock"), true, fake_firecracker);
+            let allocation = alloc(id);
+            let identity = ResumeIdentity {
+                alloc_id: id,
+                instance_id: Some(format!("user-42-f{n}")),
+                job_id: "job".into(),
+                task_name: "box".into(),
+                hostname: format!("legion-sbx-{id}"),
+                fork: true,
+                ..ResumeIdentity::default()
+            };
+            let target = RestoreTarget {
+                backend: &fc,
+                allocation: &allocation,
+                task_name: "box",
+                hostname: format!("legion-sbx-{id}"),
+                vcpus: 1,
+                memory_mib: 256,
+                scratch: scratch.clone(),
+                tap: None,
+                bridge: None,
+                vsock: Some(scratch.join("vsock.sock")),
+                datapath_wait: DATAPATH_WAIT,
+            };
+            let mut restored = TaskInstance {
+                alloc_dir: Some(tmp.path().join(format!("allocs/{id}"))),
+                ..TaskInstance::default()
+            };
+            restore_microvm(
+                &target,
+                &mut restored,
+                &manifest,
+                &out,
+                &identity,
+                &FakeTaps::default(),
+            )?;
+            let calls = vmm.drain();
+            let load = calls
+                .iter()
+                .find(|call| call.path == "/snapshot/load")
+                .and_then(|call| call.body.clone())
+                .expect("snapshot load");
+            let uds_path = PathBuf::from(load["vsock_override"]["uds_path"].as_str().unwrap());
+            assert_eq!(uds_path, scratch.join("vsock.sock"));
+            assert!(!uds_path.starts_with(&vmdev), "{}", uds_path.display());
+            assert!(sockets.insert(uds_path), "fork {n} shares a vsock socket");
+            assert!(load.get("network_overrides").is_none(), "no NIC to move");
+            assert_eq!(
+                calls.last().map(|call| call.body.clone()),
+                Some(Some(json!({"state": "Resumed"})))
+            );
+            assert!(!scratch.join("vsock.sock").exists(), "stale base cleared");
+            assert!(scratch.join("vsock.sock_1080").exists(), "listener kept");
+            assert_eq!(
+                read_boot_record(&scratch).map(|record| record.network()),
+                Some(GuestNetwork::Gated),
+                "the fork's next checkpoint is gated too"
+            );
+        }
+        Ok(())
+    }
+
+    /// Gated plan §6.3, calls entry 13: a restore whose datapath has not
+    /// bound the egress proxy socket waits, then resumes the guest anyway
+    /// (fail-closed: each dial is reset) instead of failing into a cold boot.
+    #[test]
+    fn a_gated_restore_resumes_fail_closed_when_the_datapath_is_not_bound() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let ch = Backend::CloudHypervisor {
+            binary: "/usr/bin/true".into(),
+        };
+        let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
+        std::fs::write(out.part_path(parts::ROOTFS), b"root")?;
+        std::fs::write(
+            out.part_path(parts::CH_CONFIG),
+            serde_json::to_vec(
+                &json!({ "vsock": { "cid": 3, "socket": "/allocs/7/.sandbox/vsock.sock" } }),
+            )?,
+        )?;
+        let state = SandboxCheckpointState {
+            vmm: "cloud-hypervisor".into(),
+            link_key: "sbx-gated".into(),
+            volume_count: 0,
+            vcpus: 1,
+            memory_mib: 256,
+            tap: None,
+            network: Some(GuestNetwork::Gated),
+        };
+        let memory = MemoryParts {
+            parts: out.seal(&[("rootfs", parts::ROOTFS), ("vm-config", parts::CH_CONFIG)])?,
+            ..MemoryParts::default()
+        };
+        let manifest = manifest_for(&state, memory);
+        let scratch = tmp.path().join("allocs/8/.sandbox");
+        std::fs::create_dir_all(&scratch)?;
+        std::fs::write(scratch.join("vmm.sock"), b"stale")?;
+        let vmm = FakeVmm::start_at(scratch.join("vmm.sock"), true, |_| (204, String::new()));
+        let allocation = alloc(8);
+        let target = RestoreTarget {
+            backend: &ch,
+            allocation: &allocation,
+            task_name: "box",
+            hostname: "legion-sbx-8".into(),
+            vcpus: 1,
+            memory_mib: 256,
+            scratch: scratch.clone(),
+            tap: None,
+            bridge: None,
+            vsock: Some(scratch.join("vsock.sock")),
+            datapath_wait: Duration::from_millis(100),
+        };
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().join("allocs/8")),
+            ..TaskInstance::default()
+        };
+        let started = std::time::Instant::now();
+        restore_microvm(
+            &target,
+            &mut instance,
+            &manifest,
+            &out,
+            &ResumeIdentity {
+                alloc_id: 8,
+                ..ResumeIdentity::default()
+            },
+            &FakeTaps::default(),
+        )?;
+        assert!(started.elapsed() >= Duration::from_millis(100), "it waited");
+        let calls: Vec<String> = vmm.drain().into_iter().map(|call| call.path).collect();
+        assert_eq!(calls, vec!["/api/v1/vm.resume"], "and then resumed anyway");
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.part_path(parts::CH_CONFIG))?)?;
+        assert_eq!(
+            config["vsock"]["socket"],
+            scratch.join("vsock.sock").display().to_string(),
+            "cloud-hypervisor restores onto the new allocation's socket"
+        );
+        assert!(wait_for_datapath(&scratch.join("vsock.sock"), Duration::ZERO) == false);
+        std::fs::write(scratch.join("vsock.sock_1080"), b"bound")?;
+        assert!(wait_for_datapath(
+            &scratch.join("vsock.sock"),
+            Duration::ZERO
+        ));
+        Ok(())
+    }
+
+    /// Gated plan §6.2, calls entry 7: a Firecracker too old to move the
+    /// vsock refuses the capture before pausing, so the guest never stops
+    /// for a checkpoint it could not restore.
+    #[test]
+    fn an_old_firecracker_refuses_a_gated_capture_before_pausing() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let fc = Backend::Firecracker {
+            binary: "/usr/bin/true".into(),
+        };
+        let (mut origin, scratch, _) = launched_gated(tmp.path(), 7, &fc)?;
+        let vmm = FakeVmm::start_at(
+            scratch.join("vmm.sock"),
+            false,
+            fake_firecracker_at("1.15.0"),
+        );
+        let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
+        let err = checkpoint_microvm(
+            &fc,
+            &alloc(7),
+            "box",
+            &mut origin,
+            &scratch,
+            &out,
+            AfterCheckpoint::Stop,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().starts_with(
+                "sandbox allocation 7 is gated, and node node-1 runs Firecracker 1.15.0"
+            ),
+            "{err}"
+        );
+        let calls: Vec<String> = vmm.drain().into_iter().map(|call| call.path).collect();
+        assert_eq!(calls, vec!["/version"], "never paused");
         Ok(())
     }
 
@@ -2260,6 +2885,7 @@ mod tests {
             vcpus: 1,
             memory_mib: 256,
             tap: Some("tap7".into()),
+            network: None,
         };
         let memory = MemoryParts {
             parts: out.seal(&[("rootfs", parts::ROOTFS)])?,
@@ -2280,6 +2906,8 @@ mod tests {
             scratch: scratch.clone(),
             tap: Some("tap7".into()),
             bridge: None,
+            vsock: None,
+            datapath_wait: DATAPATH_WAIT,
         };
         let mut instance = TaskInstance {
             alloc_dir: Some(dir.path().join("allocs/8")),

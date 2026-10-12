@@ -25,12 +25,25 @@
 //! tested over Unix sockets named `<base>_<port>` — the convention both
 //! Firecracker and cloud-hypervisor use for the host side of vsock, i.e.
 //! exactly what `netd` binds.
+//!
+//! **Across a memory restore.** Every relay dials a fresh vsock stream, so
+//! the first connection after a restore reaches the restoring allocation's
+//! listener (the worker moves the VM onto its own socket). Streams that were
+//! open at capture are dead: Firecracker resets them, cloud-hypervisor v52
+//! and later reset them on restore, and older cloud-hypervisor can leave
+//! them half open. The agent tracks every open relay in [`Relays`], and its
+//! resume watch ([`crate::resume::Watcher`]) closes them all when it sees a
+//! restore, so a guest client gets a prompt close on every VMM version and
+//! never a hang. The agent's own loopback listeners are guest-internal and
+//! survive the restore unchanged.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -45,6 +58,8 @@ pub trait HostStream: Read + Write + Send {
     /// A second handle for the other direction of a relay.
     fn split(&self) -> io::Result<Box<dyn HostStream>>;
     fn shutdown_write(&self) -> io::Result<()>;
+    /// Close both directions, which unblocks a reader on another handle.
+    fn shutdown_both(&self) -> io::Result<()>;
 }
 
 impl HostStream for UnixStream {
@@ -53,6 +68,66 @@ impl HostStream for UnixStream {
     }
     fn shutdown_write(&self) -> io::Result<()> {
         self.shutdown(std::net::Shutdown::Write)
+    }
+    fn shutdown_both(&self) -> io::Result<()> {
+        self.shutdown(std::net::Shutdown::Both)
+    }
+}
+
+/// The relays the agent holds open right now, so a restore can close them
+/// all at once (see the module docs).
+#[derive(Default)]
+pub struct Relays {
+    next: AtomicU64,
+    open: Mutex<HashMap<u64, OpenRelay>>,
+}
+
+/// Handles on both ends of one relay, kept only to shut them down.
+struct OpenRelay {
+    client: TcpStream,
+    host: Box<dyn HostStream>,
+}
+
+impl Relays {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, OpenRelay>> {
+        self.open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Track a relay. `None` when a handle cannot be duplicated, in which
+    /// case the relay still runs, untracked.
+    fn register(&self, client: &TcpStream, host: &dyn HostStream) -> Option<u64> {
+        let relay = OpenRelay {
+            client: client.try_clone().ok()?,
+            host: host.split().ok()?,
+        };
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.lock().insert(id, relay);
+        Some(id)
+    }
+
+    fn finish(&self, id: Option<u64>) {
+        if let Some(id) = id {
+            self.lock().remove(&id);
+        }
+    }
+
+    /// Relays open right now.
+    pub fn open_count(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Close every open relay, both ends: the guest client sees its
+    /// connection close, and a relay thread blocked on a dead host stream
+    /// wakes up. Returns how many were open.
+    pub fn close_all(&self) -> usize {
+        let open: Vec<OpenRelay> = self.lock().drain().map(|(_, relay)| relay).collect();
+        for relay in &open {
+            let _ = relay.client.shutdown(std::net::Shutdown::Both);
+            let _ = relay.host.shutdown_both();
+        }
+        open.len()
     }
 }
 
@@ -152,10 +227,12 @@ impl Default for AgentConfig {
     }
 }
 
-/// Bound listeners, handed back so a caller (a test) knows the ports.
+/// Bound listeners, handed back so a caller (a test) knows the ports, and
+/// the open relays, so the resume watch can close them on a restore.
 pub struct Started {
     pub proxy_addr: SocketAddr,
     pub dns_addr: Option<SocketAddr>,
+    pub relays: Arc<Relays>,
 }
 
 /// Bind the guest listeners and start relaying on background threads.
@@ -163,11 +240,13 @@ pub fn start(config: AgentConfig, dial: Arc<dyn HostDial>) -> io::Result<Started
     let tcp = TcpListener::bind(config.proxy_listen)?;
     let proxy_addr = tcp.local_addr()?;
     let proxy_port = config.proxy_port;
+    let relays = Arc::new(Relays::default());
     {
         let dial = dial.clone();
+        let relays = relays.clone();
         thread::Builder::new()
             .name("legion-guest-proxy".into())
-            .spawn(move || relay_tcp(tcp, dial, proxy_port))?;
+            .spawn(move || relay_tcp(tcp, dial, proxy_port, relays))?;
     }
     let dns_addr = match config.dns_listen {
         Some(bind) => {
@@ -184,17 +263,19 @@ pub fn start(config: AgentConfig, dial: Arc<dyn HostDial>) -> io::Result<Started
     Ok(Started {
         proxy_addr,
         dns_addr,
+        relays,
     })
 }
 
 /// Accept guest connections forever and relay each to the host port.
-fn relay_tcp(listener: TcpListener, dial: Arc<dyn HostDial>, port: u32) {
+fn relay_tcp(listener: TcpListener, dial: Arc<dyn HostDial>, port: u32, relays: Arc<Relays>) {
     for accepted in listener.incoming() {
         let Ok(client) = accepted else {
             thread::sleep(Duration::from_millis(50));
             continue;
         };
         let dial = dial.clone();
+        let relays = relays.clone();
         let _ = thread::Builder::new()
             .name("legion-guest-relay".into())
             .spawn(move || {
@@ -205,7 +286,9 @@ fn relay_tcp(listener: TcpListener, dial: Arc<dyn HostDial>, port: u32) {
                         return;
                     }
                 };
+                let id = relays.register(&client, &*host);
                 relay_pair(client, host);
+                relays.finish(id);
             });
     }
 }

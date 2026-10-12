@@ -1052,15 +1052,18 @@ impl SandboxTaskPlugin {
             instance.task_dir.as_deref(),
         );
         let file_tokens = has_file_identities(task);
+        if gated {
+            microvm::check_vsock_socket_path(&vsock_socket_base(&scratch))?;
+        }
         let mut payload = GuestPayload {
             command: config.command.clone(),
             env: guest_env,
             cwd: payload_cwd,
             disk_mounts: volumes.mounts,
             guest_agent: gated,
-            // Gated sandboxes are never launched for checkpoints (see below),
-            // but any guest with token files watches its identity disk.
-            resume_watch: (instance.checkpoint_launch && !gated) || file_tokens,
+            // A guest launched for checkpoints, or with token files, watches
+            // its identity disk. On a gated guest the agent runs the watch.
+            resume_watch: instance.checkpoint_launch || file_tokens,
         };
 
         let staged = instance.staged_artifacts.clone();
@@ -1128,7 +1131,6 @@ impl SandboxTaskPlugin {
             tap,
             api_socket: scratch.join("vmm.sock"),
             vsock: gated.then(|| microvm::VsockSpec {
-                cid: microvm::vsock_cid(allocation.id),
                 socket: vsock_socket_base(&scratch),
             }),
             identity_disk: None,
@@ -1137,20 +1139,15 @@ impl SandboxTaskPlugin {
         // A sandbox the job may suspend or snapshot boots behind stable
         // device links with an identity disk, so a memory checkpoint of it
         // can be restored into a later allocation (see sandbox_checkpoint).
-        let checkpointable = if !instance.checkpoint_launch {
-            false
-        } else if gated {
-            warn!(
-                allocation_id = allocation.id,
-                task_name = %task.name,
-                "Gated sandboxes cannot be memory-checkpointed yet; launching without checkpoint support"
-            );
-            false
-        } else {
+        // A gated one too: every restore moves its vsock to the restoring
+        // allocation's socket.
+        let checkpointable = if instance.checkpoint_launch {
             sandbox_checkpoint::prepare_checkpoint_launch(
                 hypervisor, allocation, &task.name, instance, &scratch, &mut spec, &tokens,
             )?;
             true
+        } else {
+            false
         };
         if !checkpointable && file_tokens {
             // No checkpoint support, but token files to keep fresh: the
@@ -1938,6 +1935,11 @@ impl TaskPlugin for SandboxTaskPlugin {
                 .tap_for(identity.instance_id.as_deref(), allocation.id)
                 .map(|tap| tap.device),
             bridge: config.auto_bridge(),
+            // A gated restore moves the guest's vsock onto this
+            // allocation's own socket, where the datapath already listens.
+            vsock: crate::task_plugins::allocation_is_gated(allocation)
+                .then(|| vsock_socket_base(&work_root(allocation, instance))),
+            datapath_wait: sandbox_checkpoint::DATAPATH_WAIT,
         };
         let scratch = target.scratch.clone();
         let guest_mib = u64::from(target.memory_mib);

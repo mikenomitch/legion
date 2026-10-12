@@ -3,8 +3,11 @@
 //!
 //! A memory restore resumes a guest mid-instruction: nothing inside it knows
 //! it was frozen, moved to a new allocation, or that hours passed. So every
-//! sandbox launched for memory checkpoints runs `legion guest-resume` (this
-//! binary, copied into the rootfs, started by the generated init). It polls
+//! sandbox launched for memory checkpoints runs this handler (the guest
+//! binary, copied into the rootfs, started by the generated init): as
+//! `guest-resume`, or inside the gated datapath's agent as `guest-agent
+//! --resume-watch`, which also closes the agent's relays on a restore
+//! ([`Watcher`]). It polls
 //! the identity disk named by `legion.identity=` on the kernel cmdline. The
 //! worker writes a fresh identity there on every restore, so a change in the
 //! disk's `alloc_id` or `host_time_unix_ms` means "you were just restored".
@@ -243,41 +246,98 @@ pub fn read_identity_fresh(device: &Path) -> R<ResumeIdentity> {
     crate::identity::read_identity_disk(device)
 }
 
-/// The watch loop `legion guest-resume` runs: remember the boot identity,
-/// then poll for a new one and apply it. Never returns.
-pub fn watch(device: &Path, host: &dyn GuestHost, poll: Duration) -> ! {
-    let mut seen = read_identity_fresh(device).ok();
-    // Tokens the disk carries at boot land in /legion/identity right away.
-    if let Some(boot) = seen.as_ref() {
-        if boot.tokens_differ(&ResumeIdentity::default()) {
-            log_tokens("boot", &apply_tokens(boot, host));
+/// What one read of the identity disk meant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    /// Nothing new: the identity the watcher already applied.
+    Unchanged,
+    /// The first identity the watcher saw (the boot identity). Its tokens,
+    /// if any, were written.
+    Boot,
+    /// The same allocation with new workload-identity tokens, written.
+    Tokens,
+    /// A restore: the guest now belongs to `alloc_id`, and the identity was
+    /// applied with this outcome.
+    Restored {
+        alloc_id: i64,
+        outcome: ResumeOutcome,
+    },
+}
+
+/// The resume watch's state: the identity it last applied. Each read of the
+/// disk goes through [`Watcher::observe`], which decides what changed and
+/// applies it. `on_restore` runs first on a restore, before anything else is
+/// refreshed: the guest agent uses it to close the relays the capture left
+/// dead, so clients reconnect through the restoring allocation's listener.
+pub struct Watcher<'a> {
+    seen: Option<ResumeIdentity>,
+    host: &'a dyn GuestHost,
+    on_restore: &'a (dyn Fn() + Sync),
+}
+
+impl<'a> Watcher<'a> {
+    pub fn new(host: &'a dyn GuestHost, on_restore: &'a (dyn Fn() + Sync)) -> Self {
+        Watcher {
+            seen: None,
+            host,
+            on_restore,
         }
+    }
+
+    pub fn observe(&mut self, current: ResumeIdentity) -> Observed {
+        let Some(seen) = self.seen.as_ref() else {
+            // Tokens the disk carries at boot land in /legion/identity
+            // right away.
+            if current.tokens_differ(&ResumeIdentity::default()) {
+                log_tokens("boot", &apply_tokens(&current, self.host));
+            }
+            self.seen = Some(current);
+            return Observed::Boot;
+        };
+        if is_token_refresh(seen, &current) {
+            log_tokens("refresh", &apply_tokens(&current, self.host));
+            self.seen = Some(current);
+            return Observed::Tokens;
+        }
+        if !is_new_identity(seen, &current) {
+            return Observed::Unchanged;
+        }
+        eprintln!(
+            "legion-guest-resume: restored as allocation {}; refreshing identity",
+            current.alloc_id
+        );
+        (self.on_restore)();
+        let outcome = apply_resume(&current, self.host);
+        let alloc_id = current.alloc_id;
+        self.seen = Some(current);
+        Observed::Restored { alloc_id, outcome }
+    }
+}
+
+/// The watch loop the resume handler runs: remember the boot identity, then
+/// poll for a new one and apply it. Never returns.
+pub fn watch(device: &Path, host: &dyn GuestHost, poll: Duration) -> ! {
+    watch_with(device, host, poll, &|| {})
+}
+
+/// [`watch`], running `on_restore` first on every restore (see
+/// [`Watcher`]).
+pub fn watch_with(
+    device: &Path,
+    host: &dyn GuestHost,
+    poll: Duration,
+    on_restore: &(dyn Fn() + Sync),
+) -> ! {
+    let mut watcher = Watcher::new(host, on_restore);
+    if let Ok(boot) = read_identity_fresh(device) {
+        watcher.observe(boot);
     }
     loop {
         std::thread::sleep(poll);
         let Ok(current) = read_identity_fresh(device) else {
             continue;
         };
-        if seen
-            .as_ref()
-            .is_some_and(|seen| is_token_refresh(seen, &current))
-        {
-            log_tokens("refresh", &apply_tokens(&current, host));
-            seen = Some(current);
-            continue;
-        }
-        let restored = seen
-            .as_ref()
-            .is_none_or(|seen| is_new_identity(seen, &current));
-        if !restored {
-            continue;
-        }
-        if seen.is_some() {
-            eprintln!(
-                "legion-guest-resume: restored as allocation {}; refreshing identity",
-                current.alloc_id
-            );
-            let outcome = apply_resume(&current, host);
+        if let Observed::Restored { outcome, .. } = watcher.observe(current) {
             eprintln!(
                 "legion-guest-resume: refreshed {}{}",
                 outcome.done.join(", "),
@@ -288,7 +348,6 @@ pub fn watch(device: &Path, host: &dyn GuestHost, poll: Duration) -> ! {
                 }
             );
         }
-        seen = Some(current);
     }
 }
 
@@ -647,6 +706,119 @@ mod tests {
         let path = dir.path().join("identity.img");
         crate::identity::write_identity_disk(&path, &restored(11))?;
         assert_eq!(read_identity_fresh(&path)?.alloc_id, 11);
+        Ok(())
+    }
+
+    /// The watcher applies the boot identity's tokens, a token refresh, and
+    /// a restore, each once, and runs the restore hook only on a restore.
+    #[test]
+    fn the_watcher_runs_the_restore_hook_only_on_a_restore() {
+        let host = Recorder::default();
+        let hooks = std::sync::atomic::AtomicUsize::new(0);
+        let hook = || {
+            hooks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        let mut watcher = Watcher::new(&host, &hook);
+        let boot = restored(7);
+        assert_eq!(watcher.observe(boot.clone()), Observed::Boot);
+        assert_eq!(watcher.observe(boot.clone()), Observed::Unchanged);
+        let refreshed = ResumeIdentity {
+            env: [("ACME_TOKEN".to_string(), "fresh".to_string())].into(),
+            ..boot.clone()
+        };
+        assert_eq!(watcher.observe(refreshed), Observed::Tokens);
+        assert_eq!(hooks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        match watcher.observe(restored(9)) {
+            Observed::Restored { alloc_id, outcome } => {
+                assert_eq!(alloc_id, 9);
+                assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+            }
+            other => panic!("expected a restore, got {other:?}"),
+        }
+        assert_eq!(hooks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(watcher.observe(restored(9)), Observed::Unchanged);
+    }
+
+    /// Gated plan §6.3: a relay the capture left dead (here, a host stream
+    /// that never answers, the half-open case an old cloud-hypervisor can
+    /// leave) is closed the moment the agent's watch sees a new allocation,
+    /// so the guest client gets a prompt close instead of a hang. A new
+    /// connection afterwards dials a fresh host stream.
+    #[test]
+    fn the_agent_closes_its_relays_when_the_guest_is_restored() -> R<()> {
+        use crate::agent::{self, AgentConfig, HostDial, UnixDial, PROXY_PORT};
+        use std::io::Read as _;
+        use std::io::Write as _;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir()?;
+        let base = dir.path().join("vsock.sock");
+        // The host end: accept and hold every stream, never reply.
+        let listener =
+            std::os::unix::net::UnixListener::bind(agent::host_socket_path(&base, PROXY_PORT))?;
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let held = held.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    held.lock().unwrap().push(stream);
+                }
+            });
+        }
+        let dial: Arc<dyn HostDial> = Arc::new(UnixDial { base });
+        let started = agent::start(
+            AgentConfig {
+                proxy_listen: "127.0.0.1:0".parse().unwrap(),
+                dns_listen: None,
+                ..Default::default()
+            },
+            dial,
+        )?;
+        let mut client = std::net::TcpStream::connect(started.proxy_addr)?;
+        client.write_all(b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n")?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while started.relays.open_count() == 0 {
+            assert!(std::time::Instant::now() < deadline, "relay never opened");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let host = Recorder::default();
+        let relays = started.relays.clone();
+        let hook = move || {
+            relays.close_all();
+        };
+        let mut watcher = Watcher::new(&host, &hook);
+        watcher.observe(restored(7));
+        assert!(matches!(
+            watcher.observe(restored(8)),
+            Observed::Restored { alloc_id: 8, .. }
+        ));
+
+        // The client sees its connection end at once, not at a timeout.
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let started_read = std::time::Instant::now();
+        let mut buf = [0u8; 16];
+        let read = client.read(&mut buf);
+        assert!(
+            started_read.elapsed() < Duration::from_secs(4),
+            "the relay was not closed: {read:?}"
+        );
+        assert!(!matches!(read, Ok(n) if n > 0), "{read:?}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while started.relays.open_count() != 0 {
+            assert!(std::time::Instant::now() < deadline, "relay never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A new guest connection dials a fresh host stream.
+        let before = held.lock().unwrap().len();
+        let mut again = std::net::TcpStream::connect(started.proxy_addr)?;
+        again.write_all(b"x")?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while held.lock().unwrap().len() == before {
+            assert!(std::time::Instant::now() < deadline, "no fresh host stream");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         Ok(())
     }
 }
