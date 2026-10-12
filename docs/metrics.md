@@ -447,6 +447,22 @@ across them. See [session-mode.md](session-mode.md).
 - **`legion_session_promotions_total`** (counter): running sessions promoted
   to keyed instances, one scheduler-lane raft entry each.
 
+Two more are counted on the worker that holds the sessions, on its own
+listener ([Worker](#worker)):
+
+- **`legion_session_evictions_total{reason}`** (counter): suspended
+  sessions whose local checkpoint the node evicted, by `reason`:
+  `keep_for` (`suspend.keepFor` passed), `envelope_gone` (the job stopped
+  or the node was drained), `disk_pressure` (below `content.minFreeDisk`),
+  or `other`. A later `instance start` on one answers `NOT_FOUND`
+  "evicted". A rising `disk_pressure` count means the node's disk is too
+  small for its suspended sessions and their `keepFor`.
+- **`legion_session_checkpoints_skipped_total`** (counter): periodic
+  session checkpoints (`suspend.checkpointEvery`) skipped because the
+  node's capture backlog exceeded one interval. Any steady rate means the
+  node cannot capture its sessions that often: lengthen the interval or
+  run fewer sessions per node.
+
 ### Heartbeat cadence
 
 Reported on the status-lane leader (the manager that owns node liveness), and

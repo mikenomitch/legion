@@ -5570,10 +5570,12 @@ message SessionStatus {
   // when a job update replaces the envelope on the node.
   int64 envelope_allocation_id = 5;
 
-  // `starting` (admitted, not running yet), `running`, `suspended`
-  // (checkpointed on its node, nothing running, not using envelope room),
-  // or `evicted` (a local-only checkpoint that is gone; reported for
-  // `suspend.keepFor` so the answer is `evicted`, not `not found`).
+  // `starting` (admitted, not running yet), `running`, or `suspended`
+  // (checkpointed on its node, nothing running, not using envelope room;
+  // `Worker.ResumeSession` or `legion instance start` brings it back). A
+  // session whose local checkpoint was evicted is not reported at all: for
+  // `suspend.keepFor` after the eviction its node answers a request for it
+  // with NotFound starting `evicted`, naming when and why.
   string state = 6;
 
   // When the session was issued, unix milliseconds: by the manager that
@@ -9072,6 +9074,66 @@ service Worker {
   // longer runs answers `stopped = false`. NotFound with `wrong_node` when
   // the id's tag names another node.
   rpc StopSession (StopSessionRequest) returns (StopSessionReply);
+
+  // Suspends sessions on this node (session durability plan §6.6,
+  // docs/session-mode.md "Idle sessions"). A manager calls it to route
+  // `legion instance suspend <session>` to the node the session id's tag
+  // names. For each id the node captures a checkpoint into its content
+  // store (a memory checkpoint for a sandbox launched for checkpoints, else
+  // a disk checkpoint, which of a session holds only its spec), stops the
+  // process, frees the session's share of its envelope, and records the
+  // session as `suspended` in its session log, so it survives a worker
+  // restart. The checkpoint stays on this node, pinned until the task's
+  // `suspend.keepFor` expires, the job stops, or disk pressure
+  // (`content.minFreeDisk`) evicts it. Nothing is written to raft.
+  //
+  // Each id is answered on its own, in `suspended` or `failed`. A session
+  // that is already suspended counts as suspended (the call is
+  // idempotent). A failed capture leaves the session running. The reply
+  // comes once every capture has finished, which for a memory checkpoint
+  // takes as long as writing the guest's memory.
+  //
+  // Only sessions whose task sets a `suspend` block with
+  // `durability = "local"` can be suspended: `durability = "store"` is not
+  // available for unpromoted sessions yet, and a promoted session is
+  // suspended through its row (`Manager.SuspendInstance`).
+  //
+  // Caller class: `manager` (a client certificate from the cluster CA
+  // carrying `legion://manager/<id>`); anything else is refused with
+  // `Unauthenticated`.
+  rpc SuspendSessions (SuspendSessionsRequest) returns (SuspendSessionsReply);
+
+  // Resumes a suspended session on this node under the same id (session
+  // durability plan §6.6). A manager calls it to route `legion instance
+  // start <session>` to the node the id's tag names. The node admits the
+  // session into its task's envelope again and restores it from its local
+  // memory checkpoint, or boots it fresh when the checkpoint is a disk one
+  // (it holds only the session's spec) or `cold` is set. The answer comes
+  // once the session's runtime returned. A local session never moves, so
+  // its generation stays 1.
+  //
+  // A session that is already running answers OK with
+  // `already_running = true`.
+  //
+  // Errors:
+  // - NotFound: the node does not hold the session. The message starts
+  //   with `evicted` when the node evicted its local checkpoint (naming
+  //   when and why; reported for `suspend.keepFor` after the eviction, and
+  //   not retryable: the session is gone), with `wrong_node` when the id's
+  //   node tag names another node, and with `not_found` otherwise.
+  // - ResourceExhausted: the envelope has no room for the session right
+  //   now, or every launch slot stayed busy for `edgeBoot.queueTimeout`.
+  //   Retryable; the session stays suspended with its checkpoint.
+  // - FailedPrecondition: the node holds no envelope for the session's
+  //   task any more (the job stopped or was moved).
+  // - Aborted: another suspend, checkpoint, or resume of the session is in
+  //   progress. Retryable.
+  // - Internal: the restore failed. The session stays suspended with its
+  //   checkpoint.
+  //
+  // Caller class: `manager`; anything else is refused with
+  // `Unauthenticated`.
+  rpc ResumeSession (ResumeSessionRequest) returns (ResumeSessionReply);
 }
 
 // Request payload for Worker.StartSession.
@@ -9158,6 +9220,89 @@ message StopSessionsRequest {
 message StopSessionsReply {
   // The ids this node was running and has ended.
   repeated string stopped = 1;
+}
+
+// Request payload for Worker.SuspendSessions.
+message SuspendSessionsRequest {
+  // The sessions to suspend. Ids the node does not hold are answered in
+  // `failed`.
+  repeated string session_ids = 1;
+
+  // Why, for the node's log: `manual` (`legion instance suspend`) or
+  // another short word.
+  string reason = 2;
+}
+
+// Reply payload for Worker.SuspendSessions.
+message SuspendSessionsReply {
+  // The sessions now suspended on this node, including any that already
+  // were.
+  repeated SuspendedSession suspended = 1;
+
+  // The sessions that were not suspended, each with why. A session whose
+  // capture failed keeps running.
+  repeated SessionSleepFailure failed = 2;
+}
+
+// One session a node suspended.
+message SuspendedSession {
+  // The session id.
+  string session_id = 1;
+
+  // The checkpoint's snapshot id (`snap-...`), local to the node: its parts
+  // are pinned in the node content store and never published.
+  string snapshot_id = 2;
+
+  // `memory` (the guest's memory, restored on resume) or `disk` (nothing
+  // but the session's spec: a resume boots it fresh under the same id).
+  string kind = 3;
+
+  // Bytes the checkpoint holds in the node content store.
+  uint64 bytes = 4;
+
+  // True when the session was already suspended before this call.
+  bool already_suspended = 5;
+}
+
+// Why a node did not suspend one session.
+message SessionSleepFailure {
+  // The session id.
+  string session_id = 1;
+
+  // The gRPC code the failure would carry on its own: `NOT_FOUND`,
+  // `FAILED_PRECONDITION`, `ABORTED`, or `INTERNAL`.
+  string code = 2;
+
+  // What went wrong. A NOT_FOUND message starts with `not_found`,
+  // `evicted`, or `wrong_node`, as `GetSession` answers.
+  string message = 3;
+}
+
+// Request payload for Worker.ResumeSession.
+message ResumeSessionRequest {
+  // The suspended session to resume.
+  string session_id = 1;
+
+  // Discard the checkpoint and boot the session fresh under the same id.
+  bool cold = 2;
+}
+
+// Reply payload for Worker.ResumeSession.
+message ResumeSessionReply {
+  // The session as it stands after the resume: `running`, or `starting`
+  // when its runtime is still coming up.
+  SessionStatus session = 1;
+
+  // This node's id.
+  string node_id = 2;
+
+  // `local` (restored from the node's memory checkpoint) or `cold` (booted
+  // fresh: a disk checkpoint, or `cold` was asked). Empty when the session
+  // was already running.
+  string resumed_from = 3;
+
+  // True when the session was running already and nothing was done.
+  bool already_running = 4;
 }
 
 // Request payload for Worker.Probe. Empty: the TLS handshake and the

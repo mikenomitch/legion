@@ -36,10 +36,12 @@ use legion::structs::{
     GetInstanceRequest, GetSessionReply, GetSessionRequest, GetTaskLogsReply, GetTaskLogsRequest,
     HeartbeatReply, HeartbeatRequest, InstanceInfo, ListInstancesReply, ListInstancesRequest, Node,
     NodeMsg, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply,
-    PromoteInstanceRequest, RestartWorkerReply, RestartWorkerRequest, SessionReport, SessionStatus,
-    StartClaimReply, StartClaimRequest, StartSessionReply, StartSessionRequest,
+    PromoteInstanceRequest, RestartWorkerReply, RestartWorkerRequest, ResumeSessionReply,
+    ResumeSessionRequest, SessionReport, SessionSleepFailure, SessionStatus, StartClaimReply,
+    StartClaimRequest, StartInstanceRequest, StartSessionReply, StartSessionRequest,
     StopInstanceRequest, StopSessionReply, StopSessionRequest, StopSessionsReply,
-    StopSessionsRequest, Submission, SuspendInstanceRequest, TaskAllocation,
+    StopSessionsRequest, Submission, SuspendInstanceRequest, SuspendSessionsReply,
+    SuspendSessionsRequest, SuspendedSession, TaskAllocation,
 };
 use tonic::{Code, Request, Response, Status, Streaming};
 
@@ -55,6 +57,8 @@ struct NodeState {
     posts: Vec<TaskAllocation>,
     /// Every session id a StopSessions call named.
     stops: Vec<String>,
+    /// Sessions this node evicted, with the `evicted:` answer's details.
+    evicted: BTreeMap<String, String>,
     epoch: u64,
 }
 
@@ -140,12 +144,82 @@ impl Worker for FakeNode {
         Ok(Response::new(StopSessionsReply { stopped }))
     }
 
+    /// Suspend as a node does it, minus the checkpoint: the session stays
+    /// listed as `suspended`.
+    async fn suspend_sessions(
+        &self,
+        request: Request<SuspendSessionsRequest>,
+    ) -> Result<Response<SuspendSessionsReply>, Status> {
+        let mut state = self.lock();
+        let mut reply = SuspendSessionsReply::default();
+        for id in request.into_inner().session_ids {
+            match state.sessions.get_mut(&id) {
+                Some(status) => {
+                    let already = status.state == "suspended";
+                    status.state = "suspended".into();
+                    reply.suspended.push(SuspendedSession {
+                        session_id: id,
+                        snapshot_id: "snap-fake".into(),
+                        kind: "memory".into(),
+                        bytes: 4096,
+                        already_suspended: already,
+                    });
+                }
+                None => reply.failed.push(SessionSleepFailure {
+                    session_id: id.clone(),
+                    code: "NotFound".into(),
+                    message: format!("not_found: no session {id}"),
+                }),
+            }
+        }
+        Ok(Response::new(reply))
+    }
+
+    async fn resume_session(
+        &self,
+        request: Request<ResumeSessionRequest>,
+    ) -> Result<Response<ResumeSessionReply>, Status> {
+        let id = request.into_inner().session_id;
+        let mut state = self.lock();
+        if let Some(when) = state.evicted.get(&id) {
+            return Err(Status::not_found(format!(
+                "evicted: session {id} was evicted from n1 {when}; a local-only session cannot be restored"
+            )));
+        }
+        let full = state.full;
+        let Some(status) = state.sessions.get_mut(&id) else {
+            return Err(Status::not_found(format!("not_found: no session {id}")));
+        };
+        if status.state != "suspended" {
+            return Ok(Response::new(ResumeSessionReply {
+                session: Some(status.clone()),
+                already_running: true,
+                ..Default::default()
+            }));
+        }
+        if full {
+            return Err(Status::resource_exhausted("envelope full"));
+        }
+        status.state = "running".into();
+        Ok(Response::new(ResumeSessionReply {
+            session: Some(status.clone()),
+            resumed_from: "local".into(),
+            ..Default::default()
+        }))
+    }
+
     async fn get_session(
         &self,
         request: Request<GetSessionRequest>,
     ) -> Result<Response<GetSessionReply>, Status> {
         let id = request.into_inner().session_id;
-        match self.lock().sessions.get(&id) {
+        let state = self.lock();
+        if let Some(when) = state.evicted.get(&id) {
+            return Err(Status::not_found(format!(
+                "evicted: session {id} was evicted from n1 {when}; a local-only session cannot be restored"
+            )));
+        }
+        match state.sessions.get(&id) {
             Some(status) => Ok(Response::new(GetSessionReply {
                 session: Some(status.clone()),
                 node_id: String::new(),
@@ -201,6 +275,8 @@ struct Cluster {
     job: String,
     /// `stateful.envelope.resources`, and one session's `resources`.
     sizes: (serde_json::Value, serde_json::Value),
+    /// The session task's `suspend` block, when it has one.
+    suspend: Option<serde_json::Value>,
     nodes: BTreeMap<String, FakeNode>,
     _dir: tempfile::TempDir,
 }
@@ -224,6 +300,28 @@ impl Cluster {
         envelope: serde_json::Value,
         session: serde_json::Value,
     ) -> R<Self> {
+        Self::build(job, nodes, envelope, session, None).await
+    }
+
+    /// [`Cluster::new`] with a `suspend` block on the session task.
+    async fn with_suspend(job: &str, nodes: &[&str], suspend: serde_json::Value) -> R<Self> {
+        Self::build(
+            job,
+            nodes,
+            json!({ "cpu": 2000, "memory": 2048 }),
+            json!({ "cpu": 500, "memory": 512 }),
+            Some(suspend),
+        )
+        .await
+    }
+
+    async fn build(
+        job: &str,
+        nodes: &[&str],
+        envelope: serde_json::Value,
+        session: serde_json::Value,
+        suspend: Option<serde_json::Value>,
+    ) -> R<Self> {
         let dir = tempfile::tempdir()?;
         let mut config = ManagerConfigFull {
             store_path: dir.path().join("store").to_str().context("utf-8")?.into(),
@@ -241,6 +339,7 @@ impl Cluster {
             svc: ManagerDaemonService::new(store),
             job: job.to_string(),
             sizes: (envelope, session),
+            suspend,
             nodes: BTreeMap::new(),
             _dir: dir,
         };
@@ -310,17 +409,21 @@ impl Cluster {
     fn submit(&self) -> R<()> {
         // Parsed as a jobspec is, which turns the session task into a keyed
         // task plus its generated envelope task.
+        let mut task = json!({
+            "name": TASK,
+            "runtime": "noop",
+            "resources": self.sizes.1,
+            "stateful": {
+                "mode": "session",
+                "envelope": { "resources": self.sizes.0 },
+            },
+        });
+        if let Some(suspend) = &self.suspend {
+            task["suspend"] = suspend.clone();
+        }
         let config: JobConfig = serde_json::from_value(json!({
             "name": self.job,
-            "task": {
-                "name": TASK,
-                "runtime": "noop",
-                "resources": self.sizes.1,
-                "stateful": {
-                    "mode": "session",
-                    "envelope": { "resources": self.sizes.0 },
-                },
-            },
+            "task": task,
         }))?;
         tokio::task::block_in_place(|| -> R<()> {
             self.store().handle_job_submit(
@@ -876,6 +979,121 @@ async fn stop_and_destroy_end_a_session_and_other_verbs_ask_for_promotion_test()
         cluster.raft_entries(),
         before,
         "ending a session writes nothing"
+    );
+    Ok(())
+}
+
+/// A session whose task has a suspend block sleeps on its node: suspend
+/// and start route by the id's tag to `Worker.SuspendSessions` and
+/// `Worker.ResumeSession`, a full envelope keeps it suspended, an evicted
+/// session answers NOT_FOUND with the node's account, and none of it
+/// writes a raft entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_with_a_suspend_block_sleeps_on_its_node_test() -> R<()> {
+    let cluster = Cluster::with_suspend(
+        "agents-sleep",
+        &["n1"],
+        json!({ "durability": "local", "idle": { "after": "5m" } }),
+    )
+    .await?;
+    let a = cluster.create(None).await?;
+    cluster.report("n1").await?;
+    let before = cluster.raft_entries();
+    let suspend = |id: String| {
+        cluster
+            .svc
+            .suspend_instance(Request::new(SuspendInstanceRequest {
+                instance_id: id,
+                ..Default::default()
+            }))
+    };
+    let start = |id: String| {
+        cluster
+            .svc
+            .start_instance(Request::new(StartInstanceRequest {
+                instance_id: id,
+                ..Default::default()
+            }))
+    };
+
+    let slept = suspend(a.instance_id.clone()).await?.into_inner();
+    assert_eq!(slept.durability, "local");
+    assert_eq!(slept.node_id, "n1");
+    assert_eq!(slept.snapshot_id, "snap-fake");
+    assert_eq!(cluster.get(&a.instance_id).await?.state, "suspended");
+    let again = suspend(a.instance_id.clone()).await?.into_inner();
+    assert!(again.message.contains("already suspended"), "{again:?}");
+
+    // A full envelope refuses the resume as retryable; the session stays.
+    cluster.node("n1").lock().full = true;
+    let full = start(a.instance_id.clone())
+        .await
+        .expect_err("the envelope is full");
+    assert_eq!(full.code(), Code::ResourceExhausted);
+    assert!(full.message().contains("stays suspended"), "{full:?}");
+    cluster.node("n1").lock().full = false;
+
+    let resumed = start(a.instance_id.clone()).await?.into_inner();
+    assert!(resumed.message.contains("resumed on n1"), "{resumed:?}");
+    assert_eq!(resumed.resuming_from, "local");
+    assert_eq!(cluster.get(&a.instance_id).await?.state, "active");
+    let running = start(a.instance_id.clone()).await?.into_inner();
+    assert!(running.message.contains("already running"), "{running:?}");
+
+    // An evicted session: its node's account, with the hint.
+    cluster.node("n1").lock().sessions.remove(&a.instance_id);
+    cluster.node("n1").lock().evicted.insert(
+        a.instance_id.clone(),
+        "at 2026-10-12T00:00:00Z (expired)".into(),
+    );
+    for err in [
+        start(a.instance_id.clone()).await.expect_err("evicted"),
+        cluster.get(&a.instance_id).await.expect_err("evicted"),
+        suspend(a.instance_id.clone()).await.expect_err("evicted"),
+    ] {
+        assert_eq!(err.code(), Code::NotFound, "{err:?}");
+        assert!(err.message().starts_with("session "), "{err:?}");
+        assert!(err.message().contains("cannot be restored"), "{err:?}");
+    }
+    assert_eq!(
+        cluster.raft_entries(),
+        before,
+        "suspend and resume of a session write nothing"
+    );
+    Ok(())
+}
+
+/// A session whose node does not answer: UNAVAILABLE naming the node, not
+/// NOT_FOUND.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_on_a_silent_node_answers_unavailable_test() -> R<()> {
+    let cluster = Cluster::with_suspend(
+        "agents-silent",
+        &["n1"],
+        json!({ "durability": "local", "idle": { "after": "5m" } }),
+    )
+    .await?;
+    // An id tagged for n1 that no index has: point n1 at a dead address.
+    let id = legion::structs::mint_session_id(TASK, "n1");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let dead = listener.local_addr()?;
+    drop(listener);
+    let mut node = cluster.store().get_node("n1")?;
+    node.config_attrs["workerAddress"] = json!(format!("https://{dead}"));
+    cluster.store().insert_node(NodeMsg::from(node))?;
+    let err = cluster
+        .svc
+        .start_instance(Request::new(StartInstanceRequest {
+            instance_id: id.clone(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("n1 does not answer");
+    assert_eq!(err.code(), Code::Unavailable, "{err:?}");
+    assert!(
+        err.message()
+            .contains(&format!("node n1 holds session {id}")),
+        "{err:?}"
     );
     Ok(())
 }

@@ -22,6 +22,10 @@
 //!         port = "http",            # the network.ports label requests go to
 //!         timeout = "30s",          # how long the gateway holds a request for the resume
 //!     },
+//!     # Session tasks only (docs/session-mode.md, "Idle sessions"):
+//!     keepFor = "24h",              # how long a node keeps a suspended session's checkpoint
+//!     checkpointEvery = "10m",      # checkpoint running sessions periodically (off by default)
+//!     onWorkerStop = "checkpoint",  # "keep" (default) | "checkpoint"
 //! },
 //! ```
 //!
@@ -57,6 +61,44 @@ pub const DEFAULT_IDLE_CPU_BELOW: f64 = 0.02;
 /// Default `suspend.wake.timeout`: as long as `resumeTimeout`, so a resume
 /// that falls back to a cold boot still answers the held request.
 pub const DEFAULT_WAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default `suspend.keepFor`: how long a node keeps a suspended session's
+/// local checkpoint, and then remembers its eviction (session durability
+/// plan §6.6, open question "keepFor default").
+pub const DEFAULT_KEEP_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Shortest `suspend.keepFor` accepted. The node sweeps its idle sessions
+/// every few seconds, and a shorter window would read as "suspend means
+/// end".
+pub const MIN_KEEP_FOR: Duration = Duration::from_secs(60);
+
+/// Shortest `suspend.checkpointEvery` accepted. Each round captures a full
+/// memory image of every running session of the task on the node, so a
+/// shorter interval would keep a node checkpointing and little else.
+pub const MIN_CHECKPOINT_EVERY: Duration = Duration::from_secs(60);
+
+/// `suspend.onWorkerStop`: what a gracefully stopping worker does with the
+/// task's running sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnWorkerStop {
+    /// Nothing: the processes outlive the worker and the restarted worker
+    /// re-adopts them (session durability plan Phase 2).
+    #[default]
+    Keep,
+    /// Checkpoint every running session first, leaving it running, so a
+    /// session whose process does not outlive the worker is restored from
+    /// that checkpoint on the same node.
+    Checkpoint,
+}
+
+impl OnWorkerStop {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnWorkerStop::Keep => "keep",
+            OnWorkerStop::Checkpoint => "checkpoint",
+        }
+    }
+}
 
 /// Longest `suspend.wake.timeout` accepted. A gateway holds a connection
 /// and a socket per waiting request, and clients rarely wait longer.
@@ -489,6 +531,24 @@ pub struct SuspendConfig {
     /// instance resumes only on `legion instance start`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<WakeConfig>,
+    /// Session tasks only: how long a node keeps a suspended session's
+    /// local checkpoint before it evicts it, and then how long it remembers
+    /// the eviction so the session answers `evicted` rather than `not
+    /// found`. Default `"24h"`, at least `"1m"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_for: Option<String>,
+    /// Session tasks only: checkpoint each running session this often
+    /// without stopping it (a pause for the capture). Unset (default): no
+    /// periodic checkpoints. Needs a memory checkpoint; at least `"1m"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_every: Option<String>,
+    /// Session tasks only: `keep` (default) leaves running sessions alone
+    /// when the worker stops gracefully; `checkpoint` checkpoints each one
+    /// first (within the worker's `edgeBoot.stopCheckpointTimeout`), so a
+    /// session whose process does not survive the stop is restored on the
+    /// same node when the worker comes back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_worker_stop: Option<String>,
 }
 
 /// [`SuspendConfig`] with defaults applied.
@@ -510,6 +570,12 @@ pub struct ResolvedSuspend {
     pub archive: Option<ArchiveMode>,
     /// `suspend.wake`, when the task accepts wake on request.
     pub wake: Option<ResolvedWake>,
+    /// `suspend.keepFor` (session tasks).
+    pub keep_for: Duration,
+    /// `suspend.checkpointEvery` (session tasks), when set.
+    pub checkpoint_every: Option<Duration>,
+    /// `suspend.onWorkerStop` (session tasks).
+    pub on_worker_stop: OnWorkerStop,
 }
 
 impl Default for ResolvedSuspend {
@@ -525,6 +591,9 @@ impl Default for ResolvedSuspend {
             durability: SnapshotDurability::Local,
             archive: None,
             wake: None,
+            keep_for: DEFAULT_KEEP_FOR,
+            checkpoint_every: None,
+            on_worker_stop: OnWorkerStop::Keep,
         }
     }
 }
@@ -600,7 +669,52 @@ impl SuspendConfig {
                     .to_string(),
             );
         }
+        let keep_for = match self.keep_for.as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_KEEP_FOR,
+            Some(raw) => {
+                let keep_for = humantime::parse_duration(raw)
+                    .map_err(|err| format!("suspend.keepFor {raw:?} is not a duration: {err}"))?;
+                if keep_for < MIN_KEEP_FOR {
+                    return Err(format!(
+                        "suspend.keepFor {raw:?} is shorter than {}s; a suspended session's \
+                         checkpoint must outlive at least one sweep of its node",
+                        MIN_KEEP_FOR.as_secs()
+                    ));
+                }
+                keep_for
+            }
+        };
+        let checkpoint_every = match self.checkpoint_every.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(raw) => {
+                let every = humantime::parse_duration(raw).map_err(|err| {
+                    format!("suspend.checkpointEvery {raw:?} is not a duration: {err}")
+                })?;
+                if every < MIN_CHECKPOINT_EVERY {
+                    return Err(format!(
+                        "suspend.checkpointEvery {raw:?} is shorter than {}s: each round \
+                         captures a full memory image of every running session\nHint: use \
+                         \"10m\" or longer, or remove checkpointEvery",
+                        MIN_CHECKPOINT_EVERY.as_secs()
+                    ));
+                }
+                Some(every)
+            }
+        };
+        let on_worker_stop = match self.on_worker_stop.as_deref().map(str::trim) {
+            None | Some("") | Some("keep") => OnWorkerStop::Keep,
+            Some("checkpoint") => OnWorkerStop::Checkpoint,
+            Some(other) => {
+                return Err(format!(
+                    "suspend.onWorkerStop {other:?} is not valid (expected \"keep\" or \
+                     \"checkpoint\")"
+                ))
+            }
+        };
         Ok(ResolvedSuspend {
+            keep_for,
+            checkpoint_every,
+            on_worker_stop,
             checkpoint,
             reserve,
             on_restore_failure,
@@ -688,6 +802,7 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
     let resolved = suspend
         .resolve()
         .map_err(|err| format!("task {:?}: {err}", task.name))?;
+    validate_session_fields(task, suspend, &resolved)?;
     if let SuspendReserve::Amount {
         memory_mib,
         cpu_mhz,
@@ -728,6 +843,41 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
             } else {
                 "disk-only"
             }
+        ));
+    }
+    Ok(())
+}
+
+/// `keepFor`, `checkpointEvery`, and `onWorkerStop` say what a node does
+/// with the sessions it holds, so they are refused on any other task. A
+/// periodic checkpoint needs a memory checkpoint: a disk checkpoint of a
+/// session captures nothing (a session has no volume), so the rounds would
+/// cost a pause and keep nothing.
+fn validate_session_fields(
+    task: &crate::structs::TaskConfig,
+    suspend: &SuspendConfig,
+    resolved: &ResolvedSuspend,
+) -> Result<(), String> {
+    let sets_session_fields = suspend.keep_for.is_some()
+        || suspend.checkpoint_every.is_some()
+        || suspend.on_worker_stop.is_some();
+    if sets_session_fields && !crate::structs::session::is_session_task(task) {
+        return Err(format!(
+            "task {:?} sets suspend.keepFor, suspend.checkpointEvery, or suspend.onWorkerStop, \
+             which apply to session tasks only (stateful.mode = \"session\"): they say what a \
+             node does with the sessions it holds\nHint: remove them; a keyed instance's \
+             checkpoint lives as long as its snapshot",
+            task.name
+        ));
+    }
+    if resolved.checkpoint_every.is_some() && default_checkpoint_kind(task) != SnapshotKind::Memory
+    {
+        return Err(format!(
+            "task {:?} sets suspend.checkpointEvery, but it checkpoints to disk (runtime {:?}), \
+             and a session's disk checkpoint holds nothing to restore from\nHint: remove \
+             checkpointEvery, or run the task with runtime = \"sandbox\" and \
+             suspend.checkpoint = \"memory\"",
+            task.name, task.runtime
         ));
     }
     Ok(())
@@ -1547,5 +1697,108 @@ mod tests {
             )),
             SnapshotKind::Disk
         );
+    }
+
+    /// A normalized session task (keyed, with an envelope), as job parsing
+    /// leaves it.
+    fn session_task(runtime: &str, suspend: serde_json::Value) -> crate::structs::TaskConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "workspace",
+            "runtime": runtime,
+            "config": { "command": ["sleep", "1"] },
+            "resources": { "cpu": 500, "memory": 512 },
+            "stateful": {
+                "mode": "keyed",
+                "envelope": { "resources": { "cpu": 4000, "memory": 4096 } },
+            },
+            "suspend": suspend,
+        }))
+        .expect("session task parses")
+    }
+
+    #[test]
+    fn session_fields_resolve_with_the_plan_defaults_test() {
+        let resolved = SuspendConfig::default().resolve().unwrap();
+        assert_eq!(resolved.keep_for, DEFAULT_KEEP_FOR);
+        assert_eq!(resolved.keep_for, Duration::from_secs(86_400));
+        assert_eq!(resolved.checkpoint_every, None);
+        assert_eq!(resolved.on_worker_stop, OnWorkerStop::Keep);
+
+        let resolved = SuspendConfig {
+            keep_for: Some("2h".into()),
+            checkpoint_every: Some("10m".into()),
+            on_worker_stop: Some("checkpoint".into()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        assert_eq!(resolved.keep_for, Duration::from_secs(7_200));
+        assert_eq!(resolved.checkpoint_every, Some(Duration::from_secs(600)));
+        assert_eq!(resolved.on_worker_stop, OnWorkerStop::Checkpoint);
+    }
+
+    #[test]
+    fn bad_session_fields_name_the_field_test() {
+        let bad = |config: SuspendConfig| config.resolve().unwrap_err();
+        let err = bad(SuspendConfig {
+            keep_for: Some("soon".into()),
+            ..Default::default()
+        });
+        assert!(err.contains("suspend.keepFor \"soon\""), "{err}");
+        let err = bad(SuspendConfig {
+            keep_for: Some("10s".into()),
+            ..Default::default()
+        });
+        assert!(err.contains("shorter than 60s"), "{err}");
+        let err = bad(SuspendConfig {
+            checkpoint_every: Some("5s".into()),
+            ..Default::default()
+        });
+        assert!(err.contains("suspend.checkpointEvery"), "{err}");
+        assert!(err.contains("Hint:"), "{err}");
+        let err = bad(SuspendConfig {
+            on_worker_stop: Some("drain".into()),
+            ..Default::default()
+        });
+        assert!(err.contains("suspend.onWorkerStop \"drain\""), "{err}");
+    }
+
+    #[test]
+    fn session_fields_are_refused_on_a_keyed_task_test() {
+        for field in [
+            serde_json::json!({ "keepFor": "1h" }),
+            serde_json::json!({ "checkpointEvery": "10m" }),
+            serde_json::json!({ "onWorkerStop": "keep" }),
+        ] {
+            let err = validate_suspend(&task("sandbox", true, field.clone())).unwrap_err();
+            assert!(err.contains("session tasks only"), "{field}: {err}");
+            assert!(
+                validate_suspend(&session_task("sandbox", field.clone())).is_ok(),
+                "{field} is valid on a session task"
+            );
+        }
+    }
+
+    #[test]
+    fn periodic_session_checkpoints_need_a_memory_checkpoint_test() {
+        let err = validate_suspend(&session_task(
+            "exec",
+            serde_json::json!({ "checkpointEvery": "10m" }),
+        ))
+        .unwrap_err();
+        assert!(err.contains("checkpoints to disk"), "{err}");
+        // Checkpoint on stop is accepted on any runtime: an exec session's
+        // checkpoint is its spec, and the restart boots it fresh under the
+        // same id.
+        assert!(validate_suspend(&session_task(
+            "exec",
+            serde_json::json!({ "onWorkerStop": "checkpoint", "keepFor": "2h" })
+        ))
+        .is_ok());
+        assert!(validate_suspend(&session_task(
+            "sandbox",
+            serde_json::json!({ "checkpointEvery": "10m", "durability": "local" })
+        ))
+        .is_ok());
     }
 }

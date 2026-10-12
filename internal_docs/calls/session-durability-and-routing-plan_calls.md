@@ -306,7 +306,64 @@ A bucket is extra infrastructure and an upload per suspend; `store`
 stays available for platforms that want node-loss survival, and the
 `evicted` answer makes the loss explicit rather than silent.
 
-## 13. Edge idempotency is node-local, and derived ids stay untagged
+## 13. An evicted or unreachable session is answered before its job's ACL scope is known
+
+**Call.** `instance get`, `instance start`, and `instance suspend` on a
+session id answer NOT_FOUND "evicted" or UNAVAILABLE "node X holds session
+Y" after only the handler's coarse check (`job:read` or `job:write` on any
+job), because the job is on the node that evicted the session or cannot
+be reached.
+
+```text
+NOT_FOUND: session workspace-q4n7c2rd.9m3x... was evicted from w-17 at 2026-10-12T09:14:03Z (keepFor expired); a local-only session cannot be restored
+Hint: start a new session, or set suspend.durability = "store" so idle sessions are kept in the content store
+```
+
+**Alternatives.**
+- (a) Answer plain NOT_FOUND unless the caller's precise scope can be
+  checked, losing the eviction account.
+- (b) Have the node return the job id with its evicted and absent answers
+  so the manager can enforce the precise scope first.
+
+**Trade-off.** A caller with access to some job can learn that a session
+id it already holds was evicted from, or lives on, a named node. It
+learns nothing it did not send except the node name and eviction time.
+
+**Why (simplicity, ease).** The id already carries its node's tag, so the
+node name is no secret from anyone holding the id, and session ids carry
+130 random bits, so they cannot be enumerated. (b) is the right follow-up
+when the evicted row grows a job field on the wire (Phase 5b touches the
+same answer); (a) would turn the plan's headline failure answer into the
+"never existed" one it exists to replace.
+
+## 14. The worker now handles SIGTERM and SIGINT, and exits 0 after its stop checkpoints
+
+**Call.** Every worker installs a SIGTERM/SIGINT handler. It checkpoints
+the running sessions whose task sets `suspend.onWorkerStop =
+"checkpoint"` (least recently checkpointed first, until
+`edgeBoot.stopCheckpointTimeout`), flushes `sessions.db`, and exits 0.
+Workloads are left running, as before. On restart, a session whose
+process died meanwhile and that has a checkpoint is restored from it.
+
+**Alternatives.**
+- (a) Install the handler only when some running session asks for it.
+- (b) Stop the sessions after checkpointing them, so a restart always
+  restores.
+
+**Trade-off.** A worker stop that used to die by the signal now exits with
+status 0, which a supervisor that inspects the exit status sees
+differently. A restore after a stop that the processes survived never
+happens: the live process wins, so a checkpoint taken at stop is wasted
+work for every session that outlives the worker.
+
+**Why (simplicity, performance).** One handler is easier to reason about
+than one that appears and disappears with the sessions on a node, and it
+costs nothing when no session asks for checkpoints. (b) would turn every
+worker restart (an upgrade, a config change) into a restore of every
+session, which is slower and lossier than re-adopting the live process,
+for the benefit of the host-reboot case only.
+
+## 15. Edge idempotency is node-local, and derived ids stay untagged
 
 **Call.** An edge start with an idempotency key derives the untagged
 session id on the node and dedupes against the node's own claim table.
@@ -327,7 +384,7 @@ retry on another node would start a differently named duplicate that
 nothing converges. Untagged, the id is the same everywhere, and the
 existing converge-to-one rule covers the rare cross-node retry.
 
-## 14. Phase 2 group-commits the session log instead of fsyncing each start
+## 16. Phase 2 group-commits the session log instead of fsyncing each start
 
 **Call.** `sessions.db` flushes every 50 ms on a writer thread
 (`src/worker/session_log.rs`, `GROUP_COMMIT`).
@@ -347,27 +404,115 @@ environment markers, and the window is small. The public doc states it
 (about 2.5 ms p50 in sandbox-scaling §16.3); a per-start fsync would
 roughly double it on ordinary disks for no durability gain.
 
-## 15. A tagged id whose node does not answer falls back to the index, not `UNAVAILABLE`
+## 17. A session suspends only when its task has a `suspend` block, and `store` is refused at the node
 
-**Call.** `sessions::find` asks the tagged node (`Worker.GetSession`)
-first; when that node does not answer, it falls back to the merged
-session index, which answers from the node's last report.
+**Call.** `instance suspend` on a session routes to its node only when its
+task sets `suspend`; without one it keeps answering FAILED_PRECONDITION
+"promote it first". A task with `suspend.durability = "store"` passes
+submit, but its node refuses to suspend an unpromoted session with
+FAILED_PRECONDITION until Phase 5b.
 
-**Alternative.** Answer `UNAVAILABLE` naming the node, as plan §8 item 3
-describes.
+```text
+FAILED_PRECONDITION: task workspace sets suspend.durability = "store", which unpromoted sessions do not support yet. Use durability = "local" (the checkpoint stays on this node), or promote the session first: `legion instance promote workspace-q4n7c2rd.9m3x...`
+```
 
-**Trade-off.** For up to 120 s after a node goes silent, `legion instance
-get` on its sessions answers from a stale report rather than saying the
-node is unreachable; after that the index drops the node and the answer is
-`NOT_FOUND`, never `UNAVAILABLE`.
+**Alternatives.**
+- (a) Suspend every session with defaults when asked, as keyed instances
+  do without a block.
+- (b) Refuse `store` on session tasks at submit.
 
-**Why (simplicity).** `find` is shared by get, stop, promote, and the
-duplicate check, and returns an option; turning a silent node into an
-error in each needs a richer result type through every caller. The stale
-answer is no worse than before Phase 3. Revisit with Phase 5's resume,
-where a lost node changes what the caller should do.
+**Trade-off.** A job with `durability = "store"` submits and then cannot
+suspend its sessions, which is discovered at the first suspend.
 
-## 16. A session ticket is a boot ticket row with gate `session`
+**Why (simplicity).** A session with no `suspend` block has no `keepFor`
+and no idle policy, and a suspend that pins node disk for a default 24h on
+a task that never asked for it would be a surprise. (b) would be a submit
+refusal that Phase 5b removes again, and a job written for `store` keeps
+working once it lands; the node's answer says what to do now.
+
+## 18. A suspended session stays in the session index as `suspended`, with no envelope usage
+
+**Call.** The node keeps reporting a suspended session on its heartbeats,
+with `state = "suspended"`. The managers' index lists it (so `get`,
+`list`, and `stop` find it), and counts it in `Usage.sessions` but adds
+none of its resources to the envelope's used room.
+
+**Alternatives.**
+- (a) Drop suspended sessions from the report and answer them only by
+  asking the node.
+- (b) Count them in neither the session count nor the amounts.
+
+**Trade-off.** `ListSessionNodes` and `legion session nodes` show a session
+count that includes sleeping sessions, which can read as busier than the
+node is.
+
+**Why (ease).** `instance list` must show suspended sessions or users lose
+track of them, and the router's room arithmetic is driven by amounts, so
+leaving the count alone kept the index change to one function
+(`session_amounts`).
+
+## 19. An `exec` session's checkpoint is a disk one, so its resume is a fresh start, and `checkpointEvery` needs memory
+
+**Call.** A session suspends with its task's checkpoint kind. For `exec`
+(and anything but `sandbox`) that is a disk checkpoint, which holds the
+spec only, so resume boots the same spec under the same id.
+`checkpointEvery` is refused at submit unless the checkpoint is a memory
+one; `onWorkerStop = "checkpoint"` is accepted on any runtime.
+
+**Alternatives.**
+- (a) Refuse `suspend` on session tasks that cannot take a memory
+  checkpoint.
+- (b) Accept `checkpointEvery` everywhere and capture whatever the kind
+  holds.
+
+**Trade-off.** An `exec` session "resumes" without its process state, the
+same as a keyed `exec` instance does.
+
+**Why (simplicity).** Suspend on `exec` still frees envelope room for an
+idle session and keeps its id, which is most of the value; keyed
+instances already work this way, so sessions match them. A periodic disk
+checkpoint captures nothing that changes, so (b) would be pure cost.
+
+## 20. Periodic captures run one at a time, and the skip rule uses a moving average of capture time
+
+**Call.** The node runs a `checkpointEvery` round every 5 seconds from
+its session maintenance loop: due sessions sorted most overdue first, a
+session skipped (and counted) when the backlog before it would exceed one
+interval, captures run sequentially, and the per-capture time is an
+exponential moving average of the last captures.
+
+**Alternatives.**
+- (a) Run captures concurrently, bounded by the launch pool.
+- (b) Queue every due capture and never skip.
+
+**Trade-off.** A node with many sessions and a short interval checkpoints
+fewer of them per interval than it could with parallel captures on fast
+disks.
+
+**Why (performance, simplicity).** Captures compete for the same disk and
+memory bandwidth as the sessions they pause, so parallel captures mostly
+lengthen each pause. (b) is the plan's rejected "queue, don't skip": a
+backlog that only grows.
+
+## 21. Idle sessions are suspended from the usage report, so idle detection needs resource enforcement
+
+**Call.** The node feeds sessions (under their negative local keys) into
+the same usage sampler and idle policy as keyed instances, takes their
+entries back out of the report before it is sent, and suspends those past
+`idle.after`.
+
+**Alternative.** A separate idle tracker for sessions that does not need
+cgroups.
+
+**Trade-off.** On a node without resource enforcement, `idle.after` never
+fires for sessions (manual suspend still works).
+
+**Why (simplicity).** The idle signals (CPU, network bytes, open exec
+sessions) are the ones keyed instances use and are documented once; a
+second tracker would drift from them. Production session nodes run with
+enforcement anyway, since the envelope is only a promise without it.
+
+## 22. A session ticket is a boot ticket row with gate `session`
 
 **Call.** Session tickets reuse the boot-ticket store: the row's gate
 column holds `"session"` to mark the scope (`SESSION_TICKET_GATE` in
@@ -383,7 +528,7 @@ needs the column after all.
 **Why (simplicity).** No migration and no new listing; the gate column
 was unused for a ticket that has no gate.
 
-## 17. Full session reports are not chunked; the manager's decode limit is raised instead
+## 23. Full session reports are not chunked; the manager's decode limit is raised instead
 
 **Call.** The manager accepts messages up to 64 MiB
 (`MANAGER_MAX_DECODE_BYTES`), which holds a full report of about 200,000
@@ -398,7 +543,7 @@ all. No envelope realistically holds that many.
 sides; the raised limit covers every envelope size we can imagine for
 now. It is open in TODO.md.
 
-## 18. Envelope payloads carry the session task's spec
+## 24. Envelope payloads carry the session task's spec
 
 **Call.** `TaskAllocation.session_task_spec` (the session task's config
 as JSON) and `session_task_config_id` ride on every envelope payload, so a
@@ -413,7 +558,7 @@ node builds an edge start without a manager.
 envelope the start lands in, and the first edge start is as fast as the
 hundredth.
 
-## 19. The node tag is an unkeyed hash of the node id
+## 25. The node tag is an unkeyed hash of the node id
 
 **Call.** `node_tag` is the first 40 bits of SHA-256 over a fixed prefix
 and the node id, in base32.
@@ -428,7 +573,7 @@ call anyway.
 **Why (simplicity).** Every manager and every picker computes it from the
 node list with no shared secret and no store write.
 
-## 20. `ListSessionNodes` reads fresh usage on each call
+## 26. `ListSessionNodes` reads fresh usage on each call
 
 **Call.** Each call reads the session index's usage across managers
 (`QuerySessions` with `usage_only`), not the router's one-second cache.
@@ -442,7 +587,7 @@ says to poll).
 **Why (simplicity).** The list is advisory and polled; a separate cache
 with its own staleness rules buys nothing at that rate.
 
-## 21. Balancer weights are clamped
+## 27. Balancer weights are clamped
 
 **Call.** `--format envoy-eds` clamps a node's weight to 1..128 and
 `--format haproxy` to 1..256, and a node not accepting keeps weight 1 and

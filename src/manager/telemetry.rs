@@ -2065,6 +2065,14 @@ pub struct WorkerMetrics {
     /// `legion_worker_edge_session_starts_total` — sessions started on this
     /// node from a session ticket (`Worker.StartSession`).
     pub edge_session_starts_total: Arc<Counter>,
+    /// `legion_session_checkpoints_skipped_total` — periodic session
+    /// checkpoints (`suspend.checkpointEvery`) a node skipped because its
+    /// backlog would not let it capture them within one interval.
+    pub session_checkpoints_skipped_total: Arc<Counter>,
+    /// `legion_session_evictions_total{reason}` — suspended sessions whose
+    /// local checkpoint this node evicted, by reason (keep_for |
+    /// disk_pressure | envelope_gone | other).
+    pub session_evictions_total: Arc<CounterVec>,
     /// `legion_worker_simulated_nodes` — simulated nodes registered by this
     /// process (`--simulate N`); 0 in a real worker.
     pub simulated_nodes: Arc<Gauge>,
@@ -2187,6 +2195,24 @@ impl WorkerMetrics {
             cell: CounterCell::default(),
         });
 
+        let session_checkpoints_skipped_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_session_checkpoints_skipped_total",
+                help: "Periodic session checkpoints (suspend.checkpointEvery) skipped because the node's checkpoint backlog would not let it capture them within one interval. A rising rate means checkpointEvery is too short for the node's session count and memory.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
+        let session_evictions_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_session_evictions_total",
+                help: "Suspended sessions whose local-only checkpoint this node evicted, by reason (keep_for, disk_pressure, envelope_gone, other). An evicted session answers `evicted` for another suspend.keepFor and cannot be resumed.",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+
         // Simulated-fleet families. A `--simulate N` process is a worker
         // process that happens to carry N nodes, so it reports through this
         // same registry: the families above become fleet-wide aggregates and
@@ -2278,6 +2304,8 @@ impl WorkerMetrics {
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&launch_pool_refusals_total) as Arc<dyn RenderMetric>,
             Arc::clone(&edge_session_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_checkpoints_skipped_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_evictions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_active) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_killed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_ratify_seconds) as Arc<dyn RenderMetric>,
@@ -2302,6 +2330,8 @@ impl WorkerMetrics {
             provisional_active,
             launch_pool_refusals_total,
             edge_session_starts_total,
+            session_checkpoints_skipped_total,
+            session_evictions_total,
             simulated_nodes,
             simulated_nodes_target,
             simulated_registrations_total,

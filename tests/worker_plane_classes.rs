@@ -64,6 +64,10 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         ("StartClaim", &[Caller::Ticket]),
         ("Probe", &[Caller::Manager]),
         ("StopSessions", &[Caller::Manager]),
+        // Session suspend and resume are routed by a manager, like
+        // StopSessions (session durability plan §6.6).
+        ("SuspendSessions", &[Caller::Manager]),
+        ("ResumeSession", &[Caller::Manager]),
         // A manager certificate (the manager's routed read), or a session
         // ticket (a front-end reading a session it started at the edge).
         ("GetSession", &[Caller::Manager, Caller::Ticket]),
@@ -231,6 +235,21 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
             .stop_sessions(legion::structs::StopSessionsRequest {
                 session_ids: vec!["workspace-not-running".into()],
                 reason: "stop".into(),
+            })
+            .await
+            .map(|_| ()),
+        "SuspendSessions" => client
+            .suspend_sessions(legion::structs::SuspendSessionsRequest {
+                session_ids: vec!["workspace-not-running".into()],
+                reason: "manual".into(),
+            })
+            .await
+            .map(|_| ()),
+        // An id this worker does not hold: NotFound once admitted.
+        "ResumeSession" => client
+            .resume_session(legion::structs::ResumeSessionRequest {
+                session_id: "workspace-not-running".into(),
+                cold: false,
             })
             .await
             .map(|_| ()),

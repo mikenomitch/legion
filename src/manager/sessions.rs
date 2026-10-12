@@ -349,6 +349,237 @@ pub async fn sweep_duplicates(store: &Store) -> usize {
     stopped
 }
 
+/// Bound on a suspend or resume call to a worker: a memory capture or a
+/// restore of a large guest takes longer than a start or a stop.
+const SLEEP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Where a session is, for the verbs that must reach it (suspend, start,
+/// get). Unlike [`find`], it keeps apart the answers a caller words
+/// differently: a node that evicted the session, and a node that holds it
+/// but cannot be reached.
+#[derive(Debug)]
+pub enum Located {
+    Found(Box<IndexedSession>),
+    /// The node evicted the session's checkpoint; the message is the node's
+    /// own (`session X was evicted from NODE at TIME (reason); …`), with
+    /// its `\nHint:` line.
+    Evicted(String),
+    /// The id's tag names a node, the node did not answer, and no manager's
+    /// index has the session either. The status is the UNAVAILABLE answer.
+    Unreachable(Status),
+    NotFound,
+}
+
+/// What one node answered to `Worker.GetSession`.
+enum NodeAnswer {
+    Holds(SessionStatus),
+    Absent,
+    Evicted(String),
+    /// The id's tag is not this node's (a stale tag map): ask elsewhere.
+    WrongNode,
+    Failed(Status),
+}
+
+async fn ask_node(store: &Store, node_id: &str, session_id: &str) -> NodeAnswer {
+    let (mut client, target) = match worker_client(store, node_id) {
+        Ok(found) => found,
+        Err(status) => return NodeAnswer::Failed(status),
+    };
+    let mut request = tonic::Request::new(crate::structs::GetSessionRequest {
+        session_id: session_id.to_string(),
+        ticket: String::new(),
+    });
+    request.set_timeout(WORKER_CALL_TIMEOUT);
+    match client.get_session(request).await {
+        Ok(reply) => match reply.into_inner().session {
+            Some(status) => NodeAnswer::Holds(status),
+            None => NodeAnswer::Absent,
+        },
+        Err(status) if status.code() == tonic::Code::NotFound => {
+            let message = status.message();
+            if let Some(rest) = message.strip_prefix("evicted:") {
+                NodeAnswer::Evicted(rest.trim_start().to_string())
+            } else if message.starts_with("wrong_node:") {
+                NodeAnswer::WrongNode
+            } else {
+                NodeAnswer::Absent
+            }
+        }
+        Err(status) => NodeAnswer::Failed(crate::manager::worker_plane::worker_call_error(
+            &target.node_id,
+            &target.address,
+            status,
+        )),
+    }
+}
+
+/// Find a session for a verb that must reach it. The tagged node is asked
+/// first; when it does not answer, the merged index stands in (a node can
+/// be unreachable from this manager and still heartbeat to another), and
+/// only when that has nothing either is the answer [`Located::Unreachable`].
+pub async fn locate(store: &Store, session_id: &str) -> Located {
+    if !crate::structs::is_minted_instance_id(session_id) {
+        return Located::NotFound;
+    }
+    let mut unreachable: Option<(String, Status)> = None;
+    if let Some(tag) = crate::structs::session_node_tag(session_id) {
+        let nodes = nodes_for_tag(store, tag);
+        let mut absent = 0;
+        for node_id in &nodes {
+            match ask_node(store, node_id, session_id).await {
+                NodeAnswer::Holds(status) => {
+                    return Located::Found(Box::new(IndexedSession {
+                        node_id: node_id.clone(),
+                        status: Some(status),
+                        recent: false,
+                    }))
+                }
+                NodeAnswer::Evicted(message) => return Located::Evicted(message),
+                NodeAnswer::Absent => absent += 1,
+                NodeAnswer::WrongNode => {}
+                NodeAnswer::Failed(status) => {
+                    debug!(session_id, node_id = %node_id, error = %status, "Session probe failed");
+                    unreachable.get_or_insert((node_id.clone(), status));
+                }
+            }
+        }
+        if !nodes.is_empty() && absent == nodes.len() {
+            return Located::NotFound;
+        }
+    }
+    let view = query(
+        store,
+        QuerySessionsRequest {
+            session_id: session_id.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    if let Some((kept, later)) = winner(view.sessions) {
+        stop_duplicates(store, later);
+        return Located::Found(Box::new(kept));
+    }
+    match unreachable {
+        Some((node_id, status)) => {
+            Located::Unreachable(unreachable_answer(store, &node_id, session_id, &status))
+        }
+        None => Located::NotFound,
+    }
+}
+
+/// The UNAVAILABLE answer for a session whose node does not answer: which
+/// node, what the cluster last knew of it, and that the session is not
+/// lost — a local session lives only there, so the caller waits for the
+/// node rather than starting over.
+pub fn unreachable_answer(
+    store: &Store,
+    node_id: &str,
+    session_id: &str,
+    cause: &Status,
+) -> Status {
+    let heard = store
+        .get_node(node_id)
+        .ok()
+        .map(|node| {
+            let age = time::OffsetDateTime::parse(
+                &node.last_heartbeat,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()
+            .map(|at| {
+                (time::OffsetDateTime::now_utc() - at)
+                    .whole_seconds()
+                    .max(0)
+            });
+            match age {
+                Some(secs) => format!(
+                    "is {} and has not been heard from for {}",
+                    node.status,
+                    humantime::format_duration(Duration::from_secs(secs as u64))
+                ),
+                None => format!("is {}", node.status),
+            }
+        })
+        .unwrap_or_else(|| "is not in the node list".to_string());
+    let cause = cause
+        .message()
+        .split("\nHint:")
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    Status::unavailable(format!(
+        "node {node_id} holds session {session_id} and {heard} ({cause})\nHint: a session \
+         lives on its node; retry when the node is back (`legion node info {node_id}`)"
+    ))
+}
+
+/// Suspend sessions on one node (`Worker.SuspendSessions`).
+pub async fn suspend_on_node(
+    store: &Store,
+    node_id: &str,
+    session_ids: &[String],
+    reason: &str,
+) -> Result<crate::structs::SuspendSessionsReply, Status> {
+    let (mut client, target) = worker_client(store, node_id)?;
+    let mut request = tonic::Request::new(crate::structs::SuspendSessionsRequest {
+        session_ids: session_ids.to_vec(),
+        reason: reason.to_string(),
+    });
+    request.set_timeout(SLEEP_CALL_TIMEOUT);
+    client
+        .suspend_sessions(request)
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|status| {
+            let status = crate::manager::worker_plane::worker_call_error(
+                &target.node_id,
+                &target.address,
+                status,
+            );
+            if crate::manager::worker_plane::is_unreachable(&status) {
+                unreachable_answer(store, node_id, &session_ids.join(", "), &status)
+            } else {
+                status
+            }
+        })
+}
+
+/// Resume a suspended session on its node (`Worker.ResumeSession`). The
+/// node's own answers pass through: RESOURCE_EXHAUSTED when the envelope is
+/// full (the checkpoint stays), NOT_FOUND `evicted:` when it was evicted
+/// meanwhile.
+pub async fn resume_on_node(
+    store: &Store,
+    node_id: &str,
+    session_id: &str,
+    cold: bool,
+) -> Result<crate::structs::ResumeSessionReply, Status> {
+    let (mut client, target) = worker_client(store, node_id)?;
+    let mut request = tonic::Request::new(crate::structs::ResumeSessionRequest {
+        session_id: session_id.to_string(),
+        cold,
+    });
+    request.set_timeout(SLEEP_CALL_TIMEOUT);
+    client
+        .resume_session(request)
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|status| {
+            let status = crate::manager::worker_plane::worker_call_error(
+                &target.node_id,
+                &target.address,
+                status,
+            );
+            if crate::manager::worker_plane::is_unreachable(&status) {
+                unreachable_answer(store, node_id, session_id, &status)
+            } else if let Some(rest) = status.message().strip_prefix("evicted:") {
+                Status::not_found(rest.trim_start().to_string())
+            } else {
+                status
+            }
+        })
+}
+
 /// Stop the later copies of a duplicated session, in the background.
 fn stop_duplicates(store: &Store, later: Vec<IndexedSession>) {
     if later.is_empty() {
@@ -426,6 +657,7 @@ pub fn instance_info(entry: &IndexedSession, group: &str) -> InstanceInfo {
         mode: crate::structs::InstanceMode::Session.to_string(),
         state: match status.state.as_str() {
             "running" => "active",
+            "suspended" => "suspended",
             _ => "pending",
         }
         .to_string(),

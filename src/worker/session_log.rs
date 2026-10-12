@@ -78,11 +78,22 @@ pub struct PersistedSession {
     /// The running process, for re-adoption. `None` unless `Running`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<PersistedAllocation>,
-    /// The checkpoint a suspended session resumes from, as the worker's
-    /// checkpoint record serializes it. `None` unless `Suspended`.
+    /// The checkpoint the session resumes from. Always set on a
+    /// `Suspended` row. A `Running` row carries the latest periodic or
+    /// worker-stop checkpoint, if one was taken, so a session whose process
+    /// did not survive a worker restart is restored from it instead of
+    /// being dropped. `None` on an `Evicted` row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint: Option<Value>,
-    /// Why and when a checkpoint was evicted, for the `evicted` answer.
+    pub checkpoint: Option<SessionCheckpoint>,
+    /// The launch payload the session started from (provisional block
+    /// included), so a resume on this node launches the same spec. Dropped
+    /// on eviction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<crate::structs::TaskAllocation>,
+    /// The task's `suspend.keepFor`, in milliseconds. 0: the default.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub keep_for_ms: u64,
+    /// Why a checkpoint was evicted, for the `evicted` answer.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub evicted_reason: String,
     /// Unix ms of the last change: when it started, suspended, or was
@@ -90,8 +101,94 @@ pub struct PersistedSession {
     pub updated_at_unix_ms: i64,
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// A session checkpoint held on this node: memory parts pinned in the node
+/// content store under `snapshot_id` (none for a disk checkpoint, which of
+/// a session holds only its id and spec).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCheckpoint {
+    /// The snapshot id its parts are pinned under (`snap-...`).
+    pub snapshot_id: String,
+    /// `memory` or `disk`.
+    pub kind: String,
+    /// The snapshot manifest, as the restore reads it.
+    pub manifest_json: String,
+    /// Bytes the checkpoint holds in the node content store.
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// When it was taken, unix ms.
+    pub taken_at_unix_ms: i64,
+}
+
 fn first_generation() -> u64 {
     1
+}
+
+impl PersistedSession {
+    /// How long a suspended or evicted row is kept (`suspend.keepFor`).
+    pub fn keep_for(&self) -> Duration {
+        if self.keep_for_ms == 0 {
+            crate::structs::suspend::DEFAULT_KEEP_FOR
+        } else {
+            Duration::from_millis(self.keep_for_ms)
+        }
+    }
+
+    /// The row once the session is suspended to `checkpoint` at `now_ms`:
+    /// nothing runs, and the envelope share is free.
+    pub fn into_suspended(mut self, checkpoint: SessionCheckpoint, now_ms: i64) -> Self {
+        self.state = SessionLogState::Suspended;
+        self.process = None;
+        self.checkpoint = Some(checkpoint);
+        self.evicted_reason.clear();
+        self.updated_at_unix_ms = now_ms;
+        self
+    }
+
+    /// The row once its checkpoint is evicted at `now_ms`: only what the
+    /// `evicted` answer needs is kept, for another `keepFor`.
+    pub fn into_evicted(mut self, reason: &str, now_ms: i64) -> Self {
+        self.state = SessionLogState::Evicted;
+        self.process = None;
+        self.checkpoint = None;
+        self.payload = None;
+        self.evicted_reason = reason.to_string();
+        self.updated_at_unix_ms = now_ms;
+        self
+    }
+
+    /// Whether a row that runs nothing has outlived `keepFor` at `now_ms`:
+    /// a suspended row is evicted then, and an evicted row forgotten.
+    pub fn expired(&self, now_ms: i64) -> bool {
+        self.state != SessionLogState::Running
+            && now_ms.saturating_sub(self.updated_at_unix_ms) >= self.keep_for().as_millis() as i64
+    }
+}
+
+/// The suspended sessions disk pressure evicts, in order: oldest suspend
+/// first (ties by id, so the order is stable), and only those whose
+/// checkpoint holds bytes, since evicting one that holds none frees
+/// nothing.
+pub fn eviction_order<'a>(rows: impl IntoIterator<Item = &'a PersistedSession>) -> Vec<String> {
+    let mut candidates: Vec<(i64, &str)> = rows
+        .into_iter()
+        .filter(|row| row.state == SessionLogState::Suspended)
+        .filter(|row| {
+            row.checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.total_bytes > 0)
+        })
+        .map(|row| (row.updated_at_unix_ms, row.session_id.as_str()))
+        .collect();
+    candidates.sort();
+    candidates
+        .into_iter()
+        .map(|(_, session_id)| session_id.to_string())
+        .collect()
 }
 
 enum Op {
@@ -311,9 +408,90 @@ mod session_log_test {
             state,
             process: None,
             checkpoint: None,
+            payload: None,
+            keep_for_ms: 0,
             evicted_reason: String::new(),
             updated_at_unix_ms: 9,
         }
+    }
+
+    fn checkpoint(bytes: u64) -> SessionCheckpoint {
+        SessionCheckpoint {
+            snapshot_id: format!("snap-{bytes}"),
+            kind: "memory".into(),
+            manifest_json: "{}".into(),
+            total_bytes: bytes,
+            taken_at_unix_ms: 5,
+        }
+    }
+
+    /// Suspend, evict, and expire: the rows a sleeping session goes through,
+    /// and that each survives a reopen of the log.
+    #[test]
+    fn suspended_and_evicted_rows_survive_a_reopen_and_expire_test() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("sessions.db");
+        let log = SessionLog::open(&path)?;
+        let mut running = session("a", SessionLogState::Running);
+        running.payload = Some(crate::structs::TaskAllocation {
+            task_name: "workspace".into(),
+            ..Default::default()
+        });
+        running.keep_for_ms = 60_000;
+        let suspended = running.clone().into_suspended(checkpoint(4096), 1_000);
+        assert_eq!(suspended.state, SessionLogState::Suspended);
+        assert!(suspended.payload.is_some(), "a resume needs the payload");
+        log.put(suspended.clone());
+        let evicted = session("b", SessionLogState::Running)
+            .into_suspended(checkpoint(1), 10)
+            .into_evicted("disk pressure", 2_000);
+        assert_eq!(evicted.state, SessionLogState::Evicted);
+        assert!(evicted.checkpoint.is_none() && evicted.payload.is_none());
+        log.put(evicted);
+        assert!(log.sync(Duration::from_secs(5)));
+        drop(log);
+
+        let rows = SessionLog::load(&path)?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].checkpoint, Some(checkpoint(4096)));
+        assert_eq!(rows[0].keep_for(), Duration::from_secs(60));
+        assert_eq!(rows[1].evicted_reason, "disk pressure");
+        // The default keepFor is the plan's 24h.
+        assert_eq!(
+            rows[1].keep_for(),
+            crate::structs::suspend::DEFAULT_KEEP_FOR
+        );
+
+        // keepFor counts from the last change.
+        assert!(!rows[0].expired(1_000 + 59_999));
+        assert!(rows[0].expired(1_000 + 60_000));
+        assert!(!rows[1].expired(2_000 + 86_399_999));
+        assert!(rows[1].expired(2_000 + 86_400_000));
+        // A running session never expires.
+        assert!(!session("c", SessionLogState::Running).expired(i64::MAX));
+        Ok(())
+    }
+
+    #[test]
+    fn disk_pressure_evicts_the_oldest_suspend_first_test() {
+        let at = |id: &str, when: i64, bytes: u64| {
+            session(id, SessionLogState::Running).into_suspended(checkpoint(bytes), when)
+        };
+        let rows = vec![
+            at("new", 300, 10),
+            at("old", 100, 10),
+            at("tie-b", 200, 10),
+            at("tie-a", 200, 10),
+            // Holds no bytes (a disk checkpoint): evicting it frees nothing.
+            at("empty", 50, 0),
+            session("running", SessionLogState::Running),
+            at("gone", 10, 10).into_evicted("keepFor expired", 20),
+        ];
+        assert_eq!(
+            eviction_order(&rows),
+            vec!["old", "tie-a", "tie-b", "new"],
+            "oldest suspend first, ties by id, nothing that frees no bytes"
+        );
     }
 
     #[test]

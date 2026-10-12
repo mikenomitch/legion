@@ -149,13 +149,14 @@ it.
 | --- | --- | --- |
 | Durable record | A raft row from create on; a named id keeps a tombstone after destroy | None while running: the node holds it, and the managers' index lists it |
 | Node loss while running | Rescheduled elsewhere, bound to its storage | Lost. A running session is not rescheduled |
-| Worker restart | The allocation is re-adopted | Re-adopted too: the node records running sessions on its own disk ([Worker restarts](#worker-restarts)) |
+| Worker restart | The allocation is re-adopted | Running sessions are re-adopted from the node's session log ([Worker restarts](#worker-restarts)); one whose process died meanwhile ends, unless `suspend.onWorkerStop = "checkpoint"` left a checkpoint to restore it from ([Idle sessions](#idle-sessions)) |
 | At most one live copy | Exact | Converges to one: a retried idempotent create can briefly run on two nodes ([Duplicates](#duplicates)) |
 | Who starts it | A manager, through raft | A manager's router, or the node itself on a session ticket ([Starting at the edge](#starting-at-the-edge)) |
 | Ids never recycled | Exact for the job's life | Probabilistic: 130 random bits, no tombstone |
 | `instance list` | An exact read | From the session index, with `complete` and `asOf` ([Listing](#listing-sessions)) |
 | Idempotent create | A replicated record | A derived id: a retry gets the same id, with no record |
-| Suspend, resume, fork, snapshot | Yes | No. Promote first |
+| Suspend and resume | Yes, with a published or local checkpoint | On the same node only, with `suspend.durability = "local"` ([Idle sessions](#idle-sessions)) |
+| Fork, snapshot | Yes | No. Promote first |
 | Events | The replicated journal | None per session. `instance.promoted` is journaled, and counters cover starts and stops |
 | Capacity | Reserved per instance at placement | Reserved per node as envelopes, whether or not sessions fill them |
 | Control-plane writes | About 8 raft entries per full lifecycle, about 3 under load | 0 for an unnamed session; 1 to promote |
@@ -200,9 +201,12 @@ resources = { cpu = 500, memory = 512 },
   session has none. Give a sandbox its own `config.network`.
 - `identities`. Workload identity for unnamed sessions is not available.
 - `speculativeStart`: a session already starts without a raft write.
-- `suspend` with `durability = "local"` or a `reserve`. A promoted session
-  can be suspended, and its node is wherever its envelope had room, so its
-  checkpoint must be published.
+- `suspend` with a `reserve`: a session's room is its envelope share, and
+  a suspended session holds none of it.
+- `suspend.keepFor`, `suspend.checkpointEvery`, or `suspend.onWorkerStop`
+  on a task that is not a session task, `keepFor` or `checkpointEvery`
+  shorter than 60 seconds, and `checkpointEvery` on a task whose
+  checkpoint is a disk one (it has no memory to capture).
 - A task named `<task>-envelope`, or any task on the reserved `envelope`
   runtime.
 
@@ -283,7 +287,8 @@ manager that ended the session within the last ten minutes answers
 `NOT_FOUND`.
 
 `legion instance start <ID>` on a running session answers
-`Instance <id> already running`, as it does for a live keyed instance.
+`Instance <id> already running`, as it does for a live keyed instance. On
+a suspended one it resumes it ([Idle sessions](#idle-sessions)).
 
 Sessions also end when:
 
@@ -294,7 +299,9 @@ Sessions also end when:
   seconds after its envelope goes, so a job update that replaces the
   envelope in place keeps its sessions. A session keeps running the job
   version it started with.
-- **The node is lost or the worker restarts.**
+- **The node is lost,** or the worker restarts after the session's process
+  died with no checkpoint to restore it from.
+- **Its checkpoint is evicted** while it is suspended.
 
 ## Worker restarts
 
@@ -328,7 +335,9 @@ manager's session index when:
 
 - no live node has the tag (the node was removed),
 - the node does not answer (the session may still be running; the index
-  answers from the node's last report),
+  answers from the node's last report, and when no manager's index has it
+  either, the answer is `UNAVAILABLE` naming the node and how long it has
+  been silent),
 - the node answers `wrong_node` (another node shares the tag, 1 in 2^40
   per pair), or
 - the id carries no tag (it was derived from an idempotency key).
@@ -464,9 +473,131 @@ describes it with `deduplicated = true`.
 | `INVALID_ARGUMENT` | `--id` is not a valid keyed id, or the task sets `promote.onName = false` |
 | `FAILED_PRECONDITION` | The session's job config no longer has its task |
 
-The commands that need a row (`suspend`, `fork`, `snapshot create`,
-`snapshot restore`, `replace`) refuse a session id with
-`FAILED_PRECONDITION` and a hint to promote it first.
+The commands that need a row (`fork`, `snapshot create`,
+`snapshot restore`, `replace`, and `suspend` on a session whose task has no
+`suspend` block) refuse a session id with `FAILED_PRECONDITION` and a hint
+to promote it first.
+
+## Idle sessions
+
+A session whose task has a `suspend` block can sleep on its own node: the
+node checkpoints it into its local content store, stops it, frees its
+share of the envelope, and keeps the checkpoint. Resuming boots it from
+that checkpoint on the same node, under the same id. None of this writes
+the replicated store. It is the cheap middle ground between a running
+session (which holds envelope room while idle) and a promoted one (which
+pays a raft row to survive its node).
+
+```nickel
+suspend = {
+  durability = "local",          # the only durability a session accepts today
+  idle = { after = "5m" },       # suspend after 5 minutes of no activity
+  keepFor = "24h",               # how long the checkpoint is kept
+  checkpointEvery = "10m",       # optional; memory checkpoints only
+  onWorkerStop = "checkpoint",   # or "keep" (the default)
+},
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `suspend.durability` | `"local"` | Where the checkpoint lives. A session keeps it on its node. `"store"` is accepted by `job validate` but not served for sessions yet: a node refuses to suspend such a session with `FAILED_PRECONDITION` |
+| `suspend.idle.after` | none | Suspend the session after this long with no activity, measured by the node as for keyed instances ([idle policy](suspend-and-resume.md#idle-policy)) |
+| `suspend.keepFor` | `"24h"` | How long a suspended session's checkpoint is kept before it is evicted. At least 60 seconds |
+| `suspend.checkpointEvery` | off | Take a live checkpoint of a running session this often, replacing the previous one. At least 60 seconds; memory checkpoints only |
+| `suspend.onWorkerStop` | `"keep"` | What the worker does to running sessions when it is stopped: `"keep"` leaves them running untouched, `"checkpoint"` checkpoints each one first (they keep running) |
+
+**Suspending.** `legion instance suspend <ID>` (`SuspendInstance`) on a
+session routes, by the node tag in the id, to that node
+(`Worker.SuspendSessions`). The reply names the checkpoint, its kind, the
+node, and `durability = "local"`; a second suspend answers `already
+suspended`. The node also suspends a session on its own when its
+`idle.after` passes. `instance get` and `instance list` then show
+`state = "suspended"` and the session no longer counts against its
+envelope.
+
+**Resuming.** `legion instance start <ID>` (`StartInstance`) on a suspended
+session routes to its node (`Worker.ResumeSession`), which admits it into
+the envelope again and boots it from the checkpoint. The reply says
+`Instance <id> resumed on <node>` with `resumingFrom = "local"`. The id
+and its generation (1) are unchanged, and the checkpoint is released once
+the session runs. A session on the `exec` runtime has no memory to
+capture, so its checkpoint is a disk one and its resume is a fresh start
+of the same spec under the same id.
+
+| Answer | When |
+| --- | --- |
+| `RESOURCE_EXHAUSTED` (retryable) | The envelope has no room for the session right now. It stays suspended with its checkpoint; retry when another session ends or suspends |
+| `NOT_FOUND` "session X was evicted from NODE at TIME (reason); a local-only session cannot be restored" | The checkpoint was evicted. The hint suggests starting a new session, or `durability = "store"` once sessions support it. The node gives this answer for another `keepFor` after the eviction, then forgets the id |
+| `UNAVAILABLE` "node NODE holds session X and ..." | The node the id names does not answer and no manager's index lists the session. A local session lives only on its node: retry when the node is back. The message says what the cluster last knew of the node |
+| `FAILED_PRECONDITION` | The task has no `suspend` block (promote the session first), or sets `durability = "store"` |
+| `ABORTED` | Another capture or resume of the session is in progress |
+
+`instance get` on an evicted session, or on one whose node is silent, gives
+the same `NOT_FOUND` and `UNAVAILABLE` answers.
+
+**Eviction.** A suspended session's checkpoint is pinned in the node's
+content store until one of these evicts it:
+
+- `keepFor` passes since it was suspended;
+- its envelope leaves the node (the job stopped or the node was drained)
+  and stays gone for 30 seconds;
+- the content filesystem drops below `content.minFreeDisk`: the node evicts
+  suspended sessions oldest first until it is back above the floor;
+- `instance stop` or `instance destroy` on the suspended session, which
+  ends it outright.
+
+Evictions are counted in `legion_session_evictions_total{reason}`
+([metrics](metrics.md#sessions)).
+
+**Periodic checkpoints (`checkpointEvery`).** With it set, the node pauses
+each running session at that interval, captures its memory, and resumes
+it, replacing the session's previous checkpoint. The first checkpoint of
+each session lands at a stable point in the second half of the interval
+after it starts, so sessions started together do not capture together. The
+node runs one capture at a time; when its backlog would delay a round by
+more than one interval, it skips the most recently checkpointed sessions
+for that round and counts them in
+`legion_session_checkpoints_skipped_total`. A periodic checkpoint is what a
+restarted worker restores from (below); it is not a backup that survives
+the node.
+
+The cost is write volume. Each capture writes about the session's guest
+memory, and the content store keeps one checkpoint per session. For 40
+sessions of 512 MiB with `checkpointEvery = "10m"`:
+
+- writes: 40 x 512 MiB x 6 an hour = 120 GiB an hour, about 34 MiB/s
+  sustained;
+- disk held: 40 x 512 MiB = 20 GiB, plus the checkpoints of suspended
+  sessions;
+- capture time: at about 2 s per 512 MiB capture, 80 s of every 600 s is
+  spent capturing, each session paused for its own 2 s.
+
+Halving the interval doubles the writes; size `content.minFreeDisk` and
+the interval together.
+
+**Worker stops (`onWorkerStop`).** A worker that gets SIGTERM or SIGINT
+leaves its workloads running, as it always has, and a restarted worker
+re-adopts the sessions still running. With `onWorkerStop = "checkpoint"`
+the worker first checkpoints each running session, least recently
+checkpointed first, until `edgeBoot.stopCheckpointTimeout` (default 60s)
+runs out, and then exits. When it starts again, a session whose process
+died meanwhile (the host rebooted, or the process was killed) is restored
+from that checkpoint, or from its latest periodic one, under the same id.
+A session with no checkpoint, or with `onWorkerStop = "keep"`, ends as
+before. Sessions the timeout did not reach are logged as left.
+
+**What is not covered.** A suspended session lives on one node. Losing the
+node, or its disk, loses the session: there is no copy elsewhere and no
+other node can resume it. Sessions that must survive their node should be
+promoted.
+
+| Not available for sessions | Instead |
+| --- | --- |
+| `suspend.durability = "store"` (a published checkpoint another node can resume) | Promote the session, then suspend it |
+| Resuming on another node | Promote first |
+| `suspend.reserve` | Size the envelope for the sessions you want running |
+| `checkpointEvery` with a disk checkpoint (`exec`) | `onWorkerStop = "checkpoint"` alone, or the sandbox runtime |
+| Wake on traffic (`suspend.wake`) | `instance start` from the caller |
 
 ## Duplicates
 
@@ -539,8 +670,15 @@ on it and no session is sent to it. See [upgrades](upgrades.md).
 
 ## Limitations
 
-- **Unnamed sessions cannot be suspended, forked, or snapshotted.** Promote
-  one first. Idle sessions kept only as bucket manifests are not available.
+- **Unnamed sessions cannot be forked or snapshotted,** and suspend only
+  to their own node's disk ([Idle sessions](#idle-sessions)). Promote one
+  for the rest. Idle sessions kept only as bucket manifests are not
+  available.
+- **A suspended session dies with its node.** Its checkpoint is on that
+  node only, until `keepFor` or disk pressure evicts it.
+- **Idle detection needs resource enforcement** (cgroups) on the node, as
+  for keyed instances. Without it, `idle.after` never fires; `instance
+  suspend` still works.
 - **No workload identity** for sessions: a session task may not declare
   `identities`, so a promoted session has none either.
 - **No per-session events or audit log.** Starts and stops are counted
@@ -555,3 +693,6 @@ on it and no session is sent to it. See [upgrades](upgrades.md).
 - **A crash can lose the last 50 ms of starts from `sessions.db`.** Those
   sessions keep running unreported until they exit. A machine reboot ends
   the node's sessions.
+- **A worker restart ends only the sessions whose process died** while it
+  was down, unless `suspend.onWorkerStop = "checkpoint"` or
+  `checkpointEvery` left a checkpoint to restore them from.

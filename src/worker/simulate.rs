@@ -773,6 +773,37 @@ impl Worker for SimWorkerService {
         Ok(Response::new(crate::structs::StopSessionsReply::default()))
     }
 
+    async fn suspend_sessions(
+        &self,
+        request: Request<crate::structs::SuspendSessionsRequest>,
+    ) -> Result<Response<crate::structs::SuspendSessionsReply>, Status> {
+        crate::worker::plane::require_manager(&request, "SuspendSessions")?;
+        let failed = request
+            .into_inner()
+            .session_ids
+            .into_iter()
+            .map(|session_id| crate::structs::SessionSleepFailure {
+                session_id,
+                code: "NotFound".into(),
+                message: "not_found: a simulated node runs no sessions".into(),
+            })
+            .collect();
+        Ok(Response::new(crate::structs::SuspendSessionsReply {
+            suspended: Vec::new(),
+            failed,
+        }))
+    }
+
+    async fn resume_session(
+        &self,
+        request: Request<crate::structs::ResumeSessionRequest>,
+    ) -> Result<Response<crate::structs::ResumeSessionReply>, Status> {
+        crate::worker::plane::require_manager(&request, "ResumeSession")?;
+        Err(Status::not_found(
+            "not_found: a simulated node runs no sessions",
+        ))
+    }
+
     async fn get_session(
         &self,
         request: Request<crate::structs::GetSessionRequest>,
