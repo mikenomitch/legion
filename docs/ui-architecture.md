@@ -697,10 +697,22 @@ live in the page.
 
 Exec is the one part of the UI that does not use gRPC-Web, because browsers
 cannot do bidirectional streaming over it. `ui/src/lib/execSocket.ts` opens a
-WebSocket to the manager's exec bridge (`ws://<host>:<port+1>/v1/exec/ws`).
+WebSocket to the manager's exec bridge at `<host>:<port+1>/v1/exec/ws`.
 It exchanges protobuf `ExecClientFrame`/`ExecServerFrame` messages (the same
 frames the CLI uses), one per binary WS frame. The bearer token rides in the
 first frame.
+
+The exec WebSocket follows `server.tls`. The UI uses `wss://` when the
+manager endpoint is `https://`, and `ws://` otherwise. When `server.tls` is
+enabled, the exec listener serves TLS with the same certificate and key as
+the gRPC listener. It accepts only TLS, and a plaintext `ws://` connection
+fails its handshake. When TLS is off, the listener stays plaintext. The
+browser has to trust the certificate on the exec port as well as on the
+manager port. A certificate-warning exception you click through for the
+manager port may not cover `port+1`, because some browsers (Firefox, for
+example) record exceptions per host and port. If the terminal fails to
+connect while the rest of the UI works, check that first. Trusting the CA
+that signed the certificate covers both ports.
 
 `components/ExecTerminal.tsx` binds those frames to an xterm.js terminal
 (`@xterm/xterm` + `@xterm/addon-fit`) and sends resize frames when the

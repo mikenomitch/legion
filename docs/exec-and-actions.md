@@ -233,6 +233,13 @@ UI   ──WebSocket /v1/exec/ws───────┘        (proxies frames)
   frame. The handshake's `Origin` must be loopback or listed in
   `server.allowedOrigins` ([UI Architecture](ui-architecture.md#allowed-browser-origins)),
   so a web page cannot open a session.
+- The WebSocket listener follows `server.tls`. When TLS is enabled, it serves
+  `wss://` with the same certificate and key as the gRPC listener, and it
+  refuses plaintext connections. When TLS is off, it serves plaintext `ws://`.
+  The UI picks `wss://` whenever its manager endpoint is `https://`. A browser
+  that does not trust the certificate on `port + 1` fails the terminal while
+  the rest of the UI works
+  ([UI Architecture](ui-architecture.md#exec--actions-interactive-terminal)).
 - Interactive sessions use a PTY on the worker (`portable-pty`: openpty on
   Unix, ConPTY on Windows). Sessions end when the connection closes. There is
   no detach/reattach.
