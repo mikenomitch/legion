@@ -7,7 +7,7 @@ use serde_json::Value;
 pub const DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT: f64 = 0.2;
 
 use crate::prelude::{
-    bail, default_raft_data_dir, default_store_path, Context, DEF_EVAL_PRIORITY,
+    anyhow, bail, default_raft_data_dir, default_store_path, Context, DEF_EVAL_PRIORITY,
     DEF_HEARTBEAT_HEADROOM, DEF_HEARTBEAT_MAX_INTERVAL_SEC, DEF_HEARTBEAT_MIN_INTERVAL_SEC,
     DEF_HEARTBEAT_TARGET_RATE_PER_SECOND, DEF_KV_DEBOUNCE_MS, DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC,
     DEF_LIVENESS_DIGEST_INTERVAL_SEC, DEF_LIVENESS_FAILOVER_GRACE_SEC,
@@ -986,10 +986,31 @@ impl From<TelemetryConfigFull> for TelemetryConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecConfig {
-    /// Master switch for `ExecAllocation` + the exec WebSocket bridge.
-    /// Default: true.
+    /// Master switch for `ExecAllocation`, `MintExecTicket`, and the exec
+    /// WebSocket bridge. Default: true.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Lifetimes for direct-exec tickets (docs/exec-and-actions.md, "Direct
+    /// exec").
+    #[serde(default)]
+    pub tickets: Option<ExecTicketsConfig>,
+}
+
+/// Manager `exec.tickets` block. Every field is a duration string.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecTicketsConfig {
+    /// How long a ticket can be redeemed when the mint names no `ttl`.
+    /// Default `60s`.
+    #[serde(default)]
+    pub default_ttl: Option<String>,
+    /// The longest `ttl` a mint may ask for. Default `10m`.
+    #[serde(default)]
+    pub max_ttl: Option<String>,
+    /// How long a direct session may run, and the default when the mint
+    /// names none. Default `1h`.
+    #[serde(default)]
+    pub max_session: Option<String>,
 }
 
 /// Resolved exec configuration.
@@ -997,11 +1018,66 @@ pub struct ExecConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ExecConfigFull {
     pub enabled: bool,
+    #[serde(default)]
+    pub tickets: ExecTicketsConfigFull,
 }
 
 impl Default for ExecConfigFull {
     fn default() -> Self {
-        ExecConfigFull { enabled: true }
+        ExecConfigFull {
+            enabled: true,
+            tickets: ExecTicketsConfigFull::default(),
+        }
+    }
+}
+
+/// Resolved `exec.tickets`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecTicketsConfigFull {
+    pub default_ttl: std::time::Duration,
+    pub max_ttl: std::time::Duration,
+    pub max_session: std::time::Duration,
+}
+
+impl Default for ExecTicketsConfigFull {
+    fn default() -> Self {
+        use crate::structs::exec_ticket::{
+            DEFAULT_MAX_SESSION_SECS, DEFAULT_TTL_SECS, MAX_TTL_SECS,
+        };
+        ExecTicketsConfigFull {
+            default_ttl: std::time::Duration::from_secs(DEFAULT_TTL_SECS),
+            max_ttl: std::time::Duration::from_secs(MAX_TTL_SECS),
+            max_session: std::time::Duration::from_secs(DEFAULT_MAX_SESSION_SECS),
+        }
+    }
+}
+
+impl ExecTicketsConfig {
+    /// Resolves the block, refusing an unparseable duration or a default
+    /// above its ceiling: a typo fails the manager at startup, not a mint.
+    pub fn with_defaults(&self) -> R<ExecTicketsConfigFull> {
+        let defaults = ExecTicketsConfigFull::default();
+        let parse = |name: &str, raw: &Option<String>, default: std::time::Duration| match raw {
+            None => Ok(default),
+            Some(raw) => humantime::parse_duration(raw)
+                .map_err(|err| anyhow!("exec.tickets.{name} `{raw}` is not a duration: {err}")),
+        };
+        let resolved = ExecTicketsConfigFull {
+            default_ttl: parse("defaultTtl", &self.default_ttl, defaults.default_ttl)?,
+            max_ttl: parse("maxTtl", &self.max_ttl, defaults.max_ttl)?,
+            max_session: parse("maxSession", &self.max_session, defaults.max_session)?,
+        };
+        if resolved.default_ttl.is_zero() || resolved.default_ttl > resolved.max_ttl {
+            bail!(
+                "exec.tickets.defaultTtl must be above zero and at most exec.tickets.maxTtl ({})",
+                humantime::format_duration(resolved.max_ttl)
+            );
+        }
+        if resolved.max_session.is_zero() {
+            bail!("exec.tickets.maxSession must be above zero");
+        }
+        Ok(resolved)
     }
 }
 
@@ -1009,6 +1085,16 @@ impl ExecConfig {
     pub fn with_defaults(&self) -> ExecConfigFull {
         ExecConfigFull {
             enabled: self.enabled.unwrap_or(true),
+            tickets: self
+                .tickets
+                .as_ref()
+                .map(|tickets| {
+                    tickets.with_defaults().unwrap_or_else(|err| {
+                        tracing::warn!(error = %err, "Invalid exec.tickets; using the defaults");
+                        ExecTicketsConfigFull::default()
+                    })
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -1023,9 +1109,21 @@ pub const DEF_ACL_JWKS_REFRESH: &str = "5m";
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AclConfig {
-    /// Master switch. Default: false (no enforcement).
+    /// Master switch. Default: true. With ACLs on, every API call needs a
+    /// credential, and the manager mints the initial management token itself
+    /// at first start (docs/auth-and-acls.md, "Quick start"). `false` is an
+    /// explicit choice for a throwaway cluster: every caller, including any
+    /// workload that can reach the manager, gets full access, and the manager
+    /// logs a warning at every start.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// File holding the secret for the initial management token, read once
+    /// when the manager mints that token (first start, or after every
+    /// management token was deleted). For infrastructure-as-code pre-seeding;
+    /// the secret must be at least 24 characters. Default: unset, and the
+    /// manager generates a random secret.
+    #[serde(default)]
+    pub bootstrap_secret_file: Option<String>,
     /// When true (and `enabled` is true), denials are logged with the
     /// `acl_audit` tracing target but requests are allowed. Use this to
     /// stage policies before flipping to full enforcement.
@@ -1118,6 +1216,8 @@ pub struct AclBindingRule {
 #[serde(rename_all = "camelCase")]
 pub struct AclConfigFull {
     pub enabled: bool,
+    #[serde(default)]
+    pub bootstrap_secret_file: Option<String>,
     pub audit_only: bool,
     pub login_ttl: String,
     pub token_max_ttl: Option<String>,
@@ -1128,7 +1228,8 @@ pub struct AclConfigFull {
 impl Default for AclConfigFull {
     fn default() -> Self {
         AclConfigFull {
-            enabled: false,
+            enabled: true,
+            bootstrap_secret_file: None,
             audit_only: false,
             login_ttl: DEF_ACL_LOGIN_TTL.into(),
             token_max_ttl: None,
@@ -1224,6 +1325,7 @@ impl From<AclConfigFull> for AclConfig {
     fn from(val: AclConfigFull) -> Self {
         AclConfig {
             enabled: Some(val.enabled),
+            bootstrap_secret_file: val.bootstrap_secret_file,
             audit_only: Some(val.audit_only),
             login_ttl: Some(val.login_ttl),
             token_max_ttl: val.token_max_ttl,
@@ -1251,6 +1353,7 @@ impl AclConfig {
         let d = AclConfigFull::default();
         AclConfigFull {
             enabled: self.enabled.unwrap_or(d.enabled),
+            bootstrap_secret_file: self.bootstrap_secret_file.clone(),
             audit_only: self.audit_only.unwrap_or(d.audit_only),
             login_ttl: self.login_ttl.clone().unwrap_or(d.login_ttl),
             token_max_ttl: self.token_max_ttl.clone(),
@@ -1873,6 +1976,15 @@ impl From<ManagerConfigFull> for ManagerConfig {
             artifacts: Some(val.artifacts.into()),
             exec: Some(ExecConfig {
                 enabled: Some(val.exec.enabled),
+                tickets: Some(ExecTicketsConfig {
+                    default_ttl: Some(
+                        humantime::format_duration(val.exec.tickets.default_ttl).to_string(),
+                    ),
+                    max_ttl: Some(humantime::format_duration(val.exec.tickets.max_ttl).to_string()),
+                    max_session: Some(
+                        humantime::format_duration(val.exec.tickets.max_session).to_string(),
+                    ),
+                }),
             }),
             telemetry: Some(val.telemetry.into()),
             edge_boot: Some(val.edge_boot.into()),
@@ -2272,6 +2384,16 @@ pub struct WorkerConfigAlt {
     /// the tickets that authorize them (see docs/edge-boot.md). Absent = off.
     #[serde(default)]
     pub edge_boot: Option<WorkerEdgeBootConfig>,
+    /// Holes in (and additions to) the host guard, the fixed floor of
+    /// destinations no allocation on this node may reach through the
+    /// datapath (docs/network-handlers.md, "The host guard"). Absent = the
+    /// default guard.
+    #[serde(default)]
+    pub host_guard: Option<crate::structs::host_guard::HostGuardConfig>,
+    /// Exec settings for workers of this type (docs/exec-and-actions.md,
+    /// "Direct exec"). Absent = manager-proxied exec only.
+    #[serde(default)]
+    pub exec: Option<WorkerExecConfig>,
     /// What `container` tasks may do on workers of this type (see
     /// docs/task-runtime-container.md, "Capabilities"). Absent means the
     /// defaults: container tasks may end up with at most the default
@@ -2305,6 +2427,30 @@ impl WorkerContainerConfig {
         }
         serde_json::from_str(raw).context("parse worker container config")
     }
+}
+
+/// The worker-type security blocks, carried to the worker as one JSON
+/// payload (`WorkerConfig.security`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSecurityConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_guard: Option<crate::structs::host_guard::HostGuardConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<WorkerExecConfig>,
+}
+
+/// Worker `exec` block.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerExecConfig {
+    /// Admit exec tickets on `Worker.ExecTask`: a client holding a ticket
+    /// from `MintExecTicket` opens its session on this worker directly,
+    /// with no manager on the data path. Off by default: a node that turns
+    /// it on accepts sessions from any client that can reach its worker
+    /// port and holds a ticket for it.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 /// Worker `resourceEnforcement` block: cgroup v2 limits for governed tasks.

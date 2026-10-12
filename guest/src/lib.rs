@@ -6,6 +6,8 @@
 //!
 //! - [`agent`]: the gated datapath's foothold, relaying the guest's loopback
 //!   proxy and DNS ports to the node over vsock.
+//! - [`exec`]: the exec listener on guest vsock port 1100, and the frames
+//!   the worker and the agent speak over it.
 //! - [`resume`]: the resume handler, which refreshes a restored guest's
 //!   identity, RNG, clock, and token files, then runs `suspend.onResume`.
 //! - [`identity`]: the identity disk the worker writes and the handler reads.
@@ -22,6 +24,7 @@
 pub mod agent;
 pub mod cli;
 pub mod env;
+pub mod exec;
 pub mod identity;
 pub mod netconf;
 pub mod resume;

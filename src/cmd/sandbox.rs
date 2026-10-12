@@ -10,11 +10,11 @@
 //! The caller may act on `booted` and must be prepared for `refused` at any
 //! point until `ratified`.
 
-use crate::cmd::helpers::json_flag;
+use crate::cmd::helpers::{json_flag, worker_plane_client};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::edge_boot::{Gate, RefusalReason};
-use crate::structs::{GetMeshCaRequest, StartClaimRequest};
+use crate::structs::StartClaimRequest;
 
 pub fn config() -> Command {
     let start_cmd = Command::new("start")
@@ -37,18 +37,24 @@ pub fn config() -> Command {
                 .long("node")
                 .value_name("ADDR")
                 .required(true)
-                .help("Worker address to start on, e.g. https://10.0.1.7:4848"),
-        )
-        .arg(
-            Arg::new("ca-cert")
-                .long("ca-cert")
-                .value_name("FILE")
-                .value_hint(ValueHint::FilePath)
                 .help(
-                    "Cluster CA (PEM, from `legion net ca show`) the node's certificate must \
-                     chain to. Default: fetched from the manager with your token",
+                    "Worker address to start on, e.g. https://10.0.1.7:4848. The worker plane \
+                     is always TLS; its certificate is verified against the cluster CA",
                 ),
         )
+        .arg(
+            Arg::new("node-name")
+                .long("node-name")
+                .value_name("NODE")
+                .help(
+                    "Node id the worker at --node must prove it is (its certificate names \
+                     <NODE>.node.legion). Without it, any node of this cluster is accepted",
+                ),
+        )
+        .arg(Arg::new("ca").long("ca").value_name("FILE").help(
+            "Cluster CA bundle (PEM) to verify the worker against. Default: fetched \
+                     from the manager with your token (`legion net ca show`)",
+        ))
         .arg(
             Arg::new("ticket")
                 .long("ticket")
@@ -115,26 +121,14 @@ async fn start(arg_matches: &ArgMatches) -> R<()> {
         None => Gate::Off,
     };
 
-    // The worker plane is mTLS: verify the node's certificate against the
-    // cluster CA. No client certificate is sent; the ticket authorizes.
-    let ca_pem = match arg_matches.get_one::<String>("ca-cert") {
-        Some(path) => std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read --ca-cert {path}"))?,
-        None => {
-            let mut manager = crate::cmd::helpers::connect_manager_client().await?;
-            let reply = output::resolve(
-                format,
-                "Failed to fetch the cluster CA (pass --ca-cert to skip the manager)",
-                manager.get_mesh_ca(GetMeshCaRequest {}).await,
-            )?
-            .into_inner();
-            if reply.cert_pem.is_empty() {
-                bail!("the cluster has no CA yet: no worker has registered");
-            }
-            reply.cert_pem
-        }
-    };
-    let (mut client, _node_id) = crate::manager::worker_plane::edge_client(&node, &ca_pem).await?;
+    let mut client = worker_plane_client(
+        &node,
+        arg_matches
+            .get_one::<String>("node-name")
+            .map(String::as_str),
+        arg_matches.get_one::<String>("ca").map(String::as_str),
+    )
+    .await?;
 
     let response = output::resolve(
         format,

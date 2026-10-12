@@ -1336,6 +1336,11 @@ pub struct Scheduler<'a> {
     /// settings above — and so a typo'd `mode` fails the manager at startup
     /// rather than quietly evicting production work on the first busy plan.
     preemption: PreemptionSettings,
+    /// Fixed seed for the `nodes_considered` / `score_sample` subset RNG.
+    /// Always `None` outside tests, where each plan seeds from entropy;
+    /// tests pin it so assertions about which subset was drawn are
+    /// deterministic rather than probabilistic.
+    nodes_considered_seed: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1366,6 +1371,7 @@ impl<'a> Scheduler<'a> {
             plan_candidates: PlanCandidatesSetting::default(),
             plan_apply_batch_max: Store::plan_apply_batch_max(store.scheduler_settings.as_ref()),
             preemption: PreemptionSettings::default(),
+            nodes_considered_seed: None,
         };
         scheduler.weights = scheduler.scheduler_weights()?;
         scheduler.nodes_considered = scheduler.nodes_considered_setting()?;
@@ -1383,6 +1389,15 @@ impl<'a> Scheduler<'a> {
             });
         }
         Ok(scheduler)
+    }
+
+    /// Pin the `nodes_considered` / `score_sample` subset RNG to `seed`, so
+    /// a test can draw a known sequence of subsets instead of asserting on
+    /// what entropy happened to produce.
+    #[cfg(test)]
+    fn with_nodes_considered_seed(mut self, seed: u64) -> Self {
+        self.nodes_considered_seed = Some(seed);
+        self
     }
 
     /// The cluster's preemption settings, for callers that need to report
@@ -2246,8 +2261,11 @@ impl<'a> Scheduler<'a> {
         } else {
             None
         };
-        let mut nodes_considered_rng =
-            StdRng::from_rng(rand::thread_rng()).context("Failed to seed nodes_considered RNG")?;
+        let mut nodes_considered_rng = match self.nodes_considered_seed {
+            Some(seed) => StdRng::seed_from_u64(seed),
+            None => StdRng::from_rng(rand::thread_rng())
+                .context("Failed to seed nodes_considered RNG")?,
+        };
         let existing_alloc_counts_by_task_node =
             Self::existing_alloc_counts_by_task_node(&own_by_node);
         // The by-id lookup is the cached one: building a map over every
@@ -7376,10 +7394,38 @@ mod tests {
         Ok(())
     }
 
+    /// Place `count` allocations of a separate filler job on each listed
+    /// node. The load has to belong to another job: a Fresh plan replaces
+    /// its own job wholesale, so the job's own allocations are dropped from
+    /// the snapshot and would leave every node scoring the same.
+    fn seed_load_from_another_job(store: &Store, load: &[(&str, usize)]) -> R<()> {
+        let filler = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "background-load".into(),
+            tasks: vec![TaskConfig::new("filler", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&filler, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&filler.name)?.id();
+        let task_id = task_id_for(store, &job_config_id, "filler")?;
+        for (node_id, count) in load {
+            for _ in 0..*count {
+                store.place_alloc(node_id, task_id)?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn spread_limits_nodes_considered_by_count() -> R<()> {
+        // `nodes_considered` draws a random 2-node subset per plan; walking a
+        // fixed range of seeds makes the sequence of subsets reproducible.
+        // Seeded from entropy, all 20 draws could miss node-b's subset
+        // (about once per 3,000 runs).
         let mut selected = HashSet::new();
-        for _ in 0..20 {
+        for seed in 0..20 {
             let store =
                 setup_store_with_scheduler("spread", Some(json!({ "nodes_considered": 2 })))?;
             store.insert_node(make_node_msg("node-a", json!({})))?;
@@ -7397,19 +7443,15 @@ mod tests {
 
             store.handle_job_submit(&job, &[dummy_submission()])?;
             let job_config_id = store.get_job_config(&job.name)?.id();
-            let task_id = task_id_for(&store, &job_config_id, "api")?;
+            seed_load_from_another_job(&store, &[("node-a", 3), ("node-b", 2)])?;
 
-            for _ in 0..3 {
-                store.place_alloc("node-a", task_id)?;
-            }
-            for _ in 0..2 {
-                store.place_alloc("node-b", task_id)?;
-            }
-
-            let scheduler = Scheduler::new(&store)?;
+            let scheduler = Scheduler::new(&store)?.with_nodes_considered_seed(seed);
             let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
 
             assert_eq!(outcome.allocations.len(), 1);
+            // Every 2-node subset holds a node the policy prefers over
+            // node-a, so node-a is never the pick.
+            assert_ne!(outcome.allocations[0].node_id, "node-a");
             selected.insert(outcome.allocations[0].node_id.clone());
         }
 
@@ -7421,8 +7463,12 @@ mod tests {
 
     #[test]
     fn bin_pack_limits_nodes_considered_by_percentage() -> R<()> {
+        // `nodes_considered` draws a random 2-node subset per plan; walking a
+        // fixed range of seeds makes the sequence of subsets reproducible.
+        // Seeded from entropy, all 20 draws could miss node-b's subset
+        // (about once per 3,000 runs).
         let mut selected = HashSet::new();
-        for _ in 0..20 {
+        for seed in 0..20 {
             let store =
                 setup_store_with_scheduler("bin_pack", Some(json!({ "nodes_considered": "50%" })))?;
             store.insert_node(make_node_msg("node-a", json!({})))?;
@@ -7440,19 +7486,15 @@ mod tests {
 
             store.handle_job_submit(&job, &[dummy_submission()])?;
             let job_config_id = store.get_job_config(&job.name)?.id();
-            let task_id = task_id_for(&store, &job_config_id, "worker")?;
+            seed_load_from_another_job(&store, &[("node-b", 2), ("node-c", 5)])?;
 
-            for _ in 0..2 {
-                store.place_alloc("node-b", task_id)?;
-            }
-            for _ in 0..5 {
-                store.place_alloc("node-c", task_id)?;
-            }
-
-            let scheduler = Scheduler::new(&store)?;
+            let scheduler = Scheduler::new(&store)?.with_nodes_considered_seed(seed);
             let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
 
             assert_eq!(outcome.allocations.len(), 1);
+            // Every 2-node subset holds a node the policy prefers over
+            // node-a, so node-a is never the pick.
+            assert_ne!(outcome.allocations[0].node_id, "node-a");
             selected.insert(outcome.allocations[0].node_id.clone());
         }
 

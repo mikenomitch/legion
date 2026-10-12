@@ -51,39 +51,92 @@ pub trait JwksSource: Send + Sync {
     fn fetch(&self) -> R<Value>;
 }
 
-/// Fetches the JWKS over HTTP from the manager's `/.well-known/jwks.json`.
-pub struct HttpJwksSource {
-    url: String,
+/// Fetches the JWKS from the manager over TLS that verifies the cluster CA
+/// (worker-plane-auth plan §6.1, §6.8): the connection names
+/// `manager.legion`, and the certificate must chain to the pinned CA, or to
+/// the bundle once the worker holds one. A ticket verifier is only as strong
+/// as its keys, so a JWKS an on-path attacker could swap would let it forge
+/// boot and exec tickets.
+pub struct PinnedJwksSource {
+    host_port: String,
+    verifier: Arc<crate::cluster_tls::PinnedManagerVerifier>,
     timeout: Duration,
 }
 
-impl HttpJwksSource {
-    pub fn new(url: impl Into<String>, timeout: Duration) -> Self {
-        HttpJwksSource {
-            url: url.into(),
+impl PinnedJwksSource {
+    pub fn new(
+        manager_addr: &str,
+        verifier: Arc<crate::cluster_tls::PinnedManagerVerifier>,
+        timeout: Duration,
+    ) -> R<Self> {
+        Ok(PinnedJwksSource {
+            host_port: crate::cluster_tls::host_port(manager_addr)?,
+            verifier,
             timeout,
-        }
+        })
     }
-}
 
-impl JwksSource for HttpJwksSource {
-    fn fetch(&self) -> R<Value> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(self.timeout)
-            .build()
-            .context("failed to build JWKS HTTP client")?;
-        let response = client
-            .get(&self.url)
-            .send()
-            .with_context(|| format!("failed to fetch JWKS from {}", self.url))?;
+    async fn fetch_async(&self) -> R<Value> {
+        use http_body_util::BodyExt;
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(self.verifier.clone())
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let server_name = rustls_pki_types::ServerName::try_from(
+            crate::cluster_tls::MANAGER_SERVER_NAME.to_string(),
+        )?;
+        let tcp = tokio::net::TcpStream::connect(&self.host_port)
+            .await
+            .with_context(|| format!("connect to {} for the JWKS", self.host_port))?;
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(server_name, tcp)
+            .await
+            .with_context(|| format!("TLS to {} for the JWKS", self.host_port))?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await?;
+        tokio::spawn(connection);
+        let request = http::Request::get(crate::manager::workload_identity::DEFAULT_JWKS_PATH)
+            .header(http::header::HOST, crate::cluster_tls::MANAGER_SERVER_NAME)
+            .body(http_body_util::Empty::<bytes::Bytes>::new())?;
+        let response = sender.send_request(request).await?;
         if !response.status().is_success() {
             bail!(
                 "JWKS fetch from {} returned {}",
-                self.url,
+                self.host_port,
                 response.status()
             );
         }
-        response.json::<Value>().context("invalid JWKS document")
+        let body = response.into_body().collect().await?.to_bytes();
+        serde_json::from_slice(&body).context("invalid JWKS document")
+    }
+}
+
+impl JwksSource for PinnedJwksSource {
+    /// Fetches on a thread of its own: verifiers run inside RPC handlers,
+    /// on the server's runtime, where blocking on another runtime panics.
+    /// A fetch happens once per refresh interval or unknown `kid`, so the
+    /// thread is cheap next to what it guards.
+    fn fetch(&self) -> R<Value> {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("build JWKS fetch runtime")?;
+                    runtime.block_on(async {
+                        tokio::time::timeout(self.timeout, self.fetch_async())
+                            .await
+                            .map_err(|_| anyhow!("JWKS fetch from {} timed out", self.host_port))?
+                    })
+                })
+                .join()
+                .map_err(|_| anyhow!("JWKS fetch thread panicked"))?
+        })
     }
 }
 
@@ -145,7 +198,7 @@ impl BootTicketVerifier {
         let header = decode_header(token).context("invalid boot ticket header")?;
         let kid = header.kid.context("boot ticket is missing a kid header")?;
 
-        let raw = self.decode_with_kid(token, &kid)?;
+        let raw = self.decode_with_kid(token, &kid, BOOT_TICKET_AUDIENCE)?;
         let not_before = raw.get("nbf").and_then(Value::as_i64);
         let claims = BootTicketClaims::from_claims(&raw)?;
 
@@ -179,7 +232,7 @@ impl BootTicketVerifier {
     /// reach a manager must still be able to redeem tickets signed by keys it
     /// already holds, which is the availability property the whole feature
     /// exists for.
-    fn decode_with_kid(&self, token: &str, kid: &str) -> R<Map<String, Value>> {
+    fn decode_with_kid(&self, token: &str, kid: &str, audience: &str) -> R<Map<String, Value>> {
         if self.refresh_needed(kid) {
             match self.source.fetch() {
                 Ok(document) => self.install(&document)?,
@@ -191,7 +244,7 @@ impl BootTicketVerifier {
 
         let mut validation = Validation::new(Algorithm::ES256);
         validation.set_issuer(&[&self.issuer]);
-        validation.set_audience(&[BOOT_TICKET_AUDIENCE]);
+        validation.set_audience(&[audience]);
         // Expiry is checked against the clock the CALLER passed in, not the
         // process clock, so the skew boundaries are exactly the ones
         // documented and are testable without sleeping. The library's own
@@ -208,8 +261,24 @@ impl BootTicketVerifier {
             .get(kid)
             .with_context(|| format!("no cached signing key for kid {kid}"))?;
         let data = decode::<Map<String, Value>>(token, &key.decoding, &validation)
-            .context("boot ticket failed verification")?;
+            .context("ticket failed verification")?;
         Ok(data.claims)
+    }
+
+    /// Verifies a ticket's signature, issuer, and `audience` against the
+    /// cached JWKS and returns its raw claims, with expiry left to the
+    /// caller (it checks against its own clock with this verifier's skew).
+    /// The exec ticket verifier shares this cache: one JWKS, one refresh
+    /// schedule, per worker.
+    pub fn decode(&self, token: &str, audience: &str) -> R<Map<String, Value>> {
+        let header = decode_header(token).context("invalid ticket header")?;
+        let kid = header.kid.context("ticket is missing a kid header")?;
+        self.decode_with_kid(token, &kid, audience)
+    }
+
+    /// The clock skew tickets are checked with.
+    pub fn clock_skew(&self) -> Duration {
+        self.clock_skew
     }
 
     fn refresh_needed(&self, kid: &str) -> bool {
@@ -533,6 +602,85 @@ mod boot_ticket_test {
         // unusable anyway, so the set stays bounded by ticket lifetime.
         verifier.spend(&claims, 1_000_400);
         assert!(verifier.spent.lock().expect("spent").is_empty());
+        Ok(())
+    }
+
+    /// Serves `body` at the JWKS path over TLS with a manager's cluster
+    /// certificate, on its own runtime. Returns the address and the CA pin.
+    fn serve_jwks(body: &'static str) -> R<(String, String)> {
+        let (ca_pem, ca_key) = crate::manager::mesh_ca::generate_ca()?;
+        let (cert, key, _) = crate::manager::mesh_ca::issue_manager_cert(
+            &ca_pem,
+            &ca_key,
+            "m1",
+            crate::manager::mesh_ca::ManagerCertKind::Server,
+        )?;
+        let identity = crate::cluster_tls::SwappableIdentity::new();
+        identity.set(crate::cluster_tls::certified_key(
+            &format!("{cert}{ca_pem}"),
+            &key,
+        )?);
+        let config = crate::cluster_tls::server_config(identity, None, true)?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = format!("http://{}", listener.local_addr()?);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).expect("listener");
+                let acceptor = tokio_rustls::TlsAcceptor::from(config);
+                while let Ok((tcp, _)) = listener.accept().await {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        continue;
+                    };
+                    let service = hyper::service::service_fn(
+                        |request: http::Request<hyper::body::Incoming>| async move {
+                            let found = request.uri().path()
+                                == crate::manager::workload_identity::DEFAULT_JWKS_PATH;
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .status(if found { 200 } else { 404 })
+                                    .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                                    .expect("response"),
+                            )
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                        .await;
+                }
+            });
+        });
+        Ok((addr, crate::cluster_tls::ca_pin_pem(&ca_pem)?))
+    }
+
+    #[test]
+    fn the_jwks_is_fetched_over_tls_pinned_to_the_cluster_ca_test() -> R<()> {
+        let (addr, pin) = serve_jwks(r#"{"keys":[]}"#)?;
+        let pinned = PinnedJwksSource::new(
+            &addr,
+            crate::cluster_tls::PinnedManagerVerifier::new(crate::cluster_tls::ManagerTrust::Pin(
+                pin,
+            )),
+            Duration::from_secs(5),
+        )?;
+        assert_eq!(pinned.fetch()?, json!({ "keys": [] }));
+
+        // A JWKS from a manager whose CA is not the pinned one is refused,
+        // so an on-path attacker cannot swap the keys.
+        let (_, other) = serve_jwks(r#"{"keys":[]}"#)?;
+        let impostor = PinnedJwksSource::new(
+            &addr,
+            crate::cluster_tls::PinnedManagerVerifier::new(crate::cluster_tls::ManagerTrust::Pin(
+                other,
+            )),
+            Duration::from_secs(5),
+        )?;
+        let err = impostor.fetch().expect_err("pin mismatch");
+        assert!(format!("{err:#}").contains("CA pin mismatch"), "{err:#}");
         Ok(())
     }
 

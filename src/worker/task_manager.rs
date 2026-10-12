@@ -2477,6 +2477,21 @@ impl WorkerTaskManager {
     /// Open a live exec session against a local allocation. Resolves the task
     /// runtime plugin, checks its declared exec support, and spawns the
     /// session. The caller (worker exec RPC) drives the returned session.
+    /// The job, task, and runtime an allocation runs here, when it runs
+    /// here: what a direct exec ticket's `legion.io/job` and
+    /// `legion.io/task` are checked against, and whether a delegated key's
+    /// ticket may reach it (never a host-level runtime).
+    pub fn exec_target(&self, allocation_id: i64) -> Option<(String, String, String)> {
+        let allocation_id = self.local_key(allocation_id);
+        let allocation = self.allocations.get(&allocation_id)?;
+        let task = self.task_configs.get(&allocation_id)?;
+        Some((
+            allocation.job_id.clone(),
+            task.name.clone(),
+            task.runtime.clone(),
+        ))
+    }
+
     pub fn open_exec_session(
         &mut self,
         allocation_id: i64,
@@ -7136,6 +7151,7 @@ mod tests {
                     },
                 ],
                 vip_block: None,
+                resolver: None,
                 mode: None,
                 ingress_tls: None,
             }),

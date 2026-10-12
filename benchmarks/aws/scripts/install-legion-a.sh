@@ -99,6 +99,8 @@ render_config 0 true "" >"$STAGE/cp-0.ncl"
 install_manager 0 "$STAGE/cp-0.ncl"
 log "waiting for cp-0 readyz"
 rig_http_ready "${CP_ADDRS[0]}" 4749/readyz 180
+log "installing the management token cp-0 minted at first start"
+rig_install_cli_token
 
 # Join token minted on the bootstrap node enrolls the other two.
 log "minting raft join token on cp-0"

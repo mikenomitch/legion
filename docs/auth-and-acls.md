@@ -6,21 +6,25 @@ present a bearer credential, and the manager resolves it to a set of named
 set of resources and actions. Once ACLs are enabled, anything not allowed is
 denied, and a matching deny rule always overrides an allow.
 
-**ACLs are off by default.** With ACLs disabled, every caller has full access
-and the UI shows a dismissable warning.
+**ACLs are on by default.** Every API call needs a credential. A fresh
+manager mints its own first credential, so nothing is open while you set it
+up, and there is no bootstrap endpoint for anything else to race you to.
 
 ## Quick start
 
 ```bash
-# 1. Enable ACLs in the manager config and restart the manager.
-#    configs/manager.ncl:
-#      acl: { enabled: true },
+# 1. Start a manager. At first start it mints the initial management token
+#    and writes the secret, mode 0600, to <dataDir>/bootstrap-token and (when
+#    that file does not exist yet) ~/.legion/token:
+legion start manager --run-worker
+#   INFO ACLs are on. Created the initial management token (accessor 7c1f...).
+#        Secret written to .legion/bootstrap-token and /home/me/.legion/token (mode 0600).
+#        The CLI on this machine uses it automatically. Treat it like a root password.
 
-# 2. Mint the one-time initial management token.
-legion acl bootstrap
-export LEGION_TOKEN=lgn_...   # the printed secret (shown exactly once)
+# 2. The CLI on the same machine already works: it reads ~/.legion/token.
+legion job run configs/jobs/demo.ncl
 
-# 3. Create a policy and a token for it.
+# 3. Create a policy and a narrower token for everyone and everything else.
 legion acl policy apply dev-team --rules '[
   {"resources": ["job"],  "actions": ["read", "write"], "names": ["dev-*"]},
   {"resources": ["kv"],   "actions": ["read", "write"], "paths": ["dev/*"]},
@@ -31,6 +35,53 @@ legion acl token create --name dev-ci --policy dev-team --ttl 720h
 # 4. Check what any credential can do.
 legion acl whoami
 ```
+
+On another machine, export the secret (`LEGION_TOKEN=lgn_...`) or run
+`legion login`. The UI's login page takes the same secret.
+
+### Where the initial token goes
+
+| File | Written | Mode |
+| --- | --- | --- |
+| `<dataDir>/bootstrap-token` (`$LEGION_DATA_DIR`, else `./.legion`) | every time the manager mints the initial token | `0600` |
+| `~/.legion/token` for the user running the manager (`$LEGION_TOKEN_FILE` overrides the path) | only when the file does not exist yet, so an existing login is never overwritten | `0600` |
+
+The manager logs the accessor ID and the file paths once, and never logs the
+secret. When `~/.legion/token` already exists it is left alone and the
+manager logs a warning saying how to use the new token instead
+(`export LEGION_TOKEN="$(cat <dataDir>/bootstrap-token)"`). This matters on
+a laptop where an older cluster's token is still in that file.
+
+The mint is a replicated control-lane write. In a raft cluster only the
+manager that leads the control lane mints the token, at first start or when
+it first wins leadership, and only that manager's data dir holds the
+`bootstrap-token` file. The token itself is replicated and works against
+every manager.
+
+A manager writes the secret to `<dataDir>/bootstrap-token.pending` before the
+replicated write and renames it into place after. If the manager dies between
+the two, the next start finishes the rename, so a cluster can't end up with a
+management token whose secret nobody holds.
+
+### Pre-seeding the secret (infrastructure as code)
+
+Point `acl.bootstrapSecretFile` at a file holding the secret (at least 24
+characters). The manager reads it once, when it mints the initial token:
+
+```nickel
+acl = { bootstrapSecretFile = "/etc/legion/bootstrap-secret" },
+```
+
+A secret shorter than 24 characters fails the start, naming the setting.
+
+### Turning ACLs off
+
+`acl = { enabled = false }` is an explicit choice for a throwaway cluster.
+Every caller then has full access, including any workload that can reach the
+manager: a task on the manager's own host reaches it on loopback, and in a
+multi-host cluster every task can reach the address workers use. The manager
+logs a warning at every start, the UI shows a banner, and `legion acl whoami`
+reports `aclEnabled: false`.
 
 ## Concepts
 
@@ -43,8 +94,8 @@ legion acl whoami
 | `kv` | KV entries and locks | get/list | put/patch/delete/locks |
 | `state` | raw state store, saved queries | SQL reads, schema | SQL writes, saved queries |
 | `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
-| `acl` | tokens, policies, users | list/get | create/update/delete |
-| `exec` | exec into a running allocation | n/a | open a session (`host = true` for host-level runtimes) |
+| `acl` | tokens, policies, users, delegated exec keys | list/get | create/update/delete |
+| `exec` | exec into a running allocation | n/a | open a session, or mint an exec ticket for one (`host = true` for host-level runtimes) |
 | `action` | run declared actions on an allocation | n/a | run an action (scope with `action_names`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
 | `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. |
@@ -177,6 +228,43 @@ configs, and observability. Gating bands on it would make everyone who may
 submit a critical job a raft administrator, and it could not express "team A
 may use `critical` for their jobs".
 
+#### Host-level jobs
+
+Some tasks run on the host as root, or close to it. Submitting or updating a
+job with one of them needs a `job:write` rule with `host = true`, the same
+flag `exec` rules use for exec into host-level runtimes:
+
+| Task | Host-level when |
+| --- | --- |
+| `exec` | always: it is a process on the host, root unless it sets `user` |
+| `container` | `network.mode = "host"`, `security.userNamespace = false`, or `security.seccomp = "unconfined"` |
+| `sandbox` | `hypervisor = "dev"` (a container standing in for a VM, not a security boundary) |
+| a runtime plugin other than `noop` | always: Legion cannot vouch for its isolation |
+
+```nickel
+# Deploy containers and sandboxes, but nothing that runs on the host:
+{ resources = ["job"], actions = ["write"], names = ["team-a-*"] },
+# Platform admins may deploy host-level jobs too:
+{ resources = ["job"], actions = ["write"], names = ["*"], host = true },
+```
+
+A refusal names the task and why, and only when the host grant is what is
+missing:
+
+```console
+$ legion job run backup.ncl
+error: permission denied: job "backup" has a host-level task ("dump" uses runtime "exec").
+Submitting it needs a job:write rule with host = true (docs/auth-and-acls.md, "Host-level jobs")
+```
+
+Management tokens hold every grant, so the first-start token and single-box
+flows are unaffected. The check runs on every path that submits a spec
+(`RunJob` and `RunJobTemplate`), after the spec parses. Scaling, instances,
+and stopping a job that already exists don't change what runs, so they need
+only `job:write`. A stored `require` policy that imposes `mode = "host"`
+makes every job it matches host-level; writing one needs `net:write`, which
+is already an admin grant.
+
 Manage policies with `legion acl policy apply|list|get|delete`. A policy file
 is Nickel (`.ncl`) or JSON (`.json`), read by the same rules as every other
 Legion config (see [Configuration Language](configuration-language.md)). It
@@ -205,11 +293,15 @@ Long-lived streams (`StreamEvents` and exec sessions, including the UI's exec
 WebSocket) re-check their credential every 30 seconds. Revoking or expiring a
 token, or removing the policy that granted the stream, closes the stream
 within that interval with the same `Unauthenticated` or `PermissionDenied`
-error a new request would get.
+error a new request would get. A [direct exec](exec-and-actions.md#direct-exec)
+session never touches a manager after its ticket is minted, so its worker
+reports it on every heartbeat instead: the manager re-checks the minting
+token there, and the session ends within one heartbeat interval of the token
+being deleted, expiring, or losing the grant.
 
-For infrastructure-as-code, `legion acl bootstrap --secret <value>` (min 24
-chars) pre-seeds the initial management token instead of generating a random
-one.
+For infrastructure-as-code, `acl.bootstrapSecretFile` pre-seeds the initial
+management token's secret (see [Pre-seeding the
+secret](#pre-seeding-the-secret-infrastructure-as-code)).
 
 Clients send the secret as a bearer credential. The CLI checks the
 `LEGION_TOKEN` env var first, then `~/.legion/token` (written by
@@ -274,7 +366,10 @@ acl = {
 
 ### Anonymous policy and audit mode (migration)
 
-There are two ways to enable ACLs on a live cluster without breaking anyone:
+ACLs are on for a new cluster. For a cluster that ran with
+`acl.enabled = false`, there are two ways to turn them on without breaking
+anyone (the first start with ACLs on mints the initial management token as
+described above):
 
 1. **Audit-only**: with `acl = { enabled = true, auditOnly = true }`, every
    denial is logged but allowed. Logs use the tracing target `acl_audit` and
@@ -358,80 +453,54 @@ this is the only thing that stops a web page from driving a local manager.
 
 ### The worker plane
 
-Every worker serves the `Worker` gRPC service (the *worker plane*) on 4848,
-and managers dial it for exec, actions, logs, restart, and push dispatch.
-It is always mutual TLS, on every platform and in every mode, including
-`--run-worker`, whether or not the cluster runs ACLs. There is no plaintext
-worker listener and no switch to turn one on. Ports, the bind and advertise
-settings, and the firewall rule are in
-[architecture-managers-workers.md](architecture-managers-workers.md#ports-and-who-dials-whom).
+Managers reach workers on the worker plane (port 4848) for dispatch, exec,
+logs, and restart. It is authenticated independently of ACL mode, because a
+manager's private key never leaves the managers:
 
-**The certificates.** One cluster CA (the same CA `legion net ca show`
-prints, generated on first use and replicated with the control lane) signs
-two kinds of certificate. The role lives in the URI SAN:
+- The listener is always mutual TLS with the node's certificate from the
+  cluster CA.
+- `PostWork`, `GetTaskLogs`, and `RestartWorker` admit only a caller that
+  presents a manager certificate (`legion://manager/<id>`). `ExecTask` admits
+  a manager, or a holder of an exec ticket on a worker that opts in to
+  [direct exec](exec-and-actions.md#direct-exec). `StartClaim` admits a holder
+  of a valid boot ticket.
+- Managers verify the worker they dial against `<node>.node.legion`.
+- Join tokens pin the cluster CA (`caHash`), and a joining worker refuses a
+  manager whose CA does not match.
+- Node keys are generated on the node. `IssueNodeCertificate` takes a CSR
+  only and never returns a private key.
 
-| Certificate | Held by | SANs | Issued |
-| --- | --- | --- | --- |
-| node | each worker | `<node>.node.legion`, `legion://node/<node id>` | the worker generates a key and sends a CSR (`IssueNodeCertificate`, authorized by its node token); the manager chooses the names and ignores what the CSR asks for. 24 hours, re-issued after 8. The key never leaves the worker; it is persisted with the certificate under `<state-dir>/identity/`, mode `0600`. |
-| manager | each manager | `legion://manager/<manager id>` (raft node id, or `local`) | the manager signs it for itself from the replicated CA key, on first use, and re-mints before it expires. `ClientAuth` only. |
+See [Managers and Workers](architecture-managers-workers.md#the-worker-plane)
+for the caller-class table and the ports, and [Rotating the cluster
+CA](#rotating-the-cluster-ca) below.
 
-The node certificate is also the service mesh's node certificate
-([network-handlers.md](network-handlers.md#mtls)).
+The worker's own connection to the manager (registration, heartbeats, the
+JWKS) is always TLS, verified against the same CA: see
+[Workers reach managers over TLS](#workers-reach-managers-over-tls) below.
 
-**Caller classes.** The worker serves its node certificate and requests, but
-does not require, a client certificate that chains to the cluster CA. A
-client certificate from another CA fails the handshake. Each RPC then
-admits named caller classes, checked before the request is read:
+### Rotating the cluster CA
 
-| RPC | Caller class | What it takes |
-| --- | --- | --- |
-| `PostWork`, `GetTaskLogs`, `RestartWorker`, `ExecTask` | `manager` | a client certificate from the cluster CA carrying `legion://manager/<id>` |
-| `StartClaim` | `ticket` | a boot ticket in the request ([edge-boot.md](edge-boot.md)); a client certificate is ignored |
-
-A node certificate is not a manager certificate: the CA signs both, and the
-role SAN is what the worker checks. Anything else is refused with
-`Unauthenticated`:
+One CA per cluster signs node, manager, and mesh certificates
+(`legion net ca show` prints the trust bundle, its pin, and the rotation
+phase). Rotate it in two steps that break no connection:
 
 ```console
-$ grpcurl -cacert ca.pem 10.0.1.7:4848 legion.Worker/GetTaskLogs
-ERROR:
-  Code: Unauthenticated
-  Message: GetTaskLogs is a manager-only worker RPC: present a Legion manager certificate
+$ legion net ca rotate
+Rotated the cluster CA. The new CA (pin sha256:...) signs every certificate from now on.
+The previous CA stays trusted until 2026-11-03T18:05:11Z, so no worker-plane or mesh connection breaks;
+nodes re-issue their certificates within one heartbeat. Join tokens minted before
+the rotation work until then; mint new ones after.
 ```
 
-So nothing but a manager can open a shell in a task, read a task's logs,
-hand a node work, or restart it, and a manager does those only after its own
-ACL checks (`exec:write`, `job:read`, `node:write`). Only managers hold
-manager certificates: their key never leaves the manager process.
-
-**The manager verifies the worker.** Every manager-to-worker call goes
-through one client that trusts only the cluster CA and checks that the
-server certificate names the node it means to reach (`<node>.node.legion`).
-A worker that registered a stale or stolen address cannot receive another
-node's work or exec sessions. The manager never dials an `http://` worker
-address: a worker older than protocol 3 keeps running work (heartbeat
-replies carry it) but exec, logs, and restart against it fail with an error
-naming its protocol version.
-
-**Known limits.**
-
-- The worker-to-manager channel (4747) is plaintext unless the manager
-  serves `server.tls`, and workers do not yet configure TLS toward a TLS
-  manager. Heartbeat replies (which can carry KV-rendered secrets),
-  registration, and the edge-boot JWKS fetch travel over it. Node private
-  keys do not: they never leave the worker. Keep 4747 on a network you
-  trust until encrypted worker connections ship.
-- Join tokens do not pin the cluster CA yet. A worker trusts whatever answers
-  at the token's address.
-- `legion net ca rotate` swaps the CA in one step; there is no overlap
-  window yet. A manager notices within 10 seconds and re-mints its
-  certificate. A node re-issues its own on the next heartbeat after a
-  manager's dial is refused for the old CA (the refused handshake signals
-  it, at most once a minute), and otherwise at its routine refresh within 8
-  hours. The first exec, logs, or restart against each node after a
-  rotation can fail; retry after a few seconds.
-- The `ticket` class on `ExecTask` (direct exec without a manager on the
-  path) is not implemented. Every exec goes through a manager.
+1. The new CA is generated and cross-signed by the old one, and signs every
+   certificate from then on. Chains carry the cross-signed certificate, so a
+   holder that still trusts only the old CA keeps verifying.
+2. The old CA stays in every trust bundle for one certificate lifetime (24
+   hours). Every node sees the new CA's pin on its next heartbeat reply and
+   re-issues at once.
+3. After the overlap, the old CA leaves the bundle. Join tokens that pin it
+   stop working; mint new ones. A worker that was offline for the whole
+   overlap must re-join.
 
 ### TLS
 
@@ -452,6 +521,33 @@ actions) serves TLS with the same certificate and key. The telemetry
 listener (`/metrics` and health probes, `server.port + 2` by default) stays
 plaintext whatever `server.tls` says.
 
+#### Workers reach managers over TLS
+
+Workers always speak TLS to the manager's API port, whether or not the
+operator turned `server.tls` on. Registration, heartbeats (whose replies
+carry rendered KV secrets and identity tokens), artifact credentials, and
+the JWKS that boot and exec tickets are verified against all ride it.
+
+- The worker sends the name `manager.legion`, and the manager answers that
+  name with its cluster server certificate (`manager.legion`,
+  `legion://manager/<id>`), signed by the cluster CA. Any other name gets
+  the operator's `server.tls` certificate when one is configured.
+- The worker verifies that certificate against its join token's CA pin from
+  the first byte of the first connection, before it sends its join secret,
+  and against the cluster CA bundle once it holds one. A manager whose CA
+  does not match is refused with the same message as a pin mismatch at
+  join.
+- Without `server.tls`, the manager tells TLS from plaintext by the
+  connection's first byte (a TLS handshake starts with `0x16`, HTTP never
+  does), so the CLI and the UI keep using `http://` on the same port while
+  every worker uses TLS. With `server.tls` on, a plaintext connection is
+  dropped.
+- A join token keeps the address the manager advertises, `http://` or
+  `https://`. The worker dials TLS to that host and port either way.
+
+Raft traffic between managers is not covered: it stays plaintext on the
+managers' network.
+
 ### Introspection
 
 `legion acl whoami` (CLI), `WhoAmI` (gRPC), the UI Access page, and the
@@ -461,7 +557,15 @@ debugging a `PermissionDenied`.
 
 ### Recovery
 
-If you lose the only management token, delete the management rows from the
-`acl_token` table in the manager's SQLite store (this requires filesystem
-access to the manager host). Then run `legion acl bootstrap` again.
-Bootstrap is allowed whenever no management token exists.
+If you lose every management token's secret, delete the management rows from
+the `acl_token` table in the manager's SQLite store (on the control-lane
+leader in a raft cluster; this requires filesystem access to the manager
+host), then restart the manager. With no management token in the store, it
+mints a fresh one at start and writes it to `<dataDir>/bootstrap-token`
+exactly as at first start. Use `acl.bootstrapSecretFile` to choose the
+secret.
+
+There is no `legion acl bootstrap` command and no `BootstrapAcl` RPC. An
+endpoint that works "whenever no management token exists" can be won by any
+workload that reaches the manager after a first start or a recovery, so the
+initial token is only ever minted by the manager process itself.

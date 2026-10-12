@@ -15,59 +15,123 @@ How to use it:
 
 ---
 
-- [ ] **Launch blocker: any task can take over the cluster.** The
-      multi-host half (workers on another host losing exec, logs, and the
-      mesh behind an unauthenticated worker port) shipped as Phase 1 in
-      [#17](https://github.com/mikenomitch/legion/pull/17); see Done,
-      "Pre-launch spot check (2026-10-11)". Linux containers and `exec` tasks share
-      the host network, so they reach the manager (ACLs off by default), the
-      worker port, the cloud metadata service, and other allocations'
-      datapath listeners. The spot check's host-guard rows need Phases 2
-      and 3. Plan:
+- [ ] **Launch blocker: workers on another host lose exec, logs, and the
+      mesh, and any task can take over the cluster.** Phases 0 to 8 are
+      built ([#32](https://github.com/mikenomitch/legion/pull/32), in
+      flight; it replaces the first cut of Phase 1 that shipped in
+      [#17](https://github.com/mikenomitch/legion/pull/17)). What is left is
+      verification on real hardware, listed below. Before Phase 1 the worker
+      plane authenticated nobody (`PostWork`, `ExecTask`, `GetTaskLogs`,
+      `RestartWorker`), and Linux containers and `exec` tasks shared the host
+      network, so they reached the manager (ACLs off by default), the worker
+      port, the cloud metadata service, and other allocations' datapath
+      listeners. Found while preparing the pre-launch AWS spot check, which
+      ran on a temporary shim (`tests/spot-check/shims.patch`) until Phase 1
+      landed. Plan:
       [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (IN EXECUTION)
       · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
       Phases in ship order, most dangerous gap first:
-  - [ ] Phase 0: ACLs on by default. The first management token is minted at
+  - [x] Phase 0: ACLs on by default. The first management token is minted at
         first start into `<dataDir>/bootstrap-token` and `~/.legion/token`
         (`0600`), and the open `BootstrapAcl` RPC and `legion acl bootstrap`
-        are removed (plan §6.10).
-  - [x] Phase 1 core: the mTLS worker plane with per-RPC caller classes,
-        manager certificates and one client factory, CSR issuance, reachable
-        bind and advertise (plan §6.1 to §6.4, §6.6), in
-        [#17](https://github.com/mikenomitch/legion/pull/17).
-  - [ ] Phase 1 remainder: two-step CA rotation (plan §6.9, calls 11).
-        Until then, after `legion net ca rotate` the first exec, logs, or
-        restart against each node can fail, and a node nothing dials keeps
-        its old certificate for up to 8 hours. Cheap first step: carry the
-        CA fingerprint on the heartbeat reply.
-  - [ ] The sandbox-exec plan's `ticket` class on `ExecTask` (plan §6.1,
-        calls 15): `ExecTask` admits only a manager certificate today.
-  - [ ] The CA pin in join tokens (plan §6.5), moved to Phase 4 (calls 10).
-  - [ ] Phase 2: the host guard in the datapath. The gated egress proxy
-        dials loopback, link-local, and node-local addresses from the host
-        namespace today, and CIDR rules never see hostnames
-        (`src/worker/netd/proxy.rs:512`, `:621`, `:879`), so the documented
-        metadata deny rule is bypassed by a name. Resolve, judge, then dial
-        (plan §6.11).
-  - [ ] Phase 3: Linux containers gated by default with `gated-default`
-        deny, ingress twins and a resolver for every gated allocation, and a
-        validate warning (plan §6.12).
-  - [ ] Phase 4: the encrypted worker-to-manager channel, with the ticket
-        JWKS fetched over it (plan §6.8).
-  - [ ] Phase 5: the host guard in the kernel: an `nftables` table matched by
-        allocation cgroup, and a cgroup leaf for every task (plan §6.13).
-  - [ ] Phase 6: the container privilege floor: per-allocation user
-        namespaces, Docker's default seccomp profile, a cgroup namespace
-        (plan §6.14).
-  - [ ] Phase 7: `exec` trust. Gated `exec` refuses root, the user switch
-        drops supplementary groups (it never calls `setgroups` today,
-        `src/task_plugins/exec.rs:679-687`), and host-level jobs need `host`
-        on `job:write` (plan §6.15, §6.16).
-  - [ ] Phase 8: reachability diagnostics: `Worker/Probe`,
-        `WORKER_UNREACHABLE` (plan §6.7).
-  - [ ] Fix the public docs now, ahead of Phase 2: `docs/network-handlers.md:556`
-        says gated "cannot be bypassed" for `container` and `exec`, but the
-        proxy reaches the host, and a root `exec` task can `setns` back out.
+        are removed (plan §6.10). Anonymous denials are now `Unauthenticated`
+        with a hint naming the token file (calls entry 17). Docs:
+        [auth-and-acls.md](../docs/auth-and-acls.md#quick-start).
+  - [x] Phase 1: the mTLS worker plane with per-RPC caller classes, CSR
+        issuance, the CA pin in join tokens (v2), reachable bind and
+        advertise (`--advertise-addr`, route-detected), two-step CA rotation
+        by cross-signing, and the simulator's fleet certificate (plan §6.1
+        to §6.6, §6.9; calls 20 to 26). Docs:
+        [architecture-managers-workers.md](../docs/architecture-managers-workers.md#the-worker-plane),
+        [auth-and-acls.md](../docs/auth-and-acls.md#the-worker-plane).
+        The `ticket` class on `ExecTask` shipped with sandbox-exec Phase 2
+        (direct exec, below).
+  - [x] Phase 2: the host guard in the datapath. Resolve once, judge every
+        address, dial what was judged, on the gated egress proxy's three
+        paths, external upstreams, and `proxy` handler targets, with the
+        worker-type `hostGuard` overrides and `host-guard` in denials,
+        `net policy test`, and `net doctor` (plan §6.11; calls 22, 23, 27,
+        28). Docs: [network-handlers.md](../docs/network-handlers.md#the-host-guard).
+  - [x] Phase 3: Linux containers gated by default (`auto` reads the
+        node's `os`), ingress twins (`to` or the advertised number) and a
+        `127.0.0.53` resolver for every gated allocation, and the
+        `gated-default` warning on `job validate`, `job run`, and `job plan`
+        (plan §6.12; calls 29 to 31). `gated-default` and the lower-case proxy
+        variables came from the gated-sandbox plan. Docs:
+        [task-runtime-container.md](../docs/task-runtime-container.md#networking-gated-by-default-on-linux),
+        [network-handlers.md](../docs/network-handlers.md#networkmode).
+  - [ ] Run a real gated container end to end on a Linux node (runc or
+        youki) with the default mode: a stock `nginx` reachable on its
+        advertised port, `curl` through the proxy refused with
+        `gated-default`, then allowed after `network.egress.allow`. This
+        repository's CI starts no OCI runtime; the placement, port, resolver,
+        and namespace pieces are tested separately
+        (`tests/gated_container_default.rs`,
+        `netns::tests::gated_start_overhead_benchmark`).
+  - [x] Phase 4: the encrypted worker-to-manager channel, with the ticket
+        JWKS fetched over it (plan §6.8; calls 32 to 34). The manager's API
+        port answers TLS for `manager.legion` with its cluster certificate and
+        plaintext for the CLI and UI, told apart by the first byte; workers
+        always dial TLS pinned to the CA. Docs:
+        [auth-and-acls.md](../docs/auth-and-acls.md#workers-reach-managers-over-tls).
+  - [ ] Raft peers still dial each other in plaintext, and with `server.tls`
+        on the API port drops plaintext, which a multi-manager raft cluster
+        needs (`src/storage/raft/network.rs:197`, `driver.rs:934`). Deferred by
+        the plan (non-goals); listed in
+        [architecture-managers-workers.md](../docs/architecture-managers-workers.md#what-is-not-implemented-yet).
+  - [x] Phase 5: the host guard in the kernel: an `inet legion_host_guard`
+        table with one chain per allocation leaf, counters reported as
+        `host-guard` denials, the `hostGuard` node attribute in
+        `legion node info`, and a label-only cgroup leaf for every task when
+        enforcement is off (plan §6.13; calls 35, 36). Docs:
+        [network-handlers.md](../docs/network-handlers.md#the-host-guard-in-the-kernel).
+  - [ ] Run the kernel host guard for real on a cgroup v2 node as root:
+        `sudo -E cargo test --lib kernel_guard_loads -- --ignored --nocapture`
+        (a dial to `169.254.169.254` from an allocation leaf fails with
+        `EPERM` and the counter reports it). Built on a hybrid-cgroup host,
+        where only the rendered table was checked against the real `nft`
+        (`the_rendered_table_passes_nft_check_test`).
+  - [x] Phase 6: the container privilege floor: per-allocation user
+        namespaces from a worker-owned id pool, shifted layer extraction,
+        idmapped task directory and volumes, a default seccomp profile over
+        Docker's blocked set, a cgroup namespace, `/sys` bound read-only
+        under a user namespace, the `security` block, and opt-out warnings
+        (plan §6.14; calls 37 to 39). Docs:
+        [task-runtime-container.md](../docs/task-runtime-container.md#security).
+  - [ ] Run the privilege floor on youki and crun
+        (`LEGION_OCI_RUNTIME=youki cargo test --lib oci_runtime_security -- --ignored`).
+        Only runc 1.5 was available when it was built.
+  - [ ] Vendor Docker's default seccomp allowlist once CI can run it on every
+        runtime (calls entry 37): the shipped profile is a denylist over the
+        same blocked set.
+  - [ ] Five pre-existing ignored runc tests fail on a hybrid-cgroup host
+        before and after the floor (`oci_runtime_exec_runs_inside_the_container`,
+        `..._sees_task_dir_files_and_their_rewrites`,
+        `..._enforces_a_declared_memory_limit`, `..._stop_force_kills_at_the_deadline`,
+        `..._stop_lets_a_trapping_container_drain`). Re-run them on a cgroup v2
+        host to tell environment from bug.
+  - [x] Phase 7: `exec` trust. Gated `exec` refuses root at submit, the user
+        switch drops supplementary groups (`setgroups(0, NULL)`), and
+        host-level jobs need `host` on `job:write`, with a refusal naming the
+        task (plan §6.15, §6.16; calls 40 to 42). Docs:
+        [task-runtime-exec.md](../docs/task-runtime-exec.md#trust),
+        [auth-and-acls.md](../docs/auth-and-acls.md#host-level-jobs).
+  - [x] Phase 8: reachability diagnostics: `Worker/Probe` from the
+        manager that accepts a registration, the outcome on the node
+        (`workerPlane`, shown by `legion node info` and the UI node page),
+        and `WORKER_UNREACHABLE` on exec, logs, and restart in the CLI and MCP
+        envelopes (plan §6.7; calls 43, 44). Docs:
+        [architecture-managers-workers.md](../docs/architecture-managers-workers.md#reachability),
+        [agent-readiness.md](../docs/agent-readiness.md).
+  - [x] Fix the public docs' "cannot be bypassed" claims for gated
+        `container` and `exec`: they now describe the host guard, and that a
+        root `exec` task can `setns` back out.
+  - [ ] `authz` webhooks, artifact fetches, and the worker's own calls are
+        not judged by the host guard (calls entry 23). Revisit if `authz`
+        ever returns data to the task.
+  - [ ] `legion net policy test` judges only the host guard's built-in
+        classes, not a node's own addresses or its `hostGuard` entries
+        (calls entry 27).
 
 - [ ] **Launch blockers from the AWS spot check (2026-10-11).** Each has
       evidence and a root cause in
@@ -121,12 +185,9 @@ How to use it:
         TAP device, guest IP config, and host DNAT. Gated mode has no
         host-to-guest ingress relay (`src/worker/daemon.rs:1934-1936`, gated
         sandboxes never get a netns).
-  - [ ] **The worker never uses TLS to reach the manager**, even when
-        `server.tls` is on, and raft peers dial `http://` only. Phase 4 of
-        the worker-plane plan covers the worker half. (The false "listener
-        TLS already covers transport encryption" claim in
-        `docs/auth-and-acls.md` was corrected in
-        [#17](https://github.com/mikenomitch/legion/pull/17).)
+  - [x] **The worker never uses TLS to reach the manager.** Fixed by
+        worker-plane-auth Phase 4; the doc claim is gone. Raft peers dialing
+        `http://` stays open above.
 
 - [ ] **Follow-ups from the 2026-10-11 spot-check fixes**
       ([#17](https://github.com/mikenomitch/legion/pull/17);
@@ -142,12 +203,13 @@ How to use it:
   - [ ] **Capability-aware placement.** A task that adds capabilities places
         like any other and fails at start on a node whose
         `container.allowCaps` refuses them; authors pin such tasks by pool
-        (calls 1). Also still open: the per-author ACL `host` grant
-        (worker-plane-auth-plan §6.16), since the allowlist bounds the node,
-        not the author.
-  - [ ] **User namespaces and seccomp matter more now** that containers get
-        Docker's 13 default capabilities instead of 3 (worker-plane-auth-plan
-        §6.14, Phase 6).
+        (calls 1). The per-author `host` grant shipped with worker-plane-auth
+        Phase 7, but a capability `add` inside the user namespace does not
+        need it, so the allowlist still bounds the node, not the author.
+  - [x] **User namespaces and seccomp matter more now** that containers get
+        Docker's 13 default capabilities instead of 3: both shipped as the
+        worker-plane-auth Phase 6 privilege floor
+        ([task-runtime-container.md](../docs/task-runtime-container.md#security)).
   - [ ] **On Linux `command` replaces the image `ENTRYPOINT`; on macOS it
         does not**, so one jobspec runs different commands per OS (calls 51).
         Needs a plan.
@@ -264,7 +326,8 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#25](https://github.com/mikenomitch/legion/pull/25) | Scheduler sharding strategies proposal, revision 3 (docs only) | Draft; [plan](plans/scheduler-sharding-strategies-proposal.md) · [calls](calls/scheduler-sharding-strategies-proposal_calls.md) |
+| [#25](https://github.com/mikenomitch/legion/pull/25) | Scheduler sharding strategies proposal, revision 3 (docs only) | Ready for review; [plan](plans/scheduler-sharding-strategies-proposal.md) · [calls](calls/scheduler-sharding-strategies-proposal_calls.md) |
+| [#29](https://github.com/mikenomitch/legion/pull/29) | Deterministic `nodes_considered` scheduler tests (flaked ~1 in 3,000 runs) | Test-only seed on `Scheduler`; bench shows no change |
 | [#17](https://github.com/mikenomitch/legion/pull/17) | Fixes for every 2026-10-11 spot-check finding, including Phase 1 of the worker plane | [plan](plans/launch-spot-check-fixes-plan.md) · [calls](calls/launch-spot-check-fixes-plan_calls.md); AWS re-run pending |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
@@ -1767,40 +1830,117 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         node-local wake on connect.
   - [ ] Phases 8 to 10: snapshot-clone density (with suspend plan Phase 8),
         a sub-VM tier seam, and cells only past the plan §6.11 trigger.
-- [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (PLANNED) ·
+- [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (IN EXECUTION) ·
       [calls](calls/sandbox-exec-plan_calls.md). Exec into Linux microVM
       sandboxes, and exec sessions that skip the manager. Implemented
       together with
       [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md)
-      ([#16](https://github.com/mikenomitch/legion/pull/16)).
-  - [ ] Found during the plan: the worker listener has no authentication
-        and no TLS (`src/worker/server.rs:55`, `:200`,
-        `src/worker/daemon.rs:318`). It binds `127.0.0.1:4848`
-        (`src/worker/daemon.rs:155`), so the gap is local: any process on
-        the worker's host, including an `exec` task or a host-network
-        container, can call `ExecTask` against any allocation on that node.
-        The worker-plane-auth plan (#16) closes it.
+      (plans in [#16](https://github.com/mikenomitch/legion/pull/16); built
+      in [#32](https://github.com/mikenomitch/legion/pull/32), in flight).
+  - [x] Found during the plan: the worker listener had no authentication
+        and no TLS, so any process on the worker's host could call
+        `ExecTask` against any allocation on that node. Closed by
+        worker-plane-auth Phase 1 (the mTLS worker plane, above).
   - [x] Amend the worker-plane-auth plan (exec plan §9): a ticket caller
         class for `ExecTask`, a classification test that allows two classes,
         and the JWKS verifier on every worker that admits tickets. Folded
         into [worker-plane-auth §6.1](plans/worker-plane-auth-plan.md#61-the-worker-listener-is-mutual-tls-always)
         (2026-10-11), which added one dependency: ticket verifiers need the
         JWKS over TLS, so direct exec also waits on worker-plane-auth Phase 4.
-  - [ ] Phase 0: exec open latency and manager cost per proxied session at
-        100, 1,000, and 10,000 concurrent sessions.
-  - [ ] Phase 1: exec into Linux microVMs over vsock. Every microVM gets a
-        vsock device and the guest agent, and `legion exec`, actions, MCP,
-        and the UI terminal work unchanged. After gated plan Phases 0 and 1
-        (without the vsock restore override, a vsock device on every microVM
-        would break memory checkpoints of TAP and `none` sandboxes) and
-        worker-plane-auth Phase 1. Gated Phase 1 is built (the override, and
-        the `legion-guest` agent crate to extend); Phase 0 is pending.
-  - [ ] Phase 2: direct exec with `MintExecTicket` and a ticket class on the
-        mTLS worker listener, `legion exec --direct`, async audit, revoked
-        accessors on the heartbeat.
-  - [ ] Phases 3 to 5: delegated minting keys, the gateway tier (shared
-        with the scaling plan's wake on request), and exec into unnamed
-        sessions after the scaling plan's Phase 6.
+  - [x] Phase 0 (partly): `tests/exec_session_benchmark.rs` measures
+        proxied and direct sessions (open latency, manager CPU and bytes per
+        session) at 1 to 500 concurrent sessions on one host, plus mint
+        throughput. Numbers in
+        [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md#exec-sessions-proxied-vs-direct-sandbox-exec-phase-0--2026-10-12)
+        ([calls entry 26](calls/sandbox-exec-plan_calls.md#26-phase-0-is-measured-on-one-host-at-up-to-500-sessions)).
+  - [ ] Phase 0 at scale: 1,000 and 10,000 concurrent sessions, and the
+        ≤ 20 ms / ≤ 80 ms open latency from the mint reply, same AZ, on the
+        AWS rig with real workers (simulated workers cannot exec). Run
+        `LEGION_EXEC_BENCH_CONCURRENCY=1000,10000 cargo test --release --test
+        exec_session_benchmark -- --ignored --nocapture` against rig workers,
+        and add a mode that reuses one worker connection per node, since
+        direct opens here pay a TLS handshake each.
+  - [x] Phase 1: exec into Linux microVMs over vsock. Every microVM gets the
+        vsock device and the agent (`--no-relay` unless gated), the agent's
+        exec listener on port 1100 (pty or pipes, the task's env and working
+        directory, the process group killed on disconnect, 64 sessions),
+        `VsockExecSession` on the worker with the version hello and bounded
+        frames, `--instance` on `legion exec` / `legion action run` / MCP,
+        the `exec` idle signal on microVMs, and the generic ending for a
+        session cut by a suspend (calls 21 to 25). Docs:
+        [task-runtime-sandbox.md § Exec](../docs/task-runtime-sandbox.md#exec),
+        the runtime table in exec-and-actions.md, suspend-and-resume.md, the
+        agent sandboxes guide.
+  - [ ] Phase 1 on KVM (no KVM in CI): with Firecracker 1.17.0+ and
+        cloud-hypervisor, a vsock guest kernel, and the static guest build,
+        run `LEGION_SANDBOX_KERNEL=/var/lib/legion/kernels/vmlinux
+        LEGION_GUEST_BINARY=$PWD/target/x86_64-unknown-linux-musl/dist/legion-guest
+        cargo test --lib sandbox_exec_over_vsock -- --ignored --nocapture
+        --test-threads 1` (pipe and pty sessions, exit status, task env).
+        Then by hand: exec after a memory resume reaches the new allocation
+        with `--instance`, a session open across a suspend ends with the
+        reset reason, a `none` sandbox takes exec while the guest still
+        cannot dial the host, an open shell keeps an idle sandbox awake, and
+        an action runs from the UI terminal.
+  - [ ] Phase 1: a checkpoint captured before every microVM had a vsock
+        device cannot be restored now that every restore passes the vsock
+        override ([calls entry 22](calls/sandbox-exec-plan_calls.md#22-every-microvm-runs-the-agent-only-a-gated-one-runs-the-relays)).
+        Legion has no installed base; note it for anyone with dev
+        checkpoints.
+  - [x] Phase 2: direct exec. `MintExecTicket` (no raft write, the same
+        authorization as `ExecAllocation`), the `ticket` class on
+        `ExecTask` behind the worker type's `exec = { direct = true }`,
+        `legion exec --direct`, `legion exec-ticket mint`, the
+        `legion_exec_ticket_mint` MCP tool, `exec.tickets` lifetimes, audit
+        of finished sessions on the heartbeat, and revocation by re-checking
+        open sessions on the heartbeat (calls 6, 9 to 15). `--instance` on
+        `legion exec`, `legion action run`, and the MCP exec tools landed
+        with it (`ExecStart.instance_id`). Docs:
+        [exec-and-actions.md § Direct exec](../docs/exec-and-actions.md#direct-exec).
+        Tests: `tests/worker_plane_e2e.rs` (direct session, exit status,
+        revocation within a heartbeat), `src/worker/direct_exec.rs`,
+        `mint_exec_ticket_admits_exactly_what_exec_allocation_admits_test`.
+  - [ ] Direct exec: bind a ticket to the client's key (a `cnf` claim and a
+        proof over the `jti` in the first frame), so a stolen ticket is
+        useless (plan §13, first open question). Today whoever redeems first
+        wins.
+  - [ ] Direct exec: sessions minted by a JWT auth-method credential have
+        no accessor to re-check on the heartbeat; they end at `max_session`,
+        which the mint clamps to the credential's expiry
+        ([calls entry 12](calls/sandbox-exec-plan_calls.md#12-a-direct-session-never-outlives-the-credential-that-minted-it)).
+  - [ ] Direct exec: the JWKS refresh and clock-skew settings live under
+        the worker's `edgeBoot` block even when only direct exec uses them
+        ([calls entry 11](calls/sandbox-exec-plan_calls.md#11-the-workers-direct-exec-switch-is-a-top-level-exec-block-in-the-worker-type)).
+  - [x] Found while building Phase 2: the pinned JWKS fetch built a runtime
+        inside the server's runtime and panicked the first time a worker
+        verified a boot or exec ticket against a live manager; edge boot's
+        tests used a static JWKS and never hit it. Verification now runs in
+        `spawn_blocking` and the fetch on its own thread
+        ([calls entry 10](calls/sandbox-exec-plan_calls.md#10-exec-tickets-share-the-boot-ticket-jwks-cache-and-verification-runs-off-the-async-runtime)).
+  - [ ] Found while building Phase 2: `legion ledger -j` prints a bare
+        array, not the standard `{ok, data}` envelope AGENTS.md requires
+        (`src/cmd/ledger.rs`).
+  - [x] Phase 3: delegated minting keys. `CreateExecKey`, `ListExecKeys`,
+        `DeleteExecKey` (`acl:write` / `acl:read`, idempotency keys), the
+        `exec_key` control-lane table, keys delivered to workers by version
+        on the heartbeat, key-signed tickets checked against the job glob and
+        ceilings and refused for host-level runtimes, sessions ended when
+        their key is deleted, `legion exec-key create|list|delete`,
+        `legion exec-ticket sign`, and the MCP key tools (calls 16 to 20).
+        Docs: [exec-and-actions.md § Delegated minting keys](../docs/exec-and-actions.md#delegated-minting-keys).
+        Tests: `tests/worker_plane_e2e.rs` (a key reaches the worker, its
+        ticket is refused for a host-level job and another job's, and stops
+        verifying after delete),
+        `a_delegated_key_mints_only_inside_its_glob_and_ceilings_test`.
+  - [ ] Delegated keys: a positive end-to-end session on a non-host runtime
+        (a `container` task on runc). The e2e suite runs `exec` tasks, which
+        keys never reach, so the accept path is covered at the verifier
+        only: on a Linux host with runc, run a container job under
+        `exec = { direct = true }`, create a key for its job, sign with
+        `legion exec-ticket sign`, and present the ticket to `Worker/ExecTask`.
+  - [ ] Phases 4 and 5: the gateway tier (shared with the scaling plan's
+        wake on request), and exec into unnamed sessions after the scaling
+        plan's Phase 6.
 - [ ] **Gated sandboxes by default, with memory checkpoints**:
       [plan](plans/gated-sandbox-checkpoints-plan.md) (IN EXECUTION) ·
       [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Phases 1 to 4
@@ -3927,6 +4067,13 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       [calls](calls/adaptive-scheduler-concurrency-plan_calls.md),
       [docs/adaptive-scheduler-concurrency.md](../docs/adaptive-scheduler-concurrency.md).
       Phase 0 (measurement) was skipped and phases 4–5 are open items above.
+- [x] **The `nodes_considered` scheduler tests are deterministic**
+      ([#29](https://github.com/mikenomitch/legion/pull/29)).
+      `spread_limits_nodes_considered_by_count` and its bin_pack twin failed
+      about once per 3,000 runs: their node load was the job's own
+      allocations, which a Fresh plan drops, so every pick was uniform. The
+      load now comes from a filler job, and the subset RNG is pinned per
+      iteration through a test-only `Scheduler` seed.
 
 ## Task runtimes
 

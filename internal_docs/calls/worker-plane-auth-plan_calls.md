@@ -4,13 +4,14 @@ Plan: [worker-plane-auth-plan.md](../plans/worker-plane-auth-plan.md)
 
 Entries are ranked by project impact, highest first. An entry's number is its
 rank. These were made while writing the plan, before any code, so each one is
-also an open invitation to argue in review. Entries 1, 2, 4, 6, 7, 12, 16,
-17, and 19 were added on 2026-10-11 when the plan took on local workload
+also an open invitation to argue in review. Entries 1, 2, 4, 6, 7, 10, 13,
+14, and 16 were added on 2026-10-11 when the plan took on local workload
 isolation and folded in the sandbox-exec plan's amendments, which also
-extended entry 14. Entry 19 reverses the plan's earlier call to keep a
-plaintext path for one release. Entries 10, 11, 15, and 20 through 25 were
-added on 2026-10-12 when Phase 1 shipped. They record where the code departs
-from the plan and what Phase 1 deferred.
+extended entry 12. Entry 16 reverses the plan's earlier call to keep a
+plaintext path for one release. Entries 45 to 47 were added when this
+branch merged `main`, which had shipped a first cut of Phase 1 in #17; they
+rank below the design calls because neither side changes what the plan
+promises a user.
 
 ## 1. ACLs are on by default, and the first token is minted at first start
 
@@ -269,65 +270,7 @@ error: the manager at https://10.0.0.5:4747 presented cluster CA sha256:51aa07..
 but this join token pins sha256:9c1e4f...
 ```
 
-## 10. Phase 1 ships without the CA pin; the pin lands with the encrypted worker channel
-
-Phase 1 shipped (2026-10-12) without §6.5. Join tokens stay version 1 with no
-`caHash`, and a joining worker still trusts whatever answers at the token's
-address. Phase 4, which encrypts the worker-to-manager channel, now carries
-the pin.
-
-**Alternative.** Ship the pin in Phase 1, as the plan's phase list says: token
-v2 with a required `caHash`, and a worker that checks every CA it receives
-against it.
-
-**Trade-off.** Until Phase 4, an impostor at the token's address gets the
-join secret and can hand the worker a CA of its own. The public docs
-(`auth-and-acls.md`, "Known limits") say so.
-
-**Why.** In Phase 1 the worker-to-manager channel is still plaintext, so the
-first CA a worker could check arrives over that channel, *after* the join
-secret has gone out. An impostor can return the real CA's PEM, which is public
-(`legion net ca show`), and the pin passes. The pin protects the join secret
-only when the worker checks it against the TLS handshake of the channel that
-carries the secret, which is Phase 4's TLS-on-4747. Shipping it now would
-break every outstanding token for a check that proves nothing. This does not
-reopen entry 19: when the pin lands, version-1 tokens are refused outright.
-**Simplicity won: one token break, when the pin means something.**
-
-## 11. CA rotation stays one step, and a refused handshake makes a node re-issue
-
-Phase 1 shipped without §6.9's two-step rotation. `legion net ca rotate`
-still replaces the CA outright. A manager re-reads the CA every 10 seconds and
-re-mints its own certificate when the CA changes. A node re-issues its
-certificate on its next heartbeat after a handshake on its worker plane fails
-for an unknown CA, rate-limited to once a minute. Its routine refresh, at
-most 8 hours away, also re-issues it.
-
-```text
-INFO A worker-plane peer trusts a different cluster CA; re-issuing the node certificate on the next heartbeat
-```
-
-**Alternative.** The plan's overlap: publish a bundle of the old and new CAs,
-keep signing with the old CA until every node has the bundle, then switch.
-That needs a `next` CA and a phase on the `net_mesh_ca` row, a migration, and
-`ca_pem` turning into a bundle on the wire.
-
-**Trade-off.** The first exec, logs, or restart against each node after a
-rotation fails. A node that nothing dials keeps its old certificate until its
-routine refresh, and mesh hops between nodes on different CAs fail until
-then, which is today's mesh behavior. The acceptance criterion "`ca rotate`
-completes with no failed exec or logs call" is not met. Any client whose
-handshake is refused for an unknown CA can trigger a re-issue, at most once a
-minute per node.
-
-**Why.** Rotation is a rare operator action, and Phase 1 removes the
-8-hour outage the plan worried about: a node re-issues within one heartbeat of
-the first refused dial. The overlap is a schema change in a store that four
-other tracks were editing during the same release. It can land as its own
-change without changing anything the user types. **Simplicity won, and the
-gap is listed in the public docs.**
-
-## 12. Per-allocation user namespaces and Docker's seccomp profile for Linux containers
+## 10. Per-allocation user namespaces and Docker's seccomp profile for Linux containers
 
 Every Linux container gets its own 65,536-id host range, a cgroup namespace,
 and Docker's default seccomp profile. Opting out of either needs the `host`
@@ -364,7 +307,7 @@ them is a compatibility change this plan has no evidence for. Because the
 worker extracts layers itself, shifting ownership costs nothing extra.
 **Safety won, and the extraction path we already own kept it cheap.**
 
-## 13. Workers send a CSR, departing from mesh_ca's manager-generated keys
+## 11. Workers send a CSR, departing from mesh_ca's manager-generated keys
 
 The worker generates its key and sends a CSR. The manager no longer returns
 private keys to anyone.
@@ -379,9 +322,9 @@ flow is more ceremony than a 24-hour credential warrants."
 guards a node's identity to the control plane, and the channel it travels over
 stays plaintext until Phase 4. A key that never leaves the node removes a
 whole class of on-path attacks for the cost of one proto field. The old path
-is removed rather than kept beside the new one (entry 19).
+is removed rather than kept beside the new one (entry 16).
 
-## 14. One listener with per-RPC caller classes, including tickets on `ExecTask`
+## 12. One listener with per-RPC caller classes, including tickets on `ExecTask`
 
 One TLS listener. Manager-only RPCs check for a manager certificate,
 `StartClaim` keeps ticket-only authorization, and `ExecTask` admits a manager
@@ -414,31 +357,7 @@ rather than downgraded to the ticket path, so the two classes can't be mixed.
 The per-RPC check mirrors how the manager already enforces ACLs, including
 the "fail the build if unclassified" guard.
 
-## 15. `ExecTask` admits only the manager until direct exec ships
-
-The classification table lists `ExecTask` with one class, `manager`. The
-`ticket` class (§6.1) and the "never downgraded" rule for two-class RPCs are
-written into `authorize`, but no RPC uses them yet.
-
-```rust
-("ExecTask", &[Caller::Manager]),   // + Caller::Ticket with the sandbox-exec plan
-```
-
-**Alternative.** Implement the ticket class now, as the plan's Phase 1 bullet
-lists it: exec tickets, `exec.direct`, and a JWKS verifier on every worker
-that admits tickets.
-
-**Trade-off.** The plan's acceptance line "lists `ExecTask` with two classes"
-is not met. Every exec goes through a manager.
-
-**Why.** Exec tickets (claims, minting, replay, revocation) belong to the
-sandbox-exec plan, which is not built, and calls entry 16 makes direct exec
-wait for Phase 4 anyway. A second class with no ticket behind it would be an
-unreachable code path in a security check. The refusal text for the
-two-class shape is already in the code and tested, so adding the class is
-one table edit and a handler branch.
-
-## 16. Ticket verifiers need the JWKS over TLS that pins the cluster CA
+## 13. Ticket verifiers need the JWKS over TLS that pins the cluster CA
 
 From Phase 4, a worker refuses to build a ticket verifier (edge boot or
 direct exec) over a plaintext non-loopback manager address. Direct exec
@@ -464,7 +383,7 @@ so it moves the problem without fixing it. Refusing to run over plaintext
 makes the dependency visible at start instead of hiding it in a doc.
 **Safety won over shipping direct exec one phase earlier.**
 
-## 17. The proxy judges resolved addresses and dials the address it judged
+## 14. The proxy judges resolved addresses and dials the address it judged
 
 For a hostname, the proxy and the external-upstream dialer resolve first,
 judge every address against the host guard and CIDR rules, and dial only an
@@ -488,7 +407,7 @@ doesn't match. (b) leaves a DNS-rebinding window between the verdict and the
 dial. Resolution already happens on every named dial, so judging its result
 adds no lookup. **Correctness won, at no performance cost.**
 
-## 18. The advertise address is auto-detected from the route to the manager
+## 15. The advertise address is auto-detected from the route to the manager
 
 The worker advertises the local address it uses to reach its manager, unless
 `LEGION_WORKER_ADVERTISE_ADDR` or `--advertise-addr` says otherwise.
@@ -505,7 +424,7 @@ should dial back, and a co-located worker still gets `127.0.0.1`. "First
 non-loopback interface" picks Docker bridges and VPN tunnels. Requiring a flag
 breaks the two-command join.
 
-## 19. No compatibility paths: no plaintext workers, no unpinned tokens, no server-generated keys
+## 16. No compatibility paths: no plaintext workers, no unpinned tokens, no server-generated keys
 
 A new manager never dials a worker over plaintext, join tokens without
 `caHash` are refused, and the node certificate API takes a CSR only. A
@@ -529,148 +448,689 @@ worked on one machine. Dispatch still reaches old workers through heartbeat
 replies, so running work is never interrupted, only interactive calls.
 **Simplicity won.**
 
-## 20. Worker-plane channels are keyed by (node name, address), not by address
+## 17. A call with no credential is `Unauthenticated`, not `PermissionDenied`
 
-The manager's factory caches one mTLS channel per `<node>.node.legion@<address>`.
-Each channel's TLS config names the node it verifies, so two nodes that
-advertise one address get two channels.
-
-**Alternatives.**
-- (a) Key by address, as the old dispatcher cache did.
-- (b) Key by node id.
-
-**Trade-off.** There are a few more channels when real nodes share an
-address (NAT, misconfiguration). A rotated CA or a re-minted manager
-certificate drops the whole cache, because both are baked into each channel,
-so the next call to each node pays one handshake.
-
-**Why.** (a) would send node B's payload over a channel that verified node A,
-which is the stolen-address case §6.3's name check exists to stop. (b) would
-open one TLS connection per simulated node to the same listener: 5,000
-connections for a 5,000-node sim process. Keying on what the channel verifies
-is correct and keeps the simulator at one connection per process.
-**Correctness won, at no performance cost on real fleets** (one node, one
-address, one channel, as before).
-
-## 21. A simulated fleet serves one certificate, named by `workerPlaneName`
-
-This takes the lean of the plan's open question 4. The fleet's first node
-(by name) requests a normal node certificate after it registers. The
-process's one listener serves that certificate. Every node in the process
-registers `workerPlaneName = "<that node>"`, and managers verify that name
-instead of the node's own, but only on nodes that also report
-`simulated: true`.
-
-```json
-{ "simulated": true, "workerAddress": "https://10.0.1.17:41233", "workerPlaneName": "sim-a-util-0" }
-```
-
-**Alternatives.**
-- (a) One certificate with a SAN per simulated node, which would be 5,000
-  SANs.
-- (b) One listener per simulated node.
-- (c) Let any node name the certificate that serves it.
-
-**Trade-off.** A node that reports `simulated: true` can point the manager's
-name check, for its own dials, at another node's certificate. The worst this
-does is redirect that node's own payloads to a peer it names. It never grants
-manager access. Push dispatch to a fleet waits until the identity node has
-registered, and heartbeats deliver work in the meantime.
-
-**Why.** (a) and (b) give up what makes the simulator cheap: one listener
-and a handful of connections per process. (c) would make every real worker's
-name check optional. Scoping the override to simulated nodes keeps real
-fleets on per-node verification. **Performance of the benchmark rig won,
-with the exception fenced to nodes that say they are fake.**
-
-## 22. No reachability probe yet: the failing call explains itself
-
-Phase 8 (`Worker/Probe`, the node-record field, `WORKER_UNREACHABLE`) is not
-built. Instead, every manager-to-worker failure that never reached the
-worker goes through one explainer. A worker's own answer passes through
-with its code.
+Made while implementing Phase 0. When ACLs deny an anonymous caller on a
+protected endpoint, the manager now answers `Unauthenticated` with a hint that
+names the token file, instead of `PermissionDenied`:
 
 ```text
-cannot reach node wkr-1 at https://10.0.1.7:4848 (Connection refused (os error 111)).
-Managers dial workers on port 4848: allow it from every manager, or set
-LEGION_WORKER_ADVERTISE_ADDR on the worker if this address is wrong
+$ legion job list -j
+{"ok":false,"error":{"code":"Unauthenticated",
+ "message":"Failed to list jobs: job:read requires a token, and no token was provided",
+ "hint":"set LEGION_TOKEN or run `legion login`. On the manager's machine, the initial management token is in <dataDir>/bootstrap-token and ~/.legion/token",
+ "retryable":false}}
 ```
 
-The dial now times out after 5 seconds instead of waiting for the kernel's
-TCP SYN timeout.
+**Alternative.** Keep `PermissionDenied` for every denial, as before, and
+only append the hint.
 
-**Alternative.** Ship the probe in Phase 1, so a firewalled worker shows up
-in `legion node info` before anyone needs a shell.
+**Trade-off.** Clients that matched `PermissionDenied` to detect "not logged
+in" now see a different code. The `acl_endpoints` matrix and one anonymous
+policy test changed with it. The UI already treats both codes as "log in".
 
-**Trade-off.** A firewalled worker still looks healthy until the first exec,
-logs, or restart against it. The error is `Unavailable` (retryable) with the
-hint, not the typed `WORKER_UNREACHABLE` envelope code.
+**Why.** With ACLs on by default, "no token at all" becomes the first error
+every new user and every agent hits, so it has to be unambiguous. gRPC's
+`Unauthenticated` means exactly that, and an agent can branch on the code
+(re-authenticate) instead of parsing prose. `PermissionDenied` keeps its
+meaning: a known caller whose policies fall short. The plan's Phase 0
+acceptance criterion already said `Unauthenticated`. **Ease for agents won.**
 
-**Why.** The spot check's complaint was a bare `transport error` with no
-node, address, or port. This fixes that on the path where it hurts. The probe
-needs a new RPC, a node-record field, CLI and UI output, and an envelope
-code in the CLI's error mapping, which is another track's file in this
-release. It stays Phase 8.
+## 18. The bootstrap secret is on disk before the replicated insert
 
-## 23. The worker plane listens only once it holds a certificate, and asks for a fresh one at every registration
+Made while implementing Phase 0. The manager writes the secret to
+`<dataDir>/bootstrap-token.pending`, then makes the replicated
+"insert if no management token exists" write, then renames the file into
+place. A start that finds a pending file finishes the rename when the secret
+matches a stored management token, and deletes it otherwise.
 
-The worker registers its `https://` address, then requests a node
-certificate (bounded at 10 seconds), and binds 4848 only after a certificate
-is installed. A certificate persisted under `<state-dir>/identity/` is served
-right away on a restart, and the worker still requests a fresh one at every
-registration.
+**Alternative.** Insert first, then write the file, which is simpler.
 
-**Alternatives.**
-- (a) Bind at startup and refuse handshakes until a certificate arrives.
-- (b) Reuse a persisted certificate until its routine refresh.
+**Trade-off.** One more file name and a recovery step at startup.
 
-**Trade-off.** A manager dial in the window between registration and
-issuance gets "connection refused". Push dispatch then falls back to the
-heartbeat, and exec gets the unreachable message. Each worker start costs one
-CSR round trip.
+**Why.** With insert-first, a crash between the two steps leaves a cluster
+whose only management token's secret is in no file, and with no bootstrap
+endpoint the only way back is deleting rows in SQLite by hand. Writing first
+makes that crash harmless, and the replicated insert stays the single point
+that decides who wins. **Simplicity for the operator won over a few lines of
+code.**
 
-**Why.** (a) has nothing to present, so it would log a "listening" line that
-is not true. (b) would keep serving a certificate from a rebuilt cluster or a
-rotated CA after a restart until the first refused dial. One CSR per process
-start is noise.
+## 19. An existing `~/.legion/token` is kept, with a warning that names the fix
 
-## 24. A manager mints its certificate on first dial, not at startup
+Made while implementing Phase 0. The plan writes `~/.legion/token` only when
+it does not exist. The implementation also logs a `WARN` when it was kept:
 
-§6.2 says each manager mints its certificate at startup. Instead the factory
-mints it on the first manager-to-worker call, from the CA it re-reads every
-10 seconds, and re-mints after 8 hours, or when the CA changes.
-
-**Alternative.** Mint at startup, as the plan says, with a retry loop.
-
-**Trade-off.** The first exec or dispatch after a manager starts pays one
-ECDSA keygen and signature (under a millisecond). A broken CA surfaces on
-first use, not at boot.
-
-**Why.** A raft manager starts before its group has a leader. A fresh
-cluster has no CA until the first worker asks for a certificate, and creating
-one is a replicated write. Startup minting would need a retry loop in
-manager startup code that the HA work was reshaping in the same release. On
-demand, the certificate exists whenever there is something to dial, and a
-rotated CA is handled by the same path.
-
-## 25. One `--advertise-addr` for real and simulated workers; the simulator's `--advertise-host` is gone
-
-`legion join` and `legion start worker` take `--advertise-addr HOST[:PORT]`,
-which wins over `LEGION_WORKER_ADVERTISE_ADDR`. The simulator's
-`--advertise-host` (default `127.0.0.1`) is removed. Simulated fleets take the
-same flag, and by default they detect the address the way a real worker does.
-
-```bash
-legion start worker $TOKEN --simulate 1000 --advertise-addr 10.0.1.17   # was --advertise-host
+```text
+WARN /home/me/.legion/token already exists and was left alone, so the CLI on
+this machine keeps using the token in it. To use the new management token:
+export LEGION_TOKEN="$(cat .legion/bootstrap-token)"
 ```
 
-**Alternative.** Keep `--advertise-host` for the simulator next to the new
-flag.
+**Alternative.** Overwrite the file whenever a new cluster mints its token,
+since on a laptop the existing file usually belongs to a cluster that was
+deleted (`mise run nuke`).
 
-**Trade-off.** Benchmark scripts that pass `--advertise-host` break. The one
-in this repo (`benchmarks/aws/scripts/start-sim-fleet.sh`) was updated.
+**Trade-off.** A developer who wipes and restarts a local cluster gets
+`Unauthenticated` from the CLI until they export the new token or delete the
+stale file. The warning and the error hint both point at the fix.
 
-**Why.** Two flags with one meaning is the drift AGENTS.md asks us not to
-keep ("no compatibility aliases"). The CLI records the flag in a
-process-wide setting rather than adding a parameter to `run_worker`, whose
-signature the manager-failover work was changing in the same release.
+**Why.** The file may hold a login to a different, live cluster, and
+silently replacing someone's credential is worse than one confusing error
+with a hint. The manager can't tell a stale token from a live one for another
+cluster. **Safety won over one step of convenience.**
+
+## 20. CA rotation cross-signs the new CA and switches signing at once
+
+Made while implementing Phase 1, and a deviation from plan §6.9. The plan
+kept signing with the old CA "until every node has fetched the bundle", then
+switched. The implementation generates the new CA, cross-signs it with the
+old one, and signs with the new CA immediately. Leaves carry the cross
+certificate in their chain during a 24-hour overlap, and the trust bundle
+holds both CAs for that overlap.
+
+```console
+$ legion net ca rotate
+Rotated the cluster CA. The new CA (pin sha256:...) signs every certificate from now on.
+The previous CA stays trusted until 2026-11-03T18:05:11Z, so no worker-plane or mesh connection breaks;
+```
+
+**Alternative.** The plan's three steps: publish a bundle, track which nodes
+have fetched it, switch signing once every live node has, then drop the old
+CA 24 hours later.
+
+**Trade-off.** Chains grow by one certificate during the overlap. A worker
+that is offline for the whole overlap can't verify the new CA when it comes
+back and must re-join. The plan's version would have stranded it too, once
+the old CA dropped.
+
+**Why.** "Every node has fetched" needs per-node acknowledgement state on the
+control lane and a decision about nodes that never come back. Cross-signing is
+how public CAs roll their roots: a holder that trusts either CA verifies
+either chain, so nothing has to be tracked. The heartbeat reply now names the
+signing CA's pin (`HeartbeatReply.cluster_ca_pin`), so nodes re-issue within
+one beat rather than within 8 hours. **Simplicity won, with no connection
+broken during the overlap.**
+
+## 21. The simulator's fleet certificate is requested through its first node
+
+Made while implementing Phase 1, answering open question 4. The simulator
+serves every simulated node from one listener, so it holds one certificate
+(`<prefix>.fleet.legion`, `legion://fleet/<prefix>`). It asks for it with
+`IssueNodeCertificate { fleet = "<prefix>" }` using the first registered
+node's token. The manager signs a fleet certificate only for a node whose
+registration carried `workerFleet = "<prefix>"`, and verifies the fleet name
+when it dials any node with that attribute.
+
+**Alternative.** One certificate with a SAN per node (5,000 names for a
+5,000-node fleet), or a plaintext stub listener for the simulator.
+
+**Trade-off.** A real worker could register with `workerFleet` set and get a
+fleet certificate. That gains it nothing: it can change only its own node
+record, so it can only receive its own work. The simulator's listener starts
+a moment after its first node registers, and a push before then waits one
+heartbeat.
+
+**Why.** The benchmark rig has to measure dispatch over the same mTLS the real
+fleet pays for. A plaintext stub would hide the handshake cost the plan asks
+to measure, and a 5,000-SAN certificate is absurd to sign and to parse on
+every handshake. **Fidelity of the benchmark won.**
+
+## 22. The host guard judges `proxy` handler targets too, so a node-local proxy needs an `allow` entry
+
+Made while implementing Phase 2. The plan names the egress proxy and external
+upstreams. The datapath also dials `proxy` handler targets, and a policy
+object's handler can name any `host:port`, so those dials go through the same
+resolve-judge-dial step. A handler pointing at a node-local sidecar
+(`target = "127.0.0.1:15001"`) is refused until the operator opens it:
+
+```nickel
+hostGuard = { allow = ["127.0.0.1:15001"] },
+```
+
+Handler health (`legion net doctor`, the heartbeat report) shows the refusal
+as `host-guard: 127.0.0.1 is loopback; allocations may not reach it`.
+
+**Alternative.** Trust handler targets, since policy objects are written by
+`net:write` holders, not by the allocation.
+
+**Trade-off.** A cluster that runs a node-local proxy hop breaks until each
+worker type lists it, and the `allow` entry is per worker type, not per
+policy.
+
+**Why.** An inline policy is part of the job, so "written by the operator" is
+not guaranteed, and a hop the allocation's traffic is handed to is still a
+connection made on its behalf. One rule for every dial is simpler to reason
+about than a list of trusted paths. **Simplicity of the boundary won** over a
+one-line config change for the clusters that need it.
+
+## 23. `authz` calls and the node's own traffic are not judged
+
+Made while implementing Phase 2. `authz` handler calls, artifact fetches, and
+the worker's calls to the manager go out without the host guard. An `authz`
+call carries request facts (method, path, headers the policy forwards), never
+task bytes, and its answer is a verdict the task never sees.
+
+**Alternative.** Judge `authz` URLs as well, refusing loopback and
+link-local webhooks.
+
+**Trade-off.** A policy author can make the worker POST request facts to a
+link-local or loopback address. They can't read the answer, and IMDSv2's
+token call is a `PUT`.
+
+**Why.** The common `authz` deployment is a node-local or loopback service, so
+judging it would break the main use for little gain. The limit is in
+`docs/network-handlers.md` ("The host guard", Limits). **Ease of the common
+setup won.**
+
+## 24. The listener waits for its certificate; registration and heartbeats do not
+
+Made while implementing Phase 1. Issuance is eager (right after
+registration), but a failed first issuance is not fatal unless the CA fails
+the join token's pin. The worker keeps heartbeating and running work, retries
+on every heartbeat, and the worker plane listener starts the moment a
+certificate (issued or persisted) is held.
+
+**Alternative.** Refuse to finish joining until the certificate is issued.
+
+**Trade-off.** For a few heartbeats after a manager hiccup, a worker can be
+registered without serving exec or logs. Dispatch survives: heartbeats carry
+the work.
+
+**Why.** A worker that crash-loops because a manager blinked during
+registration is worse than one that serves its plane a few seconds late. The
+pin mismatch stays fatal because it is the one failure where continuing would
+mean trusting an impostor. **Availability won where it costs no trust.**
+
+## 25. Several workers on one host need `--advertise-addr` to be told apart
+
+Found while implementing Phase 1. The plan's integration test runs two
+workers in one process on `127.0.0.2` and `127.0.0.3`, relying on
+auto-detection. On Linux the source address of the route to any `127/8`
+manager is `127.0.0.1`, so both would advertise `127.0.0.1`. The end-to-end
+test (`tests/worker_plane_e2e.rs`) runs one real worker through the binary
+instead, and the docs say co-located workers need their own port and, to be
+distinguished by address, `--advertise-addr`.
+
+**Alternative.** Bind and advertise the bind address when it is a specific
+IP (`LEGION_WORKER_HOST=127.0.0.2` advertises `127.0.0.2`).
+
+**Trade-off.** One more rule in a two-input default.
+
+**Why.** Binding a specific address and advertising another is a real
+topology (a NAT'd interface), so tying them together would be wrong for
+someone. The override already exists for exactly this. **Simplicity of the
+default won.**
+
+## 26. `--advertise-host` on the simulator became `--advertise-addr`, defaulting to the route
+
+Made while implementing Phase 1. The simulator's flag is now the same flag
+`legion join` and `legion start worker` take, with the same default (the
+route's source address toward the manager) instead of `127.0.0.1`. The AWS rig
+passes `--advertise-addr`.
+
+**Alternative.** Keep the simulator's flag as it was.
+
+**Trade-off.** Scripts that passed `--advertise-host` break (no alias, per
+AGENTS.md).
+
+**Why.** Two flags for the same concept is the kind of drift the plan exists
+to remove, and `127.0.0.1` as a default only worked when the simulator shared
+a host with its manager. **One concept won.**
+
+## 27. `legion net policy test` judges only the built-in classes
+
+Made while implementing Phase 2. `TestNetPolicy` runs on the manager. It
+resolves the name there and judges the classes that are the same on every
+node (loopback, unspecified, link-local, cloud metadata). A node's own
+addresses and its `hostGuard` entries are judged only on the worker.
+
+**Alternative.** Ask a node to judge (a worker-plane RPC), or carry each worker
+type's overrides into the manager's check.
+
+**Trade-off.** `net policy test` can say `allow` for a target a node refuses
+because it is that node's address or in its `hostGuard.deny`. The node's
+`net.denied` event is the authority, and the docs say so.
+
+**Why.** A dry-run that needs a live node per question is a heavier tool than
+the one agents call in a loop. The built-in classes cover the cases people
+ask about (metadata, `localhost`). **Simplicity of the dry-run won.**
+
+## 28. A name that does not resolve is a failed dial, not a denial
+
+Made while implementing Phase 2. When an external target's name does not
+resolve, the guard has no address to judge. The connection fails like any
+dial failure (`502` in HTTP mode, a closed connection at L4) with no
+`net.denied` event. A `proxy` handler may still take the flow, since the
+handler resolves the name itself.
+
+**Alternative.** Record a `host-guard` denial for unresolved names.
+
+**Trade-off.** A typo in an external upstream shows up as a dial error, not a
+policy verdict.
+
+**Why.** Reporting a denial for something that was never judged would make
+the guard look like it refused a name it never saw an address for. **Accurate
+verdicts won.**
+
+## 29. A gated twin is the port's `to`, or the advertised number itself
+
+Made while implementing Phase 3. The plan says every gated allocation gets
+"twins" for its declared ports. Twins used to be fresh ports from the node's
+dynamic range, because a host-mode task shares the host's ports with the
+datapath. A gated task has its own namespace, so its twin is now `to` when
+the port declares one, else the advertised port number:
+
+```nickel
+network = { ports = [{ name = "pg", to = 5432 }] },   # Postgres listens on 5432 inside
+```
+
+The datapath owns host port `20123` and forwards to `5432` inside the
+namespace. `LEGION_PORT_PG` is `5432`.
+
+**Alternative.** Keep dynamic twins for gated allocations too.
+
+**Trade-off.** Two ports in one task that declare the same `to` collide inside
+the namespace, as they already do on macOS. A gated task that has an ingress
+chain sees a different `LEGION_PORT_<NAME>` than before (the advertised
+number or `to`, not a dynamic twin).
+
+**Why.** Most images listen on a fixed port. With dynamic twins, every stock
+image (nginx on 80, Postgres on 5432) would need its command rewritten to read
+`LEGION_PORT_<NAME>` before it could run gated, and gated is now the default.
+`to` already means "the port inside the container" on macOS, so this gives it
+the same meaning on Linux. **Ease of the default won.**
+
+## 30. The node's `os` fingerprint decides `auto`; a node without it stays `host`
+
+Made while implementing Phase 3. Placement reads the node's `os` fingerprint
+attribute. Only `linux` turns a container's `auto` into `gated`. A submit-time
+check (no node yet) treats the node as not Linux. A Linux worker that cannot
+create namespaces (not root) is not detected at placement. The container
+fails to start with `gated network namespace ... is not ready`, and the fix
+is `network.mode = "host"` or running the worker as root.
+
+**Alternative.** Have workers report a `network.gated` capability and gate on
+it.
+
+**Trade-off.** A misconfigured worker fails at start rather than being
+skipped at placement.
+
+**Why.** The container runtime already needs a root worker on Linux (it runs
+the OCI runtime and mounts), so a node that can run containers can create
+namespaces. A capability attribute would add a second source of truth for the
+same fact. **Simplicity won.**
+
+## 31. The `gated-default` warning counts pool-scoped policy objects as coverage
+
+Made while implementing Phase 3. `job run` and `job plan` warn when a task
+would run gated with no egress allowed. A stored policy object with an egress
+chain counts as coverage when its selector matches, ignoring `nodePools`,
+because the pool is not known until placement. `job validate` runs locally,
+cannot see stored policies, and warns whenever the task itself allows
+nothing.
+
+**Alternative.** Warn unless a policy matches every eligible pool.
+
+**Trade-off.** A job that lands in a pool its policy does not cover gets no
+warning, then a `403` with `gated-default` and a hint.
+
+**Why.** A warning that fires on correct jobs teaches people to ignore it. The
+`403` itself names the source and the fix. **A quiet, accurate warning won.**
+
+## 32. Join tokens keep the manager's own scheme; workers dial TLS regardless
+
+Made while implementing Phase 4. The plan says a manager that answers TLS on
+its API port should put `https://` in its join tokens. The token's address is
+also the issuer a worker checks boot tickets against (`iss`), and the manager
+mints those tickets with its workload-identity issuer URL, which operators
+set to that same address (`http://` unless `server.tls` is on). So the token keeps that address, and the worker treats
+it as a host and port: every connection to it is TLS, naming
+`manager.legion`.
+
+**Alternative.** Rewrite the token to `https://` and the ticket issuer with
+it.
+
+**Trade-off.** A token can read `http://10.0.0.5:4747` while every byte the
+worker sends to that address is encrypted, which can surprise someone reading
+it.
+
+**Why.** Changing the scheme in two places that must agree, for a field the
+worker no longer uses to pick a transport, adds a failure mode and buys
+nothing. The docs say the worker always uses TLS. **Simplicity won.**
+
+## 33. The manager picks its certificate by the name the client asks for
+
+Made while implementing Phase 4. With `server.tls` on, the manager holds two
+certificates on one port: the operator's, for the CLI and browsers, and the
+cluster server certificate, for workers. The client's TLS server name picks
+one: `manager.legion` gets the cluster certificate, anything else (including
+no name, which is what a client dialing an IP address sends) gets the
+operator's. Workers always send `manager.legion`, including for the JWKS
+fetch, which is why that fetch uses its own small HTTP/1.1 client instead of
+`reqwest` (whose server name comes from the URL).
+
+**Alternative.** A second port for workers.
+
+**Trade-off.** A custom JWKS client to maintain, and an operator who points
+the CLI at `manager.legion` by name gets a certificate their CA doesn't
+know.
+
+**Why.** One port is one firewall rule and one advertised address, which is
+what the plan promised operators. **Ease of operation won.**
+
+## 34. A bundle accepted under a token outlives the CA that token pins
+
+Found while implementing Phase 4. Phase 1 checked a persisted bundle, and every
+re-issued one, against the join token's pin. After a CA rotation's overlap
+ends, the bundle no longer holds the pinned CA, so a worker that restarted
+then refused its own cluster. Now a worker records which token pin its bundle
+was first accepted under (`<identity dir>/token-pin`). The same token keeps
+trusting that bundle, and the manager must chain to the bundle, not the pin,
+from then on. A new token (a re-join, another cluster) must still find its
+pin in the bundle.
+
+**Alternative.** Require a re-join after every rotation, or keep the old CA in
+bundles for good.
+
+**Trade-off.** A worker whose state directory holds a bundle from this token
+trusts that bundle without re-checking the pin, so tampering with that
+directory changes what it trusts. The directory already holds the node's
+private key.
+
+**Why.** A rotation that silently strands every worker that restarts later is
+a trap, and the plan promised rotation breaks nothing. The bundle arrived over
+a connection verified against the pin or an earlier bundle, so trust chains
+back to the token. The plaintext JWKS fallback is gone too: a worker builds a
+ticket verifier only over this channel, so "refuse a plaintext JWKS URL" holds
+by construction. **Rotation that breaks nothing won.**
+
+## 35. Each allocation gets its own chain, so a drop names its allocation
+
+Made while implementing Phase 5. The plan's sketch puts every allocation's
+drops in one shared chain, with a pair of per-allocation accept rules ahead of
+them. Counters there can't say whose socket was dropped. The table instead
+gives each allocation its own chain (its own VIP block and upstream ports
+accepted, then the floor, each class with its own counter and a comment
+naming the class), and an `unattributed` chain for sockets in the cgroup
+parent that no listed leaf owns.
+
+```text
+net.denied  alloc 88213  egress  cloud metadata  source=host-guard  "dropped in the kernel: cloud metadata; ..."
+```
+
+**Alternative.** One shared floor chain, with drops reported per node.
+
+**Trade-off.** The table grows by about ten rules per allocation, and every
+change to the set of allocations reloads it (which also resets counters; the
+worker resets its baseline with it).
+
+**Why.** "A drop happened somewhere on this node" sends an operator hunting;
+the plan's point is that `net doctor` names the allocation and the cause. A
+few hundred rules is nothing to the kernel. **Diagnosability won.**
+
+## 36. Enforcement off still means a cgroup leaf where the kernel guard runs
+
+Made while implementing Phase 5. The guard matches sockets by cgroup leaf, so
+with `resourceEnforcement.enabled = false` the worker's governor still hands
+every task `legion/share/legion-<alloc>`: it creates the directory and writes
+nothing into it (no controllers, no cpuset, no limits). `cores` are not
+reserved in this mode.
+
+**Alternative.** Match by the allocation's processes some other way (UID per
+allocation, or a socket mark set by the runtime), or skip the guard when
+enforcement is off.
+
+**Trade-off.** One more mode in the governor, and a node with enforcement off
+now has a `legion/` tree.
+
+**Why.** Enforcement is on by default, so this mode is the exception; the
+cgroup is the one identity every runtime already carries (runc, the exec
+supervisor, the VMM). Skipping the guard would make a scheduling knob silently
+turn a security floor off. **One consistent floor won.**
+
+## 37. The seccomp profile is a denylist over Docker's blocked set, not Docker's JSON
+
+Made while implementing Phase 6. The plan says to embed Docker's default
+profile verbatim. That profile is an allowlist of roughly 350 syscalls across
+architectures, with argument filters and capability-conditional blocks.
+Legion ships the inverse: allow by default, refuse with `EPERM` the syscalls
+Docker documents as blocked (mounts and the new mount API, `unshare`,
+`setns`, namespace flags on `clone`, modules, `kexec`, `bpf`, the keyring,
+clocks, `reboot`, and the rest), and `clone3` with `ENOSYS`.
+
+**Alternative.** Vendor Docker's JSON with its Apache-2.0 notice.
+
+**Trade-off.** A syscall a future kernel adds is allowed until the list names
+it, where Docker's allowlist refuses it by default. Some calls Docker allows
+only with an argument filter (`personality`) are allowed outright.
+
+**Why.** A reproduction of a 900-line allowlist that is wrong for one
+architecture breaks containers in ways that look like application bugs, and
+there is no way to verify one against every runtime here. The denylist is
+short enough to review line by line, covers what an escape needs (namespaces,
+mounts, modules, `bpf`, the keyring), and the doc states the difference.
+Revisit by vendoring the real profile once a CI runner can run it on every
+runtime. **Reviewability won.**
+
+## 38. The task directory is an idmapped mount, not chowned to the range
+
+Made while implementing Phase 6. The plan says to chown `/legion/task` to the
+range's root, the way `exec` hands its tree to `user`. The worker rewrites
+files there after start (KV files with `onChange = "update"`, templates), and
+a file it creates as host root after the chown would be unreadable to a
+`0600`-mode consumer inside. So the task directory is an idmapped mount, the
+same as volumes: on disk it stays host-owned, inside it is container root's.
+
+**Alternative.** Chown at start, and chown every later write.
+
+**Trade-off.** Idmapped mounts need Linux 5.12+ and a supporting filesystem
+(tmpfs from 6.3), so an older node fails a userns container's start instead
+of running it.
+
+**Why.** Every write path would otherwise need to know about ranges, and one
+missed path is a silent permission failure. The kernel floor is already
+required for volumes. **One mechanism won.**
+
+## 39. Inside a user namespace, `/sys` is a read-only bind
+
+Made while implementing Phase 6, settling the plan's open ordering question.
+Mounting `sysfs` needs the network namespace to belong to the container's
+user namespace, and neither a gated namespace (the worker creates it) nor the
+host's does. Legion binds the host's `/sys` read-only (`rbind`, `nosuid`,
+`noexec`, `nodev`, `ro`) whenever the container has a user namespace, instead
+of creating the gated namespace inside the allocation's user namespace.
+
+**Alternative.** Create the gated namespace inside the user namespace, so
+`sysfs` mounts.
+
+**Trade-off.** The container sees the host's `/sys` (read-only), including the
+host's network interfaces under `/sys/class/net`, rather than a view of its
+own namespace.
+
+**Why.** It works on every runtime (it is what runc falls back to on its own)
+and keeps the worker's namespace code unchanged. Verified with runc 1.5, gated
+and host, in `container_start_latency_host_vs_gated_benchmark` and the
+`oci_runtime_security_*` tests; youki and crun were not available here.
+**Portability won.**
+
+## 40. Any runtime plugin but `noop` is host-level
+
+Made while implementing Phase 7. The plan's table classifies `exec`,
+`container`, and `sandbox`. Runtimes also load as plugins
+(`plugins/tasks/<name>`), and a plugin can run anything on the host. Legion
+classifies every runtime it does not know as host-level, except `noop`, which
+runs nothing.
+
+```text
+permission denied: job "x" has a host-level task ("t" uses runtime "custom", a plugin
+whose isolation Legion cannot vouch for). Submitting it needs a job:write rule with host = true
+```
+
+**Alternative.** Treat unknown runtimes as sandboxed, or let a plugin declare
+its own isolation.
+
+**Trade-off.** A plugin that is in fact sandboxed needs the host grant to
+deploy until a plugin can declare that.
+
+**Why.** A security classification that defaults to "safe" for code Legion
+has never seen is the wrong default. A plugin-declared isolation flag can
+come later without changing this rule for built-ins. **The safe default
+won.**
+
+## 41. A `dev` sandbox is host-level on every OS
+
+Made while implementing Phase 7. The plan says `hypervisor = "dev"` is
+host-level "on Linux", where it is an OCI bundle. On macOS it is an Apple
+`container` VM. Submit happens before placement, so the node's OS is not known
+then; any `dev` sandbox needs the host grant.
+
+**Alternative.** Classify by the job's constraints, or re-check at placement.
+
+**Trade-off.** A macOS developer with a scoped token needs `host` for a `dev`
+sandbox that would have run in a VM. Single-box flows use the management
+token, which has every grant.
+
+**Why.** A check at placement would turn a permission error into a stuck
+allocation. Dev mode is for development, where the management token is the
+norm. **A check that fails at submit, by name, won.**
+
+## 42. The host grant gates spec submission, not scale or instances
+
+Made while implementing Phase 7. `RunJob` and `RunJobTemplate` check `host`.
+`ScaleTask`, `CreateInstance(s)`, `StartInstance`, and `StopJob` do not: they
+change how many copies of an already admitted spec run, not what runs.
+
+**Alternative.** Check `host` on every `job:write`.
+
+**Trade-off.** A `job:write` token without `host` can scale up an `exec` job
+someone with the grant deployed.
+
+**Why.** The grant is about what code runs where, which only a spec decides.
+Gating scale would make every operator who resizes jobs a host administrator,
+the same over-broad grant the plan avoided for bands. **The narrow grant
+won.**
+
+## 43. The probe runs once per registration and lands in the node's dynamic attributes
+
+Made while implementing Phase 8. The manager that accepts a registration
+waits for the worker plane to come up, probes it (retrying at 2, 5, 10, and
+20 seconds), and writes `workerPlane = {reachable, address, from, checkedAt,
+error?}` into the node's dynamic attributes with the existing
+`update_node_dyamic` write. No new column, no periodic probing.
+
+**Alternative.** A dedicated node field (a proto change on `Node`), or every
+manager probing every node on a timer.
+
+**Trade-off.** The record says what one manager saw at join time; a worker
+that becomes unreachable later, or that only some managers can't reach, is
+reported when a call to it fails (`WORKER_UNREACHABLE`), not on the node page.
+
+**Why.** The plan's goal is the 3am surprise at join time, which one probe
+covers. Periodic probes from every manager are N×M connections for a fact the
+next exec call reports anyway. Dynamic attributes already flow to the CLI, the
+UI, and `node list -j`. **The smallest thing that answers the question won.**
+
+## 44. `WORKER_UNREACHABLE` rides a status metadata key
+
+Made while implementing Phase 8. A gRPC status carries a code from a fixed
+set. The manager returns `Unavailable` with the metadata key
+`legion-error-code: WORKER_UNREACHABLE`, and the CLI and MCP envelopes use that
+key as `error.code` when present, the gRPC code name otherwise.
+
+**Alternative.** Encode the code in the message text, or define a richer
+error detail type (`google.rpc.Status` details).
+
+**Trade-off.** A raw gRPC client sees `Unavailable` unless it reads the
+metadata.
+
+**Why.** Message parsing is the scraping the envelope exists to avoid, and a
+details type means a new dependency on every client. A metadata key is one
+line on each side and extends to the next server-named code. **Simplicity
+won.**
+
+## 45. The merge keeps this branch's worker plane over #17's first cut
+
+`main` shipped a first cut of Phase 1 in
+[#17](https://github.com/mikenomitch/legion/pull/17) while this branch built
+all nine phases from the same plan. The two touched the same files
+(`src/manager/worker_plane.rs`, `src/worker/plane.rs`, `mesh_ca.rs`, the
+simulator) with different APIs. The merge keeps this branch's modules and
+ports #17's other work onto them.
+
+#17's calls doc recorded nine calls for its cut. Where each one stands:
+
+| #17 entry | What it decided | After the merge |
+| --- | --- | --- |
+| 10 | CA pin deferred to Phase 4 | Shipped in Phase 1, checked against the TLS handshake (entries 9, 32, 34) |
+| 11 | One-step rotation; a refused handshake makes a node re-issue | Two-step rotation by cross-signing (entry 20) |
+| 15 | `ExecTask` admits only managers | The `ticket` class ships with direct exec (sandbox-exec plan) |
+| 20 | Channels keyed by (node name, address) | Same idea: keyed by (CA, address, name); the log fetch's per-request map now keys by name too |
+| 21 | Sim fleet verified through `workerPlaneName` | One fleet certificate, `<prefix>.fleet.legion` (entry 21) |
+| 22 | No probe; the failing call explains itself | `Worker/Probe` and `WORKER_UNREACHABLE` (entries 43, 44) |
+| 23 | Listener waits for its certificate | Same (entry 24) |
+| 24 | Manager mints its certificate on first dial | Same |
+| 25 | One `--advertise-addr`, through a process-wide flag | One `--advertise-addr`, passed as a parameter (entry 26) |
+
+What survived from #17: the in-process worker of `--run-worker`
+advertising the manager's routable address (now passed on `WorkerJoin`
+instead of a process-wide flag), the simulation test that dials the fleet
+without a manager certificate, and everything outside the worker plane
+(manager failover, node-token persistence, container capabilities and
+ulimits, blocked evals, the work stream).
+
+**Alternative.** Keep #17's modules and rebuild this branch's later phases
+(pin, rotation, ticket class, probe, encrypted channel) on its API.
+
+**Trade-off.** Users of #17's surface see two changes:
+`legion sandbox start --ca-cert` is `--ca` (with `--node-name`), and a
+simulated node carries `workerFleet` instead of `workerPlaneName`.
+`tests/worker_plane.rs` is gone; `tests/worker_plane_classes.rs` covers the
+same cases (classification, a request per class, foreign CA, wrong node).
+
+**Why.** Every call #17 deferred is built here, on one set of modules. Two
+factories and two listener paths would be the drift AGENTS.md rules out, and
+porting nine phases onto #17's API is more code, and more risk, than porting
+#17's few non-plane changes onto this one. **Simplicity won.**
+
+## 46. Worker failover dials through one TLS connector, not a balanced channel
+
+`main`'s manager failover (`src/worker/managers.rs`) kept a balanced tonic
+channel and swapped its endpoints on failover, all plaintext. Phase 4 needs
+every worker-to-manager connection to be TLS naming `manager.legion`,
+verified against the token's pin or the cluster bundle. The merge keeps
+failover's behavior (one active manager, move after two transport failures,
+the persisted `managers.json`) and replaces the channel with one lazy
+channel whose connector dials whichever manager is active, over TLS.
+
+**Alternative.** Keep the balanced channel and give each endpoint a TLS
+config.
+
+**Trade-off.** No connection is open to a standby manager, so a failover
+pays one TLS handshake. That is what the balanced channel cost too, since
+only the active endpoint was in it.
+
+**Why.** tonic's `ClientTlsConfig` cannot take a custom verifier, and the
+pin check is a custom verifier. One connector holds the pin logic in one
+place, and every client cloned from the channel follows a failover.
+**Simplicity won, and the security rule stays in one function.**
+
+## 47. `legion-loadgen` needs `--join-token` for its embedded fleet
+
+The instances-mode load generator embeds a simulated fleet. That fleet now
+pins the cluster CA like any worker, and only a join token carries the pin,
+so `--join-secret` is removed and `--join-token` is required with
+`--simulate`. Without it the fleet refuses to start:
+
+```text
+no cluster CA pin for the manager at http://10.0.1.5:4747; start the fleet with a token from `legion join-token create`
+```
+
+**Alternative.** Fetch the CA from the manager on first contact and trust
+it (trust on first use) when no token is given.
+
+**Trade-off.** One more argument on a benchmark command line. The AWS
+campaign script already passes a token.
+
+**Why.** A benchmark that dials the manager the way a real worker does
+measures what a real worker costs. Trust on first use would be a second
+trust path that exists only for a tool. **Simplicity won.**

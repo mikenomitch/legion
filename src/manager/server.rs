@@ -27,35 +27,37 @@ use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
 // KV encryption keyring surface (docs/kv-encryption.md).
 use crate::structs::{
-    validate_keyed_instance_id, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
-    AdvanceRolloutRequest, AllocationHealth, AllocationLog, BootTicket, CreateInstanceReply,
-    CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, DeleteJobTemplateReply,
-    DeleteJobTemplateRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply,
-    DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply,
-    DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, FailedAllocation,
-    GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply,
-    GetArtifactCredentialRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest,
-    GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply,
-    GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply,
-    GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest,
-    GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply,
-    GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
-    GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNodeContentReply,
-    GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodeUsageReply, GetNodeUsageRequest,
-    GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest,
-    GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest,
-    GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest,
-    GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetStateBackupReply,
-    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, IngressCertificate, Instance, InstanceInfo, InstanceMode,
-    InstanceState, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply,
-    IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest,
-    IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
-    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, JobTemplate,
-    JobTemplateProvenance, JobTemplateSummary, JobTemplateVariable, JobTemplateVersionInfo,
-    KvEntry, KvInjectionAction, KvJobReference, KvValueType, LedgerNode, ListBootTicketsReply,
-    ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply,
+    validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
+    AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
+    AllocationLog, BootTicket, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply,
+    CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, DeleteExecKeyReply,
+    DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteKvReply,
+    DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply,
+    DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
+    DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
+    GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
+    GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply,
+    GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply,
+    GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest,
+    GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
+    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest,
+    GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodeUsageReply,
+    GetNodeUsageRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
+    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
+    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
+    GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest,
+    GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IngressCertificate,
+    Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
+    IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest,
+    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
+    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
+    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
+    JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvJobReference,
+    KvValueType, LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply,
+    ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply,
     ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply,
     ListJobSpecHistoryRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply,
     ListJobsRequest, ListKvReply, ListKvRequest, ListNodeUsageReply, ListNodeUsageRequest,
@@ -63,23 +65,23 @@ use crate::structs::{
     ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
     ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest,
     ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
-    ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
-    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
-    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
-    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
-    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
-    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
-    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
-    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
-    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
-    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
-    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    ListVolumesReply, ListVolumesRequest, MintExecTicketReply, MintExecTicketRequest, Node,
+    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
+    PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent,
+    RaftStatus, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest,
+    RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest,
+    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
+    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
+    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RotateMeshCaReply,
+    RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest,
+    SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, ServiceEdge,
+    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
+    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
+    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
+    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
@@ -89,15 +91,14 @@ use crate::structs::{
     UpsertNetPolicyRequest,
 };
 use crate::structs::{
-    AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
-    CreateAclTokenRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply,
-    DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply,
-    DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, GetAclPolicyReply,
-    GetAclPolicyRequest, GetAuthMethodsReply, GetAuthMethodsRequest, ListAclPoliciesReply,
-    ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply,
-    ListAclUsersRequest, ListJoinTokensReply, ListJoinTokensRequest, LoginReply, LoginRequest,
-    StopCause, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply,
-    UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
+    AuthMethodInfo, CreateAclTokenReply, CreateAclTokenRequest, CreateJoinTokenReply,
+    CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply,
+    DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJoinTokenReply,
+    DeleteJoinTokenRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAuthMethodsReply,
+    GetAuthMethodsRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply,
+    ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListJoinTokensReply,
+    ListJoinTokensRequest, LoginReply, LoginRequest, StopCause, UpsertAclPolicyReply,
+    UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
 };
 use crate::structs::{
     BackupEncryptionInfo, GetKeyringStatusReply, GetKeyringStatusRequest, KeyringKeyInfo,
@@ -109,6 +110,7 @@ use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
 
 // Phase 6: ForkInstance, `from_snapshot` creates, and snapshot names.
@@ -125,6 +127,9 @@ pub use snapshot_rpcs::{
     checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
 };
 pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, IdleSweeper};
+
+/// The delegated exec keys as last read, their version, and when.
+type CachedExecKeys = (std::time::Instant, String, Vec<crate::structs::ExecKey>);
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     let status = store_error_status(action, &err);
@@ -1517,6 +1522,11 @@ pub struct ManagerDaemonService {
     /// Whether `ExecAllocation` is enabled (config `exec.enabled`, default
     /// true). When false the endpoint rejects with FailedPrecondition.
     exec_enabled: bool,
+    /// Direct-exec ticket lifetimes (`exec.tickets`).
+    exec_tickets: crate::structs::ExecTicketsConfigFull,
+    /// The delegated exec keys and their version, re-read at most once a
+    /// second for heartbeats (only workers that admit exec tickets ask).
+    exec_keys: Arc<Mutex<Option<CachedExecKeys>>>,
     /// Edge boot settings (`edgeBoot`, docs/edge-boot.md). Disabled by
     /// default: with `enabled: false` no ticket can be minted and no claim
     /// ratified, so a cluster that upgrades and changes nothing grows no new
@@ -1530,6 +1540,10 @@ pub struct ManagerDaemonService {
     /// row lands. A failover shows nothing until the next heartbeat, which is
     /// at most one interval of incompleteness and never a wrong answer.
     provisional_claims: Arc<Mutex<HashMap<String, Vec<crate::structs::ProvisionalClaimReport>>>>,
+    /// The signing CA's pin, for `HeartbeatReply.cluster_ca_pin`, re-read at
+    /// most every few seconds: it changes only on a CA rotation, and the
+    /// heartbeat path must not pay a store read per beat for it.
+    ca_pin_cache: Arc<Mutex<Option<(String, std::time::Instant)>>>,
     /// Heartbeat cadence settings (`heartbeat`, docs/heartbeat-cadence-and-scale.md).
     /// Read by the cadence report; the served interval itself comes from the
     /// status checker's ladder through the liveness table.
@@ -1599,8 +1613,11 @@ impl ManagerDaemonService {
                 crate::artifacts::FetcherRegistry::with_builtins(),
             )),
             exec_enabled: true,
+            exec_tickets: crate::structs::ExecTicketsConfigFull::default(),
+            exec_keys: Arc::new(Mutex::new(None)),
             edge_boot: crate::structs::EdgeBootConfigFull::default(),
             provisional_claims: Arc::new(Mutex::new(HashMap::new())),
+            ca_pin_cache: Arc::new(Mutex::new(None)),
             heartbeat: crate::structs::HeartbeatConfigFull::default(),
             net_policy_cache: Arc::new(Mutex::new(HashMap::new())),
             net_policy_generation: Arc::new(Mutex::new(None)),
@@ -1610,6 +1627,61 @@ impl ManagerDaemonService {
             usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
             eval_threads: 1,
         }
+    }
+
+    /// The signing cluster CA's pin, cached for a few seconds (see
+    /// `ca_pin_cache`). Empty when no CA exists yet.
+    /// The delegated exec keys for a heartbeat that asked with `version`:
+    /// `(keys, current version)`, with no keys when the worker already holds
+    /// the current set. Cached for a second, so a fleet of direct-exec
+    /// workers costs one small read per second, not one per heartbeat.
+    fn exec_keys_for(&self, version: &str) -> (Vec<crate::structs::ExecKey>, String) {
+        if version.is_empty() {
+            return (Vec::new(), String::new());
+        }
+        let mut cache = self.exec_keys.lock().unwrap_or_else(|p| p.into_inner());
+        let fresh = cache
+            .as_ref()
+            .is_some_and(|(at, _, _)| at.elapsed() < Duration::from_secs(1));
+        if !fresh {
+            match self.store.list_exec_keys() {
+                Ok(keys) => {
+                    let current = crate::manager::exec::exec_keys_version(&keys);
+                    *cache = Some((std::time::Instant::now(), current, keys));
+                }
+                Err(err) => {
+                    debug!(error = ?err, "Error loading exec keys");
+                    return (Vec::new(), version.to_string());
+                }
+            }
+        }
+        let Some((_, current, keys)) = cache.as_ref() else {
+            return (Vec::new(), version.to_string());
+        };
+        if current == version {
+            (Vec::new(), current.clone())
+        } else {
+            (keys.clone(), current.clone())
+        }
+    }
+
+    fn cluster_ca_pin(&self) -> String {
+        const TTL: Duration = Duration::from_secs(5);
+        let mut cache = self.ca_pin_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((pin, read_at)) = cache.as_ref() {
+            if read_at.elapsed() < TTL {
+                return pin.clone();
+            }
+        }
+        let pin = self
+            .store
+            .mesh_ca()
+            .ok()
+            .flatten()
+            .and_then(|ca| ca.pin().ok())
+            .unwrap_or_default();
+        *cache = Some((pin.clone(), std::time::Instant::now()));
+        pin
     }
 
     /// Overrides how often long-lived streams re-check their credential.
@@ -1783,15 +1855,33 @@ impl ManagerDaemonService {
         // template that renders `priority: 'critical'` is gated by the same
         // rule as a hand-written spec — a RunJob-only check would be
         // bypassable by rendering.
+        // A job with a host-level task (worker-plane-auth plan §6.16) needs a
+        // `job:write` rule with `host = true`: "can deploy" must not quietly
+        // mean "is root on every node".
+        let host_level = config
+            .tasks
+            .iter()
+            .find_map(crate::task_plugins::task_host_level_reason);
         let scope = match template {
             Some(template) => AclScope::job_via_template(&config.name, &template.name),
             None => AclScope::job(&config.name),
         }
         .with_band(config.priority);
-        acl::enforce(identity, AclResource::Job, AclAction::Write, &scope).map_err(|status| {
-            if status.code() == tonic::Code::PermissionDenied
-                && config.priority != crate::structs::Band::default()
-            {
+        let host_scope = scope.clone().with_host(host_level.is_some());
+        acl::enforce(identity, AclResource::Job, AclAction::Write, &host_scope).map_err(|status| {
+            let denied = status.code() == tonic::Code::PermissionDenied;
+            if let (true, Some(reason)) = (denied, host_level.as_deref()) {
+                // Name the host grant only when it is what is missing.
+                if acl::enforce(identity, AclResource::Job, AclAction::Write, &scope).is_ok() {
+                    return Status::permission_denied(format!(
+                        "job {:?} has a host-level task ({reason}). Submitting it needs a \
+                         job:write rule with host = true (docs/auth-and-acls.md, \
+                         \"Host-level jobs\")",
+                        config.name
+                    ));
+                }
+            }
+            if denied && config.priority != crate::structs::Band::default() {
                 Status::permission_denied(format!(
                     "{}: this token's policy does not allow submitting jobs in the `{}`                      priority band (see the `bands` selector in docs/auth-and-acls.md)",
                     status.message(),
@@ -2053,7 +2143,57 @@ impl ManagerDaemonService {
                 .into_iter()
                 .chain(crate::task_plugins::resource_submit_warnings(&config))
                 .chain(crate::structs::suspend::sandbox_submit_warnings(&config))
+                .chain(self.gated_egress_submit_warnings(&config))
+                .chain(crate::task_plugins::container_security_warnings(&config))
                 .collect(),
+        })
+    }
+
+    /// The node OS a task's `auto` is explained against when no placement is
+    /// in hand (`net policy show` and `test`): Linux when any node in the
+    /// cluster runs Linux, which is where an unset container mode is gated
+    /// (worker-plane-auth plan §6.12).
+    fn cluster_node_os(&self) -> Option<&'static str> {
+        let nodes = self.store.get_nodes().ok()?;
+        nodes
+            .iter()
+            .any(|node| {
+                node.fingerprint_attrs
+                    .get(crate::structs::network::ATTR_NODE_OS)
+                    .and_then(Value::as_str)
+                    == Some("linux")
+            })
+            .then_some("linux")
+    }
+
+    /// `gated-default` warnings for a submit or a plan (worker-plane-auth
+    /// plan §6.12): a task that would run gated with nothing allowing its
+    /// egress. A stored policy object with an egress chain whose selector
+    /// matches the task counts as coverage. Its `nodePools` are ignored,
+    /// because the pool is not known until placement, so a pool-scoped
+    /// object silences the warning rather than raising a false one.
+    fn gated_egress_submit_warnings(&self, config: &JobConfig) -> Vec<String> {
+        let policies = self.store.list_net_policies().unwrap_or_default();
+        crate::structs::network::gated_egress_warnings(config, |task| {
+            let facts = crate::structs::netpolicy::NetSelectorFacts {
+                node_pool: None,
+                namespace: String::new(),
+                runtime: task.runtime.clone(),
+                job: config.name.clone(),
+                labels: task
+                    .network
+                    .as_ref()
+                    .map(|network| network.labels.clone())
+                    .unwrap_or_default(),
+            };
+            policies.iter().any(|record| {
+                if record.object.egress.is_none() {
+                    return false;
+                }
+                let mut selector = record.object.selector.clone();
+                selector.node_pools.clear();
+                selector.matches(&facts)
+            })
         })
     }
 
@@ -2294,6 +2434,7 @@ impl ManagerDaemonService {
             .map(|identity| identity.name.clone())
             .collect();
         service.exec_enabled = config.exec.enabled;
+        service.exec_tickets = config.exec.tickets.clone();
         service.heartbeat = config.heartbeat.clone();
         service.eval_threads = config.eval_threads.max(1);
         service
@@ -4233,6 +4374,180 @@ impl Manager for ManagerDaemonService {
         Ok(Response::new(ReceiverStream::new(out_rx)))
     }
 
+    /// Mint a direct-exec ticket (docs/exec-and-actions.md, "Direct exec").
+    /// ACL: the coarse `exec`/`action` gate here, before anything is
+    /// looked up; the precise scope inside `mint_exec_ticket`, which runs
+    /// `ExecAllocation`'s own resolution.
+    #[instrument(skip_all, fields(allocation_id, instance_id))]
+    async fn mint_exec_ticket(
+        &self,
+        request: Request<MintExecTicketRequest>,
+    ) -> Result<Response<MintExecTicketReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
+        if !identity.would_allow(AclResource::Exec, AclAction::Write, &AclScope::any())
+            && !identity.would_allow(AclResource::Action, AclAction::Write, &AclScope::any())
+        {
+            acl::enforce(
+                &identity,
+                AclResource::Exec,
+                AclAction::Write,
+                &AclScope::any(),
+            )?;
+        }
+        let req = request.into_inner();
+        tracing::Span::current().record("allocation_id", req.allocation_id);
+        tracing::Span::current().record("instance_id", req.instance_id.as_str());
+        if !self.exec_enabled {
+            return Err(Status::failed_precondition(
+                "exec is disabled on this manager (exec.enabled=false)",
+            ));
+        }
+        let Some(state) = self.workload_identity.as_ref() else {
+            return Err(Status::failed_precondition(
+                "exec tickets are signed by the workload-identity issuer, which is not enabled \
+                 on this manager\nHint: set workloadIdentity.enabled: true in the manager \
+                 config, or exec through the manager (drop --direct)",
+            ));
+        };
+        let store = self.store.clone();
+        let state = state.clone();
+        let limits = self.exec_tickets.clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            crate::manager::exec::mint_exec_ticket(
+                &store,
+                &identity,
+                &state,
+                &limits,
+                &req,
+                std::time::SystemTime::now(),
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("mint task failed: {e}")))??;
+        Ok(Response::new(reply))
+    }
+
+    /// Register a delegated exec minting key (docs/exec-and-actions.md,
+    /// "Delegated minting keys").
+    #[instrument(skip_all)]
+    async fn create_exec_key(
+        &self,
+        request: Request<CreateExecKeyRequest>,
+    ) -> Result<Response<CreateExecKeyReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "create_exec_key", req.idempotency_key.as_deref());
+        if let Some(recorded) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            if let Some(key) = self
+                .store
+                .get_exec_key(&recorded)
+                .map_err(|e| map_store_error("Error loading exec key", e))?
+            {
+                return Ok(Response::new(CreateExecKeyReply {
+                    key: Some(key),
+                    deduplicated: true,
+                }));
+            }
+        }
+        let key = crate::manager::exec::new_exec_key(
+            &identity,
+            &self.exec_tickets,
+            &req,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        self.store
+            .insert_exec_key(&key)
+            .map_err(|e| map_store_error("Error storing exec key", e))?;
+        if !idempotency_key.is_empty() {
+            self.store
+                .idempotency_record(&idempotency_key, "create_exec_key", &key.id)
+                .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        }
+        *self.exec_keys.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        info!(
+            target: "exec_audit",
+            principal = %identity.principal,
+            accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
+            key_id = %key.id,
+            jobs = %key.jobs,
+            "exec key created"
+        );
+        Ok(Response::new(CreateExecKeyReply {
+            key: Some(key),
+            deduplicated: false,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_exec_keys(
+        &self,
+        request: Request<ListExecKeysRequest>,
+    ) -> Result<Response<ListExecKeysReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let keys = self
+            .store
+            .list_exec_keys()
+            .map_err(|e| map_store_error("Error listing exec keys", e))?;
+        Ok(Response::new(ListExecKeysReply { keys }))
+    }
+
+    #[instrument(skip_all, fields(key_id = %request.get_ref().id))]
+    async fn delete_exec_key(
+        &self,
+        request: Request<DeleteExecKeyRequest>,
+    ) -> Result<Response<DeleteExecKeyReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "delete_exec_key", req.idempotency_key.as_deref());
+        if self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+            .is_some()
+        {
+            return Ok(Response::new(DeleteExecKeyReply { deduplicated: true }));
+        }
+        self.store
+            .delete_exec_key(&req.id)
+            .map_err(|e| map_store_error("Error deleting exec key", e))?;
+        if !idempotency_key.is_empty() {
+            self.store
+                .idempotency_record(&idempotency_key, "delete_exec_key", &req.id)
+                .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        }
+        *self.exec_keys.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        info!(
+            target: "exec_audit",
+            principal = %identity.principal,
+            accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
+            key_id = %req.id,
+            "exec key deleted"
+        );
+        Ok(Response::new(DeleteExecKeyReply {
+            deduplicated: false,
+        }))
+    }
     #[instrument(skip_all)]
     async fn list_job_actions(
         &self,
@@ -4609,6 +4924,11 @@ impl Manager for ManagerDaemonService {
             index_usage,
             preemptions,
             preemption_mode: scheduler.preemption_settings().mode.as_str().to_string(),
+            warnings: self
+                .gated_egress_submit_warnings(&config)
+                .into_iter()
+                .chain(crate::task_plugins::container_security_warnings(&config))
+                .collect(),
         };
 
         Ok(Response::new(reply))
@@ -6393,10 +6713,33 @@ impl Manager for ManagerDaemonService {
             .mesh_ca()
             .map_err(|e| map_store_error("Error reading the mesh CA", e))?;
         Ok(Response::new(match ca {
-            Some(ca) => GetMeshCaReply {
-                cert_pem: ca.cert_pem,
-                created_at: ca.created_at,
-            },
+            Some(ca) => {
+                let phase = ca.phase(time::OffsetDateTime::now_utc());
+                let (phase_name, overlap_until) = match phase {
+                    crate::storage::netpolicy_store::CaRotationPhase::Stable => {
+                        ("stable", String::new())
+                    }
+                    crate::storage::netpolicy_store::CaRotationPhase::Overlap { until } => (
+                        "overlap",
+                        until
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default(),
+                    ),
+                };
+                GetMeshCaReply {
+                    bundle_pem: ca.bundle_pem(),
+                    pin: ca.pin().unwrap_or_default(),
+                    phase: phase_name.to_string(),
+                    previous_cert_pem: if overlap_until.is_empty() {
+                        String::new()
+                    } else {
+                        ca.previous_cert_pem.clone().unwrap_or_default()
+                    },
+                    overlap_until,
+                    cert_pem: ca.cert_pem,
+                    created_at: ca.created_at,
+                }
+            }
             None => GetMeshCaReply::default(),
         }))
     }
@@ -6419,11 +6762,21 @@ impl Manager for ManagerDaemonService {
             .store
             .rotate_mesh_ca()
             .map_err(|e| map_store_error("Error rotating the mesh CA", e))?;
+        let overlap_until = match ca.phase(time::OffsetDateTime::now_utc()) {
+            crate::storage::netpolicy_store::CaRotationPhase::Overlap { until } => until
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            crate::storage::netpolicy_store::CaRotationPhase::Stable => String::new(),
+        };
         info!(
             accessor = identity.accessor_id.as_deref().unwrap_or("-"),
-            "Rotated the mesh CA; nodes re-issue on their next heartbeat"
+            overlap_until = %overlap_until,
+            "Rotated the cluster CA; the new CA signs now, the previous one stays trusted \
+             until the overlap ends, and nodes re-issue on their next heartbeat"
         );
         Ok(Response::new(RotateMeshCaReply {
+            pin: ca.pin().unwrap_or_default(),
+            overlap_until,
             cert_pem: ca.cert_pem,
             created_at: ca.created_at,
         }))
@@ -6458,37 +6811,46 @@ impl Manager for ManagerDaemonService {
                 )));
             }
         }
-        self.store
+        let node = self
+            .store
             .get_node(&req.node_id)
             .map_err(|_| Status::not_found(format!("node {:?} is not registered", req.node_id)))?;
-        // The worker generates its key and sends a CSR; the manager never
-        // generates (or sees) a node's private key.
         if req.csr_pem.trim().is_empty() {
             return Err(Status::invalid_argument(
-                "csr_pem is required: the worker generates its own key and sends a certificate \
-                 signing request (worker protocol 3); upgrade the worker",
+                "csr_pem is required: workers generate their own key and send a certificate \
+                 signing request; the manager never generates or returns a node's private key",
             ));
         }
-        crate::manager::mesh_ca::check_csr(&req.csr_pem)
-            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        // The certificate's names come from the authenticated caller, never
+        // from the CSR. A fleet certificate (the simulator) needs the node to
+        // have registered as part of that fleet.
+        let subject = if req.fleet.is_empty() {
+            crate::manager::mesh_ca::CsrSubject::Node(req.node_id.clone())
+        } else {
+            let registered = crate::manager::worker_plane::worker_fleet(&node);
+            if registered.as_deref() != Some(req.fleet.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "node {:?} did not register as part of fleet {:?} (its workerFleet is {:?})",
+                    req.node_id,
+                    req.fleet,
+                    registered.unwrap_or_default()
+                )));
+            }
+            crate::manager::mesh_ca::CsrSubject::Fleet(req.fleet.clone())
+        };
         let ca = self
             .store
             .ensure_mesh_ca()
-            .map_err(|e| map_store_error("Error creating the mesh CA", e))?;
-        let (cert_pem, expires_at) = crate::manager::mesh_ca::sign_node_csr(
-            &ca.cert_pem,
-            &ca.key_pem,
-            &req.node_id,
-            &req.csr_pem,
-        )
-        .map_err(|e| {
-            error!(error = ?e, "Error signing a node certificate");
-            Status::internal("failed to sign the node certificate")
-        })?;
-        info!(node_id = %req.node_id, expires_at, "Issued node certificate");
+            .map_err(|e| map_store_error("Error creating the cluster CA", e))?;
+        let (cert_pem, expires_at) =
+            crate::manager::mesh_ca::sign_csr(&ca.cert_pem, &ca.key_pem, &req.csr_pem, &subject)
+                .map_err(|e| {
+                    Status::invalid_argument(format!("invalid certificate signing request: {e:#}"))
+                })?;
+        info!(node_id = %req.node_id, fleet = %req.fleet, expires_at, "Issued node certificate");
         Ok(Response::new(IssueNodeCertificateReply {
-            cert_pem,
-            ca_pem: ca.cert_pem,
+            cert_pem: format!("{cert_pem}{}", ca.chain_suffix()),
+            ca_pem: ca.bundle_pem(),
             expires_at,
         }))
     }
@@ -6781,6 +7143,44 @@ impl Manager for ManagerDaemonService {
             .served_interval()
             .map(|interval| interval.as_secs() as u32);
 
+        // Direct exec (docs/exec-and-actions.md, "Direct exec"): finished
+        // sessions join the `exec_audit` log the proxied path writes, and
+        // open ones are re-checked against their minting token, as the
+        // proxied path re-checks every 30 seconds.
+        for record in &req.exec_audit {
+            // The same `subject` shape the proxied path logs. An action's
+            // rendered argv can hold sensitive parameter values, so workers
+            // never report it: the action's name stands in.
+            let session = if record.action.is_empty() {
+                format!("exec:{}", record.command.join(" "))
+            } else {
+                format!("action:{}", record.action)
+            };
+            info!(
+                target: "exec_audit",
+                node_id = %id,
+                jti = %record.jti,
+                minted_by = %record.subject,
+                allocation_id = record.allocation_id,
+                job_id = %record.job,
+                task = %record.task,
+                subject = %session,
+                tty = record.tty,
+                exit_code = record.exit_code,
+                started_at = record.started_at,
+                ended_at = record.ended_at,
+                ended_by = %record.ended_by,
+                "direct exec session ended"
+            );
+        }
+        let revoked_exec_sessions = if req.exec_sessions.is_empty() {
+            Vec::new()
+        } else {
+            crate::manager::exec::revoked_exec_sessions(&self.store, &self.auth, &req.exec_sessions)
+        };
+
+        let (exec_keys, exec_keys_version) = self.exec_keys_for(&req.exec_keys_version);
+
         let reply = HeartbeatReply {
             net_policies,
             message: "ack".into(),
@@ -6792,6 +7192,10 @@ impl Manager for ManagerDaemonService {
             next_interval_seconds,
             checkpoint_requests,
             content_resync,
+            cluster_ca_pin: self.cluster_ca_pin(),
+            revoked_exec_sessions,
+            exec_keys,
+            exec_keys_version,
             manager_addresses: self.worker_manager_addresses(),
             desired_via_stream: stream.via_stream,
             work_resync: stream.resync,
@@ -6955,6 +7359,7 @@ impl Manager for ManagerDaemonService {
             heartbeat_seconds: worker_config.heartbeat_seconds,
             resource_enforcement: worker_config.resource_enforcement,
             edge_boot: worker_config.edge_boot,
+            security: worker_config.security,
             container: worker_config.container,
         };
 
@@ -7092,6 +7497,12 @@ impl Manager for ManagerDaemonService {
             worker_build_version = %request.build_version,
             worker_protocol_version = request.protocol_version,
             "Worker registered"
+        );
+        // Tell the operator now, not at 3am, when this manager can't dial
+        // the worker back (worker-plane-auth plan §6.7).
+        crate::manager::worker_plane::spawn_probe_after_registration(
+            self.store.clone(),
+            node_id.clone(),
         );
         // Easter egg: every join is announced the same way on both sides.
         info!(node_id = %node_id, "We are Legion. {node_id} has joined");
@@ -7237,17 +7648,17 @@ impl Manager for ManagerDaemonService {
             &AclScope::pool(&node.pool),
         )?;
 
-        // The worker plane (mTLS, manager certificate, node name verified):
-        // see `crate::manager::worker_plane`.
-        let target = crate::manager::worker_plane::target(&self.store, &node)
-            .map_err(|err| err.to_status())?;
-        let mut client = target.client.clone();
+        let mut client =
+            crate::manager::worker_plane::WorkerPlane::global().client(&self.store, &node)?;
+        let address = crate::manager::worker_plane::worker_address(&node).unwrap_or_default();
         let response = client
             .restart_worker(tonic::Request::new(RestartWorkerRequest {
                 node_id: node_id.clone(),
             }))
             .await
-            .map_err(|status| target.explain(status))?;
+            .map_err(|status| {
+                crate::manager::worker_plane::worker_call_error(&node_id, &address, status)
+            })?;
 
         let reply = RestartWorkerReply {
             message: response.into_inner().message,
@@ -7461,8 +7872,7 @@ impl Manager for ManagerDaemonService {
 
         // Caches keyed by node / job config so we reuse worker connections and
         // task-config lookups across the (often co-located) allocations.
-        let mut clients: HashMap<String, crate::manager::worker_plane::WorkerTarget> =
-            HashMap::new();
+        let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
         let mut task_names: HashMap<String, HashMap<i64, String>> = HashMap::new();
         let mut logs = Vec::new();
 
@@ -8376,7 +8786,10 @@ impl Manager for ManagerDaemonService {
             crate::structs::network::resolve_network_mode_with(
                 &declared_mode,
                 &task.runtime,
-                &crate::structs::network::AutoModeFacts::for_task(&task),
+                &crate::structs::network::AutoModeFacts {
+                    node_os: self.cluster_node_os(),
+                    ..crate::structs::network::AutoModeFacts::for_task(&task)
+                },
                 self.store.sandbox_gated_default(),
             )
         });
@@ -8435,6 +8848,41 @@ impl Manager for ManagerDaemonService {
         if !req.path.trim().is_empty() {
             path = Some(req.path.trim().to_string());
         }
+        // The host guard sits below every policy, so it answers first, by
+        // the address the name resolves to (resolved here, on the manager).
+        // Its built-in classes are the same on every node; a node's own
+        // addresses and its `hostGuard` overrides are judged on the worker.
+        if direction == "egress" {
+            let guard_host = host
+                .clone()
+                .or_else(|| ip.map(|ip| ip.to_string()))
+                .unwrap_or_default();
+            if !guard_host.is_empty() {
+                let guard = crate::structs::host_guard::HostGuard::default();
+                let refused = crate::worker::netd::guard::resolve_and_guard(
+                    &crate::worker::netd::guard::SystemResolver,
+                    Some(&guard),
+                    &guard_host,
+                    port,
+                )
+                .await;
+                if let Err(crate::worker::netd::guard::GuardRefusal::Denied(reason)) = refused {
+                    let hint = crate::structs::host_guard::GuardDenial::hint();
+                    return Ok(Response::new(TestNetPolicyReply {
+                        verdict: "deny".into(),
+                        source: crate::structs::host_guard::HOST_GUARD_SOURCE.into(),
+                        explanation: format!(
+                            "{}: {reason}",
+                            crate::structs::host_guard::HOST_GUARD_SOURCE
+                        ),
+                        reason,
+                        direction: direction.into(),
+                        protocol: chain.map(|c| c.protocol.clone()).unwrap_or_default(),
+                        hint: hint.to_string(),
+                    }));
+                }
+            }
+        }
         let Some(chain) = chain else {
             // A gated task's egress that nothing covers is denied
             // (`gated-default`), exactly as its datapath would.
@@ -8447,7 +8895,10 @@ impl Manager for ManagerDaemonService {
                 crate::structs::network::resolve_network_mode_with(
                     declared_mode,
                     &task.runtime,
-                    &crate::structs::network::AutoModeFacts::for_task(&task),
+                    &crate::structs::network::AutoModeFacts {
+                        node_os: self.cluster_node_os(),
+                        ..crate::structs::network::AutoModeFacts::for_task(&task)
+                    },
                     self.store.sandbox_gated_default(),
                 )
             });
@@ -9376,22 +9827,6 @@ impl Manager for ManagerDaemonService {
     }
 
     #[instrument(skip_all)]
-    async fn bootstrap_acl(
-        &self,
-        request: Request<BootstrapAclRequest>,
-    ) -> Result<Response<BootstrapAclReply>, Status> {
-        // ACL: open endpoint guarded by its one-shot semantics — it only
-        // succeeds while no management token exists.
-        let req = request.into_inner();
-        let (token, secret) = self.auth.bootstrap(&self.store, req.secret.as_deref())?;
-        info!(accessor_id = %token.accessor_id, "ACL bootstrap: initial management token created");
-        Ok(Response::new(BootstrapAclReply {
-            token: Some(token),
-            secret,
-        }))
-    }
-
-    #[instrument(skip_all)]
     async fn upsert_acl_policy(
         &self,
         request: Request<UpsertAclPolicyRequest>,
@@ -10244,24 +10679,25 @@ async fn fetch_allocation_logs(
     store: &Store,
     allocation: &crate::structs::Allocation,
     req: &GetAllocationLogsRequest,
-    clients: &mut HashMap<String, crate::manager::worker_plane::WorkerTarget>,
+    clients: &mut HashMap<String, WorkerClient<Channel>>,
 ) -> Result<Vec<crate::structs::TaskLogStream>, String> {
-    if !clients.contains_key(&allocation.node_id) {
-        let node = store
-            .get_node(&allocation.node_id)
-            .map_err(|e| format!("failed to load node {}: {e}", allocation.node_id))?;
-        // The worker plane (mTLS, manager certificate, node name verified):
-        // see `crate::manager::worker_plane`.
-        let target =
-            crate::manager::worker_plane::target(store, &node).map_err(|err| err.to_string())?;
-        clients.insert(allocation.node_id.clone(), target);
+    let node = store
+        .get_node(&allocation.node_id)
+        .map_err(|e| format!("failed to load node {}: {e}", allocation.node_id))?;
+    let target = crate::manager::worker_plane::WorkerTarget::for_node(&node)
+        .map_err(|status| status.message().to_string())?;
+    // Keyed by what the channel verifies, not the address alone: two nodes
+    // that advertise one address must not share a channel.
+    let key = format!("{}@{}", target.server_name, target.address);
+    if !clients.contains_key(&key) {
+        let client = crate::manager::worker_plane::WorkerPlane::global()
+            .client_for(store, &target)
+            .map_err(|status| status.message().to_string())?;
+        clients.insert(key.clone(), client);
     }
-    let target = clients
-        .get_mut(&allocation.node_id)
-        .expect("worker target just inserted");
+    let client = clients.get_mut(&key).expect("worker client just inserted");
 
-    let reply = target
-        .client
+    let reply = client
         .get_task_logs(GetTaskLogsRequest {
             allocation_id: allocation.id,
             stream: req.stream.clone(),
@@ -10271,18 +10707,15 @@ async fn fetch_allocation_logs(
         })
         .await
         .map_err(|status| {
-            // A failure to reach the worker at all is explained in full (node,
-            // address, port); an answer from the worker is relayed by message.
-            let reached = std::error::Error::source(&status).is_none();
-            let status = target.explain(status);
-            if reached {
-                format!(
-                    "worker on {} returned {}",
-                    allocation.node_id,
-                    status.message()
-                )
-            } else {
+            let status = crate::manager::worker_plane::worker_call_error(
+                &allocation.node_id,
+                &target.address,
+                status,
+            );
+            if crate::manager::worker_plane::is_unreachable(&status) {
                 status.message().to_string()
+            } else {
+                format!("worker on {} returned {}", allocation.node_id, status)
             }
         })?;
 
@@ -13166,6 +13599,16 @@ mod tests {
             }))
         }
 
+        async fn probe(
+            &self,
+            _request: Request<crate::structs::ProbeRequest>,
+        ) -> Result<Response<crate::structs::ProbeReply>, Status> {
+            Ok(Response::new(crate::structs::ProbeReply {
+                node_id: "node-1".into(),
+                protocol_version: u64::from(crate::constants::PROTOCOL_VERSION),
+            }))
+        }
+
         async fn get_task_logs(
             &self,
             request: Request<GetTaskLogsRequest>,
@@ -13201,47 +13644,61 @@ mod tests {
     #[tokio::test]
     async fn manager_forwards_worker_restart() -> R<()> {
         let store = setup_store()?;
+        // The worker plane is mTLS: serve the test worker with node-1's
+        // certificate from this cluster's CA, and require manager
+        // certificates from the same CA.
         let ca = store.ensure_mesh_ca()?;
-        let identity_for = |node_id: &str| -> R<crate::worker::plane::NodeIdentity> {
-            let (cert, key, _) =
-                crate::manager::mesh_ca::issue_node_cert(&ca.cert_pem, &ca.key_pem, node_id)?;
-            crate::worker::plane::NodeIdentity::new(node_id, cert, key, ca.cert_pem.clone())
-        };
+        let (key_pem, csr) = crate::manager::mesh_ca::generate_csr("node-1")?;
+        let (cert_pem, _) = crate::manager::mesh_ca::sign_csr(
+            &ca.cert_pem,
+            &ca.key_pem,
+            &csr,
+            &crate::manager::mesh_ca::CsrSubject::Node("node-1".into()),
+        )?;
+        let identity = crate::cluster_tls::SwappableIdentity::new();
+        identity.set(crate::cluster_tls::certified_key(&cert_pem, &key_pem)?);
+        let roots = crate::cluster_tls::SwappableRoots::from_pem(&ca.bundle_pem())?;
+        let tls = crate::cluster_tls::server_config(
+            identity,
+            Some(crate::cluster_tls::ClusterClientVerifier::new(roots)),
+            false,
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let worker_address = format!("https://{}", listener.local_addr()?);
 
         let called = Arc::new(Mutex::new(None));
-        let (addr, server) = crate::worker::plane::serve_for_test(
-            TestWorker {
-                called: called.clone(),
-            },
-            identity_for("node-1")?,
-        )
-        .await?;
-        let (impostor_addr, impostor) = crate::worker::plane::serve_for_test(
-            TestWorker {
-                called: Arc::new(Mutex::new(None)),
-            },
-            identity_for("node-9")?,
-        )
-        .await?;
+        let worker = TestWorker {
+            called: called.clone(),
+        };
 
-        let node = |id: &str, address: String| Node {
-            id: id.into(),
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(crate::structs::worker_server::WorkerServer::new(worker))
+                .serve_with_incoming_shutdown(
+                    crate::cluster_tls::tls_incoming(listener, tls),
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+                .ok();
+        });
+
+        let node = Node {
+            id: "node-1".into(),
             status: "ready".into(),
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
             heartbeat_source: String::new(),
-            config_attrs: json!({ "workerAddress": address }),
+            config_attrs: json!({ "workerAddress": worker_address }),
             fingerprint_attrs: json!({}),
-            dynamic_attrs: json!({}),
+            dynamic_attrs: json!({ "protocolVersion": crate::constants::PROTOCOL_VERSION }),
             health_checks: json!({}),
         };
-        store.insert_node(NodeMsg::from(node("node-1", format!("https://{addr}"))))?;
-        store.insert_node(NodeMsg::from(node(
-            "node-2",
-            format!("https://{impostor_addr}"),
-        )))?;
-        let manager = ManagerDaemonService::new(store);
+        store.insert_node(NodeMsg::from(node))?;
+        let manager = ManagerDaemonService::new(store.clone());
 
         let response = manager
             .restart_worker(Request::new(RestartWorkerRequest {
@@ -13249,23 +13706,40 @@ mod tests {
             }))
             .await?;
         assert_eq!(response.into_inner().message, "ok");
-        assert_eq!(called.lock().expect("mutex").as_deref(), Some("node-1"));
-
-        let refused = manager
-            .restart_worker(Request::new(RestartWorkerRequest {
-                node_id: "node-2".into(),
-            }))
-            .await
-            .expect_err("a listener with node-9's certificate is not node-2");
-        assert_eq!(refused.code(), tonic::Code::Unavailable);
-        assert!(
-            refused.message().contains("node-2") && refused.message().contains("TLS"),
-            "{}",
-            refused.message()
+        assert_eq!(
+            called.lock().expect("mutex").as_deref(),
+            Some("node-1"),
+            "the worker saw the restart"
         );
 
-        server.abort();
-        impostor.abort();
+        // A pre-mTLS worker (protocol 2, plaintext address) is never dialed.
+        let old = Node {
+            id: "node-old".into(),
+            status: "ready".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
+            config_attrs: json!({ "workerAddress": "http://127.0.0.1:1" }),
+            fingerprint_attrs: json!({}),
+            dynamic_attrs: json!({ "protocolVersion": 2 }),
+            health_checks: json!({}),
+        };
+        store.insert_node(NodeMsg::from(old))?;
+        let status = manager
+            .restart_worker(Request::new(RestartWorkerRequest {
+                node_id: "node-old".into(),
+            }))
+            .await
+            .expect_err("a protocol-2 worker is refused");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().contains("protocol 2"),
+            "{}",
+            status.message()
+        );
+
+        let _ = shutdown_tx.send(());
         Ok(())
     }
 
@@ -16464,6 +16938,203 @@ mod tests {
             })))
             .expect_err("unknown instance");
         assert_eq!(status.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    /// Direct exec (docs/exec-and-actions.md, "Direct exec"): a ticket is
+    /// minted for exactly the callers `ExecAllocation` would admit for the
+    /// same target, and the ticket names what was authorized.
+    #[tokio::test]
+    async fn mint_exec_ticket_admits_exactly_what_exec_allocation_admits_test() -> R<()> {
+        use crate::structs::acl::{AclIdentity, AclRule, AclSource};
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        run_jobspec(
+            &manager,
+            json!({
+                "name": "shell",
+                "task": {
+                    "name": "main",
+                    "runtime": "exec",
+                    "config": { "command": ["sleep", "600"] },
+                    "actions": [{ "name": "flush", "command": ["echo", "flushed"] }]
+                }
+            }),
+        )
+        .await?;
+        store.insert_node(NodeMsg {
+            id: "node-1".into(),
+            pool: "default".into(),
+            status: "active".into(),
+            availability: "available".into(),
+            config_attrs: json!({ "workerAddress": "https://10.0.3.17:4848" }).to_string(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: json!({
+                "protocolVersion": crate::manager::worker_plane::MIN_WORKER_PLANE_PROTOCOL
+            })
+            .to_string(),
+            health_checks: "{}".into(),
+            last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
+        })?;
+        let config = store.get_job_config("shell")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&config)?
+            .into_iter()
+            .next()
+            .context("task config")?;
+        let alloc = store.place_alloc("node-1", task_id)?;
+
+        let issuer = crate::manager::workload_identity::WorkloadIdentityState::initialize(
+            &store,
+            &crate::structs::WorkloadIdentityConfigFull {
+                enabled: true,
+                ..Default::default()
+            },
+            "http://127.0.0.1:4747",
+            std::time::SystemTime::now(),
+        )?;
+        let limits = crate::structs::ExecTicketsConfigFull::default();
+
+        let identity = |rules: Value| AclIdentity {
+            principal: "tester".into(),
+            accessor_id: Some("acc-1".into()),
+            is_management: false,
+            is_worker: false,
+            policies: vec!["p".into()],
+            rules: serde_json::from_value::<Vec<AclRule>>(rules).expect("rules"),
+            source: AclSource::Token,
+            expires_at: None,
+            audit_only: false,
+        };
+        let exec_host = identity(json!([
+            { "resources": ["exec"], "actions": ["write"], "names": ["shell"], "host": true }
+        ]));
+        let exec_no_host = identity(json!([
+            { "resources": ["exec"], "actions": ["write"], "names": ["shell"] }
+        ]));
+        let action_only = identity(json!([
+            { "resources": ["action"], "actions": ["write"], "names": ["shell"], "actionNames": ["flush"] }
+        ]));
+        let other_job = identity(json!([
+            { "resources": ["exec"], "actions": ["write"], "names": ["other"], "host": true }
+        ]));
+        let reader = identity(json!([{ "resources": ["job"], "actions": ["read"] }]));
+
+        let command = MintExecTicketRequest {
+            allocation_id: alloc.id,
+            command: vec!["/bin/sh".into()],
+            tty: true,
+            ..Default::default()
+        };
+        let action = MintExecTicketRequest {
+            allocation_id: alloc.id,
+            action: "flush".into(),
+            ..Default::default()
+        };
+        for (name, who) in [
+            ("exec with host", &exec_host),
+            ("exec without host", &exec_no_host),
+            ("action only", &action_only),
+            ("another job", &other_job),
+            ("reader", &reader),
+        ] {
+            for request in [&command, &action] {
+                let start = crate::structs::ExecStart {
+                    allocation_id: request.allocation_id,
+                    command: request.command.clone(),
+                    action: request.action.clone(),
+                    tty: request.tty,
+                    ..Default::default()
+                };
+                let proxied = crate::manager::exec::resolve_for_test(&store, who, &start);
+                let minted = crate::manager::exec::mint_exec_ticket(
+                    &store,
+                    who,
+                    &issuer,
+                    &limits,
+                    request,
+                    std::time::SystemTime::now(),
+                );
+                assert_eq!(
+                    proxied.is_ok(),
+                    minted.is_ok(),
+                    "{name} / {:?}: proxied {:?}, minted {:?}",
+                    request.action,
+                    proxied.err(),
+                    minted.err()
+                );
+                if let Err(status) = minted {
+                    assert_eq!(status.code(), tonic::Code::PermissionDenied, "{name}");
+                }
+            }
+        }
+
+        // The ticket names what was authorized, on the allocation's node.
+        let reply = crate::manager::exec::mint_exec_ticket(
+            &store,
+            &action_only,
+            &issuer,
+            &limits,
+            &action,
+            std::time::SystemTime::now(),
+        )?;
+        assert_eq!(reply.node, "node-1");
+        assert_eq!(reply.worker_address, "https://10.0.3.17:4848");
+        let claims = crate::structs::exec_ticket::ExecTicketClaims::from_claims(&issuer.verify(
+            &reply.ticket,
+            crate::structs::exec_ticket::EXEC_TICKET_AUDIENCE,
+        )?)?;
+        assert_eq!(claims.allocation_id, alloc.id);
+        assert_eq!(claims.action.as_deref(), Some("flush"));
+        assert_eq!(
+            claims.argv,
+            Some(vec!["echo".to_string(), "flushed".to_string()])
+        );
+        assert_eq!(claims.sub, "accessor:acc-1");
+        assert_eq!(claims.max_session, 3600);
+
+        // A redeem window above the manager's ceiling is refused by name.
+        let status = crate::manager::exec::mint_exec_ticket(
+            &store,
+            &exec_host,
+            &issuer,
+            &limits,
+            &MintExecTicketRequest {
+                ttl: "1h".into(),
+                ..command.clone()
+            },
+            std::time::SystemTime::now(),
+        )
+        .expect_err("above the ceiling");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("exec.tickets"),
+            "{}",
+            status.message()
+        );
+
+        // A session never outlives the credential that minted it.
+        let expiring = AclIdentity {
+            expires_at: Some(
+                (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+                    .format(&time::format_description::well_known::Rfc3339)?,
+            ),
+            ..exec_host.clone()
+        };
+        let reply = crate::manager::exec::mint_exec_ticket(
+            &store,
+            &expiring,
+            &issuer,
+            &limits,
+            &command,
+            std::time::SystemTime::now(),
+        )?;
+        assert!(
+            reply.max_session_seconds <= 300,
+            "{}",
+            reply.max_session_seconds
+        );
         Ok(())
     }
 }
