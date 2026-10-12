@@ -9,13 +9,14 @@ import type { InstanceRow } from '../../components/InstancesTable'
 import { PressureHistoryCard } from '../../components/PressureHistory'
 import SnapshotsPanel from '../../components/SnapshotsPanel'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
-import { GetLedgerReply, InstanceInfo } from '../../gen/legion_pb'
+import { InstanceInfo } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
+import { nodePublicAddress } from '../../utils/services'
 import { allows, jobScope } from '../../utils/acl'
 import { allocationHealthLabel, fetchAllocationRuntime, fetchTaskStatusByName, parseAllocNetwork } from '../../utils/allocations'
 import { formatDate, pluralize } from '../../utils/format'
-import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
+import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecFromReply, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
 import { stableList } from '../../utils/instances'
 import { bytesToMiB, fetchAllocationUsageByNode, formatIdle, formatMiB, reservationLabel } from '../../utils/usage'
@@ -40,7 +41,7 @@ function JobDetailContent() {
       managerClient.getJobInfo({ name: name }),
       // node:read garnish (allocation placement); job-scoped tokens
       // still get the rest of the page.
-      managerClient.getLedger({}).catch(() => new GetLedgerReply()),
+      managerClient.getLedger({}).catch(() => undefined),
       managerClient.listRollouts({ jobId: name, activeOnly: false, page: 1, pageSize: 200 }),
       managerClient.getJobSpec({ name: name }),
       managerClient.listJobSpecHistory({ name: name }),
@@ -63,13 +64,23 @@ function JobDetailContent() {
     ])
 
     const jobId = jobInfo.job?.id ?? name
-    const allocations = ledger.nodes.flatMap((node) =>
+    // Without node:read the ledger is unavailable, which is not the same as
+    // the job having no allocations: the card says which it is.
+    const ledgerDenied = ledger === undefined
+    // Port links use a node's public address when its worker declares one.
+    const publicAddresses = new Map(
+      (ledger?.nodes ?? []).flatMap((entry) => {
+        const address = nodePublicAddress(entry.node?.configAttrs)
+        return entry.node && address ? [[entry.node.id, address] as const] : []
+      }),
+    )
+    const allocations = (ledger?.nodes ?? []).flatMap((node) =>
       node.allocations.filter((allocation) => allocation.jobId === jobId),
     )
 
     const latestRollout = rollouts.rollouts[0]
     const rolloutStatus = latestRollout ? await managerClient.getRolloutStatus({ id: latestRollout.id }) : undefined
-    const specData = extractJobSpecData(spec.submissions)
+    const specData = extractJobSpecFromReply(spec)
 
     // Endpoints for this job's services, unhealthy included: an endpoint that
     // exists but is failing is exactly what someone is looking for here.
@@ -90,6 +101,8 @@ function JobDetailContent() {
       job: jobInfo.job,
       template: jobInfo.template,
       allocations,
+      ledgerDenied,
+      publicAddresses,
       rollouts: rollouts.rollouts,
       activeRollout: rollouts.rollouts.find((rollout) => !['completed', 'failed', 'cancelled', 'completed_incomplete'].includes(rollout.status.toLowerCase())),
       spec: spec.submissions,
@@ -486,13 +499,31 @@ function JobDetailContent() {
               <SectionCard title="Allocations" flush>
                 <Show
                   when={jobData()!.allocations.length > 0}
-                  fallback={<EmptyState icon="boxes" title="No allocations" body="The scheduler has not placed this job on any worker yet." />}
+                  fallback={
+                    <Show
+                      when={!jobData()!.ledgerDenied}
+                      fallback={<EmptyState icon="ban" title="Allocations hidden" body="Listing allocations needs node:read, which your token does not have." />}
+                    >
+                      <EmptyState
+                        icon="boxes"
+                        title="No allocations"
+                        body={
+                          jobData()!.activeRollout?.message
+                            ? `Rollout #${String(jobData()!.activeRollout!.id)}: ${jobData()!.activeRollout!.message}`
+                            : displayStatus() === 'stopped'
+                              ? 'The job is stopped.'
+                              : 'The scheduler has not placed this job on any worker. The Events page (filtered to this job) shows why.'
+                        }
+                      />
+                    </Show>
+                  }
                 >
                   <TableShell>
                     <table class={tableClass}>
                       <thead class={theadClass}>
                         <tr>
                           <th class={thClass}>ID</th>
+                          <th class={thClass}>Task</th>
                           <th class={thClass}>Instance</th>
                           <th class={thClass}>Status</th>
                           <th class={thClass}>Health</th>
@@ -510,10 +541,29 @@ function JobDetailContent() {
                             const usage = () => allocationUsage()?.get(Number(allocation.id))
                             return (
                             <tr class={trHoverClass}>
-                              <td class={tdClass + ' font-mono text-xs'}>#{String(allocation.id)}</td>
+                              <td class={tdClass + ' font-mono text-xs'}>
+                                <A class="font-semibold text-ink hover:text-brass-strong" href={`/allocations/${String(allocation.id)}`}>
+                                  #{String(allocation.id)}
+                                </A>
+                              </td>
+                              <td class={tdClass}>
+                                <Show when={allocation.taskName} fallback={<span class="text-faint">—</span>}>
+                                  <A
+                                    class="text-muted hover:text-brass-strong"
+                                    href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(allocation.taskName)}`}
+                                  >
+                                    {allocation.taskName}
+                                  </A>
+                                </Show>
+                              </td>
                               <td class={tdClass}>
                                 <Show when={allocation.instanceId} fallback={<span class="text-faint">—</span>}>
-                                  <MonoBadge title={`Stateful instance ${allocation.instanceId}`}>{allocation.instanceId}</MonoBadge>
+                                  <A
+                                    href={`/jobs/${encodeURIComponent(jobName())}/instances/${encodeURIComponent(allocation.instanceId!)}`}
+                                    title={`Stateful instance ${allocation.instanceId}`}
+                                  >
+                                    <MonoBadge class="hover:border-brass/50">{allocation.instanceId}</MonoBadge>
+                                  </A>
                                 </Show>
                               </td>
                               <td class={tdClass}><StatusBadge status={allocation.status} /></td>
@@ -521,7 +571,10 @@ function JobDetailContent() {
                                 <StatusBadge status={allocationHealthLabel(health())} title={health()?.status || undefined} />
                               </td>
                               <td class={tdClass}>
-                                <AllocationPorts network={parseAllocNetwork(allocation.network)} />
+                                <AllocationPorts
+                                  network={parseAllocNetwork(allocation.network)}
+                                  publicAddress={jobData()!.publicAddresses.get(allocation.nodeId)}
+                                />
                               </td>
                               <td class={tdClass + ' font-mono text-xs tabular-nums'}>
                                 <Show when={usage()} fallback={<span class="text-faint">-</span>}>

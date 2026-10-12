@@ -3250,13 +3250,29 @@ export class GetJobSpecByConfigRequest extends Message<GetJobSpecByConfigRequest
  */
 export class GetJobSpecReply extends Message<GetJobSpecReply> {
   /**
-   * Submissions associated with the latest job config.
-   *
-   * Field number intentionally remains `2` for compatibility.
+   * Source submissions associated with the job config, exactly as the
+   * submitter sent them (usually Nickel source, not JSON). Read these to show
+   * what was typed; read `rendered_jobspec` to learn what the job is.
    *
    * @generated from field: repeated legion.Submission submissions = 2;
    */
   submissions: Submission[] = [];
+
+  /**
+   * The job config the manager stored, as a JSON object: `name`, `priority`,
+   * `version`, `rollout`/`rollout_by_group` when set, and `tasks` — each
+   * task in the same camelCase shape `RunJobRequest.parsed_jobspec` accepts
+   * (`group`, `runtime`, `lifecycle`, `count`, `dependsOn`, `config`,
+   * `resources`, `checks`, `network`, `service`, `stateful`, ...).
+   *
+   * This is the authoritative structure of the job whatever language it was
+   * written in, with scale overrides NOT applied (`count` is the spec's).
+   * Empty string only when the config could not be loaded, which the
+   * manager reports as an error instead.
+   *
+   * @generated from field: string rendered_jobspec = 3;
+   */
+  renderedJobspec = "";
 
   constructor(data?: PartialMessage<GetJobSpecReply>) {
     super();
@@ -3267,6 +3283,7 @@ export class GetJobSpecReply extends Message<GetJobSpecReply> {
   static readonly typeName = "legion.GetJobSpecReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 2, name: "submissions", kind: "message", T: Submission, repeated: true },
+    { no: 3, name: "rendered_jobspec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobSpecReply {
@@ -16519,6 +16536,18 @@ export class GetKvRequest extends Message<GetKvRequest> {
    */
   key = "";
 
+  /**
+   * Return the entry without its value: `entry.value` is the empty string
+   * and the manager does not decrypt it. Everything else (type, version,
+   * timestamps, `encrypted`, and `GetKvReply.references`) is returned.
+   *
+   * For a client that shows a key's details and reveals the value only on
+   * request. Default `false`. Needs the same `kv:read` as a full read.
+   *
+   * @generated from field: bool metadata_only = 2;
+   */
+  metadataOnly = false;
+
   constructor(data?: PartialMessage<GetKvRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -16528,6 +16557,7 @@ export class GetKvRequest extends Message<GetKvRequest> {
   static readonly typeName = "legion.GetKvRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "metadata_only", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetKvRequest {
@@ -16560,6 +16590,23 @@ export class GetKvReply extends Message<GetKvReply> {
    */
   entry?: KvEntry;
 
+  /**
+   * Jobs whose current config reads this key: through a `$path/key`
+   * reference anywhere in the jobspec, or through a task's `kvInjections`
+   * (env vars and files rendered from KV). One entry per place the key is
+   * read, so a job that reads it twice appears twice with different
+   * `json_pointer`s.
+   *
+   * Recorded at submit time from the job's latest config; a job that stopped
+   * reading the key drops out when its next version is submitted. Only jobs
+   * the caller holds `job:read` on are listed, so the list can be shorter
+   * than the real set. Returned even when `entry` is unset, so a reference
+   * to a key that was deleted is still visible.
+   *
+   * @generated from field: repeated legion.KvJobReference references = 2;
+   */
+  references: KvJobReference[] = [];
+
   constructor(data?: PartialMessage<GetKvReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -16569,6 +16616,7 @@ export class GetKvReply extends Message<GetKvReply> {
   static readonly typeName = "legion.GetKvReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "entry", kind: "message", T: KvEntry, opt: true },
+    { no: 2, name: "references", kind: "message", T: KvJobReference, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetKvReply {
@@ -16589,6 +16637,66 @@ export class GetKvReply extends Message<GetKvReply> {
 }
 
 /**
+ * One place a job's config reads a KV key (GetKvReply.references).
+ *
+ * @generated from message legion.KvJobReference
+ */
+export class KvJobReference extends Message<KvJobReference> {
+  /**
+   * Job that reads the key.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * Job config that recorded the reference (the job's latest version when
+   * it was submitted).
+   *
+   * @generated from field: string job_config_id = 2;
+   */
+  jobConfigId = "";
+
+  /**
+   * Where in the job config the key is read, as a JSON pointer: for example
+   * `/tasks/0/config/env/DB_PASSWORD` for a `$path/key` reference, or
+   * `/tasks/web/kvInjections/env/GREETING` for an injected env var.
+   *
+   * @generated from field: string json_pointer = 3;
+   */
+  jsonPointer = "";
+
+  constructor(data?: PartialMessage<KvJobReference>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.KvJobReference";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "json_pointer", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): KvJobReference {
+    return new KvJobReference().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): KvJobReference {
+    return new KvJobReference().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): KvJobReference {
+    return new KvJobReference().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: KvJobReference | PlainMessage<KvJobReference> | undefined, b: KvJobReference | PlainMessage<KvJobReference> | undefined): boolean {
+    return proto3.util.equals(KvJobReference, a, b);
+  }
+}
+
+/**
  * Request payload for ListKv.
  *
  * @generated from message legion.ListKvRequest
@@ -16603,6 +16711,20 @@ export class ListKvRequest extends Message<ListKvRequest> {
    */
   prefix = "";
 
+  /**
+   * Return each entry's value. Default `false`: entries come back with
+   * `value` set to the empty string, and the manager never decrypts them.
+   *
+   * Listing is for browsing keys; reading a secret should be a deliberate
+   * act, so a listing does not ship every plaintext to whoever asks for the
+   * key names. Fetch one value with `GetKv`, or set this to `true` (as
+   * `legion kv list --values` does) to get them all. Every other field
+   * (type, version, timestamps, `encrypted`) is returned either way.
+   *
+   * @generated from field: bool include_values = 2;
+   */
+  includeValues = false;
+
   constructor(data?: PartialMessage<ListKvRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -16612,6 +16734,7 @@ export class ListKvRequest extends Message<ListKvRequest> {
   static readonly typeName = "legion.ListKvRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "prefix", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "include_values", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListKvRequest {
@@ -17658,6 +17781,20 @@ export class ServiceEndpoint extends Message<ServiceEndpoint> {
    */
   meshTls = false;
 
+  /**
+   * Public host name or IP of the endpoint's node, when its worker was
+   * started with `LEGION_WORKER_PUBLIC_ADDRESS`; empty otherwise.
+   *
+   * `address` is where the cluster reaches the endpoint (usually a private
+   * address); this is where a client outside the private network reaches
+   * the same `port`, for links in the UI and CLI. Display only: nothing in
+   * the cluster dials it, and it does not open the port — the node's
+   * firewall or security group must still allow the traffic.
+   *
+   * @generated from field: string public_address = 14;
+   */
+  publicAddress = "";
+
   constructor(data?: PartialMessage<ServiceEndpoint>) {
     super();
     proto3.util.initPartial(data, this);
@@ -17679,6 +17816,7 @@ export class ServiceEndpoint extends Message<ServiceEndpoint> {
     { no: 11, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
     { no: 12, name: "port_label", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "mesh_tls", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 14, name: "public_address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceEndpoint {
@@ -18937,6 +19075,18 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
    */
   instanceId?: string;
 
+  /**
+   * Name of the task this allocation runs (the `name` of the task config
+   * named by `task_config_id`).
+   *
+   * Lets a client group a job's allocations by task without a second
+   * lookup. Empty only when the task config row is gone, which a live
+   * allocation never sees.
+   *
+   * @generated from field: string task_name = 11;
+   */
+  taskName = "";
+
   constructor(data?: PartialMessage<LedgerAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -18955,6 +19105,7 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
     { no: 10, name: "network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "artifact_states", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 9, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 11, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): LedgerAllocation {
@@ -19271,6 +19422,43 @@ export class ListEventsRequest extends Message<ListEventsRequest> {
    */
   level?: string;
 
+  /**
+   * Optional stateful instance filter: only events about this instance.
+   *
+   * An event is about an instance when its `metadata_json` names it — as
+   * `instanceId` (suspend, resume, restore, fork, snapshot, volume, and
+   * provisional-start events) or `instance_id` (`node.pressure`), as one of `instances` (the
+   * forks an `instance.forked` or `instance.fork_failed` created), or as one
+   * of `suspending` (the instances an `instance.make_room` suspended) — or
+   * when it is about an allocation that fulfilled the instance, matched the
+   * way `allocation_id` matches (so `allocation.placed`, `allocation.failed`,
+   * `allocation.stopping`, and the rest). The allocation match covers
+   * allocations the manager still has a row for; events about an allocation
+   * whose row has since been pruned match only through their metadata.
+   *
+   * Combines with the other filters (AND). Matched exactly; an unknown id
+   * simply matches nothing.
+   *
+   * @generated from field: optional string instance_id = 7;
+   */
+  instanceId?: string;
+
+  /**
+   * Optional allocation filter: only events about this allocation.
+   *
+   * Matches `SchedulerEvent.allocation_id`, and also the batched events that
+   * cover several allocations and so leave that field unset: they list them
+   * in metadata as `placements[].allocationId` (`allocation.placed`) or
+   * `allocations[].allocationId` (`allocation.stopping`,
+   * `allocation.preempted`), or `victims[].allocationId`
+   * (`allocation.preempt_planned`). A batched event lists at most its first
+   * 20 allocations, so a batch of more than 20 matches only for those 20. `allocation.removed` events name no allocation ids and never
+   * match.
+   *
+   * @generated from field: optional int64 allocation_id = 8;
+   */
+  allocationId?: bigint;
+
   constructor(data?: PartialMessage<ListEventsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -19285,6 +19473,8 @@ export class ListEventsRequest extends Message<ListEventsRequest> {
     { no: 4, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 5, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "level", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 8, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListEventsRequest {
@@ -19401,6 +19591,25 @@ export class StreamEventsRequest extends Message<StreamEventsRequest> {
    */
   level?: string;
 
+  /**
+   * Optional stateful instance filter. Same semantics as
+   * `ListEventsRequest.instance_id`, with one difference for live events:
+   * the allocation match is resolved against the instance's allocations when
+   * each event arrives, so an allocation placed after the stream opened is
+   * still matched.
+   *
+   * @generated from field: optional string instance_id = 6;
+   */
+  instanceId?: string;
+
+  /**
+   * Optional allocation filter. Same semantics as
+   * `ListEventsRequest.allocation_id`.
+   *
+   * @generated from field: optional int64 allocation_id = 7;
+   */
+  allocationId?: bigint;
+
   constructor(data?: PartialMessage<StreamEventsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -19414,6 +19623,8 @@ export class StreamEventsRequest extends Message<StreamEventsRequest> {
     { no: 3, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 4, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 5, name: "level", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamEventsRequest {

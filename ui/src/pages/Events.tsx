@@ -1,6 +1,7 @@
 import { A } from '@solidjs/router'
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import { AccessGate } from '../components/AccessGate'
+import { AllocationLink } from '../components/AllocationLink'
 import { InstanceEventSummary, PressureExplanation, SnapshotEventSummary } from '../components/PressureHistory'
 import type { SchedulerEvent } from '../gen/legion_pb'
 import { managerClient } from '../grpcClient'
@@ -118,6 +119,7 @@ function EventsContent() {
           event.jobId ?? '',
           event.nodeId ?? '',
           event.evalId ?? '',
+          event.allocationId !== undefined ? `#${String(event.allocationId)}` : '',
         ]
           .join(' ')
           .toLowerCase()
@@ -224,6 +226,17 @@ function EventsContent() {
                         node={event.nodeId}
                       </A>
                     </Show>
+                    <Show when={event.allocationId !== undefined}>
+                      <AllocationLink
+                        id={event.allocationId!}
+                        job={event.jobId}
+                        variant="inherit"
+                        class="rounded bg-surface2 px-1.5 py-0.5 !text-2xs text-muted hover:text-brass-strong hover:no-underline"
+                        onClick={(clickEvent) => clickEvent.stopPropagation()}
+                      >
+                        alloc=#{String(event.allocationId)}
+                      </AllocationLink>
+                    </Show>
                     <RelativeTime value={event.createdAt} class="whitespace-nowrap text-xs text-faint" />
                   </button>
                   <Show when={expandedId() === event.id}>
@@ -234,10 +247,16 @@ function EventsContent() {
                           <span><span class="font-semibold text-faint">eval</span> {event.evalId}</span>
                         </Show>
                         <Show when={event.allocationId !== undefined}>
-                          <span><span class="font-semibold text-faint">allocation</span> {String(event.allocationId)}</span>
+                          <span>
+                            <span class="font-semibold text-faint">allocation</span>{' '}
+                            <AllocationLink id={event.allocationId!} job={event.jobId} variant="muted" />
+                          </span>
                         </Show>
                         <Show when={event.rolloutId !== undefined}>
-                          <span><span class="font-semibold text-faint">rollout</span> {String(event.rolloutId)}</span>
+                          <span>
+                            <span class="font-semibold text-faint">rollout</span>{' '}
+                            <A href={`/rollouts/${String(event.rolloutId)}`} class="hover:text-brass-strong">#{String(event.rolloutId)}</A>
+                          </span>
                         </Show>
                         <span><span class="font-semibold text-faint">at</span> {event.createdAt}</span>
                       </p>

@@ -938,6 +938,7 @@ async fn fetch_kv_entry(
 ) -> R<KvEntry> {
     let request = tonic::Request::new(GetKvRequest {
         key: key.to_string(),
+        metadata_only: false,
     });
     let response = client
         .get_kv(request)

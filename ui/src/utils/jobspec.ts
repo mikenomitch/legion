@@ -457,6 +457,16 @@ export const extractJobSpecData = (submissions: readonly Submission[]): JobSpecD
   return null
 }
 
+// The job's structure from a GetJobSpec/GetJobSpecByConfig reply. The
+// manager's `renderedJobspec` is authoritative whatever the job was written
+// in; submissions are the source as typed (usually Nickel, which is not
+// JSON), so they only serve when a reply carries no rendered spec.
+export const extractJobSpecFromReply = (reply: {
+  renderedJobspec: string
+  submissions: readonly Submission[]
+}): JobSpecData | null =>
+  (reply.renderedJobspec ? parseSubmissionContent(reply.renderedJobspec) : null) ?? extractJobSpecData(reply.submissions)
+
 export const buildTaskInstancesByName = (
   groups: readonly RolloutGroupStatus[],
 ): Map<string, TaskInstanceSummary> => {

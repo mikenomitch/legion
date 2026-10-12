@@ -524,7 +524,9 @@ fn tool_defs() -> Vec<ToolDef> {
                     "kind": { "type": "string", "description": "Kind filter, exact or category prefix (e.g. 'eval' matches eval.*)." },
                     "job_id": { "type": "string", "description": "Filter by exact job ID." },
                     "node_id": { "type": "string", "description": "Filter by exact node ID." },
-                    "level": { "type": "string", "enum": ["info", "warn", "error"], "description": "Filter by severity." }
+                    "level": { "type": "string", "enum": ["info", "warn", "error"], "description": "Filter by severity." },
+                    "instance_id": { "type": "string", "description": "Only events about this stateful instance: suspends, resumes, forks, snapshots, and its allocations' placements and failures." },
+                    "allocation_id": { "type": "integer", "description": "Filter by exact allocation ID." }
                 },
                 "additionalProperties": false
             }),
@@ -1631,6 +1633,8 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 job_id: opt_str_arg(&args, "job_id"),
                 node_id: opt_str_arg(&args, "node_id"),
                 level: opt_str_arg(&args, "level"),
+                instance_id: opt_str_arg(&args, "instance_id"),
+                allocation_id: args.get("allocation_id").and_then(Value::as_i64),
             };
             let mut client = connect().await?;
             grpc(client.list_events(request)).await

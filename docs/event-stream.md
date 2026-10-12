@@ -104,6 +104,44 @@ legion events follow --kind rollout --json   # NDJSON: one envelope per line
 `--kind` matches exactly or by category prefix. For example, `--kind eval`
 matches `eval.enqueued`, `eval.completed`, `eval.failed`, and `eval.requeued`.
 
+### Events about one instance or one allocation
+
+```bash
+legion events list --instance box-KPI6u4fi8GmwSWCo   # everything about a sandbox
+legion events list --allocation 98                   # one allocation's history
+legion events follow --instance moose
+```
+
+`--allocation` matches an event about that allocation: its `allocation_id`
+field, or, for the batched events that cover several allocations and leave
+that field unset, the ids listed in their metadata. These are
+`placements[].allocationId` on `allocation.placed`,
+`allocations[].allocationId` on `allocation.stopping` and
+`allocation.preempted`, and `victims[].allocationId` on
+`allocation.preempt_planned`. A batched event lists at most 20 allocations,
+so the 21st allocation of one batch doesn't match. `allocation.removed` names
+no ids and never matches.
+
+`--instance` matches an event that is *about* the stateful instance:
+
+- its metadata names it as `instanceId` (suspend, resume, restore, fork,
+  snapshot, volume, and provisional-start events) or `instance_id`
+  (`node.pressure`);
+- it lists it in `instances` (the forks of `instance.forked` and
+  `instance.fork_failed`) or `suspending` (`instance.make_room`);
+- or it is about an allocation that fulfilled the instance, matched the way
+  `--allocation` matches (`allocation.placed`, `allocation.failed`,
+  `allocation.stopping`, and the rest).
+
+The allocation half is resolved against the allocation rows the manager still
+has. Once an old allocation's row is gone, its events still exist but only
+match the instance through their metadata. `follow --instance` checks each
+live event as it arrives, so it picks up an allocation placed after the
+stream opened.
+
+Both filters combine with the others. They are a full scan of the bounded
+journal, which is fine at its size.
+
 ### Cursor-based polling (CLI and MCP)
 
 The state store assigns event IDs and never reuses them, so `after_id` works as
@@ -122,7 +160,7 @@ count from `lastId - firstId`, or make up an ID by adding 1. Carry the cursor
 you were given.
 
 The `legion_events` MCP tool takes the same arguments (`after_id`, `limit`,
-`kind`, `job_id`, `node_id`, `level`). It is the recommended way for MCP agents
+`kind`, `job_id`, `node_id`, `level`, `instance_id`, `allocation_id`). It is the recommended way for MCP agents
 to tail the stream incrementally.
 
 ### UI
@@ -130,6 +168,11 @@ to tail the stream incrementally.
 The **Events** page (Cluster → Events) tails `StreamEvents` over gRPC-Web. It
 reconnects and resumes automatically, and it offers client-side filtering by
 category, level, and text, pause and resume, and expandable per-event metadata.
+
+The instance page (`/jobs/<job>/instances/<id>`) and the allocation page
+(`/allocations/<id>`) each show a timeline of just their own events, using the
+`instance_id` and `allocation_id` filters. Like the Events page, they need
+`operator:read`. Without it they say so and show the rest of the page.
 
 ### gRPC
 

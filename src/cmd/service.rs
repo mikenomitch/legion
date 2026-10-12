@@ -49,6 +49,8 @@ struct ServiceRow {
 struct EndpointRow {
     #[tabled(rename = "ADDRESS")]
     address: String,
+    #[tabled(rename = "PUBLIC")]
+    public: String,
     #[tabled(rename = "ALLOC")]
     alloc: i64,
     #[tabled(rename = "NODE")]
@@ -283,6 +285,7 @@ fn endpoint_json(endpoint: &ServiceEndpoint) -> Value {
     json!({
         "service": endpoint.service,
         "address": endpoint.address,
+        "publicAddress": (!endpoint.public_address.is_empty()).then_some(&endpoint.public_address),
         "port": endpoint.port,
         "allocationId": endpoint.allocation_id,
         "nodeId": endpoint.node_id,
@@ -389,6 +392,11 @@ async fn resolve(matches: &ArgMatches) -> R<()> {
 
     let rows = endpoints.into_iter().map(|endpoint| EndpointRow {
         address: format!("{}:{}", endpoint.address, endpoint.port),
+        public: if endpoint.public_address.is_empty() {
+            "-".to_string()
+        } else {
+            format!("{}:{}", endpoint.public_address, endpoint.port)
+        },
         alloc: endpoint.allocation_id,
         node: endpoint.node_id,
         healthy: if endpoint.healthy { "yes" } else { "no" }.to_string(),
@@ -803,6 +811,7 @@ mod tests {
             meta: Default::default(),
             port_label: String::new(),
             mesh_tls: false,
+            public_address: String::new(),
         }
     }
 

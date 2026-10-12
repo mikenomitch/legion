@@ -1,6 +1,7 @@
 import { A, useParams } from '@solidjs/router'
 import { AccessGate } from '../../components/AccessGate'
-import { For, Show, createMemo, createResource } from 'solid-js'
+import { AllocationLink } from '../../components/AllocationLink'
+import { For, Show, createMemo, createResource, type JSX } from 'solid-js'
 import {
   Badge,
   CodeBlock,
@@ -41,7 +42,17 @@ function VolumeDetailContent() {
           managerClient.getVolume({ volumeId: id }),
           managerClient.listVolumeDrivers({}),
         ])
-        return { volume: volume.volume, drivers: drivers.drivers }
+        // The allocation using it now, through its instance (job:read, like
+        // the volume itself). Garnish: an instance that is gone or unreadable
+        // just leaves the row out.
+        const instanceId = volume.volume?.instanceId
+        const instance = instanceId
+          ? await managerClient
+              .getInstance({ instanceId })
+              .then((reply) => reply.instance)
+              .catch(() => undefined)
+          : undefined
+        return { volume: volume.volume, drivers: drivers.drivers, instance }
       },
       ([id]) => id,
     ),
@@ -156,7 +167,16 @@ function VolumeDetailContent() {
                     [
                       'Instance',
                       vol().instanceId ? (
-                        <span class="font-mono text-xs">{vol().instanceId}</span>
+                        vol().jobId ? (
+                          <A
+                            href={`/jobs/${encodeURIComponent(vol().jobId!)}/instances/${encodeURIComponent(vol().instanceId!)}`}
+                            class={cx(linkClass, 'font-mono text-xs')}
+                          >
+                            {vol().instanceId}
+                          </A>
+                        ) : (
+                          <span class="font-mono text-xs">{vol().instanceId}</span>
+                        )
                       ) : (
                         <span class="text-faint" title="A task volume claim: shared, with no per-instance lifecycle">
                           shared claim
@@ -173,6 +193,21 @@ function VolumeDetailContent() {
                         <span class="text-faint">not yet mounted</span>
                       ),
                     ],
+                    ...(vol().instanceId
+                      ? ([
+                          [
+                            'Allocation',
+                            <Show
+                              when={data()?.instance?.currentAllocId}
+                              fallback={<span class="text-faint" title="The instance has no running allocation">none running</span>}
+                            >
+                              {(allocationId) => (
+                                <AllocationLink id={allocationId()} job={vol().jobId} variant="inherit" class={linkClass} title="The allocation that mounts this volume now" />
+                              )}
+                            </Show>,
+                          ],
+                        ] as Array<[string, JSX.Element]>)
+                      : []),
                     ['Created', <RelativeTime value={vol().createdAt} />],
                     ['Updated', <RelativeTime value={vol().updatedAt} />],
                   ]}

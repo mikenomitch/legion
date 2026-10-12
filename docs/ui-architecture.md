@@ -62,7 +62,9 @@ Routes in `App.tsx`:
 
 - `/` overview dashboard (KPI stat cards, active rollouts, workers, recent
   scheduler activity, allocations)
-- `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`)
+- `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`,
+  `/jobs/:id/instances/:instanceId`)
+- `/allocations/:id` (no index page; every allocation id in the UI links here)
 - `/templates` (+ `/templates/:name`)
 - `/services` (+ `/services/:name`)
 - `/rollouts` (+ `/rollouts/:id`). `/deployments` redirects here.
@@ -283,8 +285,44 @@ the Access page reports it instead.
   `node.pressure` rows show the detail and hint as labeled lines, and
   `snapshot.*` rows show snapshot, instance, kind, size, and error, above
   the raw JSON.
-- `KeyValue.tsx`: key tree browser and CRUD/patch editor.
-- `Manager.tsx`: manager config snapshots.
+- `KeyValue.tsx`: key tree browser and CRUD/patch editor. Values are never
+  listed (`ListKv` without `include_values`). A selected key loads with
+  `GetKv { metadata_only }` and stays masked until **Reveal** (re-masked
+  after 60s, on Hide, on switching keys, refresh, or a hidden tab).
+  **Copy value** copies without showing it, and **Replace value** writes
+  without revealing. **Used by** lists `GetKvReply.references`, and delete
+  warns when any job reads the key. **+ New** only creates. The KV
+  encryption-at-rest strip (`components/KeyringStrip.tsx`, `operator:read`)
+  sits at the top. See [KV Store](kv-store.md#in-the-ui).
+- `Manager.tsx`: manager config snapshots. `pages/details/ManagerNodeDetail.tsx`
+  renders the published config as an at-a-glance summary, feature tiles
+  (exec, telemetry, ACLs, workload identity, KV encryption, edge boot,
+  auto-suspend, adaptive heartbeats), and per-area cards. Unknown keys go
+  under "Other settings" as dotted paths, secret-looking values are redacted
+  everywhere (including **Copy JSON** and the raw view), and the store's
+  `YYYY-MM-DD HH:MM:SS +HH:MM:SS` timestamps parse
+  (`utils/managerTime.ts`).
+- `pages/details/InstanceDetail.tsx` (`/jobs/:id/instances/:instanceId`): one
+  stateful instance from `GetInstance`. It shows state, current allocation
+  and node, storage, fork lineage, last stop and cold boot, usage against the
+  reservation, checkpoint and what it can checkpoint now, the shared
+  instance controls (`components/InstanceActions.tsx`, also used by the job
+  page's Instances card, plus Stop/Start here), its snapshots, and an event
+  timeline (`components/EventTimeline.tsx`) from
+  `ListEvents { instance_id }`.
+- `pages/details/AllocationDetail.tsx` (`/allocations/:id`): one allocation.
+  It covers placement (job, task, group, instance, worker, spec version and
+  whether it is current, the rollout that produced it), health with the
+  declared checks and why it last stopped, network (public and cluster
+  address, ports, the endpoint it registered), resources (memory gauge
+  against reservation and ceiling, CPU, idle, pressure order), an event
+  timeline from `ListEvents { allocation_id }`, logs, the task's
+  **Actions** panel aimed at this allocation, and storage. The row comes from
+  the ledger, so without `node:read` the page falls back to the job's
+  rollout (a `?job=` hint from the linking page helps) and to events. An
+  allocation the ledger no longer has is shown as ended, with its events.
+  `components/AllocationLink.tsx` renders the `#id` links used across the
+  UI.
 - `Raft.tsx`: under Cluster navigation. Polled consensus status, recent raft
   history, and operator commands (election, failover, membership, and join
   tokens). Commands that act on another manager (Transfer Leader, Add Voter,
@@ -312,10 +350,22 @@ Discovery shows up in three places, all reading the same projection:
   endpoints for that task, the declared `checks` table, and the latest
   per-allocation health snapshot.
 
-Allocation ports and health come from the state store
-(`utils/allocations.ts`). The ledger carries the assigned `network` blob but
-not the owning task name or the health snapshot. So one SQL query per job
-joins `allocation` → `task_config` → `allocation_health`.
+The ledger carries each allocation's assigned `network` blob and its task
+name (`LedgerAllocation.task_name`), so pages group a job's allocations by
+task without another lookup. Health snapshots still come from the state store
+(`utils/allocations.ts`): one SQL query per job joins `allocation` →
+`task_config` → `allocation_health`.
+
+Endpoint and port links use the node's public address
+(`ServiceEndpoint.public_address`, or `publicAddress` in the node's
+`configAttrs`) when its worker was started with
+`LEGION_WORKER_PUBLIC_ADDRESS`, with the in-cluster address beside it.
+Without one, private addresses (RFC 1918, CGNAT, loopback, link-local, ULA)
+are still linked but dimmed and badged `private`, with a tooltip naming the
+variable (`utils/services.ts`; see
+[Public addresses](service-discovery.md#public-addresses)). In the Network
+page's service graph, service boxes open the service and caller boxes open
+the job.
 
 ## Volumes
 
@@ -547,7 +597,8 @@ All of this is cosmetic. The manager is the only enforcement point.
 ## Stateful Workloads
 
 Allocation views (node detail allocation summaries, Homepage ledger cards,
-job detail allocation table) show a compact mono instance-id pill when
+job detail allocation table, the task page's Instances table) show the
+instance id, linked to its instance page, when
 `LedgerAllocation.instance_id` is set. This makes a rescheduled stateful
 allocation visibly the same instance. Stateless allocations are unchanged.
 
