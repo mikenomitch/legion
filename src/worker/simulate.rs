@@ -930,6 +930,7 @@ async fn heartbeat_sim_node(
         content_locations: None,
         exec_audit: Vec::new(),
         exec_sessions: Vec::new(),
+        exec_keys_version: String::new(),
         pressure_actions: Vec::new(),
         net_denials: Vec::new(),
         net_status: Vec::new(),

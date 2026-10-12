@@ -1013,6 +1013,44 @@ fn tool_defs() -> Vec<ToolDef> {
             }),
             mutates: true,
         },
+        ToolDef {
+            name: "legion_exec_key_list",
+            description: "List delegated exec minting keys (docs/exec-and-actions.md, \"Delegated minting keys\"): each key's id, job glob, and ticket ceilings. Public keys only. Read-only; needs acl:read.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_exec_key_create",
+            description: "Register a platform's P-256 public key so workers accept exec tickets it signs for jobs matching `jobs`, with no manager call per session. Its tickets never reach a host-level runtime (`exec`), and are bounded by `max_ttl` and `max_session`. A key is a shell capability for every matching job until deleted. Mutating; needs acl:write. Supports `idempotency_key`.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "jobs": { "type": "string", "description": "Glob over job names, e.g. agents-*." },
+                    "public_key_pem": { "type": "string", "description": "P-256 public key, SPKI PEM." },
+                    "name": { "type": "string", "description": "A label for people." },
+                    "max_ttl": { "type": "string", "description": "Ceiling on a ticket's redeem window. Default exec.tickets.maxTtl." },
+                    "max_session": { "type": "string", "description": "Ceiling on a ticket's session length. Default exec.tickets.maxSession." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the key already created." }
+                },
+                "required": ["jobs", "public_key_pem"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_exec_key_delete",
+            description: "Delete a delegated exec minting key. Workers stop accepting its tickets, and end the sessions it minted, on their next heartbeat. Mutating; needs acl:write. Supports `idempotency_key`.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Key id (xk_...)." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key." }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
     ]
 }
 
@@ -1397,6 +1435,34 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     tty: args.get("tty").and_then(Value::as_bool).unwrap_or(false),
                     ttl: opt_str_arg(&args, "ttl").unwrap_or_default(),
                     max_session: opt_str_arg(&args, "max_session").unwrap_or_default(),
+                }),
+            )
+            .await
+        }
+        "legion_exec_key_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_exec_keys(crate::structs::ListExecKeysRequest {})).await
+        }
+        "legion_exec_key_create" => {
+            let mut client = connect().await?;
+            grpc(
+                client.create_exec_key(crate::structs::CreateExecKeyRequest {
+                    jobs: str_arg(&args, "jobs")?,
+                    public_key_pem: str_arg(&args, "public_key_pem")?,
+                    name: opt_str_arg(&args, "name").unwrap_or_default(),
+                    max_ttl: opt_str_arg(&args, "max_ttl").unwrap_or_default(),
+                    max_session: opt_str_arg(&args, "max_session").unwrap_or_default(),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_exec_key_delete" => {
+            let mut client = connect().await?;
+            grpc(
+                client.delete_exec_key(crate::structs::DeleteExecKeyRequest {
+                    id: str_arg(&args, "id")?,
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
                 }),
             )
             .await

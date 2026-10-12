@@ -214,6 +214,11 @@ run tools take `instance_id` in place of `allocation_id`.
   ticket for [direct exec](#direct-exec). It is authorized like
   `legion_exec_run` (or `legion_action_run` for an action ticket) and returns
   the ticket, the worker address, the node name, and the cluster CA.
+- `legion_exec_key_list` (read-only), `legion_exec_key_create` and
+  `legion_exec_key_delete` (mutating): [delegated minting
+  keys](#delegated-minting-keys). Signing with a key's private half happens
+  in the platform's own code, or with `legion exec-ticket sign`; there is no
+  MCP tool for it, because the private key never leaves the platform.
 
 ## Direct exec
 
@@ -274,6 +279,53 @@ logs it under `exec_audit` too (`direct exec session ended`, with the exit code
 and what ended it). An action session's report carries the action name, never
 its rendered argv, which can hold sensitive parameters.
 
+### Delegated minting keys
+
+A platform that starts sandboxes at the edge can also mint their exec tickets
+itself, with no manager call per session. It registers an ES256 public key
+scoped to a job glob, and workers accept tickets signed by the private half:
+
+```console
+$ openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out platform.pem
+$ openssl pkey -in platform.pem -pubout -out platform.pub
+$ legion exec-key create --name agents-platform --jobs 'agents-*' --max-ttl 5m \
+    --public-key platform.pub -j
+{"ok":true,"data":{"keyId":"xk_3d1cq7…","jobs":"agents-*","maxTtl":"5m","maxSession":"1h",…}}
+
+# Signed offline, the way a platform's own code would:
+$ legion exec-ticket sign --key platform.pem --key-id xk_3d1cq7… --node w-17 \
+    --alloc 88213 --job agents-a --task workspace -j -- /bin/bash
+```
+
+A ticket signed by a key carries the key id as its JWT `kid` header and
+`sub = "key:<id>"`, and otherwise has the claims of a manager-minted ticket
+(audience `legion:exec`, ES256). Workers check it against the key:
+
+- the job matches the key's `jobs` glob;
+- the redeem window (`exp - iat`) is within the key's `maxTtl`, and
+  `legion.io/max_session` within its `maxSession`;
+- the target is not a host-level runtime. A key never opens a session in an
+  `exec` task, whatever grant created it; mint through a manager with the
+  `host` grant for those.
+
+Everything else is checked as for any ticket: the node, the allocation and
+task, the command and tty, single use, and the worker's restart.
+
+Creating and deleting keys takes `acl:write` and listing takes `acl:read`,
+because a key is a credential that mints shell access. A key's ceilings
+default to, and cannot exceed, the manager's `exec.tickets.maxTtl` and
+`maxSession`. Workers that admit tickets learn the key set on their heartbeat,
+so a new key works on a node within one heartbeat interval. Deleting a key
+reaches every worker the same way: its tickets stop verifying, and the
+sessions it minted end with `PermissionDenied: session ended: the exec key
+that minted this session was deleted`. Keys are audited under `exec_audit`
+(`exec key created`, `exec key deleted`), and their sessions are reported
+like any direct session, with `minted_by = key:<id>`.
+
+A leaked private key is a shell capability for every matching job on a
+non-host runtime until the key is deleted. Keep the glob narrow and the
+ceilings short.
+
 ### Manager settings
 
 ```nickel
@@ -302,6 +354,9 @@ startup.
 | `InvalidArgument: ttl 1h is above this manager's ceiling of 10m` | Ask for less, or raise `exec.tickets`. |
 | Session ends with `max_session elapsed` | The session ran its `max_session`. |
 | Session ends with `PermissionDenied: session ended: the token that minted this session was deleted` | Revoked on a heartbeat. |
+| `… is signed by exec key xk_…, which this node does not hold` | The key was deleted, or the worker has not had a heartbeat since it was created. |
+| `… exec key xk_… mints tickets for jobs matching agents-*, not billing` | The ticket's job is outside the key's glob. |
+| `… a delegated exec key never reaches a host-level runtime` | The target runs `exec`. Mint through a manager instead. |
 
 ### Limitations
 

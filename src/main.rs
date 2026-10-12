@@ -38,6 +38,7 @@ fn cli() -> Command {
         .subcommand(cmd::acl::config())
         .subcommand(cmd::exec::config())
         .subcommand(cmd::exec_ticket::config())
+        .subcommand(cmd::exec_key::config())
         .subcommand(cmd::action::config())
         .subcommand(cmd::login::login_config())
         .subcommand(cmd::login::logout_config())
@@ -97,6 +98,7 @@ async fn main() -> R<()> {
         Some(("acl", sub_matches)) => cmd::acl::handle(sub_matches).await?,
         Some(("exec", sub_matches)) => cmd::exec::handle(sub_matches).await?,
         Some(("exec-ticket", sub_matches)) => cmd::exec_ticket::handle(sub_matches).await?,
+        Some(("exec-key", sub_matches)) => cmd::exec_key::handle(sub_matches).await?,
         Some(("action", sub_matches)) => cmd::action::handle(sub_matches).await?,
         Some(("login", sub_matches)) => cmd::login::handle_login(sub_matches).await?,
         Some(("logout", sub_matches)) => cmd::login::handle_logout(sub_matches).await?,

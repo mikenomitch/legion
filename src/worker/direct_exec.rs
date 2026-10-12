@@ -35,6 +35,22 @@ pub struct ExecTicketVerifier {
     started_at: i64,
     /// Redeemed `jti`s, with the expiry that lets them be forgotten.
     spent: Mutex<HashMap<String, i64>>,
+    /// Delegated minting keys, from the heartbeat, and their version.
+    delegated: Mutex<DelegatedKeys>,
+}
+
+/// The delegated keys a worker holds (docs/exec-and-actions.md, "Delegated
+/// minting keys").
+struct DelegatedKeys {
+    version: String,
+    keys: HashMap<String, DelegatedKey>,
+}
+
+struct DelegatedKey {
+    decoding: jsonwebtoken::DecodingKey,
+    jobs: String,
+    max_ttl: i64,
+    max_session: u64,
 }
 
 impl ExecTicketVerifier {
@@ -44,16 +60,76 @@ impl ExecTicketVerifier {
             node_id: node_id.into(),
             started_at,
             spent: Mutex::new(HashMap::new()),
+            delegated: Mutex::new(DelegatedKeys {
+                version: "none".into(),
+                keys: HashMap::new(),
+            }),
         }
+    }
+
+    /// The version of the delegated keys held, for
+    /// `HeartbeatRequest.exec_keys_version` (`"none"` before the first set).
+    pub fn keys_version(&self) -> String {
+        self.delegated
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .version
+            .clone()
+    }
+
+    /// Replaces the delegated keys with a heartbeat's set. A key whose
+    /// public key does not parse is skipped with a warning; the manager
+    /// validated it at create, so that is a bug, not an attack.
+    pub fn install_keys(&self, version: &str, keys: &[crate::structs::ExecKey]) {
+        let mut parsed = HashMap::new();
+        for key in keys {
+            match jsonwebtoken::DecodingKey::from_ec_pem(key.public_key_pem.as_bytes()) {
+                Ok(decoding) => {
+                    parsed.insert(
+                        key.id.clone(),
+                        DelegatedKey {
+                            decoding,
+                            jobs: key.jobs.clone(),
+                            max_ttl: key.max_ttl_seconds as i64,
+                            max_session: key.max_session_seconds,
+                        },
+                    );
+                }
+                Err(err) => warn!(key_id = %key.id, error = %err, "Skipping an unusable exec key"),
+            }
+        }
+        let mut delegated = self.delegated.lock().unwrap_or_else(|p| p.into_inner());
+        if delegated.version != version {
+            info!(
+                "Exec keys updated: {} key(s), version {version}",
+                parsed.len()
+            );
+        }
+        delegated.version = version.to_string();
+        delegated.keys = parsed;
     }
 
     /// Verifies `token` at `now_unix` and returns its claims, without
     /// redeeming it: the caller checks the target and the command, then
-    /// calls [`ExecTicketVerifier::redeem`].
+    /// calls [`ExecTicketVerifier::redeem`]. A ticket signed by a delegated
+    /// key (`kid` starting `xk_`) is checked against that key's job glob
+    /// and ceilings; the caller refuses it for a host-level runtime.
     pub fn verify(&self, token: &str, now_unix: i64) -> R<ExecTicketClaims> {
-        let raw = self.jwks.decode(token, EXEC_TICKET_AUDIENCE)?;
+        let kid = jsonwebtoken::decode_header(token)
+            .context("invalid ticket header")?
+            .kid
+            .context("ticket is missing a kid header")?;
+        let (raw, claims) = if kid.starts_with(crate::structs::exec_ticket::EXEC_KEY_PREFIX) {
+            self.decode_delegated(token, &kid)?
+        } else {
+            let raw = self.jwks.decode(token, EXEC_TICKET_AUDIENCE)?;
+            let claims = ExecTicketClaims::from_claims(&raw)?;
+            if claims.sub.starts_with("key:") {
+                bail!("a ticket signed by the cluster cannot claim a delegated key's subject");
+            }
+            (raw, claims)
+        };
         let not_before = raw.get("nbf").and_then(Value::as_i64);
-        let claims = ExecTicketClaims::from_claims(&raw)?;
         let skew = self.jwks.clock_skew().as_secs() as i64;
         if now_unix - skew > claims.exp {
             bail!(
@@ -97,6 +173,61 @@ impl ExecTicketVerifier {
             bail!("the ticket {} has already been redeemed", claims.jti);
         }
         Ok(claims)
+    }
+
+    /// Decodes a ticket signed by the delegated key `kid`, checking it
+    /// against that key's job glob and ceilings.
+    fn decode_delegated(
+        &self,
+        token: &str,
+        kid: &str,
+    ) -> R<(serde_json::Map<String, Value>, ExecTicketClaims)> {
+        let delegated = self.delegated.lock().unwrap_or_else(|p| p.into_inner());
+        let key = delegated.keys.get(kid).with_context(|| {
+            format!(
+                "the ticket is signed by exec key {kid}, which this node does not hold (it was \
+                 deleted, or this node has not heard of it yet)"
+            )
+        })?;
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+        validation.set_audience(&[EXEC_TICKET_AUDIENCE]);
+        // Expiry is checked against the caller's clock with the node's
+        // skew, as for cluster-signed tickets.
+        validation.validate_exp = false;
+        validation.validate_nbf = false;
+        let raw = jsonwebtoken::decode::<serde_json::Map<String, Value>>(
+            token,
+            &key.decoding,
+            &validation,
+        )
+        .context("ticket failed verification")?
+        .claims;
+        let claims = ExecTicketClaims::from_claims(&raw)?;
+        if claims.sub != format!("key:{kid}") {
+            bail!("a ticket signed by exec key {kid} must carry sub = key:{kid}");
+        }
+        if !crate::structs::acl::glob_match(&key.jobs, &claims.job) {
+            bail!(
+                "exec key {kid} mints tickets for jobs matching {}, not {}",
+                key.jobs,
+                claims.job
+            );
+        }
+        if claims.exp - claims.iat > key.max_ttl {
+            bail!(
+                "the ticket's redeem window ({}s) is above exec key {kid}'s ceiling ({}s)",
+                claims.exp - claims.iat,
+                key.max_ttl
+            );
+        }
+        if claims.max_session > key.max_session {
+            bail!(
+                "the ticket's max_session ({}s) is above exec key {kid}'s ceiling ({}s)",
+                claims.max_session,
+                key.max_session
+            );
+        }
+        Ok((raw, claims))
     }
 
     /// Marks a verified ticket spent. Fails if a concurrent redemption won.
@@ -285,6 +416,33 @@ pub fn restore_audit(records: Vec<ExecAuditRecord>) {
     }
 }
 
+/// The process's exec ticket verifier, for the heartbeat loop.
+static VERIFIER: std::sync::OnceLock<Arc<ExecTicketVerifier>> = std::sync::OnceLock::new();
+
+/// Hands the heartbeat loop this worker's verifier.
+pub fn register_verifier(verifier: Arc<ExecTicketVerifier>) {
+    let _ = VERIFIER.set(verifier);
+}
+
+/// `HeartbeatRequest.exec_keys_version`: empty on a worker that admits no
+/// tickets, so the manager skips the lookup.
+pub fn keys_version() -> String {
+    VERIFIER
+        .get()
+        .map(|verifier| verifier.keys_version())
+        .unwrap_or_default()
+}
+
+/// Installs a heartbeat's delegated keys, when it carried a new set.
+pub fn apply_exec_keys(version: &str, keys: &[crate::structs::ExecKey]) {
+    let Some(verifier) = VERIFIER.get() else {
+        return;
+    };
+    if !version.is_empty() && version != verifier.keys_version() {
+        verifier.install_keys(version, keys);
+    }
+}
+
 /// Ends the sessions a manager revoked (`HeartbeatReply.revoked_exec_sessions`).
 pub fn apply_revocations(revoked: &[RevokedExecSession]) {
     if revoked.is_empty() {
@@ -448,6 +606,87 @@ mod direct_exec_test {
             ..claims(now)
         };
         verifier.verify(&mint(&issuer, &racing, EXEC_TICKET_AUDIENCE), now)?;
+        Ok(())
+    }
+
+    fn delegated(jobs: &str) -> (rcgen::KeyPair, crate::structs::ExecKey) {
+        let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let key = crate::structs::ExecKey {
+            id: "xk_platform".into(),
+            name: "platform".into(),
+            jobs: jobs.into(),
+            public_key_pem: pair.public_key_pem(),
+            max_ttl_seconds: 300,
+            max_session_seconds: 1800,
+            created_by: "accessor:abc".into(),
+            created_at: String::new(),
+        };
+        (pair, key)
+    }
+
+    fn sign(pair: &rcgen::KeyPair, job: &str, ttl: u64, max_session: u64, now: i64) -> String {
+        crate::cmd::exec_ticket::sign_delegated(
+            &crate::cmd::exec_ticket::SignRequest {
+                key_pem: pair.serialize_pem(),
+                key_id: "xk_platform".into(),
+                node: "w-17".into(),
+                allocation_id: 7,
+                job: job.into(),
+                task: "workspace".into(),
+                instance: None,
+                argv: Some(vec!["/bin/sh".into()]),
+                tty: false,
+                ttl: Duration::from_secs(ttl),
+                max_session: Duration::from_secs(max_session),
+            },
+            now,
+        )
+        .expect("sign")
+        .0
+    }
+
+    #[test]
+    fn a_delegated_key_mints_only_inside_its_glob_and_ceilings_test() -> R<()> {
+        let (_, jwks) = issuer();
+        let now = now();
+        let verifier = verifier(jwks, now - 100);
+        let (pair, key) = delegated("agents-*");
+
+        // Unknown until the heartbeat delivers it.
+        let token = sign(&pair, "agents-a", 60, 600, now);
+        let err = verifier.verify(&token, now).unwrap_err();
+        assert!(format!("{err:#}").contains("does not hold"), "{err:#}");
+        assert_eq!(verifier.keys_version(), "none");
+
+        verifier.install_keys("k1-abc", std::slice::from_ref(&key));
+        let claims = verifier.verify(&token, now)?;
+        assert_eq!(claims.sub, "key:xk_platform");
+
+        let err = verifier
+            .verify(&sign(&pair, "billing", 60, 600, now), now)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("jobs matching agents-*"),
+            "{err:#}"
+        );
+        let err = verifier
+            .verify(&sign(&pair, "agents-a", 900, 600, now), now)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("redeem window"), "{err:#}");
+        let err = verifier
+            .verify(&sign(&pair, "agents-a", 60, 3600, now), now)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("max_session"), "{err:#}");
+
+        // Another key's signature under this kid is a forgery.
+        let (other, _) = delegated("agents-*");
+        assert!(verifier
+            .verify(&sign(&other, "agents-a", 60, 600, now), now)
+            .is_err());
+
+        // Deleted: the next heartbeat's set no longer holds it.
+        verifier.install_keys("k0-empty", &[]);
+        assert!(verifier.verify(&token, now).is_err());
         Ok(())
     }
 

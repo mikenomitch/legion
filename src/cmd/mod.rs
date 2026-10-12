@@ -7,6 +7,7 @@ pub mod capabilities;
 pub mod docs;
 pub mod events;
 pub mod exec;
+pub mod exec_key;
 pub mod exec_ticket;
 pub mod guest_agent;
 pub mod guest_resume;

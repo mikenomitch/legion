@@ -76,6 +76,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_keyring_status` | no | KV encryption at rest on the answering manager ([kv-encryption.md](kv-encryption.md)): `state` (`unlocked`, `locked`, `pending_upgrade`, …), the root key provider and location, each data key with how many values it protects, plaintext rows, rewrap progress, and a one-line `hint` with the next step when something needs doing. |
 | `legion_keyring_rotate` | **yes** | Rotate the KV data key now. Values are re-encrypted in the background with no job restarts. Takes an optional `idempotency_key`. |
 | `legion_node_claims` | no | A node's live provisional (unratified) allocations, meaning work that started but is not yet confirmed ([edge-boot.md](edge-boot.md)). Tells "still booting" apart from "already confirmed". |
+| `legion_exec_key_list` | no | Delegated exec minting keys: id, job glob, and ticket ceilings. Needs `acl:read`. |
 | `legion_boot_ticket_list` | no | Outstanding boot tickets (metadata only. Token bytes are never stored or returned). |
 | `legion_service_list` | no | List declared services with healthy/total endpoint counts, which is what a job can connect to. |
 | `legion_service_resolve` | no | Resolve a service to its endpoints (address, port, allocation, node, health). |
@@ -119,6 +120,8 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_boot_ticket_create` | **yes** | Mint a boot ticket: a short-lived capability that lets one edge node start one workload without a manager call ([edge-boot.md](edge-boot.md)). It can only be revoked by expiry, so prefer short TTLs. Supports `idempotency_key`. |
 | `legion_exec_run` | **yes** | Run a one-shot command in a running allocation and return stdout, stderr, and the exit code ([exec-and-actions.md](exec-and-actions.md)). Takes `instance_id` in place of `allocation_id` to reach an instance's current allocation. Needs `exec:write` (with `host` for host-level runtimes). |
 | `legion_action_run` | **yes** | Run a declared action one-shot; the manager renders its argv. Takes `instance_id` like `legion_exec_run`. Needs `action:write` (or `exec:write`). |
+| `legion_exec_key_create` | **yes** | Register a platform's P-256 public key so workers accept exec tickets it signs for jobs matching a glob, never in a host-level runtime ([delegated minting keys](exec-and-actions.md#delegated-minting-keys)). Needs `acl:write`. Supports `idempotency_key`. |
+| `legion_exec_key_delete` | **yes** | Delete a delegated exec key; workers drop it and end its sessions on their next heartbeat. Needs `acl:write`. Supports `idempotency_key`. |
 | `legion_exec_ticket_mint` | **yes** | Mint an exec ticket for [direct exec](exec-and-actions.md#direct-exec): one session, on the worker running the target, with no manager on the data path. Authorized like `legion_exec_run` (or `legion_action_run` for an action ticket); writes nothing to the cluster. Returns the ticket, the worker address, the node name to verify, and the cluster CA. Single use, 60s to redeem by default. |
 
 Tool errors come back in-band (`result.isError = true` with a text payload),

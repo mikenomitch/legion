@@ -80,6 +80,57 @@ fn one() -> u32 {
     1
 }
 
+/// The prefix of a delegated exec key's id, and so of the `kid` a ticket
+/// signed with one carries.
+pub const EXEC_KEY_PREFIX: &str = "xk_";
+
+/// A new delegated key id (`xk_` and 16 random characters).
+pub fn new_exec_key_id() -> String {
+    format!(
+        "{EXEC_KEY_PREFIX}{}",
+        crate::util::random_string(16).to_lowercase()
+    )
+}
+
+/// The DER prefix of every P-256 SubjectPublicKeyInfo: the
+/// `id-ecPublicKey` / `prime256v1` algorithm identifier and the bit-string
+/// header of a 65-byte uncompressed point.
+const P256_SPKI_PREFIX: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
+
+/// Checks that `pem` is one P-256 public key (SPKI, `-----BEGIN PUBLIC
+/// KEY-----`), the only kind an ES256 ticket can be verified with.
+pub fn validate_p256_public_key(pem: &str) -> anyhow::Result<()> {
+    use base64::Engine;
+    let body: String = pem
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| *line != "-----BEGIN PUBLIC KEY-----")
+        .skip(1)
+        .take_while(|line| *line != "-----END PUBLIC KEY-----")
+        .collect();
+    if body.is_empty() {
+        anyhow::bail!(
+            "the public key must be PEM with a `-----BEGIN PUBLIC KEY-----` block \
+             (`openssl ec -in key.pem -pubout`)"
+        );
+    }
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(|err| anyhow::anyhow!("the public key PEM is not valid base64: {err}"))?;
+    if der.len() != P256_SPKI_PREFIX.len() + 65
+        || der[..P256_SPKI_PREFIX.len()] != P256_SPKI_PREFIX
+        || der[P256_SPKI_PREFIX.len()] != 0x04
+    {
+        anyhow::bail!("the public key is not a P-256 (prime256v1) key; exec tickets are ES256");
+    }
+    jsonwebtoken::DecodingKey::from_ec_pem(pem.as_bytes())
+        .map_err(|err| anyhow::anyhow!("unusable public key: {err}"))?;
+    Ok(())
+}
+
 /// A new ticket id (`ext_` and 24 random characters).
 pub fn new_exec_ticket_id() -> String {
     format!("ext_{}", crate::util::random_string(24).to_lowercase())
@@ -163,6 +214,17 @@ mod exec_ticket_test {
         assert_eq!(map["legion.io/alloc"], 88213);
         assert_eq!(ExecTicketClaims::from_claims(&map).unwrap(), claims());
         assert_eq!(claims().accessor(), Some("7c1f"));
+    }
+
+    #[test]
+    fn only_p256_public_keys_are_accepted_test() {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        validate_p256_public_key(&key.public_key_pem()).unwrap();
+        let p384 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        assert!(validate_p256_public_key(&p384.public_key_pem()).is_err());
+        // A private key is not a public key.
+        assert!(validate_p256_public_key(&key.serialize_pem()).is_err());
+        assert!(validate_p256_public_key("not a key").is_err());
     }
 
     #[test]

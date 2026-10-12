@@ -9998,6 +9998,18 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   execSessions: ExecSessionRef[] = [];
 
+  /**
+   * The version of the delegated exec keys this worker holds
+   * (`HeartbeatReply.exec_keys_version`). A worker that admits exec tickets
+   * sends `"none"` until it has received a set; a worker that does not
+   * sends nothing, and the manager skips the lookup.
+   *
+   * Default: empty (the worker does not admit exec tickets).
+   *
+   * @generated from field: string exec_keys_version = 17;
+   */
+  execKeysVersion = "";
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10022,6 +10034,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 14, name: "content_locations", kind: "message", T: ContentLocationReport, opt: true },
     { no: 15, name: "exec_audit", kind: "message", T: ExecAuditRecord, repeated: true },
     { no: 16, name: "exec_sessions", kind: "message", T: ExecSessionRef, repeated: true },
+    { no: 17, name: "exec_keys_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -11307,6 +11320,25 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   revokedExecSessions: RevokedExecSession[] = [];
 
+  /**
+   * The current set of delegated exec keys, sent only when
+   * `HeartbeatRequest.exec_keys_version` was non-empty and differs from
+   * `exec_keys_version` below. The worker replaces its set with this one,
+   * so a deleted key stops working on its next heartbeat. Empty with a
+   * changed version means no keys.
+   *
+   * @generated from field: repeated legion.ExecKey exec_keys = 13;
+   */
+  execKeys: ExecKey[] = [];
+
+  /**
+   * The version `exec_keys` describes. Empty when the request carried no
+   * version.
+   *
+   * @generated from field: string exec_keys_version = 14;
+   */
+  execKeysVersion = "";
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11327,6 +11359,8 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 10, name: "content_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 11, name: "cluster_ca_pin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 12, name: "revoked_exec_sessions", kind: "message", T: RevokedExecSession, repeated: true },
+    { no: 13, name: "exec_keys", kind: "message", T: ExecKey, repeated: true },
+    { no: 14, name: "exec_keys_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -21079,6 +21113,393 @@ export class MintExecTicketReply extends Message<MintExecTicketReply> {
 
   static equals(a: MintExecTicketReply | PlainMessage<MintExecTicketReply> | undefined, b: MintExecTicketReply | PlainMessage<MintExecTicketReply> | undefined): boolean {
     return proto3.util.equals(MintExecTicketReply, a, b);
+  }
+}
+
+/**
+ * A delegated exec minting key.
+ *
+ * @generated from message legion.ExecKey
+ */
+export class ExecKey extends Message<ExecKey> {
+  /**
+   * `xk_` and random characters. A ticket signed with this key carries it as
+   * its JWT `kid` header and `sub = "key:<id>"`.
+   *
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  /**
+   * A label for people, e.g. `"agents-platform"`.
+   *
+   * @generated from field: string name = 2;
+   */
+  name = "";
+
+  /**
+   * Glob over job names the key's tickets may open sessions in,
+   * e.g. `"agents-*"`.
+   *
+   * @generated from field: string jobs = 3;
+   */
+  jobs = "";
+
+  /**
+   * The ES256 (P-256) public key, SPKI PEM.
+   *
+   * @generated from field: string public_key_pem = 4;
+   */
+  publicKeyPem = "";
+
+  /**
+   * The longest redeem window (`exp - iat`) a ticket may have.
+   *
+   * @generated from field: uint64 max_ttl_seconds = 5;
+   */
+  maxTtlSeconds = protoInt64.zero;
+
+  /**
+   * The longest `legion.io/max_session` a ticket may name.
+   *
+   * @generated from field: uint64 max_session_seconds = 6;
+   */
+  maxSessionSeconds = protoInt64.zero;
+
+  /**
+   * Who created it: `accessor:<id>` or `principal:<name>`.
+   *
+   * @generated from field: string created_by = 7;
+   */
+  createdBy = "";
+
+  /**
+   * RFC 3339 UTC.
+   *
+   * @generated from field: string created_at = 8;
+   */
+  createdAt = "";
+
+  constructor(data?: PartialMessage<ExecKey>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecKey";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "jobs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "public_key_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "max_ttl_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 6, name: "max_session_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "created_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecKey {
+    return new ExecKey().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecKey {
+    return new ExecKey().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecKey {
+    return new ExecKey().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecKey | PlainMessage<ExecKey> | undefined, b: ExecKey | PlainMessage<ExecKey> | undefined): boolean {
+    return proto3.util.equals(ExecKey, a, b);
+  }
+}
+
+/**
+ * Request payload for CreateExecKey.
+ *
+ * @generated from message legion.CreateExecKeyRequest
+ */
+export class CreateExecKeyRequest extends Message<CreateExecKeyRequest> {
+  /**
+   * A label for people. Optional.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Glob over job names, e.g. `"agents-*"`. Required.
+   *
+   * @generated from field: string jobs = 2;
+   */
+  jobs = "";
+
+  /**
+   * The ES256 (P-256) public key, SPKI PEM (`openssl ec -pubout`). Required.
+   *
+   * @generated from field: string public_key_pem = 3;
+   */
+  publicKeyPem = "";
+
+  /**
+   * Ceiling on a ticket's redeem window, e.g. `"5m"`. Default and ceiling:
+   * the manager's `exec.tickets.maxTtl` (10m).
+   *
+   * @generated from field: string max_ttl = 4;
+   */
+  maxTtl = "";
+
+  /**
+   * Ceiling on a ticket's session length, e.g. `"30m"`. Default and ceiling:
+   * the manager's `exec.tickets.maxSession` (1h).
+   *
+   * @generated from field: string max_session = 5;
+   */
+  maxSession = "";
+
+  /**
+   * Retry-safe create: a repeat with the same key returns the same key.
+   *
+   * @generated from field: optional string idempotency_key = 6;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<CreateExecKeyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateExecKeyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "jobs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "public_key_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "max_ttl", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "max_session", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateExecKeyRequest {
+    return new CreateExecKeyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateExecKeyRequest {
+    return new CreateExecKeyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateExecKeyRequest {
+    return new CreateExecKeyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateExecKeyRequest | PlainMessage<CreateExecKeyRequest> | undefined, b: CreateExecKeyRequest | PlainMessage<CreateExecKeyRequest> | undefined): boolean {
+    return proto3.util.equals(CreateExecKeyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for CreateExecKey.
+ *
+ * @generated from message legion.CreateExecKeyReply
+ */
+export class CreateExecKeyReply extends Message<CreateExecKeyReply> {
+  /**
+   * @generated from field: legion.ExecKey key = 1;
+   */
+  key?: ExecKey;
+
+  /**
+   * True when this answered a retry of an earlier create.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<CreateExecKeyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateExecKeyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "message", T: ExecKey },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateExecKeyReply {
+    return new CreateExecKeyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateExecKeyReply {
+    return new CreateExecKeyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateExecKeyReply {
+    return new CreateExecKeyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateExecKeyReply | PlainMessage<CreateExecKeyReply> | undefined, b: CreateExecKeyReply | PlainMessage<CreateExecKeyReply> | undefined): boolean {
+    return proto3.util.equals(CreateExecKeyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListExecKeys.
+ *
+ * @generated from message legion.ListExecKeysRequest
+ */
+export class ListExecKeysRequest extends Message<ListExecKeysRequest> {
+  constructor(data?: PartialMessage<ListExecKeysRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListExecKeysRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListExecKeysRequest {
+    return new ListExecKeysRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListExecKeysRequest {
+    return new ListExecKeysRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListExecKeysRequest {
+    return new ListExecKeysRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListExecKeysRequest | PlainMessage<ListExecKeysRequest> | undefined, b: ListExecKeysRequest | PlainMessage<ListExecKeysRequest> | undefined): boolean {
+    return proto3.util.equals(ListExecKeysRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListExecKeys, newest first.
+ *
+ * @generated from message legion.ListExecKeysReply
+ */
+export class ListExecKeysReply extends Message<ListExecKeysReply> {
+  /**
+   * @generated from field: repeated legion.ExecKey keys = 1;
+   */
+  keys: ExecKey[] = [];
+
+  constructor(data?: PartialMessage<ListExecKeysReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListExecKeysReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "keys", kind: "message", T: ExecKey, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListExecKeysReply {
+    return new ListExecKeysReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListExecKeysReply {
+    return new ListExecKeysReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListExecKeysReply {
+    return new ListExecKeysReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListExecKeysReply | PlainMessage<ListExecKeysReply> | undefined, b: ListExecKeysReply | PlainMessage<ListExecKeysReply> | undefined): boolean {
+    return proto3.util.equals(ListExecKeysReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteExecKey.
+ *
+ * @generated from message legion.DeleteExecKeyRequest
+ */
+export class DeleteExecKeyRequest extends Message<DeleteExecKeyRequest> {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  /**
+   * Retry-safe delete: a repeat with the same key reports `deduplicated`.
+   *
+   * @generated from field: optional string idempotency_key = 2;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<DeleteExecKeyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteExecKeyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteExecKeyRequest {
+    return new DeleteExecKeyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteExecKeyRequest {
+    return new DeleteExecKeyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteExecKeyRequest {
+    return new DeleteExecKeyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteExecKeyRequest | PlainMessage<DeleteExecKeyRequest> | undefined, b: DeleteExecKeyRequest | PlainMessage<DeleteExecKeyRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteExecKeyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteExecKey.
+ *
+ * @generated from message legion.DeleteExecKeyReply
+ */
+export class DeleteExecKeyReply extends Message<DeleteExecKeyReply> {
+  /**
+   * @generated from field: bool deduplicated = 1;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<DeleteExecKeyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteExecKeyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteExecKeyReply {
+    return new DeleteExecKeyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteExecKeyReply {
+    return new DeleteExecKeyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteExecKeyReply {
+    return new DeleteExecKeyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteExecKeyReply | PlainMessage<DeleteExecKeyReply> | undefined, b: DeleteExecKeyReply | PlainMessage<DeleteExecKeyReply> | undefined): boolean {
+    return proto3.util.equals(DeleteExecKeyReply, a, b);
   }
 }
 

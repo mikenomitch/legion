@@ -56,6 +56,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "delete_acl_policy",
     "delete_acl_token",
     "delete_acl_user",
+    "delete_exec_key",
     "delete_join_token",
     "delete_kv",
     "delete_node_tokens",
@@ -70,6 +71,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "handle_job_submits",
     "idempotency_record",
     "insert_acl_token",
+    "insert_exec_key",
     "insert_join_token",
     "insert_node",
     "insert_signing_key",
@@ -270,6 +272,7 @@ fn lane_for(method: &str) -> Lane {
         | "delete_acl_policy"
         | "delete_acl_token"
         | "delete_acl_user"
+        | "delete_exec_key"
         | "delete_join_token"
         | "delete_kv"
         | "delete_node_tokens"
@@ -281,6 +284,7 @@ fn lane_for(method: &str) -> Lane {
         | "handle_job_submits"
         | "idempotency_record"
         | "insert_acl_token"
+        | "insert_exec_key"
         | "insert_join_token"
         | "insert_node"
         | "insert_signing_key"

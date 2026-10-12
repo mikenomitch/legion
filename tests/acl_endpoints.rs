@@ -188,6 +188,10 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         // Direct exec: the same coarse gate as ExecAllocation, then its
         // precise job scope once the target is resolved.
         ("MintExecTicket", Plane::Protected("exec:write")),
+        // Delegated exec minting keys are credentials: the acl resource.
+        ("CreateExecKey", Plane::Protected("acl:write")),
+        ("ListExecKeys", Plane::Protected("acl:read")),
+        ("DeleteExecKey", Plane::Protected("acl:write")),
         ("ListJobActions", Plane::Protected("job:read")),
         ("GetArtifactCredential", Plane::Worker),
         ("GetIngressCertificates", Plane::Worker),
@@ -1133,6 +1137,32 @@ async fn call_endpoint(
                 MintExecTicketRequest {
                     allocation_id: 404,
                     command: vec!["true".into()],
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "CreateExecKey" => svc
+            .create_exec_key(req(
+                CreateExecKeyRequest {
+                    name: "acl-fixture".into(),
+                    jobs: "acl-*".into(),
+                    public_key_pem: "not a key".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListExecKeys" => svc
+            .list_exec_keys(req(ListExecKeysRequest {}, token))
+            .await
+            .map(|_| ()),
+        "DeleteExecKey" => svc
+            .delete_exec_key(req(
+                DeleteExecKeyRequest {
+                    id: "xk_missing".into(),
                     ..Default::default()
                 },
                 token,

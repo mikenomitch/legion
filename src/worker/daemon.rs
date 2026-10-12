@@ -431,13 +431,14 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let direct_exec = match (&jwks, exec_direct) {
         (Some(jwks), true) => {
             info!(worker = %name, "Direct exec enabled: this node accepts exec tickets");
-            Some(Arc::new(
-                crate::worker::direct_exec::ExecTicketVerifier::new(
-                    jwks.clone(),
-                    name.clone(),
-                    time::OffsetDateTime::now_utc().unix_timestamp(),
-                ),
-            ))
+            let verifier = Arc::new(crate::worker::direct_exec::ExecTicketVerifier::new(
+                jwks.clone(),
+                name.clone(),
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            ));
+            // The heartbeat keeps its delegated keys current.
+            crate::worker::direct_exec::register_verifier(verifier.clone());
+            Some(verifier)
         }
         _ => None,
     };
@@ -1651,6 +1652,7 @@ async fn heartbeat_tick(
                 .collect(),
             exec_audit: exec_audit.clone(),
             exec_sessions: crate::worker::direct_exec::open_sessions(),
+            exec_keys_version: crate::worker::direct_exec::keys_version(),
         }));
 
         let response = match client_clone.heartbeat(req).await {
@@ -1696,6 +1698,7 @@ async fn heartbeat_tick(
         let reply = response.into_inner();
         served_interval = reply.next_interval_seconds;
         crate::worker::direct_exec::apply_revocations(&reply.revoked_exec_sessions);
+        crate::worker::direct_exec::apply_exec_keys(&reply.exec_keys_version, &reply.exec_keys);
         if let Some(pending) = content_report {
             CONTENT_ADVERTISER
                 .lock()
@@ -4070,6 +4073,8 @@ mod tests {
             content_resync: false,
             cluster_ca_pin: String::new(),
             revoked_exec_sessions: Vec::new(),
+            exec_keys: Vec::new(),
+            exec_keys_version: String::new(),
             net_policies: Vec::new(),
             claim_verdicts: Vec::new(),
             next_interval_seconds: None,

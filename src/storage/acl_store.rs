@@ -9,7 +9,7 @@ use crate::storage::errors::StorageError;
 use crate::storage::store::Store;
 use crate::storage::Lane;
 use crate::structs::acl::parse_rules;
-use crate::structs::{AclPolicy, AclTokenInfo, AclUser};
+use crate::structs::{AclPolicy, AclTokenInfo, AclUser, ExecKey};
 
 use rusqlite::{named_params, OptionalExtension, Row};
 use time::format_description::well_known::Rfc3339;
@@ -670,6 +670,100 @@ impl Store {
             return Err(anyhow::Error::new(StorageError::not_found(
                 "acl_user", username,
             )));
+        }
+        Ok(())
+    }
+}
+
+// --- Delegated exec minting keys (sandbox-exec plan §6.5;
+// docs/exec-and-actions.md, "Delegated minting keys"). One control-lane row
+// per key: a platform's public key, the job glob its tickets may reach, and
+// their ceilings. Nothing here is secret.
+
+impl Store {
+    const EXEC_KEY_COLUMNS: &'static str = "id, name, jobs, public_key_pem, max_ttl_seconds, \
+         max_session_seconds, created_by, created_at";
+
+    fn exec_key_from_row(row: &Row) -> rusqlite::Result<ExecKey> {
+        Ok(ExecKey {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            jobs: row.get(2)?,
+            public_key_pem: row.get(3)?,
+            max_ttl_seconds: row.get::<_, i64>(4)?.max(0) as u64,
+            max_session_seconds: row.get::<_, i64>(5)?.max(0) as u64,
+            created_by: row.get(6)?,
+            created_at: row.get(7)?,
+        })
+    }
+
+    #[instrument(err, skip_all, fields(id = key.id))]
+    pub fn insert_exec_key(&self, key: &ExecKey) -> R<()> {
+        let key = key.clone();
+        self.replicated(Lane::Control, "insert_exec_key", move |s| {
+            s.insert_exec_key_apply(&key)
+        })
+    }
+
+    fn insert_exec_key_apply(&self, key: &ExecKey) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute(
+            "INSERT INTO exec_key (id, name, jobs, public_key_pem, max_ttl_seconds,
+                 max_session_seconds, created_by, created_at)
+             VALUES (:id, :name, :jobs, :public_key_pem, :max_ttl_seconds,
+                 :max_session_seconds, :created_by, :created_at);",
+            named_params! {
+                ":id": key.id,
+                ":name": key.name,
+                ":jobs": key.jobs,
+                ":public_key_pem": key.public_key_pem,
+                ":max_ttl_seconds": key.max_ttl_seconds as i64,
+                ":max_session_seconds": key.max_session_seconds as i64,
+                ":created_by": key.created_by,
+                ":created_at": key.created_at,
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn get_exec_key(&self, id: &str) -> R<Option<ExecKey>> {
+        let conn = self.read_connection()?;
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM exec_key WHERE id = ?;",
+                Self::EXEC_KEY_COLUMNS
+            ),
+            [id],
+            Self::exec_key_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Every key, newest first.
+    pub fn list_exec_keys(&self) -> R<Vec<ExecKey>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM exec_key ORDER BY created_at DESC, id ASC;",
+            Self::EXEC_KEY_COLUMNS
+        ))?;
+        let rows = stmt.query_map([], Self::exec_key_from_row)?;
+        Self::collect_rows(rows)
+    }
+
+    #[instrument(err, skip_all, fields(id))]
+    pub fn delete_exec_key(&self, id: &str) -> R<()> {
+        let id = id.to_owned();
+        self.replicated(Lane::Control, "delete_exec_key", move |s| {
+            s.delete_exec_key_apply(&id)
+        })
+    }
+
+    fn delete_exec_key_apply(&self, id: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        let deleted = conn.execute("DELETE FROM exec_key WHERE id = ?;", [id])?;
+        if deleted == 0 {
+            return Err(anyhow::Error::new(StorageError::not_found("exec_key", id)));
         }
         Ok(())
     }

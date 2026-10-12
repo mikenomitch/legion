@@ -575,6 +575,41 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "exec-ticket.sign",
+            cli: "legion exec-ticket sign --key <PEM> --key-id <ID> --node <N> --alloc <A> --job <J> --task <T>",
+            grpc: None,
+            summary: "Sign an exec ticket offline with a delegated exec key's private key (no \
+                      manager call).",
+            mutates: false,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "exec-key.create",
+            cli: "legion exec-key create --jobs <GLOB> --public-key <PEM>",
+            grpc: Some("Manager/CreateExecKey"),
+            summary: "Register a platform's public key for minting exec tickets for matching \
+                      jobs on non-host runtimes.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "exec-key.list",
+            cli: "legion exec-key list",
+            grpc: Some("Manager/ListExecKeys"),
+            summary: "List delegated exec minting keys and their ceilings.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "exec-key.delete",
+            cli: "legion exec-key delete <ID>",
+            grpc: Some("Manager/DeleteExecKey"),
+            summary: "Delete a delegated exec key; workers drop it and end its sessions on \
+                      their next heartbeat.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "action.list",
             cli: "legion action list <JOB>",
             grpc: Some("Manager/ListJobActions"),

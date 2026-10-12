@@ -1838,9 +1838,27 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] Found while building Phase 2: `legion ledger -j` prints a bare
         array, not the standard `{ok, data}` envelope AGENTS.md requires
         (`src/cmd/ledger.rs`).
-  - [ ] Phases 3 to 5: delegated minting keys, the gateway tier (shared
-        with the scaling plan's wake on request), and exec into unnamed
-        sessions after the scaling plan's Phase 6.
+  - [x] Phase 3: delegated minting keys. `CreateExecKey`, `ListExecKeys`,
+        `DeleteExecKey` (`acl:write` / `acl:read`, idempotency keys), the
+        `exec_key` control-lane table, keys delivered to workers by version
+        on the heartbeat, key-signed tickets checked against the job glob and
+        ceilings and refused for host-level runtimes, sessions ended when
+        their key is deleted, `legion exec-key create|list|delete`,
+        `legion exec-ticket sign`, and the MCP key tools (calls 16 to 20).
+        Docs: [exec-and-actions.md § Delegated minting keys](../docs/exec-and-actions.md#delegated-minting-keys).
+        Tests: `tests/worker_plane_e2e.rs` (a key reaches the worker, its
+        ticket is refused for a host-level job and another job's, and stops
+        verifying after delete),
+        `a_delegated_key_mints_only_inside_its_glob_and_ceilings_test`.
+  - [ ] Delegated keys: a positive end-to-end session on a non-host runtime
+        (a `container` task on runc). The e2e suite runs `exec` tasks, which
+        keys never reach, so the accept path is covered at the verifier
+        only: on a Linux host with runc, run a container job under
+        `exec = { direct = true }`, create a key for its job, sign with
+        `legion exec-ticket sign`, and present the ticket to `Worker/ExecTask`.
+  - [ ] Phases 4 and 5: the gateway tier (shared with the scaling plan's
+        wake on request), and exec into unnamed sessions after the scaling
+        plan's Phase 6.
 - [ ] **Gated sandboxes by default, with memory checkpoints**:
       [plan](plans/gated-sandbox-checkpoints-plan.md) (IN EXECUTION) ·
       [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Phases 1 to 4

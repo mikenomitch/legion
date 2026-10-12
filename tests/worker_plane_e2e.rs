@@ -503,4 +503,123 @@ fn direct_exec_runs_on_the_worker_and_ends_when_its_token_is_revoked_test() {
         "stdout={} stderr={stderr}",
         String::from_utf8_lossy(&output.stdout)
     );
+
+    // Delegated minting keys: a platform's key reaches the worker on a
+    // heartbeat, its tickets verify there with no manager call, and they
+    // never open a session in a host-level runtime, which an `exec` task is.
+    let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
+    let private = cluster.dir.path().join("platform.pem");
+    let public = cluster.dir.path().join("platform.pub");
+    std::fs::write(&private, pair.serialize_pem()).expect("write key");
+    std::fs::write(&public, pair.public_key_pem()).expect("write public key");
+    let created = cluster.cli_json(&[
+        "exec-key",
+        "create",
+        "--jobs",
+        "direct*",
+        "--max-ttl",
+        "2m",
+        "--public-key",
+        public.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(created["ok"], true, "{created}");
+    let key_id = created["data"]["keyId"]
+        .as_str()
+        .expect("key id")
+        .to_string();
+    cluster.wait_for("the worker to learn the exec key", || {
+        std::fs::read_to_string(cluster.dir.path().join("manager.log"))
+            .unwrap_or_default()
+            .contains("Exec keys updated: 1 key(s)")
+    });
+
+    let node = minted["data"]["node"].as_str().expect("node").to_string();
+    let sign = |job: &str| {
+        let out = cluster.cli(&[
+            "exec-ticket",
+            "sign",
+            "-j",
+            "--key",
+            private.to_str().expect("utf-8"),
+            "--key-id",
+            &key_id,
+            "--node",
+            &node,
+            "--alloc",
+            &allocation.to_string(),
+            "--job",
+            job,
+            "--task",
+            "main",
+            "--max-session",
+            "10m",
+            "--",
+            "true",
+        ]);
+        let signed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("sign JSON");
+        signed["data"]["ticket"]
+            .as_str()
+            .expect("ticket")
+            .to_string()
+    };
+    let reply = legion::structs::MintExecTicketReply {
+        worker_address: minted["data"]["worker"].as_str().expect("worker").into(),
+        node: node.clone(),
+        ca_pem: minted["data"]["caPem"].as_str().expect("ca").into(),
+        ..Default::default()
+    };
+    let present = |ticket: String| -> tonic::Status {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let mut worker = legion::cmd::exec_ticket::worker_client(&reply)
+                .await
+                .expect("dial worker");
+            let frame = legion::structs::ExecClientFrame {
+                frame: Some(legion::structs::exec_client_frame::Frame::Start(
+                    legion::structs::ExecStart {
+                        exec_ticket: ticket,
+                        ..Default::default()
+                    },
+                )),
+            };
+            worker
+                .exec_task(tokio_stream::iter(vec![frame]))
+                .await
+                .expect_err("refused")
+        })
+    };
+    let refused = present(sign("direct"));
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{refused:?}");
+    assert!(
+        refused
+            .message()
+            .contains("never reaches a host-level runtime"),
+        "{}",
+        refused.message()
+    );
+    let refused = present(sign("billing"));
+    assert!(
+        refused
+            .message()
+            .contains("mints tickets for jobs matching direct*"),
+        "{}",
+        refused.message()
+    );
+
+    // Deleted: the worker drops the key on its next heartbeat.
+    let deleted = cluster.cli_json(&["exec-key", "delete", &key_id]);
+    assert_eq!(deleted["ok"], true, "{deleted}");
+    cluster.wait_for("the worker to drop the exec key", || {
+        std::fs::read_to_string(cluster.dir.path().join("manager.log"))
+            .unwrap_or_default()
+            .matches("Exec keys updated: 0 key(s)")
+            .count()
+            >= 2
+    });
+    let refused = present(sign("direct"));
+    assert!(
+        refused.message().contains("does not hold"),
+        "{}",
+        refused.message()
+    );
 }

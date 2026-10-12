@@ -94,7 +94,7 @@ reports `aclEnabled: false`.
 | `kv` | KV entries and locks | get/list | put/patch/delete/locks |
 | `state` | raw state store, saved queries | SQL reads, schema | SQL writes, saved queries |
 | `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
-| `acl` | tokens, policies, users | list/get | create/update/delete |
+| `acl` | tokens, policies, users, delegated exec keys | list/get | create/update/delete |
 | `exec` | exec into a running allocation | n/a | open a session, or mint an exec ticket for one (`host = true` for host-level runtimes) |
 | `action` | run declared actions on an allocation | n/a | run an action (scope with `action_names`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |

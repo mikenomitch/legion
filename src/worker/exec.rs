@@ -309,12 +309,18 @@ fn admit_ticket(
         .lock()
         .map_err(|_| Status::internal("task manager lock poisoned"))?
         .exec_target(claims.allocation_id);
-    let Some((job, task)) = target else {
+    let Some((job, task, runtime)) = target else {
         return Err(refuse(format!(
             "allocation {} is not running on this node",
             claims.allocation_id
         )));
     };
+    if claims.sub.starts_with("key:") && crate::task_plugins::runtime_is_host_level(&runtime) {
+        return Err(refuse(format!(
+            "a delegated exec key never reaches a host-level runtime, and {job}/{task} runs \
+             `{runtime}`; mint through a manager with the host grant instead"
+        )));
+    }
     if job != claims.job || task != claims.task {
         return Err(refuse(format!(
             "allocation {} runs {job}/{task}, not {}/{}",

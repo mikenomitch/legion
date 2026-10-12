@@ -78,17 +78,200 @@ pub fn config() -> Command {
         )
         .arg(json_flag());
 
+    let sign_cmd = Command::new("sign")
+        .about("Sign an exec ticket offline with a delegated exec key's private key")
+        .arg(
+            Arg::new("key")
+                .long("key")
+                .value_name("FILE")
+                .required(true)
+                .value_hint(ValueHint::FilePath)
+                .help("The P-256 private key, PKCS#8 PEM"),
+        )
+        .arg(
+            Arg::new("key-id")
+                .long("key-id")
+                .value_name("ID")
+                .required(true)
+                .help("The key's id from `legion exec-key create` (xk_...)"),
+        )
+        .arg(
+            Arg::new("node")
+                .long("node")
+                .value_name("NODE")
+                .required(true)
+                .help("The node the session runs on"),
+        )
+        .arg(
+            Arg::new("alloc")
+                .long("alloc")
+                .value_name("ID")
+                .required(true)
+                .help("The allocation the session runs in"),
+        )
+        .arg(
+            Arg::new("job")
+                .long("job")
+                .value_name("JOB")
+                .required(true)
+                .help("The allocation's job (must match the key's glob)"),
+        )
+        .arg(
+            Arg::new("task")
+                .long("task")
+                .value_name("TASK")
+                .required(true)
+                .help("The allocation's task"),
+        )
+        .arg(
+            Arg::new("instance")
+                .long("instance")
+                .value_name("ID")
+                .help("The instance, for the audit record"),
+        )
+        .arg(
+            Arg::new("tty")
+                .short('t')
+                .long("tty")
+                .action(ArgAction::SetTrue)
+                .help("The session is interactive"),
+        )
+        .arg(
+            Arg::new("ttl")
+                .long("ttl")
+                .value_name("DURATION")
+                .default_value("60s")
+                .help("Redeem window (at most the key's maxTtl)"),
+        )
+        .arg(
+            Arg::new("max-session")
+                .long("max-session")
+                .value_name("DURATION")
+                .default_value("1h")
+                .help("Session length (at most the key's maxSession)"),
+        )
+        .arg(
+            Arg::new("command")
+                .value_name("COMMAND")
+                .num_args(1..)
+                .last(true)
+                .help("The command the ticket allows (after --); omit to allow any command"),
+        )
+        .arg(json_flag());
+
     Command::new("exec-ticket")
         .about("Mint exec tickets for direct exec")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(mint_cmd)
+        .subcommand(sign_cmd)
+}
+
+/// What `exec-ticket sign` puts in a ticket.
+pub struct SignRequest {
+    pub key_pem: String,
+    pub key_id: String,
+    pub node: String,
+    pub allocation_id: i64,
+    pub job: String,
+    pub task: String,
+    pub instance: Option<String>,
+    pub argv: Option<Vec<String>>,
+    pub tty: bool,
+    pub ttl: std::time::Duration,
+    pub max_session: std::time::Duration,
+}
+
+/// Signs an exec ticket with a delegated key's private half: the JWT a
+/// platform's own code would produce. Returns `(ticket, jti, exp)`.
+pub fn sign_delegated(request: &SignRequest, now_unix: i64) -> R<(String, String, i64)> {
+    let jti = crate::structs::exec_ticket::new_exec_ticket_id();
+    let exp = now_unix + request.ttl.as_secs() as i64;
+    let claims = crate::structs::exec_ticket::ExecTicketClaims {
+        sub: format!("key:{}", request.key_id),
+        jti: jti.clone(),
+        iat: now_unix,
+        exp,
+        node: request.node.clone(),
+        job: request.job.clone(),
+        task: request.task.clone(),
+        allocation_id: request.allocation_id,
+        instance: request.instance.clone(),
+        argv: request.argv.clone(),
+        action: None,
+        tty: request.tty,
+        max_session: request.max_session.as_secs(),
+        uses: 1,
+    };
+    let mut body = claims.to_claims();
+    body.insert(
+        "aud".into(),
+        json!([crate::structs::exec_ticket::EXEC_TICKET_AUDIENCE]),
+    );
+    body.insert("nbf".into(), json!(now_unix));
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    header.kid = Some(request.key_id.clone());
+    let key = jsonwebtoken::EncodingKey::from_ec_pem(request.key_pem.as_bytes())
+        .context("the signing key must be a P-256 private key in PKCS#8 PEM")?;
+    let ticket = jsonwebtoken::encode(&header, &body, &key).context("sign the exec ticket")?;
+    Ok((ticket, jti, exp))
+}
+
+async fn sign_cmd(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
+    let arg = |name: &str| matches.get_one::<String>(name).cloned().unwrap_or_default();
+    let key_path = arg("key");
+    let request = SignRequest {
+        key_pem: std::fs::read_to_string(&key_path)
+            .with_context(|| format!("could not read {key_path}"))?,
+        key_id: arg("key-id"),
+        node: arg("node"),
+        allocation_id: arg("alloc")
+            .parse()
+            .context("--alloc must be an allocation id")?,
+        job: arg("job"),
+        task: arg("task"),
+        instance: matches.get_one::<String>("instance").cloned(),
+        argv: matches
+            .get_many::<String>("command")
+            .map(|values| values.cloned().collect()),
+        tty: matches.get_flag("tty"),
+        ttl: humantime::parse_duration(&arg("ttl")).context("--ttl is not a duration")?,
+        max_session: humantime::parse_duration(&arg("max-session"))
+            .context("--max-session is not a duration")?,
+    };
+    let (ticket, jti, exp) =
+        sign_delegated(&request, time::OffsetDateTime::now_utc().unix_timestamp())?;
+    let expires_at = time::OffsetDateTime::from_unix_timestamp(exp)
+        .ok()
+        .and_then(|at| {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_default();
+    if format.is_json() {
+        output::print_success(&json!({
+            "ticket": ticket,
+            "jti": jti,
+            "node": request.node,
+            "allocationId": request.allocation_id,
+            "expiresAt": expires_at,
+        }));
+    } else {
+        println!(
+            "Exec ticket {jti}, redeemable on {} until {expires_at}:\n",
+            request.node
+        );
+        println!("  {ticket}");
+    }
+    Ok(())
 }
 
 #[instrument(err, skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     match matches.subcommand() {
         Some(("mint", sub)) => mint_cmd(sub).await,
+        Some(("sign", sub)) => sign_cmd(sub).await,
         _ => bail!("unknown exec-ticket subcommand"),
     }
 }

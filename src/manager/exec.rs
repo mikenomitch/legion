@@ -22,8 +22,9 @@ use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::{
-    exec_client_frame, ExecClientFrame, ExecServerFrame, ExecSessionRef, ExecStart, ExecWinsize,
-    MintExecTicketReply, MintExecTicketRequest, RevokedExecSession,
+    exec_client_frame, CreateExecKeyRequest, ExecClientFrame, ExecKey, ExecServerFrame,
+    ExecSessionRef, ExecStart, ExecWinsize, MintExecTicketReply, MintExecTicketRequest,
+    RevokedExecSession,
 };
 use crate::task_plugins::runtime_is_host_level;
 
@@ -404,6 +405,60 @@ fn bounded_duration(
     Ok(value)
 }
 
+/// Builds a delegated exec key from a `CreateExecKey` request
+/// (docs/exec-and-actions.md, "Delegated minting keys"). Its ceilings default
+/// to, and may not exceed, the manager's own `exec.tickets` ceilings.
+pub fn new_exec_key(
+    identity: &AclIdentity,
+    limits: &crate::structs::ExecTicketsConfigFull,
+    request: &CreateExecKeyRequest,
+    now: time::OffsetDateTime,
+) -> Result<ExecKey, Status> {
+    let jobs = request.jobs.trim();
+    if jobs.is_empty() {
+        return Err(Status::invalid_argument(
+            "jobs is required: a glob over the job names this key's tickets may reach, \
+             e.g. agents-*",
+        ));
+    }
+    crate::structs::exec_ticket::validate_p256_public_key(&request.public_key_pem)
+        .map_err(|err| Status::invalid_argument(format!("{err:#}")))?;
+    let max_ttl = bounded_duration("max_ttl", &request.max_ttl, limits.max_ttl, limits.max_ttl)?;
+    let max_session = bounded_duration(
+        "max_session",
+        &request.max_session,
+        limits.max_session,
+        limits.max_session,
+    )?;
+    Ok(ExecKey {
+        id: crate::structs::exec_ticket::new_exec_key_id(),
+        name: request.name.trim().to_string(),
+        jobs: jobs.to_string(),
+        public_key_pem: request.public_key_pem.trim().to_string() + "\n",
+        max_ttl_seconds: max_ttl.as_secs(),
+        max_session_seconds: max_session.as_secs(),
+        created_by: crate::structs::exec_ticket::subject_for(
+            identity.accessor_id.as_deref(),
+            &identity.principal,
+        ),
+        created_at: now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    })
+}
+
+/// The version string of a set of delegated keys, for
+/// `HeartbeatReply.exec_keys_version`. Keys are immutable, so their ids
+/// identify the set.
+pub fn exec_keys_version(keys: &[ExecKey]) -> String {
+    use sha2::Digest;
+    let mut ids: Vec<&str> = keys.iter().map(|key| key.id.as_str()).collect();
+    ids.sort_unstable();
+    let digest = sha2::Sha256::digest(ids.join("\n").as_bytes());
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("k{}-{hex}", keys.len())
+}
+
 /// Re-checks the direct sessions a worker reports on its heartbeat, as the
 /// proxied path re-checks its own every 30 seconds: the minting token must
 /// still exist, be unexpired, and grant the session. Returns the sessions
@@ -418,6 +473,16 @@ pub fn revoked_exec_sessions(
     let mut identities: HashMap<String, Result<AclIdentity, String>> = HashMap::new();
     let mut revoked = Vec::new();
     for session in sessions {
+        // A delegated key's sessions last as long as the key.
+        if let Some(key) = session.subject.strip_prefix("key:") {
+            if matches!(store.get_exec_key(key), Ok(None)) {
+                revoked.push(RevokedExecSession {
+                    jti: session.jti.clone(),
+                    reason: "the exec key that minted this session was deleted".into(),
+                });
+            }
+            continue;
+        }
         let Some(accessor) = session.subject.strip_prefix("accessor:") else {
             continue;
         };

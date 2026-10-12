@@ -368,3 +368,110 @@ values that were used.
 **Why (security).** An action's argv is rendered with its parameters, and a
 `sensitive` parameter is redacted on the proxied path. The worker cannot tell
 which words of the argv came from sensitive parameters, so it reports none.
+
+## 16. Workers learn delegated keys by version on the heartbeat, from a one-second cache
+
+*Implementation (Phase 3).*
+
+**Call.** A worker that admits tickets sends the version of the key set it
+holds (`HeartbeatRequest.exec_keys_version`, `"none"` at first). The manager
+answers with the full set only when the version differs, and reads the
+`exec_key` table at most once a second for all heartbeats. Workers that do
+not admit tickets send nothing and cost nothing.
+
+**Alternatives.** Send every key on every heartbeat (the plan's
+`HeartbeatReply.exec_keys`); push keys to workers on change.
+
+**Trade-off.** A key created through one manager reaches workers that
+heartbeat to another manager up to a second later, and the version string is
+one more field to keep in step.
+
+**Why (performance).** Keys change rarely and heartbeats are the hottest RPC
+in the cluster (5,000 a second at 10k workers). A version check makes the
+common beat free, and the cache keeps a direct-exec fleet to one small read a
+second. A push would need managers to track which workers to tell, which
+heartbeats already do.
+
+## 17. A delegated key's sessions end through the same heartbeat re-check as a token's
+
+*Implementation (Phase 3).*
+
+**Call.** A session minted by a key carries `sub = "key:<id>"`. When the
+worker reports it on a heartbeat, the manager checks the key still exists
+and, if not, revokes the session with "the exec key that minted this session
+was deleted". Workers also drop the key from their set, so its tickets stop
+verifying.
+
+**Alternative.** Only stop verifying new tickets, and let open sessions run
+to `max_session`.
+
+**Trade-off.** One store read per key per heartbeat on a node with open
+key-minted sessions.
+
+**Why (security).** Deleting a key is how an operator answers a leaked key,
+and a leaked key's open shells are the thing they most want gone. Reusing
+entry 6's re-check bounds both halves by one heartbeat with no new mechanism.
+
+## 18. The host-level exclusion is enforced on the worker, where the runtime is known
+
+*Implementation (Phase 3).*
+
+**Call.** A key carries no runtime list. The worker refuses a key-signed
+ticket when the target allocation runs a host-level runtime
+(`runtime_is_host_level`), with a message that names the runtime and says to
+mint through a manager.
+
+```text
+exec ticket rejected: a delegated exec key never reaches a host-level runtime, and direct/main runs `exec`; mint through a manager with the host grant instead
+```
+
+**Alternative.** Have the platform declare runtimes on the key, or check at
+`CreateExecKey`.
+
+**Trade-off.** The refusal comes at redemption, not at key creation, so a
+platform finds out on its first ticket for a host-level job.
+
+**Why (security and simplicity).** The plan's rule is "non-host runtimes",
+not a choice the key holder makes. Only the worker knows what the allocation
+it is about to enter runs, and a job's runtime can change on redeploy, so a
+check at key creation could not hold.
+
+## 19. Exec keys are `acl`-resource credentials, validated by their DER prefix
+
+*Implementation (Phase 3).*
+
+**Call.** `CreateExecKey` and `DeleteExecKey` take `acl:write` and
+`ListExecKeys` `acl:read`. A key must be a P-256 SubjectPublicKeyInfo, checked
+against its fixed 26-byte DER prefix before `jsonwebtoken` parses it. The
+store code lives in `acl_store.rs`, beside tokens.
+
+**Alternatives.** An `exec`-scoped grant (`exec:write` on the glob); a new
+crate to parse SPKI.
+
+**Trade-off.** Delegating exec to a platform needs an ACL administrator, not
+just someone with exec on those jobs.
+
+**Why (security and simplicity).** The plan named `acl:write`: a key mints
+shell access for every matching job forever, which is the power to create
+credentials, not to use one. The DER prefix check refuses P-384 and RSA keys
+by name with no new dependency. `tests/raft_seam.rs` scans `store.rs` and
+`acl_store.rs` for replicated writes, so the code sits where the seam test
+sees it.
+
+## 20. `legion exec-ticket sign` signs offline, and is not an MCP tool
+
+*Implementation (Phase 3).*
+
+**Call.** A CLI helper signs a delegated ticket from a PKCS#8 private key
+file, with no manager call. MCP has create, list, and delete for keys, but
+no signing tool.
+
+**Alternative.** No signing helper (platforms write their own); an MCP
+signing tool.
+
+**Trade-off.** One more command whose output is a credential.
+
+**Why (simplicity).** A platform's own code signs in production, but an
+operator needs a way to test a key, and the end-to-end test needs one too.
+An MCP tool would mean handing a private key to the MCP server process,
+which defeats the point of a key that never leaves the platform.

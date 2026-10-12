@@ -29,8 +29,9 @@ use crate::structs::manager_server::Manager;
 use crate::structs::{
     validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
     AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
-    AllocationLog, BootTicket, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
-    CreateInstancesRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteKvReply,
+    AllocationLog, BootTicket, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply,
+    CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, DeleteExecKeyReply,
+    DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteKvReply,
     DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply,
     DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
     DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
@@ -56,31 +57,31 @@ use crate::structs::{
     JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
     JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvJobReference,
     KvValueType, LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply,
-    ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply,
-    ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
-    ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply,
-    ListKvRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply,
-    ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
-    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
-    ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest,
-    ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest,
-    MintExecTicketReply, MintExecTicketRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
-    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
-    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
-    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
-    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
-    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
-    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
-    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
-    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
-    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
-    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply,
+    ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply,
+    ListJobSpecHistoryRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply,
+    ListJobsRequest, ListKvReply, ListKvRequest, ListNodeUsageReply, ListNodeUsageRequest,
+    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
+    ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest,
+    ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
+    ListVolumesReply, ListVolumesRequest, MintExecTicketReply, MintExecTicketRequest, Node,
+    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
+    PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent,
+    RaftStatus, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest,
+    RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest,
+    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
+    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
+    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RotateMeshCaReply,
+    RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest,
+    SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, ServiceEdge,
+    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
+    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
+    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
+    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
@@ -124,6 +125,9 @@ pub use snapshot_rpcs::{
     checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
 };
 pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, IdleSweeper};
+
+/// The delegated exec keys as last read, their version, and when.
+type CachedExecKeys = (std::time::Instant, String, Vec<crate::structs::ExecKey>);
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     error!("{action}: {:?}", err);
@@ -1481,6 +1485,9 @@ pub struct ManagerDaemonService {
     exec_enabled: bool,
     /// Direct-exec ticket lifetimes (`exec.tickets`).
     exec_tickets: crate::structs::ExecTicketsConfigFull,
+    /// The delegated exec keys and their version, re-read at most once a
+    /// second for heartbeats (only workers that admit exec tickets ask).
+    exec_keys: Arc<Mutex<Option<CachedExecKeys>>>,
     /// Edge boot settings (`edgeBoot`, docs/edge-boot.md). Disabled by
     /// default: with `enabled: false` no ticket can be minted and no claim
     /// ratified, so a cluster that upgrades and changes nothing grows no new
@@ -1568,6 +1575,7 @@ impl ManagerDaemonService {
             )),
             exec_enabled: true,
             exec_tickets: crate::structs::ExecTicketsConfigFull::default(),
+            exec_keys: Arc::new(Mutex::new(None)),
             edge_boot: crate::structs::EdgeBootConfigFull::default(),
             provisional_claims: Arc::new(Mutex::new(HashMap::new())),
             ca_pin_cache: Arc::new(Mutex::new(None)),
@@ -1584,6 +1592,40 @@ impl ManagerDaemonService {
 
     /// The signing cluster CA's pin, cached for a few seconds (see
     /// `ca_pin_cache`). Empty when no CA exists yet.
+    /// The delegated exec keys for a heartbeat that asked with `version`:
+    /// `(keys, current version)`, with no keys when the worker already holds
+    /// the current set. Cached for a second, so a fleet of direct-exec
+    /// workers costs one small read per second, not one per heartbeat.
+    fn exec_keys_for(&self, version: &str) -> (Vec<crate::structs::ExecKey>, String) {
+        if version.is_empty() {
+            return (Vec::new(), String::new());
+        }
+        let mut cache = self.exec_keys.lock().unwrap_or_else(|p| p.into_inner());
+        let fresh = cache
+            .as_ref()
+            .is_some_and(|(at, _, _)| at.elapsed() < Duration::from_secs(1));
+        if !fresh {
+            match self.store.list_exec_keys() {
+                Ok(keys) => {
+                    let current = crate::manager::exec::exec_keys_version(&keys);
+                    *cache = Some((std::time::Instant::now(), current, keys));
+                }
+                Err(err) => {
+                    debug!(error = ?err, "Error loading exec keys");
+                    return (Vec::new(), version.to_string());
+                }
+            }
+        }
+        let Some((_, current, keys)) = cache.as_ref() else {
+            return (Vec::new(), version.to_string());
+        };
+        if current == version {
+            (Vec::new(), current.clone())
+        } else {
+            (keys.clone(), current.clone())
+        }
+    }
+
     fn cluster_ca_pin(&self) -> String {
         const TTL: Duration = Duration::from_secs(5);
         let mut cache = self.ca_pin_cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -4217,6 +4259,128 @@ impl Manager for ManagerDaemonService {
         .map_err(|e| Status::internal(format!("mint task failed: {e}")))??;
         Ok(Response::new(reply))
     }
+
+    /// Register a delegated exec minting key (docs/exec-and-actions.md,
+    /// "Delegated minting keys").
+    #[instrument(skip_all)]
+    async fn create_exec_key(
+        &self,
+        request: Request<CreateExecKeyRequest>,
+    ) -> Result<Response<CreateExecKeyReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "create_exec_key", req.idempotency_key.as_deref());
+        if let Some(recorded) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            if let Some(key) = self
+                .store
+                .get_exec_key(&recorded)
+                .map_err(|e| map_store_error("Error loading exec key", e))?
+            {
+                return Ok(Response::new(CreateExecKeyReply {
+                    key: Some(key),
+                    deduplicated: true,
+                }));
+            }
+        }
+        let key = crate::manager::exec::new_exec_key(
+            &identity,
+            &self.exec_tickets,
+            &req,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        self.store
+            .insert_exec_key(&key)
+            .map_err(|e| map_store_error("Error storing exec key", e))?;
+        if !idempotency_key.is_empty() {
+            self.store
+                .idempotency_record(&idempotency_key, "create_exec_key", &key.id)
+                .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        }
+        *self.exec_keys.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        info!(
+            target: "exec_audit",
+            principal = %identity.principal,
+            accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
+            key_id = %key.id,
+            jobs = %key.jobs,
+            "exec key created"
+        );
+        Ok(Response::new(CreateExecKeyReply {
+            key: Some(key),
+            deduplicated: false,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_exec_keys(
+        &self,
+        request: Request<ListExecKeysRequest>,
+    ) -> Result<Response<ListExecKeysReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let keys = self
+            .store
+            .list_exec_keys()
+            .map_err(|e| map_store_error("Error listing exec keys", e))?;
+        Ok(Response::new(ListExecKeysReply { keys }))
+    }
+
+    #[instrument(skip_all, fields(key_id = %request.get_ref().id))]
+    async fn delete_exec_key(
+        &self,
+        request: Request<DeleteExecKeyRequest>,
+    ) -> Result<Response<DeleteExecKeyReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "delete_exec_key", req.idempotency_key.as_deref());
+        if self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+            .is_some()
+        {
+            return Ok(Response::new(DeleteExecKeyReply { deduplicated: true }));
+        }
+        self.store
+            .delete_exec_key(&req.id)
+            .map_err(|e| map_store_error("Error deleting exec key", e))?;
+        if !idempotency_key.is_empty() {
+            self.store
+                .idempotency_record(&idempotency_key, "delete_exec_key", &req.id)
+                .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        }
+        *self.exec_keys.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        info!(
+            target: "exec_audit",
+            principal = %identity.principal,
+            accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
+            key_id = %req.id,
+            "exec key deleted"
+        );
+        Ok(Response::new(DeleteExecKeyReply {
+            deduplicated: false,
+        }))
+    }
     #[instrument(skip_all)]
     async fn list_job_actions(
         &self,
@@ -6809,6 +6973,8 @@ impl Manager for ManagerDaemonService {
             crate::manager::exec::revoked_exec_sessions(&self.store, &self.auth, &req.exec_sessions)
         };
 
+        let (exec_keys, exec_keys_version) = self.exec_keys_for(&req.exec_keys_version);
+
         let reply = HeartbeatReply {
             net_policies,
             message: "ack".into(),
@@ -6822,6 +6988,8 @@ impl Manager for ManagerDaemonService {
             content_resync,
             cluster_ca_pin: self.cluster_ca_pin(),
             revoked_exec_sessions,
+            exec_keys,
+            exec_keys_version,
         };
 
         Ok(Response::new(reply))

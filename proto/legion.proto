@@ -1178,6 +1178,38 @@ service Manager {
   //   `max_session`, or one above the manager's ceiling; bad action params.
   rpc MintExecTicket (MintExecTicketRequest) returns (MintExecTicketReply);
 
+  // Registers a delegated exec minting key (docs/exec-and-actions.md,
+  // "Delegated minting keys"): a platform's ES256 public key whose exec
+  // tickets workers accept for jobs matching `jobs`, with no manager call
+  // per ticket. One control-lane write per key, never per session.
+  //
+  // A key's tickets are narrower than the `exec:write` grant that could mint
+  // them: they never open a session in a host-level runtime (`exec`), their
+  // redeem window is at most `max_ttl`, and their sessions run at most
+  // `max_session`. Workers learn keys on their heartbeat, so a new key works
+  // on a node within one heartbeat interval.
+  //
+  // ACL: `acl:write` (a key is a credential that mints shell access).
+  // Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - PermissionDenied: caller lacks `acl:write`.
+  // - InvalidArgument: `public_key_pem` is not a P-256 public key; `jobs` is
+  //   empty; `max_ttl` or `max_session` is not a duration, is zero, or is
+  //   above the manager's `exec.tickets` ceiling.
+  rpc CreateExecKey (CreateExecKeyRequest) returns (CreateExecKeyReply);
+
+  // Lists delegated exec minting keys. Public keys are public; there is no
+  // secret to hide. ACL: `acl:read`.
+  rpc ListExecKeys (ListExecKeysRequest) returns (ListExecKeysReply);
+
+  // Deletes a delegated exec minting key. Workers stop accepting its tickets
+  // on their next heartbeat, and open sessions it minted end then too, with
+  // `PermissionDenied`. ACL: `acl:write`. Retry-safe with `idempotency_key`.
+  //
+  // Errors: PermissionDenied without `acl:write`; NotFound for an unknown id.
+  rpc DeleteExecKey (DeleteExecKeyRequest) returns (DeleteExecKeyReply);
+
   // Returns node + allocation view of cluster state (the "ledger").
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
 
@@ -4719,6 +4751,14 @@ message HeartbeatRequest {
   //
   // Default: empty list.
   repeated ExecSessionRef exec_sessions = 16;
+
+  // The version of the delegated exec keys this worker holds
+  // (`HeartbeatReply.exec_keys_version`). A worker that admits exec tickets
+  // sends `"none"` until it has received a set; a worker that does not
+  // sends nothing, and the manager skips the lookup.
+  //
+  // Default: empty (the worker does not admit exec tickets).
+  string exec_keys_version = 17;
 }
 
 // One finished (or refused-after-verification) direct exec session.
@@ -5208,6 +5248,17 @@ message HeartbeatReply {
   //
   // Default: empty list.
   repeated RevokedExecSession revoked_exec_sessions = 12;
+
+  // The current set of delegated exec keys, sent only when
+  // `HeartbeatRequest.exec_keys_version` was non-empty and differs from
+  // `exec_keys_version` below. The worker replaces its set with this one,
+  // so a deleted key stops working on its next heartbeat. Empty with a
+  // changed version means no keys.
+  repeated ExecKey exec_keys = 13;
+
+  // The version `exec_keys` describes. Empty when the request carried no
+  // version.
+  string exec_keys_version = 14;
 }
 
 // Why one allocation is being stopped.
@@ -8153,6 +8204,73 @@ message MintExecTicketReply {
 
   // Seconds the session may run once opened.
   uint64 max_session_seconds = 8;
+}
+
+// A delegated exec minting key.
+message ExecKey {
+  // `xk_` and random characters. A ticket signed with this key carries it as
+  // its JWT `kid` header and `sub = "key:<id>"`.
+  string id = 1;
+  // A label for people, e.g. `"agents-platform"`.
+  string name = 2;
+  // Glob over job names the key's tickets may open sessions in,
+  // e.g. `"agents-*"`.
+  string jobs = 3;
+  // The ES256 (P-256) public key, SPKI PEM.
+  string public_key_pem = 4;
+  // The longest redeem window (`exp - iat`) a ticket may have.
+  uint64 max_ttl_seconds = 5;
+  // The longest `legion.io/max_session` a ticket may name.
+  uint64 max_session_seconds = 6;
+  // Who created it: `accessor:<id>` or `principal:<name>`.
+  string created_by = 7;
+  // RFC 3339 UTC.
+  string created_at = 8;
+}
+
+// Request payload for CreateExecKey.
+message CreateExecKeyRequest {
+  // A label for people. Optional.
+  string name = 1;
+  // Glob over job names, e.g. `"agents-*"`. Required.
+  string jobs = 2;
+  // The ES256 (P-256) public key, SPKI PEM (`openssl ec -pubout`). Required.
+  string public_key_pem = 3;
+  // Ceiling on a ticket's redeem window, e.g. `"5m"`. Default and ceiling:
+  // the manager's `exec.tickets.maxTtl` (10m).
+  string max_ttl = 4;
+  // Ceiling on a ticket's session length, e.g. `"30m"`. Default and ceiling:
+  // the manager's `exec.tickets.maxSession` (1h).
+  string max_session = 5;
+  // Retry-safe create: a repeat with the same key returns the same key.
+  optional string idempotency_key = 6;
+}
+
+// Reply payload for CreateExecKey.
+message CreateExecKeyReply {
+  ExecKey key = 1;
+  // True when this answered a retry of an earlier create.
+  bool deduplicated = 2;
+}
+
+// Request payload for ListExecKeys.
+message ListExecKeysRequest {}
+
+// Reply payload for ListExecKeys, newest first.
+message ListExecKeysReply {
+  repeated ExecKey keys = 1;
+}
+
+// Request payload for DeleteExecKey.
+message DeleteExecKeyRequest {
+  string id = 1;
+  // Retry-safe delete: a repeat with the same key reports `deduplicated`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for DeleteExecKey.
+message DeleteExecKeyReply {
+  bool deduplicated = 1;
 }
 
 // Request payload for ListJobActions.
