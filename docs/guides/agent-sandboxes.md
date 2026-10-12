@@ -388,6 +388,27 @@ the running origin's too), so a harness should retry an interrupted model
 call. See [Gated sandboxes](../suspend-and-resume.md#gated-sandboxes) and
 [sandbox networking](../task-runtime-sandbox.md#networking).
 
+A gated or TAP sandbox can also serve ports, so the platform can reach a
+harness API or a preview of the dev server the agent started. Declare them
+in `network.ports`, and the node datapath owns each advertised port and
+dials into the guest for every connection (over vsock when gated, at the
+guest's bridge address on a TAP), after any ingress chain. The catalog
+lists the node's address and port. A resumed or forked sandbox serves them
+again through its new allocation, at the address and port the catalog lists
+for it. A loopback-only sandbox has nothing to dial, so submit
+refuses ports on it. See
+[Ingress into a sandbox](../network-handlers.md#ingress-into-a-sandbox).
+
+A gated sandbox also reaches the services it declares in
+`connect.upstreams`, the same way a container does:
+`$LEGION_UPSTREAM_<KEY>` and `<key>.svc.legion` both work in the guest, and
+they keep working after a resume or a fork. That is how a sandbox calls a
+platform service (a tool server, a model gateway) through Legion's policy
+and handlers without an egress rule for it. Only gated sandboxes have
+this. On a TAP or loopback-only sandbox the upstream env names the guest's
+own loopback, where nothing listens. See
+[Sandboxes](../network-handlers.md#sandboxes).
+
 Pick by what the sandbox needs from the network. If egress must be judged
 per sandbox by Legion's policy, run it gated. If the guest needs raw
 networking (a protocol the proxy can't carry, L2 adjacency, bulk
@@ -496,6 +517,34 @@ $ legion instance start user-42 --wait -j
 `instance list` shows the same thing as `active (resumed cold)`, and the UI
 as a **resumed cold** badge. See
 [when a resume cannot restore](../suspend-and-resume.md#when-a-resume-cannot-restore).
+
+### Resume on the next request
+
+Instead of calling `start` yourself, let the user's next request wake the
+sandbox. Add `wake` to the `suspend` block and declare the port the harness
+serves:
+
+```nickel
+network = { ports = [{ name = "http" }] },
+suspend = {
+  # ...as above...
+  wake = { port = "http", timeout = "30s" },
+},
+```
+
+and run a gateway in front of the fleet:
+
+```console
+$ legion start gateway --listen 0.0.0.0:443 --domain sandboxes.acme.dev \
+    --tls-cert wildcard.pem --tls-key wildcard-key.pem
+```
+
+A request for `https://user-42.sandboxes.acme.dev` reaches the gateway,
+which resumes `user-42`, holds the request until the harness accepts
+connections, and forwards it. Concurrent requests share one resume, and a
+resume that takes longer than `timeout` gets `503` with `Retry-After`.
+`POST /v1/wake/user-42` on the gateway wakes it without sending a request.
+See [the gateway](../gateway.md).
 
 ### Force a cold boot
 
@@ -917,7 +966,7 @@ a microVM matters:
 | Signal | What it sees | On a TAP-wired microVM |
 | --- | --- | --- |
 | `network` | Bytes through the node datapath, plus bytes the guest sends on its own NIC | Bytes the guest sends on its TAP (`rx_bytes` of `/sys/class/net/lgf...`) |
-| `connections` | Open connections through the datapath: ingress, and a gated sandbox's egress | Refused at submit. No datapath fronts the guest |
+| `connections` | Open connections through the datapath: ingress, and a gated sandbox's egress | Refused at submit. The guest's outbound connections leave on its own NIC, so a quiet model call would not count |
 | `cpu` | CPU at or above `cpuBelow` of the task's `cpu` | The VMM's CPU, which is the guest's |
 | `exec` | Open `exec` sessions and actions | Open sessions over the guest agent's vsock listener |
 
@@ -964,8 +1013,8 @@ So does `connections` on this sandbox:
 
 ```text
 Error: jobspec failed validation: task "workspace": suspend.idle.signals "connections" counts
-open connections through the node datapath, and this sandbox's traffic never crosses it
-(it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
+open connections through the node datapath, and this sandbox's outbound traffic never crosses
+it (it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
 (remove "connections", or run the sandbox gated, where a quiet model call through the egress
 proxy keeps it awake. Otherwise set idle.after longer than the call, or suspend from your
 platform, which knows when a call is in flight)

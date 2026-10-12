@@ -277,17 +277,19 @@ pub enum Observed {
 
 /// The resume watch's state: the identity it last applied. Each read of the
 /// disk goes through [`Watcher::observe`], which decides what changed and
-/// applies it. `on_restore` runs first on a restore, before anything else is
-/// refreshed: the guest agent uses it to close the relays the capture left
-/// dead, so clients reconnect through the restoring allocation's listener.
+/// applies it. `on_restore` runs first on a restore, with the new identity,
+/// before anything else is refreshed: the guest agent uses it to close the
+/// relays the capture left dead, so clients reconnect through the restoring
+/// allocation's listener, and to listen on any ingress port the restore
+/// added.
 pub struct Watcher<'a> {
     seen: Option<ResumeIdentity>,
     host: &'a dyn GuestHost,
-    on_restore: &'a (dyn Fn() + Sync),
+    on_restore: &'a (dyn Fn(&ResumeIdentity) + Sync),
 }
 
 impl<'a> Watcher<'a> {
-    pub fn new(host: &'a dyn GuestHost, on_restore: &'a (dyn Fn() + Sync)) -> Self {
+    pub fn new(host: &'a dyn GuestHost, on_restore: &'a (dyn Fn(&ResumeIdentity) + Sync)) -> Self {
         Watcher {
             seen: None,
             host,
@@ -317,7 +319,7 @@ impl<'a> Watcher<'a> {
             "legion-guest-resume: restored as allocation {}; refreshing identity",
             current.alloc_id
         );
-        (self.on_restore)();
+        (self.on_restore)(&current);
         let outcome = apply_resume(&current, self.host);
         let alloc_id = current.alloc_id;
         self.seen = Some(current);
@@ -328,7 +330,7 @@ impl<'a> Watcher<'a> {
 /// The watch loop the resume handler runs: remember the boot identity, then
 /// poll for a new one and apply it. Never returns.
 pub fn watch(device: &Path, host: &dyn GuestHost, poll: Duration) -> ! {
-    watch_with(device, host, poll, &|| {})
+    watch_with(device, host, poll, &|_| {})
 }
 
 /// [`watch`], running `on_restore` first on every restore (see
@@ -337,7 +339,7 @@ pub fn watch_with(
     device: &Path,
     host: &dyn GuestHost,
     poll: Duration,
-    on_restore: &(dyn Fn() + Sync),
+    on_restore: &(dyn Fn(&ResumeIdentity) + Sync),
 ) -> ! {
     let mut watcher = Watcher::new(host, on_restore);
     if let Ok(boot) = read_identity_fresh(device) {
@@ -573,6 +575,8 @@ mod tests {
                 token: format!("vault-for-{alloc_id}"),
             }],
             guest_addr: None,
+            ingress_ports: Vec::new(),
+            upstreams: Vec::new(),
         }
     }
 
@@ -769,7 +773,7 @@ mod tests {
     fn the_watcher_runs_the_restore_hook_only_on_a_restore() {
         let host = Recorder::default();
         let hooks = std::sync::atomic::AtomicUsize::new(0);
-        let hook = || {
+        let hook = |_: &ResumeIdentity| {
             hooks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         };
         let mut watcher = Watcher::new(&host, &hook);
@@ -827,6 +831,9 @@ mod tests {
                 ..Default::default()
             },
             dial,
+            Arc::new(agent::UnixListen {
+                base: dir.path().join("guest.sock"),
+            }),
         )?;
         let mut client = std::net::TcpStream::connect(started.proxy_addr)?;
         client.write_all(b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n")?;
@@ -837,16 +844,48 @@ mod tests {
         }
 
         let host = Recorder::default();
-        let relays = started.relays.clone();
-        let hook = move || {
-            relays.close_all();
+        // The restore also names an ingress port and an upstream the job
+        // added while the instance was suspended: the agent starts
+        // listening on both.
+        let free = || -> R<u16> {
+            Ok(std::net::TcpListener::bind("127.0.0.1:0")?
+                .local_addr()?
+                .port())
+        };
+        let (added, upstream) = (free()?, free()?);
+        let hook = |identity: &ResumeIdentity| {
+            let restored = started.restored(identity);
+            assert!(
+                restored.ingress_failed.is_empty(),
+                "{:?}",
+                restored.ingress_failed
+            );
+            assert!(
+                restored.upstream_failed.is_empty(),
+                "{:?}",
+                restored.upstream_failed
+            );
         };
         let mut watcher = Watcher::new(&host, &hook);
         watcher.observe(restored(7));
+        assert!(started.ingress.ports().is_empty());
         assert!(matches!(
-            watcher.observe(restored(8)),
+            watcher.observe(ResumeIdentity {
+                ingress_ports: vec![added],
+                upstreams: vec![crate::identity::GuestUpstream {
+                    port: upstream,
+                    vsock_port: None,
+                    vip: None,
+                }],
+                ..restored(8)
+            }),
             Observed::Restored { alloc_id: 8, .. }
         ));
+        assert_eq!(started.ingress.ports(), vec![added]);
+        assert_eq!(
+            started.upstreams.addresses(),
+            vec![std::net::SocketAddr::from(([127, 0, 0, 1], upstream))]
+        );
 
         // The client sees its connection end at once, not at a timeout.
         client.set_read_timeout(Some(Duration::from_secs(5)))?;

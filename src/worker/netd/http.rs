@@ -18,7 +18,11 @@
 //!    deadline, bounded retries for idempotent methods under a budget, a
 //!    weighted split by service tag, and outlier ejection of endpoints that
 //!    keep answering 5xx.
-//! 4. **The dial.** One upstream connection per request (no pooling yet),
+//! 4. **Credentials** (`connect.upstreams[].credentials`): each declared
+//!    header is dropped from what the task sent and set to the secret the
+//!    node holds. A header with no value yet fails the request with a local
+//!    `503` instead of sending it unauthenticated.
+//! 5. **The dial.** One upstream connection per request (no pooling yet),
 //!    TLS originated for `https://`/`tls://` targets, the `Host` header
 //!    rewritten to an external target's host so the origin accepts it.
 //!
@@ -30,7 +34,7 @@ use crate::structs::netpolicy::{
     parse_bytes, parse_duration, EffectiveChain, HandlerConfig, RequestFacts, Verdict, HANDLER_DLP,
     HANDLER_LOG, PROTOCOL_HTTP,
 };
-use crate::structs::{UpstreamHttpConfig, UpstreamTarget};
+use crate::structs::{UpstreamCredential, UpstreamHttpConfig, UpstreamTarget};
 use crate::worker::balance::{Balancer, Endpoint};
 use crate::worker::forwarder::ForwarderContext;
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
@@ -177,9 +181,10 @@ pub struct HttpSettings {
     /// in front of the task): selects the chain, the metric labels, and how
     /// denials are attributed.
     pub direction: &'static str,
-    /// For ingress into a gated task: dial the private port inside this
-    /// namespace.
-    pub netns: Option<PathBuf>,
+    /// For ingress: how a request reaches the task (its loopback, inside
+    /// its gated namespace when it has one, or a sandbox guest over vsock or
+    /// on its bridge). `None` dials the picked endpoint over TCP.
+    pub task: Option<crate::worker::netd::ingress::TaskTarget>,
     pub context: Arc<ForwarderContext>,
     pub balancer: Arc<dyn Balancer>,
     pub endpoints: Arc<Mutex<Vec<Endpoint>>>,
@@ -198,7 +203,14 @@ pub struct HttpSettings {
     /// The upstream's own handlers (`connect.upstreams[].handlers`); the
     /// external ones (`authz`, `proxy`) run per request after the chain's.
     pub handlers: Vec<HandlerConfig>,
+    /// `connect.upstreams[].credentials`: headers set on every request this
+    /// upstream sends, with values from the context's credential store.
+    pub credentials: Vec<UpstreamCredential>,
 }
+
+/// Headers to set on an outgoing request in place of whatever the task sent
+/// under the same names. Values are marked sensitive.
+type Injected = Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>;
 
 /// What a listener knows about one accepted connection.
 #[derive(Debug, Clone, Default)]
@@ -284,7 +296,7 @@ impl HttpSettings {
             key,
             target,
             direction: "egress",
-            netns: None,
+            task: None,
             context,
             balancer,
             endpoints,
@@ -300,7 +312,34 @@ impl HttpSettings {
             dlp,
             log_handler,
             handlers: handlers.to_vec(),
+            credentials: Vec::new(),
         }
+    }
+
+    /// The headers to inject on this request, read once so every attempt
+    /// (and a proxy hand-off) sends the same value even if a rotation lands
+    /// mid-request. `Err` names the first credential with no value: the
+    /// request must not leave without it.
+    fn injected_credentials(&self) -> Result<Injected, String> {
+        let mut out = Vec::with_capacity(self.credentials.len());
+        for credential in &self.credentials {
+            let header = credential.header.to_ascii_lowercase();
+            let value = self
+                .context
+                .credential_value(self.allocation_id, &self.key, credential)
+                .map_err(|error| format!("header {header}: {error}"))?;
+            let name = hyper::header::HeaderName::from_bytes(header.as_bytes())
+                .map_err(|_| format!("header {header}: not a valid header name"))?;
+            let mut value = hyper::header::HeaderValue::from_str(&format!(
+                "{}{}",
+                credential.prefix.as_deref().unwrap_or_default(),
+                value.expose()
+            ))
+            .map_err(|_| format!("header {header}: the value is not a valid header value"))?;
+            value.set_sensitive(true);
+            out.push((name, value));
+        }
+        Ok(out)
     }
 
     /// Settings for an ingress listener: HTTP/1.1 in front of the task's
@@ -308,18 +347,16 @@ impl HttpSettings {
     /// management (there is exactly one backend), no handlers yet.
     pub fn for_ingress(
         allocation_id: i64,
-        label: String,
-        private_port: u16,
-        netns: Option<PathBuf>,
+        task: crate::worker::netd::ingress::TaskTarget,
         context: Arc<ForwarderContext>,
         log_dir: Option<PathBuf>,
     ) -> Self {
         let mut settings = HttpSettings::new(
             allocation_id,
-            label,
+            task.label.clone(),
             Some(UpstreamTarget {
                 host: "127.0.0.1".to_string(),
-                port: private_port,
+                port: task.port,
                 tls: false,
                 http: true,
             }),
@@ -332,7 +369,7 @@ impl HttpSettings {
             log_dir,
         );
         settings.direction = "ingress";
-        settings.netns = netns;
+        settings.task = Some(task);
         settings
     }
 
@@ -504,6 +541,30 @@ fn denied_response(
         if let Ok(value) = hyper::header::HeaderValue::from_str(reason) {
             response.headers_mut().insert("legion-denied-reason", value);
         }
+    }
+    response
+}
+
+/// The local answer for a request whose credential the node does not hold:
+/// a `503` that names the upstream, the header, and why, so the caller sees
+/// a configuration problem rather than the origin's `401`.
+fn credential_unavailable_response(upstream: &str, problem: &str) -> Response<OutBody> {
+    let reason = format!("credential-unavailable: upstream {upstream} {problem}");
+    let body = json!({
+        "legion": {
+            "error": reason,
+            "upstream": upstream,
+            "source": "credential-unavailable",
+        }
+    });
+    let mut response = Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("content-type", "application/json")
+        .header("legion-denied-by", "credential-unavailable")
+        .body(full(body.to_string()))
+        .expect("static response");
+    if let Ok(value) = hyper::header::HeaderValue::from_str(&reason) {
+        response.headers_mut().insert("legion-denied-reason", value);
     }
     response
 }
@@ -684,6 +745,40 @@ async fn handle(
         }
     }
 
+    // 1c. Credentials. Read once, before the body and before any dial: a
+    // header the node holds no value for fails the request here, so it never
+    // reaches the origin (or a proxy) without its credential.
+    let injected = match settings.injected_credentials() {
+        Ok(injected) => injected,
+        Err(problem) => {
+            net_metrics::connection(direction, PROTOCOL_HTTP, "error");
+            note_edge_request(&settings, None, Some(503), started, 0);
+            debug!(
+                allocation_id = settings.allocation_id,
+                upstream = %settings.key,
+                problem = %problem,
+                "Credential unavailable; answering 503 without dialing"
+            );
+            if let Some(chain) = chain {
+                access_log(
+                    &settings,
+                    chain,
+                    &method,
+                    &path,
+                    host_header.as_deref(),
+                    503,
+                    "error",
+                    Some("credential-unavailable"),
+                    started,
+                    0,
+                    0,
+                )
+                .await;
+            }
+            return credential_unavailable_response(&settings.key, &problem);
+        }
+    };
+
     // Split the head from the body. The body is read fully either way (one
     // upstream connection per request, no streaming yet); `dlp` caps it.
     let (parts, body) = req.into_parts();
@@ -829,6 +924,7 @@ async fn handle(
             host_header.as_deref(),
             Some(&hand),
             None,
+            &injected,
         )
         .await;
         return match outcome {
@@ -1006,6 +1102,7 @@ async fn handle(
             host_header.as_deref(),
             None,
             mesh_endpoint.as_ref(),
+            &injected,
         );
         let outcome = match remaining {
             Some(remaining) => match tokio::time::timeout(remaining, attempt_future).await {
@@ -1171,7 +1268,11 @@ struct HandOff {
 /// Dial `addr`, send the request, and return the response with its body
 /// streamed through. `hand_off` sends it to a proxy instead of the origin;
 /// `mesh` dials a mesh endpoint with this node's certificate and names the
-/// workload in a PROXY v2 header before the request.
+/// workload in a PROXY v2 header before the request. On an ingress listener
+/// with neither, the request goes to the task itself ([`HttpSettings::task`]).
+/// `injected` replaces the task's own headers of the same names (credential
+/// injection).
+#[allow(clippy::too_many_arguments)]
 async fn attempt_request(
     settings: &Arc<HttpSettings>,
     addr: &str,
@@ -1180,33 +1281,8 @@ async fn attempt_request(
     host_header: Option<&str>,
     hand_off: Option<&HandOff>,
     mesh: Option<&Endpoint>,
+    injected: &Injected,
 ) -> Result<Response<OutBody>, AttemptError> {
-    let stream = match settings.netns.clone() {
-        Some(netns) => {
-            let socket: std::net::SocketAddr = addr
-                .parse()
-                .map_err(|_| AttemptError::Connect(format!("invalid address {addr}")))?;
-            crate::worker::netd::netns::connect_tcp(Some(netns), socket)
-                .await
-                .map_err(|err| AttemptError::Connect(err.to_string()))?
-        }
-        // A `proxy` handler's target comes from policy a job may append to,
-        // so it is dialed through the host guard. (An external target was
-        // already resolved and judged before the attempts; `addr` is the
-        // address that passed.)
-        None if hand_off.is_some() => {
-            crate::worker::netd::guard::dial_guarded(&settings.context, addr, DIAL_TIMEOUT)
-                .await
-                .map_err(AttemptError::Connect)?
-        }
-        None => match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => return Err(AttemptError::Connect(err.to_string())),
-            Err(_) => return Err(AttemptError::Connect("dial timed out".into())),
-        },
-    };
-    let _ = stream.set_nodelay(true);
-
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -1222,6 +1298,14 @@ async fn attempt_request(
         if HOP_BY_HOP.contains(&lower.as_str()) || lower == "host" {
             continue;
         }
+        // The task's own value for an injected header (a placeholder its
+        // SDK insisted on, or anything else) never leaves the node.
+        if injected.iter().any(|(injected, _)| *injected == *name) {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    for (name, value) in injected {
         builder = builder.header(name, value);
     }
     // The origin must see its own name, not the loopback the task dialed.
@@ -1245,6 +1329,35 @@ async fn attempt_request(
     let request = builder
         .body(full(body))
         .map_err(|err| AttemptError::Reset(err.to_string()))?;
+
+    // Ingress: the task itself, through its namespace, its VMM's vsock, or
+    // its bridge. A `proxy` hop and a mesh endpoint are dialed on the host,
+    // like any endpoint.
+    if hand_off.is_none() && mesh.is_none() {
+        if let Some(task) = settings.task.as_ref() {
+            let stream = task
+                .connect()
+                .await
+                .map_err(|err| AttemptError::Connect(format!("{err:#}")))?;
+            return send_over(TokioIo::new(stream), request).await;
+        }
+    }
+    // A `proxy` handler's target comes from policy a job may append to, so
+    // it is dialed through the host guard. (An external target was already
+    // resolved and judged before the attempts; `addr` is the address that
+    // passed.)
+    let stream = if hand_off.is_some() {
+        crate::worker::netd::guard::dial_guarded(&settings.context, addr, DIAL_TIMEOUT)
+            .await
+            .map_err(AttemptError::Connect)?
+    } else {
+        match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => return Err(AttemptError::Connect(err.to_string())),
+            Err(_) => return Err(AttemptError::Connect("dial timed out".into())),
+        }
+    };
+    let _ = stream.set_nodelay(true);
 
     if let Some(endpoint) = mesh {
         let connector = settings
@@ -1453,8 +1566,10 @@ mod integration {
     //! upstream, driven through the forwarder's public API.
 
     use crate::structs::netpolicy::{merge_policies, InlinePolicy, NetPolicyObject};
-    use crate::structs::AllocNetPolicy;
-    use crate::worker::forwarder::{ForwarderContext, UpstreamForwarder, UpstreamSpec};
+    use crate::structs::{AllocNetPolicy, UpstreamCredential};
+    use crate::worker::forwarder::{
+        ForwarderContext, SecretValue, UpstreamForwarder, UpstreamSpec,
+    };
     use crate::worker::netd::{Denials, NetPolicyCache};
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
@@ -1507,6 +1622,18 @@ mod integration {
                                 .unwrap_or_default()
                                 .to_string();
                             let method = req.method().to_string();
+                            // Every value of the two credential-shaped
+                            // headers, so a test can see both what was
+                            // injected and that nothing else survived.
+                            let auth = ["authorization", "x-api-key"]
+                                .iter()
+                                .flat_map(|name| {
+                                    req.headers().get_all(*name).iter().map(move |v| {
+                                        format!("{name}:{}", v.to_str().unwrap_or_default())
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
                             let body = req.into_body().collect().await.unwrap().to_bytes();
                             if path == "/flaky" && n < flaky {
                                 return Ok::<_, hyper::Error>(
@@ -1517,7 +1644,7 @@ mod integration {
                                 );
                             }
                             let text = format!(
-                                "{method} {path} host={host} body={}",
+                                "{method} {path} host={host} auth=[{auth}] body={}",
                                 String::from_utf8_lossy(&body)
                             );
                             Ok(Response::new(Full::new(Bytes::from(text))))
@@ -1619,9 +1746,11 @@ mod integration {
                 to: Some(format!("http://127.0.0.1:{origin}")),
                 http: Some(http),
                 handlers: vec![dlp],
+                credentials: Vec::new(),
                 vip: None,
                 canonical_port: None,
                 netns: None,
+                vsock: None,
             }])
             .await;
         assert_eq!(forwarder.active().len(), 1, "listener bound");
@@ -1689,6 +1818,205 @@ mod integration {
         );
     }
 
+    /// Credential injection: the node sets each declared header from the
+    /// value it holds, the task's own value never reaches the origin, and a
+    /// header with no value fails closed with a local 503 without dialing.
+    /// Submit validation only admits `https://` targets; the forwarder is
+    /// built directly here so a plaintext origin can see the headers.
+    #[tokio::test]
+    async fn credentials_are_injected_and_fail_closed_without_a_value() {
+        let (origin, hits) = start_origin(0).await;
+        let forwarder = UpstreamForwarder::new();
+        let context = forwarder.context();
+        let port = free_port().await;
+        let credentials: Vec<UpstreamCredential> = serde_json::from_value(serde_json::json!([
+            { "header": "authorization", "prefix": "Bearer ", "from": { "kv": "secrets/openai" } },
+            { "header": "x-api-key", "from": { "kv": "secrets/key" } },
+        ]))
+        .unwrap();
+        forwarder
+            .sync(&[UpstreamSpec {
+                allocation_id: 9,
+                service: "openai".into(),
+                local_port: port,
+                balance: "round_robin".into(),
+                to: Some(format!("http://127.0.0.1:{origin}")),
+                http: None,
+                handlers: Vec::new(),
+                credentials,
+                vip: None,
+                canonical_port: None,
+                netns: None,
+                vsock: None,
+            }])
+            .await;
+        let send = "GET /v1/models HTTP/1.1\r\nHost: x\r\nAuthorization: placeholder\r\nX-Api-Key: dummy\r\nx-api-key: dummy-2\r\n\r\n";
+
+        // Never fetched: 503, named, and the origin is never dialed.
+        let (status, head, body) = request(port, send).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(
+            head.contains("legion-denied-by: credential-unavailable"),
+            "{head}"
+        );
+        assert!(
+            body.contains("header authorization: kv secrets/openai not fetched yet"),
+            "{body}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no dial without a credential"
+        );
+
+        // One of two held is still not enough.
+        context.set_credential(
+            9,
+            "openai",
+            "authorization",
+            "secrets/openai",
+            1,
+            SecretValue::new("sk-live-1"),
+        );
+        let (status, _, body) = request(port, send).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("kv secrets/key not fetched yet"), "{body}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        // Both held: injected, the task's own values dropped.
+        context.set_credential(
+            9,
+            "openai",
+            "x-api-key",
+            "secrets/key",
+            1,
+            SecretValue::new("k-1"),
+        );
+        let (status, _, body) = request(port, send).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("auth=[authorization:Bearer sk-live-1,x-api-key:k-1]"),
+            "{body}"
+        );
+
+        // Rotation: the next request carries the new value.
+        context.set_credential(
+            9,
+            "openai",
+            "x-api-key",
+            "secrets/key",
+            2,
+            SecretValue::new("k-2"),
+        );
+        let (_, _, body) = request(port, send).await;
+        assert!(body.contains("x-api-key:k-2]"), "{body}");
+
+        // A transient fetch problem keeps the last good value, and says so.
+        context.set_credential_error(
+            9,
+            "openai",
+            "x-api-key",
+            "secrets/key",
+            "kv secrets/key could not be read".into(),
+            false,
+        );
+        let (status, _, body) = request(port, send).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            context.credential_problems(9)[0].contains("injecting the previous value"),
+            "{:?}",
+            context.credential_problems(9)
+        );
+
+        // A deleted key revokes it: 503 again, naming the key.
+        context.set_credential_error(
+            9,
+            "openai",
+            "x-api-key",
+            "secrets/key",
+            "kv secrets/key not found".into(),
+            true,
+        );
+        let before = hits.load(Ordering::SeqCst);
+        let (status, _, body) = request(port, send).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("kv secrets/key not found"), "{body}");
+        assert_eq!(hits.load(Ordering::SeqCst), before);
+        assert!(
+            context.credential_problems(9)[0].contains("requests on this upstream get 503"),
+            "{:?}",
+            context.credential_problems(9)
+        );
+
+        // Allocations that leave take their values with them.
+        context.retain_allocations(&std::collections::HashSet::new());
+        assert_eq!(context.credential_version(9, "openai", "authorization"), 0);
+        assert!(format!("{:?}", SecretValue::new("sk-live-1")).contains("redacted"));
+    }
+
+    /// A gated sandbox reaches its upstream over the VMM's vsock host
+    /// socket, and the same listener state injects the credential there, so
+    /// the key stays out of the guest and its memory checkpoints.
+    #[tokio::test]
+    async fn credentials_are_injected_on_a_gated_sandboxs_vsock_upstream() {
+        use tokio::net::UnixStream;
+        let (origin, _hits) = start_origin(0).await;
+        let forwarder = UpstreamForwarder::new();
+        let context = forwarder.context();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vsock.sock_20010");
+        let credentials: Vec<UpstreamCredential> = serde_json::from_value(serde_json::json!([
+            { "header": "authorization", "prefix": "Bearer ", "from": { "identity": "api" } },
+        ]))
+        .unwrap();
+        forwarder
+            .sync(&[UpstreamSpec {
+                allocation_id: 9,
+                service: "api".into(),
+                local_port: 20010,
+                balance: "round_robin".into(),
+                to: Some(format!("http://127.0.0.1:{origin}")),
+                http: None,
+                handlers: Vec::new(),
+                credentials,
+                vip: None,
+                canonical_port: None,
+                netns: None,
+                vsock: Some(path.clone()),
+            }])
+            .await;
+        context.set_credential(
+            9,
+            "api",
+            "authorization",
+            "identity api",
+            1_900_000_000,
+            SecretValue::new("eyJ.token"),
+        );
+
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream
+            .write_all(
+                b"GET /v1/x HTTP/1.1\r\nHost: x\r\nAuthorization: placeholder\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("the vsock upstream answered in time")
+        .unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(
+            text.contains("auth=[authorization:Bearer eyJ.token]"),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn l4_path_is_untouched_without_http() {
         // An external tcp:// upstream with no policy stays a byte splice.
@@ -1704,9 +2032,11 @@ mod integration {
                 to: Some(format!("tcp://127.0.0.1:{origin}")),
                 http: None,
                 handlers: Vec::new(),
+                credentials: Vec::new(),
                 vip: None,
                 canonical_port: None,
                 netns: None,
+                vsock: None,
             }])
             .await;
         let (status, _, body) =

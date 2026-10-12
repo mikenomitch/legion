@@ -15,7 +15,7 @@ use tracing::warn;
 use super::artifact::{validate_task_artifacts, ArtifactSpec};
 use super::band::Band;
 use super::instance::InstanceMode;
-use super::workload_identity::{validate_identities, WorkloadIdentity};
+use super::workload_identity::WorkloadIdentity;
 use super::{Job, PlannedAllocation, Submission};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Tabled)]
@@ -2913,12 +2913,28 @@ impl TaskConfig {
     }
 
     pub fn validate_identities(&self) -> R<()> {
-        validate_identities(
+        crate::structs::workload_identity::validate_identities_with(
             &self.name,
             &self.identities,
             self.is_stateful(),
             self.sandbox_refreshes_env_tokens(),
+            &self.injected_identity_names(),
         )
+    }
+
+    /// The identities this task's `connect.upstreams` credentials inject
+    /// (`from = { identity }`), each once.
+    pub fn injected_identity_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .connect
+            .iter()
+            .flat_map(|connect| connect.upstreams.iter())
+            .flat_map(|upstream| upstream.credentials.iter())
+            .filter_map(|credential| credential.identity_name())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     /// Validate artifacts declared on this task (artifact system plan):
@@ -3866,6 +3882,62 @@ mod tests {
             .validate_identities()
             .expect_err("empty audience must be rejected");
         assert!(err.to_string().contains("audience"), "{err}");
+    }
+
+    #[test]
+    fn an_identity_named_by_an_upstream_credential_needs_no_delivery_test() {
+        let task = |identities: serde_json::Value, from: serde_json::Value| -> TaskConfig {
+            let spec = serde_json::json!({
+                "name": "demo",
+                "task": {
+                    "runtime": "exec",
+                    "identities": identities,
+                    "connect": { "upstreams": [{
+                        "name": "api", "to": "https://api.example.com",
+                        "credentials": [{ "header": "authorization", "prefix": "Bearer ", "from": from }],
+                    }] },
+                }
+            });
+            let config: JobConfig = serde_json::from_value(spec).expect("should deserialize");
+            config.tasks[0].clone()
+        };
+
+        // Injection only: no env, no file.
+        let ok = task(
+            serde_json::json!([{ "name": "api", "audience": ["https://api.example.com"] }]),
+            serde_json::json!({ "identity": "api" }),
+        );
+        assert_eq!(ok.injected_identity_names(), vec!["api"]);
+        ok.validate_identities()
+            .expect("an injected identity needs no delivery");
+        ok.validate_connect().expect("connect validates");
+
+        // Not injected and not delivered is still an error, naming the way out.
+        let err = task(
+            serde_json::json!([{ "name": "api", "audience": ["https://api.example.com"] }]),
+            serde_json::json!({ "kv": "secrets/api" }),
+        )
+        .validate_identities()
+        .expect_err("an identity nobody receives");
+        assert!(err.to_string().contains("from = { identity"), "{err}");
+
+        // The credential must name a declared identity.
+        let err = task(
+            serde_json::json!([]),
+            serde_json::json!({ "identity": "api" }),
+        )
+        .validate_identities()
+        .expect_err("undeclared identity");
+        assert!(err.to_string().contains("declares no identities"), "{err}");
+
+        // A change mode has nothing to act on when only the node holds the token.
+        let err = task(
+            serde_json::json!([{ "name": "api", "audience": ["a"], "changeMode": "restart" }]),
+            serde_json::json!({ "identity": "api" }),
+        )
+        .validate_identities()
+        .expect_err("change mode without delivery");
+        assert!(err.to_string().contains("nothing to act on"), "{err}");
     }
 
     #[test]

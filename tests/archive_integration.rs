@@ -298,6 +298,10 @@ fn job(archive: &str, on_restore_failure: Option<&str>) -> JobConfig {
             durability: Some("store".into()),
             archive: Some(archive.into()),
             on_restore_failure: on_restore_failure.map(str::to_string),
+            wake: Some(legion::structs::suspend::WakeConfig {
+                port: "http".into(),
+                timeout: None,
+            }),
             ..Default::default()
         }),
         ..TaskConfig::new(TASK, "sandbox")
@@ -495,6 +499,8 @@ async fn a_manifest_only_instance_lives_in_the_bucket_until_started() -> R<()> {
     assert!(!info.named);
     assert_eq!(info.job_id, JOB);
     assert_eq!(info.checkpoint_id.as_deref(), Some(checkpoint.as_str()));
+    // The task's wake block still applies, so a gateway can wake it.
+    assert_eq!(info.wake.map(|wake| wake.port).as_deref(), Some("http"));
 
     // A named instance of the same task is archived slim: its id is a name.
     let (named, _, _) = cluster.archived(Some("user-7")).await?;

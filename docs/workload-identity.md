@@ -112,7 +112,11 @@ A full runnable example is at
 - `name` is required and unique within the task.
 - `audience` must be non-empty, because a token without an audience can be
   replayed against any relying party.
-- At least one of `env` or `file` must be set.
+- At least one of `env` or `file` must be set, unless a
+  `connect.upstreams` credential names the identity (`from = { identity =
+  "<name>" }`). Then the node injects the token into requests to that
+  upstream and the identity may have no delivery at all, and no
+  `changeMode`. See [Injecting a token into an upstream](#injecting-a-token-into-an-upstream).
 - `extraClaims` are static literals. Keys can't be a reserved JWT claim
   (`iss`/`sub`/`aud`/…) or use the `legion.io/*` namespace.
 - **Change mode and delivery must be compatible.** `env` with
@@ -317,6 +321,36 @@ is a single manager, and it is always primary.
    `FailedPrecondition`. The worker logs one warning, and the task starts
    without tokens. Job specs still validate, so you can declare identities
    before the cluster enables the feature.
+
+### Injecting a token into an upstream
+
+Some origins take a token in a header and nothing else: an internal API
+that verifies Legion JWTs, a cloud endpoint fronted by an STS. Instead of
+handing the token to the task and having it set the header, name the
+identity in an upstream credential and the node sets it:
+
+```nickel
+identities = [{ name = "api", audience = ["https://api.internal.example"], ttl = "15m" }],
+connect = {
+  upstreams = [{
+    name = "api",
+    to = "https://api.internal.example",
+    credentials = [
+      { header = "Authorization", prefix = "Bearer ", from = { identity = "api" } },
+    ],
+  }],
+},
+```
+
+The task calls `http://$LEGION_UPSTREAM_API/...` with no token. The node's
+forwarder fetches the token with `GetUpstreamCredentials` (the manager
+mints it from the scheduling record, as above), holds it in memory, and asks
+for a new one once less than half the TTL is left. The worker does not run a
+refresh loop or write a file for an identity with no `env` or `file`, so the
+token is never in the task, its checkpoints, or its snapshots. The reserved
+`legion` identity cannot be injected. Everything else about injection
+(fail-closed `503`, status, the `https://` requirement) is in
+[Credential injection](network-handlers.md#credential-injection).
 
 ### Sandboxes
 
@@ -655,6 +689,42 @@ per-task `sub` security boundary, so matchers accept only `kv` and
 > that is used right away and never stored. (Task-scoped `auth.identity` for
 > artifacts is not yet supported, because it needs the fetching allocation's
 > id passed in the request.)
+
+## The manager's own identity, and why Legion does not issue it
+
+Tasks and worker nodes receive identities that Legion issues. The manager is
+the other way round. Where it needs a cloud credential for itself, which today
+means shipping its state to object storage under
+[streaming persistence](persistence-streaming.md), it presents an identity
+issued by the platform it runs on: EKS IRSA, a SPIRE JWT-SVID, Vault, an EC2
+instance profile or an ECS task role. On EKS that takes no Legion config at
+all; elsewhere it is two environment variables:
+
+```ini
+# The manager's service unit
+Environment=AWS_ROLE_ARN=arn:aws:iam::123456789012:role/legion-manager-state
+Environment=AWS_WEB_IDENTITY_TOKEN_FILE=/run/spire/svid/jwt
+```
+
+There is deliberately no `managerIdentities` block, even though the symmetry
+with `nodeIdentities` makes one look natural:
+
+- Legion's signing key lives in the SQLite store that streaming persistence
+  backs up. A self-issued credential would mean that reading the store is
+  enough to overwrite its backups.
+- A restore runs before any store exists, so there would be no key and no
+  token to restore with.
+- AWS validates a token by fetching the issuer's JWKS from the manager, so the
+  manager's ability to back itself up would depend on the manager being
+  reachable.
+
+The general rule: **an identity may not be issued by the system it is used to
+protect.** Node identities satisfy it, because the manager is a separate trust
+root from the worker. The manager's own backups cannot satisfy it against the
+manager's own issuer.
+
+The resolution order, IAM policy and failure modes are in
+[Streaming persistence: Credentials](persistence-streaming.md#credentials).
 
 ## Provider integration cookbook
 

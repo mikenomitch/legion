@@ -109,6 +109,7 @@ suspend = {
   archive = "slim",               # "slim" | "manifestOnly": keep the record in the bucket (store only)
   idle = { after = "3m" },        # suspend automatically when quiet
   onPressure = true,              # let a short node suspend it instead of evicting
+  wake = { port = "http" },       # resume on a request through `legion start gateway`
 },
 ```
 
@@ -123,6 +124,7 @@ suspend = {
 | `archive` | none | Once a `durability = "store"` checkpoint is published, move its record out of the replicated store and into the bucket: `slim` keeps a small instance row, `manifestOnly` keeps nothing for an unnamed instance. See [Archiving idle instances](#archiving-idle-instances). |
 | `idle` | none | Suspend automatically once the instance has been quiet for `idle.after`. See [Idle policy](#idle-policy). |
 | `onPressure` | `false` | Let the node's memory pressure response suspend this instance (the `suspend` step) before it evicts anything. See [Under memory pressure](#under-memory-pressure). |
+| `wake` | none | `{ port, timeout = "30s" }`: requests through `legion start gateway` for this instance go to the `network.ports` label `port`, and a request for a suspended instance resumes it and is held until it serves. Without it, the gateway refuses the instance. See [Waking on a request](#waking-on-a-request). |
 
 Submit refuses anything the block cannot honor, with the fix in the hint:
 
@@ -281,7 +283,8 @@ every connection through its egress proxy. So it keeps an agent harness in a
 **gated** sandbox awake through a quiet model call, which is an outbound
 connection through the proxy, and a long streamed response counts as
 `network` activity the whole time it streams. A sandbox that is not gated
-has no datapath connections to count. See the next section.
+makes its outbound connections around the datapath, so there is nothing to
+count for a model call. See the next section.
 
 Suspending *during* a model call, and waking when it returns, needs the
 workload to say it is parked. That is the `hint` signal, which is not
@@ -296,7 +299,7 @@ sandbox differently from an `exec` or `container` task:
 | Signal | microVM on `none` or `tap` | Gated microVM | Dev mode (Apple `container`) |
 | --- | --- | --- | --- |
 | `network` | Bytes the guest sends on its TAP device, read from `/sys/class/net/<tap>/statistics/rx_bytes`. Nothing on `none` | Bytes through the egress proxy (and any ingress), as they move | Bytes the container sends, from `container stats` |
-| `connections` | **Refused at submit.** No datapath sees the guest's connections | Every open connection through the egress proxy, so a quiet model call keeps the sandbox awake | **Refused at submit** |
+| `connections` | **Refused at submit.** No datapath sees the guest's outbound connections (a TAP guest's advertised ports are fronted by the datapath, but counting only inbound would miss a quiet model call) | Every open connection through the egress proxy, and every open ingress connection to the guest's ports, so a quiet model call or a client waiting on a slow response keeps the sandbox awake | **Refused at submit** |
 | `cpu` | The VMM's CPU, which is the guest's | The same | The container VM's CPU, from `container stats` |
 | `exec` | Open `legion exec` and action sessions over the guest agent's vsock listener | The same | `legion exec` sessions |
 
@@ -314,8 +317,8 @@ Two rules follow, both checked at submit:
 
   ```text
   Error: jobspec failed validation: task "workspace": suspend.idle.signals "connections" counts
-  open connections through the node datapath, and this sandbox's traffic never crosses it
-  (it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
+  open connections through the node datapath, and this sandbox's outbound traffic never crosses
+  it (it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
   (remove "connections", or run the sandbox gated, where a quiet model call through the egress
   proxy keeps it awake. Otherwise set idle.after longer than the call, or suspend from your
   platform, which knows when a call is in flight) [code=InvalidArgument]
@@ -455,6 +458,31 @@ under 300 ms for a 1 GiB guest on local NVMe. A disk resume is a cold boot.
 
 `--cold` discards the checkpoint and boots fresh on the retained storage. It
 is the escape hatch when a checkpoint cannot be restored.
+
+### Waking on a request
+
+A task with `suspend.wake` resumes when a request for it reaches
+[`legion start gateway`](gateway.md). The gateway calls `StartInstance`,
+holds the request until the instance accepts connections on `wake.port`, and
+then forwards it, so a sleeping sandbox answers its link a moment later:
+
+```nickel
+suspend = {
+  idle = { after = "3m" },
+  wake = { port = "http", timeout = "30s" },
+},
+network = { ports = [{ name = "http" }] },
+```
+
+A sandbox's port is reachable when it runs gated or on a TAP (see
+[Ingress into a sandbox](network-handlers.md#ingress-into-a-sandbox)).
+Concurrent requests share one resume. Past `wake.timeout` the client gets
+`503` with `Retry-After`. A `stopped` instance is never woken this way. An
+[archived](#archiving-idle-instances) instance wakes the same way: its
+resume reads the archive manifest back first. `instance get` on a task with
+`wake` shows where each port is served while
+the instance runs. See [gateway.md](gateway.md) for addressing, `CONNECT`,
+the webhook, and errors.
 
 ### When a resume cannot restore
 
@@ -1305,6 +1333,36 @@ reset), the allocation reports `net_capture_unavailable`, and `legion net
 doctor` names the unbound socket. A transient bind error never turns a
 resume into a cold boot.
 
+**Advertised ports keep working.** The restoring allocation's ingress
+listeners dial the restored guest through its new socket (see
+[Ingress into a sandbox](network-handlers.md#ingress-into-a-sandbox)). The
+workload in the restored memory still listens on the ports it was captured
+with, even when the new placement assigned different numbers, so the
+checkpoint records them and the datapath dials those. Consumers keep using
+the advertised port the catalog lists for the new allocation. A port the
+new placement adds is handed to the guest agent on the identity disk. In
+`/legion/resume.env`, `LEGION_PORT_<label>` names the port the restored
+workload actually listens on, and `LEGION_ADDR_<label>` the new
+allocation's advertised address. A client connected at capture sees its
+connection close and reconnects. While the instance is suspended, nothing
+serves its advertised port. With `connections` in the idle signals, an open
+ingress connection keeps a gated sandbox awake like an open egress one.
+
+**Upstreams keep working.** The workload in the restored memory still dials
+the upstream loopback ports it was captured with. The checkpoint records
+them, and the restore tells the guest agent which local port the new
+allocation was assigned for each, which is where the new allocation's
+upstream listener is. The agent relays the old port to it from the first
+connection. The agent also listens on the new allocation's VIPs, and keeps
+relaying the old ones, so a resolver cache that still holds an old
+`<key>.svc.legion` answer works too. In `/legion/resume.env`,
+`LEGION_UPSTREAM_<KEY>` and `LEGION_UPSTREAM_PORT_<KEY>` name the loopback
+port the restored workload dials, and `LEGION_UPSTREAM_VIP_<KEY>` the new
+VIP. An upstream the job added while the instance was suspended gets its
+listener in the guest on restore. One the job removed stops working: its
+loopback port in the guest stays open, but the new allocation has no
+listener behind it.
+
 **Open connections reset.** A memory checkpoint closes every connection the
 guest has open through the datapath:
 
@@ -1812,6 +1870,16 @@ entries.
   expires. Keep TTLs short on tasks you fork. Secrets the origin loaded, ACL
   tokens it logged in for, open connections, and leases are copied too. Use
   `suspend.onResume` to drop them.
+- **Keep API keys out of the guest entirely.** A key the workload never
+  holds cannot be captured, forked, or published. For HTTP APIs, declare it
+  on an `https://` upstream with
+  [credential injection](network-handlers.md#credential-injection): the
+  node sets the header on the way out, from KV or as a workload-identity
+  token, and the value lives only in the worker's memory and on the TLS
+  connection to the origin. Rotation is a `legion kv put`, and no checkpoint
+  taken before or after it contains the key. This reaches `exec`,
+  `container`, and gated `sandbox` tasks; a TAP-wired or loopback-only
+  sandbox cannot reach its upstreams.
 
 ## Published checkpoint encryption
 
@@ -1974,7 +2042,7 @@ See [metrics](metrics.md#suspend-and-resume).
 | An idle instance never suspends | A listed signal keeps firing (an open `exec` session, a client holding a connection with `connections` listed, background CPU above `cpuBelow`) | Compare `instance get`'s idle since with what the task is doing, then adjust `signals` or `cpuBelow` |
 | `legion_idle_sweep_suspends_total{outcome="skipped"}` rising | The sweep found idle instances it could not suspend | The manager's debug log names why (a worker without the `checkpoint` capability, a memory checkpoint the node cannot take) |
 | Submit: `suspend.idle.signals "hint" is not implemented yet` | The workload's own idle signal is not available | Remove `hint`. Add `connections` to keep quiet datapath connections awake (ingress on any runtime, and egress on gated tasks, sandboxes included) |
-| Submit: `"connections" counts open connections through the node datapath, and this sandbox's traffic never crosses it` | A sandbox that is not gated has no datapath connections | Remove `connections`, or run the sandbox gated. Otherwise raise `after` or suspend from your platform |
+| Submit: `"connections" counts open connections through the node datapath, and this sandbox's outbound traffic never crosses it` | A sandbox that is not gated has no datapath connections | Remove `connections`, or run the sandbox gated. Otherwise raise `after` or suspend from your platform |
 | A TAP-wired sandbox never suspends | The guest keeps sending on its TAP (NTP, ARP, a chatty agent) | Compare `node usage`'s IDLE column with the guest's traffic, or drop `network` from `signals` |
 | Allocation fails: `sandbox needs TAP device lgf... on bridge br0: it exists and another process holds it` | The instance already runs a guest on this node | Stop the other allocation first |
 | Allocation fails: `bridge br0's sandbox range ... is full (N addresses leased on node w-03)` | Every address in the node's `sandbox.bridges.br0.range` is leased | Widen `range` in the worker config, or stop sandboxes on that node. See [Addressing](task-runtime-sandbox.md#addressing) |

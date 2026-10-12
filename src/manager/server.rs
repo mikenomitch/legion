@@ -49,13 +49,14 @@ use crate::structs::{
     GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
     GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest,
     GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IngressCertificate,
-    Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
-    IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest,
-    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
-    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
-    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetUpstreamCredentialsReply,
+    GetUpstreamCredentialsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply,
+    HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IngressCertificate, Instance,
+    InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply, IssueBootTicketRequest,
+    IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply,
+    IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest,
+    IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JobConfig,
+    JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
     JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvJobReference,
     KvValueType, LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply,
     ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply,
@@ -81,8 +82,9 @@ use crate::structs::{
     StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
     Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
     UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
-    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, UpstreamCredentialValue,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
+    WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
@@ -779,6 +781,9 @@ fn map_instance_info(
         // attach ([`attach_guest_address`]).
         guest_address: None,
         guest_bridge: None,
+        // Set by GetInstance only ([`attach_wake_and_endpoints`]).
+        endpoints: Vec::new(),
+        wake: None,
         named: instance.named,
         archived: suspend.manifest_url.is_some(),
         manifest_url: suspend.manifest_url,
@@ -1953,6 +1958,10 @@ impl ManagerDaemonService {
             .map(|task| task.network.as_ref().and_then(|n| n.ingress.as_ref()))
             .collect();
         enforce_kv_cert_read(identity, &ingress_chains)?;
+        enforce_kv_credential_read(
+            identity,
+            config.tasks.iter().filter_map(|task| task.connect.as_ref()),
+        )?;
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
@@ -6580,8 +6589,12 @@ impl Manager for ManagerDaemonService {
                 AclAction::Read,
                 &AclScope::job(&manifest.envelope.job_id),
             )?;
+            // Its task's `suspend.wake` block still applies: the gateway
+            // wakes an archived instance like any suspended one.
+            let mut info = manifest_only_instance_info(&manifest, &url);
+            attach_wake_and_endpoints(&self.store, &mut info);
             return Ok(Response::new(GetInstanceReply {
-                instance: Some(manifest_only_instance_info(&manifest, &url)),
+                instance: Some(info),
                 provisional: None,
                 provisional_node_id: String::new(),
             }));
@@ -6615,6 +6628,7 @@ impl Manager for ManagerDaemonService {
             &mut info,
             &guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner())),
         );
+        attach_wake_and_endpoints(&self.store, &mut info);
         if info.detail.is_none() {
             info.detail = idle_unmeasured.or(egress_unenforced);
         }
@@ -9499,6 +9513,116 @@ impl Manager for ManagerDaemonService {
         Ok(Response::new(GetIngressCertificatesReply { certificates }))
     }
 
+    #[instrument(skip_all, fields(node_id = %request.get_ref().node_id, credentials = request.get_ref().known.len()))]
+    async fn get_upstream_credentials(
+        &self,
+        request: Request<GetUpstreamCredentialsRequest>,
+    ) -> Result<Response<GetUpstreamCredentialsReply>, Status> {
+        // ACL: worker-plane endpoint (nodes fetch the KV secrets behind
+        // `connect.upstreams[].credentials` of allocations placed on them).
+        // The node never names a KV path: each one is derived below from the
+        // allocation's own connect declaration, which only a submitter
+        // holding `kv:read` on the path could have written.
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let req = request.into_inner();
+        acl::enforce_node_binding(&identity, &req.node_id)?;
+
+        let desired = build_desired_allocations(&self.store, &req.node_id, &[])
+            .map_err(|e| map_store_error("Error building desired allocations", e))?;
+        let declared: HashMap<i64, crate::structs::ConnectConfig> = desired
+            .iter()
+            .filter(|allocation| !allocation.task_connect.trim().is_empty())
+            .filter_map(|allocation| {
+                serde_json::from_str(&allocation.task_connect)
+                    .ok()
+                    .map(|connect| (allocation.allocation_id, connect))
+            })
+            .collect();
+
+        let credentials = req
+            .known
+            .iter()
+            .map(|known| {
+                let header = known.header.trim().to_ascii_lowercase();
+                let mut out = UpstreamCredentialValue {
+                    allocation_id: known.allocation_id,
+                    upstream: known.upstream.clone(),
+                    header: known.header.clone(),
+                    ..Default::default()
+                };
+                let credential = declared
+                    .get(&known.allocation_id)
+                    .and_then(|connect| {
+                        connect
+                            .upstreams
+                            .iter()
+                            .find(|upstream| upstream.key() == known.upstream)
+                    })
+                    .and_then(|upstream| {
+                        upstream
+                            .credentials
+                            .iter()
+                            .find(|credential| credential.header.eq_ignore_ascii_case(&header))
+                    });
+                let Some(credential) = credential else {
+                    out.error = format!(
+                        "allocation is not placed on this node or upstream {} declares no \
+                         credential for header {header}",
+                        known.upstream
+                    );
+                    out.absent = true;
+                    return out;
+                };
+                out.source = credential.source();
+                if let Some(name) = credential.identity_name() {
+                    self.upstream_identity_token(known, name, &mut out);
+                    return out;
+                }
+                let Some(path) = credential.kv_path().map(str::to_string) else {
+                    out.error = format!(
+                        "upstream {} credential {header} names no provider",
+                        known.upstream
+                    );
+                    out.absent = true;
+                    return out;
+                };
+                match self.store.get_kv(&path) {
+                    Ok(Some(entry)) => {
+                        out.version = entry.version;
+                        if entry.version == known.version {
+                            out.unchanged = true;
+                        } else {
+                            // One trailing line ending (a value put from a
+                            // file) is not part of the secret.
+                            let value = entry.value.trim_end_matches(['\r', '\n']);
+                            if value.contains(['\r', '\n', '\0']) || value.is_empty() {
+                                // A header value cannot carry these; sending
+                                // it would split the request.
+                                out.error = format!(
+                                    "kv {path} is empty or holds a line break or NUL, which \
+                                     an HTTP header cannot carry"
+                                );
+                            } else {
+                                out.value = value.to_string();
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        out.error = format!("kv {path} not found");
+                        out.absent = true;
+                    }
+                    Err(err) => {
+                        warn!(kv_path = %path, error = ?err, "Failed reading upstream credential");
+                        out.error = format!("kv {path} could not be read");
+                    }
+                }
+                out
+            })
+            .collect();
+        Ok(Response::new(GetUpstreamCredentialsReply { credentials }))
+    }
+
     #[instrument(skip_all)]
     async fn list_service_edges(
         &self,
@@ -11910,6 +12034,110 @@ pub(crate) fn desired_payload(
 /// after each stateful task's fence window, its running allocations) down with
 /// it.
 impl ManagerDaemonService {
+    /// The token behind a `from = { identity = "<name>" }` upstream
+    /// credential (docs/network-handlers.md, "Credential injection"): the
+    /// task's identity of that name, minted for the allocation exactly as
+    /// `IssueWorkloadIdentityToken` would. The token the node already holds
+    /// (`known.version` is its expiry) stays until less than half the
+    /// identity's TTL remains, so a steady node mints about twice per TTL.
+    /// The caller has already checked the allocation is on the calling node.
+    fn upstream_identity_token(
+        &self,
+        known: &crate::structs::UpstreamCredentialKnown,
+        identity_name: &str,
+        out: &mut UpstreamCredentialValue,
+    ) {
+        let Some(state) = self.workload_identity.as_ref() else {
+            out.error = "workload identity is not enabled on this manager (set \
+                         workloadIdentity.enabled: true in the manager config)"
+                .to_string();
+            return;
+        };
+        let allocation = match self.store.get_allocation_by_id(known.allocation_id) {
+            Ok(Some(allocation)) => allocation,
+            Ok(None) => {
+                out.error = format!("allocation {} not found", known.allocation_id);
+                out.absent = true;
+                return;
+            }
+            Err(err) => {
+                warn!(allocation_id = known.allocation_id, error = ?err, "Failed loading allocation for an upstream identity");
+                out.error = "allocation could not be loaded".to_string();
+                return;
+            }
+        };
+        let task = match self
+            .store
+            .get_task_configs_for_job_config(&allocation.job_config_id)
+        {
+            Ok(tasks) => tasks
+                .into_iter()
+                .find(|(id, _)| *id == allocation.task_config_id)
+                .map(|(_, task)| task),
+            Err(err) => {
+                warn!(allocation_id = known.allocation_id, error = ?err, "Failed loading task config for an upstream identity");
+                None
+            }
+        };
+        let Some(task) = task else {
+            out.error = "task config could not be loaded".to_string();
+            return;
+        };
+        let Some(identity) = task
+            .identities
+            .iter()
+            .find(|identity| identity.name == identity_name)
+        else {
+            out.error = format!(
+                "task {} declares no identity named {identity_name:?}",
+                task.name
+            );
+            out.absent = true;
+            return;
+        };
+
+        let now = std::time::SystemTime::now();
+        let now_secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or_default();
+        let half_life = (state.token_lifetime(identity).as_secs() / 2) as i64;
+        if known.version > 0 && known.version - now_secs > half_life {
+            out.version = known.version;
+            out.unchanged = true;
+            return;
+        }
+
+        let claims =
+            match claims_for_allocation(&self.store, &allocation, &task, DEF_CLUSTER_REGION) {
+                Ok(claims) => claims,
+                Err(err) => {
+                    error!(error = ?err, "Error deriving workload identity claims for an upstream");
+                    out.error = "failed to derive workload identity claims".to_string();
+                    return;
+                }
+            };
+        match state.issue(&claims, identity, now) {
+            Ok(issued) => {
+                // Lifecycle log only, never the token.
+                info!(
+                    allocation_id = known.allocation_id,
+                    upstream = %known.upstream,
+                    identity = %identity_name,
+                    expires_at = issued.expires_at,
+                    kid = %issued.kid,
+                    "Issued workload identity token for upstream injection"
+                );
+                out.version = issued.expires_at as i64;
+                out.value = issued.token;
+            }
+            Err(err) => {
+                error!(error = ?err, "Error signing workload identity token for an upstream");
+                out.error = "failed to sign workload identity token".to_string();
+            }
+        }
+    }
+
     /// Effective network policy for every desired allocation, as content
     /// hashes. Zero store access when the cluster has no policy (cached
     /// generation) and no task on this node declares one.
@@ -12424,6 +12652,41 @@ fn enforce_kv_cert_read(
     Ok(())
 }
 
+/// `connect.upstreams[].credentials` hands a KV value to the datapath, which
+/// sends it to the upstream's origin, so naming one needs the same right as
+/// reading it: `kv:read` on the path. Without this, job submit access would
+/// be a way to exfiltrate any secret in KV to a host of the submitter's
+/// choosing. Applied to RunJob and template runs.
+fn enforce_kv_credential_read<'a>(
+    identity: &crate::structs::AclIdentity,
+    connects: impl Iterator<Item = &'a crate::structs::ConnectConfig>,
+) -> Result<(), Status> {
+    for connect in connects {
+        for upstream in &connect.upstreams {
+            for path in upstream.credentials.iter().filter_map(|c| c.kv_path()) {
+                acl::enforce(
+                    identity,
+                    AclResource::Kv,
+                    AclAction::Read,
+                    &AclScope::path(path),
+                )
+                .map_err(|status| {
+                    Status::new(
+                        status.code(),
+                        format!(
+                            "{} (connect.upstreams[{}].credentials names kv {path}; the \
+                             submitter needs kv read on it)",
+                            status.message(),
+                            upstream.key()
+                        ),
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn enforce_net_policy_scope(
     identity: &crate::structs::AclIdentity,
     action: AclAction,
@@ -12514,6 +12777,38 @@ fn guest_addresses(
 
 /// Fill `info`'s guest address from the node reports, for its running
 /// allocation.
+/// What `legion start gateway` needs from GetInstance (docs/gateway.md):
+/// the task's `suspend.wake` block and where the current allocation serves
+/// each declared port. Lookups that fail leave the fields empty, which the
+/// gateway reads as "not routable".
+fn attach_wake_and_endpoints(store: &Store, info: &mut InstanceInfo) {
+    info.wake = store
+        .suspend_settings_for(&info.job_id, &info.task)
+        .wake
+        .map(|wake| crate::structs::InstanceWake {
+            port: wake.port,
+            timeout_ms: wake.timeout.as_millis() as u64,
+        });
+    let Some(network) = info
+        .current_alloc_id
+        .and_then(|id| store.get_allocation_by_id(id).ok().flatten())
+        .filter(|allocation| allocation.status != crate::constants::ALLOCATION_STATUS_SUSPENDED)
+        .and_then(|allocation| allocation.network)
+    else {
+        return;
+    };
+    let address = network.address.clone().unwrap_or_default();
+    info.endpoints = network
+        .ports
+        .iter()
+        .map(|port| crate::structs::InstanceEndpoint {
+            port: port.name.clone(),
+            address: address.clone(),
+            number: u32::from(port.host_port),
+        })
+        .collect();
+}
+
 fn attach_guest_address(info: &mut InstanceInfo, addresses: &HashMap<i64, (String, String)>) {
     if let Some((address, bridge)) = info
         .current_alloc_id
@@ -15227,6 +15522,233 @@ mod tests {
         let bad = fetch(vec![(alloc.id, first[0].version)]).await?;
         assert!(bad[0].bundle_pem.is_empty());
         assert!(bad[0].error.contains("no private key"), "{}", bad[0].error);
+        Ok(())
+    }
+
+    /// The node names (allocation, upstream, header), never paths: the
+    /// manager derives the KV path from the allocation's own connect
+    /// declaration, sends the value once per version, and marks a deleted
+    /// key or an undeclared header `absent` so the node drops what it holds.
+    #[tokio::test]
+    async fn get_upstream_credentials_derives_the_path_and_skips_unchanged_test() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        put_kv_entry(&manager, "secrets/openai", "sk-live-1\n").await?;
+        run_jobspec(
+            &manager,
+            json!({
+                "name": "agent",
+                "task": {
+                    "runtime": "exec",
+                    "config": { "command": ["sleep", "30"] },
+                    "connect": {
+                        "upstreams": [{
+                            "name": "openai",
+                            "to": "https://api.openai.com",
+                            "credentials": [{
+                                "header": "Authorization",
+                                "prefix": "Bearer ",
+                                "from": { "kv": "secrets/openai" },
+                            }],
+                        }],
+                    },
+                },
+            }),
+        )
+        .await?;
+        insert_node(&store, "node-1")?;
+        let job_config_id = store.get_job_config("agent")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&job_config_id)?
+            .into_iter()
+            .next()
+            .context("task config")?;
+        let alloc = store.place_alloc("node-1", task_id)?;
+
+        let fetch = |known: Vec<(i64, &'static str, &'static str, i64)>| {
+            let manager = &manager;
+            async move {
+                manager
+                    .get_upstream_credentials(Request::new(GetUpstreamCredentialsRequest {
+                        node_id: "node-1".into(),
+                        known: known
+                            .into_iter()
+                            .map(|(allocation_id, upstream, header, version)| {
+                                crate::structs::UpstreamCredentialKnown {
+                                    allocation_id,
+                                    upstream: upstream.into(),
+                                    header: header.into(),
+                                    version,
+                                }
+                            })
+                            .collect(),
+                    }))
+                    .await
+                    .map(|reply| reply.into_inner().credentials)
+            }
+        };
+
+        let first = fetch(vec![
+            (alloc.id, "openai", "authorization", 0),
+            (alloc.id, "openai", "x-api-key", 0),
+            (alloc.id + 999, "openai", "authorization", 0),
+        ])
+        .await?;
+        assert_eq!(first[0].source, "kv secrets/openai");
+        assert_eq!(
+            first[0].value, "sk-live-1",
+            "one trailing newline is trimmed"
+        );
+        assert!(first[0].error.is_empty(), "{}", first[0].error);
+        assert!(
+            first[1].absent && first[1].value.is_empty(),
+            "{:?}",
+            first[1]
+        );
+        assert!(first[2].absent, "an allocation on another node is absent");
+        assert!(
+            first[2].error.contains("not placed on this node"),
+            "{}",
+            first[2].error
+        );
+
+        let again = fetch(vec![(
+            alloc.id,
+            "openai",
+            "authorization",
+            first[0].version,
+        )])
+        .await?;
+        assert!(again[0].unchanged);
+        assert!(
+            again[0].value.is_empty(),
+            "no material for an unchanged version"
+        );
+
+        // A value no header can carry is reported, not sent, and is not
+        // authoritative (the node keeps its last good value).
+        put_kv_entry(&manager, "secrets/openai", "a\r\nInjected: yes").await?;
+        let bad = fetch(vec![(
+            alloc.id,
+            "openai",
+            "authorization",
+            first[0].version,
+        )])
+        .await?;
+        assert!(bad[0].value.is_empty());
+        assert!(!bad[0].absent);
+        assert!(bad[0].error.contains("line break"), "{}", bad[0].error);
+
+        // Deleting the key revokes it.
+        delete_kv_entry(&manager, "secrets/openai").await?;
+        let gone = fetch(vec![(
+            alloc.id,
+            "openai",
+            "authorization",
+            first[0].version,
+        )])
+        .await?;
+        assert!(gone[0].absent);
+        assert_eq!(gone[0].error, "kv secrets/openai not found");
+        Ok(())
+    }
+
+    /// `from = { identity }`: the manager mints the task's identity for the
+    /// allocation, the node keeps it while more than half its TTL is left,
+    /// and an identity the task does not declare is absent.
+    #[tokio::test]
+    async fn get_upstream_credentials_mints_an_identity_token_test() -> R<()> {
+        use crate::structs::workload_identity::WorkloadIdentity;
+        let store = setup_store()?;
+        let wi = wi_state(&store)?;
+        let manager =
+            ManagerDaemonService::new(store.clone()).with_workload_identity(Some(wi.clone()));
+        let task = TaskConfig {
+            identities: vec![WorkloadIdentity {
+                name: "api".into(),
+                audience: vec!["https://api.example.com".into()],
+                ttl: Some("10m".into()),
+                ..Default::default()
+            }],
+            connect: Some(serde_json::from_value(json!({
+                "upstreams": [{
+                    "name": "api",
+                    "to": "https://api.example.com",
+                    "credentials": [{
+                        "header": "authorization",
+                        "prefix": "Bearer ",
+                        "from": { "identity": "api" },
+                    }],
+                }],
+            }))?),
+            ..TaskConfig::new("agent-task", "noop")
+        };
+        task.validate_identities()?;
+        let alloc = submit_and_place_identity_task(&store, "agent", task)?;
+
+        let fetch = |version: i64| {
+            let manager = &manager;
+            async move {
+                manager
+                    .get_upstream_credentials(Request::new(GetUpstreamCredentialsRequest {
+                        node_id: "node-1".into(),
+                        known: vec![crate::structs::UpstreamCredentialKnown {
+                            allocation_id: alloc.id,
+                            upstream: "api".into(),
+                            header: "authorization".into(),
+                            version,
+                        }],
+                    }))
+                    .await
+                    .map(|reply| reply.into_inner().credentials.remove(0))
+            }
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        let first = fetch(0).await?;
+        assert!(first.error.is_empty(), "{}", first.error);
+        assert_eq!(first.source, "identity api");
+        assert!(
+            (first.version - now - 600).abs() <= 5,
+            "the version is the token's expiry: {} vs now {now}",
+            first.version
+        );
+        let claims = wi
+            .verify(&first.value, "https://api.example.com")
+            .context("the injected value is a token for the upstream's audience")?;
+        assert_eq!(claims["legion.io/job"], "agent");
+
+        // Fresh enough: nothing is minted or sent.
+        let again = fetch(first.version).await?;
+        assert!(again.unchanged && again.value.is_empty(), "{again:?}");
+        assert_eq!(again.version, first.version);
+
+        // Less than half the TTL left: a new token.
+        let stale = fetch(now + 200).await?;
+        assert!(!stale.unchanged);
+        assert!(!stale.value.is_empty());
+
+        // Workload identity off on the manager: an error the node reports,
+        // not an authoritative absence.
+        let disabled = ManagerDaemonService::new(store.clone());
+        let off = disabled
+            .get_upstream_credentials(Request::new(GetUpstreamCredentialsRequest {
+                node_id: "node-1".into(),
+                known: vec![crate::structs::UpstreamCredentialKnown {
+                    allocation_id: alloc.id,
+                    upstream: "api".into(),
+                    header: "authorization".into(),
+                    version: 0,
+                }],
+            }))
+            .await?
+            .into_inner()
+            .credentials
+            .remove(0);
+        assert!(off.value.is_empty() && !off.absent);
+        assert!(off.error.contains("not enabled"), "{}", off.error);
         Ok(())
     }
 

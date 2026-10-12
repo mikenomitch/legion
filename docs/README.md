@@ -79,6 +79,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   when idle or under memory pressure, identity refresh after a restore, disk
   and memory snapshots, restoring an instance in place, expiry, and the
   `snapshot` ACL resource.
+- [Gateway: Wake on Request](gateway.md): `legion start gateway`, a stateless
+  front door that routes requests to keyed instances by host, header, or
+  `CONNECT`, resumes a suspended one on a request, and holds the request
+  until it serves (`suspend.wake`).
 - [Rollouts](rollouts.md): update strategies, health gating, manual/auto
   progression.
 - [Rollout Strategy Plugins](rollout-strategy-plugins.md)

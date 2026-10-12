@@ -2,7 +2,7 @@
 
 Decisions made while writing
 [`plans/gated-sandbox-checkpoints-plan.md`](../plans/gated-sandbox-checkpoints-plan.md),
-and while executing it (Phases 0 to 4 on a host without KVM). **Entries are ranked by project impact, highest
+and while executing it (Phases 0 to 5 on a host without KVM). **Entries are ranked by project impact, highest
 first. The number is the rank.** Implementation-time calls get inserted at
 their rank as the phases execute. If a citation elsewhere names an entry by
 number, fix it when you renumber.
@@ -144,7 +144,7 @@ mounts the allocation's dir on a constant path.
 keyed by the instance id like `own_tap_name`, so a resume needs no override.
 (c) The mount namespace as the primary design.
 
-**Trade-off.** Gated memory checkpoints need Firecracker 1.16.1 (entry 12),
+**Trade-off.** Gated memory checkpoints need Firecracker 1.16.1 (entry 18),
 and the design depends on two VMM features Legion has not run yet.
 
 **Why (correctness, simplicity).** (a) is a security bug: a VMM opens a disk
@@ -283,7 +283,186 @@ run a glibc binary, so (a) makes the default fail closed on the most common
 small image. (b) touches every dependency of the worker for a guest-side
 need. (c) adds a fetch to the boot path and a version matrix.
 
-## 11. The guest code is its own workspace crate, `legion-guest`
+## 11. Every sandbox port the node can reach is fronted, TAP included, and only a loopback-only sandbox's are refused
+
+**Call.** Phase 5 fronts every port a sandbox advertises when the datapath
+can reach its guest, with or without an ingress chain: a gated guest over
+host-initiated vsock (`CONNECT <port>`), a TAP guest at its leased bridge
+address. Submit refuses `network.ports` only on a sandbox nothing can reach.
+This supersedes entries 30 and 31, the Phase 2 refusal.
+
+```text
+task "workspace" declares network.ports, but nothing can reach a port in its guest: with no
+config.network and network.mode not "gated", the guest has loopback only
+Hint: set network.mode = "gated" to serve the ports through the node datapath, or wire the guest
+to a bridge (config.network = { mode = "tap", bridge = "br0" })
+```
+
+**Alternatives.** (a) Phase 5 as planned, gated only, with TAP sandboxes'
+ports left as they were: exported into the guest, reachable on the bridge,
+never at the address the catalog lists. (b) Ship gated first and leave TAP
+as a TODO. (c) Map TAP ports with DNAT rules on the node. (d) Keep accepting
+ports on a loopback-only sandbox, as before.
+
+**Trade-off.** A TAP guest's ports now go through a user-space splice on the
+node, and its workload must bind its bridge address or `0.0.0.0`. A sandbox
+spec with ports and no network config, accepted before, fails at submit.
+
+**Why (simplicity, ease).** A wake-on-request gateway splices to the
+`address:host_port` the catalog lists, and should not care how a guest is
+wired. With a per-connection dial target (`TaskDial`), TAP is one more arm
+beside vsock, reading a lease file already on disk, so it cost a few dozen
+lines rather than a phase. (c) adds per-guest iptables state that must
+follow restores and forks, which Legion avoids everywhere else. (d) is the
+§6.8 footgun: ports in the catalog that accept nothing.
+
+## 12. A gated sandbox's upstreams ride the guest agent to the node's own upstream listener, on a vsock socket
+
+**Call.** For each `connect.upstreams` entry of a gated sandbox, the guest
+agent listens on `127.0.0.1:<local port>` (and the VIP, entry 16) and
+relays every connection to host vsock port `<local port>`. The worker binds
+that upstream's ordinary listener state on
+`<alloc dir>/.sandbox/vsock.sock_<local port>` (a `UnixListener` arm of
+`start_listener`) instead of a loopback port, so balancing, HTTP mode, the
+egress chain, the upstream's handlers, and fail-closed while the policy is
+pending are the same code. `capture_ready` counts these sockets with the
+proxy and the resolver, and `net doctor` names an unbound one:
+
+```text
+upstream db is not bound on the guest's vsock socket /var/lib/legion/allocs/7/.sandbox/vsock.sock_20003
+```
+
+**Alternatives.** (a) Leave upstreams unreachable in a sandbox and document
+it. (b) Send upstream traffic through the egress proxy (the agent's 1080):
+no per-upstream listener in the guest, but a client that is not
+proxy-aware (`psql`, a gRPC channel) cannot use it, and the proxy would have
+to map a destination back to an upstream to apply its HTTP block and
+handlers. (c) One vsock port for every upstream, with a header from the
+agent naming which. (d) A sandbox-specific forwarder on the host.
+
+**Trade-off.** One vsock host socket per upstream per sandbox, and the
+upstream's local port doubles as a vsock port, so 1080 and 53 are refused as
+`localPort` (entry 38). The forwarder's connection path became generic
+over the stream type, and the PROXY header of a `proxy` hop carries no
+peer address for a vsock connection.
+
+**Why (simplicity, extensibility).** The upstream listener is where every
+upstream feature already lives, so binding the same state on another socket
+makes each future upstream feature work in a sandbox for free. (b) splits
+upstream behavior across two code paths and breaks non-HTTP clients. (c)
+adds a framing the agent must speak and the host must trust, for a socket
+count that is small anyway. One number naming the guest port, the vsock
+port, and `LEGION_UPSTREAM_PORT_<KEY>` keeps `net doctor`, the agent's log,
+and the env in agreement, as entry 15 does for ingress.
+
+## 13. A restored sandbox keeps the ports it was captured with, and the datapath dials those
+
+**Call.** The boot record (`checkpoint-boot.json`) records `guest_ports`,
+port label to the port the workload binds, and the checkpoint's runtime
+state carries it. A restore records each label's captured port when the
+checkpoint has one, else the new allocation's bind port, and writes the
+record before the guest resumes. The ingress target reads it per connection
+(`TaskTarget::port`). The identity disk sets `LEGION_PORT_<label>` in
+`resume.env` to the same number.
+
+**Alternatives.** (a) Re-request the captured ports at placement. (b) Have
+the guest agent listen on the new port and relay to the old. (c) Dial the
+new allocation's port.
+
+**Trade-off.** The new allocation's own `LEGION_PORT_<label>` can differ
+from what its guest listens on; the record is the truth. A small file read
+per inbound connection.
+
+**Why (correctness, simplicity).** A memory restore brings back a process
+that already called `bind`. (c) dials a port nobody listens on, on every
+restore whose placement moved the port, which is exactly when a
+wake-on-request gateway needs it to work. (a) couples placement to a
+checkpoint and fails when the port is taken. (b) needs the agent to learn
+both numbers and does nothing for a TAP guest, which has no agent in the
+path. Reading per connection also covers the listener being bound before
+the restore writes the record.
+
+## 14. A restore retargets the guest agent's upstream relays, not the node's listener
+
+**Call.** The checkpoint records `guest_upstreams`, upstream key to the
+loopback port the workload dials, like `guest_ports`. A restore keeps those
+ports in the guest (the processes dialing them ride the memory), and the
+identity disk carries each upstream's new allocation local port
+(`GuestUpstream::vsock_port`). The agent keeps one target per upstream,
+keyed by its loopback port, that every listener of the upstream reads per
+connection, and the restore stores the new port there. The node always
+binds `vsock.sock_<the allocation's own local port>` and never reads the
+boot record for upstreams.
+
+**Alternatives.** (a) The node binds the captured port, read from the boot
+record when it builds listener specs (built first, then dropped). (b)
+Re-request the captured local ports at placement. (c) Dial the new
+allocation's port in the guest (impossible: the workload holds the old
+address in memory).
+
+**Trade-off.** The agent holds a little mutable state per upstream, the
+identity disk carries a second number per upstream, and `--upstream` grew
+a `PORT@VSOCK` form that a boot never uses. An upstream the job removed
+while the instance was suspended keeps its listener in the guest, relaying
+to a socket nobody binds, so its dials are refused.
+
+**Why (correctness, performance).** The node's listener must exist before
+the guest dials, and the boot record is written during the restore, after
+the heartbeat that delivered it bound the allocation's listeners. Under (a)
+upstreams were broken from the resume until the next heartbeat applied the
+record, up to one heartbeat interval, which the manager stretches past a
+minute on a large fleet, and every heartbeat read a file per sandbox
+upstream. Retargeting in the guest
+works from the first connection and costs one atomic store. Ingress makes
+the opposite choice (entry 13) because there the node dials, so it can
+read the record per connection.
+
+## 15. The vsock port is the port the workload binds, and a sandbox gets no twin of its own
+
+**Call.** `CONNECT <port>` names the port the workload binds
+(`AllocPort::bind_port`, what `LEGION_PORT_<label>` says), and the guest
+agent listens on that vsock port and relays to `127.0.0.1:<same port>`. A
+sandbox gets a private twin exactly when any task does (an ingress chain).
+Without one, the guest binds the advertised number itself.
+
+**Alternatives.** (a) Always give sandboxes a twin. (b) A fixed vsock port
+per label (`10000 + index`), mapped to the workload port by the agent. (c)
+One vsock port for all ingress, with a port header from the host.
+
+**Trade-off.** Guest vsock ports and the agent's egress host ports (1080,
+53) are different spaces, which a reader of the agent must keep straight. A
+gated guest's `127.0.0.1:1080` is the agent's, so a workload cannot serve on
+1080 there (documented).
+
+**Why (simplicity).** One number names both ends, so `net doctor`, the
+agent's log, and the workload's env agree. The guest's network stack is its
+own, so the advertised number cannot collide with the datapath's listener on
+the node, and a twin would only spend a port from the node's range. (b) and
+(c) add a mapping the guest must learn and a restore must keep consistent.
+
+## 16. The guest agent serves each upstream's VIP, so `<key>.svc.legion` works in a gated guest
+
+**Call.** The gated resolver (vsock 53) already answers `<key>.svc.legion`
+with the allocation's VIPs. The agent also listens on `<vip>:<canonical
+port>` in the guest, relaying to the same vsock port as the loopback
+listener, and the node binds no VIP for a sandbox. A restore adds the new
+allocation's VIPs and keeps the old ones relaying, retargeted with the rest.
+
+**Alternatives.** (a) Document that names do not work in a gated guest and
+point at `LEGION_UPSTREAM_<KEY>`. (b) Answer `<key>.svc.legion` with
+`127.0.0.1` and rely on SRV records for the port.
+
+**Trade-off.** The agent binds addresses in 127.42/16 inside the guest,
+which needs the guest's `lo` to own 127/8 (Linux does, with no
+configuration). Old VIPs linger in a restored guest until it reboots.
+
+**Why (ease).** `db.svc.legion:5432` working the same in a container and a
+sandbox is the point of name-is-config: an agent's code should not branch
+on where it runs. (b) breaks every client that does not read SRV records,
+which is nearly all of them. Lingering old VIPs are what a resolver cache
+holding the old answer needs.
+
+## 17. The guest code is its own workspace crate, `legion-guest`
 
 **Call.** The guest agent, resume handler, identity-disk format, env file
 format, and netlink re-addressing move into `guest/` (crate `legion-guest`, a
@@ -304,7 +483,7 @@ crate with four dependencies builds one in seconds for any target. One
 parser and one identity-disk module serve both sides, so the worker and the
 guest cannot disagree about the format.
 
-## 12. Gated memory checkpoints need Firecracker 1.16.1, checked at capture
+## 18. Gated memory checkpoints need Firecracker 1.16.1, checked at capture
 
 **Call.** A memory suspend, snapshot, or fork of a gated sandbox on
 Firecracker older than 1.16.1 is refused before capture, with the version
@@ -329,7 +508,7 @@ timing out after restore when a TX descriptor was in flight (#5958), which
 is the gated datapath's only traffic pattern. (b) is placement machinery for
 a version skew that an upgrade fixes, and the refusal names the upgrade.
 
-## 13. A live capture of a gated Firecracker sandbox resets its open connections, and we say so
+## 19. A live capture of a gated Firecracker sandbox resets its open connections, and we say so
 
 **Call.** Accept that Firecracker closes every open guest vsock connection
 at `SnapshotCreate`, so a live `snapshot create --memory` or a fork drops
@@ -349,7 +528,28 @@ happens on a suspend anyway. (a) removes fork, the feature agent platforms
 want most, to avoid a retry. (b) cannot work: the reset is in the guest
 kernel's transport, below the agent.
 
-## 14. Declared `connect.upstreams` are not subject to `gated-default`
+## 20. Ingress takes no Firecracker 1.17 floor until Phase 0 measures #6100
+
+**Call.** Host-initiated vsock runs on whatever Firecracker a gated sandbox
+runs on. The plan's version table names 1.17.0 for host-initiated RX no
+longer sticking after a bare pause and resume (#6100), for Phase 0 to
+measure. No floor is enforced; the public doc names the release and says
+to run it for gated sandboxes that serve ports.
+
+**Alternatives.** (a) Refuse ports on gated sandboxes on nodes below 1.17.
+(b) Refuse a live memory snapshot or fork (the bare pause and resume) of a
+gated sandbox with ports below 1.17.
+
+**Trade-off.** On Firecracker 1.16, a gated origin that serves ports may
+stop receiving inbound connections after a live capture, if #6100 reaches
+this path, until it is restarted.
+
+**Why (simplicity).** No guest has booted on this host, so the bug's reach
+is unmeasured, and a floor is a version gate with its own refusal surface on
+three APIs. G5.1 measures it, and the floor check from entry 18 is where a
+1.17 rule goes if it does.
+
+## 21. Declared `connect.upstreams` are not subject to `gated-default`
 
 **Call.** A gated task's declared upstreams (`connect.upstreams`) are an
 explicit allowance in the task block, so their listeners dial as before.
@@ -366,7 +566,7 @@ the service.
 the task may reach. Requiring a second, matching egress rule would make
 every gated service consumer write the same thing twice.
 
-## 15. A gated resolver forwards while the allocation's policy is pending
+## 22. A gated resolver forwards while the allocation's policy is pending
 
 **Call.** A gated allocation's resolver answers `NXDOMAIN` for names nothing
 allows (`gated-default`) only once its policy is known. While the policy is
@@ -383,7 +583,7 @@ probing their API) would cache a failure from the pending window and keep it
 after the policy arrives. Resolution grants no connection, and the window is
 one heartbeat.
 
-## 16. `connections` counts open egress connections too, and `network` stamps bytes as they move
+## 23. `connections` counts open egress connections too, and `network` stamps bytes as they move
 
 **Call.** The egress proxy wraps every splice in the activity ledger's
 `TrackedStream`. `network` sees bytes during a long stream, and
@@ -402,7 +602,48 @@ already holds. (a) is a second knob for a one-word difference. (b) leaves the
 gap the suspend plan's calls entry 53 recorded. The hot-path cost is the one
 the ingress side already pays.
 
-## 17. An absent `config.network` means gated, and an explicit `none` means an air gap
+## 24. `connections` stays refused on a sandbox that is not gated, though TAP ports are fronted now
+
+**Call.** A TAP sandbox's inbound connections cross the datapath since entry
+11, but submit still refuses `connections` on any sandbox that is not
+gated. The error says "outbound traffic" now.
+
+**Alternatives.** Accept `connections` on a TAP sandbox that declares ports,
+counting its ingress only.
+
+**Trade-off.** A TAP sandbox has no signal for an inbound request that
+sends nothing for a while. `network` sees the bytes its guest sends.
+
+**Why (ease).** On a sandbox the signal exists to keep a harness awake
+through a quiet model call (entry 23), an outbound connection a TAP guest
+makes on its own NIC. Counting only the inbound half would accept a spec
+whose author believes the call is covered.
+
+## 25. Upstreams on TAP and loopback-only sandboxes stay unreachable, and are not refused
+
+**Call.** Only a gated sandbox reaches its upstreams. A TAP-wired or
+loopback-only sandbox that declares `connect.upstreams` is accepted and
+placed. Its `LEGION_UPSTREAM_<KEY>` names `127.0.0.1:<port>` in the guest,
+where nothing listens, so dials are refused. The public docs say so, and
+TODO.md tracks the TAP case.
+
+**Alternatives.** (a) Refuse `connect.upstreams` at submit on a sandbox that
+will not run gated, as ports on a loopback-only sandbox are (entry 11). (b)
+Serve a TAP guest's upstreams on the node's bridge address, attributed by
+the guest's leased source address.
+
+**Trade-off.** A spec that cannot work is accepted, and the failure shows as
+a refused connection in the guest rather than a submit error.
+
+**Why (scope).** (b) is its own design: a listener per bridge address,
+attribution by a source address the guest controls (unlike a vsock socket),
+and the lease moving on restore. It was deferred so this change stays on the
+gated path. (a) is the better end state for the loopback-only case, but
+while `auto` resolves to `host`, it would refuse every default sandbox that
+declares upstreams, which needs its own look at what that does to existing
+specs.
+
+## 26. An absent `config.network` means gated, and an explicit `none` means an air gap
 
 **Call.** `config.network = { mode = "none" }` stays and now means no vsock,
 no agent, and no DNS. Leaving `config.network` out means gated.
@@ -418,7 +659,7 @@ nothing on `container` and `exec`. (b) loses the case gated cannot serve: an
 image the agent cannot run on, and a compute sandbox that should have no
 door at all, not a door that is shut by policy.
 
-## 18. A gated-or-TAP shape mismatch is refused at restore, not at the API
+## 27. A gated-or-TAP shape mismatch is refused at restore, not at the API
 
 **Call.** `instance create --from-snapshot` no longer compares the task's
 network shape with the snapshot's at the API. The restore refuses by name
@@ -435,7 +676,7 @@ snapshot's `runtime_state`.
 it is restoring into, since a `require` policy can change a task's mode
 after the snapshot. One rule in one place, as the plan's §6.2 states.
 
-## 19. The agent closes dead relays with a shutdown, so a client sees a close
+## 28. The agent closes dead relays with a shutdown, so a client sees a close
 
 **Call.** After a restore the guest agent shuts both directions of every
 open relay (`shutdown(Both)` on the guest and vsock sockets). A client
@@ -452,7 +693,7 @@ whole one, though HTTP clients check `Content-Length`.
 from the restore watcher would race those threads. A shutdown is safe from
 any thread and still never hangs, which is the guarantee the docs make.
 
-## 20. Every gated sandbox gets a resolver, with or without upstreams
+## 29. Every gated sandbox gets a resolver, with or without upstreams
 
 **Call.** `dns_specs` emits a resolver for every gated sandbox. Today it
 needs a VIP block, which only allocations with upstreams get.
@@ -467,7 +708,10 @@ guest has no DNS at all. The sandbox resolver binds a Unix socket and never
 uses the VIP address, so a block would spend one of 256 per node for
 nothing.
 
-## 21. Ingress into gated sandboxes is its own phase, and refused until then
+## 30. Ingress into gated sandboxes is its own phase, and refused until then
+
+> **Superseded by entry 11.** Phase 5 serves a gated sandbox's ports and
+> lifted this refusal. Kept as the record of the interim.
 
 **Call.** Phase 2 refuses advertised ingress ports on a gated sandbox at
 submit. Phase 5 adds ingress over host-initiated vsock (`CONNECT <port>`)
@@ -485,7 +729,10 @@ sandbox does not have. Refusing it is the honest interim. Ingress needs
 agent-side vsock listeners and a Firecracker version floor Phase 0 measures,
 and the default flip should not wait on it.
 
-## 22. Ingress ports are refused on any sandbox that will run gated
+## 31. Ingress ports are refused on any sandbox that will run gated
+
+> **Superseded by entry 11.** Phase 5 serves a gated sandbox's ports and
+> lifted this refusal. Kept as the record of the interim.
 
 **Call.** Submit refuses `network.ports` on a sandbox that runs gated: an
 explicit `gated`, or `auto` once the default is open. A sandbox with a
@@ -505,7 +752,7 @@ network config must add a TAP block to submit.
 accept connections that never reach the guest. The refusal points at the
 working shape until Phase 5.
 
-## 23. A checkpoint on a hand-named TAP moves onto the instance's own device
+## 32. A checkpoint on a hand-named TAP moves onto the instance's own device
 
 **Call.** A resume whose checkpoint names a TAP device other than the
 instance's own (one taken on `tap = "tap0"` before Phase 4) moves the NIC
@@ -522,7 +769,7 @@ older Firecracker fails at load instead of with a named refusal.
 checkpoint, and the plan promises they restore and get a Legion address.
 The move is a path forks already exercise.
 
-## 24. The guest address rides the network status report as two fields
+## 33. The guest address rides the network status report as two fields
 
 **Call.** The worker reports a TAP guest's lease on `NetAllocStatus`
 (`guest_address`, `guest_bridge`), and the manager copies it onto
@@ -540,7 +787,7 @@ manager restart.
 and the address must not depend on that. Two fields let an agent use the
 address without parsing, and the CLI prints the combined form.
 
-## 25. A restore waits briefly for the datapath's socket, then resumes fail-closed
+## 34. A restore waits briefly for the datapath's socket, then resumes fail-closed
 
 **Call.** Before resuming a restored gated guest, wait up to 5 seconds for
 `vsock.sock_1080`. If it is still missing, resume anyway and report
@@ -556,7 +803,7 @@ before the launch, so a miss is a transient bind error. Failing the restore
 would turn that into a cold boot that loses the user's running state, while
 a missing socket only means each dial is reset, which is fail-closed.
 
-## 26. The guest agent owns the resume watch
+## 35. The guest agent owns the resume watch
 
 **Call.** `legion guest-agent` absorbs `legion guest-resume`'s identity-disk
 watch when both are needed, so on a restore it can drop its own relays in
@@ -572,7 +819,28 @@ other.
 half-open connections fail fast instead of hanging. A signal between two
 processes needs a pid file and a race-free handshake for no gain.
 
-## 27. Every gated guest uses CID 3
+## 36. The agent learns its ingress ports from its command line at boot and from the identity disk at restore, and never unbinds
+
+**Call.** The generated init passes `--ingress-port <port>` per advertised
+port to `legion guest-agent`. A restore writes
+`ResumeIdentity::ingress_ports`, and the agent's resume watch listens on any
+port it does not have yet. Listeners are never closed.
+
+**Alternatives.** (a) Read the ports from the identity disk at boot too.
+(b) Reconcile on restore: close listeners for ports the identity no longer
+names.
+
+**Trade-off.** A restore that drops a port leaves a guest listener that
+nothing dials.
+
+**Why (simplicity).** The init line already carries the agent's flags, and
+the root disk's fingerprint covers it, so a changed port list rebuilds the
+disk. The identity disk is what a restore rewrites and what the agent
+already watches. The listeners are guest memory and survive a restore, and
+the restored workload keeps its captured ports (entry 13), which the
+datapath keeps dialing, so (b) would close exactly the ports in use.
+
+## 37. Every gated guest uses CID 3
 
 **Call.** Delete `vsock_cid` and give every gated guest CID 3.
 
@@ -586,7 +854,42 @@ space, the guest agent dials the host (CID 2), and Firecracker cannot change
 the CID on load. A per-allocation CID is stale after every restore and
 shared by every fork anyway, so it only looks meaningful.
 
-## 28. Widen the proxy variables, defer transparent capture
+## 38. An upstream `localPort` of 1080 or 53, and a guest port of 1080 or 1100, are refused on a gated sandbox
+
+**Call.** Submit refuses, on a sandbox that will run gated, an advertised
+port the guest would bind on 1080 (`static` or `to`), and an upstream
+`localPort` of 1080 or 53:
+
+```text
+task "workspace" connect.upstreams entry "db" sets localPort 53, but a gated sandbox's upstreams are
+relayed to the node on vsock ports of the same number, and 1080 and 53 are the guest's egress proxy
+and resolver
+Hint: pick another localPort, or drop it to take a dynamic one
+```
+
+**Alternatives.** (a) Map upstream vsock ports into a range of their own
+(vsock ports are 32 bits, so `65536 + local port` never collides), which
+would leave only the guest's `127.0.0.1:1080` reserved. (b) Let it fail at
+start.
+
+**Trade-off.** Two port numbers a container may use are unavailable to a
+gated sandbox's upstreams.
+
+**Why (simplicity).** Dynamic ports come from far above both, so only a
+pinned port can hit this, and saying so at submit costs nothing. (a) breaks
+the one-number rule (entry 12) for every upstream to spare two pinned
+values almost nobody picks.
+
+**Later (merging sandbox exec).** The guest agent now also listens on guest
+vsock port 1100 for exec sessions on every microVM, and an advertised port
+is served on the guest vsock port of its own number, so a gated guest port
+of 1100 is refused the same way (`... and vsock port 1100 is the guest
+agent's exec listener`). The alternative was to offset ingress vsock ports
+(`65536 + port`) and reserve nothing. It lost for the same reason as (a):
+one more pinned value almost nobody picks does not justify a second
+numbering rule.
+
+## 39. Widen the proxy variables, defer transparent capture
 
 **Call.** Phase 2 sets lower-case proxy variables and `NODE_USE_ENV_PROXY=1`
 for every gated runtime. Transparent redirect inside the guest stays an open
@@ -604,7 +907,7 @@ modern Node for the cost of a few env entries. Transparent capture needs
 netfilter in the guest kernel and SNI parsing in the agent, and it should be
 sized by the denials Phase 2 actually records.
 
-## 29. Capture side effects come back as `notes` on the reply
+## 40. Capture side effects come back as `notes` on the reply
 
 **Call.** `CreateSnapshotReply` and `ForkInstanceReply` gain `repeated
 string notes`. A live capture of a gated Firecracker sandbox adds one, and
@@ -619,7 +922,7 @@ it out from the instance.
 the manager knows the node's VMM. A list leaves room for the next side
 effect without another field.
 
-## 30. The worker finds the guest binary beside itself, or where an override says
+## 41. The worker finds the guest binary beside itself, or where an override says
 
 **Call.** The worker copies `legion-guest` from its own directory, or from
 `LEGION_GUEST_BINARY` when set. A set override that does not exist fails the
@@ -637,7 +940,7 @@ setting. A wrong override is a mistake to name, not hide. Fingerprinting the
 binary also fixes a stale agent surviving a worker upgrade in a reused root
 disk.
 
-## 31. Removed fields stay in the parser only to refuse them by name
+## 42. Removed fields stay in the parser only to refuse them by name
 
 **Call.** `SandboxNetworkConfig` keeps `tap` and `mac` as hidden fields
 (skipped by the schema) whose only use is the refusal with the replacement,
@@ -653,7 +956,7 @@ the first one a malformed config gets.
 refuse. A user or agent moving a spec forward gets the exact fix (`Set bridge
 = "<the bridge tap0 was on>"`) instead of a schema error.
 
-## 32. Only a resume asks for its previous address
+## 43. Only a resume asks for its previous address
 
 **Call.** A restore asks the pool for the address its checkpoint recorded
 only when it is a resume of the same instance. A fork, and a create from a
@@ -668,7 +971,7 @@ address even when it is free.
 Phase 4 exists to fix, and preferring it would bring it back whenever the
 origin is on another node or briefly stopped.
 
-## 33. The lease goes first on the kernel command line, and resolv.conf is baked in
+## 44. The lease goes first on the kernel command line, and resolv.conf is baked in
 
 **Call.** `ip=` comes before the task's `kernel_args`, so a task's own `ip=`
 wins at boot (the kernel takes the last one), and the resume handler still
@@ -686,7 +989,7 @@ reports wrongly until the first restore.
 command line, and an operator debugging a guest should be able to use it.
 Baking resolv.conf in needs no init step and no tool in the image.
 
-## 34. The worker re-checks the Firecracker floor before a gated capture
+## 45. The worker re-checks the Firecracker floor before a gated capture
 
 **Call.** Besides the manager's refusal at suspend, snapshot, and fork, the
 worker refuses a gated memory capture on Firecracker older than 1.16.1
@@ -700,7 +1003,7 @@ before pausing the guest.
 and a capture the node cannot restore would lose the guest's network on
 resume.
 
-## 35. The Firecracker floor check resolves the task's own VMM first
+## 46. The Firecracker floor check resolves the task's own VMM first
 
 **Call.** The 1.16.1 check reads the task's explicit `hypervisor` first, then
 the node's default VMM, and compares that VMM's own version attribute
@@ -714,7 +1017,7 @@ does.
 **Why (correctness).** A node with both VMMs installed would otherwise judge
 a Firecracker task by cloud-hypervisor's version, or the reverse.
 
-## 36. `net policy show` resolves `auto`, and the policy replies carry hints
+## 47. `net policy show` resolves `auto`, and the policy replies carry hints
 
 **Call.** `ShowNetPolicyReply.effective_mode` now resolves `auto` the way
 placement would (it used to echo `auto`), with `notes` explaining it, and
@@ -728,7 +1031,7 @@ placement would (it used to echo `auto`), with `notes` explaining it, and
 **Why (ease).** An agent asking "will this be gated" gets the answer, and a
 denial carries its fix in a field it can act on.
 
-## 37. `egress-unenforced` appears only once the gated default is open
+## 48. `egress-unenforced` appears only once the gated default is open
 
 **Call.** The `egress-unenforced` instance detail (a sandbox whose `auto`
 would be gated, running on a dev backend) is reported only while the default
@@ -741,9 +1044,9 @@ is open.
 **Why (simplicity).** Before the flip, `auto` means `host` everywhere, so
 nothing is unenforced relative to what the user would get on Linux.
 
-## 38. A restore waits on the existing net status, with no new marker
+## 49. A restore waits on the existing net status, with no new marker
 
-**Call.** The restore's wait for the datapath (entry 25)
+**Call.** The restore's wait for the datapath (entry 34)
 polls for the egress proxy's socket, and an unbound socket is reported
 through the existing `net_status` problems, which now name the socket path.
 
@@ -754,7 +1057,7 @@ through the existing `net_status` problems, which now name the socket path.
 **Why (simplicity).** The socket's existence is the readiness signal, and
 `net doctor` already shows net status problems.
 
-## 39. The Phase 0 boot test binds the real datapath in-process
+## 50. The Phase 0 boot test binds the real datapath in-process
 
 **Call.** `sandbox_gated_boots_*` start the node's real egress proxy and
 resolver for one allocation inside the test, then boot the guest through the
@@ -772,3 +1075,40 @@ policy, and it needs the internet.
 path carries the datapath, and the in-process datapath is the same code a
 worker runs. A loopback origin would be refused once the worker-plane-auth
 host guard lands.
+
+## 51. HTTP-mode ingress dials through the task target, so a hand-off proxy is dialed from the host
+
+**Call.** HTTP mode's per-request dial to the task goes through the same
+`TaskTarget::connect` as the L4 splice: loopback, a namespace, a guest's
+vsock, or a bridge address. A `proxy` hand-off or a mesh endpoint is a TCP
+dial from the host namespace. Before, an HTTP-mode hand-off on a gated task
+was dialed inside the task's namespace, where nothing routes to it.
+
+**Alternatives.** Keep `HttpSettings.netns` and add a vsock case beside it.
+
+**Trade-off.** None beyond where a hand-off dial originates, which is the
+fix.
+
+**Why (simplicity, extensibility).** One way to reach a task, used by both
+modes, so the next way (another VMM transport) is one more `TaskDial` arm.
+
+## 52. Anything but `OK <n>` within two seconds is a failed dial
+
+**Call.** The host side of the handshake writes `CONNECT <port>\n` and reads
+one line, at most 64 bytes, byte by byte so nothing past the newline is
+consumed. `OK <n>` (any `n`, a trailing `\r` tolerated) succeeds. A close
+names the port (`nothing in the guest listens on vsock port <port>`), and an
+error line, a long line, or two seconds of silence fail the dial too. The
+connection then closes like any failed ingress dial.
+
+**Alternatives.** (a) Parse the VMMs' error lines and map them to distinct
+errors. (b) A longer budget for a guest still booting.
+
+**Trade-off.** A guest that takes over two seconds to accept looks like a
+dead one to that client.
+
+**Why (simplicity).** Firecracker and cloud-hypervisor both close the stream
+when nothing listens and neither documents an error line, so the only
+contract is the `OK` line. A byte-at-a-time read of one short line is cheap,
+and reading past it would swallow the guest's first bytes. Two seconds is
+the datapath's dial budget everywhere else.

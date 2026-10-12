@@ -634,6 +634,14 @@ pub(crate) struct GuestPayload {
     /// Off, the agent runs `--no-relay`: the guest still cannot dial the
     /// host, and the vsock device carries host-initiated exec only.
     pub relay: bool,
+    /// A gated sandbox's advertised ports, passed to the agent as
+    /// `--ingress-port`: it listens on each as a vsock port and relays the
+    /// node datapath's connections to the workload on the same port.
+    pub ingress_ports: Vec<u16>,
+    /// A gated sandbox's upstreams, passed to the agent as `--upstream
+    /// PORT[=VIP:PORT]`: it listens on each loopback port (and VIP) and
+    /// relays to the node datapath's vsock socket for the port.
+    pub upstreams: Vec<legion_guest::identity::GuestUpstream>,
     /// A sandbox launched for memory checkpoints (or with token files):
     /// init starts the resume handler in the background, which watches the
     /// identity disk and refreshes the guest after every restore (new
@@ -716,31 +724,39 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
     if payload.guest_agent {
         // The agent takes exec sessions on vsock port 1100. On a gated guest
         // it is also the datapath's foothold: it relays 127.0.0.1:1080 and
-        // :53 to the host over vsock, and without it a gated guest has
-        // loopback and nothing else, which is the fail-closed outcome the
-        // mode promises. When the guest also needs the resume watch, the
-        // agent runs it.
-        let watch = if payload.resume_watch {
-            " --resume-watch"
-        } else {
-            ""
-        };
-        let (relay, started, missing) = if payload.relay {
+        // :53 to the host over vsock, and the host's ingress connections in
+        // to the workload. Without it a gated guest has loopback and nothing
+        // else, which is the fail-closed outcome the mode promises. When the
+        // guest also needs the resume watch, the agent runs it.
+        let mut flags = String::new();
+        if !payload.relay {
+            flags.push_str(" --no-relay");
+        }
+        // Each advertised port: the agent listens on it as a vsock port and
+        // relays the datapath's connections to the workload's loopback port.
+        for port in &payload.ingress_ports {
+            flags.push_str(&format!(" --ingress-port {port}"));
+        }
+        // Each upstream: the agent listens on its loopback port and VIP and
+        // relays to the datapath's vsock socket for the port. The argument
+        // is digits, dots, a colon, `@`, and `=`, so it needs no quoting.
+        for upstream in &payload.upstreams {
+            flags.push_str(&format!(" --upstream {}", upstream.to_arg()));
+        }
+        if payload.resume_watch {
+            flags.push_str(" --resume-watch");
+        }
+        let (started, missing) = if payload.relay {
             (
-                "",
                 "gated network and exec over vsock",
                 "the sandbox has no network and takes no exec sessions",
             )
         } else {
-            (
-                " --no-relay",
-                "exec over vsock",
-                "the sandbox takes no exec sessions",
-            )
+            ("exec over vsock", "the sandbox takes no exec sessions")
         };
         script.push_str(&format!(
             "if [ -x {GUEST_AGENT_PATH} ]; then\n\
-             \x20   {GUEST_AGENT_PATH} guest-agent{relay}{watch} >/dev/console 2>&1 &\n\
+             \x20   {GUEST_AGENT_PATH} guest-agent{flags} >/dev/console 2>&1 &\n\
              \x20   echo \"legion: guest agent started ({started})\"\n\
              else\n\
              \x20   echo \"legion: guest agent missing at {GUEST_AGENT_PATH}; {missing}\" >&2\n\
@@ -1432,6 +1448,58 @@ mod tests {
         assert!(!script.contains("guest-resume"), "{script}");
     }
 
+    /// Gated plan §6.10: a gated guest's advertised ports and upstreams
+    /// reach the agent as flags, which the guest crate's own parser accepts.
+    #[test]
+    fn a_gated_guest_hands_its_ports_to_the_agent() {
+        let upstreams = vec![
+            legion_guest::identity::GuestUpstream {
+                port: 20003,
+                vsock_port: None,
+                vip: Some("127.42.0.2:5432".parse().unwrap()),
+            },
+            legion_guest::identity::GuestUpstream {
+                port: 20004,
+                vsock_port: None,
+                vip: None,
+            },
+        ];
+        let script = render_init_script(&GuestPayload {
+            command: vec!["/bin/sh".into()],
+            guest_agent: true,
+            relay: true,
+            ingress_ports: vec![8080, 20001],
+            upstreams: upstreams.clone(),
+            resume_watch: true,
+            ..GuestPayload::default()
+        });
+        let line = script
+            .lines()
+            .find(|line| line.contains("/legion/legion guest-agent"))
+            .expect("agent line");
+        assert_eq!(
+            line.trim(),
+            "/legion/legion guest-agent --ingress-port 8080 --ingress-port 20001 \
+             --upstream 20003=127.42.0.2:5432 --upstream 20004 --resume-watch \
+             >/dev/console 2>&1 &"
+        );
+        let words: Vec<String> = line
+            .split_whitespace()
+            .skip(1)
+            .take_while(|word| !word.starts_with('>'))
+            .map(str::to_string)
+            .collect();
+        match legion_guest::cli::parse(&words).unwrap() {
+            legion_guest::cli::Invocation::Agent(args) => {
+                assert!(args.relay);
+                assert_eq!(args.ingress_ports, vec![8080, 20001]);
+                assert_eq!(args.upstreams, upstreams);
+                assert!(args.resume_watch.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn firecracker_config_matches_vm_spec() {
         let mut spec = spec();
@@ -1493,6 +1561,8 @@ mod tests {
             resume_watch: false,
             guest_binary: None,
             resolvers: Vec::new(),
+            ingress_ports: Vec::new(),
+            upstreams: Vec::new(),
         };
         let script = render_init_script(&payload);
 
@@ -1542,6 +1612,8 @@ mod tests {
             resume_watch: false,
             guest_binary: None,
             resolvers: Vec::new(),
+            ingress_ports: Vec::new(),
+            upstreams: Vec::new(),
         };
 
         let dir = tempfile::tempdir()?;

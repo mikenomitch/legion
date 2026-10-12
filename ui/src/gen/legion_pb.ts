@@ -6079,6 +6079,31 @@ export class InstanceInfo extends Message<InstanceInfo> {
   guestBridge?: string;
 
   /**
+   * Where the instance's current allocation serves each of its declared
+   * `network.ports`: the node's advertised address and the advertised
+   * (host) port, the same pair the service catalog publishes. Empty while
+   * the instance has no allocation (pending, suspended, stopped) and on
+   * rows placed before the node advertised an address. Set by GetInstance
+   * only; ListInstances leaves it empty. `legion start gateway` dials the
+   * entry named by `wake.port` (docs/gateway.md).
+   *
+   * @generated from field: repeated legion.InstanceEndpoint endpoints = 37;
+   */
+  endpoints: InstanceEndpoint[] = [];
+
+  /**
+   * The task's `suspend.wake` block, when it declares one: the instance
+   * accepts wake on request through `legion start gateway`, which resumes
+   * it when a request arrives while it is suspended and holds the request
+   * until the instance serves. Unset means the gateway refuses to route to
+   * this instance. Resolved from the newest config of the instance's job
+   * and task. Set by GetInstance only.
+   *
+   * @generated from field: optional legion.InstanceWake wake = 38;
+   */
+  wake?: InstanceWake;
+
+  /**
    * Whether the instance id is a name. True for a caller-chosen keyed id, a
    * fork of a named instance (`<origin>-f<n>`), a seeded
    * `initialInstances` id, an edge-boot id, and every slot id. False for a
@@ -6210,6 +6235,8 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 34, name: "cold_boot", kind: "message", T: InstanceColdBoot, opt: true },
     { no: 35, name: "guest_address", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 36, name: "guest_bridge", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 37, name: "endpoints", kind: "message", T: InstanceEndpoint, repeated: true },
+    { no: 38, name: "wake", kind: "message", T: InstanceWake, opt: true },
     { no: 39, name: "named", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 40, name: "archived", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 41, name: "manifest_url", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
@@ -6234,6 +6261,116 @@ export class InstanceInfo extends Message<InstanceInfo> {
 
   static equals(a: InstanceInfo | PlainMessage<InstanceInfo> | undefined, b: InstanceInfo | PlainMessage<InstanceInfo> | undefined): boolean {
     return proto3.util.equals(InstanceInfo, a, b);
+  }
+}
+
+/**
+ * One served port of an instance (InstanceInfo.endpoints).
+ *
+ * @generated from message legion.InstanceEndpoint
+ */
+export class InstanceEndpoint extends Message<InstanceEndpoint> {
+  /**
+   * The port's label in the task's `network.ports` (`http`).
+   *
+   * @generated from field: string port = 1;
+   */
+  port = "";
+
+  /**
+   * The node's advertised address (an IP or hostname). Empty when the node
+   * advertises none.
+   *
+   * @generated from field: string address = 2;
+   */
+  address = "";
+
+  /**
+   * The advertised port number: what the catalog, health checks, and the
+   * gateway dial. With an ingress chain this is the datapath's port in front
+   * of the task, so the chain applies to gateway traffic too.
+   *
+   * @generated from field: uint32 number = 3;
+   */
+  number = 0;
+
+  constructor(data?: PartialMessage<InstanceEndpoint>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InstanceEndpoint";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "port", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "number", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceEndpoint {
+    return new InstanceEndpoint().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InstanceEndpoint {
+    return new InstanceEndpoint().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InstanceEndpoint {
+    return new InstanceEndpoint().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InstanceEndpoint | PlainMessage<InstanceEndpoint> | undefined, b: InstanceEndpoint | PlainMessage<InstanceEndpoint> | undefined): boolean {
+    return proto3.util.equals(InstanceEndpoint, a, b);
+  }
+}
+
+/**
+ * The resolved `suspend.wake` block of an instance's task.
+ *
+ * @generated from message legion.InstanceWake
+ */
+export class InstanceWake extends Message<InstanceWake> {
+  /**
+   * The `network.ports` label requests are sent to.
+   *
+   * @generated from field: string port = 1;
+   */
+  port = "";
+
+  /**
+   * How long a gateway holds a request while the instance resumes before it
+   * answers `503` with `Retry-After`, in milliseconds. Defaults to 30000.
+   *
+   * @generated from field: uint64 timeout_ms = 2;
+   */
+  timeoutMs = protoInt64.zero;
+
+  constructor(data?: PartialMessage<InstanceWake>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InstanceWake";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "port", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "timeout_ms", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceWake {
+    return new InstanceWake().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InstanceWake {
+    return new InstanceWake().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InstanceWake {
+    return new InstanceWake().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InstanceWake | PlainMessage<InstanceWake> | undefined, b: InstanceWake | PlainMessage<InstanceWake> | undefined): boolean {
+    return proto3.util.equals(InstanceWake, a, b);
   }
 }
 
@@ -10320,6 +10457,287 @@ export class GetIngressCertificatesReply extends Message<GetIngressCertificatesR
 
   static equals(a: GetIngressCertificatesReply | PlainMessage<GetIngressCertificatesReply> | undefined, b: GetIngressCertificatesReply | PlainMessage<GetIngressCertificatesReply> | undefined): boolean {
     return proto3.util.equals(GetIngressCertificatesReply, a, b);
+  }
+}
+
+/**
+ * One injected header in a GetUpstreamCredentials request: an allocation on
+ * the calling node, one of its upstreams, and one credential header on it.
+ *
+ * @generated from message legion.UpstreamCredentialKnown
+ */
+export class UpstreamCredentialKnown extends Message<UpstreamCredentialKnown> {
+  /**
+   * The allocation (manager-facing id) whose credential to fetch.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The upstream's key: the `name` of an external upstream
+   * (`connect.upstreams[].name`), as in `LEGION_UPSTREAM_<NAME>`.
+   *
+   * @generated from field: string upstream = 2;
+   */
+  upstream = "";
+
+  /**
+   * The injected header, lower-cased (`x-api-key`, `authorization`).
+   *
+   * @generated from field: string header = 3;
+   */
+  header = "";
+
+  /**
+   * The version of the value the worker already holds, or 0 for none: the
+   * KV entry's version for a `kv` credential, the token's expiry (unix
+   * seconds) for an `identity` one. When it is still current the reply is
+   * `unchanged`.
+   *
+   * @generated from field: int64 version = 4;
+   */
+  version = protoInt64.zero;
+
+  constructor(data?: PartialMessage<UpstreamCredentialKnown>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpstreamCredentialKnown";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "upstream", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "header", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpstreamCredentialKnown {
+    return new UpstreamCredentialKnown().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpstreamCredentialKnown {
+    return new UpstreamCredentialKnown().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpstreamCredentialKnown {
+    return new UpstreamCredentialKnown().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpstreamCredentialKnown | PlainMessage<UpstreamCredentialKnown> | undefined, b: UpstreamCredentialKnown | PlainMessage<UpstreamCredentialKnown> | undefined): boolean {
+    return proto3.util.equals(UpstreamCredentialKnown, a, b);
+  }
+}
+
+/**
+ * Request payload for GetUpstreamCredentials.
+ *
+ * @generated from message legion.GetUpstreamCredentialsRequest
+ */
+export class GetUpstreamCredentialsRequest extends Message<GetUpstreamCredentialsRequest> {
+  /**
+   * The worker node asking. Must match the caller's authenticated per-node
+   * credential.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Every credential header declared by an allocation on this node.
+   *
+   * @generated from field: repeated legion.UpstreamCredentialKnown known = 2;
+   */
+  known: UpstreamCredentialKnown[] = [];
+
+  constructor(data?: PartialMessage<GetUpstreamCredentialsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetUpstreamCredentialsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "known", kind: "message", T: UpstreamCredentialKnown, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetUpstreamCredentialsRequest {
+    return new GetUpstreamCredentialsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsRequest {
+    return new GetUpstreamCredentialsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsRequest {
+    return new GetUpstreamCredentialsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetUpstreamCredentialsRequest | PlainMessage<GetUpstreamCredentialsRequest> | undefined, b: GetUpstreamCredentialsRequest | PlainMessage<GetUpstreamCredentialsRequest> | undefined): boolean {
+    return proto3.util.equals(GetUpstreamCredentialsRequest, a, b);
+  }
+}
+
+/**
+ * One credential in a GetUpstreamCredentials reply.
+ *
+ * @generated from message legion.UpstreamCredentialValue
+ */
+export class UpstreamCredentialValue extends Message<UpstreamCredentialValue> {
+  /**
+   * The allocation this credential is for.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The upstream key, echoed from the request.
+   *
+   * @generated from field: string upstream = 2;
+   */
+  upstream = "";
+
+  /**
+   * The header, echoed from the request.
+   *
+   * @generated from field: string header = 3;
+   */
+  header = "";
+
+  /**
+   * Where the value comes from, as the allocation's declaration names it:
+   * `kv secrets/openai` or `identity api`. Set even when `error` is, so the
+   * worker can report which key or identity is at fault. Empty when the
+   * declaration is gone.
+   *
+   * @generated from field: string source = 4;
+   */
+  source = "";
+
+  /**
+   * The value's version: the KV entry's version, or the identity token's
+   * expiry in unix seconds. The worker sends it back as
+   * `UpstreamCredentialKnown.version`.
+   *
+   * @generated from field: int64 version = 5;
+   */
+  version = protoInt64.zero;
+
+  /**
+   * True when the version the worker sent is still current (the KV entry
+   * has not moved, or the identity token it holds has more than half its
+   * TTL left). No value is returned.
+   *
+   * @generated from field: bool unchanged = 6;
+   */
+  unchanged = false;
+
+  /**
+   * The secret: the raw KV value, or the signed identity token, which the
+   * forwarder sends as the header value after the declared `prefix`. Treat
+   * as a secret: never log it, never write it to disk.
+   *
+   * @generated from field: string value = 7;
+   */
+  value = "";
+
+  /**
+   * Why no value was returned, e.g. "kv secrets/openai not found" or
+   * "workload identity is not enabled on this manager". Empty on success.
+   *
+   * @generated from field: string error = 8;
+   */
+  error = "";
+
+  /**
+   * True when `error` is authoritative rather than transient: the KV key
+   * does not exist, or the allocation is not on this node or no longer
+   * declares this credential. The worker drops any value it holds, so
+   * deleting the key revokes the credential on the next heartbeat. False
+   * for transient problems (a KV read failure, a failed token mint), where
+   * the worker keeps the last good value.
+   *
+   * @generated from field: bool absent = 9;
+   */
+  absent = false;
+
+  constructor(data?: PartialMessage<UpstreamCredentialValue>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpstreamCredentialValue";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "upstream", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "header", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "unchanged", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "value", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "absent", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpstreamCredentialValue {
+    return new UpstreamCredentialValue().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpstreamCredentialValue {
+    return new UpstreamCredentialValue().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpstreamCredentialValue {
+    return new UpstreamCredentialValue().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpstreamCredentialValue | PlainMessage<UpstreamCredentialValue> | undefined, b: UpstreamCredentialValue | PlainMessage<UpstreamCredentialValue> | undefined): boolean {
+    return proto3.util.equals(UpstreamCredentialValue, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetUpstreamCredentials.
+ *
+ * @generated from message legion.GetUpstreamCredentialsReply
+ */
+export class GetUpstreamCredentialsReply extends Message<GetUpstreamCredentialsReply> {
+  /**
+   * One entry per requested credential, in request order.
+   *
+   * @generated from field: repeated legion.UpstreamCredentialValue credentials = 1;
+   */
+  credentials: UpstreamCredentialValue[] = [];
+
+  constructor(data?: PartialMessage<GetUpstreamCredentialsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetUpstreamCredentialsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "credentials", kind: "message", T: UpstreamCredentialValue, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetUpstreamCredentialsReply {
+    return new GetUpstreamCredentialsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsReply {
+    return new GetUpstreamCredentialsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsReply {
+    return new GetUpstreamCredentialsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetUpstreamCredentialsReply | PlainMessage<GetUpstreamCredentialsReply> | undefined, b: GetUpstreamCredentialsReply | PlainMessage<GetUpstreamCredentialsReply> | undefined): boolean {
+    return proto3.util.equals(GetUpstreamCredentialsReply, a, b);
   }
 }
 

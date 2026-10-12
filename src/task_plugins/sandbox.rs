@@ -566,7 +566,136 @@ pub fn vsock_socket_base(scratch: &Path) -> PathBuf {
 
 /// [`vsock_socket_base`] from the allocation directory the worker owns.
 pub fn vsock_socket_base_for(alloc_dir: &Path) -> PathBuf {
-    vsock_socket_base(&alloc_dir.join(".sandbox"))
+    vsock_socket_base(&sandbox_dir_for(alloc_dir))
+}
+
+/// A sandbox's scratch dir (`<alloc>/.sandbox`): its VMM sockets, root disk,
+/// boot record, and address lease.
+pub fn sandbox_dir_for(alloc_dir: &Path) -> PathBuf {
+    alloc_dir.join(".sandbox")
+}
+
+/// The port the guest in `scratch` listens on for the advertised port
+/// `label`, when its boot record says: a guest restored from a memory
+/// checkpoint keeps the ports it was captured with, even when the restoring
+/// allocation was assigned others. `None` means the allocation's own bind
+/// port. The node datapath reads this per ingress connection, since the
+/// record is written as the guest boots or resumes, after the datapath
+/// already listens (docs/network-handlers.md, "Ingress into a sandbox").
+pub fn sandbox_guest_port(scratch: &Path, label: &str) -> Option<u16> {
+    sandbox_checkpoint::recorded_guest_port(scratch, label)
+}
+
+/// The address a TAP-wired guest in `scratch` holds on its bridge, from
+/// its lease. `None` before the worker leased one (the guest has not
+/// started) and for gated and loopback-only guests.
+pub fn sandbox_guest_address(scratch: &Path) -> Option<std::net::Ipv4Addr> {
+    sandbox_addr::read_lease(scratch).map(|lease| lease.address)
+}
+
+/// The upstreams a gated guest's agent relays: each declared upstream's
+/// loopback port (`ports`, by key, else its local port), the host vsock
+/// port behind it (always the allocation's local port, where the node
+/// datapath listens), and its VIP, so `<key>.svc.legion` works in the
+/// guest. Sorted, so the init script and the disk fingerprint are stable.
+fn gated_guest_upstreams(
+    network: Option<&crate::structs::AllocNetwork>,
+    ports: &BTreeMap<String, u16>,
+) -> Vec<legion_guest::identity::GuestUpstream> {
+    let Some(network) = network.filter(|network| network.is_gated()) else {
+        return Vec::new();
+    };
+    let mut upstreams: Vec<legion_guest::identity::GuestUpstream> = network
+        .upstreams
+        .iter()
+        .map(|upstream| {
+            let port = ports
+                .get(&upstream.service)
+                .copied()
+                .unwrap_or(upstream.local_port);
+            legion_guest::identity::GuestUpstream {
+                port,
+                vsock_port: (port != upstream.local_port).then_some(upstream.local_port),
+                vip: upstream
+                    .vip_address()
+                    .and_then(|address| address.parse().ok()),
+            }
+        })
+        .collect();
+    upstreams.sort();
+    upstreams.dedup();
+    upstreams
+}
+
+/// The ports a gated guest's agent serves ingress on at boot: every
+/// advertised port's bind port, sorted and unique.
+fn gated_ingress_ports(allocation: &Allocation) -> Vec<u16> {
+    let mut ports: Vec<u16> = sandbox_checkpoint::boot_guest_ports(allocation.network.as_ref())
+        .into_values()
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// The port env a restored guest's `/legion/resume.env` carries:
+/// `LEGION_PORT_<label>` is the port the guest listens on (unchanged by the
+/// restore for a port it was captured with), and `LEGION_IP_<label>` and
+/// `LEGION_ADDR_<label>` are where the restoring allocation advertises it.
+/// For a gated guest's upstreams, `LEGION_UPSTREAM_<KEY>` and
+/// `LEGION_UPSTREAM_PORT_<KEY>` name the loopback port the guest dials
+/// (likewise unchanged), and `LEGION_UPSTREAM_VIP_<KEY>` the restoring
+/// allocation's VIP, which the agent also listens on.
+fn restored_port_env(
+    allocation: &Allocation,
+    guest_ports: &BTreeMap<String, u16>,
+    guest_upstreams: &BTreeMap<String, u16>,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    let Some(network) = allocation.network.as_ref() else {
+        return env;
+    };
+    for port in &network.ports {
+        let label = crate::structs::sanitize_env_label(&port.name);
+        let guest = guest_ports
+            .get(&port.name)
+            .copied()
+            .unwrap_or(port.bind_port());
+        env.insert(format!("LEGION_PORT_{label}"), guest.to_string());
+        if let Some(address) = network.address.as_deref() {
+            env.insert(format!("LEGION_IP_{label}"), address.to_string());
+            env.insert(
+                format!("LEGION_ADDR_{label}"),
+                format!("{address}:{}", port.host_port),
+            );
+        }
+    }
+    for upstream in &network.upstreams {
+        let Some(port) = guest_upstreams.get(&upstream.service).copied() else {
+            continue;
+        };
+        let label = crate::structs::sanitize_env_label(&upstream.service);
+        env.insert(
+            format!("LEGION_UPSTREAM_{label}"),
+            format!("{}:{port}", crate::structs::UPSTREAM_LOOPBACK_ADDR),
+        );
+        env.insert(format!("LEGION_UPSTREAM_PORT_{label}"), port.to_string());
+        if let Some(vip) = upstream.vip_address() {
+            env.insert(format!("LEGION_UPSTREAM_VIP_{label}"), vip);
+        }
+    }
+    env
+}
+
+/// Whether a sandbox's runtime config wires its guest to a bridge
+/// (`config.network = { mode = "tap", ... }`), the one sandbox shape whose
+/// guest has an address the node can dial.
+pub fn sandbox_config_is_tap(config: &Value) -> bool {
+    config
+        .get("network")
+        .and_then(|network| network.get("mode"))
+        .and_then(Value::as_str)
+        == Some("tap")
 }
 
 /// The env var a TAP guest reads its leased address from (and its
@@ -884,6 +1013,15 @@ fn build_stamp(layout: &Path, payload: &GuestPayload, artifacts: &[StagedArtifac
     if payload.resume_watch {
         hasher.update(b"\0resume-watch\0");
     }
+    for port in &payload.ingress_ports {
+        // The init script hands these to the agent.
+        hasher.update(b"\0ingress-port\0");
+        hasher.update(port.to_string().as_bytes());
+    }
+    for upstream in &payload.upstreams {
+        hasher.update(b"\0upstream\0");
+        hasher.update(upstream.to_arg().as_bytes());
+    }
     if let Some(binary) = payload.guest_binary.as_ref() {
         // A new guest binary (a worker upgrade, the static build installed)
         // must reach the guest, so it rebuilds the disk.
@@ -1120,6 +1258,17 @@ impl SandboxTaskPlugin {
             disk_mounts: volumes.mounts,
             guest_agent: true,
             relay: gated,
+            // A gated guest's advertised ports: the agent listens on each
+            // as a vsock port and relays to the workload, which binds the
+            // same number (`LEGION_PORT_<label>`).
+            ingress_ports: if gated {
+                gated_ingress_ports(allocation)
+            } else {
+                Vec::new()
+            },
+            // Its upstreams: the agent listens on each one's loopback port
+            // and VIP and relays to the datapath's vsock socket for it.
+            upstreams: gated_guest_upstreams(allocation.network.as_ref(), &BTreeMap::new()),
             resume_watch,
             guest_binary: Some(microvm::guest_binary()?),
             resolvers: lease
@@ -2083,6 +2232,30 @@ impl TaskPlugin for SandboxTaskPlugin {
             )?;
             identity.guest_addr = Some(lease.guest_addr());
         }
+        // The restored workload still listens on the ports it was captured
+        // with. A gated guest's agent serves exactly those (plus any port
+        // the job added while it was suspended), and the refreshed env says
+        // where each one is advertised now.
+        let guest_ports =
+            sandbox_checkpoint::restored_guest_ports(manifest, allocation.network.as_ref());
+        // Likewise its upstreams: the workload dials the loopback ports it
+        // was captured with, and the agent relays each to this allocation's
+        // local port for it, where its datapath listens.
+        let guest_upstreams =
+            sandbox_checkpoint::restored_guest_upstreams(manifest, allocation.network.as_ref());
+        if target.vsock.is_some() {
+            let mut ports: Vec<u16> = guest_ports.values().copied().collect();
+            ports.sort_unstable();
+            ports.dedup();
+            identity.ingress_ports = ports;
+            identity.upstreams =
+                gated_guest_upstreams(allocation.network.as_ref(), &guest_upstreams);
+        }
+        identity.env.extend(restored_port_env(
+            allocation,
+            &guest_ports,
+            &guest_upstreams,
+        ));
         sandbox_checkpoint::restore_microvm(
             &target,
             instance,
@@ -3855,5 +4028,67 @@ mod tests {
     #[ignore = "requires KVM + cloud-hypervisor + a guest kernel"]
     fn sandbox_fork_divergence_cloud_hypervisor() -> R<()> {
         fork_divergence("cloud-hypervisor")
+    }
+
+    /// A gated guest's agent relays each upstream on the loopback port its
+    /// workload dials (the captured one after a restore) and on its VIP, to
+    /// the allocation's local port, and a restored guest's env names both.
+    /// A guest that is not gated relays nothing.
+    #[test]
+    fn a_gated_guest_relays_its_upstreams_on_the_ports_it_dials() {
+        use legion_guest::identity::GuestUpstream;
+        let network: crate::structs::AllocNetwork = serde_json::from_value(json!({
+            "mode": "gated",
+            "upstreams": [
+                {
+                    "service": "db", "localPort": 20003, "balance": "least_conn",
+                    "vip": "127.42.0.2", "canonicalPort": 5432,
+                },
+                {
+                    "service": "api", "localPort": 20004, "balance": "least_conn",
+                    "to": "https://api.example.com",
+                },
+            ],
+        }))
+        .unwrap();
+        let db = |port: u16, vsock_port: Option<u16>| GuestUpstream {
+            port,
+            vsock_port,
+            vip: Some("127.42.0.2:5432".parse().unwrap()),
+        };
+        let api = GuestUpstream {
+            port: 20004,
+            vsock_port: None,
+            vip: None,
+        };
+        assert_eq!(
+            gated_guest_upstreams(Some(&network), &BTreeMap::new()),
+            vec![db(20003, None), api]
+        );
+        // Restored: the workload keeps dialing 20011, which the agent now
+        // relays to this allocation's local port, 20003.
+        let captured: BTreeMap<String, u16> =
+            [("db".to_string(), 20011), ("api".to_string(), 20004)].into();
+        assert_eq!(
+            gated_guest_upstreams(Some(&network), &captured),
+            vec![api, db(20011, Some(20003))]
+        );
+
+        let allocation = Allocation {
+            network: Some(network.clone()),
+            ..alloc()
+        };
+        let env = restored_port_env(&allocation, &BTreeMap::new(), &captured);
+        assert_eq!(env["LEGION_UPSTREAM_DB"], "127.0.0.1:20011");
+        assert_eq!(env["LEGION_UPSTREAM_PORT_DB"], "20011");
+        assert_eq!(env["LEGION_UPSTREAM_VIP_DB"], "127.42.0.2:5432");
+        assert_eq!(env["LEGION_UPSTREAM_API"], "127.0.0.1:20004");
+        assert!(!env.contains_key("LEGION_UPSTREAM_VIP_API"));
+
+        let host = crate::structs::AllocNetwork {
+            mode: None,
+            ..network
+        };
+        assert!(gated_guest_upstreams(Some(&host), &BTreeMap::new()).is_empty());
     }
 }

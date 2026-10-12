@@ -11,9 +11,15 @@
 //!    arrives with mTLS);
 //! 2. for a gated task, fails closed while policy is pending or the edge-boot
 //!    gate is shut;
-//! 3. forwards to the private port — spliced (L4), or parsed as HTTP/1.1
-//!    when the chain is `protocol = "http"` so request-time rules apply —
-//!    dialing inside the task's namespace when it has one.
+//! 3. forwards to the task — spliced (L4), or parsed as HTTP/1.1 when the
+//!    chain is `protocol = "http"` so request-time rules apply — the way
+//!    [`TaskDial`] says: the private port on loopback (inside the task's
+//!    namespace when it has one), or a sandbox guest over host-initiated
+//!    vsock or at its address on the bridge.
+//!
+//! A sandbox guest has its own network stack, so the datapath fronts every
+//! port a gated or TAP-wired sandbox advertises, with or without an ingress
+//! chain: nothing else on the node can reach the guest's ports.
 //!
 //! Health checks and the catalog keep targeting the advertised port, so a
 //! check exercises the same path a consumer does. A deny-everything ingress
@@ -30,16 +36,175 @@ use crate::worker::netd::netns;
 use crate::worker::netd::policy::ingress_connect_verdict;
 use crate::worker::netd::proxyproto::{self, tlv, Prefixed};
 use crate::worker::netd::tls::{self as net_tls, PeerIdentity};
+use crate::worker::netd::vsock;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::task::Poll;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::task::JoinHandle;
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// How long a TCP dial to a task may take.
+const TASK_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How an allowed ingress connection reaches the task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskDial {
+    /// `127.0.0.1:<port>`, inside the task's gated namespace when it has
+    /// one: `exec` and `container` tasks.
+    Loopback { netns: Option<PathBuf> },
+    /// A gated sandbox guest, which has no NIC: host-initiated vsock
+    /// through the VMM's base socket in the guest's sandbox dir
+    /// (`<alloc>/.sandbox/vsock.sock`, `CONNECT <port>`), to the guest
+    /// agent, which relays to the workload's loopback port.
+    Vsock { scratch: PathBuf },
+    /// A TAP-wired sandbox guest: TCP to the address the worker leased it
+    /// on its bridge (read from the sandbox dir).
+    Bridge { scratch: PathBuf },
+}
+
+impl TaskDial {
+    /// A gated listener fails closed while policy is pending or the boot
+    /// gate is shut: the task's namespace, or a gated sandbox's vsock.
+    pub fn gated(&self) -> bool {
+        matches!(
+            self,
+            TaskDial::Loopback { netns: Some(_) } | TaskDial::Vsock { .. }
+        )
+    }
+}
+
+/// One advertised port's way to the task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskTarget {
+    pub dial: TaskDial,
+    /// The port label (`network.ports[].name`).
+    pub label: String,
+    /// The port the allocation's task binds (`AllocPort::bind_port`).
+    pub port: u16,
+}
+
+impl TaskTarget {
+    /// The port the workload listens on now. A sandbox guest restored from
+    /// a memory checkpoint keeps the ports it was captured with, which its
+    /// sandbox dir records; everything else binds the allocation's own.
+    /// Read per connection, because a restore writes the record after this
+    /// listener is already bound.
+    pub fn port(&self) -> u16 {
+        match &self.dial {
+            TaskDial::Loopback { .. } => self.port,
+            TaskDial::Vsock { scratch } | TaskDial::Bridge { scratch } => {
+                crate::task_plugins::sandbox_guest_port(scratch, &self.label).unwrap_or(self.port)
+            }
+        }
+    }
+
+    /// The TCP address a loopback or bridge dial goes to. A TAP guest's
+    /// address is read from its lease per connection, since a restore or a
+    /// fork leases a new one after this listener is bound.
+    pub fn tcp_addr(&self) -> R<SocketAddr> {
+        let port = self.port();
+        match &self.dial {
+            TaskDial::Loopback { .. } => Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)),
+            TaskDial::Bridge { scratch } => {
+                let address =
+                    crate::task_plugins::sandbox_guest_address(scratch).with_context(|| {
+                        format!(
+                            "the sandbox guest has no address leased in {} yet",
+                            scratch.display()
+                        )
+                    })?;
+                Ok(SocketAddr::new(IpAddr::V4(address), port))
+            }
+            TaskDial::Vsock { .. } => bail!("a gated sandbox guest is reached over vsock, not TCP"),
+        }
+    }
+
+    /// Open a connection to the task.
+    pub async fn connect(&self) -> R<TaskStream> {
+        match &self.dial {
+            TaskDial::Loopback { netns } => {
+                let stream = netns::connect_tcp(netns.clone(), self.tcp_addr()?).await?;
+                let _ = stream.set_nodelay(true);
+                Ok(TaskStream::Tcp(stream))
+            }
+            TaskDial::Bridge { .. } => {
+                let addr = self.tcp_addr()?;
+                let stream = tokio::time::timeout(TASK_DIAL_TIMEOUT, TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| anyhow!("dial {addr} timed out"))?
+                    .with_context(|| format!("connect {addr}"))?;
+                let _ = stream.set_nodelay(true);
+                Ok(TaskStream::Tcp(stream))
+            }
+            TaskDial::Vsock { scratch } => {
+                let base = crate::task_plugins::vsock_socket_base(scratch);
+                Ok(TaskStream::Vsock(
+                    vsock::dial(&base, u32::from(self.port())).await?,
+                ))
+            }
+        }
+    }
+}
+
+/// A connection to the task: TCP (loopback, a namespace, a bridge), or a
+/// vsock stream through a sandbox's VMM.
+pub enum TaskStream {
+    Tcp(TcpStream),
+    Vsock(UnixStream),
+}
+
+impl AsyncRead for TaskStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TaskStream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            TaskStream::Vsock(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for TaskStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            TaskStream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            TaskStream::Vsock(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TaskStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            TaskStream::Vsock(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TaskStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            TaskStream::Vsock(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
 
 /// One advertised port the datapath fronts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,25 +214,38 @@ pub struct IngressSpec {
     pub label: String,
     /// The advertised host port the datapath binds.
     pub host_port: u16,
-    /// The private port the task bound.
+    /// The port the task binds: the private twin with an ingress chain,
+    /// else (a sandbox guest, whose port space is its own) the advertised
+    /// port's own number.
     pub private_port: u16,
-    /// The task's gated namespace, when it has one (dial inside it).
-    pub netns: Option<PathBuf>,
+    /// How a connection reaches the task.
+    pub dial: TaskDial,
     /// Bind address; `None` is every interface.
     pub bind: Option<IpAddr>,
+}
+
+impl IngressSpec {
+    fn target(&self) -> TaskTarget {
+        TaskTarget {
+            dial: self.dial.clone(),
+            label: self.label.clone(),
+            port: self.private_port,
+        }
+    }
 }
 
 type IngressKey = (i64, String);
 
 struct Shared {
     spec: IngressSpec,
+    target: TaskTarget,
     context: Arc<ForwarderContext>,
     http: OnceLock<Arc<HttpSettings>>,
 }
 
 impl Shared {
     fn gated(&self) -> bool {
-        self.spec.netns.is_some()
+        self.spec.dial.gated()
     }
 
     fn http_settings(self: &Arc<Self>) -> Option<Arc<HttpSettings>> {
@@ -84,9 +262,7 @@ impl Shared {
                 .get_or_init(|| {
                     Arc::new(HttpSettings::for_ingress(
                         self.spec.allocation_id,
-                        self.spec.label.clone(),
-                        self.spec.private_port,
-                        self.spec.netns.clone(),
+                        self.target.clone(),
                         self.context.clone(),
                         self.context.log_dir_for(self.spec.allocation_id),
                     ))
@@ -187,6 +363,7 @@ impl IngressListeners {
                     "Started ingress listener"
                 );
                 let shared = Arc::new(Shared {
+                    target: spec.target(),
                     spec: spec.clone(),
                     context: self.context.clone(),
                     http: OnceLock::new(),
@@ -518,15 +695,14 @@ async fn serve_accepted<S>(
         return;
     }
 
-    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), shared.spec.private_port);
-    let mut task = match netns::connect_tcp(shared.spec.netns.clone(), target).await {
+    let mut task = match shared.target.connect().await {
         Ok(stream) => stream,
         Err(err) => {
             debug!(
                 allocation_id,
                 label = %shared.spec.label,
                 error = ?err,
-                "Ingress could not reach the task's private port"
+                "Ingress could not reach the task"
             );
             net_metrics::connection("ingress", PROTOCOL_TCP, "error");
             let _ = client.shutdown().await;
@@ -632,7 +808,7 @@ mod tests {
                 label: "http".into(),
                 host_port,
                 private_port: private,
-                netns: None,
+                dial: TaskDial::Loopback { netns: None },
                 bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             }])
             .await;
@@ -718,7 +894,7 @@ mod tests {
                 label: "http".into(),
                 host_port,
                 private_port: private,
-                netns: None,
+                dial: TaskDial::Loopback { netns: None },
                 bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             }])
             .await;
@@ -818,7 +994,7 @@ mod tests {
                 label: "https".into(),
                 host_port,
                 private_port: private,
-                netns: None,
+                dial: TaskDial::Loopback { netns: None },
                 bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             }])
             .await;
@@ -928,7 +1104,7 @@ mod tests {
                 label: "tcp".into(),
                 host_port,
                 private_port: private,
-                netns: None,
+                dial: TaskDial::Loopback { netns: None },
                 bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             }])
             .await;
@@ -941,5 +1117,266 @@ mod tests {
             .drain()
             .iter()
             .any(|d| d.direction == "ingress" && d.source == "fallthrough"));
+    }
+
+    /// A fake VMM on a gated sandbox's base socket: it answers the
+    /// host-initiated handshake (`CONNECT <port>` → `OK 1073741824`) by
+    /// connecting to the guest's listener for that port, here a Unix socket
+    /// `<guest>_<port>` standing in for vsock, and splicing. Nothing
+    /// listening on the port closes the stream, as both VMMs do.
+    fn fake_vmm(base: PathBuf, guest: PathBuf) {
+        let listener = tokio::net::UnixListener::bind(&base).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut host, _)) = listener.accept().await {
+                let guest = guest.clone();
+                tokio::spawn(async move {
+                    let mut line = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while host.read(&mut byte).await.unwrap_or(0) == 1 && byte[0] != b'\n' {
+                        line.push(byte[0]);
+                    }
+                    let line = String::from_utf8_lossy(&line).to_string();
+                    let Some(port) = line
+                        .strip_prefix("CONNECT ")
+                        .and_then(|port| port.parse::<u32>().ok())
+                    else {
+                        return;
+                    };
+                    let path = crate::worker::netd::guest_agent::host_socket_path(&guest, port);
+                    let Ok(mut inside) = UnixStream::connect(path).await else {
+                        return;
+                    };
+                    if host.write_all(b"OK 1073741824\n").await.is_err() {
+                        return;
+                    }
+                    let _ = tokio::io::copy_bidirectional(&mut host, &mut inside).await;
+                });
+            }
+        });
+    }
+
+    /// Assign each allocation its ingress policy, in one sync (the cache
+    /// replaces its whole assignment table on every sync).
+    fn assign(cache: &NetPolicyCache, policies: &[(i64, serde_json::Value)]) {
+        let effective: Vec<_> = policies
+            .iter()
+            .map(|(id, ingress)| (*id, policy(ingress.clone())))
+            .collect();
+        let assignments: Vec<AllocNetPolicy> = effective
+            .iter()
+            .map(|(allocation_id, body)| AllocNetPolicy {
+                allocation_id: *allocation_id,
+                policy_hash: body.hash.clone(),
+            })
+            .collect();
+        cache.apply_assignments(&assignments);
+        for (_, body) in effective {
+            cache.insert_body(&body.hash.clone(), body).unwrap();
+        }
+    }
+
+    /// Gated plan §6.10: an advertised port of a gated sandbox, end to end
+    /// against fakes: the ingress listener judges the peer, dials the VMM's
+    /// base socket with `CONNECT <port>`, and the guest agent's ingress
+    /// relays to the workload's loopback port. L4 and HTTP chains both
+    /// apply, the activity ledger sees the connection, a gated guest fails
+    /// closed while its policy is pending, and a restored guest is dialed
+    /// on the port its boot record says it still listens on.
+    #[tokio::test]
+    async fn gated_sandbox_ingress_splices_through_the_vmm_vsock_socket_test() {
+        use crate::worker::netd::guest_agent::{Ingress, Relays, UnixListen};
+
+        let workload = free_port().await;
+        task_on(workload).await;
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join(".sandbox");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let guest = dir.path().join("guest.sock");
+        fake_vmm(
+            crate::task_plugins::vsock_socket_base(&scratch),
+            guest.clone(),
+        );
+        // The guest agent's ingress side, listening on vsock port ==
+        // the workload's port.
+        let agent = Ingress::new(
+            Arc::new(UnixListen {
+                base: guest.clone(),
+            }),
+            Arc::new(Relays::default()),
+        );
+        assert!(agent.ensure(&[workload]).is_empty());
+
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        assign(
+            &cache,
+            &[
+                (41, json!({ "allow": ["127.0.0.0/8"] })),
+                (
+                    43,
+                    json!({
+                        "protocol": "http", "policy": "deny",
+                        "rules": [{ "match": { "path": "/public/**" }, "action": "allow" }]
+                    }),
+                ),
+            ],
+        );
+        let context = Arc::new(ForwarderContext::new(cache, denials.clone()));
+        let ingress = IngressListeners::new(context.clone());
+        let (l4, http_port, pending) = (free_port().await, free_port().await, free_port().await);
+        let spec = |allocation_id: i64, host_port: u16, private_port: u16| IngressSpec {
+            allocation_id,
+            label: "http".into(),
+            host_port,
+            private_port,
+            dial: TaskDial::Vsock {
+                scratch: scratch.clone(),
+            },
+            bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        };
+        ingress
+            .sync(&[
+                spec(41, l4, workload),
+                spec(43, http_port, workload),
+                spec(44, pending, workload),
+            ])
+            .await;
+
+        let ok = request(
+            l4,
+            "GET /hello HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(ok.contains("task saw GET /hello"), "{ok}");
+        assert!(
+            context
+                .activity()
+                .snapshot()
+                .get(&41)
+                .is_some_and(|activity| activity.last_bytes_unix > 0),
+            "the activity ledger saw the connection"
+        );
+
+        // HTTP mode: the request rules apply, then the request goes over
+        // the same vsock dial.
+        let public = request(
+            http_port,
+            "GET /public/x HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(public.contains("task saw GET /public/x"), "{public}");
+        let admin = request(
+            http_port,
+            "GET /admin HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(admin.starts_with("HTTP/1.1 403"), "{admin}");
+
+        // No policy has arrived for allocation 44: a gated guest denies.
+        let out = request(pending, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(out.is_empty(), "{out:?}");
+        assert!(denials
+            .drain()
+            .iter()
+            .any(|d| d.allocation_id == 44 && d.source == "policy-pending"));
+
+        // A restored guest: the allocation was assigned another port, but
+        // the workload in the guest's memory still holds the old one, which
+        // the boot record names. The dial follows the record.
+        let elsewhere = free_port().await;
+        ingress.sync(&[spec(41, l4, elsewhere)]).await;
+        let missed = request(l4, "GET /a HTTP/1.1\r\nHost: svc\r\n\r\n").await;
+        assert!(
+            missed.is_empty(),
+            "nothing listens on {elsewhere}: {missed}"
+        );
+        crate::task_plugins::write_guest_ports_record(&scratch, &[("http", workload)]).unwrap();
+        let restored = request(
+            l4,
+            "GET /after-restore HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            restored.contains("task saw GET /after-restore"),
+            "{restored}"
+        );
+    }
+
+    /// A TAP-wired sandbox: the datapath dials the address the worker
+    /// leased the guest (loopback stands in for the bridge here) on the
+    /// port the guest listens on, read per connection so a restore's new
+    /// lease and recorded ports apply at once.
+    #[tokio::test]
+    async fn tap_sandbox_ingress_dials_the_leased_guest_address_test() {
+        use crate::task_plugins::sandbox_addr::{GuestLease, LEASE_FILE};
+
+        let workload = free_port().await;
+        task_on(workload).await;
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join(".sandbox");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let lease = |address: &str| {
+            let lease = GuestLease {
+                bridge: "br0".into(),
+                address: address.parse().unwrap(),
+                prefix: 16,
+                gateway: None,
+                dns: Vec::new(),
+            };
+            std::fs::write(
+                scratch.join(LEASE_FILE),
+                serde_json::to_vec(&lease).unwrap(),
+            )
+            .unwrap();
+        };
+
+        // The dial target, before and after the worker leased an address.
+        let target = TaskTarget {
+            dial: TaskDial::Bridge {
+                scratch: scratch.clone(),
+            },
+            label: "http".into(),
+            port: workload,
+        };
+        let err = target.tcp_addr().unwrap_err().to_string();
+        assert!(err.contains("no address leased"), "{err}");
+        lease("10.88.128.7");
+        assert_eq!(
+            target.tcp_addr().unwrap(),
+            format!("10.88.128.7:{workload}").parse().unwrap()
+        );
+        assert!(!target.dial.gated(), "a TAP guest is not gated");
+        crate::task_plugins::write_guest_ports_record(&scratch, &[("http", 20001)]).unwrap();
+        assert_eq!(
+            target.tcp_addr().unwrap(),
+            "10.88.128.7:20001".parse().unwrap(),
+            "a restored guest keeps the port it was captured with"
+        );
+        crate::task_plugins::write_guest_ports_record(&scratch, &[("http", workload)]).unwrap();
+
+        // End to end, with the guest "on" loopback.
+        lease("127.0.0.1");
+        let cache = Arc::new(NetPolicyCache::new());
+        let context = Arc::new(ForwarderContext::new(cache, Arc::new(Denials::new())));
+        let ingress = IngressListeners::new(context);
+        let host_port = free_port().await;
+        ingress
+            .sync(&[IngressSpec {
+                allocation_id: 51,
+                label: "http".into(),
+                host_port,
+                private_port: workload,
+                dial: TaskDial::Bridge {
+                    scratch: scratch.clone(),
+                },
+                bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            }])
+            .await;
+        let ok = request(
+            host_port,
+            "GET /preview HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(ok.contains("task saw GET /preview"), "{ok}");
     }
 }

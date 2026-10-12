@@ -199,6 +199,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ListJobActions", Plane::Protected("job:read")),
         ("GetArtifactCredential", Plane::Worker),
         ("GetIngressCertificates", Plane::Worker),
+        ("GetUpstreamCredentials", Plane::Worker),
         ("ListEvents", Plane::Protected("operator:read")),
         ("StreamEvents", Plane::Protected("operator:read")),
         ("WhoAmI", Plane::Open),
@@ -1228,6 +1229,16 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "GetUpstreamCredentials" => svc
+            .get_upstream_credentials(req(
+                GetUpstreamCredentialsRequest {
+                    node_id: NODE_ID.into(),
+                    known: Vec::new(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "ListEvents" => svc
             .list_events(req(ListEventsRequest::default(), token))
             .await
@@ -1942,6 +1953,7 @@ async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
         "FetchNetPolicy",
         "GetArtifactCredential",
         "GetIngressCertificates",
+        "GetUpstreamCredentials",
         "RatifyClaim",
     ] {
         let status = call_endpoint(&svc, &fixtures, method, Some(&intruder))
@@ -2662,6 +2674,87 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
     assert_eq!(status.code(), Code::PermissionDenied);
     assert!(
         status.message().contains("certs/edge"),
+        "{}",
+        status.message()
+    );
+    run(trusted)
+        .await
+        .expect("kv:read on the path allows naming it");
+    Ok(())
+}
+
+/// `connect.upstreams[].credentials` hands a KV value to the datapath, which
+/// sends it to the upstream's origin, so naming one in a job needs `kv:read`
+/// on that path: job-write access alone must not be a way to send any secret
+/// in KV to a host of the submitter's choosing.
+#[tokio::test]
+async fn upstream_credential_needs_kv_read_on_the_path() -> R<()> {
+    let (svc, _fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    svc.store.upsert_acl_policy(
+        "deployer",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+    )?;
+    svc.store.upsert_acl_policy(
+        "secret-reader",
+        "",
+        r#"[{"resources": ["kv"], "actions": ["read"], "paths": ["secrets/*"]}]"#,
+    )?;
+    let (_, deployer) = authenticator
+        .mint_token(&svc.store, "deployer", "client", &["deployer".into()], None)
+        .map_err(|s| anyhow!(s.to_string()))?;
+    let (_, trusted) = authenticator
+        .mint_token(
+            &svc.store,
+            "trusted-deployer",
+            "client",
+            &["deployer".into(), "secret-reader".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    let run = |token: String| {
+        let jobspec = serde_json::json!({
+            "name": "agent",
+            "task": {
+                // A container, not `exec`: submitting a host-level task
+                // needs `host = true`, which is not what this test is about.
+                "runtime": "container",
+                "config": { "image": "alpine", "command": ["sleep", "30"] },
+                "connect": {
+                    "upstreams": [{
+                        "name": "openai",
+                        "to": "https://api.openai.com",
+                        "credentials": [{ "header": "authorization", "prefix": "Bearer ", "from": { "kv": "secrets/openai" } }],
+                    }],
+                },
+            },
+        });
+        let svc = &svc;
+        async move {
+            svc.run_job(req(
+                RunJobRequest {
+                    parsed_jobspec: jobspec.to_string(),
+                    submissions: Vec::new(),
+                    priority: None,
+                    force_reschedule: false,
+                    idempotency_key: None,
+                },
+                Some(&token),
+            ))
+            .await
+        }
+    };
+
+    let status = run(deployer)
+        .await
+        .expect_err("job:write alone must not name a KV credential");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert!(
+        status
+            .message()
+            .contains("connect.upstreams[openai].credentials names kv secrets/openai"),
         "{}",
         status.message()
     );

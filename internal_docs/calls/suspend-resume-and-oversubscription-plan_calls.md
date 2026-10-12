@@ -1354,7 +1354,7 @@ so `used` would refuse nodes that have room.
 [gated-sandbox-checkpoints-plan.md](../plans/gated-sandbox-checkpoints-plan.md)
 Phase 1: gated sandboxes take memory checkpoints, and the submit refusal is
 gone. What is refused now, at capture, is a gated sandbox on Firecracker
-older than 1.16.1 ([gated calls entry 12](gated-sandbox-checkpoints-plan_calls.md#12-gated-memory-checkpoints-need-firecracker-1161-checked-at-capture)).
+older than 1.16.1 ([gated calls entry 18](gated-sandbox-checkpoints-plan_calls.md#18-gated-memory-checkpoints-need-firecracker-1161-checked-at-capture)).
 
 **Call.** Job validation (`job run`, `job validate`, `job plan`) refuses a
 `sandbox` task that declares gated networking and asks for memory checkpoints.

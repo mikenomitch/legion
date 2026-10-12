@@ -17,6 +17,7 @@ pub mod constants;
 pub mod constraints;
 pub mod content_publish;
 pub mod content_store;
+pub mod gateway;
 pub mod manager;
 pub mod otel;
 pub mod plugin_runtime;
