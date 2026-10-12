@@ -93,11 +93,11 @@
         # Quiet this long, then suspend. Tuned for a human who stepped away.
         after = "3m",
         # What a TAP-wired microVM can show: bytes the guest sends on its
-        # TAP, and its CPU. `exec` would never fire (a microVM takes no exec
-        # sessions), and `connections` is refused (no datapath fronts the
+        # TAP, its CPU, and open `legion exec` sessions (the guest agent's
+        # vsock listener). `connections` is refused (no datapath fronts the
         # guest). See the guide's "An instance never goes idle, or goes idle
         # too soon".
-        signals = ["network", "cpu"],
+        signals = ["network", "cpu", "exec"],
         cpuBelow = 0.02,
       },
       # Under memory pressure, suspend this sandbox (state kept) before the

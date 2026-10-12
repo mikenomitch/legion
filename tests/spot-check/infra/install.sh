@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs Legion on the rig and forms the cluster:
 #   1. ships the Linux binary to every box (S3 + presigned URL)
-#   2. starts sc-mgr-1 as the raft bootstrap node and bootstraps ACLs
+#   2. starts sc-mgr-1 as the raft bootstrap node and reads its first token
 #   3. joins sc-mgr-2 and sc-mgr-3 with a raft join token
 #   4. joins both workers with a worker join token
 #
@@ -92,12 +92,15 @@ if ! sc_ssh "$mgr1" "test -d /var/lib/legion/raft"; then
 fi
 
 if [ ! -s "$SC_STATE/token" ]; then
-    sc_log "Bootstrapping ACLs (management token saved to .state/token)"
-    # Pre-seeded secret, so the token never has to be parsed out of output.
-    secret="lgn_sc_$(openssl rand -hex 24)"
-    on_mgr1 legion acl bootstrap --secret "$secret" >/dev/null
-    echo "$secret" >"$SC_STATE/token"
+    sc_log "Fetching the first-start management token (saved to .state/token)"
+    # ACLs are on by default: the manager mints the first management token
+    # at first start into <dataDir>/bootstrap-token (docs/auth-and-acls.md).
+    sc_ssh "$mgr1" "sudo cat /var/lib/legion/bootstrap-token" >"$SC_STATE/token"
     chmod 600 "$SC_STATE/token"
+    if [ ! -s "$SC_STATE/token" ]; then
+        echo "$mgr1 wrote no /var/lib/legion/bootstrap-token; see: tests/spot-check/infra/ssh.sh $mgr1 journalctl -u legion-manager" >&2
+        exit 1
+    fi
 fi
 
 for name in "${SC_MANAGERS[@]:1}"; do

@@ -1107,22 +1107,21 @@ impl SandboxTaskPlugin {
             instance.task_dir.as_deref(),
         );
         let file_tokens = has_file_identities(task);
-        if gated {
-            microvm::check_vsock_socket_path(&vsock_socket_base(&scratch))?;
-        }
+        // Every microVM has a vsock device and the agent, for exec
+        // (sandbox-exec plan §6.1). Only a gated one gets the relays.
+        microvm::check_vsock_socket_path(&vsock_socket_base(&scratch))?;
         // A guest launched for checkpoints, or with token files, watches its
-        // identity disk. On a gated guest the agent runs the watch.
+        // identity disk. The agent runs the watch.
         let resume_watch = instance.checkpoint_launch || file_tokens;
         let mut payload = GuestPayload {
             command: config.command.clone(),
             env: guest_env,
             cwd: payload_cwd,
             disk_mounts: volumes.mounts,
-            guest_agent: gated,
+            guest_agent: true,
+            relay: gated,
             resume_watch,
-            guest_binary: (gated || resume_watch)
-                .then(microvm::guest_binary)
-                .transpose()?,
+            guest_binary: Some(microvm::guest_binary()?),
             resolvers: lease
                 .as_ref()
                 .map(|lease| lease.dns.clone())
@@ -1196,7 +1195,7 @@ impl SandboxTaskPlugin {
             memory_mib: config.memory_mib(),
             tap,
             api_socket: scratch.join("vmm.sock"),
-            vsock: gated.then(|| microvm::VsockSpec {
+            vsock: Some(microvm::VsockSpec {
                 socket: vsock_socket_base(&scratch),
             }),
             identity_disk: None,
@@ -1378,6 +1377,7 @@ impl SandboxTaskPlugin {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                security: oci_bundle::BundleSecurity::default(),
                 // Docker's defaults, like a `container` task that adjusts
                 // nothing: a dev-mode sandbox runs the same stock images. A
                 // sandbox cannot drop capabilities, so the node's container
@@ -1646,9 +1646,9 @@ impl TaskPlugin for SandboxTaskPlugin {
     }
 
     fn exec_support(&self) -> ExecSupport {
-        // Exec into a microVM needs a vsock guest agent (deferred); dev mode
-        // borrows Apple `container exec`. Either way the session is sandboxed,
-        // never host-level.
+        // A microVM takes exec through its guest agent over vsock; dev mode
+        // on macOS borrows Apple `container exec`. Either way the session is
+        // sandboxed, never host-level.
         let supported = Backend::detect(None)
             .map(|hypervisor| hypervisor.supports_exec())
             .unwrap_or(false);
@@ -1669,9 +1669,22 @@ impl TaskPlugin for SandboxTaskPlugin {
         let hypervisor = Backend::detect(configured_backend(task).as_deref())?;
         if !hypervisor.supports_exec() {
             bail!(
-                "sandbox exec is not supported on {}: exec into a microVM needs a guest agent \
-                 (not yet implemented)",
+                "sandbox exec is not supported on {}: the Linux dev path runs no guest agent",
                 hypervisor.label()
+            );
+        }
+        if hypervisor.is_microvm() {
+            // The guest agent's exec listener, through the VMM's vsock host
+            // socket. The guest runs it as root in the task's environment.
+            info!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                tty = opts.tty,
+                "Opening exec session in a microVM over vsock"
+            );
+            return crate::task_plugins::vsock_exec::open(
+                &vsock_socket_base(&work_root(allocation, _runtime)),
+                &opts,
             );
         }
         let name = match hypervisor {
@@ -2041,10 +2054,10 @@ impl TaskPlugin for SandboxTaskPlugin {
                 .tap_for(identity.instance_id.as_deref(), allocation.id)
                 .map(|tap| tap.device),
             bridge: config.tap_bridge(),
-            // A gated restore moves the guest's vsock onto this
-            // allocation's own socket, where the datapath already listens.
-            vsock: crate::task_plugins::allocation_is_gated(allocation)
-                .then(|| vsock_socket_base(&work_root(allocation, instance))),
+            // Every restore moves the guest's vsock onto this allocation's
+            // own socket: exec dials it, and on a gated guest the datapath
+            // already listens there.
+            vsock: Some(vsock_socket_base(&work_root(allocation, instance))),
             datapath_wait: sandbox_checkpoint::DATAPATH_WAIT,
         };
         let scratch = target.scratch.clone();
@@ -3486,6 +3499,92 @@ mod tests {
     #[ignore = "Phase 0: requires KVM + cloud-hypervisor + a vsock guest kernel + legion-guest"]
     fn sandbox_gated_boots_cloud_hypervisor() -> R<()> {
         gated_boot("cloud-hypervisor")
+    }
+
+    /// Sandbox-exec plan Phase 1 on a real VMM: a TAP-less, ungated microVM
+    /// (network `none`) takes a pipe session with its own exit status and a
+    /// pty session sized as asked, while the guest still has no listener it
+    /// could dial out through.
+    ///
+    /// ```text
+    /// LEGION_SANDBOX_KERNEL=/var/lib/legion/kernels/vmlinux \
+    /// LEGION_GUEST_BINARY=$PWD/target/x86_64-unknown-linux-musl/dist/legion-guest \
+    /// cargo test --lib sandbox_exec_over_vsock -- --ignored --nocapture --test-threads 1
+    /// ```
+    fn exec_over_vsock(hypervisor: &str) -> R<()> {
+        if std::env::var_os(microvm::GUEST_BINARY_ENV).is_none() {
+            bail!(
+                "set {} to the static legion-guest build: the test binary cannot serve as the \
+                 guest agent",
+                microvm::GUEST_BINARY_ENV
+            );
+        }
+        let image = std::env::var("LEGION_SANDBOX_TEST_IMAGE")
+            .unwrap_or_else(|_| "alpine:latest".to_string());
+        let task = task_with(json!({
+            "image": image,
+            "hypervisor": hypervisor,
+            "command": ["/bin/sh", "-c", "echo booted; sleep 600"],
+            "env": { "GREETING": "from-the-task-env" },
+        }));
+        let allocation = alloc();
+        let tmp = tempfile::tempdir()?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().join("allocs").join(allocation.id.to_string())),
+            log_dir: Some(tmp.path().join("logs")),
+            ..TaskInstance::default()
+        };
+        let plugin = SandboxTaskPlugin;
+        plugin.prepare(&allocation, &task, &mut instance)?;
+        plugin.start(&allocation, &task, &mut instance)?;
+        let console = instance.log_dir.as_ref().unwrap().join("stdout.log");
+        wait_for("the guest to boot", || {
+            std::fs::read_to_string(&console).is_ok_and(|log| log.contains("booted"))
+        })?;
+        assert!(plugin.exec_support().exec, "a microVM takes exec");
+
+        let opts = crate::task_plugins::ExecOptions::new(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "echo $GREETING; ls /proc/self/fd >/dev/null; exit 3".into(),
+            ],
+            false,
+        );
+        let mut session = plugin.exec(&allocation, &task, &mut instance, opts)?;
+        let mut output = session.take_output()?;
+        session.close_stdin();
+        let mut text = String::new();
+        output.stdout.read_to_string(&mut text)?;
+        assert_eq!(session.wait()?, 3, "the process's own exit status");
+        assert!(text.contains("from-the-task-env"), "{text}");
+
+        let mut tty = crate::task_plugins::ExecOptions::new(
+            vec!["sh".into(), "-c".into(), "stty size".into()],
+            true,
+        );
+        tty.winsize = (120, 40);
+        let mut session = plugin.exec(&allocation, &task, &mut instance, tty)?;
+        let mut output = session.take_output()?;
+        let mut text = String::new();
+        output.stdout.read_to_string(&mut text)?;
+        assert_eq!(session.wait()?, 0);
+        assert!(text.contains("40 120"), "{text}");
+
+        plugin.stop(&allocation, &task, &mut instance)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Sandbox exec Phase 1: requires KVM + Firecracker 1.17.0+ + a vsock guest kernel + legion-guest"]
+    fn sandbox_exec_over_vsock_firecracker() -> R<()> {
+        exec_over_vsock("firecracker")
+    }
+
+    #[test]
+    #[ignore = "Sandbox exec Phase 1: requires KVM + cloud-hypervisor + a vsock guest kernel + legion-guest"]
+    fn sandbox_exec_over_vsock_cloud_hypervisor() -> R<()> {
+        exec_over_vsock("cloud-hypervisor")
     }
 
     /// The highest `counter=N` a guest has printed to its console so far.

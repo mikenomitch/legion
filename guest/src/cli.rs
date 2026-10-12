@@ -17,6 +17,7 @@ use crate::agent::{self, AgentConfig, VsockDial, HOST_CID};
 
 const USAGE: &str = "\
 usage: legion-guest guest-agent [--proxy-port PORT] [--dns-port PORT] [--host-cid CID]
+                                [--no-relay] [--exec-port PORT]
                                 [--resume-watch [--identity DEVICE] [--poll-ms MS]]
        legion-guest guest-resume [--identity DEVICE] [--poll-ms MS]
 
@@ -29,8 +30,15 @@ pub struct AgentArgs {
     /// 0 disables the DNS relay.
     pub dns_port: u16,
     pub host_cid: u32,
-    /// Also run the resume watch in this process (a gated sandbox launched
-    /// for memory checkpoints), so a restore can close the relays it holds.
+    /// Run the proxy and DNS relays (a gated sandbox). `--no-relay` turns
+    /// them off for a TAP or `none` sandbox, whose agent only takes exec
+    /// sessions: the guest still cannot dial the host.
+    pub relay: bool,
+    /// The guest vsock port the exec listener binds; 0 disables exec.
+    pub exec_port: u32,
+    /// Also run the resume watch in this process (a sandbox launched for
+    /// memory checkpoints), so a restore can close the relays and exec
+    /// sessions it holds.
     pub resume_watch: Option<ResumeArgs>,
 }
 
@@ -40,6 +48,8 @@ impl Default for AgentArgs {
             proxy_port: agent::PROXY_PORT as u16,
             dns_port: agent::DNS_PORT as u16,
             host_cid: HOST_CID,
+            relay: true,
+            exec_port: crate::exec::EXEC_PORT,
             resume_watch: None,
         }
     }
@@ -113,6 +123,8 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
                     }
                     "--dns-port" => parsed.dns_port = number(flag, value(flag, &mut rest)?)?,
                     "--host-cid" => parsed.host_cid = number(flag, value(flag, &mut rest)?)?,
+                    "--no-relay" => parsed.relay = false,
+                    "--exec-port" => parsed.exec_port = number(flag, value(flag, &mut rest)?)?,
                     "--resume-watch" => resume_watch = true,
                     "--identity" => {
                         watch.identity = Some(PathBuf::from(value(flag, &mut rest)?));
@@ -167,28 +179,39 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 fn run_agent(args: &AgentArgs) -> Result<()> {
-    let config = AgentConfig {
-        proxy_listen: format!("127.0.0.1:{}", args.proxy_port).parse()?,
-        proxy_port: u32::from(args.proxy_port),
-        dns_listen: (args.dns_port != 0)
-            .then(|| format!("127.0.0.1:{}", args.dns_port).parse())
-            .transpose()?,
-        dns_port: u32::from(args.dns_port),
+    if args.exec_port != 0 {
+        // Exec first: it is the one listener every microVM's agent runs.
+        crate::exec::serve_vsock(args.exec_port)
+            .with_context(|| format!("listen for exec on vsock port {}", args.exec_port))?;
+        eprintln!("legion-guest-agent: exec on vsock port {}", args.exec_port);
+    }
+    let relays = if args.relay {
+        let config = AgentConfig {
+            proxy_listen: format!("127.0.0.1:{}", args.proxy_port).parse()?,
+            proxy_port: u32::from(args.proxy_port),
+            dns_listen: (args.dns_port != 0)
+                .then(|| format!("127.0.0.1:{}", args.dns_port).parse())
+                .transpose()?,
+            dns_port: u32::from(args.dns_port),
+        };
+        let started = agent::start(config, Arc::new(VsockDial { cid: args.host_cid }))?;
+        eprintln!(
+            "legion-guest-agent: proxy on {}, dns on {} -> host cid {}",
+            started.proxy_addr,
+            started
+                .dns_addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "off".into()),
+            args.host_cid
+        );
+        Some(started.relays.clone())
+    } else {
+        None
     };
-    let started = agent::start(config, Arc::new(VsockDial { cid: args.host_cid }))?;
-    eprintln!(
-        "legion-guest-agent: proxy on {}, dns on {} -> host cid {}",
-        started.proxy_addr,
-        started
-            .dns_addr
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| "off".into()),
-        args.host_cid
-    );
     if let Some(watch) = args.resume_watch.as_ref() {
-        let relays = started.relays.clone();
         return run_agent_watch(watch, &move || {
-            let closed = relays.close_all();
+            let closed =
+                relays.as_ref().map_or(0, |relays| relays.close_all()) + crate::exec::close_all();
             if closed > 0 {
                 eprintln!(
                     "legion-guest-agent: restored; closed {closed} connection(s) the capture \
@@ -294,6 +317,14 @@ mod tests {
                     identity: None,
                     poll: Duration::from_millis(100),
                 }),
+                ..AgentArgs::default()
+            })
+        );
+        // A TAP or `none` sandbox: exec only, no relays.
+        assert_eq!(
+            parse(&args(&["guest-agent", "--no-relay", "--exec-port", "1100"])).unwrap(),
+            Invocation::Agent(AgentArgs {
+                relay: false,
                 ..AgentArgs::default()
             })
         );

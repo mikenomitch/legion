@@ -2,7 +2,12 @@
 
 > **Judgement calls:** [`calls/sandbox-exec-plan_calls.md`](../calls/sandbox-exec-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-11). Nothing here is built. This plan
+**Status: IN EXECUTION** (written 2026-10-11). Phases 1 (exec into
+microVMs over vsock), 2 (direct exec), and 3 (delegated minting keys) shipped
+on 2026-10-12 with worker-plane-auth Phases 0 to 8, and Phase 0 is measured
+on one host; deviations are calls 6 and 9 to 26. Open: Phase 0 at scale on
+the rig, Phase 1 on KVM hardware (the steps are in §11, "Verification
+record"), and Phases 4 and 5. The rest is below. This plan
 is the brief for implementing exec into microVM sandboxes together with
 [worker-plane-auth-plan.md](worker-plane-auth-plan.md) (PR
 [#16](https://github.com/mikenomitch/legion/pull/16)). Deliberately
@@ -654,6 +659,37 @@ Each phase ships alone and is worth having alone.
 - **Phase 4:** a gateway forwards a ticketed session and refuses an
   unticketed one, and a browser terminal works through it.
 - **Benchmarks:** the §7 matrix before and after Phases 1 and 2, in the PR.
+
+### Verification record (2026-10-12)
+
+What ran where, and what still needs hardware:
+
+- **Ran in CI's environment (no KVM):** the guest agent's exec listener
+  against the worker's `VsockExecSession` over Unix sockets, with a fake VMM
+  answering `CONNECT 1100` (pipe and pty sessions, resize, exit status,
+  process-group kill on disconnect, an old agent's hello, a hostile 4 GiB
+  frame, a guest with no agent); the init script and root-disk payload for
+  gated and ungated guests; direct exec end to end on a manager and an
+  in-process worker (`tests/worker_plane_e2e.rs`: session, exit status,
+  mint JSON, revocation within a heartbeat, delegated keys reaching the
+  worker, refused for a host-level job and another job, and dropped on
+  delete); the mint ACL matrix; Phase 0 at 1 to 500 sessions.
+- **Needs a KVM host** (Firecracker 1.17.0+, cloud-hypervisor, a vsock guest
+  kernel, the static `legion-guest`):
+
+  ```text
+  LEGION_SANDBOX_KERNEL=/var/lib/legion/kernels/vmlinux \
+  LEGION_GUEST_BINARY=$PWD/target/x86_64-unknown-linux-musl/dist/legion-guest \
+  cargo test --lib sandbox_exec_over_vsock -- --ignored --nocapture --test-threads 1
+  ```
+
+  then by hand: exec after a memory resume with `--instance`, a session
+  across a suspend, exec into a `none` sandbox while the guest still cannot
+  dial the host, the `exec` idle signal, and an action from the UI terminal.
+- **Needs the AWS rig:** Phase 0 at 1,000 and 10,000 sessions on real
+  workers, and the same-AZ open-latency SLO.
+- **Needs runc:** a delegated key's accepted session on a `container` task
+  (the e2e suite's tasks are `exec`, which keys never reach).
 
 ## 12. Rollout and backward compatibility
 

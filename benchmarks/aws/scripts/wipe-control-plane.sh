@@ -14,7 +14,7 @@ for idx in "${!CP_ADDRS[@]}"; do
         sudo systemctl disable --now legion-manager 2>/dev/null || true
         sudo systemctl disable --now nomad 2>/dev/null || true
         if command -v kubeadm >/dev/null 2>&1; then sudo kubeadm reset -f 2>/dev/null || true; fi
-        sudo rm -rf /var/lib/legion /var/lib/nomad /etc/kubernetes /var/lib/etcd
+        sudo rm -rf /var/lib/legion /var/lib/nomad /etc/kubernetes /var/lib/etcd /root/.legion
         sudo rm -f /etc/systemd/system/legion-manager.service /etc/systemd/system/nomad.service
         sudo systemctl daemon-reload
     "

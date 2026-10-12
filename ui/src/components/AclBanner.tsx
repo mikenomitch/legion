@@ -54,9 +54,10 @@ export function AclBanner() {
           <p class="flex min-w-0 items-center gap-2">
             <Icon name="alertTriangle" size={15} class="shrink-0" />
             <span class="min-w-0">
-              <span class="font-semibold">ACLs are disabled.</span> Anyone who can reach this manager
-              has full access. Set <code class="rounded bg-amber-500/15 px-1 font-mono text-xs">acl.enabled: true</code> in
-              the manager config to enforce access control.
+              <span class="font-semibold">ACLs are disabled.</span> Anyone who can reach this manager,
+              including any task on its host, has full access. Remove{' '}
+              <code class="rounded bg-amber-500/15 px-1 font-mono text-xs">acl.enabled = false</code> from
+              the manager config to turn access control back on.
             </span>
           </p>
           <button type="button" onClick={dismiss} aria-label="Dismiss ACL warning" class={dismissClass}>

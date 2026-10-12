@@ -22,21 +22,21 @@ five public IPv4 addresses. Workers use
 [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html),
 so microVM sandboxes get `/dev/kvm` without bare metal.
 
-**Temporary shims.** The rig needs two not-for-merge source patches, kept
-in [`shims.patch`](shims.patch) rather than in `src/`. Apply them before
-building the Linux binary, and only while the real fixes are missing
-(`git apply --check` fails once the code they touch has changed, which is
-the cue to check whether each one is still needed). Each hunk is marked
-`SPOT-CHECK SHIM`:
+**Temporary shim.** The rig needs one not-for-merge source patch, kept in
+[`shims.patch`](shims.patch) rather than in `src/`. Apply it before building
+the Linux binary, and only while the real fix is missing (`git apply
+--check` fails once the code it touches has changed, which is the cue to
+check whether it is still needed). The hunk is marked `SPOT-CHECK SHIM`:
 
-- **Worker address** (`src/worker/daemon.rs`): `LEGION_WORKER_HOST` and
-  `LEGION_WORKER_ADVERTISE_ADDR` let managers reach workers on other hosts.
-  The worker API stays unauthenticated, so the rig only opens port 4848 to
-  the managers' security group. The real fix is
-  [worker-plane-auth-plan.md](../../internal_docs/plans/worker-plane-auth-plan.md).
 - **Health checks after artifact staging** (`src/worker/task_manager.rs`):
   the staging thread enters the Tokio runtime, so tasks whose images go
   through the artifact pipeline get health checks instead of a panic.
+
+The worker address shim is gone: workers bind `LEGION_WORKER_HOST` and
+advertise `LEGION_WORKER_ADVERTISE_ADDR` natively, and managers reach them
+over mutual TLS
+([architecture-managers-workers.md](../../docs/architecture-managers-workers.md#ports-and-who-dials-whom)).
+The rig still opens port 4848 only to the managers' security group.
 
 ## Layout
 

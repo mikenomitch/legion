@@ -10,6 +10,7 @@
 pub mod artifacts;
 pub mod certs;
 pub mod checkpoint_seal;
+pub mod cluster_tls;
 pub mod cmd;
 pub mod config_lang;
 pub mod constants;
