@@ -33,8 +33,9 @@ use crate::structs::snapshot::SnapshotDurability;
 /// Default `suspend.resumeTimeout`.
 pub const DEFAULT_RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default timeout for `suspend.onResume` inside the guest.
-pub const ON_RESUME_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for `suspend.onResume` inside the guest. The guest's
+/// resume handler enforces it, so it is defined there.
+pub use legion_guest::resume::ON_RESUME_TIMEOUT;
 
 /// Default `suspend.idle.after`.
 pub const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(180);

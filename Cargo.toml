@@ -25,7 +25,18 @@ include = [
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# The workspace is this crate plus `guest/`, the in-guest agent that ships as
+# its own static binary (docs/task-runtime-sandbox.md, "The guest agent").
+# The example plugins under `plugins/` are separate crates built by build.rs
+# with their own lockfiles, so they stay out of it.
+[workspace]
+members = [".", "guest"]
+exclude = ["plugins"]
+
 [dependencies]
+# The guest agent, resume handler, and identity disk format, shared with the
+# static `legion-guest` binary built from the same crate.
+legion-guest = { path = "guest", version = "0.1.0" }
 clap = { version = "4.5.48", features = ["cargo", "derive"] }
 futures = "0.3"
 # Persistent (HAMT) maps for the scheduler's read model: a plan's capacity
