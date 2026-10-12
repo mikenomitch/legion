@@ -51,8 +51,15 @@ const KVM_DEVICE: &str = "/dev/kvm";
 /// not use it.
 pub(crate) const GUEST_INIT_PATH: &str = "/legion/init";
 pub(crate) const GUEST_ENV_PATH: &str = "/legion/env";
-/// The worker's own binary, copied in for a gated sandbox's guest agent.
+/// The guest binary (the static `legion-guest`, or the worker's own binary
+/// as a fallback), copied in for the guest agent and the resume handler.
 pub(crate) const GUEST_AGENT_PATH: &str = "/legion/legion";
+
+/// Names the static guest binary, overriding the default: `legion-guest`
+/// beside the worker's own executable.
+pub(crate) const GUEST_BINARY_ENV: &str = "LEGION_GUEST_BINARY";
+/// The static guest binary's file name, beside the worker.
+const GUEST_BINARY_NAME: &str = "legion-guest";
 pub(crate) const GUEST_ARTIFACT_DIR: &str = "/legion/artifacts";
 
 /// Guest block devices, in attach order: root disk first, then every attached
@@ -625,6 +632,10 @@ pub(crate) struct GuestPayload {
     /// On a gated sandbox the agent runs it (`guest-agent --resume-watch`),
     /// so a restore closes the agent's dead relays in the same process.
     pub resume_watch: bool,
+    /// The binary copied in as `/legion/legion` when the guest needs the
+    /// agent or the resume handler. `None` resolves it at install
+    /// ([`guest_binary`]).
+    pub guest_binary: Option<GuestBinary>,
 }
 
 /// One volume disk mount inside the guest. A volume with no declared `path`
@@ -794,20 +805,110 @@ pub(crate) fn install_guest_payload(
         }
     }
     if payload.guest_agent || payload.resume_watch {
-        install_guest_agent(rootfs)?;
+        let binary = match payload.guest_binary.clone() {
+            Some(binary) => binary,
+            None => guest_binary()?,
+        };
+        install_guest_agent(rootfs, &binary)?;
     }
     Ok(())
 }
 
-/// Copy this binary into the rootfs as `/legion/legion`. The agent is a
-/// subcommand of the same executable, so a node ships exactly one artifact;
-/// an image whose libc cannot run it is reported by init at boot (the guest
-/// then has no network, which is the gated mode's promise).
-fn install_guest_agent(rootfs: &Path) -> R<()> {
+/// The binary a guest runs as `/legion/legion`: its guest agent and resume
+/// handler (calls entry 6 of the gated plan).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuestBinary {
+    pub path: PathBuf,
+    /// The static `legion-guest`, which runs on any image (busybox, Alpine).
+    /// False for the fallback, the worker's own binary, which needs the
+    /// image to have a compatible glibc.
+    pub is_static: bool,
+    /// Size and modification time, so a new binary rebuilds the root disk
+    /// rather than reusing one that carries the old agent.
+    pub fingerprint: String,
+}
+
+impl GuestBinary {
+    fn at(path: PathBuf, is_static: bool) -> R<Self> {
+        let metadata =
+            std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        Ok(GuestBinary {
+            fingerprint: format!("{}:{}:{modified}", path.display(), metadata.len()),
+            path,
+            is_static,
+        })
+    }
+}
+
+/// Find the guest binary: [`GUEST_BINARY_ENV`] when set (and it must exist),
+/// else `legion-guest` beside the worker's executable, else the worker's
+/// own executable, which every guest can still try to run.
+pub(crate) fn guest_binary() -> R<GuestBinary> {
+    let worker = std::env::current_exe().context("locating the legion binary")?;
+    guest_binary_from(
+        std::env::var(GUEST_BINARY_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        &worker,
+    )
+}
+
+fn guest_binary_from(configured: Option<PathBuf>, worker: &Path) -> R<GuestBinary> {
+    if let Some(path) = configured {
+        if !path.is_file() {
+            bail!(
+                "{GUEST_BINARY_ENV} names {}, which does not exist: install the static \
+                 legion-guest binary there, or unset it",
+                path.display()
+            );
+        }
+        return GuestBinary::at(path, true);
+    }
+    let beside = worker.with_file_name(GUEST_BINARY_NAME);
+    if beside.is_file() {
+        return GuestBinary::at(beside, true);
+    }
+    GuestBinary::at(worker.to_path_buf(), false)
+}
+
+/// At worker start: say once when sandbox guests will get the worker's own
+/// binary, which a musl image (`alpine:latest`) cannot run, so its gated
+/// guest has no network and its restores keep their old identity.
+pub(crate) fn warn_if_no_static_guest_binary() {
+    if installed_vmms().is_empty() {
+        // No microVM monitor: this node runs dev-mode sandboxes only, which
+        // never get the guest binary.
+        return;
+    }
+    match guest_binary() {
+        Ok(binary) if binary.is_static => {
+            info!(path = %binary.path.display(), "Sandbox guests run the static legion-guest binary");
+        }
+        Ok(binary) => warn!(
+            worker = %binary.path.display(),
+            "No static legion-guest binary beside the worker (or {GUEST_BINARY_ENV}); sandbox guests get a copy of the worker itself, which runs only on images with a compatible glibc. On a musl image a gated sandbox has no network and a restore keeps its old identity"
+        ),
+        Err(err) => {
+            warn!(error = %err, "The sandbox guest binary is unusable; sandbox guests that need it will fail to build")
+        }
+    }
+}
+
+/// Copy the guest binary into the rootfs as `/legion/legion`. An image that
+/// cannot run it is reported by init at boot (a gated guest then has no
+/// network, which is the gated mode's promise).
+fn install_guest_agent(rootfs: &Path, binary: &GuestBinary) -> R<()> {
     let target = rootfs.join(GUEST_AGENT_PATH.trim_start_matches('/'));
-    let source = std::env::current_exe().context("locating the legion binary")?;
-    std::fs::copy(&source, &target)
-        .with_context(|| format!("copy {} to {}", source.display(), target.display()))?;
+    std::fs::copy(&binary.path, &target)
+        .with_context(|| format!("copy {} to {}", binary.path.display(), target.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1204,6 +1305,55 @@ mod tests {
 
     /// A gated sandbox launched for checkpoints runs one process: the agent
     /// owns the resume watch, so a restore can close its relays.
+    /// Gated plan §6.5, calls entry 6: the static `legion-guest` beside the
+    /// worker wins, an explicit override must exist, and with neither the
+    /// worker copies itself (the glibc fallback).
+    #[test]
+    fn the_static_guest_binary_is_preferred_over_the_worker() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let worker = dir.path().join("legion");
+        std::fs::write(&worker, b"worker")?;
+        let fallback = guest_binary_from(None, &worker)?;
+        assert_eq!(fallback.path, worker);
+        assert!(!fallback.is_static);
+
+        std::fs::write(dir.path().join("legion-guest"), b"static guest")?;
+        let beside = guest_binary_from(None, &worker)?;
+        assert_eq!(beside.path, dir.path().join("legion-guest"));
+        assert!(beside.is_static);
+        assert_ne!(beside.fingerprint, fallback.fingerprint);
+
+        let elsewhere = dir.path().join("opt-legion-guest");
+        std::fs::write(&elsewhere, b"another static guest")?;
+        assert_eq!(
+            guest_binary_from(Some(elsewhere.clone()), &worker)?.path,
+            elsewhere
+        );
+        let err = guest_binary_from(Some(dir.path().join("missing")), &worker).unwrap_err();
+        assert!(
+            err.to_string().contains("LEGION_GUEST_BINARY names"),
+            "{err}"
+        );
+
+        // What lands in the guest is the chosen binary.
+        let rootfs = tempfile::tempdir()?;
+        install_guest_payload(
+            rootfs.path(),
+            &GuestPayload {
+                command: vec!["/bin/sh".into()],
+                guest_agent: true,
+                guest_binary: Some(beside),
+                ..GuestPayload::default()
+            },
+            "legion-sbx-3",
+        )?;
+        assert_eq!(
+            std::fs::read(rootfs.path().join("legion/legion"))?,
+            b"static guest"
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_gated_checkpointable_guest_runs_the_watch_inside_the_agent() {
         let script = render_init_script(&GuestPayload {
@@ -1277,6 +1427,7 @@ mod tests {
             ],
             guest_agent: false,
             resume_watch: false,
+            guest_binary: None,
         };
         let script = render_init_script(&payload);
 
@@ -1323,6 +1474,7 @@ mod tests {
             }],
             guest_agent: false,
             resume_watch: false,
+            guest_binary: None,
         };
 
         let dir = tempfile::tempdir()?;

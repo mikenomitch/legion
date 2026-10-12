@@ -246,6 +246,7 @@ async fn run_worker_with_manager(
     let enforcement_config =
         usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
     apply_resource_enforcement_env(&enforcement_config);
+    crate::task_plugins::warn_if_no_static_guest_binary();
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
         manager.load_builtin_plugins();
@@ -2239,7 +2240,8 @@ fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
 
 /// The per-allocation resolvers a desired set implies: one per allocation
 /// that was assigned a VIP block, answering `<key>.svc.legion` with that
-/// allocation's upstream VIPs.
+/// allocation's upstream VIPs, and one per gated sandbox, on its vsock
+/// socket, with or without a block.
 fn dns_specs(
     desired: &[TaskAllocation],
     alloc_root: &std::path::Path,
@@ -2252,12 +2254,16 @@ fn dns_specs(
         let Ok(network) = serde_json::from_str::<AllocNetwork>(&allocation.network) else {
             continue;
         };
-        let Some(resolver) = network
+        let resolver = network
             .resolver_address()
-            .and_then(|addr| addr.parse::<std::net::Ipv4Addr>().ok())
-        else {
+            .and_then(|addr| addr.parse::<std::net::Ipv4Addr>().ok());
+        let sandbox = is_gated_sandbox(allocation);
+        // Every gated sandbox gets a resolver on its vsock socket, VIP block
+        // or not: without one, a guest with no upstreams has no DNS at all
+        // (gated plan §6.5, calls entry 11). Everything else needs a block.
+        if resolver.is_none() && !sandbox {
             continue;
-        };
+        }
         let names = network
             .vip_names()
             .into_iter()
@@ -2265,7 +2271,6 @@ fn dns_specs(
                 Some((key, (vip.parse::<std::net::Ipv4Addr>().ok()?, port)))
             })
             .collect();
-        let sandbox = is_gated_sandbox(allocation);
         specs.push(crate::worker::netd::dns::DnsSpec {
             allocation_id: allocation.allocation_id,
             resolver,
@@ -2583,13 +2588,27 @@ fn net_status(
                 expected_upstreams
             ));
         }
-        if network.vip_block.is_some() && !resolver_ready {
+        if vsock_sandbox && !resolver_ready {
+            problems.push(format!(
+                "allocation resolver is not bound on the guest's vsock socket {}",
+                crate::worker::netd::guest_agent::host_socket_path(
+                    &sandbox_vsock_base(alloc_root, id),
+                    crate::worker::netd::guest_agent::DNS_PORT,
+                )
+                .display()
+            ));
+        } else if network.vip_block.is_some() && !resolver_ready {
             problems.push(
                 "allocation resolver is not bound (port 53 needs CAP_NET_BIND_SERVICE)".into(),
             );
         }
+        // A gated sandbox's capture is both vsock host sockets: the proxy and
+        // the resolver.
         let capture_ready = if gated {
-            namespace_ready && proxy_ready && upstreams.len() >= expected_upstreams
+            namespace_ready
+                && proxy_ready
+                && (!vsock_sandbox || resolver_ready)
+                && upstreams.len() >= expected_upstreams
         } else {
             true
         };
@@ -3499,6 +3518,32 @@ mod tests {
             .to_string(),
             ..TaskAllocation::default()
         }
+    }
+
+    /// Gated plan §6.5, calls entry 11: every gated sandbox gets a resolver
+    /// on its vsock socket even with no upstreams (and so no VIP block),
+    /// and never binds an address. A gated container still needs a block
+    /// (its namespace resolver gap is tracked separately).
+    #[test]
+    fn every_gated_sandbox_gets_a_resolver_on_its_vsock_socket_test() {
+        let alloc_root = std::path::Path::new("/var/lib/legion/allocs");
+        let gated = |allocation_id: i64, runtime: &str| TaskAllocation {
+            allocation_id,
+            task_runtime: runtime.into(),
+            network: json!({ "mode": "gated" }).to_string(),
+            ..TaskAllocation::default()
+        };
+        let specs = dns_specs(&[gated(7, "sandbox"), gated(8, "container")], alloc_root);
+        assert_eq!(specs.len(), 1, "{specs:?}");
+        assert_eq!(specs[0].allocation_id, 7);
+        assert_eq!(specs[0].resolver, None, "no address to bind");
+        assert_eq!(specs[0].netns, None);
+        assert_eq!(
+            specs[0].unix.as_deref(),
+            Some(std::path::Path::new(
+                "/var/lib/legion/allocs/7/.sandbox/vsock.sock_53"
+            ))
+        );
     }
 
     #[test]

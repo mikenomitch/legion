@@ -808,30 +808,36 @@
                 # An ${artifact.<name>} reference works here too.
                 kernel = "/var/lib/legion/kernels/vmlinux",
                 kernel_args = "quiet",
-                network = {
-                    # "none" (default, loopback only) or "tap". Not used
-                    # when the task's own `network.mode` below is "gated".
-                    mode = "none",
-                    # With mode = "tap": a pre-created host TAP device (one
-                    # guest per node, so refused on a keyed task, with
-                    # count above one, or with a createFirst rollout), or
-                    # "auto" for a TAP Legion creates per instance (`lgf` +
-                    # a hash of the instance id), attaches to `bridge`,
-                    # recreates on resume, and deletes with the allocation:
-                    # tap = "auto",
-                    # The host bridge an auto TAP joins. Required with
-                    # tap = "auto", refused with a fixed tap.
-                    # bridge = "br0",
-                    # Guest MAC. An auto TAP defaults to one derived from
-                    # the allocation id.
-                    # mac = "02:00:00:00:00:01",
-                },
+                # The guest's own network, for a sandbox that is not gated.
+                # This task is gated (the task-level `network` below), and
+                # submit refuses a gated sandbox with a `config.network`: a
+                # gated guest has no NIC. So it is shown commented out.
+                # network = {
+                #     # "none" (default, loopback only) or "tap".
+                #     mode = "tap",
+                #     # With mode = "tap": a pre-created host TAP device (one
+                #     # guest per node, so refused on a keyed task, with
+                #     # count above one, or with a createFirst rollout), or
+                #     # "auto" for a TAP Legion creates per instance (`lgf` +
+                #     # a hash of the instance id), attaches to `bridge`,
+                #     # recreates on resume, and deletes with the allocation.
+                #     tap = "auto",
+                #     # The host bridge an auto TAP joins. Required with
+                #     # tap = "auto", refused with a fixed tap.
+                #     bridge = "br0",
+                #     # Guest MAC. An auto TAP defaults to one derived from
+                #     # the allocation id.
+                #     mac = "02:00:00:00:00:01",
+                # },
             },
             # The task-level network block applies to sandboxes too: "gated"
             # boots the guest with no NIC and a vsock to the node datapath,
             # where the egress policy decides (docs/network-handlers.md,
-            # "Sandboxes"). "auto" is "host" until the vsock path is
-            # exercised on a real VMM in CI.
+            # "Sandboxes"). A gated task that nothing allows denies every
+            # destination (`gated-default`), so list what it needs.
+            # Ingress ports are refused on a gated sandbox (no NIC to reach).
+            # "auto" is "host" until the vsock path is exercised on a real
+            # VMM.
             network = {
                 mode = "gated",
                 egress = { allow = ["pypi.org", "files.pythonhosted.org"] },

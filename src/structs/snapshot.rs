@@ -433,19 +433,6 @@ pub fn memory_checkpoint_ask(task: &crate::structs::TaskConfig) -> Option<Memory
     None
 }
 
-/// Whether the task's own declaration puts it on gated networking.
-///
-/// Only the declared mode is visible at submit time: a stored network
-/// policy can also force `gated` at placement. Used by submit checks that
-/// depend on the datapath seeing a sandbox's traffic (the `connections` idle
-/// signal) and on the guest running the agent's resume watch.
-pub fn task_declares_gated_network(task: &crate::structs::TaskConfig) -> bool {
-    task.network.as_ref().is_some_and(|network| {
-        crate::structs::network::resolve_network_mode(&network.mode, &task.runtime)
-            == crate::structs::netpolicy::MODE_GATED
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,7 +524,7 @@ mod tests {
     #[test]
     fn a_gated_sandbox_that_asks_for_memory_checkpoints_is_launched_for_them() {
         let task = sandbox_task(Some("gated"), Some(SnapshotsConfig::default()));
-        assert!(task_declares_gated_network(&task));
+        assert!(crate::structs::network::task_runs_gated(&task, false));
         assert_eq!(
             memory_checkpoint_ask(&task).map(|ask| ask.field),
             Some("snapshots")

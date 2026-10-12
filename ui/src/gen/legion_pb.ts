@@ -25570,7 +25570,10 @@ export class ShowNetPolicyReply extends Message<ShowNetPolicyReply> {
   matchedPolicies: string[] = [];
 
   /**
-   * The task's declared `network.mode` and the mode the merge resolved.
+   * The task's declared `network.mode`, and the mode it resolves to: the one
+   * a matching `require` policy imposes, else the declared one with `auto`
+   * resolved for the task's runtime (assuming a microVM node for a sandbox;
+   * each allocation's node status carries the mode it actually runs in).
    *
    * @generated from field: string declared_mode = 3;
    */
@@ -25591,6 +25594,18 @@ export class ShowNetPolicyReply extends Message<ShowNetPolicyReply> {
    */
   nodeStatusJson: string[] = [];
 
+  /**
+   * Notes about how the task's network is actually enforced, beyond its
+   * mode, printed by `legion net doctor` as warnings. Today:
+   * `egress-unenforced: ...` for a sandbox that runs without Legion's
+   * egress policy only because its node is a dev backend (Apple
+   * `container`, a Linux OCI runtime) with no vsock to the datapath. Empty
+   * in the common case.
+   *
+   * @generated from field: repeated string notes = 6;
+   */
+  notes: string[] = [];
+
   constructor(data?: PartialMessage<ShowNetPolicyReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -25604,6 +25619,7 @@ export class ShowNetPolicyReply extends Message<ShowNetPolicyReply> {
     { no: 3, name: "declared_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "effective_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "node_status_json", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 6, name: "notes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ShowNetPolicyReply {
@@ -25728,7 +25744,9 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
 
   /**
    * The rule that decided (`policy/<name>#<index>`, `task#<index>`, or
-   * `fallthrough`); empty on allow-by-absence.
+   * `fallthrough`); empty on allow-by-absence. `gated-default` when the task
+   * runs gated and no task block or policy object covers its egress at all:
+   * gated denies everything nothing allows.
    *
    * @generated from field: string source = 2;
    */
@@ -25760,6 +25778,15 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
    */
   explanation = "";
 
+  /**
+   * How to change the verdict, when there is an obvious fix. Set for a
+   * `gated-default` denial: allow the destination in the task's
+   * `network.egress.allow`, or apply a policy object. Empty otherwise.
+   *
+   * @generated from field: string hint = 7;
+   */
+  hint = "";
+
   constructor(data?: PartialMessage<TestNetPolicyReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -25774,6 +25801,7 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
     { no: 4, name: "direction", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "protocol", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "explanation", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TestNetPolicyReply {

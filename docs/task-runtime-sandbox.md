@@ -130,6 +130,9 @@ The generated `/legion/init` is plain POSIX shell, so it runs on whatever
 - mounts each volume disk at its declared `path`, with the filesystem the
   driver reported (read-only when claimed read-only). A volume with no `path`
   is attached but left unmounted for raw device access.
+- starts the [guest agent](#the-guest-agent) when the guest needs it: the
+  gated datapath's relay, and the resume handler for a guest launched for
+  memory checkpoints or with identity token files
 - sources `/legion/env` and `cd`s to the working directory
 - runs the command and echoes `legion: sandbox command exited with status N`
 - powers the machine off so the VMM exits
@@ -138,10 +141,51 @@ The kernel cmdline carries `panic=1` as a backstop, so even a wedged guest
 terminates instead of hanging the allocation.
 
 **Rebuilds are fingerprinted.** Legion rebuilds the root disk only when the
-image, command, env, working dir, volume mounts, or artifacts change. Without
-this, a crash-looping sandbox would re-extract and re-format a
-multi-hundred-MiB image on every restart. The fingerprint hashes env values,
-since they can be secrets. The values are never logged or stored.
+image, command, env, working dir, volume mounts, artifacts, or guest agent
+binary change. Without this, a crash-looping sandbox would re-extract and
+re-format a multi-hundred-MiB image on every restart. The fingerprint hashes
+env values, since they can be secrets. The values are never logged or stored.
+
+### The guest agent
+
+Some guests run a small Legion program next to the workload, copied into the
+root disk as `/legion/legion`:
+
+- **The gated datapath's relay** (`guest-agent`), on a gated sandbox. It
+  relays the guest's loopback proxy and resolver ports to the node over vsock
+  ([network-handlers.md](network-handlers.md#sandboxes)).
+- **The resume handler**, on a sandbox launched for memory checkpoints or
+  with identity token files. It refreshes the guest's identity, RNG, clock,
+  and token files after a restore and runs `onResume`
+  ([Identity after a restore](#identity-after-a-restore)). On a gated
+  sandbox the relay runs it in the same process, so a restore also closes
+  the relays the capture left dead.
+
+The program is `legion-guest`, a statically linked build of just these two
+jobs (under 1 MB), which runs on any image with `/bin/sh`: glibc, musl
+(`alpine:latest`), and busybox alike. Ship it with the worker:
+
+| Where the worker looks | |
+| --- | --- |
+| `LEGION_GUEST_BINARY` in the worker's environment | Used when set. A path that does not exist fails the sandbox's start with that reason |
+| `legion-guest` in the same directory as the worker binary | The normal install |
+| neither | The worker copies **itself**, and warns at start: `No static legion-guest binary beside the worker` |
+
+The fallback works only where the image's libc can run the worker binary (a
+glibc image close enough to the worker's build host). On a musl image it
+cannot, so init prints `legion: guest agent missing ...` or the binary fails
+to start. A gated guest then has no network at all (fail-closed), and a
+restored guest keeps its old identity. Installing `legion-guest` fixes both;
+the root disk rebuilds on the next start, because the binary is part of its
+fingerprint.
+
+Build it for each architecture the workers run:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build -p legion-guest --profile dist --target x86_64-unknown-linux-musl
+# target/x86_64-unknown-linux-musl/dist/legion-guest
+```
 
 ## Stateful Sandboxes
 
@@ -389,6 +433,14 @@ copied into the rootfs) to relay the guest's loopback proxy and resolver ports
 over the vsock. See [network-handlers.md](network-handlers.md#sandboxes) for
 the mechanics, what is enforced, and current status. It is unit-tested over
 Unix sockets but not yet boot-tested on a VMM in CI.
+
+A gated guest that no policy covers denies every destination
+(`gated-default`, see
+[Default deny](network-handlers.md#default-deny)), so open what the guest
+needs in `network.egress.allow`. Every gated sandbox gets a resolver, and the
+guest's proxy variables come in both cases plus `NODE_USE_ENV_PROXY=1`.
+Submit refuses a gated sandbox that also sets `config.network`, and one that
+declares `network.ports` (ingress into a gated guest is not supported yet).
 
 A gated sandbox takes memory checkpoints like any other: suspend, resume,
 snapshots, forks, and publish. Every restore moves the guest's vsock onto the
@@ -659,9 +711,10 @@ memory restore, since the device rides the snapshot.
   but a process's env is fixed at exec. Read the new token from
   `/legion/identity/<ENV>` or `/legion/resume.env`, or restart the process
   from `suspend.onResume`.
-- **The resume handler is the worker's binary.** A guest whose libc cannot
-  run it (a musl image with a glibc worker build, for example) restores
-  without refreshing its identity, and init says so on the console.
+- **A worker without `legion-guest` copies itself into the guest.** That
+  binary needs the image's glibc, so on a musl image a gated guest has no
+  network and a restore keeps its old identity. See
+  [The guest agent](#the-guest-agent).
 - **A TAP device is restored by name.** Both VMMs reopen the TAP device
   name recorded in the saved state. Before a restore the worker checks that
   the task still names the same device, uses it when it exists and is free,

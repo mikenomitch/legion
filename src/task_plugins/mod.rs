@@ -24,6 +24,7 @@ mod oci_image;
 pub mod resource_enforcement;
 mod sandbox;
 mod sandbox_checkpoint;
+pub(crate) use microvm::warn_if_no_static_guest_binary;
 pub use sandbox::{sandbox_usage_source, vsock_socket_base_for, SandboxUsageSource};
 pub use sandbox_checkpoint::{
     firecracker_needs_api_socket, sandbox_checkpoint_support, sandbox_vmm_attrs, IDENTITY_DRIVE_ID,

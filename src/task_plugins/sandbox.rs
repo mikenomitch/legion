@@ -862,6 +862,12 @@ fn build_stamp(layout: &Path, payload: &GuestPayload, artifacts: &[StagedArtifac
     if payload.resume_watch {
         hasher.update(b"\0resume-watch\0");
     }
+    if let Some(binary) = payload.guest_binary.as_ref() {
+        // A new guest binary (a worker upgrade, the static build installed)
+        // must reach the guest, so it rebuilds the disk.
+        hasher.update(b"\0guest-binary\0");
+        hasher.update(binary.fingerprint.as_bytes());
+    }
     hasher.update(b"\0cwd\0");
     hasher.update(payload.cwd.as_deref().unwrap_or("").as_bytes());
     for mount in &payload.disk_mounts {
@@ -1055,15 +1061,19 @@ impl SandboxTaskPlugin {
         if gated {
             microvm::check_vsock_socket_path(&vsock_socket_base(&scratch))?;
         }
+        // A guest launched for checkpoints, or with token files, watches its
+        // identity disk. On a gated guest the agent runs the watch.
+        let resume_watch = instance.checkpoint_launch || file_tokens;
         let mut payload = GuestPayload {
             command: config.command.clone(),
             env: guest_env,
             cwd: payload_cwd,
             disk_mounts: volumes.mounts,
             guest_agent: gated,
-            // A guest launched for checkpoints, or with token files, watches
-            // its identity disk. On a gated guest the agent runs the watch.
-            resume_watch: instance.checkpoint_launch || file_tokens,
+            resume_watch,
+            guest_binary: (gated || resume_watch)
+                .then(microvm::guest_binary)
+                .transpose()?,
         };
 
         let staged = instance.staged_artifacts.clone();

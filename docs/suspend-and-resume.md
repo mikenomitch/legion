@@ -1975,10 +1975,12 @@ See [metrics](metrics.md#suspend-and-resume).
   this can approach the heartbeat interval.
 - **A memory part is hashed twice**, once when captured and once when stored,
   which adds seconds for a multi-GiB guest after it has resumed.
-- **The resume handler needs the worker's binary to run in the guest.** It is
-  copied in at boot, so a guest whose libc cannot run it (for example a musl
-  image when the worker is built against glibc) restores without refreshing
-  its identity, and init says so on the console.
+- **The resume handler needs a guest binary that runs on the image.** The
+  static `legion-guest` runs on any image. A worker without it copies itself,
+  and a guest whose libc cannot run that (a musl image when the worker is
+  built against glibc) restores without refreshing its identity, and init
+  says so on the console. See
+  [The guest agent](task-runtime-sandbox.md#the-guest-agent).
 - **Suspend checkpoints are local by default.** With `durability = "local"`
   a suspended instance resumes only on the node that holds its checkpoint.
   Losing the node loses the checkpoint, and `onRestoreFailure` decides what

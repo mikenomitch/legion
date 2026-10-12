@@ -29,7 +29,7 @@ use crate::worker::forwarder::ForwarderContext;
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::netns;
-use crate::worker::netd::policy::egress_connect_verdict;
+use crate::worker::netd::policy::{egress_connect_verdict, gated_egress_connect_verdict};
 use crate::worker::netd::proxyproto::Prefixed;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -336,6 +336,17 @@ fn judge(
                 },
             )
         }
+        // A gated allocation that no egress chain covers denies
+        // (`gated-default`); a cooperative one allows with attribution.
+        _ if proxy.gated => gated_egress_connect_verdict(
+            policy.as_deref(),
+            &ConnectFacts {
+                host,
+                ip,
+                port,
+                identity: None,
+            },
+        ),
         _ => egress_connect_verdict(
             policy.as_deref(),
             &ConnectFacts {
@@ -1610,6 +1621,69 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Gated plan §6.5, calls entry 2: a gated allocation that no task
+    /// block and no policy object covers denies every destination with
+    /// `gated-default`, readable in the `403` and the denial. Writing
+    /// `egress = { policy = "allow" }` restores allow-all with attribution.
+    #[tokio::test]
+    async fn a_gated_allocation_with_no_policy_denies_by_default() {
+        let origin_port = origin().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let empty = merge_policies(&[], InlinePolicy::default());
+        let mut allow: crate::structs::netpolicy::ChainConfig =
+            serde_json::from_value(json!({ "policy": "allow", "accessLog": true })).unwrap();
+        crate::structs::netpolicy::validate_inline_chain(
+            "workspace",
+            crate::structs::netpolicy::Direction::Egress,
+            &mut allow,
+        )
+        .unwrap();
+        let open = merge_policies(
+            &[],
+            InlinePolicy {
+                egress: Some(&allow),
+                ..InlinePolicy::default()
+            },
+        );
+        cache.apply_assignments(&[
+            AllocNetPolicy {
+                allocation_id: 7,
+                policy_hash: empty.hash.clone(),
+            },
+            AllocNetPolicy {
+                allocation_id: 8,
+                policy_hash: open.hash.clone(),
+            },
+        ]);
+        cache.insert_body(&empty.hash.clone(), empty).unwrap();
+        cache.insert_body(&open.hash.clone(), open).unwrap();
+        let context = Arc::new(ForwarderContext::new(cache, denials.clone()));
+        let proxies = EgressProxies::new(context);
+        let (shut, opened) = (vsock_spec(dir.path(), 7), vsock_spec(dir.path(), 8));
+        proxies.sync(&[shut.clone(), opened.clone()]).await;
+
+        let response = get_via(shut.unix.as_deref().unwrap(), origin_port, "/anything").await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("legion-denied-by: gated-default"),
+            "{response}"
+        );
+        let drained = denials.drain();
+        assert!(
+            drained.iter().any(|denial| denial.allocation_id == 7
+                && denial.source == "gated-default"
+                && denial.reason.contains("nothing allows 127.0.0.1")),
+            "{drained:?}"
+        );
+
+        let response = get_via(opened.unix.as_deref().unwrap(), origin_port, "/anything").await;
+        assert!(response.contains("200 OK"), "{response}");
     }
 
     #[tokio::test]

@@ -696,7 +696,10 @@ fn validate_sandbox_idle_signals(
         return Ok(());
     }
     if idle.signals.contains(&IdleSignal::Connections)
-        && !crate::structs::snapshot::task_declares_gated_network(task)
+        && !crate::structs::network::task_runs_gated(
+            task,
+            crate::structs::network::sandbox_gated_by_default(),
+        )
     {
         return Err(format!(
             "task {:?}: suspend.idle.signals \"connections\" counts open connections through \

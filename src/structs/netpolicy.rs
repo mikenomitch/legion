@@ -74,6 +74,27 @@ pub const MODE_HOST: &str = "host";
 pub const MODE_GATED: &str = "gated";
 pub const MODES: &[&str] = &[MODE_AUTO, MODE_HOST, MODE_GATED];
 
+/// The verdict source when a gated allocation's egress reaches a
+/// destination and no task block or policy object covers its egress at all
+/// (gated plan §6.5, calls entry 2): gated means nothing leaves unless a
+/// rule says so, on every runtime. It names itself in the `403`, the
+/// `net.denied` event, and `legion net policy test`.
+pub const SOURCE_GATED_DEFAULT: &str = "gated-default";
+
+/// Why [`SOURCE_GATED_DEFAULT`] denied `destination`, as the verdict's reason.
+pub fn gated_default_reason(destination: &str) -> String {
+    format!("the task is gated and nothing allows {destination}")
+}
+
+/// The fix [`SOURCE_GATED_DEFAULT`] points at, for `destination` (a host,
+/// possibly with a port).
+pub fn gated_default_hint(destination: &str) -> String {
+    format!(
+        "add {destination:?} to network.egress.allow, or apply a policy object; \
+         network.egress = {{ policy = \"allow\" }} allows everything"
+    )
+}
+
 /// TLS modes on a chain. Ingress: `off`, `server`, `mutual`. Egress:
 /// `passthrough` (default; rules see SNI only) or `originate` (the task speaks
 /// plaintext to the datapath, which adds TLS to the destination).
@@ -2011,5 +2032,37 @@ mod tests {
     fn effective_chain_reports_connect_only() {
         assert!(eff(json!({ "allow": ["a.example"] })).is_connect_only());
         assert!(!eff(json!({ "protocol": "http", "allow": ["a.example/x"] })).is_connect_only());
+    }
+
+    /// Every policy object shipped under `configs/policies/` evaluates and
+    /// passes the same validation `legion net policy apply` runs, and the
+    /// agent sandbox one stays opt-in (`default`, sandboxes only).
+    #[test]
+    fn shipped_policy_objects_validate() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/policies");
+        let mut seen = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("ncl") {
+                continue;
+            }
+            let raw = crate::config_lang::eval_file(&path).unwrap();
+            let mut object: NetPolicyObject = serde_json::from_str(&raw)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            object
+                .normalize_and_validate()
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            seen.push(object);
+        }
+        let agent = seen
+            .iter()
+            .find(|object| object.name == "agent-sandbox-egress")
+            .expect("agent-sandbox-egress.ncl ships");
+        assert_eq!(agent.enforcement, ENFORCEMENT_DEFAULT);
+        assert_eq!(agent.selector.runtimes, vec!["sandbox".to_string()]);
+        assert!(
+            agent.mode.is_none(),
+            "it opens hosts, it does not impose a mode"
+        );
     }
 }
