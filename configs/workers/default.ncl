@@ -114,12 +114,32 @@
         #     steps = ["reclaim", "suspend", "evict-bursting", "evict-reserved"],
         # },
     },
-    # `sandbox` runtime settings. Only used with resourceEnforcement.enabled
-    # (docs/resource-enforcement.md#sandbox-tasks).
+    # `sandbox` runtime settings.
     sandbox = {
         # MiB a sandbox allocation's cgroup allows on top of its guest
-        # memory, for the VMM process itself. Default 64.
+        # memory, for the VMM process itself. Default 64. Only used with
+        # resourceEnforcement.enabled (docs/resource-enforcement.md#sandbox-tasks).
         vmmOverheadMiB = 64,
+        # The host bridges TAP-wired sandboxes join on this node, each with
+        # the pool Legion leases guest addresses from
+        # (docs/task-runtime-sandbox.md, "Addressing"). A sandbox with
+        # config.network = { mode = "tap", bridge = "br0" } places only on
+        # nodes that declare br0 here. The bridge itself, and NAT behind it,
+        # are the operator's.
+        # bridges = {
+        #     br0 = {
+        #         # The bridge's network: the guest's netmask.
+        #         subnet = "10.88.0.0/16",
+        #         # The guest's default route. Never leased.
+        #         gateway = "10.88.0.1",
+        #         # What Legion leases (default: the whole subnet). Keep it
+        #         # out of any DHCP pool on the bridge, and disjoint from
+        #         # other nodes' ranges when one L2 segment spans nodes.
+        #         range = "10.88.128.0/17",
+        #         # The guest's resolv.conf (default: the gateway).
+        #         dns = ["10.88.0.1"],
+        #     },
+        # },
     },
     # Whether this node serves `Worker.StartClaim` — that is, whether it will
     # start work on a boot ticket at all (docs/edge-boot.md). Off by default

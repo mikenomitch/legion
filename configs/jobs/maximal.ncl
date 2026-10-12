@@ -815,19 +815,16 @@
                 # network = {
                 #     # "none" (default, loopback only) or "tap".
                 #     mode = "tap",
-                #     # With mode = "tap": a pre-created host TAP device (one
-                #     # guest per node, so refused on a keyed task, with
-                #     # count above one, or with a createFirst rollout), or
-                #     # "auto" for a TAP Legion creates per instance (`lgf` +
-                #     # a hash of the instance id), attaches to `bridge`,
-                #     # recreates on resume, and deletes with the allocation.
-                #     tap = "auto",
-                #     # The host bridge an auto TAP joins. Required with
-                #     # tap = "auto", refused with a fixed tap.
+                #     # The host bridge the guest's NIC joins (required with
+                #     # mode = "tap"). Legion creates a TAP per instance
+                #     # (`lgf` + a hash of the instance id) on it, recreates
+                #     # it on resume, and deletes it with the allocation. The
+                #     # guest's address is leased from the bridge's pool in
+                #     # the worker config (sandbox.bridges.br0), applied at
+                #     # boot and re-leased on every restore and fork, and the
+                #     # task only places on nodes that declare br0. The MAC is
+                #     # derived from the allocation id.
                 #     bridge = "br0",
-                #     # Guest MAC. An auto TAP defaults to one derived from
-                #     # the allocation id.
-                #     mac = "02:00:00:00:00:01",
                 # },
             },
             # The task-level network block applies to sandboxes too: "gated"

@@ -10,6 +10,7 @@
 //!   identity, RNG, clock, and token files, then runs `suspend.onResume`.
 //! - [`identity`]: the identity disk the worker writes and the handler reads.
 //! - [`env`]: the `/legion/env` and `/legion/resume.env` format.
+//! - [`netconf`]: re-addressing a TAP-wired guest's NIC after a restore.
 //! - [`cli`]: the `guest-agent` and `guest-resume` command lines.
 //!
 //! The worker's `legion` binary links this crate (its `legion guest-agent`
@@ -22,4 +23,5 @@ pub mod agent;
 pub mod cli;
 pub mod env;
 pub mod identity;
+pub mod netconf;
 pub mod resume;

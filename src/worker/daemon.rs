@@ -246,6 +246,7 @@ async fn run_worker_with_manager(
     let enforcement_config =
         usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
     apply_resource_enforcement_env(&enforcement_config);
+    let sandbox_bridges = apply_sandbox_bridges_env(enforcement_config.sandbox.as_ref());
     crate::task_plugins::warn_if_no_static_guest_binary();
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
@@ -394,6 +395,15 @@ async fn run_worker_with_manager(
         warn!(
             "resourceEnforcement.oversubscribe is set but this node cannot enforce (no cgroup \
              v2, or not Linux); registering at physical capacity"
+        );
+    }
+    // The bridges a TAP sandbox can join here: a task on `bridge = "br0"`
+    // carries an implicit `sandbox.bridges contains "br0"` constraint, so it
+    // never places on a node that could not address its guest.
+    if !sandbox_bridges.is_empty() {
+        config_attrs.insert(
+            crate::task_plugins::sandbox_addr::BRIDGES_ATTR.into(),
+            json!(sandbox_bridges),
         );
     }
     config_attrs.insert(
@@ -655,6 +665,27 @@ fn apply_resource_enforcement_env(config: &crate::structs::WorkerResourceEnforce
         std::env::remove_var(crate::constants::ENV_CGROUP_PARENT);
         std::env::remove_var(crate::constants::ENV_SANDBOX_VMM_OVERHEAD_MIB);
     }
+}
+
+/// Publishes the worker's `sandbox.bridges` pools into the environment for
+/// the sandbox runtime, which leases TAP guests their addresses from them
+/// (docs/task-runtime-sandbox.md, "Addressing"). Returns the bridge names,
+/// which the node advertises. Unlike the VMM overhead, this does not depend
+/// on resource enforcement.
+fn apply_sandbox_bridges_env(sandbox: Option<&crate::structs::WorkerSandboxConfig>) -> Vec<String> {
+    let env = crate::task_plugins::sandbox_addr::BRIDGES_ENV;
+    let Some(bridges) = sandbox
+        .map(|sandbox| &sandbox.bridges)
+        .filter(|bridges| !bridges.is_empty())
+    else {
+        std::env::remove_var(env);
+        return Vec::new();
+    };
+    match serde_json::to_string(bridges) {
+        Ok(json) => std::env::set_var(env, json),
+        Err(err) => warn!(error = %err, "Failed to publish sandbox.bridges to the sandbox runtime"),
+    }
+    bridges.keys().cloned().collect()
 }
 
 /// Parses the worker config's `artifacts` JSON payload (empty = defaults):
@@ -2527,15 +2558,36 @@ fn net_status(
     let cache = forwarder.context().cache();
     let mut out = Vec::new();
     for allocation in desired {
+        let id = allocation.allocation_id;
+        // A TAP sandbox's leased guest address (docs/task-runtime-sandbox.md,
+        // "Addressing"), which makes the allocation worth reporting even with
+        // nothing else on the datapath.
+        let lease = (allocation.task_runtime == "sandbox")
+            .then(|| {
+                crate::task_plugins::sandbox_addr::read_lease(
+                    &alloc_root.join(id.to_string()).join(".sandbox"),
+                )
+            })
+            .flatten();
         let network: Option<AllocNetwork> = if allocation.network.trim().is_empty() {
             None
         } else {
             serde_json::from_str(&allocation.network).ok()
         };
         let Some(network) = network else {
+            if let Some(lease) = lease {
+                out.push(crate::structs::NetAllocStatus {
+                    allocation_id: id,
+                    mode: crate::structs::netpolicy::MODE_HOST.to_string(),
+                    capture_ready: true,
+                    tls_ready: true,
+                    guest_address: lease.address.to_string(),
+                    guest_bridge: lease.bridge,
+                    ..Default::default()
+                });
+            }
             continue;
         };
-        let id = allocation.allocation_id;
         let gated = network.is_gated();
         let expected_upstreams = network.upstreams.len();
         let expected_ingress = network
@@ -2543,7 +2595,11 @@ fn net_status(
             .iter()
             .filter(|p| p.private_port.is_some())
             .count();
-        if !gated && expected_upstreams == 0 && expected_ingress == 0 && network.vip_block.is_none()
+        if !gated
+            && expected_upstreams == 0
+            && expected_ingress == 0
+            && network.vip_block.is_none()
+            && lease.is_none()
         {
             continue;
         }
@@ -2662,6 +2718,11 @@ fn net_status(
             tls_ready,
             tls_error,
             mesh_identity: forwarder.context().mesh_identity().is_some(),
+            guest_address: lease
+                .as_ref()
+                .map(|lease| lease.address.to_string())
+                .unwrap_or_default(),
+            guest_bridge: lease.map(|lease| lease.bridge).unwrap_or_default(),
         });
     }
     out

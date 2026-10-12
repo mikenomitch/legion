@@ -156,6 +156,12 @@ pub(crate) struct SandboxCheckpointState {
     /// ever checkpointed before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<GuestNetwork>,
+    /// The address a TAP guest held from its bridge's pool, so a resume
+    /// asks for it again first (docs/task-runtime-sandbox.md, "Addressing").
+    /// Absent for gated and loopback-only guests, and on checkpoints taken
+    /// before Legion addressed TAP guests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_address: Option<String>,
 }
 
 impl SandboxCheckpointState {
@@ -333,6 +339,7 @@ pub(crate) fn boot_identity(
         on_resume: Vec::new(),
         fork: false,
         files: tokens.files.clone(),
+        guest_addr: None,
     }
 }
 
@@ -400,6 +407,8 @@ pub(crate) fn prepare_checkpoint_launch(
         } else {
             GuestNetwork::None
         }),
+        guest_address: crate::task_plugins::sandbox_addr::read_lease(scratch)
+            .map(|lease| lease.address.to_string()),
     };
     let identity_path = scratch.join(IDENTITY_FILE);
     write_identity_disk(
@@ -901,7 +910,7 @@ pub(crate) fn ensure_fork_tap(
     }
 }
 
-/// Wire a fresh boot to its auto TAP (`config.network.tap = "auto"`):
+/// Wire a fresh boot to its TAP (`config.network = { mode = "tap", bridge }`):
 /// `device` is this instance's own TAP ([`crate::structs::fork::own_tap_name`]),
 /// created and attached to `bridge` when missing.
 ///
@@ -941,22 +950,6 @@ pub(crate) fn ensure_auto_tap(
             Ok(())
         }
     }
-}
-
-/// Refuse a fresh boot on a TAP device another process holds. Every other
-/// state (free, missing, unknown on a host that cannot tell) is left to the
-/// VMM, which reports a missing device itself.
-pub(crate) fn ensure_boot_tap_free(taps: &dyn TapHost, device: &str, task: &str) -> R<()> {
-    if matches!(taps.state(device), Ok(TapState::Busy)) {
-        bail!(
-            "sandbox needs TAP device {device} (network.tap of task {task:?}), but another \
-             process holds it: a fixed network.tap serves one guest per node, and another \
-             instance of this task (a fork's origin, when this is a disk fork or a fork that \
-             booted cold) already runs here\nHint: fork with --checkpoint memory, which gives \
-             each fork its own TAP device, or run one instance of a fixed-TAP task per node"
-        );
-    }
-    Ok(())
 }
 
 /// Make sure the TAP device a memory checkpoint recorded exists, is free,
@@ -1166,7 +1159,9 @@ pub(crate) enum RestoreTap {
 /// Decide the TAP a restore uses. A new instance (`identity.fork`) whose
 /// task wires a TAP gets its own device, named from its instance id. An
 /// instance that was itself a fork records that own device in its later
-/// checkpoints, so resuming one of those keeps it.
+/// checkpoints, so resuming one of those keeps it. A checkpoint wired to
+/// any other device (a hand-named TAP from before every TAP was per
+/// instance) also moves onto the instance's own device.
 pub(crate) fn restore_tap(
     recorded: Option<&str>,
     configured: Option<&str>,
@@ -1177,17 +1172,32 @@ pub(crate) fn restore_tap(
         .as_deref()
         .map(crate::structs::fork::own_tap_name);
     match (recorded, configured, own) {
-        (Some(origin), Some(_), Some(own)) if identity.fork => RestoreTap::Own {
+        (Some(recorded), Some(_), Some(own)) if recorded == own && !identity.fork => {
+            RestoreTap::Recorded {
+                configured: Some(own),
+            }
+        }
+        // A fork, and a checkpoint wired to a device that is not this
+        // instance's own (one taken on a hand-named TAP before every TAP
+        // was per instance), move the NIC onto the instance's own device.
+        (Some(origin), Some(_), Some(own)) => RestoreTap::Own {
             origin: origin.to_string(),
             own,
-        },
-        (Some(recorded), Some(_), Some(own)) if recorded == own => RestoreTap::Recorded {
-            configured: Some(own),
         },
         _ => RestoreTap::Recorded {
             configured: configured.map(str::to_string),
         },
     }
+}
+
+/// The address a TAP guest held when `manifest` was captured, which a resume
+/// asks its bridge's pool for first.
+pub(crate) fn recorded_guest_address(manifest: &SnapshotManifest) -> Option<std::net::Ipv4Addr> {
+    serde_json::from_value::<SandboxCheckpointState>(manifest.runtime_state.clone())
+        .ok()?
+        .guest_address?
+        .parse()
+        .ok()
 }
 
 /// Check a manifest against the task it is about to be restored into.
@@ -1448,6 +1458,10 @@ pub(crate) fn restore_microvm(
     let state = SandboxCheckpointState {
         tap: moved_to.or(state.tap),
         network: Some(network),
+        guest_address: identity
+            .guest_addr
+            .as_ref()
+            .map(|addr| addr.address.clone()),
         ..state
     };
     write_boot_record(scratch, &state)?;
@@ -1582,6 +1596,7 @@ mod tests {
             memory_mib: 1024,
             tap: None,
             network: None,
+            guest_address: None,
         };
         let allocation = alloc(9);
         let fc = Backend::Firecracker {
@@ -1810,14 +1825,34 @@ mod tests {
 
     /// Phase 6: three forks of one TAP-wired Firecracker checkpoint. Each
     /// gets its own TAP (created, enslaved to the origin TAP's bridge, and
-    /// named in `network_overrides`), its own MAC and hostname on the
-    /// identity disk, and records its own TAP for its next checkpoint.
+    /// named in `network_overrides`), its own MAC, hostname, and leased
+    /// address on the identity disk (gated plan §6.7), and records its own
+    /// TAP and address for its next checkpoint.
     #[test]
     fn forks_of_a_tap_wired_checkpoint_get_their_own_taps_and_macs() -> R<()> {
         let tmp = tempfile::tempdir()?;
         let fc = Backend::Firecracker {
             binary: "/usr/bin/true".into(),
         };
+        let allocs = tmp.path().join("allocs");
+        let pool = crate::task_plugins::sandbox_addr::BridgePool::from_config(
+            "br0",
+            &crate::structs::config::SandboxBridgeConfig {
+                subnet: "10.88.0.0/16".into(),
+                gateway: Some("10.88.0.1".into()),
+                range: Some("10.88.128.0/24".into()),
+                dns: Vec::new(),
+            },
+        )?;
+        // The origin leased an address before its launch, which records it
+        // for its checkpoints.
+        let origin_lease = crate::task_plugins::sandbox_addr::lease(
+            &pool,
+            &allocs.join("7").join(".sandbox"),
+            Some(&allocs),
+            None,
+            "w-01",
+        )?;
         let (mut origin, origin_scratch, _) = launched(tmp.path(), 7, &fc)?;
         let vmm = FakeVmm::start_at(origin_scratch.join("vmm.sock"), false, fake_firecracker);
         let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
@@ -1832,8 +1867,13 @@ mod tests {
         )?;
         drop(vmm);
         let mut state: SandboxCheckpointState = serde_json::from_value(parts.runtime.clone())?;
+        assert_eq!(state.guest_address, Some(origin_lease.address.to_string()));
         state.tap = Some("tap0".into());
         let manifest = manifest_for(&state, parts);
+        assert_eq!(
+            recorded_guest_address(&manifest),
+            Some(origin_lease.address)
+        );
         let taps = FakeTaps {
             masters: [("tap0".to_string(), "br0".to_string())].into(),
             ..FakeTaps::default()
@@ -1841,6 +1881,7 @@ mod tests {
 
         let mut own_taps = std::collections::HashSet::new();
         let mut macs = std::collections::HashSet::new();
+        let mut addresses = std::collections::HashSet::from([origin_lease.address]);
         for (n, id) in [(1, 8), (2, 9), (3, 10)] {
             let instance_id = format!("run-17-f{n}");
             let own = crate::structs::fork::own_tap_name(&instance_id);
@@ -1876,6 +1917,19 @@ mod tests {
                 vsock: None,
                 datapath_wait: DATAPATH_WAIT,
             };
+            // A fork asks for no previous address, so it never gets the
+            // origin's.
+            let lease = crate::task_plugins::sandbox_addr::lease(
+                &pool,
+                &scratch,
+                Some(&allocs),
+                None,
+                "w-01",
+            )?;
+            let identity = ResumeIdentity {
+                guest_addr: Some(lease.guest_addr()),
+                ..identity
+            };
             restore_microvm(&target, &mut restored, &manifest, &out, &identity, &taps)?;
             let calls = vmm.drain();
             assert_eq!(calls[0].path, "/snapshot/load");
@@ -1883,10 +1937,20 @@ mod tests {
                 calls[0].body.as_ref().unwrap()["network_overrides"],
                 json!([{ "iface_id": "eth0", "host_dev_name": own }])
             );
+            assert!(
+                addresses.insert(lease.address),
+                "fork {n} shares an address"
+            );
             assert!(own_taps.insert(own.clone()), "fork {n} shares a TAP");
             let written =
                 crate::task_plugins::checkpoint::read_identity_disk(&scratch.join(IDENTITY_FILE))?;
             assert!(macs.insert(written.mac.clone().expect("a fork gets a MAC")));
+            assert_eq!(written.guest_addr, identity.guest_addr);
+            assert_eq!(
+                read_boot_record(&scratch).and_then(|record| record.guest_address),
+                Some(lease.address.to_string()),
+                "the fork's next checkpoint records its own address"
+            );
             assert_eq!(written.hostname, format!("legion-sbx-{id}"));
             assert_eq!(
                 read_boot_record(&scratch).and_then(|record| record.tap),
@@ -1929,7 +1993,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_tap_moves_only_forks_with_a_tap() {
+    fn restore_tap_moves_forks_and_foreign_devices_onto_the_instance_tap() {
         let fork = ResumeIdentity {
             instance_id: Some("run-17-f1".into()),
             fork: true,
@@ -1952,10 +2016,20 @@ mod tests {
             fork: false,
             ..fork
         };
+        let own = crate::structs::fork::own_tap_name("run-17-f1");
         assert_eq!(
-            restore_tap(Some("tap0"), Some("tap0"), &resume),
+            restore_tap(Some(&own), Some(&own), &resume),
             RestoreTap::Recorded {
-                configured: Some("tap0".into())
+                configured: Some(own.clone())
+            }
+        );
+        // A checkpoint taken on a hand-named TAP (before every TAP was per
+        // instance) moves onto the instance's own device on resume.
+        assert_eq!(
+            restore_tap(Some("tap0"), Some(&own), &resume),
+            RestoreTap::Own {
+                origin: "tap0".into(),
+                own: own.clone(),
             }
         );
     }
@@ -1981,21 +2055,6 @@ mod tests {
         };
         ensure_fork_tap(&taps, "tap0", Some("tap0"), None, "lgf1", dir.path())?;
         assert_eq!(*taps.log.lock().unwrap(), vec!["create lgf1", "up lgf1"]);
-        Ok(())
-    }
-
-    #[test]
-    fn a_fresh_boot_on_a_held_tap_is_a_named_failure() -> R<()> {
-        let taps = FakeTaps {
-            states: [("tap0".to_string(), TapState::Busy)].into(),
-            ..FakeTaps::default()
-        };
-        let err = ensure_boot_tap_free(&taps, "tap0", "workspace").unwrap_err();
-        assert!(
-            format!("{err:#}").starts_with("sandbox needs TAP device tap0"),
-            "{err:#}"
-        );
-        ensure_boot_tap_free(&FakeTaps::default(), "tap0", "workspace")?;
         Ok(())
     }
 
@@ -2135,6 +2194,7 @@ mod tests {
             memory_mib: 256,
             tap: tap.map(str::to_string),
             network,
+            guest_address: None,
         };
         let target = |tap: Option<&str>, bridge: Option<&str>, gated: bool| RestoreTarget {
             backend: &fc,
@@ -2388,6 +2448,7 @@ mod tests {
             memory_mib: 256,
             tap: None,
             network: Some(GuestNetwork::Gated),
+            guest_address: None,
         };
         let memory = MemoryParts {
             parts: out.seal(&[("rootfs", parts::ROOTFS), ("vm-config", parts::CH_CONFIG)])?,
@@ -2886,6 +2947,7 @@ mod tests {
             memory_mib: 256,
             tap: Some("tap7".into()),
             network: None,
+            guest_address: None,
         };
         let memory = MemoryParts {
             parts: out.seal(&[("rootfs", parts::ROOTFS)])?,

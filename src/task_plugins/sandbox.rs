@@ -40,12 +40,12 @@ use crate::task_plugins::checkpoint::{
     AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport,
 };
 use crate::task_plugins::microvm::{self, Backend, GuestDiskMount, GuestPayload, TapNet, VmSpec};
-use crate::task_plugins::sandbox_checkpoint;
 use crate::task_plugins::{
     configure_task_log_capture, derived_schema, oci_bundle, oci_image, reap_task_process,
     spawn_pipe, spawn_pty, spawn_task_process, validate_schema, ExecOptions, ExecSession,
     ExecSupport, MountedVolume, TaskInstance, TaskPlugin,
 };
+use crate::task_plugins::{sandbox_addr, sandbox_checkpoint};
 use crate::volumes::VolumeMode;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -126,9 +126,9 @@ struct SandboxTaskConfig {
     #[serde(default)]
     kernel_args: Option<String>,
 
-    /// Guest network interface backed by a host TAP device: one the
-    /// operator created (`tap = "tap0"`), or one Legion creates per
-    /// instance and attaches to a bridge (`tap = "auto"`).
+    /// Guest network interface on a host bridge: Legion creates a TAP
+    /// device per instance, attaches it to `bridge`, and leases the guest an
+    /// address from the bridge's pool in the worker config.
     #[serde(default)]
     network: Option<SandboxNetworkConfig>,
 
@@ -141,33 +141,31 @@ struct SandboxTaskConfig {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SandboxNetworkConfig {
-    /// `none` (default) or `tap` to attach the guest to a host TAP device.
+    /// `none` (default) or `tap` to give the guest a NIC on a host bridge.
     #[serde(default)]
     mode: Option<String>,
 
-    /// The host TAP device (required with `mode: tap`). Either the name of
-    /// a device an operator or network plugin created, which serves one
-    /// guest per node (so submit refuses it on a keyed task, with a count
-    /// above one, or with a `createFirst` rollout), or `"auto"`: Legion
-    /// creates a device per instance
-    /// (`lgf` plus a hash of the instance id), attaches it to `bridge`,
-    /// recreates it under the same name on restore, and deletes it when the
-    /// allocation is destroyed. Any number of auto-TAP sandboxes fit on a
-    /// node, and each one can take memory checkpoints.
-    #[serde(default)]
-    tap: Option<String>,
-
-    /// The host bridge an auto TAP joins (required with `tap: "auto"`, and
-    /// only allowed with it). The bridge itself, its addressing, and any DHCP
-    /// on it are the operator's: Legion only enslaves the TAP to it.
+    /// The host bridge the guest's NIC joins (required with `mode: tap`).
+    /// Legion creates a TAP device per instance (`lgf` plus a hash of the
+    /// instance id), attaches it here, recreates it under the same name on
+    /// restore, and deletes it when the allocation is destroyed. The guest's
+    /// address comes from this bridge's pool in the worker config
+    /// (`sandbox.bridges.<bridge>`), and the task only places on nodes that
+    /// declare one.
     #[serde(default)]
     bridge: Option<String>,
 
-    /// MAC address handed to the guest interface. An auto TAP defaults to a
-    /// locally administered address derived from the allocation id, so
-    /// guests sharing a bridge never collide.
+    /// Removed: Legion creates the TAP device. Kept only to refuse it with
+    /// the replacement.
     #[serde(default)]
-    mac: Option<String>,
+    #[schemars(skip)]
+    tap: Option<Value>,
+
+    /// Removed: Legion derives the guest MAC from the allocation id. Kept
+    /// only to refuse it with the replacement.
+    #[serde(default)]
+    #[schemars(skip)]
+    mac: Option<Value>,
 }
 
 /// Where a sandbox guest reads its workload-identity token files
@@ -246,18 +244,6 @@ fn guest_tokens(
             });
     }
     tokens
-}
-
-/// `config.network.tap` value that asks Legion for a per-instance TAP.
-pub const AUTO_TAP: &str = "auto";
-
-/// How a sandbox's guest NIC is wired to the host, as declared.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TapWiring {
-    /// An operator-created device, the same name for every instance.
-    Fixed(String),
-    /// A Legion-created device per instance, on this bridge.
-    Auto { bridge: String },
 }
 
 /// Whether `name` can be a Linux network interface name: 1 to 15 bytes, no
@@ -397,51 +383,48 @@ impl SandboxTaskConfig {
             }
         }
         if let Some(network) = self.network.as_ref() {
+            if let Some(tap) = network.tap.as_ref() {
+                let was = tap.as_str().unwrap_or_default();
+                let hint = if was == "auto" || was.is_empty() {
+                    "Drop tap: Legion always creates a TAP per instance on bridge".to_string()
+                } else {
+                    format!("Set bridge = \"<the bridge {was} was on>\"")
+                };
+                bail!(
+                    "config.network.tap is gone: Legion creates a TAP per instance on \
+                     network.bridge and leases the guest an address from the bridge's pool\nHint: \
+                     {hint}, and declare sandbox.bridges.<bridge> in the worker config \
+                     (docs/task-runtime-sandbox.md, \"Addressing\")"
+                );
+            }
+            if network.mac.is_some() {
+                bail!(
+                    "config.network.mac is gone: Legion derives each guest's MAC from its \
+                     allocation id, so instances and forks on one bridge never collide\nHint: \
+                     drop mac"
+                );
+            }
             match network.mode.as_deref().unwrap_or("none") {
-                "none" => {}
-                "tap" => {
-                    let Some(tap) = network
-                        .tap
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                    else {
+                "none" => {
+                    if network.bridge.is_some() {
                         bail!(
-                            "sandbox task network.mode `tap` requires network.tap (a host TAP \
-                             device name, or \"auto\" for one per instance)"
+                            "sandbox task network.bridge applies only to mode = \"tap\"\nHint: \
+                             set mode = \"tap\", or drop bridge"
                         );
-                    };
-                    let bridge = network.bridge.as_deref().map(str::trim);
-                    if tap == AUTO_TAP {
-                        match bridge {
-                            None | Some("") => bail!(
-                                "sandbox task network.tap = \"auto\" requires network.bridge: \
-                                 the host bridge each instance's TAP joins\nHint: set bridge = \
-                                 \"br0\" (or whichever bridge carries your sandbox network)"
-                            ),
-                            Some(bridge) if !valid_interface_name(bridge) => bail!(
-                                "sandbox task network.bridge {bridge:?} is not a valid interface \
-                                 name (1 to 15 characters, no `/`, `:`, or whitespace)"
-                            ),
-                            Some(_) => {}
-                        }
-                    } else {
-                        if !valid_interface_name(tap) {
-                            bail!(
-                                "sandbox task network.tap {tap:?} is not a valid interface name \
-                                 (1 to 15 characters, no `/`, `:`, or whitespace)"
-                            );
-                        }
-                        if bridge.is_some_and(|bridge| !bridge.is_empty()) {
-                            bail!(
-                                "sandbox task network.bridge applies only to tap = \"auto\": a \
-                                 fixed TAP ({tap}) is wired by whoever created it\nHint: set tap \
-                                 = \"auto\" to have Legion create and attach a TAP per \
-                                 instance, or drop bridge"
-                            );
-                        }
                     }
                 }
+                "tap" => match network.bridge.as_deref().map(str::trim) {
+                    None | Some("") => bail!(
+                        "sandbox task network.mode `tap` requires network.bridge: the host \
+                         bridge each instance's TAP joins\nHint: set bridge = \"br0\" (or \
+                         whichever bridge carries your sandbox network)"
+                    ),
+                    Some(bridge) if !valid_interface_name(bridge) => bail!(
+                        "sandbox task network.bridge {bridge:?} is not a valid interface name (1 \
+                         to 15 characters, no `/`, `:`, or whitespace)"
+                    ),
+                    Some(_) => {}
+                },
                 other => bail!("sandbox task network.mode must be `none` or `tap`, got `{other}`"),
             }
         }
@@ -461,52 +444,66 @@ impl SandboxTaskConfig {
             .unwrap_or(DEFAULT_ROOTFS_HEADROOM_MIB)
     }
 
-    /// The declared TAP wiring, or `None` for a loopback-only guest.
-    fn tap_wiring(&self) -> Option<TapWiring> {
+    /// The bridge the guest's NIC joins, or `None` for a guest with no NIC.
+    fn tap_bridge(&self) -> Option<String> {
         let network = self.network.as_ref()?;
         if network.mode.as_deref().unwrap_or("none") != "tap" {
             return None;
         }
-        let tap = network.tap.as_deref()?.trim();
-        Some(if tap == AUTO_TAP {
-            TapWiring::Auto {
-                bridge: network.bridge.as_deref()?.trim().to_string(),
-            }
-        } else {
-            TapWiring::Fixed(tap.to_string())
+        Some(network.bridge.as_deref()?.trim().to_string()).filter(|bridge| !bridge.is_empty())
+    }
+
+    /// The TAP device (and MAC) this allocation's guest attaches: the
+    /// instance's own device ([`crate::structs::fork::own_tap_name`], the
+    /// name a fork of it would get too), or the allocation's when it serves
+    /// no instance, with a MAC derived from the allocation id.
+    fn tap_for(&self, instance_id: Option<&str>, allocation_id: i64) -> Option<TapNet> {
+        self.tap_bridge()?;
+        let owner = instance_id
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::structs::fork::allocation_tap_owner(allocation_id));
+        Some(TapNet {
+            device: crate::structs::fork::own_tap_name(&owner),
+            mac: Some(crate::structs::fork::fork_mac(allocation_id)),
         })
     }
+}
 
-    /// The bridge an auto TAP joins.
-    fn auto_bridge(&self) -> Option<String> {
-        match self.tap_wiring()? {
-            TapWiring::Auto { bridge } => Some(bridge),
-            TapWiring::Fixed(_) => None,
+/// Give a TAP sandbox the implicit constraint on its bridge: the node
+/// attribute [`sandbox_addr::BRIDGES_ATTR`] must contain it. Without it the
+/// task could place on a node with no such bridge (or no address pool for
+/// it) and fail at start. Constraints in the object form become the
+/// equivalent list. Idempotent, so a resubmit does not stack copies.
+fn constrain_to_bridge(task: &mut TaskConfig) {
+    let Ok(config) = SandboxTaskConfig::from_value(&task.config) else {
+        // Validation reports the parse error.
+        return;
+    };
+    let Some(bridge) = config.tap_bridge() else {
+        return;
+    };
+    let rule = serde_json::json!({
+        "key": sandbox_addr::BRIDGES_ATTR,
+        "operator": "contains",
+        "value": bridge,
+    });
+    let mut rules = match std::mem::take(&mut task.constraints) {
+        Value::Array(rules) => rules,
+        Value::Object(map) => map
+            .into_iter()
+            .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+            .collect(),
+        Value::Null => Vec::new(),
+        other => {
+            // Not a constraint shape: leave it for validation to report.
+            task.constraints = other;
+            return;
         }
+    };
+    if !rules.contains(&rule) {
+        rules.push(rule);
     }
-
-    /// The TAP device (and MAC) this allocation's guest attaches. A fixed
-    /// TAP is the declared name. An auto TAP is the instance's own device
-    /// ([`crate::structs::fork::own_tap_name`], the name a fork of it would
-    /// get too), or the allocation's when it serves no instance.
-    fn tap_for(&self, instance_id: Option<&str>, allocation_id: i64) -> Option<TapNet> {
-        let mac = self
-            .network
-            .as_ref()
-            .and_then(|network| network.mac.clone());
-        match self.tap_wiring()? {
-            TapWiring::Fixed(device) => Some(TapNet { device, mac }),
-            TapWiring::Auto { .. } => {
-                let owner = instance_id
-                    .map(str::to_string)
-                    .unwrap_or_else(|| crate::structs::fork::allocation_tap_owner(allocation_id));
-                Some(TapNet {
-                    device: crate::structs::fork::own_tap_name(&owner),
-                    mac: mac.or_else(|| Some(crate::structs::fork::fork_mac(allocation_id))),
-                })
-            }
-        }
-    }
+    task.constraints = Value::Array(rules);
 }
 
 /// The instance an allocation serves, from the `LEGION_INSTANCE_ID` the
@@ -570,6 +567,31 @@ pub fn vsock_socket_base(scratch: &Path) -> PathBuf {
 /// [`vsock_socket_base`] from the allocation directory the worker owns.
 pub fn vsock_socket_base_for(alloc_dir: &Path) -> PathBuf {
     vsock_socket_base(&alloc_dir.join(".sandbox"))
+}
+
+/// The env var a TAP guest reads its leased address from (and its
+/// `/legion/resume.env` after a restore).
+pub const GUEST_ADDR_ENV: &str = "LEGION_GUEST_ADDR";
+
+/// The worker's allocation root (`<allocs>/`), which the address leases of
+/// every sandbox on the node live under.
+fn alloc_root(instance: &TaskInstance) -> Option<PathBuf> {
+    instance
+        .alloc_dir
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
+/// The extra kernel command line: a TAP guest's `ip=` autoconfiguration
+/// first, then the task's own `kernel_args`, which may override it.
+fn guest_cmdline(ip: Option<String>, kernel_args: Option<&str>) -> Option<String> {
+    let parts: Vec<&str> = ip
+        .as_deref()
+        .into_iter()
+        .chain(kernel_args.map(str::trim).filter(|args| !args.is_empty()))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// Per-allocation scratch: image layout, extracted rootfs, root disk, and the
@@ -868,6 +890,10 @@ fn build_stamp(layout: &Path, payload: &GuestPayload, artifacts: &[StagedArtifac
         hasher.update(b"\0guest-binary\0");
         hasher.update(binary.fingerprint.as_bytes());
     }
+    for resolver in &payload.resolvers {
+        hasher.update(b"\0resolver\0");
+        hasher.update(resolver.to_string().as_bytes());
+    }
     hasher.update(b"\0cwd\0");
     hasher.update(payload.cwd.as_deref().unwrap_or("").as_bytes());
     for mount in &payload.disk_mounts {
@@ -981,31 +1007,30 @@ impl SandboxTaskPlugin {
         let name = sandbox_name(allocation);
         let tap = config.tap_for(instance_id_from_env(env), allocation.id);
         std::fs::create_dir_all(&scratch)?;
-        match (config.tap_wiring(), tap.as_ref()) {
-            // An auto TAP is this instance's own device: created, attached
-            // to its bridge, and recorded so destroy deletes it.
-            (Some(TapWiring::Auto { bridge }), Some(tap)) => {
+        // The guest's NIC: this instance's own TAP on its bridge (created,
+        // and recorded so destroy deletes it), and an address leased from
+        // the bridge's pool (docs/task-runtime-sandbox.md, "Addressing").
+        // The pool is checked first, so a node that cannot address the
+        // guest fails the start before it creates anything.
+        let lease = match (config.tap_bridge(), tap.as_ref()) {
+            (Some(bridge), Some(tap)) => {
+                let pool = sandbox_addr::pool_for(&bridge)?;
                 sandbox_checkpoint::ensure_auto_tap(
                     &sandbox_checkpoint::HostTaps,
                     &tap.device,
                     &bridge,
                     &scratch,
                 )?;
+                Some(sandbox_addr::lease(
+                    &pool,
+                    &scratch,
+                    alloc_root(instance).as_deref(),
+                    None,
+                    &allocation.node_id,
+                )?)
             }
-            // A fixed `network.tap` serves one guest per node. Booting on a
-            // TAP another VMM holds fails by name here, rather than as an
-            // opaque VMM error: a disk fork, or a fork that fell back to a
-            // cold boot, of a TAP-wired task lands on the node where its
-            // origin holds the TAP.
-            (Some(TapWiring::Fixed(_)), Some(tap)) => {
-                sandbox_checkpoint::ensure_boot_tap_free(
-                    &sandbox_checkpoint::HostTaps,
-                    &tap.device,
-                    &task.name,
-                )?;
-            }
-            _ => {}
-        }
+            _ => None,
+        };
         if let Some(tap) = tap.as_ref() {
             sandbox_checkpoint::record_attached_tap(&scratch, &tap.device)?;
         }
@@ -1034,6 +1059,9 @@ impl SandboxTaskPlugin {
         let image_config = oci_bundle::read_image_config(&layout)?;
         let mut guest_env = oci_bundle::merge_env_map(&image_config.env, env);
         guest_env.extend(instance.volume_env());
+        if let Some(lease) = lease.as_ref() {
+            guest_env.insert(GUEST_ADDR_ENV.to_string(), lease.address.to_string());
+        }
         let payload_cwd = config
             .cwd
             .clone()
@@ -1074,6 +1102,10 @@ impl SandboxTaskPlugin {
             guest_binary: (gated || resume_watch)
                 .then(microvm::guest_binary)
                 .transpose()?,
+            resolvers: lease
+                .as_ref()
+                .map(|lease| lease.dns.clone())
+                .unwrap_or_default(),
         };
 
         let staged = instance.staged_artifacts.clone();
@@ -1133,7 +1165,10 @@ impl SandboxTaskPlugin {
         let mut spec = VmSpec {
             name: name.clone(),
             kernel,
-            extra_cmdline: config.kernel_args.clone(),
+            extra_cmdline: guest_cmdline(
+                lease.as_ref().map(|lease| lease.kernel_ip_arg(&name)),
+                config.kernel_args.as_deref(),
+            ),
             root_disk,
             volume_disks: volumes.disks,
             vcpus: config.vcpus(),
@@ -1373,7 +1408,11 @@ impl TaskPlugin for SandboxTaskPlugin {
     ///   a job stored before this rule (no `memory_mib`) keeps booting at
     ///   512 MiB exactly as it did, rather than shrinking to a defaulted
     ///   reservation it never asked for.
+    /// - A TAP sandbox gains `sandbox.bridges contains "<bridge>"`, so it
+    ///   only places on nodes whose worker config gives its bridge an
+    ///   address pool ([`constrain_to_bridge`]).
     fn normalize_task(&self, task: &mut TaskConfig) {
+        constrain_to_bridge(task);
         if !task.resources.is_object() {
             task.resources = Value::Object(Default::default());
         }
@@ -1437,8 +1476,11 @@ impl TaskPlugin for SandboxTaskPlugin {
     /// every check in [`SandboxTaskConfig::validate`] to submit time, which is
     /// where an agent or a human can still act on it.
     fn validate_config(&self, config: &Value) -> R<()> {
-        validate_schema(&self.schema(), config)?;
+        // The typed parse first: it names the replacement for a removed
+        // field (`network.tap`, `network.mac`), which the schema would only
+        // call unknown.
         SandboxTaskConfig::from_value(config)?;
+        validate_schema(&self.schema(), config)?;
         Ok(())
     }
 
@@ -1659,26 +1701,18 @@ impl TaskPlugin for SandboxTaskPlugin {
     fn set_network_gate(
         &self,
         allocation: &Allocation,
-        task: &TaskConfig,
+        _task: &TaskConfig,
         instance: &mut TaskInstance,
         open: bool,
     ) -> R<()> {
-        let config = SandboxTaskConfig::from_value(&task.config)?;
         if crate::task_plugins::allocation_is_gated(allocation) {
             // A gated guest's only door is the datapath: the gate is the
             // policy-withheld marker every vsock listener checks.
             return crate::task_plugins::set_gated_namespace_gate(allocation, open);
         }
-        // The device the guest was wired to at boot (an auto TAP's name is
-        // per instance), else the declared fixed one.
-        let device =
-            sandbox_checkpoint::attached_tap(&work_root(allocation, instance)).or_else(|| {
-                match config.tap_wiring() {
-                    Some(TapWiring::Fixed(device)) => Some(device),
-                    _ => None,
-                }
-            });
-        let Some(device) = device else {
+        // The device the guest was wired to at boot (per instance).
+        let Some(device) = sandbox_checkpoint::attached_tap(&work_root(allocation, instance))
+        else {
             // Loopback-only guest: nothing to gate, and nothing to open.
             return Ok(());
         };
@@ -1944,7 +1978,7 @@ impl TaskPlugin for SandboxTaskPlugin {
             tap: config
                 .tap_for(identity.instance_id.as_deref(), allocation.id)
                 .map(|tap| tap.device),
-            bridge: config.auto_bridge(),
+            bridge: config.tap_bridge(),
             // A gated restore moves the guest's vsock onto this
             // allocation's own socket, where the datapath already listens.
             vsock: crate::task_plugins::allocation_is_gated(allocation)
@@ -1957,6 +1991,23 @@ impl TaskPlugin for SandboxTaskPlugin {
         // the restore writes, beside its env tokens.
         let mut identity = identity.clone();
         identity.files = guest_tokens(task, &|_| None, instance.task_dir.as_deref()).files;
+        // A TAP guest takes a fresh address from its bridge's pool on this
+        // node, and the resume handler applies it (replacing whatever the
+        // captured guest had). A resume asks for its previous address first.
+        if let Some(bridge) = config.tap_bridge() {
+            let pool = sandbox_addr::pool_for(&bridge)?;
+            let previous = (!identity.fork)
+                .then(|| sandbox_checkpoint::recorded_guest_address(manifest))
+                .flatten();
+            let lease = sandbox_addr::lease(
+                &pool,
+                &scratch,
+                alloc_root(instance).as_deref(),
+                previous,
+                &allocation.node_id,
+            )?;
+            identity.guest_addr = Some(lease.guest_addr());
+        }
         sandbox_checkpoint::restore_microvm(
             &target,
             instance,
@@ -2115,7 +2166,7 @@ mod tests {
             "env": { "MODE": "test" },
             "vcpus": 2,
             "memory_mib": 1024,
-            "network": { "mode": "tap", "tap": "tap0", "mac": "02:00:00:00:00:01" },
+            "network": { "mode": "tap", "bridge": "br0" },
         }))?;
 
         assert_eq!(parsed.image, "alpine:latest");
@@ -2124,10 +2175,51 @@ mod tests {
         assert_eq!(
             parsed.tap_for(Some("user-42"), 7),
             Some(TapNet {
-                device: "tap0".into(),
-                mac: Some("02:00:00:00:00:01".into())
+                device: crate::structs::fork::own_tap_name("user-42"),
+                mac: Some(crate::structs::fork::fork_mac(7))
             })
         );
+        Ok(())
+    }
+
+    /// Gated plan §6.7: a TAP sandbox places only where its bridge has an
+    /// address pool. The implicit constraint joins the task's own (an
+    /// object-form constraint becomes the equivalent list), once.
+    #[test]
+    fn a_tap_sandbox_is_constrained_to_nodes_with_its_bridge() -> R<()> {
+        let tap =
+            json!({"image": "a", "command": ["x"], "network": { "mode": "tap", "bridge": "br0" }});
+        let mut task = task_with(tap);
+        task.constraints = json!({ "kernel.name": "linux" });
+        SandboxTaskPlugin.normalize_task(&mut task);
+        SandboxTaskPlugin.normalize_task(&mut task);
+        assert_eq!(
+            task.constraints,
+            json!([
+                { "key": "kernel.name", "value": "linux" },
+                { "key": "sandbox.bridges", "operator": "contains", "value": "br0" },
+            ])
+        );
+        let rules = crate::constraints::ConstraintSet::new(&task.constraints)?;
+        let node = |config_attrs: Value| crate::structs::Node {
+            id: "w-03".into(),
+            status: "active".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
+            config_attrs,
+            fingerprint_attrs: json!({ "kernel.name": "linux" }),
+            dynamic_attrs: json!({}),
+            health_checks: json!({}),
+        };
+        assert!(rules.is_satisfied(&node(json!({ "sandbox.bridges": ["br0", "br1"] })), None));
+        assert!(!rules.is_satisfied(&node(json!({ "sandbox.bridges": ["br1"] })), None));
+        assert!(!rules.is_satisfied(&node(json!({})), None));
+
+        // A sandbox with no NIC gains nothing.
+        let none = normalized(json!({"image": "a", "command": ["x"]}), json!({}));
+        assert_eq!(none.constraints, json!({}));
         Ok(())
     }
 
@@ -2319,12 +2411,12 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_tap_without_a_device() {
+    fn config_rejects_tap_without_a_bridge() {
         let err = SandboxTaskConfig::from_value(
             &json!({"image": "a", "command": ["x"], "network": {"mode": "tap"}}),
         )
-        .expect_err("tap without device");
-        assert!(err.to_string().contains("requires network.tap"));
+        .expect_err("tap without a bridge");
+        assert!(err.to_string().contains("requires network.bridge"));
 
         let err = SandboxTaskConfig::from_value(
             &json!({"image": "a", "command": ["x"], "network": {"mode": "bridge"}}),
@@ -2391,70 +2483,92 @@ mod tests {
         Ok(())
     }
 
-    /// `tap = "auto"` names a device per instance (the name a fork of it
+    /// A TAP sandbox gets a device per instance (the name a fork of it
     /// would get), attached to the declared bridge, with a MAC per
-    /// allocation unless the spec pins one.
+    /// allocation.
     #[test]
-    fn an_auto_tap_is_named_per_instance_and_needs_a_bridge() -> R<()> {
-        let auto = SandboxTaskConfig::from_value(&json!({
+    fn a_tap_is_named_per_instance_and_needs_a_bridge() -> R<()> {
+        let tap = SandboxTaskConfig::from_value(&json!({
             "image": "a", "command": ["x"],
-            "network": { "mode": "tap", "tap": "auto", "bridge": "br0" },
+            "network": { "mode": "tap", "bridge": "br0" },
         }))?;
-        assert_eq!(
-            auto.tap_wiring(),
-            Some(TapWiring::Auto {
-                bridge: "br0".into()
-            })
-        );
-        assert_eq!(auto.auto_bridge().as_deref(), Some("br0"));
-        let user = auto.tap_for(Some("user-42"), 7).expect("a TAP");
+        assert_eq!(tap.tap_bridge().as_deref(), Some("br0"));
+        let user = tap.tap_for(Some("user-42"), 7).expect("a TAP");
         assert_eq!(user.device, crate::structs::fork::own_tap_name("user-42"));
         assert_eq!(user.mac.as_deref(), Some("02:4c:00:00:00:07"));
         // Another instance, another device; the same instance on a later
         // allocation (a resume), the same device.
-        assert_ne!(
-            auto.tap_for(Some("user-43"), 8).unwrap().device,
-            user.device
-        );
+        assert_ne!(tap.tap_for(Some("user-43"), 8).unwrap().device, user.device);
         assert_eq!(
-            auto.tap_for(Some("user-42"), 99).unwrap().device,
+            tap.tap_for(Some("user-42"), 99).unwrap().device,
             user.device
         );
         // No instance: named after the allocation.
         assert_eq!(
-            auto.tap_for(None, 7).unwrap().device,
+            tap.tap_for(None, 7).unwrap().device,
             crate::structs::fork::own_tap_name("alloc-7")
         );
+        let none = SandboxTaskConfig::from_value(&json!({"image": "a", "command": ["x"]}))?;
+        assert!(none.tap_for(Some("user-42"), 7).is_none());
 
-        let err = SandboxTaskConfig::from_value(&json!({
-            "image": "a", "command": ["x"], "network": { "mode": "tap", "tap": "auto" },
-        }))
-        .expect_err("auto without a bridge");
+        let refused = |network: Value| {
+            let err = SandboxTaskConfig::from_value(&json!({
+                "image": "a", "command": ["x"], "network": network,
+            }))
+            .expect_err("refused");
+            format!("{err:#}")
+        };
+        assert!(refused(json!({ "mode": "tap" })).contains("requires network.bridge"));
         assert!(
-            format!("{err:#}").contains("requires network.bridge"),
-            "{err:#}"
+            refused(json!({ "mode": "tap", "bridge": "a-bridge-name-too-long" }))
+                .contains("not a valid interface name")
         );
-
-        let err = SandboxTaskConfig::from_value(&json!({
-            "image": "a", "command": ["x"],
-            "network": { "mode": "tap", "tap": "tap0", "bridge": "br0" },
-        }))
-        .expect_err("bridge with a fixed TAP");
-        assert!(
-            format!("{err:#}").contains("applies only to tap = \"auto\""),
-            "{err:#}"
-        );
-
-        let err = SandboxTaskConfig::from_value(&json!({
-            "image": "a", "command": ["x"],
-            "network": { "mode": "tap", "tap": "auto", "bridge": "a-bridge-name-too-long" },
-        }))
-        .expect_err("bridge name too long");
-        assert!(
-            format!("{err:#}").contains("not a valid interface name"),
-            "{err:#}"
-        );
+        assert!(refused(json!({ "bridge": "br0" })).contains("applies only to mode = \"tap\""));
         Ok(())
+    }
+
+    /// Gated plan Phase 4: `tap` and `mac` are gone, and submit names the
+    /// replacement rather than "unknown field".
+    #[test]
+    fn a_hand_named_tap_or_mac_is_refused_with_the_replacement() {
+        let refused = |network: Value| {
+            let err = SandboxTaskConfig::from_value(&json!({
+                "image": "a", "command": ["x"], "network": network,
+            }))
+            .expect_err("refused");
+            format!("{err:#}")
+        };
+        let err = refused(json!({ "mode": "tap", "tap": "tap0" }));
+        assert!(
+            err.starts_with("config.network.tap is gone: Legion creates a TAP per instance"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Hint: Set bridge = \"<the bridge tap0 was on>\""),
+            "{err}"
+        );
+        assert!(err.contains("sandbox.bridges.<bridge>"), "{err}");
+        let err = refused(json!({ "mode": "tap", "tap": "auto", "bridge": "br0" }));
+        assert!(err.contains("Hint: Drop tap"), "{err}");
+        let err = refused(json!({ "mode": "tap", "bridge": "br0", "mac": "02:00:00:00:00:01" }));
+        assert!(err.starts_with("config.network.mac is gone"), "{err}");
+    }
+
+    /// The guest's kernel brings `eth0` up with the lease, ahead of the
+    /// task's own `kernel_args` (which can override it).
+    #[test]
+    fn the_lease_rides_the_kernel_command_line() {
+        assert_eq!(guest_cmdline(None, None), None);
+        assert_eq!(guest_cmdline(None, Some("  ")), None);
+        assert_eq!(guest_cmdline(None, Some("quiet")).as_deref(), Some("quiet"));
+        assert_eq!(
+            guest_cmdline(
+                Some("ip=10.88.128.7::10.88.0.1:255.255.0.0:h:eth0:off".into()),
+                Some("quiet")
+            )
+            .as_deref(),
+            Some("ip=10.88.128.7::10.88.0.1:255.255.0.0:h:eth0:off quiet")
+        );
     }
 
     #[test]

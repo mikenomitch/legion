@@ -971,6 +971,9 @@ async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
         match reply.instance {
             Some(instance) => {
                 print_table(vec![InstanceRow::from(&instance)]);
+                if let Some(address) = address_line(&instance) {
+                    println!("\n{address}");
+                }
                 if let Some(snapshot) = instance.restore_snapshot_id.as_deref() {
                     println!(
                         "\nrestoring: from snapshot {snapshot}, until its node reports the outcome"
@@ -1077,6 +1080,16 @@ fn checkpoint_column(instance: &InstanceInfo) -> String {
         (Some(kind), _) => format!("{id} ({kind})"),
         (None, _) => id.to_string(),
     }
+}
+
+/// A TAP sandbox's leased guest address, for `instance get`
+/// (`address: 10.88.128.7 (br0)`).
+fn address_line(instance: &InstanceInfo) -> Option<String> {
+    let address = instance.guest_address.as_deref()?;
+    Some(match instance.guest_bridge.as_deref() {
+        Some(bridge) if !bridge.is_empty() => format!("address: {address} ({bridge})"),
+        _ => format!("address: {address}"),
+    })
 }
 
 /// The last suspend and restore, for `instance get`.
@@ -1324,6 +1337,21 @@ mod tests {
                     volume was kept"),
             "{lines:?}"
         );
+    }
+
+    /// Gated plan §6.7: a TAP sandbox shows the address Legion leased it.
+    #[test]
+    fn instance_get_shows_a_tap_guest_address() {
+        let tap = InstanceInfo {
+            guest_address: Some("10.88.128.7".into()),
+            guest_bridge: Some("br0".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            address_line(&tap).as_deref(),
+            Some("address: 10.88.128.7 (br0)")
+        );
+        assert_eq!(address_line(&InstanceInfo::default()), None);
     }
 
     /// `instance get` names why the last suspend happened and, while the

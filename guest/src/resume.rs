@@ -17,7 +17,9 @@
 //!    snapshot must never share RNG state; VMGenID reseeds too where the VMM
 //!    exposes it, and this is the explicit reseed beside it),
 //! 2. steps the clock to the host's time,
-//! 3. sets the hostname, and the NIC's MAC when the restore assigned one,
+//! 3. sets the hostname, the NIC's MAC when the restore assigned one, and,
+//!    on a TAP-wired guest, the address Legion leased it (flushing whatever
+//!    address the captured guest had, see [`crate::netconf`]),
 //! 4. writes the refreshed identity where the workload can read it:
 //!    `/legion/identity.json` (mode 0600), `/legion/resume.env` (the
 //!    refreshed env, including `LEGION_ALLOC_ID` and every env-delivered
@@ -62,6 +64,9 @@ pub trait GuestHost {
     fn set_hostname(&self, hostname: &str) -> R<()>;
     /// Give the guest NIC a new MAC address.
     fn set_mac(&self, mac: &str) -> R<()>;
+    /// Re-address the guest NIC with a leased address, its default route,
+    /// and its resolvers.
+    fn set_address(&self, addr: &crate::identity::GuestAddr) -> R<()>;
     /// Write a file atomically with `mode`.
     fn write_file(&self, path: &Path, contents: &[u8], mode: u32) -> R<()>;
     /// Run `argv` with `env` added, wait up to `timeout`, and return its
@@ -113,6 +118,9 @@ pub fn apply_resume(identity: &ResumeIdentity, host: &dyn GuestHost) -> ResumeOu
     if let Some(mac) = identity.mac.as_deref() {
         step("nic", host.set_mac(mac));
     }
+    if let Some(addr) = identity.guest_addr.as_ref() {
+        step("address", host.set_address(addr));
+    }
 
     let tokens = apply_tokens(identity, host);
     outcome.done.extend(tokens.done);
@@ -138,13 +146,16 @@ pub fn apply_resume(identity: &ResumeIdentity, host: &dyn GuestHost) -> ResumeOu
 }
 
 /// The env the handler publishes in `/legion/resume.env` and hands to
-/// `onResume`: the identity's env plus `LEGION_ALLOC_ID` and
-/// `LEGION_INSTANCE_ID`.
+/// `onResume`: the identity's env plus `LEGION_ALLOC_ID`,
+/// `LEGION_INSTANCE_ID`, and a TAP guest's `LEGION_GUEST_ADDR`.
 fn resume_env(identity: &ResumeIdentity) -> BTreeMap<String, String> {
     let mut env = identity.env.clone();
     env.insert("LEGION_ALLOC_ID".into(), identity.alloc_id.to_string());
     if let Some(instance) = identity.instance_id.as_deref() {
         env.insert("LEGION_INSTANCE_ID".into(), instance.to_string());
+    }
+    if let Some(addr) = identity.guest_addr.as_ref() {
+        env.insert("LEGION_GUEST_ADDR".into(), addr.address.clone());
     }
     env
 }
@@ -418,19 +429,20 @@ impl GuestHost for LinuxGuest {
     }
 
     fn set_mac(&self, mac: &str) -> R<()> {
-        // The guest's one NIC. The link bounces so peers relearn it.
-        for args in [
-            vec!["link", "set", "eth0", "down"],
-            vec!["link", "set", "eth0", "address", mac],
-            vec!["link", "set", "eth0", "up"],
-        ] {
-            let status = std::process::Command::new("ip")
-                .args(&args)
-                .status()
-                .context("run ip")?;
-            if !status.success() {
-                bail!("ip {} failed with {status}", args.join(" "));
-            }
+        // The guest's one NIC, through netlink (no `ip` tool in the image
+        // needed). The link bounces so peers relearn it.
+        crate::netconf::set_mac(crate::netconf::GUEST_NIC, crate::netconf::parse_mac(mac)?)
+    }
+
+    fn set_address(&self, addr: &crate::identity::GuestAddr) -> R<()> {
+        let parsed = crate::netconf::parse(addr)?;
+        crate::netconf::apply(crate::netconf::GUEST_NIC, &parsed)?;
+        if !parsed.dns.is_empty() {
+            self.write_file(
+                Path::new("/etc/resolv.conf"),
+                crate::netconf::resolv_conf(&parsed.dns).as_bytes(),
+                0o644,
+            )?;
         }
         Ok(())
     }
@@ -508,6 +520,13 @@ mod tests {
             self.calls.lock().unwrap().push(format!("mac {mac}"));
             Ok(())
         }
+        fn set_address(&self, addr: &crate::identity::GuestAddr) -> R<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("address {}/{}", addr.address, addr.prefix));
+            Ok(())
+        }
         fn write_file(&self, path: &Path, contents: &[u8], mode: u32) -> R<()> {
             self.calls
                 .lock()
@@ -553,6 +572,7 @@ mod tests {
                 mode: 0o440,
                 token: format!("vault-for-{alloc_id}"),
             }],
+            guest_addr: None,
         }
     }
 
@@ -585,6 +605,40 @@ mod tests {
         assert_eq!(*mode, 0o600);
         let written: ResumeIdentity = serde_json::from_slice(json).unwrap();
         assert_eq!(written.alloc_id, 9);
+    }
+
+    /// Gated plan §6.7: a TAP guest restored into a fork gets its own MAC,
+    /// then its own leased address, and the workload can read the address
+    /// from `LEGION_GUEST_ADDR`.
+    #[test]
+    fn a_tap_restore_applies_the_leased_address_after_the_mac() {
+        let host = Recorder::default();
+        let identity = ResumeIdentity {
+            mac: Some("02:4c:00:00:00:09".into()),
+            guest_addr: Some(crate::identity::GuestAddr {
+                address: "10.88.128.9".into(),
+                prefix: 16,
+                gateway: Some("10.88.0.1".into()),
+                dns: vec!["10.88.0.1".into()],
+                bridge: "br0".into(),
+            }),
+            ..restored(9)
+        };
+        let outcome = apply_resume(&identity, &host);
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        let calls = host.calls.lock().unwrap().clone();
+        let mac_at = calls.iter().position(|c| c.starts_with("mac ")).unwrap();
+        let addr_at = calls
+            .iter()
+            .position(|c| c == "address 10.88.128.9/16")
+            .expect("re-addressed");
+        assert!(mac_at < addr_at, "{calls:?}");
+        let files = host.files.lock().unwrap();
+        let env = String::from_utf8_lossy(&files[&PathBuf::from(GUEST_RESUME_ENV)].0).into_owned();
+        assert!(
+            env.contains("export LEGION_GUEST_ADDR='10.88.128.9'"),
+            "{env}"
+        );
     }
 
     #[test]

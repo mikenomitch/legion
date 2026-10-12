@@ -116,22 +116,6 @@ pub(crate) fn fork_precondition(
             }
         }
     }
-    // A disk fork boots each fork fresh. On `tap = "auto"` that is the
-    // fork's own `lgf` device, but a fixed TAP is the one the origin holds.
-    // Submit refuses a fixed TAP on a keyed task, so only a spec stored
-    // before that rule reaches this.
-    if let Some(tap) = crate::structs::fork::sandbox_fixed_tap(task) {
-        if kind == SnapshotKind::Disk {
-            return Some(format!(
-                "instance {id} wires its guest to the fixed TAP device {tap:?} \
-                 (config.network.tap), and a disk fork boots each fork fresh on that device, \
-                 which the origin already holds on node {}\nHint: use --checkpoint memory, \
-                 which moves each fork to its own TAP device, or resubmit the job with tap = \
-                 \"auto\"",
-                node.id
-            ));
-        }
-    }
     if kind == SnapshotKind::Memory && sandbox_uses_tap(task) {
         let vmm = node
             .fingerprint_attrs

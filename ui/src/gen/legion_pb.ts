@@ -5921,6 +5921,30 @@ export class InstanceInfo extends Message<InstanceInfo> {
    */
   coldBoot?: InstanceColdBoot;
 
+  /**
+   * The IPv4 address the running allocation's guest holds, for a `sandbox`
+   * on `config.network = { mode = "tap", bridge = ... }`. Legion leases it
+   * from the bridge's pool in the node's worker config
+   * (`sandbox.bridges.<bridge>`) at boot, and leases a fresh one on every
+   * restore and fork, which the guest applies before its workload runs
+   * again: a fork never answers on its origin's address, and a resume on
+   * the same node gets its previous address back when it is still free.
+   * From the node's latest network status report, so unset for a few
+   * seconds after a start, and unset for gated and loopback-only sandboxes
+   * and every other runtime. See docs/task-runtime-sandbox.md, "Addressing".
+   *
+   * @generated from field: optional string guest_address = 35;
+   */
+  guestAddress?: string;
+
+  /**
+   * The bridge `guest_address` belongs to (`br0`). Set exactly when
+   * `guest_address` is.
+   *
+   * @generated from field: optional string guest_bridge = 36;
+   */
+  guestBridge?: string;
+
   constructor(data?: PartialMessage<InstanceInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5963,6 +5987,8 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 32, name: "held_memory_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
     { no: 33, name: "held_cpu_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
     { no: 34, name: "cold_boot", kind: "message", T: InstanceColdBoot, opt: true },
+    { no: 35, name: "guest_address", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 36, name: "guest_bridge", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
@@ -26197,6 +26223,24 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
    */
   meshIdentity = false;
 
+  /**
+   * A TAP-wired `sandbox`'s guest address, leased from its bridge's pool
+   * (`sandbox.bridges.<bridge>` in the worker config) at boot and on every
+   * restore and fork. Empty for every other allocation. The manager surfaces
+   * it as `InstanceInfo.guest_address`. A TAP sandbox is reported here even
+   * when it declares no ports, upstreams, or VIPs, with `mode = "host"`.
+   *
+   * @generated from field: string guest_address = 15;
+   */
+  guestAddress = "";
+
+  /**
+   * The bridge `guest_address` belongs to. Empty exactly when it is.
+   *
+   * @generated from field: string guest_bridge = 16;
+   */
+  guestBridge = "";
+
   constructor(data?: PartialMessage<NetAllocStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -26219,6 +26263,8 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
     { no: 12, name: "tls_ready", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 13, name: "tls_error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 14, name: "mesh_identity", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 15, name: "guest_address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "guest_bridge", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetAllocStatus {

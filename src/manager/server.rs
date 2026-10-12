@@ -730,6 +730,10 @@ fn map_instance_info(
         pending_op,
         idle_since,
         idle_after_seconds,
+        // From the node's network status report, which the handlers
+        // attach ([`attach_guest_address`]).
+        guest_address: None,
+        guest_bridge: None,
     }
 }
 
@@ -4735,12 +4739,6 @@ impl Manager for ManagerDaemonService {
             inner.task_group.as_deref(),
             inner.task_name.as_deref(),
         )?;
-        // The submit-time fixed-TAP rule, asked of the count being set: a
-        // second guest on a fixed TAP fails to boot (docs/task-runtime-sandbox.md).
-        if let Some(count) = inner.count {
-            crate::structs::fork::validate_fixed_tap(task, count, false)
-                .map_err(Status::failed_precondition)?;
-        }
         let (task_group, task_name, spec_count) =
             (task.group.clone(), task.name.clone(), task.count.num);
         let job_config_id = config.id();
@@ -5711,6 +5709,7 @@ impl Manager for ManagerDaemonService {
             .store
             .instance_lineage_for_job(&inner.job_id)
             .map_err(|e| map_store_error("Error listing instances", e))?;
+        let addresses = guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner()));
         let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         let instances = self
             .store
@@ -5721,7 +5720,9 @@ impl Manager for ManagerDaemonService {
             .map(|instance| {
                 let state = suspend.remove(&instance.instance_id).unwrap_or_default();
                 let history = history.remove(&instance.instance_id).unwrap_or_default();
-                map_instance_info(&self.store, &usage, instance, state, history)
+                let mut info = map_instance_info(&self.store, &usage, instance, state, history);
+                attach_guest_address(&mut info, &addresses);
+                info
             })
             .collect();
 
@@ -5769,6 +5770,10 @@ impl Manager for ManagerDaemonService {
         let egress_unenforced = instance_egress_unenforced_detail(&self.store, &instance);
         let mut info = map_instance_info(&self.store, &usage, instance, suspend, history);
         drop(usage);
+        attach_guest_address(
+            &mut info,
+            &guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner())),
+        );
         if info.detail.is_none() {
             info.detail = idle_unmeasured.or(egress_unenforced);
         }
@@ -11278,7 +11283,39 @@ fn net_status_json(node_id: &str, status: &crate::structs::NetAllocStatus) -> Va
         "tlsReady": status.tls_ready,
         "tlsError": status.tls_error,
         "meshIdentity": status.mesh_identity,
+        "guestAddress": status.guest_address,
+        "guestBridge": status.guest_bridge,
     })
+}
+
+/// Every TAP sandbox guest address the nodes reported, by allocation id, as
+/// `(address, bridge)` (`NetAllocStatus.guest_address`).
+fn guest_addresses(
+    status: &HashMap<String, Vec<crate::structs::NetAllocStatus>>,
+) -> HashMap<i64, (String, String)> {
+    status
+        .values()
+        .flatten()
+        .filter(|entry| !entry.guest_address.is_empty())
+        .map(|entry| {
+            (
+                entry.allocation_id,
+                (entry.guest_address.clone(), entry.guest_bridge.clone()),
+            )
+        })
+        .collect()
+}
+
+/// Fill `info`'s guest address from the node reports, for its running
+/// allocation.
+fn attach_guest_address(info: &mut InstanceInfo, addresses: &HashMap<i64, (String, String)>) {
+    if let Some((address, bridge)) = info
+        .current_alloc_id
+        .and_then(|allocation_id| addresses.get(&allocation_id))
+    {
+        info.guest_address = Some(address.clone());
+        info.guest_bridge = Some(bridge.clone());
+    }
 }
 
 fn net_policy_to_proto(
@@ -11823,6 +11860,39 @@ mod tests {
         };
         store.handle_job_submit(&job, &[submission()])?;
         Ok(())
+    }
+
+    /// Gated plan §6.7: the node's report of a TAP guest's leased address
+    /// reaches the instance serving that allocation, and no other.
+    #[test]
+    fn a_reported_guest_address_reaches_its_instance() {
+        let report = |allocation_id, address: &str| crate::structs::NetAllocStatus {
+            allocation_id,
+            mode: "host".into(),
+            guest_address: address.into(),
+            guest_bridge: if address.is_empty() { "" } else { "br0" }.into(),
+            ..Default::default()
+        };
+        let status = HashMap::from([(
+            "w-03".to_string(),
+            vec![report(7, "10.88.128.7"), report(8, "")],
+        )]);
+        let addresses = guest_addresses(&status);
+        let mut running = InstanceInfo {
+            current_alloc_id: Some(7),
+            ..Default::default()
+        };
+        attach_guest_address(&mut running, &addresses);
+        assert_eq!(running.guest_address.as_deref(), Some("10.88.128.7"));
+        assert_eq!(running.guest_bridge.as_deref(), Some("br0"));
+        for current_alloc_id in [Some(8), Some(9), None] {
+            let mut other = InstanceInfo {
+                current_alloc_id,
+                ..Default::default()
+            };
+            attach_guest_address(&mut other, &addresses);
+            assert_eq!(other.guest_address, None);
+        }
     }
 
     /// Gated plan Phase 2: an allocation placed gated by `auto` (a sandbox

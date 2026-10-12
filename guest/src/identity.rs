@@ -68,6 +68,33 @@ pub struct ResumeIdentity {
     /// handler rewrites these files with no restart. Secret, like `token`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<GuestTokenFile>,
+    /// The address a TAP-wired guest takes after this restore, from its
+    /// bridge's pool on the restoring node. The handler flushes `eth0`'s
+    /// addresses and applies this one, its default route, and its resolvers,
+    /// so forks never share an address. Absent for gated and loopback-only
+    /// guests, which have no NIC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_addr: Option<GuestAddr>,
+}
+
+/// One IPv4 address Legion leased a TAP guest from its bridge's pool
+/// (docs/task-runtime-sandbox.md, "Addressing").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestAddr {
+    /// The guest's address, dotted quad.
+    pub address: String,
+    /// The bridge network's prefix length (`/16`), for the guest's netmask.
+    pub prefix: u8,
+    /// The default route, when the bridge has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    /// Resolvers for the guest's `/etc/resolv.conf`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<String>,
+    /// The bridge the address belongs to, for display.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bridge: String,
 }
 
 impl ResumeIdentity {

@@ -304,7 +304,7 @@ impl SnapshotManifest {
 /// Who a restored allocation is, and one token file inside its guest. The
 /// guest's resume handler reads these off the identity disk, so they live in
 /// the `legion-guest` crate the guest binary is built from.
-pub use legion_guest::identity::{GuestTokenFile, ResumeIdentity};
+pub use legion_guest::identity::{GuestAddr, GuestTokenFile, ResumeIdentity};
 
 /// Never prints the key bytes (build.rs turns off the generated Debug).
 impl fmt::Debug for crate::structs::CheckpointPartKey {

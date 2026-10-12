@@ -299,6 +299,13 @@ mod tests {
             on_resume: vec!["/bin/reconnect".into()],
             fork: false,
             files: Vec::new(),
+            guest_addr: Some(legion_guest::identity::GuestAddr {
+                address: "10.88.128.42".into(),
+                prefix: 16,
+                gateway: Some("10.88.0.1".into()),
+                dns: vec!["10.88.0.1".into()],
+                bridge: "br0".into(),
+            }),
         }
     }
 
