@@ -199,6 +199,10 @@ fn worker_capabilities(publishing: bool) -> Vec<String> {
         // §6.13). Informational: the manager recognizes a streaming worker
         // by the stream position its heartbeat reports.
         WORK_STREAM_CAPABILITY.to_string(),
+        // Runs session envelopes and admits sessions into them
+        // (docs/session-mode.md). Envelope tasks require it, so a worker
+        // that predates sessions is never given one.
+        crate::structs::session::SESSIONS_CAPABILITY.to_string(),
     ];
     if publishing {
         capabilities.push(crate::structs::snapshot::CONTENT_PUBLISH_CAPABILITY.to_string());
@@ -1816,6 +1820,19 @@ async fn heartbeat_tick(
                 }
             }
         };
+        // The sessions this node runs (docs/session-mode.md), as a delta
+        // against what the manager last acknowledged; same no-restore
+        // contract as the content report above.
+        let session_report = {
+            let current = task_manager
+                .lock()
+                .expect("task manager")
+                .session_statuses();
+            SESSION_ADVERTISER
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .prepare(current)
+        };
         let exec_audit = crate::worker::direct_exec::take_audit();
         // On the stream, the heartbeat stops listing what the node runs: it
         // reports its stream position and a digest of its desired set, and
@@ -1842,6 +1859,7 @@ async fn heartbeat_tick(
             content_locations: content_report
                 .as_ref()
                 .map(|pending| pending.report.clone()),
+            session_report: Some(session_report.report.clone()),
             usage,
             pressure_actions,
             net_denials,
@@ -1945,6 +1963,17 @@ async fn heartbeat_tick(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .acknowledge(pending, reply.content_resync);
+        }
+        SESSION_ADVERTISER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .acknowledge(session_report, reply.session_resync);
+        // The later copy of a session id another node also runs.
+        if !reply.stop_sessions.is_empty() {
+            task_manager.lock().expect("task manager").stop_sessions(
+                &reply.stop_sessions,
+                "duplicate of a session on another node",
+            );
         }
         // The desired set is the other place a node learns job configs it may
         // later be asked to start from a ticket.
@@ -3175,6 +3204,12 @@ pub const WORK_STREAM_CAPABILITY: &str = "work-stream";
 /// over with a full resync, which is the protocol.
 static WORK_MIRROR: std::sync::LazyLock<crate::worker::work_stream::SharedMirror> =
     std::sync::LazyLock::new(Default::default);
+
+/// The epoch protocol for this node's session report (docs/session-mode.md),
+/// mirroring [`CONTENT_ADVERTISER`].
+static SESSION_ADVERTISER: std::sync::LazyLock<
+    Mutex<crate::worker::session_report::SessionAdvertiser>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Allocation health as the manager last acknowledged it, so a streaming
 /// worker's heartbeat sends only what changed (sandbox-scaling plan §6.13).
@@ -5065,6 +5100,8 @@ mod tests {
             exec_keys_version: String::new(),
             desired_via_stream: false,
             work_resync: false,
+            session_resync: false,
+            stop_sessions: Vec::new(),
             net_policies: Vec::new(),
             claim_verdicts: Vec::new(),
             next_interval_seconds: None,

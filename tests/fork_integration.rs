@@ -251,6 +251,8 @@ fn task(runtime: &str, storage: bool) -> TaskConfig {
                 retain_on_scale_in: None,
                 retain_on_stop: None,
             }),
+            envelope: None,
+            promote: None,
         }),
         ..TaskConfig::new(TASK, runtime)
     }

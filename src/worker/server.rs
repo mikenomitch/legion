@@ -41,6 +41,17 @@ pub trait ClaimRatifier: Send + Sync {
     ) -> R<crate::structs::RatifyClaimReply>;
 }
 
+/// The status a refused provisional start answers with. A session refused
+/// for room is RESOURCE_EXHAUSTED, which the manager's session router reads as
+/// "try the next node"; everything else is FAILED_PRECONDITION, as before.
+fn admission_status(err: &anyhow::Error) -> Status {
+    use crate::worker::task_manager::SessionRefusal;
+    match err.downcast_ref::<SessionRefusal>() {
+        Some(SessionRefusal::EnvelopeFull { .. }) => Status::resource_exhausted(format!("{err:#}")),
+        _ => Status::failed_precondition(format!("{err:#}")),
+    }
+}
+
 pub struct WorkerDaemonService {
     /// This worker's node id, checked against requests that name a node.
     pub node_id: String,
@@ -82,7 +93,7 @@ impl Worker for WorkerDaemonService {
             if allocation.allocation_id == 0 {
                 let admitted =
                     edge::admit_and_launch(&self.task_manager, &allocation, &provisional)
-                        .map_err(|err| Status::failed_precondition(format!("{err:#}")))?;
+                        .map_err(|err| admission_status(&err))?;
                 return Ok(Response::new(PostWorkReply {
                     message: format!("Provisional start {} admitted", admitted.claim_id),
                 }));
@@ -352,6 +363,7 @@ impl Worker for WorkerDaemonService {
                 origin: "edge".into(),
                 on_refused: task_gate.on_refused.as_str().to_string(),
                 ticket_jti: claims.jti.clone(),
+                session: None,
             }),
         )
         .map_err(|err| Status::internal(format!("failed to build payload: {err:#}")))?;
@@ -435,6 +447,30 @@ impl Worker for WorkerDaemonService {
             node_id: self.node_id.clone(),
             protocol_version: u64::from(crate::constants::PROTOCOL_VERSION),
         }))
+    }
+
+    /// End sessions on this node (docs/session-mode.md). Manager-only, like
+    /// `PostWork`, which starts them.
+    #[instrument(err, skip_all, fields(sessions))]
+    async fn stop_sessions(
+        &self,
+        request: Request<crate::structs::StopSessionsRequest>,
+    ) -> Result<Response<crate::structs::StopSessionsReply>, Status> {
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "StopSessions")?;
+        let request = request.into_inner();
+        tracing::Span::current().record("sessions", request.session_ids.len());
+        let reason = if request.reason.is_empty() {
+            "stop".to_string()
+        } else {
+            request.reason
+        };
+        let stopped = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .stop_sessions(&request.session_ids, &format!("requested ({reason})"));
+        Ok(Response::new(crate::structs::StopSessionsReply { stopped }))
     }
 }
 

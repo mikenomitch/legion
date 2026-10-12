@@ -423,6 +423,30 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   so alert on a rising `failed` rate, and watch `retrying` for a store going
   bad.
 
+- **`legion_instance_archived_total{mode}`** (counter): suspended instances
+  [archived](suspend-and-resume.md#archiving-idle-instances) once their
+  checkpoint published, by `mode`: `slim` (a slim instance row stays) or
+  `manifestOnly` (no row stays, the bucket holds the instance). Counted on
+  the manager that recorded the publish.
+
+### Sessions
+
+Counted on the manager that served the request, so with several managers sum
+across them. See [session-mode.md](session-mode.md).
+
+- **`legion_session_starts_total{outcome}`** (counter): session creates the
+  session router answered, by `outcome`: `started`, `deduplicated` (an
+  idempotent retry found the session running), `no_envelope` (no node holds
+  an envelope for the task yet), `no_room` (every envelope was full by the
+  router's view), or `refused` (the nodes tried all refused). None of them
+  writes the replicated store. A rising `no_room` or `refused` rate means
+  the envelopes are too small for the arrival rate.
+- **`legion_session_stops_total{reason}`** (counter): sessions this manager
+  ended on their nodes, by `reason`: `stop`, `destroy`, or `duplicate` (the
+  later copy of a session id running on two nodes).
+- **`legion_session_promotions_total`** (counter): running sessions promoted
+  to keyed instances, one scheduler-lane raft entry each.
+
 ### Heartbeat cadence
 
 Reported on the status-lane leader (the manager that owns node liveness), and

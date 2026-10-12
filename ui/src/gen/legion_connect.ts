@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUpstreamCredentialsReply, GetUpstreamCredentialsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUpstreamCredentialsReply, GetUpstreamCredentialsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -366,16 +366,22 @@ export const Manager = {
      * created through this RPC is the task's desired allocation count (zero
      * instances = zero allocations).
      *
-     * Id assignment: when `instance_id` is absent the server mints an id,
+     * Id assignment: when `instance_id` is absent the server mints an
+     * unnamed id, `<task>-<26 lowercase base32 characters>` (130 random bits),
      * unless the target task sets `stateful.requireId: true`, which rejects
-     * the request instead. A caller-supplied `instance_id` is always accepted
-     * when valid.
+     * the request instead. A caller-supplied `instance_id` is a name and is
+     * always accepted when valid. That shape is reserved for minted ids: a
+     * caller id ending in `-` plus 26 characters of `[a-z2-7]` is refused, so
+     * nobody can re-create an unnamed instance by typing its id. Named and
+     * unnamed instances differ only on destroy (see DestroyInstance and
+     * `InstanceInfo.named`).
      *
      * Errors:
      * - NotFound: the job does not exist.
      * - InvalidArgument: no keyed task matches `group`/`task`, the match is
      *   ambiguous, the id has an invalid charset (must match
-     *   `[A-Za-z0-9._-]{1,128}`), or `requireId: true` and no id was given.
+     *   `[A-Za-z0-9._-]{1,128}`) or the reserved minted-id shape, or
+     *   `requireId: true` and no id was given.
      * - AlreadyExists: the id collides with ANY existing instance row of the
      *   job — including Stopped instances and Terminated tombstones — or
      *   structurally aliases the reserved slot-id pattern
@@ -389,6 +395,23 @@ export const Manager = {
      * `from_snapshot` restores the new instance from a snapshot
      * instead of booting it empty. See `CreateInstances` for the contract,
      * which is the same for one instance.
+     *
+     * Session-mode tasks (`stateful.mode = "session"`, docs/session-mode.md):
+     * a create without `instance_id` starts an unnamed session and writes
+     * nothing to the replicated store. The manager's session router picks a
+     * node whose envelope for the task has room (most room first, from the
+     * session index), sends the start straight to that node, and tries the
+     * next node when one refuses. The reply carries `mode = "session"`,
+     * `durable = false`, and the node. With an `idempotency_key` the session
+     * id is derived from the key, the caller, the job, and the task, so a
+     * retry finds the running session and answers `deduplicated` without any
+     * record. A create with `instance_id` is an ordinary keyed create (a named
+     * instance is durable from birth), unless the task sets
+     * `stateful.promote.onName = false`, which refuses it. `from_snapshot` is
+     * refused for a session. Session-specific errors:
+     * - ResourceExhausted: no node's envelope for the task has room. Retryable
+     *   once sessions end or envelopes are added.
+     * - FailedPrecondition: no node holds an envelope for the task yet.
      *
      * @generated from rpc legion.Manager.CreateInstance
      */
@@ -472,26 +495,40 @@ export const Manager = {
      * Destroys a keyed-mode instance: stops its current allocation, drops its
      * storage handle, and marks the instance Terminated.
      *
-     * The instance row is retained as a tombstone so its id can never be
-     * re-created — and its workload identity `sub` never re-minted for a
-     * different workload — for the lifetime of the job (the never-recycle
-     * guarantee). Destroying the whole job (DestroyJob) cascades and clears its
-     * instance history, after which the id is free again; a live job never
-     * recycles a destroyed id. The storage handle is always dropped on destroy
-     * — a destroyed sandbox's state must not be reattachable. (This is
+     * A named instance (`InstanceInfo.named`: a caller-chosen id, or a fork of
+     * one) keeps its row as a tombstone so its id can never be re-created —
+     * and its workload identity `sub` never re-minted for a different
+     * workload — for the lifetime of the job (the never-recycle guarantee).
+     * Destroying the whole job (DestroyJob) cascades and clears its instance
+     * history, after which the id is free again; a live job never recycles a
+     * destroyed id. An unnamed instance (a server-minted id) leaves no row at
+     * all: its id is unique by 130 random bits and its shape is reserved, so
+     * it is never reused either, and the store holds live instances rather
+     * than history. The storage handle is always dropped on destroy — a
+     * destroyed sandbox's state must not be reattachable. (This is
      * intentionally stricter than slot-mode scale-in, which retains storage by
      * default for a later scale-out.)
      *
      * Destroying an already-Terminated instance succeeds as a no-op, so the
-     * call is safe to retry even without an idempotency key.
+     * call is safe to retry even without an idempotency key. A retried destroy
+     * of an unnamed instance answers NOT_FOUND, since nothing is left; pass an
+     * `idempotency_key` to get the first call's reply back instead.
      *
      * Destroy also applies to Stopped instances: the row transitions
      * stopped -> terminated and its retained storage handle is dropped. It
      * applies to Suspended instances the same way, and their suspend
      * checkpoint is reclaimed on its node.
      *
+     * A running session (docs/session-mode.md) is ended on its node, which
+     * leaves nothing behind: a session has no row to tombstone. The same coarse
+     * `job:write` check precedes the session lookup as in GetInstance. Ending a
+     * session writes nothing, so `idempotency_key` records nothing for it;
+     * instead, a repeat on the manager that ended the session within the last
+     * ten minutes answers `"Session <id> already ended"`, and a repeat that
+     * lands on another manager answers NotFound.
+     *
      * Errors:
-     * - NotFound: no instance row with this id exists.
+     * - NotFound: no instance row and no running session has this id.
      * - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
      *   by the scheduler via `count.num`, not this API).
      *
@@ -528,8 +565,12 @@ export const Manager = {
      * Stopping an already-stopped instance succeeds as a no-op, so the call is
      * safe to retry even without an idempotency key.
      *
+     * On a running session (docs/session-mode.md) stop is destroy: the session
+     * ends on its node and nothing remains to start again. A repeat behaves as
+     * DestroyInstance describes for sessions.
+     *
      * Errors:
-     * - NotFound: no instance row with this id exists.
+     * - NotFound: no instance row and no running session has this id.
      * - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
      *   by the scheduler via `count.num`; stop the job or scale in instead).
      * - FailedPrecondition: the instance is Terminated. Destroyed instances
@@ -580,8 +621,12 @@ export const Manager = {
      * rescheduling) succeeds as a no-op, so the call is safe to retry even
      * without an idempotency key.
      *
+     * A running session (docs/session-mode.md) is live too, and answers the
+     * same no-op.
+     *
      * Errors:
-     * - NotFound: no instance row with this id exists.
+     * - NotFound: no instance row, archive manifest, or running session has
+     *   this id.
      * - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
      *   by the scheduler via `count.num`, not this API).
      * - FailedPrecondition: the instance is Terminated (destroyed ids are
@@ -661,6 +706,10 @@ export const Manager = {
      * the reason in the snapshot's `error` and `snapshot.publish_failed`, and
      * the manager asks the node to publish again after one minute, then five
      * (three attempts in all).
+     *
+     * A running session (docs/session-mode.md) cannot be suspended: the call
+     * answers FailedPrecondition and names PromoteInstance, which gives the
+     * session a row without restarting it.
      *
      * @generated from rpc legion.Manager.SuspendInstance
      */
@@ -756,6 +805,10 @@ export const Manager = {
      *     a fork elsewhere could not get its copy), or on a node whose worker
      *     has no `contentStore` to publish to.
      *
+     * A running session (docs/session-mode.md) cannot be forked: the call
+     * answers FailedPrecondition and names PromoteInstance, which gives the
+     * session a row without restarting it.
+     *
      * @generated from rpc legion.Manager.ForkInstance
      */
     forkInstance: {
@@ -790,6 +843,10 @@ export const Manager = {
      *   allocation's node is not `lost` (the gate only ever holds allocations
      *   on lost nodes; everything else reschedules through the normal paths).
      *
+     * A running session (docs/session-mode.md) cannot be replaced: the call
+     * answers FailedPrecondition and names PromoteInstance, which gives the
+     * session a row without restarting it.
+     *
      * @generated from rpc legion.Manager.ReplaceInstance
      */
     replaceInstance: {
@@ -804,6 +861,11 @@ export const Manager = {
      * re-materialization; keyed rows retained forever as never-recycle
      * tombstones).
      *
+     * The job's running sessions (docs/session-mode.md) follow the rows, read
+     * from the session index of this manager and every peer: `durable =
+     * false`, `mode = "session"`. `complete` says whether every node that can
+     * run sessions has reported, and `as_of` when the index was read.
+     *
      * @generated from rpc legion.Manager.ListInstances
      */
     listInstances: {
@@ -815,8 +877,14 @@ export const Manager = {
     /**
      * Returns one stateful instance by id.
      *
+     * A session (docs/session-mode.md) has no row: when the id names none,
+     * the manager looks it up in the session index its peers and the nodes'
+     * heartbeats keep, after a coarse `job:read` check on any job (so a
+     * caller without job access cannot probe which session ids exist), then
+     * enforces `job:read` on the session's own job.
+     *
      * Errors:
-     * - NotFound: no instance row with this id exists.
+     * - NotFound: no instance row and no running session has this id.
      *
      * @generated from rpc legion.Manager.GetInstance
      */
@@ -824,6 +892,46 @@ export const Manager = {
       name: "GetInstance",
       I: GetInstanceRequest,
       O: GetInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Promotes a running session (docs/session-mode.md) to a keyed instance:
+     * one scheduler-lane entry writes an instance row and an allocation row
+     * bound to it on the session's node, and the node adopts the running
+     * session as that allocation in place. Nothing restarts. From then on the
+     * instance is keyed: listed exactly, at most one live allocation, rescheduled
+     * on node loss, and kept as a tombstone on destroy when it is named.
+     *
+     * The new allocation reserves nothing of its own: the session already sits
+     * inside its node's envelope, and stays inside it until it stops. A
+     * replacement placed after node loss reserves the task's full resources,
+     * like any keyed placement.
+     *
+     * ACL: `job:write` on the session's job, checked coarsely before the
+     * session lookup and precisely after it.
+     *
+     * Retry-safe without a key too: when the instance the request would create
+     * already exists and was promoted from this session, the reply describes
+     * it with `deduplicated = true`.
+     *
+     * The manager pushes the new allocation to the session's node right away.
+     * The push is best effort: the rows are written either way, and a node the
+     * push misses adopts the session from its next desired set.
+     *
+     * Errors:
+     * - NotFound: no running session has this id.
+     * - AlreadyExists: `new_id` (or the session id) names an existing instance
+     *   that was not promoted from this session, including a tombstone.
+     * - InvalidArgument: `new_id` is not a valid keyed id, or the task sets
+     *   `stateful.promote.onName = false` and `new_id` is set.
+     * - FailedPrecondition: the session's job config no longer has its task.
+     *
+     * @generated from rpc legion.Manager.PromoteInstance
+     */
+    promoteInstance: {
+      name: "PromoteInstance",
+      I: PromoteInstanceRequest,
+      O: PromoteInstanceReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -877,6 +985,10 @@ export const Manager = {
      *   - `disk` was asked for an instance with no `stateful.storage` volume;
      *   - a snapshot of this instance is already being captured.
      * - AlreadyExists: `name` is already used by another snapshot of the job.
+     *
+     * A running session (docs/session-mode.md) cannot be snapshotted: the call
+     * answers FailedPrecondition and names PromoteInstance, which gives the
+     * session a row without restarting it.
      *
      * @generated from rpc legion.Manager.CreateSnapshot
      */
@@ -991,6 +1103,10 @@ export const Manager = {
      * placed on any node whose fingerprint passes the manifest's `compat`,
      * preferring nodes that already hold its parts (the `locality` score), and
      * that node fetches the parts from the content store before restoring.
+     *
+     * A running session (docs/session-mode.md) cannot be restored: the call
+     * answers FailedPrecondition and names PromoteInstance, which gives the
+     * session a row without restarting it.
      *
      * @generated from rpc legion.Manager.RestoreInstance
      */
@@ -3009,6 +3125,24 @@ export const Worker = {
       O: ProbeReply,
       kind: MethodKind.Unary,
     },
+    /**
+     * Ends sessions on this node (docs/session-mode.md). Called by a manager
+     * for `instance stop` or `instance destroy` on a session, and to stop the
+     * later copy of a duplicated session id. Ids the node does not run are
+     * ignored, so the call is idempotent.
+     *
+     * Caller class: `manager` (a client certificate from the cluster CA
+     * carrying `legion://manager/<id>`); anything else is refused with
+     * `Unauthenticated`.
+     *
+     * @generated from rpc legion.Worker.StopSessions
+     */
+    stopSessions: {
+      name: "StopSessions",
+      I: StopSessionsRequest,
+      O: StopSessionsReply,
+      kind: MethodKind.Unary,
+    },
   }
 } as const;
 
@@ -3247,6 +3381,25 @@ export const RaftTransport = {
       name: "TriggerElection",
       I: TriggerElectionRequest,
       O: TriggerElectionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Reads this manager's session index (docs/session-mode.md). Each manager
+     * indexes the sessions of the nodes that heartbeat to it, so a manager
+     * answering a GetInstance, ListInstances, or CreateInstance for a session
+     * asks every peer and merges the answers. Read-only, and answered by
+     * every member, leader or not.
+     *
+     * ACL: manager-plane internal, authenticated by cluster secret metadata.
+     * It is not a `Manager` RPC, so it takes no ACL row; the calling manager
+     * has already authorized its own caller.
+     *
+     * @generated from rpc legion.RaftTransport.QuerySessions
+     */
+    querySessions: {
+      name: "QuerySessions",
+      I: QuerySessionsRequest,
+      O: QuerySessionsReply,
       kind: MethodKind.Unary,
     },
   }

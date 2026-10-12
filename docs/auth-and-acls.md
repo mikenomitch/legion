@@ -459,8 +459,8 @@ manager's private key never leaves the managers:
 
 - The listener is always mutual TLS with the node's certificate from the
   cluster CA.
-- `PostWork`, `GetTaskLogs`, and `RestartWorker` admit only a caller that
-  presents a manager certificate (`legion://manager/<id>`). `ExecTask` admits
+- `PostWork`, `GetTaskLogs`, `RestartWorker`, and `StopSessions` admit only a
+  caller that presents a manager certificate (`legion://manager/<id>`). `ExecTask` admits
   a manager, or a holder of an exec ticket on a worker that opts in to
   [direct exec](exec-and-actions.md#direct-exec). `StartClaim` admits a holder
   of a valid boot ticket.

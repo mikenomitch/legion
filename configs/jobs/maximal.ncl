@@ -760,6 +760,18 @@
                 # nfs. This task's local-dir volume keeps it at "local"
                 # (job validation refuses "store" here).
                 durability = "local",
+                # Once a "store" checkpoint is published, move its record
+                # out of the replicated store into the bucket, next to its
+                # parts (docs/suspend-and-resume.md, "Archiving idle
+                # instances"). "slim": the instance row stays, recording the
+                # archive manifest's URL, and the snapshot row is dropped.
+                # "manifestOnly": an unnamed instance without a
+                # stateful.storage volume keeps no row at all (any other
+                # instance keeps a slim row). Unset (default): nothing is
+                # archived. Needs durability = "store", a memory checkpoint,
+                # and no reserve, so this exec task leaves it out (job
+                # validation refuses it here):
+                # archive = "slim",
                 # argv a sandbox guest runs after every memory restore, once
                 # its identity is refreshed. Sandbox memory checkpoints only,
                 # so this exec task leaves it out (job validation refuses it
@@ -812,6 +824,59 @@
                 cpu = 250,
                 memory = 128,
             },
+            constraints = {
+                os = "linux",
+            },
+            affinities = {
+                node_class = "sandbox",
+            },
+        },
+        {
+            name = "scratch",
+            runtime = "exec",
+            group = "scratch",
+            # Session-mode task (see docs/session-mode.md): `legion instance
+            # create maximal-demo --group scratch` without --id starts an
+            # unnamed session straight on a node with envelope room and
+            # writes nothing to the replicated store. It is lost with its
+            # node, listed from the nodes' reports, and becomes a keyed
+            # instance with `legion instance promote <id>`. The task sees
+            # LEGION_INSTANCE_MODE = "session". A session task may not
+            # declare storage, volumes, ports, a service, connect upstreams,
+            # identities, requireId, or initialInstances.
+            stateful = {
+                mode = "session",
+                # The room each eligible node keeps for this task's sessions.
+                # Legion places one generated `scratch-envelope` allocation
+                # per node (on workers with the `sessions` capability) with
+                # these resources, and admits sessions against it.
+                envelope = {
+                    # Must set cpu and memory, and every amount `resources`
+                    # below declares; a session must fit.
+                    resources = { cpu = 4000, memory = 4096 },
+                    # Extra placement constraints for the envelopes, on top
+                    # of the task's own `constraints`. Optional.
+                    constraints = { node_class = "sandbox" },
+                },
+                # Whether a caller-chosen id is accepted (`instance create
+                # --id`, a keyed instance from birth; `instance promote
+                # --id`, a rename). Default true. With false, every create
+                # starts an unnamed session and a promotion keeps its id.
+                promote = {
+                    onName = true,
+                },
+            },
+            config = {
+                command = ["sleep", "600"],
+            },
+            # One session's size, in the envelope's units.
+            resources = {
+                cpu = 250,
+                memory = 256,
+            },
+            # The task's constraints and affinities place its envelopes
+            # (the generated `scratch-envelope` task inherits both, plus
+            # envelope.constraints above).
             constraints = {
                 os = "linux",
             },

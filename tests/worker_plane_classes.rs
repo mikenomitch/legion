@@ -63,6 +63,7 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         ("ExecTask", &[Caller::Manager, Caller::Ticket]),
         ("StartClaim", &[Caller::Ticket]),
         ("Probe", &[Caller::Manager]),
+        ("StopSessions", &[Caller::Manager]),
     ]
 }
 
@@ -215,6 +216,14 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
             .map(|_| ()),
         "Probe" => client
             .probe(legion::structs::ProbeRequest {})
+            .await
+            .map(|_| ()),
+        // An id this worker does not run: ignored once admitted.
+        "StopSessions" => client
+            .stop_sessions(legion::structs::StopSessionsRequest {
+                session_ids: vec!["workspace-not-running".into()],
+                reason: "stop".into(),
+            })
             .await
             .map(|_| ()),
         other => panic!("no request builder for Worker RPC {other}"),

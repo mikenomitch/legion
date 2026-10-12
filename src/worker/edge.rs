@@ -54,6 +54,12 @@ pub fn record_from_payload(
         on_refused: OnRefused::parse(&provisional.on_refused).unwrap_or(OnRefused::Kill),
         ticket_jti: provisional.ticket_jti.clone(),
         allocation_id: None,
+        session: provisional
+            .session
+            .as_ref()
+            .map(|start| crate::worker::claims::SessionClaim {
+                lease_issued_at_unix_ms: start.lease_issued_at_unix_ms,
+            }),
     }
 }
 
@@ -83,9 +89,17 @@ pub fn admit_and_launch(
         );
     }
 
+    // A session is admitted into its envelope, not the node's free capacity
+    // (docs/session-mode.md); everything after admission is the same claim
+    // machinery.
+    let session = record.is_session();
     let admitted = {
         let mut guard = task_manager.lock().expect("task manager");
-        guard.admit_claim(record)?
+        if session {
+            guard.admit_session(record)?
+        } else {
+            guard.admit_claim(record)?
+        }
     };
 
     // The payload's allocation id is 0 on the wire; the node runs the work
@@ -93,9 +107,11 @@ pub fn admit_and_launch(
     let mut launch_payload = payload.clone();
     launch_payload.allocation_id = admitted.local_key;
 
-    crate::manager::telemetry::worker_metrics()
-        .provisional_starts_total
-        .inc(&[admitted.origin.as_str(), gate.as_str()]);
+    if !session {
+        crate::manager::telemetry::worker_metrics()
+            .provisional_starts_total
+            .inc(&[admitted.origin.as_str(), gate.as_str()]);
+    }
 
     let claim_id = admitted.claim_id.clone();
     let manager = task_manager.clone();
@@ -269,6 +285,7 @@ mod worker_edge_test {
             task_suspend: String::new(),
             task_snapshots: String::new(),
             identity_epoch: 0,
+            promoted_from_session: String::new(),
             task_lifecycle: String::new(),
             task_restart: String::new(),
         }
@@ -283,6 +300,7 @@ mod worker_edge_test {
             origin: "edge".into(),
             on_refused: "kill".into(),
             ticket_jti: "tkt_1".into(),
+            session: None,
         }
     }
 

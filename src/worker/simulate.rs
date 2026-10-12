@@ -761,6 +761,17 @@ impl Worker for SimWorkerService {
             protocol_version: u64::from(crate::constants::PROTOCOL_VERSION),
         }))
     }
+
+    /// Simulated nodes run no sessions: they do not advertise the
+    /// `sessions` capability, so no envelope is placed on them and no router
+    /// sends them a start.
+    async fn stop_sessions(
+        &self,
+        request: Request<crate::structs::StopSessionsRequest>,
+    ) -> Result<Response<crate::structs::StopSessionsReply>, Status> {
+        crate::worker::plane::require_manager(&request, "StopSessions")?;
+        Ok(Response::new(crate::structs::StopSessionsReply::default()))
+    }
 }
 
 /// A launched fleet: observability for tests and drivers, plus the point
@@ -1337,6 +1348,8 @@ async fn heartbeat_sim_node(
         usage: None,
         // Nor anything to checkpoint, unless faking the channel.
         snapshot_reports: snapshot_reports.clone(),
+        // Nor sessions (no `sessions` capability).
+        session_report: None,
     }));
     let reply = match client.clone().heartbeat(req).await {
         Ok(reply) => reply.into_inner(),

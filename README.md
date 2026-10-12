@@ -281,12 +281,31 @@ they should. Legion handles all three.
   pack the active ones tighter, and fork copies a running sandbox for an
   agent to explore from. See the
   [agent sandboxes guide](docs/guides/agent-sandboxes.md).
-- **Sandboxes that scale.** Every sandbox is a durable, named instance:
-  it survives node loss, suspends and resumes, forks, and its id is never
+- **Sandboxes that scale.** A keyed sandbox is a durable instance: it
+  survives node loss, suspends and resumes, forks, and its id is never
   reused. A full lifecycle (create, run, suspend, resume, destroy) costs the
   control plane 8 replicated writes, down from 22. Concurrent creates and
   suspends share a single write, so the cost per sandbox falls under load.
   See [Sandboxes at scale](docs/sandboxes-at-scale.md).
+- **A control plane the size of what's live, not of history.** Every
+  manager keeps the whole replicated store, so its size is what a new
+  manager has to copy and what every snapshot carries. A sandbox whose id
+  Legion minted leaves nothing behind when it is destroyed: its id is 130
+  random bits, so it is never handed out again without a tombstone to
+  enforce it. An idle sandbox can
+  [archive](docs/suspend-and-resume.md#archiving-idle-instances) its
+  checkpoint record to the object store beside its memory snapshot, so a
+  million parked sandboxes cost a small row each, or nothing at all.
+- **Sessions that write nothing.** Durable records have a price: every
+  keyed start goes through the replicated log, which caps the start rate
+  (about 50 lifecycles a second on a 4-core manager). For sandboxes that
+  are disposable, [session mode](docs/session-mode.md) takes the log off
+  the start path. The job reserves room on each node up front, any manager
+  sends a start straight to a node with room, and the nodes report what
+  they run, so a start or stop is zero replicated writes. The same 4-core
+  manager starts about 970 sessions a second, and start capacity grows with
+  the nodes rather than with the log. A session that turns out to matter
+  is promoted to a durable instance in one write, without restarting.
 - **Work lands in one round trip.** Each node holds one stream to its
   manager, so a placement reaches it as soon as it commits, at any
   heartbeat interval. A node running 10,000 sandboxes sends a heartbeat of a
@@ -370,10 +389,10 @@ add:
 
 - **Faster sandbox wake-ups**: wake on connect, lazy memory restore, and diff
   snapshots on top of [suspend and resume](docs/suspend-and-resume.md).
-- **Sandbox scaling to very large session counts**: ephemeral sessions,
-  node-reported state, idle sessions in object storage that wake on
-  request, and sequenced delivery of work, so raft holds only what must be
-  durable ([plan](internal_docs/plans/sandbox-scaling-plan.md)).
+- **Sandbox scaling to very large session counts**: idle sessions in
+  object storage that wake on request, workload identity for sessions, and
+  denser sandboxes per node
+  ([plan](internal_docs/plans/sandbox-scaling-plan.md)).
 - **Built-in ingress gateway, autoscaler, cert-manager, and GitOps tools**, or
   a more omakase starting experience.
 - **Resource registry for sharing and pulling jobs, templates, and plugins.**
@@ -409,7 +428,8 @@ start:
   [Running Redis](docs/guides/redis.md) ·
   [Serving TLS Certificates from KV](docs/guides/tls-certificates.md) ·
   [Running Agent Sandboxes](docs/guides/agent-sandboxes.md) ·
-  [Sandboxes at Scale](docs/sandboxes-at-scale.md)
+  [Sandboxes at Scale](docs/sandboxes-at-scale.md) ·
+  [Session Mode](docs/session-mode.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md)

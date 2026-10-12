@@ -225,6 +225,66 @@ anything is captured.
   on, so upgrading the whole fleet's VMM leaves it nowhere to run. Upgrade a
   subset first, or resume the instances before the last old node goes.
 
+## Unnamed instance ids
+
+Server-minted keyed ids changed shape and guarantee in the release that
+added unnamed instances ([Id rules](stateful-workloads.md#id-rules)):
+
+- **The never-recycled guarantee for server-minted ids is now
+  probabilistic.** A minted id is `<task>-<26 base32>` (130 random bits) and
+  `instance destroy` deletes its row instead of keeping a tombstone. Ids you
+  choose keep their tombstones exactly as before.
+- **Nothing existing is released.** The upgrade marks every existing
+  instance row named, including tombstones of ids minted by an older
+  release (`<task>-<16 alphanumerics>`), so they keep refusing re-creation.
+  Only instances minted after the upgrade are unnamed.
+- **A caller id may no longer end in `-` plus 26 characters of `[a-z2-7]`.**
+  That shape is reserved for minted ids. Scripts that generate ids of that
+  shape themselves get `InvalidArgument`; drop the id to have one minted,
+  or change the generator.
+- **Downgrading a manager** leaves the `instance.named` column it does not
+  read, and an older manager tombstones every destroy again.
+
+## Archived instances
+
+The release that added [archived instances](suspend-and-resume.md#archiving-idle-instances)
+(`suspend.archive`) changed one output shape and added one column:
+
+- **`legion instance list -j` returns an object.** The data was a bare
+  array of instances. It is now `{ "instances": [...], "nextIdlePageToken":
+  "..." }`, so `--include-idle` can page. Scripts that read `.data[]` read
+  `.data.instances[]`.
+- **The `instance.manifest_url` column** is appended by the upgrade.
+  Nothing is archived until a job sets `suspend.archive`.
+- **Downgrading a manager** loses archived instances: an older manager does
+  not read `manifest_url`, so a slim archived instance looks like a
+  suspended instance whose checkpoint is gone (`onRestoreFailure` decides),
+  and a `manifestOnly` instance, which has no row, is not found. Start the
+  archived instances you need before a downgrade.
+
+## Session mode
+
+The release that added [session mode](session-mode.md) changed these
+shapes:
+
+- **Managers first, as always.** A worker advertises the `sessions`
+  capability only once it runs a version with session support, and
+  envelopes are placed only on workers that advertise it. A session job
+  submitted while every worker is older places no envelope, and creates
+  answer `FailedPrecondition` until a worker upgrades.
+- **Heartbeats carry a session report**, and replies may ask for a resync
+  or name sessions to stop. An older manager ignores the report, so a
+  worker upgraded first runs sessions nobody indexes; upgrade managers
+  first.
+- **`legion instance list -j` adds `complete` and `asOf`**, and
+  `instance create -j` adds `mode`, `durable`, `node`, and `state`. Existing
+  fields are unchanged.
+- **The `instance.promoted_from` column** is appended by the upgrade.
+  Downgrading a manager loses it, and a promoted instance reads as an
+  ordinary keyed instance.
+- **Downgrading a worker** ends its running sessions: an older worker does
+  not know them. Promote the sessions you need first.
+
 ## Task-plugin ABI
 
 Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by

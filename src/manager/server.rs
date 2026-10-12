@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::prelude::*;
 
 use crate::manager::acl::{self, Authenticator};
+use crate::manager::archive;
 use crate::manager::dispatcher::build_task_allocation;
 use crate::manager::job_templates;
 use crate::manager::rollout::{
@@ -20,8 +21,8 @@ use crate::manager::workload_identity::{claims_for_allocation, WorkloadIdentityS
 use crate::storage::errors::StorageError;
 use crate::storage::events::{ArtifactPin, SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::store::{
-    DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome, JobTemplateVersionRecord,
-    StartInstanceOutcome, StopInstanceOutcome, Store,
+    ArchivedCheckpoint, DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome,
+    JobTemplateVersionRecord, StartInstanceOutcome, StopInstanceOutcome, Store,
 };
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
@@ -120,6 +121,7 @@ mod checkpoint_support;
 mod fork_rpcs;
 mod make_room;
 mod node_content_rpcs;
+mod session_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
 mod work_stream;
@@ -782,6 +784,51 @@ fn map_instance_info(
         // Set by GetInstance only ([`attach_wake_and_endpoints`]).
         endpoints: Vec::new(),
         wake: None,
+        named: instance.named,
+        archived: suspend.manifest_url.is_some(),
+        manifest_url: suspend.manifest_url,
+        durable: true,
+        promoted_from: instance.promoted_from,
+        node_id: None,
+        lease_issued_at: None,
+        envelope_alloc_id: None,
+    }
+}
+
+/// The InstanceInfo of an instance archived with `archive =
+/// "manifestOnly"`, which has no row: what its archive manifest's envelope
+/// says (docs/suspend-and-resume.md, "Archived instances").
+fn manifest_only_instance_info(
+    manifest: &crate::structs::archive::ArchiveManifest,
+    manifest_url: &str,
+) -> InstanceInfo {
+    let envelope = &manifest.envelope;
+    let at = |unix: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)
+            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    };
+    InstanceInfo {
+        instance_id: envelope.instance_id.clone(),
+        job_id: envelope.job_id.clone(),
+        group: envelope.group.clone(),
+        task: envelope.task.clone(),
+        mode: InstanceMode::Keyed.to_string(),
+        state: InstanceState::Suspended.to_string(),
+        created_at: envelope.created_at.clone(),
+        updated_at: envelope
+            .suspended_at
+            .and_then(at)
+            .unwrap_or_else(|| envelope.created_at.clone()),
+        checkpoint_id: Some(envelope.snapshot.snapshot_id.clone()),
+        checkpoint_durability: Some(envelope.snapshot.durability.as_str().to_string()),
+        suspended_at: envelope.suspended_at.and_then(at),
+        suspend_reason: envelope.suspend_reason.clone(),
+        last_suspend_ms: envelope.last_suspend_ms.map(|ms| ms.max(0) as u64),
+        forked_from: envelope.forked_from.clone(),
+        named: envelope.named,
+        archived: true,
+        manifest_url: Some(manifest_url.to_string()),
+        ..Default::default()
     }
 }
 
@@ -2523,8 +2570,21 @@ impl ManagerDaemonService {
             origin: "edge".into(),
             on_refused: String::new(),
             ticket_jti: String::new(),
+            session: None,
         });
         Some(payload)
+    }
+
+    /// The archive manifest of a `manifestOnly` instance with no row, for
+    /// the instance handlers' NotFound path. A contentStore that could not
+    /// be read is `Unavailable`, not NotFound: the instance may well exist.
+    async fn find_manifest_only(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<(crate::structs::archive::ArchiveManifest, String)>, Status> {
+        archive::find_manifest_only(&self.store, instance_id)
+            .await
+            .map_err(|err| Status::unavailable(format!("{err:#}")))
     }
 
     /// The live, unratified claim for an instance, and the node holding it.
@@ -5526,6 +5586,10 @@ impl Manager for ManagerDaemonService {
                 instance_id,
                 deduplicated: true,
                 restoring_from,
+                mode: InstanceMode::Keyed.to_string(),
+                durable: true,
+                node_id: String::new(),
+                state: String::new(),
             }));
         }
 
@@ -5554,6 +5618,23 @@ impl Manager for ManagerDaemonService {
                 )));
             }
             None => {}
+        }
+
+        // Session mode (docs/session-mode.md): a create without an id starts
+        // an unnamed session through the session router and writes nothing
+        // to the replicated store. A name makes it an ordinary keyed
+        // instance, durable from birth, unless the task refuses names.
+        if crate::structs::session::is_session_task(task) {
+            if requested_id.is_none() {
+                return self.create_session(&identity, &inner, &config, task).await;
+            }
+            if !crate::structs::session::accepts_names(task) {
+                return Err(Status::invalid_argument(format!(
+                    "task {} sets stateful.promote.onName = false: its instances are unnamed \
+                     sessions; omit instance_id",
+                    task.name
+                )));
+            }
         }
 
         // Phase 6: restore from a snapshot instead of booting empty.
@@ -5626,6 +5707,10 @@ impl Manager for ManagerDaemonService {
             instance_id,
             deduplicated: false,
             restoring_from,
+            mode: InstanceMode::Keyed.to_string(),
+            durable: true,
+            node_id: String::new(),
+            state: String::new(),
         }))
     }
 
@@ -5720,6 +5805,25 @@ impl Manager for ManagerDaemonService {
                  count > 0 asks the server to mint ids. List explicit instance_ids instead",
                 task.name
             )));
+        }
+        // A session task's unnamed instances are sessions, which a batch of
+        // rows cannot express; named ones are ordinary keyed instances.
+        if crate::structs::session::is_session_task(task) {
+            if inner.count > 0 {
+                return Err(Status::invalid_argument(format!(
+                    "task {} is a session task: unnamed instances are sessions, started one per \
+                     CreateInstance call without an id. Use count only for keyed tasks, or list \
+                     instance_ids to create named instances",
+                    task.name
+                )));
+            }
+            if !crate::structs::session::accepts_names(task) {
+                return Err(Status::invalid_argument(format!(
+                    "task {} sets stateful.promote.onName = false: its instances are unnamed \
+                     sessions; create them with CreateInstance and no id",
+                    task.name
+                )));
+            }
         }
 
         // Phase 6: restore every instance from a snapshot.
@@ -5823,13 +5927,27 @@ impl Manager for ManagerDaemonService {
             }));
         }
 
-        let instance = self
+        let Some(instance) = self
             .store
             .get_instance(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?
-            .ok_or_else(|| {
-                Status::not_found(format!("instance {} not found", inner.instance_id))
-            })?;
+        else {
+            // A running session has no row: stopping it ends it on its node,
+            // with no write anywhere (docs/session-mode.md).
+            return match self
+                .end_session(&identity, &inner.instance_id, "stop")
+                .await?
+            {
+                Some(message) => Ok(Response::new(StopInstanceReply {
+                    message,
+                    deduplicated: false,
+                })),
+                None => Err(Status::not_found(format!(
+                    "instance {} not found",
+                    inner.instance_id
+                ))),
+            };
+        };
         acl::enforce(
             &identity,
             AclResource::Job,
@@ -5850,6 +5968,11 @@ impl Manager for ManagerDaemonService {
                 inner.instance_id
             )));
         }
+        let manifest_url = self
+            .store
+            .instance_suspend_state(&inner.instance_id)
+            .map_err(|e| map_store_error("Error loading instance", e))?
+            .manifest_url;
 
         // One scheduler-lane entry: the stop and its idempotency record.
         // No eval follows. The stop already removed the allocation rows
@@ -5874,6 +5997,10 @@ impl Manager for ManagerDaemonService {
                 Ok(message)
             })
             .map_err(|e| map_store_error("Error stopping instance", e))?;
+        // A stop discards an archived checkpoint like any other.
+        if let Some(url) = manifest_url.as_deref() {
+            archive::delete_manifest_logged(&self.store, url, &inner.instance_id).await;
+        }
 
         Ok(Response::new(StopInstanceReply {
             message,
@@ -5915,10 +6042,51 @@ impl Manager for ManagerDaemonService {
         let instance = self
             .store
             .get_instance(&inner.instance_id)
-            .map_err(|e| map_store_error("Error loading instance", e))?
-            .ok_or_else(|| {
-                Status::not_found(format!("instance {} not found", inner.instance_id))
-            })?;
+            .map_err(|e| map_store_error("Error loading instance", e))?;
+        let Some(instance) = instance else {
+            // An instance archived with `archive = "manifestOnly"` has no
+            // row: its archive manifest is the whole record.
+            let Some((manifest, url)) = self.find_manifest_only(&inner.instance_id).await? else {
+                // A running session needs no start (docs/session-mode.md).
+                return match self
+                    .find_session(&identity, &inner.instance_id, AclAction::Write)
+                    .await?
+                {
+                    Some(_) => Ok(Response::new(StartInstanceReply {
+                        message: format!("Instance {} already running", inner.instance_id),
+                        deduplicated: false,
+                        resuming_from: String::new(),
+                        node_id: String::new(),
+                    })),
+                    None => Err(Status::not_found(format!(
+                        "instance {} not found",
+                        inner.instance_id
+                    ))),
+                };
+            };
+            acl::enforce(
+                &identity,
+                AclResource::Job,
+                AclAction::Write,
+                &AclScope::job(&manifest.envelope.job_id),
+            )?;
+            let job = self
+                .store
+                .get_job(&manifest.envelope.job_id)
+                .map_err(|e| map_store_error("Error loading job", e))?;
+            if job.status == "stopped" {
+                return Err(Status::failed_precondition(format!(
+                    "job {} is stopped; run the job first, then start its instances",
+                    job.name
+                )));
+            }
+            let recorded =
+                self.resume_manifest_only(manifest, &url, inner.cold, &idempotency_key)?;
+            // The row is back, so the manifest is no longer the record: a
+            // later destroy must not leave it to resume the id again.
+            archive::delete_manifest_logged(&self.store, &url, &inner.instance_id).await;
+            return Ok(Response::new(recorded.into_reply(false)));
+        };
         acl::enforce(
             &identity,
             AclResource::Job,
@@ -5957,7 +6125,30 @@ impl Manager for ManagerDaemonService {
 
         // A suspended instance resumes from its checkpoint (or boots cold).
         if instance.state == InstanceState::Suspended {
-            let recorded = self.resume_instance(&instance, inner.cold, &idempotency_key)?;
+            // An archived instance's checkpoint is read back from its
+            // archive manifest; the resume puts the snapshot row back in
+            // the same entry.
+            let manifest_url = self
+                .store
+                .instance_suspend_state(&inner.instance_id)
+                .map_err(|e| map_store_error("Error loading instance", e))?
+                .manifest_url;
+            let archived = match manifest_url.as_deref() {
+                Some(url) if !inner.cold => {
+                    Some(match archive::read_manifest(&self.store, url).await {
+                        Ok(manifest) => {
+                            ArchivedCheckpoint::Read(Box::new(manifest.snapshot_record()))
+                        }
+                        Err(err) => ArchivedCheckpoint::Unreadable(err.to_string()),
+                    })
+                }
+                _ => None,
+            };
+            let recorded =
+                self.resume_instance(&instance, inner.cold, archived, &idempotency_key)?;
+            if let Some(url) = manifest_url.as_deref() {
+                archive::delete_manifest_logged(&self.store, url, &inner.instance_id).await;
+            }
             return Ok(Response::new(recorded.into_reply(false)));
         }
 
@@ -6038,16 +6229,65 @@ impl Manager for ManagerDaemonService {
         let instance = self
             .store
             .get_instance(&inner.instance_id)
-            .map_err(|e| map_store_error("Error loading instance", e))?
-            .ok_or_else(|| {
-                Status::not_found(format!("instance {} not found", inner.instance_id))
-            })?;
+            .map_err(|e| map_store_error("Error loading instance", e))?;
+        let Some(instance) = instance else {
+            // A running session has no row either: destroying it is the same
+            // as stopping it, since nothing of it remains (docs/session-mode.md).
+            if let Some(message) = self
+                .end_session(&identity, &inner.instance_id, "destroy")
+                .await?
+            {
+                return Ok(Response::new(DestroyInstanceReply {
+                    message,
+                    deduplicated: false,
+                }));
+            }
+            // An instance archived with `archive = "manifestOnly"` has no
+            // row, so destroying it is deleting its archive manifest.
+            let (manifest, url) = self
+                .find_manifest_only(&inner.instance_id)
+                .await?
+                .ok_or_else(|| {
+                    Status::not_found(format!("instance {} not found", inner.instance_id))
+                })?;
+            acl::enforce(
+                &identity,
+                AclResource::Job,
+                AclAction::Write,
+                &AclScope::job(&manifest.envelope.job_id),
+            )?;
+            archive::delete_manifest(&self.store, &url)
+                .await
+                .map_err(|err| {
+                    Status::unavailable(format!(
+                        "could not delete the archive manifest of instance {}: {err:#}",
+                        inner.instance_id
+                    ))
+                })?;
+            let message = format!("Destroyed instance {}", inner.instance_id);
+            let key = idempotency_key.clone();
+            let recorded = message.clone();
+            self.store
+                .scheduler_group_commit("destroy_instance", move |s| {
+                    s.idempotency_record(&key, "destroy_instance", &recorded)
+                })
+                .map_err(|e| map_store_error("Error destroying instance", e))?;
+            return Ok(Response::new(DestroyInstanceReply {
+                message,
+                deduplicated: false,
+            }));
+        };
         acl::enforce(
             &identity,
             AclResource::Job,
             AclAction::Write,
             &AclScope::job(&instance.job_id),
         )?;
+        let manifest_url = self
+            .store
+            .instance_suspend_state(&inner.instance_id)
+            .map_err(|e| map_store_error("Error loading instance", e))?
+            .manifest_url;
 
         // One scheduler-lane entry: the destroy and its idempotency record.
         // No eval follows, for the reason `stop_instance` gives: the destroy
@@ -6070,6 +6310,10 @@ impl Manager for ManagerDaemonService {
                 Ok(message)
             })
             .map_err(|e| map_store_error("Error destroying instance", e))?;
+        // An archived instance's checkpoint went with it.
+        if let Some(url) = manifest_url.as_deref() {
+            archive::delete_manifest_logged(&self.store, url, &inner.instance_id).await;
+        }
 
         Ok(Response::new(DestroyInstanceReply {
             message,
@@ -6111,13 +6355,15 @@ impl Manager for ManagerDaemonService {
             }));
         }
 
-        let instance = self
+        let Some(instance) = self
             .store
             .get_instance(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?
-            .ok_or_else(|| {
-                Status::not_found(format!("instance {} not found", inner.instance_id))
-            })?;
+        else {
+            return Err(self
+                .missing_instance(&identity, &inner.instance_id, "replaced")
+                .await);
+        };
         acl::enforce(
             &identity,
             AclResource::Job,
@@ -6220,23 +6466,88 @@ impl Manager for ManagerDaemonService {
             .instance_lineage_for_job(&inner.job_id)
             .map_err(|e| map_store_error("Error listing instances", e))?;
         let addresses = guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner()));
-        let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
-        let instances = self
+        let rows = self
             .store
             .list_instances(&inner.job_id)
-            .map_err(|e| map_store_error("Error listing instances", e))?
-            .into_iter()
-            .filter(|instance| group.as_deref().is_none_or(|group| instance.group == group))
-            .map(|instance| {
-                let state = suspend.remove(&instance.instance_id).unwrap_or_default();
-                let history = history.remove(&instance.instance_id).unwrap_or_default();
-                let mut info = map_instance_info(&self.store, &usage, instance, state, history);
-                attach_guest_address(&mut info, &addresses);
-                info
-            })
-            .collect();
+            .map_err(|e| map_store_error("Error listing instances", e))?;
+        let mut instances: Vec<InstanceInfo> = {
+            let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+            rows.into_iter()
+                .filter(|instance| group.as_deref().is_none_or(|group| instance.group == group))
+                .map(|instance| {
+                    let state = suspend.remove(&instance.instance_id).unwrap_or_default();
+                    let history = history.remove(&instance.instance_id).unwrap_or_default();
+                    let mut info = map_instance_info(&self.store, &usage, instance, state, history);
+                    attach_guest_address(&mut info, &addresses);
+                    info
+                })
+                .collect()
+        };
 
-        Ok(Response::new(ListInstancesReply { instances }))
+        // Archived instances with no row (`archive = "manifestOnly"`) live
+        // only in the bucket: list a page of them after the rows.
+        let mut next_idle_page_token = String::new();
+        if inner.include_idle {
+            let page_size = match inner.idle_page_size {
+                0 => archive::DEFAULT_IDLE_PAGE,
+                size => size as usize,
+            };
+            let (listed, next) = archive::list_job_archives(
+                &self.store,
+                &inner.job_id,
+                &inner.idle_page_token,
+                page_size,
+            )
+            .await
+            .map_err(|err| {
+                Status::unavailable(format!(
+                    "could not list the archived instances of job {} in its contentStore: \
+                     {err:#}",
+                    inner.job_id
+                ))
+            })?;
+            let rows: std::collections::HashSet<String> = instances
+                .iter()
+                .map(|info| info.instance_id.clone())
+                .collect();
+            for archived in listed {
+                if rows.contains(&archived.instance_id)
+                    || group
+                        .as_deref()
+                        .is_some_and(|group| archived.group != group)
+                {
+                    continue;
+                }
+                instances.push(InstanceInfo {
+                    instance_id: archived.instance_id,
+                    job_id: archived.job_id,
+                    group: archived.group,
+                    task: archived.task,
+                    mode: InstanceMode::Keyed.to_string(),
+                    state: InstanceState::Suspended.to_string(),
+                    created_at: archived.written_at.clone(),
+                    updated_at: archived.written_at,
+                    archived: true,
+                    manifest_url: Some(archived.url),
+                    ..Default::default()
+                });
+            }
+            next_idle_page_token = next;
+        }
+
+        // Running sessions have no row: they come from the session index
+        // of this manager and its peers, after the rows.
+        let (sessions, complete, as_of) = self
+            .list_job_sessions(&inner.job_id, group.as_deref())
+            .await;
+        instances.extend(sessions);
+
+        Ok(Response::new(ListInstancesReply {
+            instances,
+            next_idle_page_token,
+            complete,
+            as_of,
+        }))
     }
 
     /// Fetch one stateful instance by id.
@@ -6251,10 +6562,43 @@ impl Manager for ManagerDaemonService {
         let instance = self
             .store
             .get_instance(&inner.instance_id)
-            .map_err(|e| map_store_error("Error loading instance", e))?
-            .ok_or_else(|| {
-                Status::not_found(format!("instance {} not found", inner.instance_id))
-            })?;
+            .map_err(|e| map_store_error("Error loading instance", e))?;
+        let Some(instance) = instance else {
+            // A running session has no row: answer from the session index.
+            if let Some(session) = self
+                .find_session(&identity, &inner.instance_id, AclAction::Read)
+                .await?
+            {
+                return Ok(Response::new(GetInstanceReply {
+                    instance: Some(self.session_info(&session)),
+                    provisional: None,
+                    provisional_node_id: String::new(),
+                }));
+            }
+            // An instance archived with `archive = "manifestOnly"` has no
+            // row: answer from its archive manifest.
+            let (manifest, url) = self
+                .find_manifest_only(&inner.instance_id)
+                .await?
+                .ok_or_else(|| {
+                    Status::not_found(format!("instance {} not found", inner.instance_id))
+                })?;
+            acl::enforce(
+                &identity,
+                AclResource::Job,
+                AclAction::Read,
+                &AclScope::job(&manifest.envelope.job_id),
+            )?;
+            // Its task's `suspend.wake` block still applies: the gateway
+            // wakes an archived instance like any suspended one.
+            let mut info = manifest_only_instance_info(&manifest, &url);
+            attach_wake_and_endpoints(&self.store, &mut info);
+            return Ok(Response::new(GetInstanceReply {
+                instance: Some(info),
+                provisional: None,
+                provisional_node_id: String::new(),
+            }));
+        };
         acl::enforce(
             &identity,
             AclResource::Job,
@@ -6293,6 +6637,15 @@ impl Manager for ManagerDaemonService {
             provisional,
             provisional_node_id,
         }))
+    }
+
+    // The handler lives in `session_rpcs`, and enforces `job:write` on the
+    // session's job itself (coarse `AclScope::any()` first).
+    async fn promote_instance(
+        &self,
+        request: Request<crate::structs::PromoteInstanceRequest>,
+    ) -> Result<Response<crate::structs::PromoteInstanceReply>, Status> {
+        self.promote_instance_rpc(request).await
     }
 
     // === SNAPSHOTS (docs/suspend-and-resume.md) ===
@@ -7089,6 +7442,23 @@ impl Manager for ManagerDaemonService {
                 false
             }
         });
+        // The node's sessions, into the in-memory session index, by the same
+        // epoch protocol (docs/session-mode.md). The reply carries a resync
+        // request and any duplicate session copies this node should stop.
+        let (session_resync, stop_sessions) = match req.session_report.as_ref() {
+            Some(report) => {
+                let ingest = self
+                    .store
+                    .sessions()
+                    .ingest(&id, report, std::time::Instant::now());
+                let resync = ingest.outcome == crate::storage::content_index::IngestOutcome::Resync;
+                if resync {
+                    debug!(node_id = %id, base_epoch = report.base_epoch, "Session report needs resync");
+                }
+                (resync, ingest.stop)
+            }
+            None => (false, Vec::new()),
+        };
         // Service-graph samples: fold into per-(caller, service) windows.
         if !req.net_edges.is_empty() {
             let callers: HashMap<i64, (String, String)> = feed_allocations
@@ -7209,6 +7579,8 @@ impl Manager for ManagerDaemonService {
             manager_addresses: self.worker_manager_addresses(),
             desired_via_stream: stream.via_stream,
             work_resync: stream.resync,
+            session_resync,
+            stop_sessions,
         };
 
         Ok(Response::new(reply))
@@ -13329,6 +13701,8 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
+                envelope: None,
+                promote: None,
             }),
             ..aws_identity_task("db")
         };
@@ -13595,6 +13969,8 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -13796,6 +14172,7 @@ mod tests {
             .list_instances(tonic::Request::new(ListInstancesRequest {
                 job_id: "fence-detail".into(),
                 group: None,
+                ..Default::default()
             }))
             .await?
             .into_inner();
@@ -13875,6 +14252,13 @@ mod tests {
             &self,
             _request: Request<PostWorkRequest>,
         ) -> Result<Response<PostWorkReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn stop_sessions(
+            &self,
+            _request: Request<crate::structs::StopSessionsRequest>,
+        ) -> Result<Response<crate::structs::StopSessionsReply>, Status> {
             Err(Status::unimplemented("not used in test"))
         }
 
@@ -17063,6 +17447,8 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -17415,6 +17801,7 @@ mod tests {
             .block_on(manager.list_instances(Request::new(ListInstancesRequest {
                 job_id: job_id.into(),
                 group: None,
+                ..Default::default()
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -17424,6 +17811,7 @@ mod tests {
             .block_on(manager.list_instances(Request::new(ListInstancesRequest {
                 job_id: job_id.into(),
                 group: Some("sandboxes".into()),
+                ..Default::default()
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();

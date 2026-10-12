@@ -225,8 +225,12 @@ connection close, and its next request wakes the instance.
   only `http/1.1` in ALPN).
 - The instance sees the gateway as the client. No `Forwarded` or
   `X-Forwarded-For` header is added.
-- The gateway wakes keyed instances. It does not load-balance, and it does
-  not route to slot-mode instances or services.
+- The gateway wakes keyed instances, including
+  [archived](suspend-and-resume.md#archiving-idle-instances) ones: the
+  resume reads the archive manifest back first. It does not wake unnamed
+  [sessions](session-mode.md), which cannot be suspended; promote one first.
+  It does not load-balance, and it does not route to slot-mode instances or
+  services.
 - No metrics endpoint yet. The gateway logs each wake (`Gateway woke
   instance`, with `waited_ms`) and each refusal at debug level.
 - Certificates are read at start. Restart the gateway to rotate them.

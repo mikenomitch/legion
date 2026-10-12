@@ -1934,6 +1934,29 @@ fn migration_list() -> Vec<M<'static>> {
         )",
         )
         .down("DROP TABLE IF EXISTS exec_key;"),
+        // Unnamed instances (sandbox-scaling plan, Phase 4;
+        // docs/stateful-workloads.md, "Id rules"): `named = 0` marks a keyed
+        // instance whose id was server-minted (130 random bits, in a shape
+        // callers may not choose), which is deleted on destroy instead of
+        // kept as a tombstone. Every existing row is named, so nothing
+        // already tombstoned is released. Appended at the end, since raft
+        // changesets bind columns by position. Scheduler lane, like
+        // `instance`.
+        M::up("ALTER TABLE instance ADD COLUMN named INTEGER NOT NULL DEFAULT 1;").down(""),
+        // Archived instances (sandbox-scaling plan, Phase 5;
+        // docs/suspend-and-resume.md, "Archived instances"): `manifest_url`
+        // names the archive manifest a suspended instance's checkpoint was
+        // moved to in the `contentStore`, set in the entry that drops its
+        // snapshot row and cleared when a resume reads it back. Appended at
+        // the end, since raft changesets bind columns by position. Scheduler
+        // lane, like `instance`.
+        M::up("ALTER TABLE instance ADD COLUMN manifest_url TEXT;").down(""),
+        // Session promotion (sandbox-scaling plan, Phase 6;
+        // docs/session-mode.md, "Promotion"): the session a keyed instance
+        // was promoted from, written once when PromoteInstance inserts the
+        // row. Appended at the end, since raft changesets bind columns by
+        // position. Scheduler lane, like `instance`.
+        M::up("ALTER TABLE instance ADD COLUMN promoted_from TEXT;").down(""),
     ]
 }
 
