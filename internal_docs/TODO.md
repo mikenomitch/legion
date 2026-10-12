@@ -326,6 +326,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#25](https://github.com/mikenomitch/legion/pull/25) | Scheduler sharding strategies proposal, revision 3 (docs only) | Ready for review; [plan](plans/scheduler-sharding-strategies-proposal.md) · [calls](calls/scheduler-sharding-strategies-proposal_calls.md) |
 | [#31](https://github.com/mikenomitch/legion/pull/31) | Wake on request (`legion start gateway`, `suspend.wake`), credential injection on egress (`connect.upstreams[].credentials`, KV and identity providers), ingress into gated and TAP sandboxes, and upstreams in gated sandboxes | [wake plan](plans/wake-on-request-plan.md) · [credential plan](plans/egress-credential-injection-plan.md) · [gated plan](plans/gated-sandbox-checkpoints-plan.md) Phase 5; KVM checks G5.1 and G5.2 pending |
 | [#28](https://github.com/mikenomitch/legion/pull/28) | Streaming persistence: one credential path for replica, takeover restore and lease (platform identity by default, keys in `persistence.streaming.credentials`), boot checks, and the object-storage lease that could never be acquired on real S3 | Breaking: lease keys and `LITESTREAM_*` key vars removed; [plan](plans/manager-workload-identity-plan.md) · [calls](calls/manager-workload-identity-plan_calls.md) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
@@ -3196,6 +3197,33 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       (learners + zone auto-replacement), and an async DR standby cluster
       with manual promotion and generation fencing. Cross-cluster service
       discovery deferred to a follow-up plan (see plan §11).
+- [ ] **Scheduler sharding (more raft groups for more throughput)**
+      ([#25](https://github.com/mikenomitch/legion/pull/25)) —
+      [proposal](plans/scheduler-sharding-strategies-proposal.md) (with a
+      [calls doc](calls/scheduler-sharding-strategies-proposal_calls.md)):
+      the option map for scaling eval/alloc throughput by adding raft
+      groups. Headline recommendation (revision 3, 2026-10-12): pool-keyed *node-owned*
+      scheduler shards where a shard is a raft group **plus its own state
+      file** (`scheduler-<k>.sqlite`) — extra groups over the shared
+      `store.sqlite` only overlap the quorum round-trip and the arithmetic
+      says ~×1.1 post-batching, because capture and apply serialize on the
+      process-global `CAPTURE_MUTEX`. Rung A co-locates every shard leader
+      on the anchor (N writers + N pipelines on one box, composites/backup
+      untouched); rung B spreads leadership; rung C is online resharding.
+      Job-keyed (Omega-style) shards rejected; more write-class lanes
+      refused as a scaling axis. Revision 3 adds that the October AWS
+      campaigns show two regimes: small fleets look commit-bound (rung A's
+      case), while at the largest fleets the leader is planning-bound with
+      an idle commit path and idle followers, where M3 (plan shipping)
+      is the cheaper lever, so M3 is now a peer of rung A, not a fallback.
+      Gated on Phase 0: read the capture-vs-propose ratio and the
+      eval-phase split from the October S3 archives (`collect.sh` now
+      scrapes both raft series) and micro-bench N pipelines over one file
+      vs N files. Names the cross-file consequences to audit (cross-lane
+      `ON DELETE CASCADE`s including `allocation_health` →
+      `allocation`, shard-resident `scheduler_event`, per-shard
+      adaptive-concurrency limits, per-file schema checks, attach cap of
+      8, `ID_STRIDE` widening).
 - [x] Version handshake between manager and worker — protocol version plus
       build-skew reporting, upgrade order in [docs/upgrades.md](../docs/upgrades.md)
       ([#137](https://github.com/mikenomitch/legion/pull/137))
