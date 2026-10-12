@@ -1820,7 +1820,16 @@ fn worker_heartbeats_forward_across_a_status_lane_split() -> R<()> {
     wait_for(
         Duration::from_secs(60),
         "mgr-b leads the status lane while mgr-a keeps control",
-        || b.leads_lane("status") && a.leads_lane("control"),
+        // Winning the lane and mgr-a learning about it are separate events,
+        // one heartbeat apart; what follows routes on mgr-a's view.
+        || {
+            b.leads_lane("status")
+                && a.leads_lane("control")
+                && a.lane_status("status")
+                    .and_then(|(_, leader, _, _)| leader)
+                    .as_deref()
+                    == Some("mgr-b")
+        },
     );
 
     // The worker's heartbeat lands on mgr-a (workers dial ONE manager) and
@@ -1909,7 +1918,16 @@ fn worker_liveness_reaches_the_status_leader_by_digest() -> R<()> {
     wait_for(
         Duration::from_secs(60),
         "mgr-b leads the status lane while mgr-a keeps control",
-        || b.leads_lane("status") && a.leads_lane("control"),
+        // Winning the lane and mgr-a learning about it are separate events,
+        // one heartbeat apart; what follows routes on mgr-a's view.
+        || {
+            b.leads_lane("status")
+                && a.leads_lane("control")
+                && a.lane_status("status")
+                    .and_then(|(_, leader, _, _)| leader)
+                    .as_deref()
+                    == Some("mgr-b")
+        },
     );
     // mgr-b owns liveness now, so it seeds its table the way the status
     // checker does on acquisition.

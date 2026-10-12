@@ -2595,6 +2595,25 @@ impl WorkerTaskManager {
 
     /// Worker-local key for a manager-facing allocation id. The identity
     /// function unless the id names a ratified claim.
+    /// Whether an allocation that just arrived on the work stream should be
+    /// started at once (`worker/work_stream.rs`), the way a push starts one.
+    /// No for anything this node already runs, launches, stops, or holds
+    /// back, and for the committed form of an unratified provisional start:
+    /// its ratification, not a second launch, finishes it. The heartbeat's
+    /// reconcile settles every case this declines.
+    pub fn wants_streamed_launch(&self, allocation: &TaskAllocation) -> bool {
+        let local = self.local_key(allocation.allocation_id);
+        !self.instances.contains_key(&local)
+            && !self.launching.contains_key(&local)
+            && !self.terminating.contains_key(&local)
+            && !self.draining.contains_key(&local)
+            && !self.cancelled_launches.contains(&local)
+            && !self.pressure_evicted.contains(&local)
+            && !self
+                .claims
+                .unratified_matches(&allocation.job_config_id, &allocation.task_name)
+    }
+
     pub fn local_key(&self, allocation_id: i64) -> i64 {
         self.claims
             .by_allocation_id(allocation_id)

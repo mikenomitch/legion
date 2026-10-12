@@ -72,7 +72,7 @@ impl Store {
     #[instrument(err, skip_all, fields(jti = record.jti, job = record.job))]
     pub fn insert_boot_ticket(&self, record: &BootTicketRecord) -> R<()> {
         let record = record.clone();
-        self.replicated(Lane::Control, "insert_boot_ticket", move |s| {
+        self.replicated(Lane::Scheduler, "insert_boot_ticket", move |s| {
             s.insert_boot_ticket_apply(&record)
         })
     }
@@ -141,7 +141,7 @@ impl Store {
     #[instrument(err, skip_all, fields(jti))]
     pub fn spend_boot_ticket(&self, jti: &str, now_unix: i64) -> R<bool> {
         let jti = jti.to_owned();
-        self.replicated(Lane::Control, "spend_boot_ticket", move |s| {
+        self.replicated(Lane::Scheduler, "spend_boot_ticket", move |s| {
             s.spend_boot_ticket_apply(&jti, now_unix)
         })
     }
@@ -160,7 +160,7 @@ impl Store {
     /// maintenance tick that expires signing keys.
     #[instrument(err, skip_all)]
     pub fn prune_expired_boot_tickets(&self, now_unix: i64) -> R<usize> {
-        self.replicated(Lane::Control, "prune_expired_boot_tickets", move |s| {
+        self.replicated(Lane::Scheduler, "prune_expired_boot_tickets", move |s| {
             let conn = s.write_connection()?;
             let removed = conn.execute(
                 "DELETE FROM boot_ticket WHERE expires_at_unix <= ?1;",

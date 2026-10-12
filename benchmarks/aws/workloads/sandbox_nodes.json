@@ -1,0 +1,13 @@
+{
+  "description": "Simulated sandbox hosts for scripts/run-sandbox-campaign.sh: a large microVM host (48 vCPU, 192 GiB). At the campaign's 64 MiB / 10 MHz sandbox, memory is the binding resource, about 3,000 sandboxes per host, capped at 3,000. The capacity is notional (simulated nodes run nothing), so it sets how densely the scheduler may pack, which is what the heartbeat and density numbers depend on.",
+  "node_profiles": [
+    {
+      "name": "sandbox-host",
+      "count": 1,
+      "memory_gb": 192,
+      "cpus": 48,
+      "max_allocations": 3000,
+      "attrs": { "class": "sandbox" }
+    }
+  ]
+}
