@@ -326,6 +326,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#35](https://github.com/mikenomitch/legion/pull/35) | Session durability, routing, and edge starts plan (docs only): concurrent node starts, worker-restart survival, node tag in session ids, manager-free edge starts, sleeping on the node; raft directory deferred | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
@@ -2821,6 +2822,36 @@ Plan: [artifact-system-plan.md](plans/artifact-system-plan.md) · docs: [artifac
 ## Stateful & volumes
 
 Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.md), [volume-plugin-system](plans/volume-plugin-system-plan.md) · docs: [volumes.md](../docs/volumes.md), [stateful-workloads.md](../docs/stateful-workloads.md)
+
+- [ ] **Session durability and routing back** (builds on session mode; plan in
+      [#35](https://github.com/mikenomitch/legion/pull/35)). A worker
+      restart ends every unpromoted session, a session cannot sleep,
+      finding one fans out to every manager, and every start goes through
+      a manager. Plan:
+      [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md)
+      (PLANNED) · calls:
+      [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md).
+  - [ ] Phase 1: the node starts sessions concurrently (launch out from
+        under the task-manager lock, no state-file fsync per session start,
+        bounded launch pool).
+  - [ ] Phase 2: node-local `sessions.db`, adopt sessions on worker restart.
+  - [ ] Phase 3: the start node's tag in the minted session id, tag-first
+        routing with fan-out as the fallback.
+  - [ ] Phase 4: edge starts with no manager on the path
+        (`ListSessionNodes` for an outside consistent-hash picker, session
+        tickets, `Worker.StartSession`), and the manager-routed path
+        measured across three managers.
+  - [ ] Phase 5: session suspend on the node (`durability = "local"` or
+        `"store"`), `suspend.keepFor`, `evicted` answers, resume by tag with
+        manifest fallback, edge resume on any node, and moves fenced by a
+        generation claimed with a conditional manifest write (plan §6.7).
+  - [ ] No split brain (plan §6.7): manifest create for idempotent `store`
+        starts, the fence list, the managers' batched duplicate sweep, and
+        self-fencing after `stateful.fenceAfter`.
+  - [ ] Optional `suspend.checkpointEvery` and `suspend.onWorkerStop =
+        "checkpoint"` (plan §6.6).
+  - [ ] Phase 6 (conditional, plan §6.8): batched raft session directory,
+        only past its trigger.
 
 All deferred from the volume plan v1:
 
