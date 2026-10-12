@@ -6765,6 +6765,69 @@ mod tests {
             .expect("a typed session refusal")
     }
 
+    /// Session durability plan §6.4: a node starts a session from a session
+    /// ticket with the spec its envelope carries, mints the id with its own
+    /// tag, dedupes a keyed retry on the node, and refuses past the room.
+    #[test]
+    fn an_edge_start_runs_a_session_from_the_envelope_spec_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let mut envelope = envelope_payload(100);
+        envelope.session_task_spec = serde_json::to_string(&TaskConfig {
+            name: "workspace".into(),
+            runtime: "exec".into(),
+            config: json!({ "command": ["sleep", "30"] }),
+            resources: json!({ "cpu": 500, "memory": 256 }),
+            ..Default::default()
+        })?;
+        envelope.session_task_config_id = 7;
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope)?;
+        let ticket = crate::structs::edge_boot::SessionTicketClaims {
+            jti: "jti-1".into(),
+            job: "agent-sandboxes".into(),
+            task: "workspace".into(),
+            pool: "default".into(),
+            expires_at_unix: i64::MAX,
+        };
+        let pool = crate::worker::launch_pool::LaunchPool::new(4, Duration::from_secs(1));
+        let slot = || pool.try_acquire().expect("a launch slot");
+        let start = |key: &str| {
+            crate::worker::edge::start_edge_session(&manager, "node-1", &ticket, key, slot())
+        };
+
+        let minted = start("")?;
+        assert!(!minted.deduplicated);
+        assert_eq!(
+            crate::structs::session_node_tag(&minted.session_id),
+            Some(crate::structs::node_tag("node-1").as_str())
+        );
+        let keyed = start("req-1")?;
+        let again = start("req-1")?;
+        assert!(again.deduplicated);
+        assert_eq!(again.session_id, keyed.session_id);
+
+        // Room for two 500 MHz sessions in a 1000 MHz envelope.
+        let full = start("").expect_err("the envelope is full");
+        assert!(full.downcast_ref::<SessionRefusal>().is_some(), "{full:#}");
+
+        let mut guard = manager.lock().expect("task manager");
+        let status = guard
+            .session_status(&minted.session_id)
+            .expect("the session is running");
+        assert_eq!(status.origin, "edge");
+        assert_eq!(status.ticket_jti, "jti-1");
+        assert_eq!(status.generation, 1);
+        let stopped = guard.stop_sessions(
+            &[minted.session_id.clone(), keyed.session_id.clone()],
+            "test",
+        );
+        assert_eq!(stopped.len(), 2);
+        Ok(())
+    }
+
     /// Session durability plan §6.1: a session's runtime calls run with the
     /// task-manager lock released, so a node's session starts overlap, and
     /// a session start never rewrites the worker's state file.
