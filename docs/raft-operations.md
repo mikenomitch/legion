@@ -234,6 +234,12 @@ Open the Legion UI and go to **Cluster → Raft**. It shows the status card,
 operator command buttons, join-token issuance, and event history, all
 backed by the same engine state as the CLI.
 
+Transfer Leader, Add Voter, Add Learner and Remove Member each ask for a
+target node ID in a form that opens under the buttons, and suggest the ids
+the manager knows (voters, learners and configured `peers`). Remove Member
+asks for a second click to confirm. Transfer Leader is disabled on a
+single-voter cluster, because there is no other voter to hand leadership to.
+
 ## Operational notes
 
 - **Quorum:** run an odd number of managers (1, 3, or 5). A majority must

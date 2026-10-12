@@ -33,6 +33,8 @@ const ICON_PATHS: Record<string, string> = {
   x: 'M18 6 6 18 M6 6l12 12',
   chevronRight: 'm9 18 6-6-6-6',
   chevronLeft: 'm15 18-6-6 6-6',
+  chevronDown: 'm6 9 6 6 6-6',
+  chevronUp: 'm18 15-6-6-6 6',
   copy: 'M8 8h12v12H8z M16 8V6a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2',
   check: 'M20 6 9 17l-5-5',
   play: 'm6 3 14 9-14 9V3z',

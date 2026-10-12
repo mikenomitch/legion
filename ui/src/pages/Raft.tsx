@@ -6,17 +6,53 @@ import { Badge, Button, CodeBlock, ConfirmButton, DefList, EmptyState, Field, Ic
 import { formatDateTime } from '../utils/format'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
 
-const raftCommands = [
+type RaftCommand = {
+  label: string
+  command: string
+  destructive: boolean
+  // Commands that act on another manager open an inline target form instead
+  // of running on click; `targetHint` is that form's help line.
+  requiresTarget?: boolean
+  targetHint?: string
+}
+
+const raftCommands: RaftCommand[] = [
   { label: 'Trigger Election', command: 'trigger-election', destructive: false },
   { label: 'Step Down Leader', command: 'step-down', destructive: true },
-  { label: 'Transfer Leader', command: 'transfer-leader', requiresTarget: true, destructive: false },
-  { label: 'Add Voter', command: 'add-voter', requiresTarget: true, destructive: false },
-  { label: 'Add Learner', command: 'add-learner', requiresTarget: true, destructive: false },
-  { label: 'Remove Member', command: 'remove-member', requiresTarget: true, destructive: true },
+  {
+    label: 'Transfer Leader',
+    command: 'transfer-leader',
+    requiresTarget: true,
+    destructive: false,
+    targetHint: 'The voting manager to hand leadership to.',
+  },
+  {
+    label: 'Add Voter',
+    command: 'add-voter',
+    requiresTarget: true,
+    destructive: false,
+    targetHint: 'The manager to make a voter. It must be reachable at its configured peer address.',
+  },
+  {
+    label: 'Add Learner',
+    command: 'add-learner',
+    requiresTarget: true,
+    destructive: false,
+    targetHint: 'The manager to add as a non-voting learner that replicates the log.',
+  },
+  {
+    label: 'Remove Member',
+    command: 'remove-member',
+    requiresTarget: true,
+    destructive: true,
+    targetHint: 'The voter or learner to remove from the cluster.',
+  },
 ]
 
 function RaftContent() {
   const [target, setTarget] = createSignal('')
+  // The target-taking command whose form is open, if any.
+  const [pending, setPending] = createSignal<RaftCommand>()
   const [commandResult, setCommandResult] = createSignal('')
   const [joinToken, setJoinToken] = createSignal('')
   const [joinTokenExpiry, setJoinTokenExpiry] = createSignal('')
@@ -41,6 +77,51 @@ function RaftContent() {
   // Only claim "disabled" once the manager has actually answered.
   const raftDisabled = createMemo(() => status() !== undefined && !status()?.status?.enabled)
 
+  // Settled voters other than this manager. With none there is no one to
+  // hand leadership to, so Transfer Leader is disabled rather than left to
+  // fail. Unknown until the first status reply, which disables nothing.
+  const otherVoters = createMemo(() => {
+    const raft = status()?.status
+    return raft ? raft.voters.filter((id) => id !== raft.nodeId) : undefined
+  })
+  const singleVoter = createMemo(() => otherVoters()?.length === 0)
+
+  // Ids worth suggesting in the target field, per command.
+  const targetSuggestions = createMemo(() => {
+    const raft = status()?.status
+    const command = pending()?.command
+    if (!raft || !command) return []
+    const voters = new Set(raft.voters)
+    const learners = new Set(raft.learners)
+    const known = [...new Set([...raft.voters, ...raft.learners, ...raft.peers])].filter((id) => id !== raft.nodeId)
+    switch (command) {
+      case 'transfer-leader':
+        return otherVoters() ?? []
+      case 'add-voter':
+        return known.filter((id) => !voters.has(id))
+      case 'add-learner':
+        return known.filter((id) => !voters.has(id) && !learners.has(id))
+      default:
+        return known.filter((id) => voters.has(id) || learners.has(id))
+    }
+  })
+
+  const openTargetForm = (entry: RaftCommand) => {
+    if (pending()?.command === entry.command) {
+      setPending(undefined)
+      return
+    }
+    setPending(entry)
+    setCommandResult('')
+    // Prefill the one obvious answer (a two-manager transfer); otherwise
+    // keep what was typed, since the same id often feeds several commands.
+    const suggestions = targetSuggestions()
+    if (suggestions.length === 1 && !target().trim()) setTarget(suggestions[0])
+    queueMicrotask(() => targetInput?.focus())
+  }
+
+  let targetInput: HTMLInputElement | undefined
+
   const runCommand = async (name: string, needsTarget = false) => {
     const targetNodeId = target().trim()
     if (needsTarget && !targetNodeId) {
@@ -54,6 +135,7 @@ function RaftContent() {
       actor: 'ui',
     })
     setCommandResult(response.event?.message ?? 'Command submitted.')
+    if (needsTarget) setPending(undefined)
     await refresh()
   }
 
@@ -130,49 +212,120 @@ function RaftContent() {
               />
             }
           >
-            <Field label="Target node ID" hint="Required for transfer/add/remove commands." class="mb-3">
-              <input
-                value={target()}
-                onInput={(event) => setTarget(event.currentTarget.value)}
-                class={cx(inputClass, 'font-mono')}
-                placeholder="mgr-b"
-              />
-            </Field>
             <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
               <For each={raftCommands}>
-                {(entry) => (
-                  <Show
-                    when={entry.destructive}
-                    fallback={
-                      <Button
-                        disabled={!canRunCommands()}
-                        onClick={() => void runCommand(entry.command, entry.requiresTarget)}
-                        class="justify-start"
+                {(entry) => {
+                  const transferBlocked = () => entry.command === 'transfer-leader' && singleVoter()
+                  return (
+                    <Show
+                      when={!entry.requiresTarget}
+                      fallback={
+                        // Opens the target form below; the form's own button runs it.
+                        <Button
+                          disabled={!canRunCommands() || transferBlocked()}
+                          title={transferBlocked() ? 'This is the only voting manager — there is no one to transfer leadership to.' : undefined}
+                          aria-expanded={pending()?.command === entry.command}
+                          onClick={() => openTargetForm(entry)}
+                          class={cx(
+                            'justify-start',
+                            pending()?.command === entry.command && 'border-brass/50 bg-brass/10 text-brass-strong',
+                          )}
+                        >
+                          <span class="flex-1 text-left">{entry.label}</span>
+                          <Icon name={pending()?.command === entry.command ? 'chevronUp' : 'chevronDown'} size={13} class="text-faint" />
+                        </Button>
+                      }
+                    >
+                      <Show
+                        when={entry.destructive}
+                        fallback={
+                          <Button
+                            disabled={!canRunCommands()}
+                            onClick={() => void runCommand(entry.command)}
+                            class="!justify-start"
+                          >
+                            {entry.label}
+                          </Button>
+                        }
                       >
-                        {entry.label}
-                      </Button>
-                    }
-                  >
-                    <ConfirmButton
-                      label={entry.label}
-                      icon="alertTriangle"
-                      disabled={!canRunCommands()}
-                      onConfirm={() => void runCommand(entry.command, entry.requiresTarget)}
-                      class="justify-start"
-                    />
-                  </Show>
-                )}
+                        <ConfirmButton
+                          label={entry.label}
+                          icon="alertTriangle"
+                          disabled={!canRunCommands()}
+                          onConfirm={() => void runCommand(entry.command)}
+                          class="!justify-start"
+                        />
+                      </Show>
+                    </Show>
+                  )
+                }}
               </For>
               <Button
                 variant="accent"
                 icon="keySquare"
                 disabled={!canRunCommands()}
                 onClick={() => void issueJoinToken()}
-                class="justify-start"
+                class="!justify-start"
               >
                 Issue Join Token
               </Button>
             </div>
+            <Show when={singleVoter() && canRunCommands()}>
+              <p class="mt-2 text-2xs text-faint">
+                Transfer Leader needs a second voting manager; this cluster has one.
+              </p>
+            </Show>
+            <Show when={pending()}>
+              {(entry) => (
+                <form
+                  class="mt-3 rounded-md border border-line bg-surface2/50 p-3"
+                  onSubmit={(event) => {
+                    event.preventDefault()
+                    // Enter must not skip the confirm step of a destructive command.
+                    if (!entry().destructive) void runCommand(entry().command, true)
+                  }}
+                >
+                  <Field label={`${entry().label} — target node ID`} hint={entry().targetHint}>
+                    <input
+                      ref={targetInput}
+                      value={target()}
+                      onInput={(event) => setTarget(event.currentTarget.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Escape') setPending(undefined)
+                      }}
+                      class={cx(inputClass, 'font-mono')}
+                      placeholder={targetSuggestions()[0] ?? 'mgr-b'}
+                      list="raft-target-suggestions"
+                      autocomplete="off"
+                      spellcheck={false}
+                    />
+                  </Field>
+                  <datalist id="raft-target-suggestions">
+                    <For each={targetSuggestions()}>{(id) => <option value={id} />}</For>
+                  </datalist>
+                  <div class="mt-2.5 flex items-center justify-end gap-2">
+                    <Button variant="ghost" onClick={() => setPending(undefined)}>
+                      Cancel
+                    </Button>
+                    <Show
+                      when={entry().destructive}
+                      fallback={
+                        <Button type="submit" variant="primary" disabled={!canRunCommands() || !target().trim()}>
+                          {entry().label}
+                        </Button>
+                      }
+                    >
+                      <ConfirmButton
+                        label={entry().label}
+                        icon="alertTriangle"
+                        disabled={!canRunCommands() || !target().trim()}
+                        onConfirm={() => void runCommand(entry().command, true)}
+                      />
+                    </Show>
+                  </div>
+                </form>
+              )}
+            </Show>
             <Show when={commandResult()}>
               <Note tone="info" class="mt-3" onDismiss={() => setCommandResult('')}>{commandResult()}</Note>
             </Show>

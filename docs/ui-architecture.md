@@ -287,7 +287,10 @@ the Access page reports it instead.
 - `Manager.tsx`: manager config snapshots.
 - `Raft.tsx`: under Cluster navigation. Polled consensus status, recent raft
   history, and operator commands (election, failover, membership, and join
-  tokens).
+  tokens). Commands that act on another manager (Transfer Leader, Add Voter,
+  Add Learner, Remove Member) open an inline target form, with known peer
+  ids suggested, instead of sharing one always-visible field. Transfer Leader
+  is disabled while this manager is the only settled voter.
 - `components/LogViewer.tsx`: the live task log tail, with stream and
   allocation filters and **Find in logs** (case-insensitive, hits
   highlighted, "N of M lines match").
@@ -513,7 +516,9 @@ same rule that a selector never matches a request without that attribute.
   login link (anonymous) or a switch-identity link (authenticated). The gate
   lives at the page level because wrapping the router's outlet in any
   conditional captures it once, which freezes navigation while the URL keeps
-  changing.
+  changing. The Overview spans every resource, so it gates differently: with
+  ACLs enforced, an anonymous visitor gets the same log-in card (`LoginGate`)
+  and a logged-in identity sees each card it can read.
 - **Mutating controls** (stop/destroy job, scale, cordon/drain/uncordon,
   rollout advance/stop, KV save/delete/patch, raft commands, saved-query
   writes, exec and actions, template publish/delete, snapshot

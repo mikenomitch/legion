@@ -14,6 +14,7 @@ const sectionLabels: Record<string, string> = {
   templates: 'Templates',
   rollouts: 'Rollouts',
   services: 'Services',
+  network: 'Network',
   volumes: 'Volumes',
   raft: 'Raft',
   events: 'Events',
@@ -26,6 +27,9 @@ const sectionLabels: Record<string, string> = {
   oidc: 'Single sign-on',
   deployments: 'Rollouts',
 }
+
+// Path segments with no route of their own (see buildCrumbs).
+const unlinkedSegments = new Set(['tasks', 'specs', 'oidc'])
 
 /** True when the first path segment is a section the app has a page for. */
 export const isKnownSection = (segment: string | undefined): boolean =>
@@ -81,7 +85,9 @@ export const buildCrumbs = (pathname: string): Breadcrumb[] => {
     href += `/${segment}`
     crumbs.push({
       label: labelForSegment(segments, index),
-      href: index === segments.length - 1 ? undefined : href,
+      // `/jobs/:id/tasks`, `/jobs/:id/specs` and `/oidc` are not pages of
+      // their own, so those crumbs are labels rather than links to a 404.
+      href: index === segments.length - 1 || unlinkedSegments.has(segment) ? undefined : href,
     })
   })
 
