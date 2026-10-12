@@ -302,6 +302,31 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let enforcement_config =
         usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
     apply_resource_enforcement_env(&enforcement_config);
+    // The host guard in the kernel (worker-plane-auth plan §6.13). It
+    // matches sockets by cgroup leaf, so where it runs every task gets one,
+    // enforcement or not.
+    let kernel_guard = crate::worker::netd::kernel_guard::probe();
+    match &kernel_guard {
+        crate::worker::netd::kernel_guard::Availability::Active => {
+            std::env::set_var(crate::constants::ENV_HOST_GUARD_KERNEL, "1");
+            std::env::set_var(
+                crate::constants::ENV_CGROUP_PARENT,
+                &enforcement_config.cgroup_parent,
+            );
+            info!(
+                "Host guard active in the kernel (nftables): host-mode tasks cannot reach this \
+                 node's Legion ports, cloud metadata, or other allocations' listeners"
+            );
+        }
+        crate::worker::netd::kernel_guard::Availability::Unavailable(reason) => {
+            std::env::remove_var(crate::constants::ENV_HOST_GUARD_KERNEL);
+            warn!(
+                %reason,
+                "Host guard unavailable in the kernel: host-mode tasks can reach this node's \
+                 Legion ports and cloud metadata (gated tasks are still guarded by the datapath)"
+            );
+        }
+    }
     let sandbox_bridges = apply_sandbox_bridges_env(enforcement_config.sandbox.as_ref());
     crate::task_plugins::warn_if_no_static_guest_binary();
     let restored_allocations = {
@@ -465,6 +490,11 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // toward the manager unless overridden (docs/architecture-managers-
     // workers.md, "Ports"). Always `https://`: the worker plane is mTLS.
     config_attrs.insert("workerAddress".into(), Value::String(advertised.clone()));
+    // `legion node info` shows whether host-mode tasks are guarded here.
+    config_attrs.insert(
+        crate::worker::netd::kernel_guard::NODE_ATTR.into(),
+        Value::String(kernel_guard.attribute()),
+    );
     if let Some(public_address) = worker_public_address() {
         config_attrs.insert("publicAddress".into(), Value::String(public_address));
     }
@@ -535,7 +565,17 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             Arc::new(crate::worker::netd::Denials::new()),
         )
         .with_logs_base_dir(logs_base_dir.clone())
-        .with_host_guard(Arc::new(host_guard_for(&config.security))),
+        .with_host_guard(Arc::new(host_guard_for(&config.security)))
+        .with_kernel_guard_if(
+            (kernel_guard == crate::worker::netd::kernel_guard::Availability::Active).then(|| {
+                kernel_guard_base(
+                    &config.security,
+                    u16::try_from(server_port).unwrap_or_default(),
+                    &manager_addr,
+                    &enforcement_config.cgroup_parent,
+                )
+            }),
+        ),
     );
     let net_dns = Arc::new(crate::worker::netd::dns::NetDns::new(
         net_context.clone(),
@@ -664,6 +704,106 @@ impl crate::worker::server::ClaimRatifier for ManagerClaimRatifier {
 /// The host guard this worker type's `hostGuard` block describes. A block
 /// the manager validated can't fail here; if it somehow does, the worker
 /// keeps the default guard (no overrides), which refuses more, never less.
+/// The kernel host guard's table without its allocations: Legion's ports on
+/// this node and the operator's `hostGuard` entries (plan §6.13). The
+/// manager's ports count when it shares the node (its address is local).
+fn kernel_guard_base(
+    security: &str,
+    worker_port: u16,
+    manager_addr: &str,
+    cgroup_parent: &str,
+) -> crate::worker::netd::kernel_guard::GuardTable {
+    let mut table = crate::worker::netd::kernel_guard::GuardTable {
+        cgroup_parent: cgroup_parent.to_string(),
+        ..Default::default()
+    };
+    table.control_ports.insert(worker_port);
+    if let Ok(uri) = manager_addr.parse::<http::Uri>() {
+        let host = uri.host().unwrap_or_default().trim_matches(['[', ']']);
+        let local = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => {
+                ip.is_loopback() || crate::structs::host_guard::interface_addresses().contains(&ip)
+            }
+            Err(_) => host == "localhost",
+        };
+        if let (true, Some(port)) = (local, uri.port_u16()) {
+            // The API, the exec WebSocket, and telemetry.
+            for offset in 0..=2 {
+                if let Some(port) = port.checked_add(offset) {
+                    table.control_ports.insert(port);
+                }
+            }
+        }
+    }
+    let config: crate::structs::WorkerSecurityConfig =
+        serde_json::from_str(security).unwrap_or_default();
+    if let Some(host_guard) = config.host_guard {
+        for entry in host_guard.deny {
+            let entry = entry.trim().to_string();
+            if entry.contains(':') {
+                table.deny_v6.push(entry);
+            } else {
+                table.deny_v4.push(entry);
+            }
+        }
+        for entry in host_guard.allow {
+            if crate::structs::host_guard::parse_allow(&entry).is_err() {
+                continue;
+            }
+            let entry = entry.trim();
+            let split = match entry.strip_prefix('[') {
+                Some(rest) => rest
+                    .split_once("]:")
+                    .map(|(addr, port)| (addr.to_string(), port)),
+                None => entry
+                    .rsplit_once(':')
+                    .map(|(addr, port)| (addr.to_string(), port)),
+            };
+            if let Some((addr, port)) = split {
+                if let Ok(port) = port.parse() {
+                    table.allow.push((addr, port));
+                }
+            }
+        }
+    }
+    table
+}
+
+/// The allocations the kernel host guard matches this beat: every desired
+/// allocation whose cgroup leaf exists, with its own VIP block and upstream
+/// loopback ports, which it may still reach.
+fn kernel_guarded_allocations(
+    desired: &[TaskAllocation],
+) -> Vec<crate::worker::netd::kernel_guard::GuardedAllocation> {
+    let parent = crate::task_plugins::exec_isolation::cgroup_parent();
+    desired
+        .iter()
+        .filter_map(|allocation| {
+            let cgroup = crate::worker::netd::kernel_guard::existing_leaf(
+                &parent,
+                allocation.allocation_id,
+            )?;
+            let network: Option<AllocNetwork> = serde_json::from_str(&allocation.network).ok();
+            Some(crate::worker::netd::kernel_guard::GuardedAllocation {
+                allocation_id: allocation.allocation_id,
+                cgroup,
+                vip_block: network
+                    .as_ref()
+                    .and_then(|network| network.vip_block.clone()),
+                loopback_ports: network
+                    .map(|network| {
+                        network
+                            .upstreams
+                            .iter()
+                            .map(|upstream| upstream.local_port)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
 fn host_guard_for(security: &str) -> crate::structs::host_guard::HostGuard {
     let config = if security.trim().is_empty() {
         crate::structs::WorkerSecurityConfig::default()
@@ -1575,6 +1715,14 @@ async fn heartbeat_tick(
         crate::worker::edge::sweep_leases(task_manager);
         // The host guard's node-address class follows the interfaces.
         forwarder.context().refresh_node_addresses();
+        // The kernel host guard follows the desired set: one rule chain per
+        // allocation leaf, and the drops since the last beat as denials.
+        if forwarder.context().kernel_guard_active() {
+            let guarded = kernel_guarded_allocations(&reply.desired_allocations);
+            let context = forwarder.context().clone();
+            let _ =
+                tokio::task::spawn_blocking(move || context.reconcile_kernel_guard(guarded)).await;
+        }
         // The manager acknowledged us, so this reply is authoritative for the
         // connect datapath (see `apply_upstreams` on fail-static semantics).
         let alloc_root = task_manager

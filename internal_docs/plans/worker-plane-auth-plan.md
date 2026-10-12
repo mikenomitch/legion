@@ -4,7 +4,8 @@
 
 **Status: IN EXECUTION.** Phases 0 (ACLs on by default), 1 (the mTLS worker
 plane), 2 (the host guard in the datapath), 3 (Linux containers gated by
-default), and 4 (the encrypted worker-to-manager channel) shipped. The plan
+default), 4 (the encrypted worker-to-manager channel), and 5 (the host guard
+in the kernel) shipped. The plan
 has two halves that share one threat: something reaching a node's control
 plane that shouldn't.
 
@@ -1508,6 +1509,14 @@ item in `internal_docs/TODO.md`.
   in-process worker joining over TLS, and `worker_plane_e2e` through a CA
   rotation. Not run: a worker on another host, and a multi-manager raft
   cluster with `server.tls` (raft TLS is deferred).
+- **Phase 5** was built on the same VM, which has a hybrid cgroup layout
+  (cgroup v2 only at `/sys/fs/cgroup/unified`), so the guard reports itself
+  unavailable there. What ran: the golden rendering, counter parsing and
+  deltas, the label-only governor, and `nft -c` (the real `nft` 1.0.9 parsing
+  and checking the full transaction, cgroupv2 matches included). Not run:
+  loading the table and dropping a real connection
+  (`kernel_guard_loads_and_drops_metadata_from_an_allocation_test`, ignored,
+  needs a cgroup v2 host).
 
 ## 10. Rollout and backward compatibility
 

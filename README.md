@@ -318,16 +318,12 @@ each feature.
 Don't run Legion where untrusted workloads share a host with other work, or
 on a network you don't trust. Known gaps:
 
-- **Linux containers and `exec` tasks share the host's network by default**,
-  so they can reach the worker and manager ports, the cloud metadata service,
-  and anything else on the host. `network.mode = "gated"` closes this for
-  containers and non-root `exec` tasks: the namespace has no route except
-  Legion's listeners, and every destination they dial is judged by the
-  [host guard](docs/network-handlers.md#the-host-guard), which refuses the
-  node, link-local, and cloud metadata. Set `gated` explicitly for untrusted
-  code. The
-  [worker-plane auth plan](internal_docs/plans/worker-plane-auth-plan.md)
-  makes it the default.
+- **`exec` tasks run on the host, and as root unless they set a `user`.**
+  They share the host's network. On Linux nodes with cgroup v2 and `nft`,
+  the [kernel host guard](docs/network-handlers.md#the-host-guard-in-the-kernel)
+  keeps them off Legion's ports, the cloud metadata service, and other
+  allocations' listeners, but a root task can remove it. Run untrusted code
+  in `container` (gated by default on Linux) or `sandbox`, never `exec`.
 - **Raft traffic between managers is plaintext.** Workers reach managers over
   TLS pinned to the cluster CA, and managers reach workers over mutual TLS,
   but peer managers talk to each other in the clear. Keep managers on a

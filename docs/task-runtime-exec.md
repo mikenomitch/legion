@@ -91,6 +91,12 @@ By default an `exec` task shares the host's network (`network.mode =
 ports owned by the node datapath. Egress policy applies to traffic through
 those upstreams and to names resolved through the allocation's resolver
 (`LEGION_DNS`). In this mode, enforcement depends on the task cooperating.
+On a Linux node running the
+[kernel host guard](network-handlers.md#the-host-guard-in-the-kernel), the
+task still cannot reach the node's Legion ports, the cloud metadata service,
+or other allocations' listeners: its sockets are matched by its cgroup leaf
+and dropped with `EPERM`. A task running as root can remove that table, so
+the guard holds for tasks with a `user` only.
 
 With `network.mode = "gated"` (Linux), the worker creates an empty network
 namespace for the allocation before it starts. The process enters it with

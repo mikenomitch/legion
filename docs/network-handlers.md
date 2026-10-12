@@ -871,22 +871,84 @@ in `allow` is refused for the same reason.
 
 **Limits.**
 
-- The guard is in the datapath. A `host`-mode task dials the network
-  directly, so nothing stops it reaching the node or the metadata service;
-  use `gated`, and the defense in depth under "Cloud metadata" below.
+- The datapath guard judges what the datapath dials. A `host`-mode task dials
+  the network directly; the [kernel guard](#the-host-guard-in-the-kernel)
+  below covers it on Linux nodes that can run it.
 - A root `exec` task in `gated` mode can `setns` back into the host
   namespace.
 - The guard judges destinations, not the node's own outbound traffic:
   artifact fetches, `authz` webhooks, and the worker's own calls to the
   manager are not judged.
 
+### The host guard in the kernel
+
+A `host`-mode task (an `exec` task, a container with `network.mode =
+"host"`) never passes through the datapath, so on Linux the worker also
+installs one `nftables` table, `inet legion_host_guard`, that applies a
+floor to every socket an allocation opens. It matches sockets by the
+allocation's cgroup leaf (`<cgroupParent>/{share,reserve}/legion-<alloc>`)
+in the output hook and drops:
+
+| Destination | Why |
+| --- | --- |
+| `169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200` | the cloud metadata service |
+| `hostGuard.deny` entries | operator additions |
+| Legion's ports on any local address: the worker plane, and the manager's API, exec, and telemetry ports when the manager shares the node | the node's control plane |
+| `127.42.0.0/16` and every allocation's upstream loopback ports | other allocations' datapath listeners |
+
+An allocation keeps its own VIP block and upstream ports, and
+`hostGuard.allow` entries are accepted first. A dropped `connect()` fails at
+once with `EPERM` ("Operation not permitted"), not a timeout. Each allocation
+has its own chain with its own counters. The worker reads them every
+heartbeat and reports new drops as `net.denied` events with source
+`host-guard`, the class as the destination (`cloud metadata`, `a Legion
+control port`, `another allocation's datapath`), and `dropped in the kernel`
+in the reason, so `legion net doctor` and the event stream name the cause.
+
+The worker owns the table: it replaces it atomically whenever the set of
+allocations changes (`nft -f` with an add-delete-add transaction) and needs
+no new dependency, only the `nft` binary. Every task gets a cgroup leaf
+where the guard runs, even with `resourceEnforcement.enabled = false`: the
+leaf then carries no limits, only the label the guard matches.
+
+Whether a node runs it is the `hostGuard` node attribute, shown by
+`legion node info`:
+
+```console
+$ legion node info wkr-1
+Node ID: wkr-1
+Worker plane   https://10.0.1.7:4848
+Host guard     active (nftables)
+```
+
+A node that cannot run it says why, logs a `WARN` at start, and still runs
+host-mode tasks, because host mode is the explicit trust opt-in:
+
+```text
+Host guard     unavailable (no cgroup v2 unified hierarchy at /sys/fs/cgroup)
+```
+
+**What it does not cover.**
+
+- A task that is root on the host with `CAP_NET_ADMIN`, which is any `exec`
+  task without a `user`, can delete the table.
+- Other daemons on the node's addresses, except Legion's own ports. Host
+  mode is host networking; the guard keeps Legion's control plane, the
+  metadata service, and other allocations' listeners out of reach, not
+  every service an operator chose to run.
+- Nodes without the cgroup v2 unified hierarchy (hybrid or v1-only hosts),
+  without `nft`, or where the worker is not root.
+- macOS. Apple `container` runs each container in its own VM, and `exec`
+  tasks there are host processes.
+
 ### Cloud metadata
 
 The cloud instance metadata service (`169.254.169.254`, `fd00:ec2::254`,
 `100.100.100.200`) serves the instance's role credentials to anyone who can
 reach it. The host guard refuses it for every connection the datapath
-dials, so a gated task cannot reach it through Legion. A `host`-mode task
-can, because its traffic does not pass through Legion.
+dials, so a gated task cannot reach it through Legion. A `host`-mode task's
+traffic does not pass through Legion; on Linux nodes running the
+[kernel guard](#the-host-guard-in-the-kernel) it is dropped there instead.
 
 As defense in depth on AWS, require IMDSv2 and set the hop limit to 1, so a
 token request from inside a container's network namespace never gets an
@@ -1155,9 +1217,10 @@ This section lists what that covers and what it does not.
   `container` and `exec`) closes that gap, because the namespace has no
   route except Legion's listeners, and every destination those listeners
   dial is judged by the [host guard](#the-host-guard) before policy. A root
-  `exec` task can still leave the namespace, and a host-mode task can still
-  dial the node and the metadata service directly, so `host` mode is
-  cooperative. On macOS, egress stays cooperative, and
+  `exec` task can still leave the namespace. A host-mode task's policy stays
+  cooperative, but the [kernel guard](#the-host-guard-in-the-kernel) keeps it
+  off the node's Legion ports, the metadata service, and other allocations'
+  listeners where it runs. On macOS, egress stays cooperative, and
   there are no VIPs, per-allocation resolvers, or gated namespaces. A gated
   `sandbox` is captured over vsock. That path is implemented and
   unit-tested but not exercised on a real VMM in CI. `auto` resolves to

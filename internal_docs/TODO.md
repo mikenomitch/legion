@@ -77,8 +77,18 @@ How to use it:
         needs (`src/storage/raft/network.rs:197`, `driver.rs:934`). Deferred by
         the plan (non-goals); listed in
         [architecture-managers-workers.md](../docs/architecture-managers-workers.md#what-is-not-implemented-yet).
-  - [ ] Phase 5: the host guard in the kernel: an `nftables` table matched by
-        allocation cgroup, and a cgroup leaf for every task (plan §6.13).
+  - [x] Phase 5: the host guard in the kernel: an `inet legion_host_guard`
+        table with one chain per allocation leaf, counters reported as
+        `host-guard` denials, the `hostGuard` node attribute in
+        `legion node info`, and a label-only cgroup leaf for every task when
+        enforcement is off (plan §6.13; calls 35, 36). Docs:
+        [network-handlers.md](../docs/network-handlers.md#the-host-guard-in-the-kernel).
+  - [ ] Run the kernel host guard for real on a cgroup v2 node as root:
+        `sudo -E cargo test --lib kernel_guard_loads -- --ignored --nocapture`
+        (a dial to `169.254.169.254` from an allocation leaf fails with
+        `EPERM` and the counter reports it). Built on a hybrid-cgroup host,
+        where only the rendered table was checked against the real `nft`
+        (`the_rendered_table_passes_nft_check_test`).
   - [ ] Phase 6: the container privilege floor: per-allocation user
         namespaces, Docker's default seccomp profile, a cgroup namespace
         (plan §6.14).

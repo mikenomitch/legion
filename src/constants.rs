@@ -20,6 +20,11 @@ pub const PROTOCOL_VERSION: u32 = 3;
 pub const ENV_RESOURCE_ENFORCEMENT: &str = "LEGION_RESOURCE_ENFORCEMENT";
 /// cgroup v2 parent path (relative to /sys/fs/cgroup) for worker-owned cgroups.
 pub const ENV_CGROUP_PARENT: &str = "LEGION_CGROUP_PARENT";
+/// Set by the worker when the kernel host guard is active
+/// (docs/network-handlers.md, "The host guard in the kernel"): every task then
+/// gets a cgroup leaf, enforcement or not, because the guard matches sockets
+/// by leaf.
+pub const ENV_HOST_GUARD_KERNEL: &str = "LEGION_HOST_GUARD_KERNEL";
 /// Extra memory, in MiB, a `sandbox` allocation's cgroup allows on top of
 /// its guest size, for the VMM process itself (worker `sandbox.vmmOverheadMiB`).
 pub const ENV_SANDBOX_VMM_OVERHEAD_MIB: &str = "LEGION_SANDBOX_VMM_OVERHEAD_MIB";

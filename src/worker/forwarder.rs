@@ -192,6 +192,17 @@ pub struct ForwarderContext {
     /// Name resolution for destinations the host guard judges; the system
     /// resolver when unset.
     resolver: Option<Arc<dyn crate::worker::netd::guard::Resolver>>,
+    /// The host guard in the kernel (`netd::kernel_guard`), on a node that
+    /// can run it.
+    kernel_guard: Option<Mutex<KernelGuardRuntime>>,
+}
+
+/// The kernel host guard's state on one worker: the table without its
+/// allocations (ports, operator entries), and what is loaded.
+#[derive(Debug)]
+pub struct KernelGuardRuntime {
+    pub base: crate::worker::netd::kernel_guard::GuardTable,
+    pub guard: crate::worker::netd::kernel_guard::KernelGuard,
 }
 
 /// The default guard: no operator overrides, the node's current interface
@@ -247,6 +258,90 @@ impl ForwarderContext {
             activity: Arc::new(crate::worker::netd::activity::ActivityLedger::new()),
             host_guard: Some(Arc::new(default_host_guard())),
             resolver: None,
+            kernel_guard: None,
+        }
+    }
+
+    /// Runs the kernel host guard with `base` (its ports and operator
+    /// entries); the allocations come from each heartbeat.
+    pub fn with_kernel_guard(
+        mut self,
+        base: crate::worker::netd::kernel_guard::GuardTable,
+    ) -> Self {
+        self.kernel_guard = Some(Mutex::new(KernelGuardRuntime {
+            base,
+            guard: Default::default(),
+        }));
+        self
+    }
+
+    /// [`Self::with_kernel_guard`] when `base` is set.
+    pub fn with_kernel_guard_if(
+        self,
+        base: Option<crate::worker::netd::kernel_guard::GuardTable>,
+    ) -> Self {
+        match base {
+            Some(base) => self.with_kernel_guard(base),
+            None => self,
+        }
+    }
+
+    /// Whether this node runs the kernel host guard.
+    pub fn kernel_guard_active(&self) -> bool {
+        self.kernel_guard.is_some()
+    }
+
+    /// Reloads the kernel table for `allocations` when it changed, and
+    /// records drops since the last call as `host-guard` denials for the
+    /// next heartbeat. Blocking: it runs `nft`.
+    pub fn reconcile_kernel_guard(
+        &self,
+        allocations: Vec<crate::worker::netd::kernel_guard::GuardedAllocation>,
+    ) {
+        let Some(runtime) = &self.kernel_guard else {
+            return;
+        };
+        let mut runtime = lock(runtime);
+        let mut table = runtime.base.clone();
+        table.allocations = allocations;
+        match runtime.guard.reconcile(table) {
+            Ok(true) => debug!(
+                allocations = runtime.guard.allocations(),
+                "Reloaded the kernel host guard"
+            ),
+            Ok(false) => {}
+            Err(err) => {
+                warn!(error = %format!("{err:#}"), "Failed to load the kernel host guard; retrying on the next heartbeat");
+                return;
+            }
+        }
+        let counters = match crate::worker::netd::kernel_guard::read_counters() {
+            Ok(counters) => counters,
+            Err(err) => {
+                debug!(error = %format!("{err:#}"), "Could not read the kernel host guard's counters");
+                return;
+            }
+        };
+        for (allocation_id, reason, packets) in runtime.guard.new_drops(counters) {
+            let Some(denials) = self.denials.as_ref() else {
+                return;
+            };
+            let who = self.identity_for(allocation_id);
+            denials.record_count(
+                allocation_id,
+                who.as_ref(),
+                "egress",
+                "tcp",
+                &reason,
+                crate::structs::host_guard::HOST_GUARD_SOURCE,
+                Some(&format!(
+                    "dropped in the kernel: {reason}; allocations may not reach it"
+                )),
+                None,
+                "",
+                "",
+                u32::try_from(packets).unwrap_or(u32::MAX),
+            );
         }
     }
 

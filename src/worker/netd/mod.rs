@@ -27,6 +27,7 @@ pub mod guest_agent;
 pub mod handlers;
 pub mod http;
 pub mod ingress;
+pub mod kernel_guard;
 pub mod netns;
 pub mod policy;
 pub mod proxy;

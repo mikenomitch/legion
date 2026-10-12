@@ -840,3 +840,47 @@ a connection verified against the pin or an earlier bundle, so trust chains
 back to the token. The plaintext JWKS fallback is gone too: a worker builds a
 ticket verifier only over this channel, so "refuse a plaintext JWKS URL" holds
 by construction. **Rotation that breaks nothing won.**
+
+## 35. Each allocation gets its own chain, so a drop names its allocation
+
+Made while implementing Phase 5. The plan's sketch puts every allocation's
+drops in one shared chain, with a pair of per-allocation accept rules ahead of
+them. Counters there can't say whose socket was dropped. The table instead
+gives each allocation its own chain (its own VIP block and upstream ports
+accepted, then the floor, each class with its own counter and a comment
+naming the class), and an `unattributed` chain for sockets in the cgroup
+parent that no listed leaf owns.
+
+```text
+net.denied  alloc 88213  egress  cloud metadata  source=host-guard  "dropped in the kernel: cloud metadata; ..."
+```
+
+**Alternative.** One shared floor chain, with drops reported per node.
+
+**Trade-off.** The table grows by about ten rules per allocation, and every
+change to the set of allocations reloads it (which also resets counters; the
+worker resets its baseline with it).
+
+**Why.** "A drop happened somewhere on this node" sends an operator hunting;
+the plan's point is that `net doctor` names the allocation and the cause. A
+few hundred rules is nothing to the kernel. **Diagnosability won.**
+
+## 36. Enforcement off still means a cgroup leaf where the kernel guard runs
+
+Made while implementing Phase 5. The guard matches sockets by cgroup leaf, so
+with `resourceEnforcement.enabled = false` the worker's governor still hands
+every task `legion/share/legion-<alloc>`: it creates the directory and writes
+nothing into it (no controllers, no cpuset, no limits). `cores` are not
+reserved in this mode.
+
+**Alternative.** Match by the allocation's processes some other way (UID per
+allocation, or a socket mark set by the runtime), or skip the guard when
+enforcement is off.
+
+**Trade-off.** One more mode in the governor, and a node with enforcement off
+now has a `legion/` tree.
+
+**Why.** Enforcement is on by default, so this mode is the exception; the
+cgroup is the one identity every runtime already carries (runc, the exec
+supervisor, the VMM). Skipping the guard would make a scheduling knob silently
+turn a security floor off. **One consistent floor won.**

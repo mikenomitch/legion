@@ -91,6 +91,9 @@ impl Node {
 
     pub fn print_long(&self) {
         println!("Node ID: {}", self.id);
+        for line in self.security_lines() {
+            println!("{line}");
+        }
 
         let mut attrs = Map::new();
         let default_map = Map::new();
@@ -117,6 +120,27 @@ impl Node {
         if let Ok(printable) = to_string(&attrs) {
             println!("Attributes: {printable}");
         }
+    }
+
+    /// The worker plane and host guard lines `legion node info` prints
+    /// above the raw attributes (worker-plane-auth plan §6.7, §6.13).
+    pub fn security_lines(&self) -> Vec<String> {
+        let attr = |key: &str| {
+            self.config_attrs
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let mut lines = Vec::new();
+        if let Some(address) = attr("workerAddress") {
+            lines.push(format!("Worker plane   {address}"));
+        }
+        lines.push(format!(
+            "Host guard     {}",
+            attr("hostGuard").unwrap_or_else(|| "not reported (worker predates it)".into())
+        ));
+        lines
     }
 
     pub fn print_long_json(&self) {

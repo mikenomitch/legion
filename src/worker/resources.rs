@@ -180,6 +180,11 @@ pub struct NodeResourceGovernor {
     /// Whether the worker was started with `resourceEnforcement.enabled` and
     /// this node can actually enforce (cgroup v2 present).
     enabled: bool,
+    /// Enforcement is off, but the kernel host guard runs, and it matches
+    /// sockets by cgroup leaf: every governed task still gets
+    /// `<parent>/share/legion-<alloc>`, with no limits written
+    /// (worker-plane-auth plan §6.13).
+    labels_only: bool,
     /// Hierarchy root relative to [`CGROUP_ROOT`] — the worker config's
     /// `cgroupParent`, `legion` by default.
     root: PathBuf,
@@ -204,10 +209,27 @@ impl NodeResourceGovernor {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
+            labels_only: false,
             root: PathBuf::from("legion"),
             usable_cores: Vec::new(),
             reserved: BTreeMap::new(),
         }
+    }
+
+    /// The governor for a node with enforcement off where the kernel host
+    /// guard runs: leaves for every task, no limits, no cpusets.
+    fn labels_only_from_env() -> Option<Self> {
+        let wanted = std::env::var(crate::constants::ENV_HOST_GUARD_KERNEL).as_deref() == Ok("1");
+        if !wanted || !enforcement_available() {
+            return None;
+        }
+        Some(Self {
+            enabled: false,
+            labels_only: true,
+            root: PathBuf::from(crate::task_plugins::exec_isolation::cgroup_parent()),
+            usable_cores: Vec::new(),
+            reserved: BTreeMap::new(),
+        })
     }
 
     /// Build the governor from the worker's `resourceEnforcement` config (via
@@ -218,7 +240,7 @@ impl NodeResourceGovernor {
     /// daemon already warned about it at start.
     pub fn from_env() -> Self {
         if !crate::task_plugins::exec_isolation::enforcement_enabled() {
-            return Self::disabled();
+            return Self::labels_only_from_env().unwrap_or_else(Self::disabled);
         }
         if !cfg!(target_os = "linux") {
             // The daemon logged what the switch means here at start.
@@ -248,6 +270,7 @@ impl NodeResourceGovernor {
         );
         Self {
             enabled: true,
+            labels_only: false,
             root,
             usable_cores,
             reserved: BTreeMap::new(),
@@ -334,7 +357,24 @@ impl NodeResourceGovernor {
         task: &TaskConfig,
         mode: ResourceEnforcement,
     ) -> R<Option<ResourceAssignment>> {
-        if !self.enabled || mode == ResourceEnforcement::Unsupported {
+        if mode == ResourceEnforcement::Unsupported {
+            return Ok(None);
+        }
+        if self.labels_only {
+            // A leaf for the kernel host guard to match, and nothing else.
+            return Ok(Some(ResourceAssignment {
+                slice: Slice::Share,
+                cgroup_path: self
+                    .root
+                    .join(Slice::Share.dir_name())
+                    .join(leaf_name(allocation_id)),
+                cores: None,
+                cpu_weight: None,
+                memory_limit_bytes: None,
+                memory_low_bytes: None,
+            }));
+        }
+        if !self.enabled {
             return Ok(None);
         }
 
@@ -400,6 +440,12 @@ impl NodeResourceGovernor {
     /// releasing an allocation that reserved nothing, or releasing twice, is
     /// a no-op.
     pub fn release(&mut self, allocation_id: i64, assignment: Option<&ResourceAssignment>) {
+        if self.labels_only {
+            if let Some(assignment) = assignment {
+                remove_task_cgroup(assignment);
+            }
+            return;
+        }
         if !self.enabled {
             return;
         }
@@ -468,6 +514,13 @@ impl NodeResourceGovernor {
     /// Create the hierarchy root and both slices, delegating the controllers
     /// the limits need. Idempotent — every start calls it.
     fn ensure_hierarchy(&self) -> R<()> {
+        if self.labels_only {
+            // Directories only: no controllers are delegated, no limits.
+            let root = PathBuf::from(CGROUP_ROOT).join(&self.root);
+            let share = root.join(Slice::Share.dir_name());
+            return std::fs::create_dir_all(&share)
+                .with_context(|| format!("create cgroup {}", share.display()));
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -680,10 +733,45 @@ mod tests {
     fn governor(cores: &[u32]) -> NodeResourceGovernor {
         NodeResourceGovernor {
             enabled: true,
+            labels_only: false,
             root: PathBuf::from("legion"),
             usable_cores: cores.to_vec(),
             reserved: BTreeMap::new(),
         }
+    }
+
+    /// With enforcement off and the kernel host guard on, a task still gets
+    /// its leaf, so the guard can match its sockets, and nothing else: no
+    /// cores are reserved and no limit is written.
+    #[test]
+    fn labels_only_gives_every_task_a_leaf_and_no_limits_test() -> R<()> {
+        let mut governor = NodeResourceGovernor {
+            enabled: false,
+            labels_only: true,
+            root: PathBuf::from("legion"),
+            usable_cores: Vec::new(),
+            reserved: BTreeMap::new(),
+        };
+        let task: TaskConfig = serde_json::from_value(serde_json::json!({
+            "name": "web", "runtime": "exec",
+            "resources": { "cores": 2, "memory": 256, "cpu": 500 },
+            "config": { "command": ["true"] },
+        }))?;
+        let assignment = governor
+            .plan(7, &task, ResourceEnforcement::WorkerCgroup)?
+            .expect("a leaf");
+        assert_eq!(
+            assignment.cgroup_path,
+            PathBuf::from("legion/share/legion-7")
+        );
+        assert_eq!(assignment.cores, None);
+        assert_eq!(assignment.cpu_weight, None);
+        assert_eq!(assignment.memory_limit_bytes, None);
+        assert!(governor.reserved_cores().is_empty());
+        assert!(governor
+            .plan(8, &task, ResourceEnforcement::Unsupported)?
+            .is_none());
+        Ok(())
     }
 
     #[test]
@@ -1011,6 +1099,7 @@ mod tests {
         let root = format!("legion-phase2-test-{}", std::process::id());
         let mut governor = NodeResourceGovernor {
             enabled: true,
+            labels_only: false,
             root: PathBuf::from(&root),
             usable_cores: fingerprint_usable_cores(),
             reserved: BTreeMap::new(),
