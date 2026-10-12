@@ -13,10 +13,11 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use crate::agent::{self, AgentConfig, VsockDial, HOST_CID};
+use crate::agent::{self, AgentConfig, VsockDial, VsockListen, HOST_CID};
 
 const USAGE: &str = "\
 usage: legion-guest guest-agent [--proxy-port PORT] [--dns-port PORT] [--host-cid CID]
+                                [--ingress-port PORT]...
                                 [--resume-watch [--identity DEVICE] [--poll-ms MS]]
        legion-guest guest-resume [--identity DEVICE] [--poll-ms MS]
 
@@ -29,6 +30,10 @@ pub struct AgentArgs {
     /// 0 disables the DNS relay.
     pub dns_port: u16,
     pub host_cid: u32,
+    /// Ports the node datapath fronts (`--ingress-port`, repeated): the
+    /// agent listens on each as a vsock port and relays to the workload's
+    /// loopback port of the same number.
+    pub ingress_ports: Vec<u16>,
     /// Also run the resume watch in this process (a gated sandbox launched
     /// for memory checkpoints), so a restore can close the relays it holds.
     pub resume_watch: Option<ResumeArgs>,
@@ -40,6 +45,7 @@ impl Default for AgentArgs {
             proxy_port: agent::PROXY_PORT as u16,
             dns_port: agent::DNS_PORT as u16,
             host_cid: HOST_CID,
+            ingress_ports: Vec::new(),
             resume_watch: None,
         }
     }
@@ -113,6 +119,15 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
                     }
                     "--dns-port" => parsed.dns_port = number(flag, value(flag, &mut rest)?)?,
                     "--host-cid" => parsed.host_cid = number(flag, value(flag, &mut rest)?)?,
+                    "--ingress-port" => {
+                        let port: u16 = number(flag, value(flag, &mut rest)?)?;
+                        if port == 0 {
+                            bail!("--ingress-port must be a port from 1 to 65535\n{USAGE}");
+                        }
+                        if !parsed.ingress_ports.contains(&port) {
+                            parsed.ingress_ports.push(port);
+                        }
+                    }
                     "--resume-watch" => resume_watch = true,
                     "--identity" => {
                         watch.identity = Some(PathBuf::from(value(flag, &mut rest)?));
@@ -174,27 +189,34 @@ fn run_agent(args: &AgentArgs) -> Result<()> {
             .then(|| format!("127.0.0.1:{}", args.dns_port).parse())
             .transpose()?,
         dns_port: u32::from(args.dns_port),
+        ingress_ports: args.ingress_ports.clone(),
     };
-    let started = agent::start(config, Arc::new(VsockDial { cid: args.host_cid }))?;
+    let started = agent::start(
+        config,
+        Arc::new(VsockDial { cid: args.host_cid }),
+        Arc::new(VsockListen),
+    )?;
     eprintln!(
-        "legion-guest-agent: proxy on {}, dns on {} -> host cid {}",
+        "legion-guest-agent: proxy on {}, dns on {} -> host cid {}; ingress on vsock {}",
         started.proxy_addr,
         started
             .dns_addr
             .map(|addr| addr.to_string())
             .unwrap_or_else(|| "off".into()),
-        args.host_cid
+        args.host_cid,
+        port_list(&started.ingress.ports()),
     );
+    log_ingress_failures(&started.ingress_errors);
     if let Some(watch) = args.resume_watch.as_ref() {
-        let relays = started.relays.clone();
-        return run_agent_watch(watch, &move || {
-            let closed = relays.close_all();
+        return run_agent_watch(watch, &|identity: &crate::identity::ResumeIdentity| {
+            let (closed, failed) = started.restored(&identity.ingress_ports);
             if closed > 0 {
                 eprintln!(
                     "legion-guest-agent: restored; closed {closed} connection(s) the capture \
                      left dead"
                 );
             }
+            log_ingress_failures(&failed);
         });
     }
     // The relays run on their own threads; this one only keeps the process
@@ -204,17 +226,43 @@ fn run_agent(args: &AgentArgs) -> Result<()> {
     }
 }
 
+/// `20001, 20002`, or `none`.
+fn port_list(ports: &[u16]) -> String {
+    if ports.is_empty() {
+        return "none".into();
+    }
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One console line per ingress port the agent could not listen on. The
+/// datapath's connections to that port then fail, and the console says why.
+fn log_ingress_failures(failed: &[(u16, std::io::Error)]) {
+    for (port, err) in failed {
+        eprintln!("legion-guest-agent: cannot listen on vsock port {port} for ingress: {err}");
+    }
+}
+
 /// The agent's resume watch: the resume handler's loop, closing the agent's
-/// relays first on every restore.
+/// relays (and adding the restore's ingress ports) first on every restore.
 #[cfg(target_os = "linux")]
-fn run_agent_watch(args: &ResumeArgs, on_restore: &(dyn Fn() + Sync)) -> Result<()> {
+fn run_agent_watch(
+    args: &ResumeArgs,
+    on_restore: &(dyn Fn(&crate::identity::ResumeIdentity) + Sync),
+) -> Result<()> {
     let device = identity_device(args.identity.as_ref())?;
     eprintln!("legion-guest-resume: watching {}", device.display());
     crate::resume::watch_with(&device, &crate::resume::LinuxGuest, args.poll, on_restore)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_agent_watch(args: &ResumeArgs, _on_restore: &(dyn Fn() + Sync)) -> Result<()> {
+fn run_agent_watch(
+    args: &ResumeArgs,
+    _on_restore: &(dyn Fn(&crate::identity::ResumeIdentity) + Sync),
+) -> Result<()> {
     let _ = identity_device(args.identity.as_ref());
     bail!("guest-agent --resume-watch runs inside a Linux sandbox guest only")
 }
@@ -297,6 +345,27 @@ mod tests {
                 ..AgentArgs::default()
             })
         );
+        // A gated sandbox that advertises ports: one flag per port,
+        // de-duplicated.
+        assert_eq!(
+            parse(&args(&[
+                "guest-agent",
+                "--ingress-port",
+                "20001",
+                "--ingress-port=8080",
+                "--ingress-port",
+                "20001",
+                "--resume-watch",
+            ]))
+            .unwrap(),
+            Invocation::Agent(AgentArgs {
+                ingress_ports: vec![20001, 8080],
+                resume_watch: Some(ResumeArgs::default()),
+                ..AgentArgs::default()
+            })
+        );
+        let err = parse(&args(&["guest-agent", "--ingress-port", "0"])).unwrap_err();
+        assert!(err.to_string().contains("from 1 to 65535"), "{err}");
         let err = parse(&args(&["guest-agent", "--identity", "/dev/vdc"])).unwrap_err();
         assert!(
             err.to_string().contains("only applies with --resume-watch"),

@@ -893,6 +893,12 @@ proxy variables and the same `resolv.conf` a gated container gets work
 unchanged. The node checks every connection, and the guest cannot bypass it
 because there is no other way out.
 
+The agent also carries the other direction. For every port the task
+advertises, it listens on that vsock port in the guest and relays each
+connection to the workload's `127.0.0.1:<port>`. The node datapath opens
+those connections after its ingress chain has run (see
+[Ingress into a sandbox](#ingress-into-a-sandbox)).
+
 **The guest agent binary.** The worker copies `legion-guest`, a statically
 linked build of the agent and the resume handler, into the rootfs as
 `/legion/legion`, so it runs on any image, `alpine:latest` and busybox
@@ -915,10 +921,11 @@ What is and is not enforced:
   to drop one of them. It also needs a microVM backend. With `hypervisor =
   "dev"` (a container standing in for a VM), the start fails with that
   reason instead of running unprotected.
-- Ingress into a gated sandbox is not supported yet: the guest has no NIC,
-  and the datapath does not dial into a guest. Submit refuses
-  `network.ports` on a gated sandbox (`ingress into a gated sandbox is not
-  supported yet`). Wire the guest to a TAP to serve ports.
+- Advertised ports work. The datapath owns each one on the node and dials
+  into the guest over the VMM's vsock socket, so every inbound connection
+  passes the ingress chain first. A gated guest fails closed on ingress like
+  any gated allocation (see
+  [Ingress into a sandbox](#ingress-into-a-sandbox)).
 - The edge-boot `boot` gate uses the same policy-withheld marker the vsock
   listeners check, so a provisional sandbox has no network until it is
   ratified.
@@ -943,11 +950,12 @@ closes the relays it holds when it sees the restore, so clients get a prompt
 close rather than a hang. See
 [suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
 
-Current status: the host side (VMM configuration, listeners, status, the
-restore-time socket move) and the agent are implemented and unit-tested over
-Unix sockets with the VMMs' naming, and against fake VMM APIs. This
-repository's CI has no KVM, so it does not run an end-to-end boot or restore
-with a real VMM. `auto` resolves to `host` for sandboxes, as it does for
+Current status: the host side (VMM configuration, listeners, the ingress
+dial and its handshake, status, the restore-time socket move) and the agent
+(egress and ingress relays) are implemented and unit-tested over Unix
+sockets with the VMMs' naming, and against fake VMMs. This repository's CI
+has no KVM, so it does not run an end-to-end boot, restore, or inbound
+connection with a real VMM. `auto` resolves to `host` for sandboxes, as it does for
 every runtime.
 If the guest binary cannot run on the image (the glibc fallback on a musl
 image), init reports it on the console and the guest has no network. This
@@ -1047,6 +1055,76 @@ headers). The original peer appears in the access log and in `net.denied`
 events, and an ingress `proxy` hop receives it in the PROXY v2 header. There
 is one listener per advertised port per allocation. The cluster edge and per-tag routing on ingress are not part of
 this feature.
+
+### Ingress into a sandbox
+
+A sandbox guest has its own network stack, so a port it listens on is not
+on the node's loopback. The datapath fronts **every** port a sandbox
+advertises, with or without an ingress chain: it owns `<address>:<host
+port>` on the node, as it does for any fronted port, and dials into the
+guest for each connection it allows.
+
+| The sandbox's network | How the datapath reaches the guest |
+| --- | --- |
+| `network.mode = "gated"` (no NIC) | Through the VMM's vsock socket for the allocation, `<alloc dir>/.sandbox/vsock.sock`, with the host-initiated handshake both Firecracker and cloud-hypervisor implement: it writes `CONNECT <port>\n`, expects `OK <n>\n`, then splices. Anything else (a closed stream, an error line, silence for two seconds) is a failed dial. In the guest, the agent listens on vsock port `<port>` and relays to `127.0.0.1:<port>`. |
+| `config.network = { mode = "tap", ... }` | TCP to the guest's leased bridge address, `<guest address>:<port>`. |
+| Neither (`config.network = { mode = "none" }`, or no network config while `auto` is `host`) | Nothing can reach the guest's loopback, so submit refuses `network.ports`. |
+
+```nickel
+network = {
+    mode = "gated",
+    ports = [{ name = "http" }],
+    egress = { allow = ["pypi.org"] },
+},
+```
+
+The workload binds `$LEGION_PORT_HTTP` as on every runtime: a gated guest
+on loopback or every address (`0.0.0.0`), a TAP guest on its bridge address
+or every address. That is the advertised port's own number when there is no
+ingress chain (the guest's stack is its own, so it does not collide with
+the datapath's listener on the node), and the private twin when there is
+one. The vsock port is the same number, so one number names both ends.
+
+Everything else is unchanged: the ingress chain, TLS termination, the
+access log, `net.denied`, the activity ledger behind the `connections`
+idle signal, and `legion net doctor`. A gated guest fails closed on
+ingress like any gated allocation: while its policy is pending or its
+boot gate is shut, nothing is accepted.
+
+**Across a memory checkpoint.** A suspended, resumed, or forked sandbox
+keeps serving its ports through the restoring allocation's listeners. The
+restored workload still listens on the ports it was captured with, even
+when the new placement assigned different numbers. The checkpoint records
+those ports, and the datapath dials them. A port the new placement adds is
+added to the guest agent by the restore's identity. A TAP guest is dialed
+at the address the restore leased it. Connections open at capture are
+closed, as on egress.
+
+Failure modes:
+
+- **Nothing listens in the guest yet.** The agent closes the stream at
+  once (a gated guest), or the dial is refused (a TAP guest). The client
+  sees its connection close, and a health check through the port fails
+  until the workload is up.
+- **The guest agent is not running** (the glibc fallback on a musl image).
+  The VMM closes the handshake, so every inbound connection closes. The
+  guest has no egress either, so this fails closed.
+- **A TAP guest has no lease yet.** The dial fails with `the sandbox guest
+  has no address leased in <dir> yet`.
+
+Limits:
+
+- An ingress `proxy` hop hands the connection to your proxy, which cannot
+  reach a port inside a sandbox guest, as with a gated task's private port.
+- In a gated guest, `127.0.0.1:1080` belongs to the agent's egress proxy
+  relay, so the workload cannot serve on port 1080.
+- Firecracker 1.17 fixes host-initiated vsock connections that stop
+  receiving after a VM is paused and resumed in place (Firecracker #6100),
+  which a live `snapshot create --memory` or a fork does to the origin.
+  Legion does not require 1.17 yet. Run 1.17 or later for gated sandboxes
+  that serve ports.
+- CI has no KVM, so the vsock path is tested against a fake VMM and a fake
+  guest, not a real microVM.
 
 **Rollouts.** A task with a `service` block drains before it stops. It
 leaves the catalog, keeps serving for one heartbeat interval (or
@@ -1231,8 +1309,9 @@ This section lists what that covers and what it does not.
   `host` for every runtime, so set `gated` explicitly.
 - **Ingress is enforced everywhere it applies.** The datapath owns the
   advertised port and the task binds a private twin, on every runtime and
-  platform. TCP only. The task sees the datapath as the peer, not the
-  original client.
+  platform. A gated or TAP-wired sandbox's ports are always fronted, over
+  vsock or at the guest's bridge address. TCP only. The task sees the
+  datapath as the peer, not the original client.
 - **TLS**: ingress chains terminate `server`/`mutual` TLS with your files, a
   certificate held in KV (swapped live on renewal), or the mesh certificate.
   Legion stores and serves certificates but does not issue public ones: a
@@ -1240,7 +1319,7 @@ This section lists what that covers and what it does not.
   workload identity, never per-workload certificates. There is no kTLS fast
   path (a terminated connection is copied in user space), no revocation
   beyond the 24-hour lifetime, and an ingress `proxy` hop cannot reach a
-  gated task's private port.
+  gated task's private port or a port inside a sandbox guest.
 - **No HTTP/2 or HTTP/3** (`protocol = "h2"` is rejected with that reason),
   no UDP, no WASM handlers, and no TLS interception. Legion will not add TLS
   interception. Use external upstreams when policy needs to see the body,

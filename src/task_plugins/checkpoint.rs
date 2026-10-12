@@ -306,6 +306,7 @@ mod tests {
                 dns: vec!["10.88.0.1".into()],
                 bridge: "br0".into(),
             }),
+            ingress_ports: vec![8080, 20001],
         }
     }
 

@@ -26,6 +26,17 @@
 //! Firecracker and cloud-hypervisor use for the host side of vsock, i.e.
 //! exactly what `netd` binds.
 //!
+//! **Ingress.** The other direction is [`Ingress`]: for each port the task
+//! advertises, the agent listens on `AF_VSOCK` at that port number and
+//! relays every connection to the workload's `127.0.0.1:<port>`. The node
+//! datapath opens those connections through the VMM's base socket with the
+//! host-initiated handshake (`CONNECT <port>`), after its ingress chain,
+//! TLS, and accounting have run. The vsock port is the port the workload
+//! binds (`LEGION_PORT_<label>`), so one number names both ends; the agent's
+//! egress ports (1080, 53) are host ports, a separate space. The listener is
+//! abstracted as [`GuestListen`] so the relay is tested over Unix sockets
+//! too.
+//!
 //! **Across a memory restore.** Every relay dials a fresh vsock stream, so
 //! the first connection after a restore reaches the restoring allocation's
 //! listener (the worker moves the VM onto its own socket). Streams that were
@@ -34,13 +45,17 @@
 //! them half open. The agent tracks every open relay in [`Relays`], and its
 //! resume watch ([`crate::resume::Watcher`]) closes them all when it sees a
 //! restore, so a guest client gets a prompt close on every VMM version and
-//! never a hang. The agent's own loopback listeners are guest-internal and
-//! survive the restore unchanged.
+//! never a hang. The agent's own listeners, loopback and vsock alike, are
+//! guest kernel state and survive the restore unchanged: a restored guest
+//! keeps the ports it was captured with, so the datapath of the restoring
+//! allocation dials the same vsock ports. A port the restore adds arrives
+//! on the identity disk (`ResumeIdentity::ingress_ports`), and the resume
+//! watch hands it to [`Ingress::ensure`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::unix::net::UnixStream;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -203,6 +218,221 @@ fn vsock_connect(_cid: u32, _port: u32) -> io::Result<UnixStream> {
     ))
 }
 
+/// Where host-initiated connections arrive: the guest side of ingress.
+pub trait GuestListen: Send + Sync {
+    /// Listen on guest port `port`.
+    fn listen(&self, port: u32) -> io::Result<Box<dyn GuestListener>>;
+}
+
+/// One bound ingress listener.
+pub trait GuestListener: Send {
+    /// The next connection the host opened to this port.
+    fn accept(&self) -> io::Result<Box<dyn HostStream>>;
+}
+
+/// The real thing: `AF_VSOCK` on any CID. The VMM delivers a host's
+/// `CONNECT <port>` on its base socket to the guest listener on `port`.
+pub struct VsockListen;
+
+impl GuestListen for VsockListen {
+    fn listen(&self, port: u32) -> io::Result<Box<dyn GuestListener>> {
+        vsock_listen(port)
+    }
+}
+
+/// Tests: a Unix listener at `<base>_<port>` stands in for the vsock port.
+pub struct UnixListen {
+    pub base: PathBuf,
+}
+
+impl GuestListen for UnixListen {
+    fn listen(&self, port: u32) -> io::Result<Box<dyn GuestListener>> {
+        Ok(Box::new(UnixListener::bind(host_socket_path(
+            &self.base, port,
+        ))?))
+    }
+}
+
+impl GuestListener for UnixListener {
+    fn accept(&self) -> io::Result<Box<dyn HostStream>> {
+        Ok(Box::new(UnixListener::accept(self)?.0))
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VsockListener {
+    fd: std::os::unix::io::OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl GuestListener for VsockListener {
+    fn accept(&self) -> io::Result<Box<dyn HostStream>> {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        loop {
+            // SAFETY: accept4(2) on a listening descriptor we own; the peer
+            // address is not wanted, so both out-pointers are null.
+            let fd = unsafe {
+                libc::accept4(
+                    self.fd.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                // SAFETY: a freshly accepted stream descriptor we now own. A
+                // vsock stream behaves as a stream socket for read, write,
+                // shutdown, and dup, which is all `UnixStream` asks of it.
+                // (std's `UnixListener::accept` would reject the vsock peer
+                // address, which is why the accept is done here.)
+                return Ok(Box::new(unsafe { UnixStream::from_raw_fd(fd) }));
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn vsock_listen(port: u32) -> io::Result<Box<dyn GuestListener>> {
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+    // SAFETY: plain socket(2)/bind(2)/listen(2) on a freshly created
+    // descriptor, owned by `OwnedFd` from the moment it exists; the sockaddr
+    // is fully initialised and its length is its size.
+    unsafe {
+        let raw = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = OwnedFd::from_raw_fd(raw);
+        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_cid = libc::VMADDR_CID_ANY;
+        addr.svm_port = port;
+        if libc::bind(
+            raw,
+            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::listen(raw, 128) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Box::new(VsockListener { fd }))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn vsock_listen(_port: u32) -> io::Result<Box<dyn GuestListener>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "AF_VSOCK is Linux-only",
+    ))
+}
+
+/// How long the agent waits for the workload's loopback port to accept.
+const WORKLOAD_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The agent's ingress side: one listener per port the node datapath
+/// fronts, each relaying host-initiated connections to the workload (see
+/// the module docs). Its relays are tracked in the same [`Relays`] as the
+/// egress ones, so a restore closes both.
+pub struct Ingress {
+    listen: Arc<dyn GuestListen>,
+    relays: Arc<Relays>,
+    /// Where the workload listens: loopback in a guest.
+    workload: IpAddr,
+    ports: Mutex<BTreeSet<u16>>,
+}
+
+impl Ingress {
+    pub fn new(listen: Arc<dyn GuestListen>, relays: Arc<Relays>) -> Arc<Self> {
+        Arc::new(Ingress {
+            listen,
+            relays,
+            workload: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ports: Mutex::new(BTreeSet::new()),
+        })
+    }
+
+    /// Listen on every port in `ports` that is not listened on yet. A port
+    /// already served keeps its listener (a restored guest's listeners are
+    /// part of its memory and survive the restore), and nothing is ever
+    /// unbound. Returns the ports it could not listen on, with why.
+    pub fn ensure(self: &Arc<Self>, ports: &[u16]) -> Vec<(u16, io::Error)> {
+        let mut failed = Vec::new();
+        for &port in ports {
+            if self.lock().contains(&port) {
+                continue;
+            }
+            let listener = match self.listen.listen(u32::from(port)) {
+                Ok(listener) => listener,
+                Err(err) => {
+                    failed.push((port, err));
+                    continue;
+                }
+            };
+            let this = self.clone();
+            match thread::Builder::new()
+                .name(format!("legion-guest-ingress-{port}"))
+                .spawn(move || this.serve(port, listener))
+            {
+                Ok(_) => {
+                    self.lock().insert(port);
+                }
+                Err(err) => failed.push((port, err)),
+            }
+        }
+        failed
+    }
+
+    /// The ports listened on now.
+    pub fn ports(&self) -> Vec<u16> {
+        self.lock().iter().copied().collect()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<u16>> {
+        self.ports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Accept host connections on `port` forever, relaying each to the
+    /// workload on the same port.
+    fn serve(self: Arc<Self>, port: u16, listener: Box<dyn GuestListener>) {
+        loop {
+            let host = match listener.accept() {
+                Ok(host) => host,
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+            };
+            let workload = SocketAddr::new(self.workload, port);
+            let relays = self.relays.clone();
+            let _ = thread::Builder::new()
+                .name("legion-guest-ingress-relay".into())
+                .spawn(move || {
+                    // Nothing listening yet (a workload still starting, a
+                    // health check that came early): close the host stream
+                    // so the datapath sees the connection end at once.
+                    let Ok(client) = TcpStream::connect_timeout(&workload, WORKLOAD_DIAL_TIMEOUT)
+                    else {
+                        let _ = host.shutdown_both();
+                        return;
+                    };
+                    let id = relays.register(&client, &*host);
+                    relay_pair(client, host);
+                    relays.finish(id);
+                });
+        }
+    }
+}
+
 /// What to run.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -214,6 +444,9 @@ pub struct AgentConfig {
     pub dns_listen: Option<SocketAddr>,
     /// Host port the DNS relay dials.
     pub dns_port: u32,
+    /// Ports the node datapath fronts: the agent listens on each as a vsock
+    /// port and relays to the workload's loopback port of the same number.
+    pub ingress_ports: Vec<u16>,
 }
 
 impl Default for AgentConfig {
@@ -223,6 +456,7 @@ impl Default for AgentConfig {
             proxy_port: PROXY_PORT,
             dns_listen: Some("127.0.0.1:53".parse().expect("static")),
             dns_port: DNS_PORT,
+            ingress_ports: Vec::new(),
         }
     }
 }
@@ -233,14 +467,39 @@ pub struct Started {
     pub proxy_addr: SocketAddr,
     pub dns_addr: Option<SocketAddr>,
     pub relays: Arc<Relays>,
+    /// The ingress side, so the resume watch can add the ports a restore
+    /// names.
+    pub ingress: Arc<Ingress>,
+    /// Ingress ports the agent could not listen on, with why. The rest of
+    /// the agent runs regardless: egress never depends on ingress.
+    pub ingress_errors: Vec<(u16, io::Error)>,
+}
+
+impl Started {
+    /// What the agent does when its resume watch sees a restore: close
+    /// every relay the capture left dead (egress and ingress), then listen
+    /// on any ingress port the restore added. Returns how many relays it
+    /// closed and the ports it could not listen on.
+    pub fn restored(&self, ingress_ports: &[u16]) -> (usize, Vec<(u16, io::Error)>) {
+        let closed = self.relays.close_all();
+        (closed, self.ingress.ensure(ingress_ports))
+    }
 }
 
 /// Bind the guest listeners and start relaying on background threads.
-pub fn start(config: AgentConfig, dial: Arc<dyn HostDial>) -> io::Result<Started> {
+/// `listen` is where host-initiated (ingress) connections arrive:
+/// [`VsockListen`] in a guest.
+pub fn start(
+    config: AgentConfig,
+    dial: Arc<dyn HostDial>,
+    listen: Arc<dyn GuestListen>,
+) -> io::Result<Started> {
     let tcp = TcpListener::bind(config.proxy_listen)?;
     let proxy_addr = tcp.local_addr()?;
     let proxy_port = config.proxy_port;
     let relays = Arc::new(Relays::default());
+    let ingress = Ingress::new(listen, relays.clone());
+    let ingress_errors = ingress.ensure(&config.ingress_ports);
     {
         let dial = dial.clone();
         let relays = relays.clone();
@@ -264,6 +523,8 @@ pub fn start(config: AgentConfig, dial: Arc<dyn HostDial>) -> io::Result<Started
         proxy_addr,
         dns_addr,
         relays,
+        ingress,
+        ingress_errors,
     })
 }
 
@@ -412,6 +673,9 @@ mod tests {
                 ..Default::default()
             },
             dial.clone(),
+            Arc::new(UnixListen {
+                base: dir.path().join("guest.sock"),
+            }),
         )?;
 
         // TCP: what the guest sends reaches the host port and the reply
@@ -436,6 +700,133 @@ mod tests {
             base: dir.path().join("nothing"),
         });
         assert!(relay_dns_query(&*dead, DNS_PORT, b"x").is_err());
+        Ok(())
+    }
+
+    /// A workload on a loopback port that answers each line upper-cased,
+    /// then closes.
+    fn workload() -> io::Result<u16> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut line = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while stream.read(&mut byte).unwrap_or(0) == 1 {
+                        line.push(byte[0]);
+                        if byte[0] == b'\n' {
+                            let _ = stream.write_all(&line.to_ascii_uppercase());
+                            line.clear();
+                        }
+                    }
+                });
+            }
+        });
+        Ok(port)
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Gated plan §6.10: a host-initiated connection to guest port P (here
+    /// a Unix socket standing in for vsock port P) reaches the workload on
+    /// `127.0.0.1:P`, both ways. The relay is tracked, so a restore closes
+    /// it like an egress relay, and a later connection works again.
+    #[test]
+    fn ingress_relays_host_connections_to_the_workload_port() -> io::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let port = workload()?;
+        let guest = dir.path().join("guest.sock");
+        let started = start(
+            AgentConfig {
+                proxy_listen: "127.0.0.1:0".parse().unwrap(),
+                dns_listen: None,
+                ingress_ports: vec![port],
+                ..Default::default()
+            },
+            Arc::new(UnixDial {
+                base: dir.path().join("host.sock"),
+            }),
+            Arc::new(UnixListen {
+                base: guest.clone(),
+            }),
+        )?;
+        assert!(started.ingress_errors.is_empty());
+        assert_eq!(started.ingress.ports(), vec![port]);
+
+        // What the host sends reaches the workload, and its answer comes
+        // back on the same stream.
+        let mut host = UnixStream::connect(host_socket_path(&guest, u32::from(port)))?;
+        host.set_read_timeout(Some(Duration::from_secs(5)))?;
+        host.write_all(b"hello guest\n")?;
+        let mut answer = [0u8; 12];
+        host.read_exact(&mut answer)?;
+        assert_eq!(&answer, b"HELLO GUEST\n");
+        wait_until("the relay is tracked", || started.relays.open_count() == 1);
+
+        // A restore closes it: the host sees the stream end promptly.
+        assert_eq!(started.relays.close_all(), 1);
+        let mut rest = Vec::new();
+        let read = host.read_to_end(&mut rest);
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?} {rest:?}");
+        wait_until("the relay finishes", || started.relays.open_count() == 0);
+
+        // The listener itself survives, so the next connection works.
+        let mut again = UnixStream::connect(host_socket_path(&guest, u32::from(port)))?;
+        again.set_read_timeout(Some(Duration::from_secs(5)))?;
+        again.write_all(b"again\n")?;
+        let mut answer = [0u8; 6];
+        again.read_exact(&mut answer)?;
+        assert_eq!(&answer, b"AGAIN\n");
+        Ok(())
+    }
+
+    /// The ports a restore names are added, ports already served are left
+    /// alone, a port that cannot be listened on is reported, and a port
+    /// with no workload behind it closes the host stream at once.
+    #[test]
+    fn ingress_ensure_adds_ports_and_reports_failures() -> io::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let guest = dir.path().join("guest.sock");
+        let ingress = Ingress::new(
+            Arc::new(UnixListen {
+                base: guest.clone(),
+            }),
+            Arc::new(Relays::default()),
+        );
+        let first = workload()?;
+        assert!(ingress.ensure(&[first]).is_empty());
+        // Already served: no second bind (which would fail on the path).
+        assert!(ingress.ensure(&[first]).is_empty());
+
+        let second = workload()?;
+        // Something already holds the second port's socket path.
+        let squatter = UnixListener::bind(host_socket_path(&guest, u32::from(second)))?;
+        let failed = ingress.ensure(&[first, second]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, second);
+        drop(squatter);
+        std::fs::remove_file(host_socket_path(&guest, u32::from(second)))?;
+        assert!(ingress.ensure(&[second]).is_empty());
+        let mut ports = vec![first, second];
+        ports.sort_unstable();
+        assert_eq!(ingress.ports(), ports);
+
+        // A port nobody listens on in the guest: the stream closes.
+        let idle = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        assert!(ingress.ensure(&[idle]).is_empty());
+        let mut host = UnixStream::connect(host_socket_path(&guest, u32::from(idle)))?;
+        host.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut buf = [0u8; 4];
+        let read = host.read(&mut buf);
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
         Ok(())
     }
 }

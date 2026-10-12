@@ -181,9 +181,10 @@ pub struct HttpSettings {
     /// in front of the task): selects the chain, the metric labels, and how
     /// denials are attributed.
     pub direction: &'static str,
-    /// For ingress into a gated task: dial the private port inside this
-    /// namespace.
-    pub netns: Option<PathBuf>,
+    /// For ingress: how a request reaches the task (its loopback, inside
+    /// its gated namespace when it has one, or a sandbox guest over vsock or
+    /// on its bridge). `None` dials the picked endpoint over TCP.
+    pub task: Option<crate::worker::netd::ingress::TaskTarget>,
     pub context: Arc<ForwarderContext>,
     pub balancer: Arc<dyn Balancer>,
     pub endpoints: Arc<Mutex<Vec<Endpoint>>>,
@@ -295,7 +296,7 @@ impl HttpSettings {
             key,
             target,
             direction: "egress",
-            netns: None,
+            task: None,
             context,
             balancer,
             endpoints,
@@ -346,18 +347,16 @@ impl HttpSettings {
     /// management (there is exactly one backend), no handlers yet.
     pub fn for_ingress(
         allocation_id: i64,
-        label: String,
-        private_port: u16,
-        netns: Option<PathBuf>,
+        task: crate::worker::netd::ingress::TaskTarget,
         context: Arc<ForwarderContext>,
         log_dir: Option<PathBuf>,
     ) -> Self {
         let mut settings = HttpSettings::new(
             allocation_id,
-            label,
+            task.label.clone(),
             Some(UpstreamTarget {
                 host: "127.0.0.1".to_string(),
-                port: private_port,
+                port: task.port,
                 tls: false,
                 http: true,
             }),
@@ -370,7 +369,7 @@ impl HttpSettings {
             log_dir,
         );
         settings.direction = "ingress";
-        settings.netns = netns;
+        settings.task = Some(task);
         settings
     }
 
@@ -1219,8 +1218,10 @@ struct HandOff {
 /// Dial `addr`, send the request, and return the response with its body
 /// streamed through. `hand_off` sends it to a proxy instead of the origin;
 /// `mesh` dials a mesh endpoint with this node's certificate and names the
-/// workload in a PROXY v2 header before the request. `injected` replaces
-/// the task's own headers of the same names (credential injection).
+/// workload in a PROXY v2 header before the request. On an ingress listener
+/// with neither, the request goes to the task itself ([`HttpSettings::task`]).
+/// `injected` replaces the task's own headers of the same names (credential
+/// injection).
 #[allow(clippy::too_many_arguments)]
 async fn attempt_request(
     settings: &Arc<HttpSettings>,
@@ -1232,23 +1233,6 @@ async fn attempt_request(
     mesh: Option<&Endpoint>,
     injected: &Injected,
 ) -> Result<Response<OutBody>, AttemptError> {
-    let stream = match settings.netns.clone() {
-        Some(netns) => {
-            let socket: std::net::SocketAddr = addr
-                .parse()
-                .map_err(|_| AttemptError::Connect(format!("invalid address {addr}")))?;
-            crate::worker::netd::netns::connect_tcp(Some(netns), socket)
-                .await
-                .map_err(|err| AttemptError::Connect(err.to_string()))?
-        }
-        None => match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => return Err(AttemptError::Connect(err.to_string())),
-            Err(_) => return Err(AttemptError::Connect("dial timed out".into())),
-        },
-    };
-    let _ = stream.set_nodelay(true);
-
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -1295,6 +1279,25 @@ async fn attempt_request(
     let request = builder
         .body(full(body))
         .map_err(|err| AttemptError::Reset(err.to_string()))?;
+
+    // Ingress: the task itself, through its namespace, its VMM's vsock, or
+    // its bridge. A `proxy` hop and a mesh endpoint are dialed on the host,
+    // like any endpoint.
+    if hand_off.is_none() && mesh.is_none() {
+        if let Some(task) = settings.task.as_ref() {
+            let stream = task
+                .connect()
+                .await
+                .map_err(|err| AttemptError::Connect(format!("{err:#}")))?;
+            return send_over(TokioIo::new(stream), request).await;
+        }
+    }
+    let stream = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => return Err(AttemptError::Connect(err.to_string())),
+        Err(_) => return Err(AttemptError::Connect("dial timed out".into())),
+    };
+    let _ = stream.set_nodelay(true);
 
     if let Some(endpoint) = mesh {
         let connector = settings

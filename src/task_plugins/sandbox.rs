@@ -566,7 +566,83 @@ pub fn vsock_socket_base(scratch: &Path) -> PathBuf {
 
 /// [`vsock_socket_base`] from the allocation directory the worker owns.
 pub fn vsock_socket_base_for(alloc_dir: &Path) -> PathBuf {
-    vsock_socket_base(&alloc_dir.join(".sandbox"))
+    vsock_socket_base(&sandbox_dir_for(alloc_dir))
+}
+
+/// A sandbox's scratch dir (`<alloc>/.sandbox`): its VMM sockets, root disk,
+/// boot record, and address lease.
+pub fn sandbox_dir_for(alloc_dir: &Path) -> PathBuf {
+    alloc_dir.join(".sandbox")
+}
+
+/// The port the guest in `scratch` listens on for the advertised port
+/// `label`, when its boot record says: a guest restored from a memory
+/// checkpoint keeps the ports it was captured with, even when the restoring
+/// allocation was assigned others. `None` means the allocation's own bind
+/// port. The node datapath reads this per ingress connection, since the
+/// record is written as the guest boots or resumes, after the datapath
+/// already listens (docs/network-handlers.md, "Ingress into a sandbox").
+pub fn sandbox_guest_port(scratch: &Path, label: &str) -> Option<u16> {
+    sandbox_checkpoint::recorded_guest_port(scratch, label)
+}
+
+/// The address a TAP-wired guest in `scratch` holds on its bridge, from
+/// its lease. `None` before the worker leased one (the guest has not
+/// started) and for gated and loopback-only guests.
+pub fn sandbox_guest_address(scratch: &Path) -> Option<std::net::Ipv4Addr> {
+    sandbox_addr::read_lease(scratch).map(|lease| lease.address)
+}
+
+/// The ports a gated guest's agent serves ingress on at boot: every
+/// advertised port's bind port, sorted and unique.
+fn gated_ingress_ports(allocation: &Allocation) -> Vec<u16> {
+    let mut ports: Vec<u16> = sandbox_checkpoint::boot_guest_ports(allocation.network.as_ref())
+        .into_values()
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// The port env a restored guest's `/legion/resume.env` carries:
+/// `LEGION_PORT_<label>` is the port the guest listens on (unchanged by the
+/// restore for a port it was captured with), and `LEGION_IP_<label>` and
+/// `LEGION_ADDR_<label>` are where the restoring allocation advertises it.
+fn restored_port_env(
+    allocation: &Allocation,
+    guest_ports: &BTreeMap<String, u16>,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    let Some(network) = allocation.network.as_ref() else {
+        return env;
+    };
+    for port in &network.ports {
+        let label = crate::structs::sanitize_env_label(&port.name);
+        let guest = guest_ports
+            .get(&port.name)
+            .copied()
+            .unwrap_or(port.bind_port());
+        env.insert(format!("LEGION_PORT_{label}"), guest.to_string());
+        if let Some(address) = network.address.as_deref() {
+            env.insert(format!("LEGION_IP_{label}"), address.to_string());
+            env.insert(
+                format!("LEGION_ADDR_{label}"),
+                format!("{address}:{}", port.host_port),
+            );
+        }
+    }
+    env
+}
+
+/// Whether a sandbox's runtime config wires its guest to a bridge
+/// (`config.network = { mode = "tap", ... }`), the one sandbox shape whose
+/// guest has an address the node can dial.
+pub fn sandbox_config_is_tap(config: &Value) -> bool {
+    config
+        .get("network")
+        .and_then(|network| network.get("mode"))
+        .and_then(Value::as_str)
+        == Some("tap")
 }
 
 /// The env var a TAP guest reads its leased address from (and its
@@ -884,6 +960,11 @@ fn build_stamp(layout: &Path, payload: &GuestPayload, artifacts: &[StagedArtifac
     if payload.resume_watch {
         hasher.update(b"\0resume-watch\0");
     }
+    for port in &payload.ingress_ports {
+        // The init script hands these to the agent.
+        hasher.update(b"\0ingress-port\0");
+        hasher.update(port.to_string().as_bytes());
+    }
     if let Some(binary) = payload.guest_binary.as_ref() {
         // A new guest binary (a worker upgrade, the static build installed)
         // must reach the guest, so it rebuilds the disk.
@@ -1119,6 +1200,14 @@ impl SandboxTaskPlugin {
             cwd: payload_cwd,
             disk_mounts: volumes.mounts,
             guest_agent: gated,
+            // A gated guest's advertised ports: the agent listens on each
+            // as a vsock port and relays to the workload, which binds the
+            // same number (`LEGION_PORT_<label>`).
+            ingress_ports: if gated {
+                gated_ingress_ports(allocation)
+            } else {
+                Vec::new()
+            },
             resume_watch,
             guest_binary: (gated || resume_watch)
                 .then(microvm::guest_binary)
@@ -2070,6 +2159,21 @@ impl TaskPlugin for SandboxTaskPlugin {
             )?;
             identity.guest_addr = Some(lease.guest_addr());
         }
+        // The restored workload still listens on the ports it was captured
+        // with. A gated guest's agent serves exactly those (plus any port
+        // the job added while it was suspended), and the refreshed env says
+        // where each one is advertised now.
+        let guest_ports =
+            sandbox_checkpoint::restored_guest_ports(manifest, allocation.network.as_ref());
+        if target.vsock.is_some() {
+            let mut ports: Vec<u16> = guest_ports.values().copied().collect();
+            ports.sort_unstable();
+            ports.dedup();
+            identity.ingress_ports = ports;
+        }
+        identity
+            .env
+            .extend(restored_port_env(allocation, &guest_ports));
         sandbox_checkpoint::restore_microvm(
             &target,
             instance,

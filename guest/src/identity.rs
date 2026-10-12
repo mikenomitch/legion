@@ -75,6 +75,17 @@ pub struct ResumeIdentity {
     /// guests, which have no NIC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_addr: Option<GuestAddr>,
+    /// The guest ports a gated guest serves ingress on after this restore
+    /// (docs/network-handlers.md, "Ingress into a sandbox"). For each port
+    /// P, the guest agent listens on vsock port P and relays every
+    /// connection the node datapath opens to the workload's `127.0.0.1:P`.
+    /// A restored guest keeps the ports it was captured with, so this
+    /// normally repeats them; a port the job added while the instance was
+    /// suspended is new here, and the agent starts listening on it. Empty
+    /// for TAP and loopback-only guests, and on the boot identity (the init
+    /// script hands the agent its first ports).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingress_ports: Vec<u16>,
 }
 
 /// One IPv4 address Legion leased a TAP guest from its bridge's pool

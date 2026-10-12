@@ -768,8 +768,9 @@
                     # ["network", "cpu", "exec"]. "connections" also counts
                     # an open ingress connection through the node datapath
                     # that sends nothing (a client waiting on a slow
-                    # response). A sandbox that is not gated has no datapath
-                    # ingress, so "connections" is refused there, as is
+                    # response). A sandbox that is not gated sends its own
+                    # traffic around the datapath, so "connections" is
+                    # refused there, as is
                     # "exec" on a sandbox pinned to a VMM (a microVM takes no
                     # exec sessions). On a sandbox, "network" also counts
                     # bytes the guest sends on its TAP or Apple container
@@ -879,11 +880,17 @@
             # where the egress policy decides (docs/network-handlers.md,
             # "Sandboxes"). A gated task that nothing allows denies every
             # destination (`gated-default`), so list what it needs.
-            # Ingress ports are refused on a gated sandbox (no NIC to reach).
+            # Advertised ports work on a gated sandbox: the node datapath
+            # owns the port on the node and dials into the guest over vsock,
+            # where the guest agent relays to the workload's
+            # 127.0.0.1:$LEGION_PORT_HTTP ("Ingress into a sandbox"). A
+            # sandbox that is neither gated nor on a TAP has loopback only,
+            # and submit refuses ports on it.
             # "auto" is "host" until the vsock path is exercised on a real
             # VMM.
             network = {
                 mode = "gated",
+                ports = [{ name = "http" }],
                 egress = { allow = ["pypi.org", "files.pythonhosted.org"] },
             },
             # Opt into snapshots (`legion snapshot`, docs/suspend-and-resume.md).

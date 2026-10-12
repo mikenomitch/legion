@@ -46,6 +46,7 @@
 //! same rewrite fork TAPs use. See
 //! `internal_docs/plans/gated-sandbox-checkpoints-plan.md` §6.2.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -162,6 +163,83 @@ pub(crate) struct SandboxCheckpointState {
     /// before Legion addressed TAP guests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_address: Option<String>,
+    /// The port the guest's workload listens on per advertised port label
+    /// (`LEGION_PORT_<label>` inside the guest). Fixed at the guest's first
+    /// boot and carried through every checkpoint, because the processes
+    /// listening on them ride the guest's memory: a restore into an
+    /// allocation with different port numbers still has its workload on
+    /// these, so the datapath dials these. Empty on checkpoints taken
+    /// before sandbox ingress, which then use the restoring allocation's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub guest_ports: BTreeMap<String, u16>,
+}
+
+/// The ports a freshly booted guest's workload binds: each advertised
+/// port's bind port (`AllocPort::bind_port`), by label.
+pub(crate) fn boot_guest_ports(
+    network: Option<&crate::structs::AllocNetwork>,
+) -> BTreeMap<String, u16> {
+    network
+        .map(|network| {
+            network
+                .ports
+                .iter()
+                .map(|port| (port.name.clone(), port.bind_port()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The ports a guest restored from `manifest` into an allocation with
+/// `network` listens on: what the checkpoint recorded for each label the
+/// allocation still advertises, and the allocation's own bind port for a
+/// label the checkpoint does not know (a port the job added while the
+/// instance was suspended, which only something `onResume` starts can
+/// serve).
+pub(crate) fn restored_guest_ports(
+    manifest: &SnapshotManifest,
+    network: Option<&crate::structs::AllocNetwork>,
+) -> BTreeMap<String, u16> {
+    let recorded = serde_json::from_value::<SandboxCheckpointState>(manifest.runtime_state.clone())
+        .map(|state| state.guest_ports)
+        .unwrap_or_default();
+    boot_guest_ports(network)
+        .into_iter()
+        .map(|(label, port)| {
+            let port = recorded.get(&label).copied().unwrap_or(port);
+            (label, port)
+        })
+        .collect()
+}
+
+/// The port the guest in `scratch` listens on for `label`, when its boot
+/// record says (a sandbox launched for memory checkpoints, booted or
+/// restored). `None` means the allocation's own bind port.
+pub(crate) fn recorded_guest_port(scratch: &Path, label: &str) -> Option<u16> {
+    read_boot_record(scratch)?.guest_ports.get(label).copied()
+}
+
+/// For tests elsewhere in the crate (the datapath's): a boot record that
+/// says only which ports the guest in `scratch` listens on.
+#[cfg(test)]
+pub(crate) fn write_guest_ports_record(scratch: &Path, ports: &[(&str, u16)]) -> R<()> {
+    write_boot_record(
+        scratch,
+        &SandboxCheckpointState {
+            vmm: "firecracker".into(),
+            link_key: "sbx-test".into(),
+            volume_count: 0,
+            vcpus: 1,
+            memory_mib: 128,
+            tap: None,
+            network: Some(GuestNetwork::Gated),
+            guest_address: None,
+            guest_ports: ports
+                .iter()
+                .map(|(label, port)| (label.to_string(), *port))
+                .collect(),
+        },
+    )
 }
 
 impl SandboxCheckpointState {
@@ -340,6 +418,9 @@ pub(crate) fn boot_identity(
         fork: false,
         files: tokens.files.clone(),
         guest_addr: None,
+        // The boot agent learns its ingress ports from its command line; the
+        // identity only carries them on a restore.
+        ingress_ports: Vec::new(),
     }
 }
 
@@ -409,6 +490,7 @@ pub(crate) fn prepare_checkpoint_launch(
         }),
         guest_address: crate::task_plugins::sandbox_addr::read_lease(scratch)
             .map(|lease| lease.address.to_string()),
+        guest_ports: boot_guest_ports(allocation.network.as_ref()),
     };
     let identity_path = scratch.join(IDENTITY_FILE);
     write_identity_disk(
@@ -1083,7 +1165,7 @@ fn retarget_cloud_hypervisor_config(
 }
 
 /// How long a gated restore waits for the datapath's egress proxy socket
-/// before resuming the guest anyway (gated plan §6.3, calls entry 25).
+/// before resuming the guest anyway (gated plan §6.3, calls entry 30).
 pub(crate) const DATAPATH_WAIT: Duration = Duration::from_secs(5);
 
 /// Wait up to `timeout` for the egress proxy's socket beside a gated guest's
@@ -1407,6 +1489,22 @@ pub(crate) fn restore_microvm(
     instance.pid = Some(child.id());
     instance.child = Some(child);
 
+    // What a later checkpoint of this guest records: the TAP it is wired to
+    // now, its new address, and the ports its workload still listens on.
+    // Written before the guest resumes, because the datapath reads the ports
+    // from it per connection: the first ingress connection after the resume
+    // must already reach the port the restored workload holds.
+    let next = SandboxCheckpointState {
+        tap: moved_to.clone().or_else(|| state.tap.clone()),
+        network: Some(state.network()),
+        guest_address: identity
+            .guest_addr
+            .as_ref()
+            .map(|addr| addr.address.clone()),
+        guest_ports: restored_guest_ports(manifest, target.allocation.network.as_ref()),
+        ..state.clone()
+    };
+
     let loaded = (|| -> R<()> {
         wait_for_api_socket(&socket, API_SOCKET_TIMEOUT)?;
         match target.backend {
@@ -1434,11 +1532,13 @@ pub(crate) fn restore_microvm(
                 // Belt and braces: the link already points at the new disk,
                 // and the explicit repoint is what a fork relies on.
                 api.update_drive(IDENTITY_DRIVE_ID, &identity_link)?;
+                write_boot_record(scratch, &next)?;
                 await_datapath(target);
                 api.resume()
             }
             // `--restore` loaded the state at launch, paused.
             _ => {
+                write_boot_record(scratch, &next)?;
                 await_datapath(target);
                 CloudHypervisorApi::new(&socket).resume()
             }
@@ -1453,22 +1553,10 @@ pub(crate) fn restore_microvm(
         );
         return Err(err.context(format!("restoring sandbox from checkpoint {}", manifest.id)));
     }
-    // A later checkpoint of this guest records the TAP it is wired to now.
-    let network = state.network();
-    let state = SandboxCheckpointState {
-        tap: moved_to.or(state.tap),
-        network: Some(network),
-        guest_address: identity
-            .guest_addr
-            .as_ref()
-            .map(|addr| addr.address.clone()),
-        ..state
-    };
-    write_boot_record(scratch, &state)?;
     info!(
         allocation_id = target.allocation.id,
         snapshot_id = %manifest.id,
-        vmm = %state.vmm,
+        vmm = %next.vmm,
         restore_ms = started.elapsed().as_millis() as u64,
         "Restored sandbox from memory checkpoint"
     );
@@ -1597,6 +1685,7 @@ mod tests {
             tap: None,
             network: None,
             guest_address: None,
+            guest_ports: BTreeMap::new(),
         };
         let allocation = alloc(9);
         let fc = Backend::Firecracker {
@@ -2195,6 +2284,7 @@ mod tests {
             tap: tap.map(str::to_string),
             network,
             guest_address: None,
+            guest_ports: BTreeMap::new(),
         };
         let target = |tap: Option<&str>, bridge: Option<&str>, gated: bool| RestoreTarget {
             backend: &fc,
@@ -2423,7 +2513,7 @@ mod tests {
         Ok(())
     }
 
-    /// Gated plan §6.3, calls entry 25: a restore whose datapath has not
+    /// Gated plan §6.3, calls entry 30: a restore whose datapath has not
     /// bound the egress proxy socket waits, then resumes the guest anyway
     /// (fail-closed: each dial is reset) instead of failing into a cold boot.
     #[test]
@@ -2449,6 +2539,7 @@ mod tests {
             tap: None,
             network: Some(GuestNetwork::Gated),
             guest_address: None,
+            guest_ports: BTreeMap::new(),
         };
         let memory = MemoryParts {
             parts: out.seal(&[("rootfs", parts::ROOTFS), ("vm-config", parts::CH_CONFIG)])?,
@@ -2511,7 +2602,7 @@ mod tests {
         Ok(())
     }
 
-    /// Gated plan §6.2, calls entry 12: a Firecracker too old to move the
+    /// Gated plan §6.2, calls entry 15: a Firecracker too old to move the
     /// vsock refuses the capture before pausing, so the guest never stops
     /// for a checkpoint it could not restore.
     #[test]
@@ -2951,6 +3042,7 @@ mod tests {
             tap: Some("tap7".into()),
             network: None,
             guest_address: None,
+            guest_ports: BTreeMap::new(),
         };
         let memory = MemoryParts {
             parts: out.seal(&[("rootfs", parts::ROOTFS)])?,

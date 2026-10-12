@@ -281,7 +281,8 @@ every connection through its egress proxy. So it keeps an agent harness in a
 **gated** sandbox awake through a quiet model call, which is an outbound
 connection through the proxy, and a long streamed response counts as
 `network` activity the whole time it streams. A sandbox that is not gated
-has no datapath connections to count. See the next section.
+makes its outbound connections around the datapath, so there is nothing to
+count for a model call. See the next section.
 
 Suspending *during* a model call, and waking when it returns, needs the
 workload to say it is parked. That is the `hint` signal, which is not
@@ -296,7 +297,7 @@ sandbox differently from an `exec` or `container` task:
 | Signal | microVM on `none` or `tap` | Gated microVM | Dev mode (Apple `container`) |
 | --- | --- | --- | --- |
 | `network` | Bytes the guest sends on its TAP device, read from `/sys/class/net/<tap>/statistics/rx_bytes`. Nothing on `none` | Bytes through the egress proxy (and any ingress), as they move | Bytes the container sends, from `container stats` |
-| `connections` | **Refused at submit.** No datapath sees the guest's connections | Every open connection through the egress proxy, so a quiet model call keeps the sandbox awake | **Refused at submit** |
+| `connections` | **Refused at submit.** No datapath sees the guest's outbound connections (a TAP guest's advertised ports are fronted by the datapath, but counting only inbound would miss a quiet model call) | Every open connection through the egress proxy, and every open ingress connection to the guest's ports, so a quiet model call or a client waiting on a slow response keeps the sandbox awake | **Refused at submit** |
 | `cpu` | The VMM's CPU, which is the guest's | The same | The container VM's CPU, from `container stats` |
 | `exec` | Never fires: a microVM takes no exec sessions | The same | `legion alloc exec` sessions |
 
@@ -314,8 +315,8 @@ Two rules follow, both checked at submit:
 
   ```text
   Error: jobspec failed validation: task "workspace": suspend.idle.signals "connections" counts
-  open connections through the node datapath, and this sandbox's traffic never crosses it
-  (it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
+  open connections through the node datapath, and this sandbox's outbound traffic never crosses
+  it (it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
   (remove "connections", or run the sandbox gated, where a quiet model call through the egress
   proxy keeps it awake. Otherwise set idle.after longer than the call, or suspend from your
   platform, which knows when a call is in flight) [code=InvalidArgument]
@@ -1221,6 +1222,21 @@ reset), the allocation reports `net_capture_unavailable`, and `legion net
 doctor` names the unbound socket. A transient bind error never turns a
 resume into a cold boot.
 
+**Advertised ports keep working.** The restoring allocation's ingress
+listeners dial the restored guest through its new socket (see
+[Ingress into a sandbox](network-handlers.md#ingress-into-a-sandbox)). The
+workload in the restored memory still listens on the ports it was captured
+with, even when the new placement assigned different numbers, so the
+checkpoint records them and the datapath dials those. Consumers keep using
+the advertised port the catalog lists for the new allocation. A port the
+new placement adds is handed to the guest agent on the identity disk. In
+`/legion/resume.env`, `LEGION_PORT_<label>` names the port the restored
+workload actually listens on, and `LEGION_ADDR_<label>` the new
+allocation's advertised address. A client connected at capture sees its
+connection close and reconnects. While the instance is suspended, nothing
+serves its advertised port. With `connections` in the idle signals, an open
+ingress connection keeps a gated sandbox awake like an open egress one.
+
 **Open connections reset.** A memory checkpoint closes every connection the
 guest has open through the datapath:
 
@@ -1897,7 +1913,7 @@ See [metrics](metrics.md#suspend-and-resume).
 | An idle instance never suspends | A listed signal keeps firing (an open `exec` session, a client holding a connection with `connections` listed, background CPU above `cpuBelow`) | Compare `instance get`'s idle since with what the task is doing, then adjust `signals` or `cpuBelow` |
 | `legion_idle_sweep_suspends_total{outcome="skipped"}` rising | The sweep found idle instances it could not suspend | The manager's debug log names why (a worker without the `checkpoint` capability, a memory checkpoint the node cannot take) |
 | Submit: `suspend.idle.signals "hint" is not implemented yet` | The workload's own idle signal is not available | Remove `hint`. Add `connections` to keep quiet datapath connections awake (ingress on any runtime, and egress on gated tasks, sandboxes included) |
-| Submit: `"connections" counts open connections through the node datapath, and this sandbox's traffic never crosses it` | A sandbox that is not gated has no datapath connections | Remove `connections`, or run the sandbox gated. Otherwise raise `after` or suspend from your platform |
+| Submit: `"connections" counts open connections through the node datapath, and this sandbox's outbound traffic never crosses it` | A sandbox that is not gated has no datapath connections | Remove `connections`, or run the sandbox gated. Otherwise raise `after` or suspend from your platform |
 | Submit: `lists "exec", but this sandbox always runs as a microVM` | A microVM takes no exec sessions | Remove `exec` |
 | Warning: `suspend.idle counts "exec", which never fires while the sandbox runs as a microVM` | The default signals on a sandbox that may run as a microVM | List signals explicitly, or ignore it for a dev-mode-only job |
 | A TAP-wired sandbox never suspends | The guest keeps sending on its TAP (NTP, ARP, a chatty agent) | Compare `node usage`'s IDLE column with the guest's traffic, or drop `network` from `signals` |

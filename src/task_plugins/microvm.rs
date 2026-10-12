@@ -625,6 +625,10 @@ pub(crate) struct GuestPayload {
     /// binary, copied into the rootfs) before the command, and the resolver
     /// is the agent on loopback.
     pub guest_agent: bool,
+    /// A gated sandbox's advertised ports, passed to the agent as
+    /// `--ingress-port`: it listens on each as a vsock port and relays the
+    /// node datapath's connections to the workload on the same port.
+    pub ingress_ports: Vec<u16>,
     /// A sandbox launched for memory checkpoints (or with token files):
     /// init starts the resume handler in the background, which watches the
     /// identity disk and refreshes the guest after every restore (new
@@ -706,17 +710,23 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
 
     if payload.guest_agent {
         // The datapath's foothold: relays 127.0.0.1:1080 and :53 to the host
-        // over vsock. Without it a gated guest has loopback and nothing else,
+        // over vsock, and the host's ingress connections in to the workload.
+        // Without it a gated guest has loopback and nothing else,
         // which is the fail-closed outcome the mode promises. When the guest
         // also needs the resume watch, the agent runs it.
-        let watch = if payload.resume_watch {
-            " --resume-watch"
-        } else {
-            ""
-        };
+        // Each advertised port: the agent listens on it as a vsock port and
+        // relays the datapath's connections to the workload's loopback port.
+        let mut flags: String = payload
+            .ingress_ports
+            .iter()
+            .map(|port| format!(" --ingress-port {port}"))
+            .collect();
+        if payload.resume_watch {
+            flags.push_str(" --resume-watch");
+        }
         script.push_str(&format!(
             "if [ -x {GUEST_AGENT_PATH} ]; then\n\
-             \x20   {GUEST_AGENT_PATH} guest-agent{watch} >/dev/console 2>&1 &\n\
+             \x20   {GUEST_AGENT_PATH} guest-agent{flags} >/dev/console 2>&1 &\n\
              \x20   echo \"legion: guest agent started (gated network over vsock)\"\n\
              else\n\
              \x20   echo \"legion: guest agent missing at {GUEST_AGENT_PATH}; the sandbox has no network\" >&2\n\
@@ -1382,6 +1392,41 @@ mod tests {
         assert!(!script.contains("guest-resume"), "{script}");
     }
 
+    /// Gated plan §6.10: a gated guest's advertised ports reach the agent
+    /// as flags, which the guest crate's own parser accepts.
+    #[test]
+    fn a_gated_guest_hands_its_ports_to_the_agent() {
+        let script = render_init_script(&GuestPayload {
+            command: vec!["/bin/sh".into()],
+            guest_agent: true,
+            ingress_ports: vec![8080, 20001],
+            resume_watch: true,
+            ..GuestPayload::default()
+        });
+        let line = script
+            .lines()
+            .find(|line| line.contains("/legion/legion guest-agent"))
+            .expect("agent line");
+        assert_eq!(
+            line.trim(),
+            "/legion/legion guest-agent --ingress-port 8080 --ingress-port 20001 \
+             --resume-watch >/dev/console 2>&1 &"
+        );
+        let words: Vec<String> = line
+            .split_whitespace()
+            .skip(1)
+            .take_while(|word| !word.starts_with('>'))
+            .map(str::to_string)
+            .collect();
+        match legion_guest::cli::parse(&words).unwrap() {
+            legion_guest::cli::Invocation::Agent(args) => {
+                assert_eq!(args.ingress_ports, vec![8080, 20001]);
+                assert!(args.resume_watch.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn firecracker_config_matches_vm_spec() {
         let mut spec = spec();
@@ -1442,6 +1487,7 @@ mod tests {
             resume_watch: false,
             guest_binary: None,
             resolvers: Vec::new(),
+            ingress_ports: Vec::new(),
         };
         let script = render_init_script(&payload);
 
@@ -1490,6 +1536,7 @@ mod tests {
             resume_watch: false,
             guest_binary: None,
             resolvers: Vec::new(),
+            ingress_ports: Vec::new(),
         };
 
         let dir = tempfile::tempdir()?;

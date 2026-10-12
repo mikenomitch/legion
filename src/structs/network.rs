@@ -179,9 +179,11 @@ pub fn task_runs_gated(task: &crate::structs::TaskConfig, sandbox_gated_default:
 ///
 /// - An explicit `network.mode = "gated"` with a `config.network`: a gated
 ///   guest has no NIC (and `none` has no vsock), so the two contradict.
-/// - Advertised ports (`network.ports`) on a sandbox that runs gated: the
-///   guest has no NIC and the datapath does not dial into a guest yet, so
-///   nothing could reach them.
+/// - Advertised ports (`network.ports`) on a sandbox whose guest nothing can
+///   reach: the node datapath fronts a gated guest's ports over vsock and a
+///   TAP guest's on its bridge address, and a guest that is neither has
+///   loopback only (`config.network = { mode = "none" }`, or no network
+///   config while `auto` resolves to `host`).
 pub fn validate_gated_sandbox(
     task: &crate::structs::TaskConfig,
     sandbox_gated_default: bool,
@@ -214,16 +216,34 @@ pub fn validate_gated_sandbox(
         .as_ref()
         .map(|network| network.ports.len())
         .unwrap_or(0);
-    if ports > 0 && task_runs_gated(task, sandbox_gated_default) {
-        return Err(format!(
-            "task {:?} declares network.ports on a gated sandbox, but ingress into a gated \
-             sandbox is not supported yet: the guest has no NIC, and the datapath does not dial \
-             into a guest, so nothing could reach those ports\nHint: wire the guest to a TAP \
-             (config.network = {{ mode = \"tap\", ... }}) to serve ports, or drop network.ports",
-            task.name
-        ));
+    if ports == 0 || task_runs_gated(task, sandbox_gated_default) {
+        return Ok(());
     }
-    Ok(())
+    let config_mode = task
+        .config
+        .get("network")
+        .filter(|value| !value.is_null())
+        .map(|network| {
+            network
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("none")
+                .trim()
+                .to_ascii_lowercase()
+        });
+    let why = match config_mode.as_deref() {
+        Some("tap") => return Ok(()),
+        Some(_) => "config.network = { mode = \"none\" } gives the guest no network device",
+        None => {
+            "with no config.network and network.mode not \"gated\", the guest has loopback only"
+        }
+    };
+    Err(format!(
+        "task {:?} declares network.ports, but nothing can reach a port in its guest: {why}\n\
+         Hint: set network.mode = \"gated\" to serve the ports through the node datapath, or \
+         wire the guest to a bridge (config.network = {{ mode = \"tap\", bridge = \"br0\" }})",
+        task.name
+    ))
 }
 
 /// Why a sandbox that runs without Legion's egress policy because of its
@@ -2123,8 +2143,10 @@ mod tests {
         ));
     }
 
-    /// Gated plan §6.8: gated plus `config.network`, and ports on a gated
-    /// sandbox, are refused at submit with the fix.
+    /// Gated plan §6.8: gated plus `config.network` is refused at submit
+    /// with the fix. Since Phase 5 the datapath serves a gated sandbox's
+    /// ports, so only ports nothing can reach are refused: a loopback-only
+    /// guest's.
     #[test]
     fn contradictory_gated_sandboxes_are_refused_at_submit() {
         let gated = Some(json!({ "mode": "gated" }));
@@ -2141,22 +2163,38 @@ mod tests {
         assert!(validate_gated_sandbox(&task_of("sandbox", gated.clone(), none), false).is_err());
 
         let plain = json!({ "image": "a", "command": ["sh"] });
+        // Gated plan Phase 5: ports on a gated sandbox are served.
         let ports = Some(json!({ "mode": "gated", "ports": [{ "name": "http" }] }));
-        let err =
-            validate_gated_sandbox(&task_of("sandbox", ports, plain.clone()), false).unwrap_err();
-        assert!(
-            err.contains("ingress into a gated sandbox is not supported yet"),
-            "{err}"
-        );
-        assert!(err.contains("Hint: wire the guest to a TAP"), "{err}");
-        // A default sandbox with ports: refused only once the default is
-        // gated, and never one that declares its own network.
+        assert!(validate_gated_sandbox(&task_of("sandbox", ports, plain.clone()), false).is_ok());
+        // A default sandbox with ports: loopback only while `auto` is
+        // `host`, so refused with both ways to serve them; served once the
+        // default is gated.
         let auto_ports = Some(json!({ "ports": [{ "name": "http" }] }));
         let default = task_of("sandbox", auto_ports.clone(), plain.clone());
-        assert!(validate_gated_sandbox(&default, false).is_ok());
-        assert!(validate_gated_sandbox(&default, true).is_err());
+        let err = validate_gated_sandbox(&default, false).unwrap_err();
+        assert_eq!(
+            err,
+            "task \"workspace\" declares network.ports, but nothing can reach a port in its \
+             guest: with no config.network and network.mode not \"gated\", the guest has \
+             loopback only\nHint: set network.mode = \"gated\" to serve the ports through the \
+             node datapath, or wire the guest to a bridge (config.network = { mode = \"tap\", \
+             bridge = \"br0\" })"
+        );
+        assert!(validate_gated_sandbox(&default, true).is_ok());
+        // A TAP guest's ports are served on its bridge address, gated
+        // default or not.
         let tap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "tap" } });
-        assert!(validate_gated_sandbox(&task_of("sandbox", auto_ports, tap), true).is_ok());
+        let on_tap = task_of("sandbox", auto_ports.clone(), tap);
+        assert!(validate_gated_sandbox(&on_tap, false).is_ok());
+        assert!(validate_gated_sandbox(&on_tap, true).is_ok());
+        // An air-gapped guest has no door at all.
+        let air_gap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "none" } });
+        let err =
+            validate_gated_sandbox(&task_of("sandbox", auto_ports, air_gap), true).unwrap_err();
+        assert!(
+            err.contains("config.network = { mode = \"none\" } gives the guest no network device"),
+            "{err}"
+        );
         // Other runtimes and plain gated sandboxes pass.
         assert!(
             validate_gated_sandbox(&task_of("sandbox", gated.clone(), plain.clone()), true).is_ok()

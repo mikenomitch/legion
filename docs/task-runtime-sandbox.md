@@ -170,8 +170,10 @@ Some guests run a small Legion program next to the workload, copied into the
 root disk as `/legion/legion`:
 
 - **The gated datapath's relay** (`guest-agent`), on a gated sandbox. It
-  relays the guest's loopback proxy and resolver ports to the node over vsock
-  ([network-handlers.md](network-handlers.md#sandboxes)).
+  relays the guest's loopback proxy and resolver ports to the node over
+  vsock, and relays the node's inbound connections on each advertised port
+  (`--ingress-port <port>` on its command line) to the workload's loopback
+  port ([network-handlers.md](network-handlers.md#sandboxes)).
 - **The resume handler**, on a sandbox launched for memory checkpoints or
   with identity token files. It refreshes the guest's identity, RNG, clock,
   token files, and a TAP guest's address after a restore and runs `onResume`
@@ -380,7 +382,7 @@ A sandbox's network is one of three shapes:
 
 | Shape | How | What the guest gets |
 | --- | --- | --- |
-| Loopback only | The default (`config.network` unset, or `{ mode = "none" }`) | No NIC. Suits compute sandboxes |
+| Loopback only | The default (`config.network` unset, or `{ mode = "none" }`) | No NIC. Suits compute sandboxes. Nothing can reach its ports, so submit refuses `network.ports` |
 | Gated | The task's `network.mode = "gated"` (see [Gated networking](#gated-networking) below) | No NIC. A vsock to the node datapath, where policy, handlers, and identity judge every connection |
 | TAP | `config.network = { mode = "tap", bridge = "br0" }` | A NIC on a host bridge, with an address Legion leases it |
 
@@ -509,8 +511,15 @@ runs a DHCP server for other hosts, keep its pool outside `range`. The bridge
 itself, its gateway address, and any NAT behind it are the operator's: Legion
 only attaches TAPs to it and leases addresses on it.
 
-`LEGION_PORT_*` and `LEGION_ADDR_*` are still exported into the guest, but
-nothing maps host ports into the VM yet.
+**Ports.** A TAP guest's advertised ports are served at the address the
+catalog advertises. The node datapath owns `<node address>:<host port>` and,
+for each connection its ingress chain allows (every connection, without a
+chain), dials `<guest address>:$LEGION_PORT_<label>`, reading the lease per
+connection so a restore's new address applies at once. The guest binds
+`$LEGION_PORT_<label>` on its bridge address or on every address
+(`0.0.0.0`); a loopback-only bind is unreachable. See
+[Ingress into a sandbox](network-handlers.md#ingress-into-a-sandbox).
+`LEGION_ADDR_*` names the node's address, which is what consumers dial.
 
 ### Idle detection and the boot gate
 
@@ -547,8 +556,16 @@ A gated guest that no policy covers denies every destination
 [Default deny](network-handlers.md#default-deny)), so open what the guest
 needs in `network.egress.allow`. Every gated sandbox gets a resolver, and the
 guest's proxy variables come in both cases plus `NODE_USE_ENV_PROXY=1`.
-Submit refuses a gated sandbox that also sets `config.network`, and one that
-declares `network.ports` (ingress into a gated guest is not supported yet).
+Submit refuses a gated sandbox that also sets `config.network`.
+
+A gated sandbox serves the ports it declares in `network.ports`. The node
+datapath owns each advertised port on the node and, for every connection
+the ingress chain allows, dials into the guest through the VMM's vsock
+socket (`CONNECT <port>`). The guest agent listens on that vsock port and
+relays to the workload's `127.0.0.1:$LEGION_PORT_<label>`, so the workload
+binds the port as on any runtime, on loopback or every address. Health
+checks, the catalog, and consumers all use the advertised port. See
+[Ingress into a sandbox](network-handlers.md#ingress-into-a-sandbox).
 
 A gated sandbox takes memory checkpoints like any other: suspend, resume,
 snapshots, forks, and publish. Every restore moves the guest's vsock onto the

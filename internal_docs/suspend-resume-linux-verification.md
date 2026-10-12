@@ -1994,7 +1994,7 @@ the Phase 3c/6 `HostTaps` calls, already covered by
 ## Gated sandboxes
 
 The [gated sandbox checkpoints plan](plans/gated-sandbox-checkpoints-plan.md)
-(Phases 0 to 4). Built on a Linux host **without KVM**: the vsock retarget,
+(Phases 0 to 5). Built on a Linux host **without KVM**: the vsock retarget,
 the guest agent's relay drop, the datapath's attribution, the idle signals,
 the gated default, and TAP addressing ran against fakes, fixture trees, Unix
 sockets standing in for vsock, and (for the guest's netlink re-addressing) a
@@ -2198,6 +2198,40 @@ for i in t-1 t-1-f1 t-1-f2 t-1-f3; do legion instance get $i -j | jq -r '.data.i
   "tap0" }` with `config.network.tap is gone` and the bridge hint, and a
   pool with every address leased fails the next start with `bridge br0's
   sandbox range ... is full`.
+
+### G5.1 Ingress
+
+A keyed gated sandbox with `network = { mode = "gated", ports = [{ name =
+"http" }], egress = { policy = "allow" } }`, `suspend.checkpoint =
+"memory"`, `idle.signals` including `connections`, and a command that
+serves HTTP on `$LEGION_PORT_HTTP` (`python3 -m http.server
+$LEGION_PORT_HTTP`, or busybox `httpd -f -p $LEGION_PORT_HTTP`):
+
+```bash
+legion instance create agents --id g-1 --wait
+legion service resolve <service> -j        # or: legion alloc get <alloc> -j | jq .data.network
+curl -sv http://<node address>:<host port>/
+legion instance suspend g-1 --wait && legion instance resume g-1 --wait
+curl -sv http://<new node address>:<new host port>/
+legion instance fork g-1 --wait && curl -sv http://<fork address>:<fork port>/
+```
+
+- **Pass:** every `curl` answers from the guest, including after the resume
+  (check `legion net doctor` for the new allocation's `ingress_bound`) and
+  from the fork. A connection held open with `nc <address> <port>` and no
+  input keeps the instance from idling while it is open.
+- **Also:** with an ingress chain denying `/admin`, `curl .../admin` gets
+  the structured `403` and a `net.denied` event with `direction = ingress`.
+  A sandbox with ports and no network config is refused at submit with
+  `nothing can reach a port in its guest`.
+- **Firecracker #6100:** on Firecracker 1.16, take a live `snapshot create
+  --memory g-1` and `curl` the origin repeatedly for a minute. Record
+  whether inbound connections stall; on 1.17 they must not. The result
+  decides the ingress floor (calls entry 17).
+- **Repeat on a TAP sandbox** (`config.network = { mode = "tap", bridge =
+  "br0" }`, the workload bound on `0.0.0.0`): the same `curl`s work through
+  the node's address, and after a fork the datapath dials the fork's new
+  lease.
 
 ### Ignored tests
 

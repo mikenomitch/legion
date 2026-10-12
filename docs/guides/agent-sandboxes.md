@@ -378,6 +378,17 @@ the running origin's too), so a harness should retry an interrupted model
 call. See [Gated sandboxes](../suspend-and-resume.md#gated-sandboxes) and
 [sandbox networking](../task-runtime-sandbox.md#networking).
 
+A gated or TAP sandbox can also serve ports, so the platform can reach a
+harness API or a preview of the dev server the agent started. Declare them
+in `network.ports`, and the node datapath owns each advertised port and
+dials into the guest for every connection (over vsock when gated, at the
+guest's bridge address on a TAP), after any ingress chain. The catalog
+lists the node's address and port. A resumed or forked sandbox serves them
+again through its new allocation, at the address and port the catalog lists
+for it. A loopback-only sandbox has nothing to dial, so submit
+refuses ports on it. See
+[Ingress into a sandbox](../network-handlers.md#ingress-into-a-sandbox).
+
 Pick by what the sandbox needs from the network. If egress must be judged
 per sandbox by Legion's policy, run it gated. If the guest needs raw
 networking (a protocol the proxy can't carry, L2 adjacency, bulk
@@ -935,7 +946,7 @@ a microVM matters:
 | Signal | What it sees | On a TAP-wired microVM |
 | --- | --- | --- |
 | `network` | Bytes through the node datapath, plus bytes the guest sends on its own NIC | Bytes the guest sends on its TAP (`rx_bytes` of `/sys/class/net/lgf...`) |
-| `connections` | Open connections through the datapath: ingress, and a gated sandbox's egress | Refused at submit. No datapath fronts the guest |
+| `connections` | Open connections through the datapath: ingress, and a gated sandbox's egress | Refused at submit. The guest's outbound connections leave on its own NIC, so a quiet model call would not count |
 | `cpu` | CPU at or above `cpuBelow` of the task's `cpu` | The VMM's CPU, which is the guest's |
 | `exec` | Open `exec` sessions and actions | Never fires. A microVM takes no exec sessions, so `job run` warns when it is listed |
 
@@ -981,8 +992,8 @@ So does `connections` on this sandbox:
 
 ```text
 Error: jobspec failed validation: task "workspace": suspend.idle.signals "connections" counts
-open connections through the node datapath, and this sandbox's traffic never crosses it
-(it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
+open connections through the node datapath, and this sandbox's outbound traffic never crosses
+it (it is not network.mode = "gated", so it reaches the network on its own NIC or not at all)
 (remove "connections", or run the sandbox gated, where a quiet model call through the egress
 proxy keeps it awake. Otherwise set idle.after longer than the call, or suspend from your
 platform, which knows when a call is in flight)

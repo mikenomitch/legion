@@ -1930,7 +1930,7 @@ async fn apply_upstreams(
     }
     if let Some(ingress) = forwarder.ingress() {
         ingress
-            .sync(&ingress_specs(&reply.desired_allocations))
+            .sync(&ingress_specs(&reply.desired_allocations, alloc_root))
             .await;
     }
     let context = forwarder.context();
@@ -2641,7 +2641,7 @@ fn dns_specs(
         let sandbox = is_gated_sandbox(allocation);
         // Every gated sandbox gets a resolver on its vsock socket, VIP block
         // or not: without one, a guest with no upstreams has no DNS at all
-        // (gated plan §6.5, calls entry 20). Everything else needs a block.
+        // (gated plan §6.5, calls entry 25). Everything else needs a block.
         if resolver.is_none() && !sandbox {
             continue;
         }
@@ -2905,11 +2905,20 @@ fn proxy_specs(
     specs
 }
 
-/// The ingress listeners a desired set implies: one per advertised port
-/// that was given a private twin at placement (the task has an ingress
-/// chain), bound in the host namespace and dialing the private port inside
-/// the task's namespace when it has one.
-fn ingress_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::ingress::IngressSpec> {
+/// The ingress listeners a desired set implies, all bound in the host
+/// namespace:
+///
+/// - one per advertised port that was given a private twin at placement
+///   (the task has an ingress chain), dialing the twin on loopback, inside
+///   the task's namespace when it is gated;
+/// - one per advertised port of a gated or TAP-wired sandbox, with or
+///   without a chain: the guest has its own port space, which nothing else
+///   on the node reaches. A gated guest is dialed over host-initiated vsock
+///   on its VMM's socket, a TAP guest at its leased address on the bridge.
+fn ingress_specs(
+    desired: &[TaskAllocation],
+    alloc_root: &std::path::Path,
+) -> Vec<crate::worker::netd::ingress::IngressSpec> {
     let mut specs = Vec::new();
     for allocation in desired {
         if allocation.network.trim().is_empty() {
@@ -2918,24 +2927,69 @@ fn ingress_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::ingress
         let Ok(network) = serde_json::from_str::<AllocNetwork>(&allocation.network) else {
             continue;
         };
-        let netns = network
-            .is_gated()
-            .then(|| crate::worker::netd::netns::netns_path(allocation.allocation_id));
-        for port in &network.ports {
-            let Some(private_port) = port.private_port else {
-                continue;
+        specs.extend(allocation_ingress_specs(allocation, &network, alloc_root));
+    }
+    specs
+}
+
+/// [`ingress_specs`] for one allocation whose network is already parsed.
+fn allocation_ingress_specs(
+    allocation: &TaskAllocation,
+    network: &AllocNetwork,
+    alloc_root: &std::path::Path,
+) -> Vec<crate::worker::netd::ingress::IngressSpec> {
+    use crate::worker::netd::ingress::{IngressSpec, TaskDial};
+    if network.ports.is_empty() {
+        return Vec::new();
+    }
+    let sandbox_dial = sandbox_ingress_dial(allocation, network, alloc_root);
+    let netns = network
+        .is_gated()
+        .then(|| crate::worker::netd::netns::netns_path(allocation.allocation_id));
+    network
+        .ports
+        .iter()
+        .filter_map(|port| {
+            let dial = match (&sandbox_dial, port.private_port) {
+                (Some(dial), _) => dial.clone(),
+                (None, Some(_)) => TaskDial::Loopback {
+                    netns: netns.clone(),
+                },
+                (None, None) => return None,
             };
-            specs.push(crate::worker::netd::ingress::IngressSpec {
+            Some(IngressSpec {
                 allocation_id: allocation.allocation_id,
                 label: port.name.clone(),
                 host_port: port.host_port,
-                private_port,
-                netns: netns.clone(),
+                private_port: port.bind_port(),
+                dial,
                 bind: None,
-            });
-        }
+            })
+        })
+        .collect()
+}
+
+/// How the datapath reaches a sandbox guest's ports: over vsock when it is
+/// gated, at its bridge address when it is TAP-wired. `None` for every
+/// other allocation, including a loopback-only sandbox, whose ports nothing
+/// can reach (submit refuses them).
+fn sandbox_ingress_dial(
+    allocation: &TaskAllocation,
+    network: &AllocNetwork,
+    alloc_root: &std::path::Path,
+) -> Option<crate::worker::netd::ingress::TaskDial> {
+    use crate::worker::netd::ingress::TaskDial;
+    if allocation.task_runtime != "sandbox" {
+        return None;
     }
-    specs
+    let scratch = crate::task_plugins::sandbox_dir_for(
+        &alloc_root.join(allocation.allocation_id.to_string()),
+    );
+    if network.is_gated() {
+        return Some(TaskDial::Vsock { scratch });
+    }
+    let config: Value = serde_json::from_str(&allocation.task_config).ok()?;
+    crate::task_plugins::sandbox_config_is_tap(&config).then_some(TaskDial::Bridge { scratch })
 }
 
 /// What the datapath reports about each desired allocation on the next
@@ -3007,11 +3061,7 @@ fn net_status(
         };
         let gated = network.is_gated();
         let expected_upstreams = network.upstreams.len();
-        let expected_ingress = network
-            .ports
-            .iter()
-            .filter(|p| p.private_port.is_some())
-            .count();
+        let expected_ingress = allocation_ingress_specs(allocation, &network, alloc_root).len();
         if !gated
             && expected_upstreams == 0
             && expected_ingress == 0
@@ -4218,7 +4268,7 @@ mod tests {
         }
     }
 
-    /// Gated plan §6.5, calls entry 20: every gated sandbox gets a resolver
+    /// Gated plan §6.5, calls entry 25: every gated sandbox gets a resolver
     /// on its vsock socket even with no upstreams (and so no VIP block),
     /// and never binds an address. A gated container still needs a block
     /// (its namespace resolver gap is tracked separately).
@@ -4338,6 +4388,100 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].credentials.len(), 2);
         assert_eq!(specs[0].credentials[0].prefix.as_deref(), Some("Bearer "));
+    }
+
+    /// Gated plan §6.10: how the ingress listener reaches each task. A task
+    /// with an ingress chain is dialed on its private twin; a gated sandbox
+    /// over its VMM's vsock and a TAP sandbox at its leased address, chain
+    /// or not; a loopback-only sandbox and a chainless task are not fronted.
+    #[test]
+    fn ingress_specs_pick_how_each_task_is_reached() {
+        use crate::worker::netd::ingress::TaskDial;
+        let root = std::path::Path::new("/var/lib/legion/allocs");
+        let port = |host: u16, private: Option<u16>| {
+            let mut port = json!({ "name": "http", "hostPort": host });
+            if let Some(private) = private {
+                port["privatePort"] = json!(private);
+            }
+            port
+        };
+        let allocation = |id: i64, runtime: &str, network: Value, config: Value| TaskAllocation {
+            provisional: None,
+            allocation_id: id,
+            task_runtime: runtime.into(),
+            network: network.to_string(),
+            task_config: config.to_string(),
+            ..TaskAllocation::default()
+        };
+        let desired = vec![
+            allocation(
+                1,
+                "exec",
+                json!({ "ports": [port(20000, Some(20001))] }),
+                json!({}),
+            ),
+            allocation(
+                2,
+                "exec",
+                json!({ "ports": [port(20002, None)] }),
+                json!({}),
+            ),
+            allocation(
+                3,
+                "sandbox",
+                json!({ "mode": "gated", "ports": [port(20004, None)] }),
+                json!({ "image": "a" }),
+            ),
+            allocation(
+                4,
+                "sandbox",
+                json!({ "ports": [port(20006, Some(20007))] }),
+                json!({ "image": "a", "network": { "mode": "tap", "bridge": "br0" } }),
+            ),
+            allocation(
+                5,
+                "sandbox",
+                json!({ "ports": [port(20008, None)] }),
+                json!({ "image": "a" }),
+            ),
+        ];
+        let specs = ingress_specs(&desired, root);
+        let reached: Vec<(i64, u16, u16, TaskDial)> = specs
+            .into_iter()
+            .map(|spec| {
+                (
+                    spec.allocation_id,
+                    spec.host_port,
+                    spec.private_port,
+                    spec.dial,
+                )
+            })
+            .collect();
+        let scratch = |id: i64| crate::task_plugins::sandbox_dir_for(&root.join(id.to_string()));
+        assert_eq!(
+            reached,
+            vec![
+                (1, 20000, 20001, TaskDial::Loopback { netns: None }),
+                // No twin: the guest binds the advertised number itself,
+                // and the vsock port is that number.
+                (
+                    3,
+                    20004,
+                    20004,
+                    TaskDial::Vsock {
+                        scratch: scratch(3)
+                    }
+                ),
+                (
+                    4,
+                    20006,
+                    20007,
+                    TaskDial::Bridge {
+                        scratch: scratch(4)
+                    }
+                ),
+            ]
+        );
     }
 
     #[test]

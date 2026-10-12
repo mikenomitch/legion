@@ -26,7 +26,12 @@ mod sandbox;
 pub(crate) mod sandbox_addr;
 mod sandbox_checkpoint;
 pub(crate) use microvm::warn_if_no_static_guest_binary;
-pub use sandbox::{sandbox_usage_source, vsock_socket_base_for, SandboxUsageSource};
+pub use sandbox::{
+    sandbox_config_is_tap, sandbox_dir_for, sandbox_guest_address, sandbox_guest_port,
+    sandbox_usage_source, vsock_socket_base, vsock_socket_base_for, SandboxUsageSource,
+};
+#[cfg(test)]
+pub(crate) use sandbox_checkpoint::write_guest_ports_record;
 pub use sandbox_checkpoint::{
     firecracker_needs_api_socket, sandbox_checkpoint_support, sandbox_vmm_attrs, IDENTITY_DRIVE_ID,
 };

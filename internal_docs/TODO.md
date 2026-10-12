@@ -1821,9 +1821,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         sessions after the scaling plan's Phase 6.
 - [ ] **Gated sandboxes by default, with memory checkpoints**:
       [plan](plans/gated-sandbox-checkpoints-plan.md) (IN EXECUTION) ·
-      [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Phases 1 to 4
-      are built (see Done, Task runtimes) on a host without KVM, in PR
-      [#24](https://github.com/mikenomitch/legion/pull/24). What is left:
+      [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Phases 1 to 5
+      are built (see Done, Task runtimes) on a host without KVM, Phases 1
+      to 4 merged in PR [#24](https://github.com/mikenomitch/legion/pull/24).
+      What is left:
   - [ ] Phase 0, the gate: boot a gated sandbox on a real VMM for the first
         time. On a KVM host with Firecracker 1.16.1+, cloud-hypervisor v52+,
         a kernel with `CONFIG_VIRTIO_VSOCKETS=y` and `CONFIG_IP_PNP=y`, and
@@ -1841,10 +1842,26 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         ([calls entry 2](calls/gated-sandbox-checkpoints-plan_calls.md#2-the-flip-to-gated-by-default-is-built-but-held-closed-until-phase-0-passes)).
   - [ ] Run the KVM checks for the built phases: G1.1 to G1.5 (gated memory
         checkpoints on both VMMs), G2.1 (glibc and musl images), G3.1
-        (model-call wake), G4.1 (TAP re-addressing), and record them in the
-        verification doc.
-  - [ ] Phase 5: ingress into gated sandboxes over host-initiated vsock,
-        lifting the submit refusal of `network.ports` on a gated sandbox.
+        (model-call wake), G4.1 (TAP re-addressing), G5.1 (`curl` an
+        advertised port of a gated sandbox, suspend, resume, `curl` again;
+        repeat on a TAP sandbox), and record them in the verification doc.
+  - [ ] Found while building Phase 5: decide the Firecracker floor for
+        ingress. 1.17 fixes host-initiated RX sticking after a bare pause
+        and resume (#6100), which a live memory snapshot or fork does to
+        the origin; nothing enforces it yet, and G5.1 should measure it
+        ([calls entry 17](calls/gated-sandbox-checkpoints-plan_calls.md#17-ingress-takes-no-firecracker-117-floor-until-phase-0-measures-6100)).
+  - [ ] Found while building Phase 5: an ingress `proxy` hop cannot reach a
+        port inside a sandbox guest (the same gap as a gated task's private
+        port; [docs](../docs/network-handlers.md#ingress-into-a-sandbox)).
+  - [ ] Found while building Phase 5: a gated guest's `127.0.0.1:1080` is
+        the agent's proxy relay, so a workload advertising port 1080 cannot
+        bind it. Submit does not refuse a static port 1080 on a gated
+        sandbox yet.
+  - [ ] Found while building Phase 5: after a restore that moved a port,
+        the new allocation's own `LEGION_PORT_<label>` (its env, and what
+        `alloc get` shows) differs from the port the restored guest listens
+        on; `resume.env` and the datapath use the recorded port
+        ([calls entry 12](calls/gated-sandbox-checkpoints-plan_calls.md#12-a-restored-sandbox-keeps-the-ports-it-was-captured-with-and-the-datapath-dials-those)).
   - [ ] Found during the plan: gated `container` and `exec` tasks without
         upstreams get no VIP block and so no resolver
         ([plan §6.5](plans/gated-sandbox-checkpoints-plan.md#65-gated-is-the-sandbox-default-and-it-denies-by-default)).
@@ -1858,7 +1875,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] Found while building: a gated resolver forwards queries while the
         allocation's policy is still pending (the first heartbeat after
         placement), a narrow DNS channel the proxy does not have
-        ([calls entry 15](calls/gated-sandbox-checkpoints-plan_calls.md#15-a-gated-resolver-forwards-while-the-allocations-policy-is-pending)).
+        ([calls entry 19](calls/gated-sandbox-checkpoints-plan_calls.md#19-a-gated-resolver-forwards-while-the-allocations-policy-is-pending)).
         Revisit if boot-time resolution failures turn out to be rare.
   - [ ] Found while building: TAP guests are IPv4 only (`sandbox.bridges`
         takes an IPv4 subnet), and a guest kernel without `CONFIG_IP_PNP`
@@ -3967,7 +3984,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       and `endpoints` on `GetInstance`.
       [plan](plans/wake-on-request-plan.md) ·
       [docs](../docs/gateway.md)
-- [x] **Gated sandboxes, Phases 1 to 4** of the
+- [x] **Gated sandboxes, Phases 1 to 5** of the
       [gated sandbox checkpoints plan](plans/gated-sandbox-checkpoints-plan.md)
       ([calls](calls/gated-sandbox-checkpoints-plan_calls.md)), built on a
       host without KVM and tested against fake VMMs, Unix sockets standing
@@ -3985,7 +4002,8 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         runtime, a resolver for every gated sandbox, lower-case proxy vars
         and `NODE_USE_ENV_PROXY`, the static `legion-guest` agent (workspace
         crate `guest/`), submit refusals for gated plus TAP and for ingress
-        ports on a gated sandbox, `net policy show` resolving `auto`, and the
+        ports on a gated sandbox (the latter lifted by Phase 5), `net policy
+        show` resolving `auto`, and the
         shipped `configs/policies/agent-sandbox-egress.ncl`. The `auto` to
         `gated` flip is built and held (open above).
         [docs](../docs/network-handlers.md#default-deny)
@@ -3999,6 +4017,16 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         attribute and implicit constraint, and `config.network.tap` and
         `mac` removed (disk forks of TAP sandboxes allowed).
         [docs](../docs/task-runtime-sandbox.md#addressing)
+  - [x] Phase 5: ingress into sandboxes. The ingress listener dials a gated
+        guest through the VMM's base vsock socket (`CONNECT <port>` / `OK
+        <n>`, `src/worker/netd/vsock.rs`), the guest agent listens on a
+        vsock port per advertised port and relays to the workload's
+        loopback, a TAP guest's ports are fronted at its leased address,
+        the guest's ports ride the checkpoint so a restore dials the ports
+        the restored workload holds, and submit refuses ports only on a
+        loopback-only sandbox. G5.1 is open above.
+        [docs](../docs/network-handlers.md#ingress-into-a-sandbox) ·
+        [plan §6.10](plans/gated-sandbox-checkpoints-plan.md#610-ingress-into-a-gated-sandbox-phase-5)
 - [x] **Sandbox guest size follows `resources`** (`memoryMax`, else
       `memory`), so the scheduler's reservation and the VM's size can no
       longer drift apart

@@ -791,9 +791,11 @@ fn sandbox_is_always_microvm(task: &crate::structs::TaskConfig) -> bool {
 ///
 /// - `connections` counts connections through the node datapath: ingress
 ///   it fronts, and egress through a gated allocation's proxy. A sandbox's
-///   traffic crosses the datapath only when it is gated, so on `none`,
-///   `tap`, or a dev-mode container it would never fire, and a harness
-///   waiting on a quiet model call would still be suspended.
+///   outbound traffic crosses the datapath only when it is gated, so on
+///   `none`, `tap`, or a dev-mode container a harness waiting on a quiet
+///   model call would still be suspended. (A TAP guest's advertised ports
+///   are fronted by the datapath since gated plan Phase 5, but counting
+///   only the inbound half would read as a signal that covers the call.)
 /// - `exec`, listed explicitly, on a task pinned to a microVM VMM: a
 ///   microVM takes no exec sessions. (Listed by default, or on `auto`,
 ///   it is a warning instead: see [`sandbox_submit_warnings`].)
@@ -813,8 +815,9 @@ fn validate_sandbox_idle_signals(
     {
         return Err(format!(
             "task {:?}: suspend.idle.signals \"connections\" counts open connections through \
-             the node datapath, and this sandbox's traffic never crosses it (it is not \
-             network.mode = \"gated\", so it reaches the network on its own NIC or not at all)\n\
+             the node datapath, and this sandbox's outbound traffic never crosses it (it is \
+             not network.mode = \"gated\", so it reaches the network on its own NIC or not at \
+             all)\n\
              Hint: remove \"connections\", or run the sandbox gated, where a quiet model call \
              through the egress proxy keeps it awake. Otherwise set idle.after longer than the \
              call, or suspend from your platform, which knows when a call is in flight",
