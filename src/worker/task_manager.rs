@@ -6855,6 +6855,7 @@ mod tests {
                     },
                 ],
                 vip_block: None,
+                resolver: None,
                 mode: None,
                 ingress_tls: None,
             }),

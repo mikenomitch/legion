@@ -1987,7 +1987,56 @@ impl ManagerDaemonService {
                 .into_iter()
                 .chain(crate::task_plugins::resource_submit_warnings(&config))
                 .chain(crate::structs::suspend::sandbox_submit_warnings(&config))
+                .chain(self.gated_egress_submit_warnings(&config))
                 .collect(),
+        })
+    }
+
+    /// The node OS a task's `auto` is explained against when no placement is
+    /// in hand (`net policy show` and `test`): Linux when any node in the
+    /// cluster runs Linux, which is where an unset container mode is gated
+    /// (worker-plane-auth plan §6.12).
+    fn cluster_node_os(&self) -> Option<&'static str> {
+        let nodes = self.store.get_nodes().ok()?;
+        nodes
+            .iter()
+            .any(|node| {
+                node.fingerprint_attrs
+                    .get(crate::structs::network::ATTR_NODE_OS)
+                    .and_then(Value::as_str)
+                    == Some("linux")
+            })
+            .then_some("linux")
+    }
+
+    /// `gated-default` warnings for a submit or a plan (worker-plane-auth
+    /// plan §6.12): a task that would run gated with nothing allowing its
+    /// egress. A stored policy object with an egress chain whose selector
+    /// matches the task counts as coverage. Its `nodePools` are ignored,
+    /// because the pool is not known until placement, so a pool-scoped
+    /// object silences the warning rather than raising a false one.
+    fn gated_egress_submit_warnings(&self, config: &JobConfig) -> Vec<String> {
+        let policies = self.store.list_net_policies().unwrap_or_default();
+        crate::structs::network::gated_egress_warnings(config, |task| {
+            let facts = crate::structs::netpolicy::NetSelectorFacts {
+                node_pool: None,
+                namespace: String::new(),
+                runtime: task.runtime.clone(),
+                job: config.name.clone(),
+                labels: task
+                    .network
+                    .as_ref()
+                    .map(|network| network.labels.clone())
+                    .unwrap_or_default(),
+            };
+            policies.iter().any(|record| {
+                if record.object.egress.is_none() {
+                    return false;
+                }
+                let mut selector = record.object.selector.clone();
+                selector.node_pools.clear();
+                selector.matches(&facts)
+            })
         })
     }
 
@@ -4453,6 +4502,7 @@ impl Manager for ManagerDaemonService {
             index_usage,
             preemptions,
             preemption_mode: scheduler.preemption_settings().mode.as_str().to_string(),
+            warnings: self.gated_egress_submit_warnings(&config),
         };
 
         Ok(Response::new(reply))
@@ -8107,7 +8157,10 @@ impl Manager for ManagerDaemonService {
             crate::structs::network::resolve_network_mode_with(
                 &declared_mode,
                 &task.runtime,
-                &crate::structs::network::AutoModeFacts::for_task(&task),
+                &crate::structs::network::AutoModeFacts {
+                    node_os: self.cluster_node_os(),
+                    ..crate::structs::network::AutoModeFacts::for_task(&task)
+                },
                 self.store.sandbox_gated_default(),
             )
         });
@@ -8190,12 +8243,13 @@ impl Manager for ManagerDaemonService {
                         verdict: "deny".into(),
                         source: crate::structs::host_guard::HOST_GUARD_SOURCE.into(),
                         explanation: format!(
-                            "{}: {reason}. Hint: {hint}",
+                            "{}: {reason}",
                             crate::structs::host_guard::HOST_GUARD_SOURCE
                         ),
                         reason,
                         direction: direction.into(),
                         protocol: chain.map(|c| c.protocol.clone()).unwrap_or_default(),
+                        hint: hint.to_string(),
                     }));
                 }
             }
@@ -8212,7 +8266,10 @@ impl Manager for ManagerDaemonService {
                 crate::structs::network::resolve_network_mode_with(
                     declared_mode,
                     &task.runtime,
-                    &crate::structs::network::AutoModeFacts::for_task(&task),
+                    &crate::structs::network::AutoModeFacts {
+                        node_os: self.cluster_node_os(),
+                        ..crate::structs::network::AutoModeFacts::for_task(&task)
+                    },
                     self.store.sandbox_gated_default(),
                 )
             });

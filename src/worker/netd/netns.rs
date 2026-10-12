@@ -388,4 +388,60 @@ mod tests {
         assert!(!netns_exists(allocation_id));
         destroy(allocation_id).unwrap();
     }
+
+    /// Worker-plane-auth plan Phase 3 benchmark: what running gated adds to
+    /// a Linux container's start on this node. Host networking does none of
+    /// this; a gated start creates the namespace, brings loopback up, and
+    /// binds the listeners every gated allocation now gets (the egress
+    /// proxy, the resolver on UDP and TCP, and one ingress twin's peer
+    /// inside), then tears it all down at stop. Needs root on Linux:
+    ///
+    /// ```text
+    /// cargo test --lib -- --ignored gated_start_overhead --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn gated_start_overhead_benchmark() {
+        if !can_manage_netns() {
+            eprintln!("skipping: needs root on Linux");
+            return;
+        }
+        const RUNS: usize = 200;
+        let base = 800_000 + i64::from(std::process::id() % 10_000) * 1_000;
+        let mut start = Vec::with_capacity(RUNS);
+        let mut stop = Vec::with_capacity(RUNS);
+        for run in 0..RUNS {
+            let allocation_id = base + run as i64;
+            let _ = destroy(allocation_id);
+            let began = std::time::Instant::now();
+            let path = create(allocation_id).unwrap();
+            let proxy = bind_tcp(Some(path.clone()), "127.0.0.1:1080".parse().unwrap())
+                .await
+                .unwrap();
+            let dns_udp = bind_udp(Some(path.clone()), "127.0.0.53:53".parse().unwrap())
+                .await
+                .unwrap();
+            let dns_tcp = bind_tcp(Some(path.clone()), "127.0.0.53:53".parse().unwrap())
+                .await
+                .unwrap();
+            start.push(began.elapsed());
+            let began = std::time::Instant::now();
+            drop((proxy, dns_udp, dns_tcp));
+            destroy(allocation_id).unwrap();
+            stop.push(began.elapsed());
+        }
+        let report = |name: &str, samples: &mut Vec<std::time::Duration>| {
+            samples.sort();
+            let at = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+            println!(
+                "{name}: p50 {:?}, p99 {:?}, max {:?} over {} runs",
+                at(0.50),
+                at(0.99),
+                samples[samples.len() - 1],
+                samples.len()
+            );
+        };
+        report("gated start (namespace + listeners)", &mut start);
+        report("gated stop (teardown)", &mut stop);
+    }
 }

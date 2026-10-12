@@ -708,3 +708,68 @@ policy verdict.
 **Why.** Reporting a denial for something that was never judged would make
 the guard look like it refused a name it never saw an address for. **Accurate
 verdicts won.**
+
+## 29. A gated twin is the port's `to`, or the advertised number itself
+
+Made while implementing Phase 3. The plan says every gated allocation gets
+"twins" for its declared ports. Twins used to be fresh ports from the node's
+dynamic range, because a host-mode task shares the host's ports with the
+datapath. A gated task has its own namespace, so its twin is now `to` when
+the port declares one, else the advertised port number:
+
+```nickel
+network = { ports = [{ name = "pg", to = 5432 }] },   # Postgres listens on 5432 inside
+```
+
+The datapath owns host port `20123` and forwards to `5432` inside the
+namespace. `LEGION_PORT_PG` is `5432`.
+
+**Alternative.** Keep dynamic twins for gated allocations too.
+
+**Trade-off.** Two ports in one task that declare the same `to` collide inside
+the namespace, as they already do on macOS. A gated task that has an ingress
+chain sees a different `LEGION_PORT_<NAME>` than before (the advertised
+number or `to`, not a dynamic twin).
+
+**Why.** Most images listen on a fixed port. With dynamic twins, every stock
+image (nginx on 80, Postgres on 5432) would need its command rewritten to read
+`LEGION_PORT_<NAME>` before it could run gated, and gated is now the default.
+`to` already means "the port inside the container" on macOS, so this gives it
+the same meaning on Linux. **Ease of the default won.**
+
+## 30. The node's `os` fingerprint decides `auto`; a node without it stays `host`
+
+Made while implementing Phase 3. Placement reads the node's `os` fingerprint
+attribute. Only `linux` turns a container's `auto` into `gated`. A submit-time
+check (no node yet) treats the node as not Linux. A Linux worker that cannot
+create namespaces (not root) is not detected at placement. The container
+fails to start with `gated network namespace ... is not ready`, and the fix
+is `network.mode = "host"` or running the worker as root.
+
+**Alternative.** Have workers report a `network.gated` capability and gate on
+it.
+
+**Trade-off.** A misconfigured worker fails at start rather than being
+skipped at placement.
+
+**Why.** The container runtime already needs a root worker on Linux (it runs
+the OCI runtime and mounts), so a node that can run containers can create
+namespaces. A capability attribute would add a second source of truth for the
+same fact. **Simplicity won.**
+
+## 31. The `gated-default` warning counts pool-scoped policy objects as coverage
+
+Made while implementing Phase 3. `job run` and `job plan` warn when a task
+would run gated with no egress allowed. A stored policy object with an egress
+chain counts as coverage when its selector matches, ignoring `nodePools`,
+because the pool is not known until placement. `job validate` runs locally,
+cannot see stored policies, and warns whenever the task itself allows
+nothing.
+
+**Alternative.** Warn unless a policy matches every eligible pool.
+
+**Trade-off.** A job that lands in a pool its policy does not cover gets no
+warning, then a `403` with `gated-default` and a hint.
+
+**Why.** A warning that fires on correct jobs teaches people to ignore it. The
+`403` itself names the source and the fix. **A quiet, accurate warning won.**

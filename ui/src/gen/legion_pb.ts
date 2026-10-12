@@ -3582,6 +3582,19 @@ export class PlanJobReply extends Message<PlanJobReply> {
    */
   preemptionMode = "";
 
+  /**
+   * Valid settings that will not do what the author most likely expects,
+   * one human-readable line each (the same lines `RunJob` returns). Today: a
+   * task that would run gated (a `container` on a Linux node by default, or
+   * any task with `network.mode = "gated"`) with no `network.egress` and no
+   * stored policy object covering it, whose outbound connections would all
+   * be refused with `gated-default`. Each line ends with a `hint:` naming the
+   * fix. Empty when there is nothing to say.
+   *
+   * @generated from field: repeated string warnings = 8;
+   */
+  warnings: string[] = [];
+
   constructor(data?: PartialMessage<PlanJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3597,6 +3610,7 @@ export class PlanJobReply extends Message<PlanJobReply> {
     { no: 5, name: "index_usage", kind: "message", T: TaskIndexUsage, repeated: true },
     { no: 6, name: "preemptions", kind: "message", T: PlannedPreemption, repeated: true },
     { no: 7, name: "preemption_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobReply {
@@ -25828,7 +25842,9 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
   /**
    * How to change the verdict, when there is an obvious fix. Set for a
    * `gated-default` denial: allow the destination in the task's
-   * `network.egress.allow`, or apply a policy object. Empty otherwise.
+   * `network.egress.allow`, or apply a policy object. Set for a `host-guard`
+   * denial: the guard is changed on the worker (`hostGuard.allow`), not in
+   * job policy. Empty otherwise.
    *
    * @generated from field: string hint = 7;
    */

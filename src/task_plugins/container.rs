@@ -1317,6 +1317,7 @@ mod tests {
                 },
             ],
             vip_block: None,
+            resolver: None,
             mode: None,
             ingress_tls: None,
         });
@@ -1528,6 +1529,91 @@ mod tests {
             stderr.contains("stderr-line"),
             "stderr captured: {stderr:?}"
         );
+        Ok(())
+    }
+
+    /// Worker-plane-auth plan Phase 3 benchmark: container start latency on
+    /// host networking and gated (the new Linux default), from `start()` to
+    /// the container's `true` exiting. A gated run also pays for what the
+    /// worker does before it: the namespace and the egress proxy and resolver
+    /// listeners inside it. One warm-up pull, then the image is reused, so
+    /// the numbers are runtime plus bundle, not registry. Needs root, an OCI
+    /// runtime, and network:
+    ///
+    /// ```text
+    /// LEGION_OCI_RUNTIME=runc cargo test --lib container_start_latency \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root, an OCI runtime (youki/runc/crun) + network"]
+    fn container_start_latency_host_vs_gated_benchmark() -> R<()> {
+        use crate::worker::netd::netns;
+        const RUNS: usize = 20;
+        let plugin = ContainerTaskPlugin;
+        let task = container_task("startbench", json!(["/bin/true"]));
+        let tmp = tempfile::tempdir()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let run = |id: i64, gated: bool| -> R<std::time::Duration> {
+            let mut allocation = alloc_with_id(id);
+            let began = std::time::Instant::now();
+            let listeners = if gated {
+                let path = netns::create(id)?;
+                allocation.network = Some(crate::structs::AllocNetwork {
+                    mode: Some("gated".into()),
+                    resolver: Some(crate::structs::network::GATED_RESOLVER_ADDR.into()),
+                    ..Default::default()
+                });
+                Some(runtime.block_on(async {
+                    Ok::<_, anyhow::Error>((
+                        netns::bind_tcp(Some(path.clone()), "127.0.0.1:1080".parse()?).await?,
+                        netns::bind_udp(Some(path.clone()), "127.0.0.53:53".parse()?).await?,
+                        netns::bind_tcp(Some(path), "127.0.0.53:53".parse()?).await?,
+                    ))
+                })?)
+            } else {
+                None
+            };
+            let mut instance = TaskInstance {
+                alloc_dir: Some(tmp.path().to_path_buf()),
+                log_dir: Some(tmp.path().join(format!("logs-{id}"))),
+                ..TaskInstance::default()
+            };
+            plugin.start(&allocation, &task, &mut instance)?;
+            let status = instance.child.take().expect("child handle set").wait()?;
+            let elapsed = began.elapsed();
+            assert!(
+                status.success(),
+                "container {id} exited cleanly: {status:?}"
+            );
+            drop(listeners);
+            if gated {
+                netns::destroy(id)?;
+            }
+            Ok(elapsed)
+        };
+        if !netns::can_manage_netns() {
+            eprintln!("skipping: needs root on Linux");
+            return Ok(());
+        }
+        run(9100, false)?; // warm-up: pulls the image once
+        let (mut host, mut gated) = (Vec::new(), Vec::new());
+        for i in 0..RUNS as i64 {
+            host.push(run(9200 + i, false)?);
+            gated.push(run(9300 + i, true)?);
+        }
+        for (name, samples) in [("host", &mut host), ("gated", &mut gated)] {
+            samples.sort();
+            let at = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+            println!(
+                "container start, {name}: p50 {:?}, p99 {:?} over {} runs",
+                at(0.50),
+                at(0.99),
+                samples.len()
+            );
+        }
         Ok(())
     }
 

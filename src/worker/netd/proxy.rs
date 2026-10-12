@@ -1586,8 +1586,7 @@ mod tests {
     async fn a_resumed_gated_sandbox_is_judged_by_its_new_allocations_policy() {
         let origin_port = origin().await;
         let dir = tempfile::tempdir().unwrap();
-        let (context, denials) =
-            gated_context(
+        let (context, denials) = gated_context(
             &[(7, &["127.0.0.1/**"]), (8, &["127.0.0.1/health"])],
             &[origin_port],
         );
@@ -1621,8 +1620,7 @@ mod tests {
         let origin_port = origin().await;
         let dir = tempfile::tempdir().unwrap();
         let allow: &[&str] = &["127.0.0.1/ok/**"];
-        let (context, denials) =
-            gated_context(
+        let (context, denials) = gated_context(
             &[(7, allow), (11, allow), (12, allow), (13, allow)],
             &[origin_port],
         );

@@ -211,6 +211,15 @@ unknown capability name in `exec`'s `hardening` block, a non-octal `umask`, or
 both `oom_adj` and `oom_score_adj` set. These come back from `job validate`
 instead of from a task that fails to start on some node ten seconds later.
 
+A valid spec can still carry **warnings**: settings that will not do what the
+author most likely expects. They come back as a `warnings` list in the
+`job validate --json` data, in `job run`'s reply, and in `PlanJobReply.warnings`
+(`legion job plan -j`). One an agent meets often: a `container` on a Linux
+node runs gated by default and denies every outbound connection that nothing
+allows, so a task with no `network.egress` (and no policy object covering it)
+is warned about before its first `403 gated-default`. Each warning line ends
+with a `hint:` naming the fix.
+
 ### Job templates: authoring by parameter instead of by spec
 
 When a cluster publishes [job templates](job-templates.md), an agent doesn't

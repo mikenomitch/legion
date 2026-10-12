@@ -52,12 +52,12 @@ A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
      the extracted rootfs's `/etc/passwd` and `/etc/group`, and `HOME` comes
      from the passwd entry when the env doesn't set it. Names that can't be
      resolved fall back to root with a warning.
-   - host networking by default, with the host's `/etc/resolv.conf` and
-     `/etc/hosts` bind-mounted read-only so DNS works. When the allocation has
-     its own resolver, the bundle mounts a generated `resolv.conf` pointing at
-     it instead. With `network.mode = "gated"`, the bundle joins the
-     allocation's network namespace (see
-     [Networking: `host` and `gated`](#networking-host-and-gated)),
+   - the allocation's network namespace when it runs gated (the default; see
+     [Networking](#networking-gated-by-default-on-linux)), with a generated
+     `resolv.conf` pointing at its resolver. With `network.mode = "host"`, the
+     host's network, with the host's `/etc/resolv.conf` and `/etc/hosts`
+     bind-mounted read-only so DNS works (or a generated `resolv.conf` when
+     the allocation has its own resolver),
    - a writable root filesystem.
 3. **Run it:** `<runtime> run --bundle <dir> legion-<alloc>`.
 
@@ -122,9 +122,12 @@ only being used for scheduling. Both travel in the allocation payload
   Two validation rules apply on both Linux and macOS: `cores` must be a
   **whole number** (a cpuset can't hold a fraction of a CPU), and a task
   declares `cores` **or** `cpu`, never both.
-- **Linux port mapping is not applied.** In the default `host` mode, assigned
-  ports reach the container directly. In `gated` mode, inbound traffic only
-  arrives through the datapath's ingress listeners
+- **Linux: ports arrive through the datapath.** In the default `gated` mode
+  the datapath owns each assigned host port and forwards it into the
+  container's namespace, to `to` when the port declares it and to the same
+  port number otherwise, so `{ name = "pg", to = 5432 }` reaches a server
+  listening on 5432. In `host` mode, assigned ports reach the container
+  directly and `to` is not applied
   ([Network Handlers](network-handlers.md#gated-mode)).
 
 ## Runtime Behavior
@@ -311,27 +314,76 @@ directly (see [docs/artifacts.md](artifacts.md)):
   and `${artifact.<name>}` hold the in-container path. See
   [The task directory](#the-task-directory-legiontask).
 
-## Networking: `host` and `gated`
+## Networking: gated by default on Linux
 
-By default a `container` task shares the host's network (`network.mode =
-"host"`). Declared ports are host ports, and `connect.upstreams` are loopback
-ports owned by the node datapath. Egress policy applies to traffic through
-those upstreams and to names resolved through the allocation's resolver
-(`LEGION_DNS`). In this mode, enforcement depends on the workload using them.
+On a Linux node a `container` task runs **gated** unless it says otherwise:
+`network.mode = "auto"`, the default, resolves to `gated` at placement. The
+worker creates an empty network namespace for the allocation before it
+starts, and the container joins it by path through an OCI `network`
+namespace entry. The namespace holds loopback and the datapath's listeners,
+nothing else:
 
-With `network.mode = "gated"` (Linux), the worker creates an empty network
-namespace for the allocation before it starts. The container joins it by path
-through an OCI `network` namespace entry. The namespace holds only loopback and
-the datapath's listeners: upstream ports, VIPs, the resolver, and an egress
-proxy at `127.0.0.1:1080` exported as `HTTP_PROXY` / `HTTPS_PROXY` /
-`ALL_PROXY`. A tool that ignores the proxy has no route out, so its only way
+| Inside the namespace | What it is |
+| --- | --- |
+| `127.0.0.1:1080` | the egress proxy, exported as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (and lower case) and `LEGION_EGRESS_PROXY` |
+| `127.0.0.53:53` | the allocation's resolver, in `/etc/resolv.conf` and `LEGION_DNS`. A task with upstreams gets its VIP block's `.1` instead |
+| `LEGION_UPSTREAM_<KEY>`, `<key>.svc.legion` | upstreams and their VIPs |
+| each declared port | the port the task listens on: `to` when the port sets it, else the host port. The datapath owns the host port on the node and forwards to it |
+
+**Egress is denied unless something allows it.** A gated container that no
+task block and no policy object covers is refused every destination with the
+`gated-default` source. Opening a host is one line:
+
+```nickel
+network = { egress = { allow = ["api.stripe.com:443"] } },
+```
+
+Observing everything and blocking nothing is also one line, and the
+[host guard](network-handlers.md#the-host-guard) still applies under it:
+
+```nickel
+network = { egress = { policy = "allow", accessLog = true } },
+```
+
+`legion job validate`, `legion job run`, and `legion job plan` warn when a
+container on a Linux node would run gated with nothing allowed:
+
+```text
+warning: task "web" is gated (the default for containers on Linux) and allows no
+egress. Outbound connections will be refused with `gated-default`.
+hint: add hosts to network.egress.allow, or set network.mode = "host"
+```
+
+A tool that ignores the proxy variables has no route out, so its only way
 off the namespace is a connection the datapath judges. Every destination the
-proxy dials is checked against the [host guard](network-handlers.md#the-host-guard)
-first: the node itself (loopback and its own addresses), link-local (the
-cloud metadata service), and other allocations' listeners are refused
-whatever the job's policy says, and a hostname is judged by the address it
-resolves to. The full model, the fail-closed rules, and the limits (no raw
-UDP, no ICMP, no inbound to undeclared ports, Linux only) are in
+proxy dials is checked against the host guard first: the node itself
+(loopback and its own addresses), link-local (the cloud metadata service),
+and other allocations' listeners are refused whatever the job's policy says,
+and a hostname is judged by the address it resolves to.
+
+**Inbound.** Every declared port gets an ingress listener on its host port,
+with or without an ingress chain, so the service is reachable from other
+nodes, from service consumers, and from its own health checks. Without a
+chain the listener allows every peer. The task sees the datapath as its peer,
+not the original client.
+
+**What gated costs a container.** No raw UDP (DNS goes through the resolver),
+no ICMP, IPv4 only inside the namespace, and no route for tools that ignore
+the proxy variables. That includes Java's default HTTP client and most
+database drivers. Reach a database outside the cluster through an external
+upstream (`connect.upstreams` with `to = "tcp://db.example.com:5432"`), which
+needs no proxy support. Each start also pays for the namespace and its
+listeners, a few milliseconds (see [Testing](#testing) for the numbers).
+
+**Opting out.** `network.mode = "host"` shares the host's network, as every
+container did before gated became the default. Declared ports are host
+ports, and egress policy applies only to traffic through upstreams and the
+resolver. A host-mode container can reach the node, other allocations'
+listeners, and the cloud metadata service, so keep it for trusted images.
+
+On macOS, `auto` stays `host`: Apple `container` already runs each container
+in its own VM on its own network, and macOS has no network namespaces. The
+full model, the fail-closed rules, and the limits are in
 [Network Handlers](network-handlers.md#gated-mode).
 
 ## Capability Summary
@@ -345,7 +397,7 @@ UDP, no ICMP, no inbound to undeclared ports, Linux only) are in
 | Graceful stop (`stop { signal, killAfter }`) | ✅ both platforms |
 | Memory / CPU limits | ✅ macOS (guest sizing). ✅ Linux with `resourceEnforcement.enabled` (cgroup v2). See [docs/resource-enforcement.md](resource-enforcement.md) |
 | Exclusive cores (`resources.cores`) | ✅ Linux (cpuset pinning). macOS sizes the guest instead |
-| Port publishing | ✅ macOS. n/a on Linux (host networking, or ingress listeners in `gated` mode) |
+| Port publishing | ✅ macOS (`--publish`). Linux: ingress listeners forward each host port into the gated namespace (`to`, or the same port); not applied in `host` mode |
 | Volumes (`volumes[]`, `stateful.storage`) | ✅ bind-mounted at the declared `path`. See [docs/volumes.md](volumes.md) |
 | Artifacts | ✅ image (staged via `containerImageDesugar`, or pulled by the runtime) and file/tree (readable under `/legion/task`) |
 | Exec / interactive PTY | ✅ / ✅ on both Apple `container` and the Linux OCI runtimes (sandboxed). See [docs/exec-and-actions.md](exec-and-actions.md) |
@@ -384,6 +436,22 @@ cargo test --lib apple_container -- --ignored --nocapture
 LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime -- --ignored --nocapture
 ```
 
+**What gated costs at start.** Two ignored benchmarks measure it on a Linux
+node, as root:
+
+```bash
+# the namespace and its listeners alone, 200 runs
+cargo test --lib gated_start_overhead -- --ignored --nocapture
+# a whole container start, host vs gated, 20 runs each
+LEGION_OCI_RUNTIME=runc cargo test --lib container_start_latency -- --ignored --nocapture
+```
+
+On a 4-core Linux 6.18 VM with `runc` and an unoptimized build, the
+namespace and listeners added p50 1.0 ms and p99 3.9 ms (teardown p50
+0.1 ms). A whole `alpine` container start that runs `/bin/true` took p50
+354 ms and p99 414 ms on host networking, and p50 360 ms and p99 506 ms
+gated.
+
 ## Current Scope and Limitations
 
 - The runtime integration is simple: it shells out to runtime binaries.
@@ -394,10 +462,10 @@ LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime -- --ignored --nocapture
 - File-delivery destinations must resolve under `/legion/task`. Per-file bind
   mounts and K8s-style projected volumes were rejected as designs because they
   break atomic refresh. They aren't planned.
-- Linux containers share host networking by default. A private network
-  namespace is available only through `network.mode = "gated"`, which has its
-  own limits ([Network Handlers](network-handlers.md#gated-mode)). Port
-  mapping is not implemented.
+- Linux containers are gated by default, with the costs listed under
+  [Networking](#networking-gated-by-default-on-linux): no raw UDP or ICMP,
+  IPv4 only, and no route for tools that ignore the proxy variables.
+  `network.mode = "host"` opts out.
 - Linux resource enforcement requires the cgroup v2 unified hierarchy, a
   worker that can create the `legion/` subtree at the cgroup root, and
   `resourceEnforcement.enabled` in the worker config. Without it, `resources`

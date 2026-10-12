@@ -50,9 +50,22 @@ How to use it:
         worker-type `hostGuard` overrides and `host-guard` in denials,
         `net policy test`, and `net doctor` (plan §6.11; calls 22, 23, 27,
         28). Docs: [network-handlers.md](../docs/network-handlers.md#the-host-guard).
-  - [ ] Phase 3: Linux containers gated by default with `gated-default`
-        deny, ingress twins and a resolver for every gated allocation, and a
-        validate warning (plan §6.12).
+  - [x] Phase 3: Linux containers gated by default (`auto` reads the
+        node's `os`), ingress twins (`to` or the advertised number) and a
+        `127.0.0.53` resolver for every gated allocation, and the
+        `gated-default` warning on `job validate`, `job run`, and `job plan`
+        (plan §6.12; calls 29 to 31). `gated-default` and the lower-case proxy
+        variables came from the gated-sandbox plan. Docs:
+        [task-runtime-container.md](../docs/task-runtime-container.md#networking-gated-by-default-on-linux),
+        [network-handlers.md](../docs/network-handlers.md#networkmode).
+  - [ ] Run a real gated container end to end on a Linux node (runc or
+        youki) with the default mode: a stock `nginx` reachable on its
+        advertised port, `curl` through the proxy refused with
+        `gated-default`, then allowed after `network.egress.allow`. This
+        repository's CI starts no OCI runtime; the placement, port, resolver,
+        and namespace pieces are tested separately
+        (`tests/gated_container_default.rs`,
+        `netns::tests::gated_start_overhead_benchmark`).
   - [ ] Phase 4: the encrypted worker-to-manager channel, with the ticket
         JWKS fetched over it (plan §6.8).
   - [ ] Phase 5: the host guard in the kernel: an `nftables` table matched by

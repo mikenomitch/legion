@@ -2600,6 +2600,15 @@ message PlanJobReply {
   // otherwise, which is exactly the discoverability failure this field
   // exists to prevent.
   string preemption_mode = 7;
+
+  // Valid settings that will not do what the author most likely expects,
+  // one human-readable line each (the same lines `RunJob` returns). Today: a
+  // task that would run gated (a `container` on a Linux node by default, or
+  // any task with `network.mode = "gated"`) with no `network.egress` and no
+  // stored policy object covering it, whose outbound connections would all
+  // be refused with `gated-default`. Each line ends with a `hint:` naming the
+  // fix. Empty when there is nothing to say.
+  repeated string warnings = 8;
 }
 
 // One allocation a plan would displace.
@@ -9574,7 +9583,9 @@ message TestNetPolicyReply {
 
   // How to change the verdict, when there is an obvious fix. Set for a
   // `gated-default` denial: allow the destination in the task's
-  // `network.egress.allow`, or apply a policy object. Empty otherwise.
+  // `network.egress.allow`, or apply a policy object. Set for a `host-guard`
+  // denial: the guard is changed on the worker (`hostGuard.allow`), not in
+  // job policy. Empty otherwise.
   string hint = 7;
 }
 

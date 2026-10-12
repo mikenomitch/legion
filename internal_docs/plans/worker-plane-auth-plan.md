@@ -3,7 +3,8 @@
 > **Judgement calls:** [worker-plane-auth-plan_calls.md](../calls/worker-plane-auth-plan_calls.md)
 
 **Status: IN EXECUTION.** Phases 0 (ACLs on by default), 1 (the mTLS worker
-plane) and 2 (the host guard in the datapath) shipped. The plan
+plane), 2 (the host guard in the datapath), and 3 (Linux containers gated by
+default) shipped. The plan
 has two halves that share one threat: something reaching a node's control
 plane that shouldn't.
 
@@ -1481,6 +1482,26 @@ sudo -E LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_security -- --ignor
   follower works after a leader failover. A worker is unreachable on purpose
   (security group) and reported. The spot-check job passes on every worker,
   including the metadata rows on real EC2.
+
+### Verification record
+
+What ran, where, as each phase shipped. Anything not run is also an open
+item in `internal_docs/TODO.md`.
+
+- **Phases 0 to 2** ran in a Linux 6.18 VM as root (cgroup hybrid, `nft`,
+  `runc`, no KVM): `cargo test --all --locked` green, including
+  `tests/worker_plane_e2e.rs` (the real binary with an in-process worker
+  over mTLS: logs, exec with exit status, a CA rotation in the middle) and
+  the datapath guard tests against real namespaces.
+- **Phase 3** ran on the same VM: `tests/gated_container_default.rs`
+  (placement), the network unit tests, and both start benchmarks with `runc`:
+  the namespace and listeners add p50 1.0 ms / p99 3.9 ms
+  (`gated_start_overhead_benchmark`, 200 runs), and a whole `alpine` start
+  is p50 354 ms / p99 414 ms on host networking against p50 360 ms / p99
+  506 ms gated (`container_start_latency_host_vs_gated_benchmark`, 20 runs
+  each, unoptimized build). Not run: a real gated service end to end (a stock
+  `nginx` on its advertised port with the default deny), and the AWS spot
+  check.
 
 ## 10. Rollout and backward compatibility
 

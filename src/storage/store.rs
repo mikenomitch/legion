@@ -12167,37 +12167,61 @@ impl Store {
             || declared
                 .trim()
                 .eq_ignore_ascii_case(crate::structs::netpolicy::MODE_AUTO);
-        let mut mode =
-            if auto && runtime == "sandbox" && self.sandbox_gated_default.load(Ordering::Relaxed) {
-                // Gated plan Phase 2: a sandbox's `auto` depends on its own
-                // `config.network` and `hypervisor` and on the node's default
-                // VMM. Only paid by sandbox placements while the gate is open.
-                let config: Value = tx
-                    .query_row(
-                        "SELECT config FROM task_config WHERE id = ?;",
-                        [task_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                    .unwrap_or(Value::Null);
-                let node_attrs: Value = tx
-                    .query_row(
-                        "SELECT fingerprint_attrs FROM node WHERE id = ?;",
-                        [node_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                    .unwrap_or(Value::Null);
-                let facts = crate::structs::network::AutoModeFacts {
-                    node_vmm: node_attrs
-                        .get(crate::structs::checkpoint::ATTR_SANDBOX_VMM)
-                        .and_then(Value::as_str),
-                    ..crate::structs::network::AutoModeFacts::from_config(&config)
-                };
-                crate::structs::network::resolve_network_mode_with(declared, &runtime, &facts, true)
-            } else {
-                crate::structs::resolve_network_mode(declared, &runtime)
+        let sandbox_gate = self.sandbox_gated_default.load(Ordering::Relaxed);
+        let mut mode = if auto && runtime == "container" {
+            // Worker-plane-auth plan §6.12: a container's `auto` is `gated`
+            // on a Linux node, `host` on macOS. One indexed read, paid only
+            // by container placements that left the mode unset.
+            let node_attrs: Value = tx
+                .query_row(
+                    "SELECT fingerprint_attrs FROM node WHERE id = ?;",
+                    [node_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(Value::Null);
+            let facts = crate::structs::network::AutoModeFacts {
+                node_os: node_attrs
+                    .get(crate::structs::network::ATTR_NODE_OS)
+                    .and_then(Value::as_str),
+                ..Default::default()
             };
+            crate::structs::network::resolve_network_mode_with(
+                declared,
+                &runtime,
+                &facts,
+                sandbox_gate,
+            )
+        } else if auto && runtime == "sandbox" && sandbox_gate {
+            // Gated plan Phase 2: a sandbox's `auto` depends on its own
+            // `config.network` and `hypervisor` and on the node's default
+            // VMM. Only paid by sandbox placements while the gate is open.
+            let config: Value = tx
+                .query_row(
+                    "SELECT config FROM task_config WHERE id = ?;",
+                    [task_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(Value::Null);
+            let node_attrs: Value = tx
+                .query_row(
+                    "SELECT fingerprint_attrs FROM node WHERE id = ?;",
+                    [node_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(Value::Null);
+            let facts = crate::structs::network::AutoModeFacts {
+                node_vmm: node_attrs
+                    .get(crate::structs::checkpoint::ATTR_SANDBOX_VMM)
+                    .and_then(Value::as_str),
+                ..crate::structs::network::AutoModeFacts::from_config(&config)
+            };
+            crate::structs::network::resolve_network_mode_with(declared, &runtime, &facts, true)
+        } else {
+            crate::structs::resolve_network_mode(declared, &runtime)
+        };
         // Stored policies are rare on the placement path; the generation
         // check makes a cluster without any of them pay one indexed read.
         if self.net_policy_generation().unwrap_or(0) > 0 {
@@ -12233,6 +12257,14 @@ impl Store {
         Ok(Some(mode))
     }
 
+    /// A task's runtime, read on the placement path.
+    fn task_runtime(&self, tx: &Connection, task_id: i64) -> R<Option<String>> {
+        Ok(tx
+            .prepare_cached("SELECT runtime FROM task_config WHERE id = ?;")?
+            .query_row([task_id], |row| row.get(0))
+            .optional()?)
+    }
+
     fn assign_allocation_network(
         &self,
         tx: &Connection,
@@ -12261,15 +12293,24 @@ impl Store {
         let has_upstreams = connect
             .as_ref()
             .is_some_and(|connect| !connect.upstreams.is_empty());
+        let mode = self.effective_network_mode(tx, node_id, task_id, network.as_ref())?;
+        let gated = mode.as_deref() == Some(crate::structs::netpolicy::MODE_GATED);
+        // A gated container or exec task gets a namespace resolver and
+        // ingress listeners whatever it declares (plan §6.12). A gated
+        // sandbox is reached over vsock instead, so it gets neither here.
+        let gated_namespace =
+            gated && self.task_runtime(tx, task_id)?.as_deref() != Some("sandbox");
         if !has_ports && !has_upstreams {
             // No ports and no upstreams: the row carries a network only when
             // a mode other than `host` applies (the task asked for `gated`,
-            // or a required policy imposes it), so plain jobs stay unchanged.
-            let mode = self.effective_network_mode(tx, node_id, task_id, network.as_ref())?;
+            // the node defaults it, or a required policy imposes it), so
+            // plain jobs stay unchanged.
             return Ok(match mode.as_deref() {
                 Some(mode) if mode != crate::structs::netpolicy::MODE_HOST => {
                     Some(crate::structs::AllocNetwork {
                         mode: Some(mode.to_string()),
+                        resolver: gated_namespace
+                            .then(|| crate::structs::network::GATED_RESOLVER_ADDR.to_string()),
                         ..Default::default()
                     })
                 }
@@ -12288,6 +12329,11 @@ impl Store {
             let existing: crate::structs::AllocNetwork = from_str(&raw)
                 .with_context(|| format!("invalid stored allocation network on node {node_id}"))?;
             used.extend(existing.ports.iter().map(|port| port.host_port));
+            // A host-mode ingress twin is a host port too; a gated one lives
+            // in the allocation's own namespace and takes nothing here.
+            if !existing.is_gated() {
+                used.extend(existing.ports.iter().filter_map(|port| port.private_port));
+            }
             used.extend(
                 existing
                     .upstreams
@@ -12338,7 +12384,10 @@ impl Store {
             &used,
             &service_ports,
             vip_block.as_deref(),
-            has_ingress,
+            // A gated namespace has no other way in: every declared port
+            // gets an ingress listener, chain or not (plan §6.12).
+            has_ingress || gated_namespace,
+            gated_namespace,
         )
         .with_context(|| format!("failed to assign ports on node {node_id}"))?;
         let address = tx
@@ -12347,7 +12396,8 @@ impl Store {
             .ok()
             .and_then(|attrs| worker_address_host(&attrs));
 
-        let mode = self.effective_network_mode(tx, node_id, task_id, network.as_ref())?;
+        let resolver = (gated_namespace && vip_block.is_none())
+            .then(|| crate::structs::network::GATED_RESOLVER_ADDR.to_string());
         let ingress_tls = if has_ingress {
             self.ingress_tls_at_placement(tx, node_id, task_id, network.as_ref())?
         } else {
@@ -12358,6 +12408,7 @@ impl Store {
             ports,
             upstreams,
             vip_block,
+            resolver,
             mode,
             ingress_tls,
         }))

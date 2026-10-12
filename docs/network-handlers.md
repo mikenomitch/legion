@@ -273,16 +273,20 @@ behave the same whichever one the task dials. The loopback port and
 
 | Env var | Value |
 | --- | --- |
-| `LEGION_DNS` | `127.42.<b>.1`, the allocation's resolver |
+| `LEGION_DNS` | `127.42.<b>.1`, the allocation's resolver (`127.0.0.53` for a gated allocation with no upstreams) |
 | `LEGION_UPSTREAM_HOST_<KEY>` | `<key>.svc.legion` |
 | `LEGION_UPSTREAM_VIP_<KEY>` | `<vip>:<canonical port>` |
 
-**Who gets the resolver automatically.** A `container` task's
-`/etc/resolv.conf` is generated to point at it (`search svc.legion`,
+**Who gets the resolver automatically.** Every allocation with upstreams,
+and every gated `container` or `exec` allocation, upstreams or not. A gated
+allocation without a VIP block gets its resolver at the fixed address
+`127.0.0.53` inside its namespace, which spends no VIP block. A `container`
+task's `/etc/resolv.conf` is generated to point at it (`search svc.legion`,
 `ndots:1`). An `exec` task gets `LEGION_DNS` and keeps the host's
 `/etc/resolv.conf`, in gated mode too. Legion does not generate a
 resolv.conf for `exec` tasks, so point your tool at `LEGION_DNS` to use the
-allocation's resolver. A gated `sandbox` uses the guest
+allocation's resolver; on a host whose `resolv.conf` names systemd-resolved's
+`127.0.0.53`, a gated `exec` task reaches its own resolver without that. A gated `sandbox` uses the guest
 agent's relay as its resolver (`nameserver 127.0.0.1` in the guest's
 `resolv.conf`, see "Sandboxes").
 
@@ -560,14 +564,17 @@ certificate revocation. The 24-hour lifetime takes its place.
 
 | `mode` | Meaning | Default for |
 | --- | --- | --- |
-| `host` | host networking. Policy is cooperative (proxy env vars, upstreams, the resolver) | `container`, `exec`, `sandbox` |
-| `gated` | the workload's network namespace holds loopback and the datapath only, so a `container` or non-root `exec` task can't open a socket around it. Every destination the egress proxy dials is judged by the [host guard](#the-host-guard) and then by policy, by the address a name resolves to. A root `exec` task can leave the namespace. For a `sandbox`, it is a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | — |
-| `auto` | `host` for every runtime | — |
+| `host` | host networking. Policy is cooperative (proxy env vars, upstreams, the resolver) | `exec`, `sandbox`, `container` on macOS |
+| `gated` | the workload's network namespace holds loopback and the datapath only, so a `container` or non-root `exec` task can't open a socket around it. Every destination the egress proxy dials is judged by the [host guard](#the-host-guard) and then by policy, by the address a name resolves to. A root `exec` task can leave the namespace. For a `sandbox`, it is a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | `container` on Linux |
+| `auto` (the default) | `gated` for a `container` on a Linux node, `host` for everything else | — |
 | `bridge`, `cni/<name>` | reserved for the datapath plugin, rejected at submit | — |
 
-The effective mode is resolved **at placement**. It is the task's own value,
-or the one imposed by the highest-priority matching `require` policy (`mode`
-on a policy object). A namespace is set when the task starts, so a policy
+The effective mode is resolved **at placement**, with the node in hand:
+`auto` reads the node's `os` fingerprint, so one `container` job runs gated
+on its Linux nodes and on host networking on its macOS nodes. It is the
+task's own value, or the one imposed by the highest-priority matching
+`require` policy (`mode` on a policy object). An explicit `gated` is never
+downgraded. A namespace is set when the task starts, so a policy
 that changes `mode` affects the next placement, not a running allocation.
 
 ### Gated mode
@@ -576,8 +583,9 @@ With `mode = "gated"`, the worker creates an empty network namespace for the
 allocation before it starts: `/var/run/netns/legion-<allocation>`, with
 loopback up, no other interface, and no route. It binds every datapath
 listener inside that namespace: the upstream loopback ports, the VIPs, the
-allocation's resolver at `127.42.<b>.1:53`, and an **egress proxy** at
-`127.0.0.1:1080`. A `container` joins the namespace by path (an OCI
+allocation's resolver (at `127.42.<b>.1:53` with a VIP block, else at
+`127.0.0.53:53`), an **ingress listener** for every declared port, and an
+**egress proxy** at `127.0.0.1:1080`. A `container` joins the namespace by path (an OCI
 `network` namespace entry). An `exec` task enters it with `setns` before
 exec, before dropping privileges. The worker dials out from the host
 namespace, so the listeners are the only way out.
@@ -833,7 +841,8 @@ chain:
 
 ```console
 $ legion net policy test web --to http://instance-data.ec2.internal/
-✗ deny host-guard: instance-data.ec2.internal resolves to 169.254.169.254 (link-local); allocations may not reach it. Hint: the host guard is set on the worker (hostGuard.allow), not in job policy
+✗ deny host-guard: instance-data.ec2.internal resolves to 169.254.169.254 (link-local); allocations may not reach it
+  Hint: the host guard is set on the worker (hostGuard.allow), not in job policy
 ```
 
 `net policy test` runs on the manager, so it judges the built-in classes
@@ -943,9 +952,12 @@ network = {
 - **The datapath owns the advertised port.** The node's datapath binds
   `LEGION_PORT_HTTP` as consumers see it (the port in the catalog and in
   `LEGION_UPSTREAM_*` feeds) on the host. The task gets a **private twin**
-  port from the same dynamic range as its own `LEGION_PORT_HTTP` (a
-  container's port publish uses the twin too), so nothing in the task
-  changes. The task cannot take the advertised port back, because the bind
+  as its own `LEGION_PORT_HTTP` (a container's port publish uses the twin
+  too), so nothing in the task changes. On the host the twin comes from the
+  same dynamic range. Inside a gated namespace, which has its own ports, the
+  twin is the port's `to`, or the advertised port number itself when `to` is
+  unset, so an image that listens on a fixed port (`{ name = "pg", to =
+  5432 }`) needs no change. The task cannot take the advertised port back, because the bind
   fails with the address already in use. This makes ingress enforceable on
   every runtime and platform, not only on gated Linux.
 - **Every accepted connection is checked** against the ingress chain using
@@ -959,6 +971,11 @@ network = {
   proxied per request in HTTP mode.
 - **Gated allocations fail closed** on ingress the same way as on egress.
   While the policy is pending or the boot gate is shut, nothing is accepted.
+- **Every gated allocation gets ingress listeners**, chain or not, because
+  its namespace has no other way in. Without a chain the listener accepts
+  every peer, so a gated container's service is reachable from other nodes,
+  from its consumers, and from its health checks exactly as on host
+  networking.
 - **Health checks go through the chain**, because the checker dials the
   advertised port. A chain that denies everything also denies the checker.
   Allow `cidr = "127.0.0.0/8"` for a node-local checker. `legion net doctor`
@@ -1144,7 +1161,8 @@ This section lists what that covers and what it does not.
   there are no VIPs, per-allocation resolvers, or gated namespaces. A gated
   `sandbox` is captured over vsock. That path is implemented and
   unit-tested but not exercised on a real VMM in CI. `auto` resolves to
-  `host` for every runtime, so set `gated` explicitly.
+  `gated` for containers on Linux nodes and to `host` for everything else,
+  so set `gated` explicitly for an `exec` task.
 - **Ingress is enforced everywhere it applies.** The datapath owns the
   advertised port and the task binds a private twin, on every runtime and
   platform. TCP only. The task sees the datapath as the peer, not the
