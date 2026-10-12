@@ -326,6 +326,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#29](https://github.com/mikenomitch/legion/pull/29) | Deterministic `nodes_considered` scheduler tests (flaked ~1 in 3,000 runs) | Test-only seed on `Scheduler`; bench shows no change |
 | [#17](https://github.com/mikenomitch/legion/pull/17) | Fixes for every 2026-10-11 spot-check finding, including Phase 1 of the worker plane | [plan](plans/launch-spot-check-fixes-plan.md) · [calls](calls/launch-spot-check-fixes-plan_calls.md); AWS re-run pending |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
@@ -4038,6 +4039,13 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       [calls](calls/adaptive-scheduler-concurrency-plan_calls.md),
       [docs/adaptive-scheduler-concurrency.md](../docs/adaptive-scheduler-concurrency.md).
       Phase 0 (measurement) was skipped and phases 4–5 are open items above.
+- [x] **The `nodes_considered` scheduler tests are deterministic**
+      ([#29](https://github.com/mikenomitch/legion/pull/29)).
+      `spread_limits_nodes_considered_by_count` and its bin_pack twin failed
+      about once per 3,000 runs: their node load was the job's own
+      allocations, which a Fresh plan drops, so every pick was uniform. The
+      load now comes from a filler job, and the subset RNG is pinned per
+      iteration through a test-only `Scheduler` seed.
 
 ## Task runtimes
 
