@@ -7,6 +7,22 @@ use crate::prelude::*;
 use crate::structs::config::ManagerConfigFull;
 use crate::structs::{Allocation, Node};
 
+/// The `(id, resources)` rows of the allocations that hold node capacity.
+///
+/// A terminal allocation (`complete` or `failed`: its process exited) keeps
+/// its row so its task's slot stays spent, but it no longer uses the node's
+/// CPU, memory, disk, or allocation count, so it is left out of every usage
+/// sum: the read model's free pools, the plan-time ledger, and the
+/// plan-apply transaction's capacity check. A DAG's finished steps would
+/// otherwise keep their resources until the job stopped, and the next step
+/// could not fit (docs/jobs-tasks-and-scheduling.md).
+pub(crate) fn capacity_rows(allocations: &[Allocation]) -> impl Iterator<Item = (i64, &Value)> {
+    allocations
+        .iter()
+        .filter(|allocation| !crate::constants::allocation_status_is_terminal(&allocation.status))
+        .map(|allocation| (allocation.id, &allocation.resources))
+}
+
 const DEFAULT_TASK_MEMORY_MIB: f64 = 256.0;
 const DEFAULT_TASK_CPU_MHZ: f64 = 100.0;
 const DEFAULT_TASK_ALLOCATIONS: f64 = 1.0;
@@ -953,9 +969,10 @@ impl ResourcePool {
         Ok(pool)
     }
 
-    /// The node's FREE pool: fingerprinted capacity minus every given
-    /// allocation's normalized usage. This is the cached-per-node form the
-    /// read model maintains and the plan-time ledger clones.
+    /// The node's FREE pool: fingerprinted capacity minus the normalized
+    /// usage of every given allocation that still holds capacity (see
+    /// [`capacity_rows`]). This is the cached-per-node form the read model
+    /// maintains and the plan-time ledger clones.
     ///
     /// Deliberately total (never errors): a node or allocation whose
     /// resources fail to parse yields an **empty** pool — the node fits
@@ -967,13 +984,7 @@ impl ResourcePool {
         allocations: &[Allocation],
         policy: &ResourcePolicy,
     ) -> ResourcePool {
-        Self::free_from_rows(
-            node,
-            allocations
-                .iter()
-                .map(|allocation| (allocation.id, &allocation.resources)),
-            policy,
-        )
+        Self::free_from_rows(node, capacity_rows(allocations), policy)
     }
 
     /// Same subtraction as [`ResourcePool::free_for_node`], from bare

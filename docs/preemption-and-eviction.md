@@ -175,6 +175,14 @@ measured against the task's live allocation count, and it holds across a whole
 plan. Eight placements cannot each take one allocation below the floor and
 together take eight.
 
+When the floor (or anything else) leaves only some of a job's placements
+possible, the plan places those and reports the rest as unplaced (see
+[Partial placement](scheduler-and-eval-loop.md#partial-placement)). For
+example, a `high` job that wants 2 replicas on a node full of a 2-allocation
+`low` task with `minAvailable = "50%"` evicts one `low` allocation, places one
+replica, and leaves the other unplaced with `preemption found no eligible
+victims (1 protected by disruption.minAvailable)`.
+
 **What this does not protect you from:** an operator draining half the
 cluster can take your service below `minAvailable`. A Kubernetes
 PodDisruptionBudget would block that. Legion accepts this gap so the floor can

@@ -27,7 +27,22 @@ before it calls any plugin code.
 
 ## How Plugin Loading Works
 
-Legion finds plugin roots in `LEGION_PLUGIN_DIR` (default: `plugins/` under the repo root).
+Legion finds the plugin root in `LEGION_PLUGIN_DIR` when it is set. Otherwise
+it uses the first of these directories that exists:
+
+1. `<dir of the legion binary>/plugins` — a bundle unpacked next to the
+   binary.
+2. `<dir of the legion binary>/../lib/legion/plugins` — an installed binary,
+   for example `/usr/local/bin/legion` with `/usr/local/lib/legion/plugins`.
+3. `plugins/` in the source checkout the binary was built from — what
+   `cargo run` and `cargo test` use.
+
+When none exists, the root is `<dir of the legion binary>/plugins`, and only
+the built-in runtimes are available. That is a normal setup, not an error:
+the built-in task runtimes (`exec`, `container`, `sandbox`) are compiled into
+the binary and need no manifest on disk, and a worker that finds no optional
+plugin (it probes for `noop` at start) says so at `debug` level. A plugin a
+job or config actually names still fails with the missing path in the error.
 
 Dynamic plugins follow this pattern:
 

@@ -221,7 +221,7 @@ run_cell() { # run_cell <cell-id> <rate> <sessions> <hold-ms> <nodes> [sample]
     rsh "$LOADGEN_ADDR" "
         legion-loadgen --mode instances --manager $MANAGER --join-token '$TOKEN' \
             --simulate $nodes --sim-name-prefix sbx --sim-profiles $REMOTE_OUT/sandbox_nodes.json \
-            --advertise-host $LOADGEN_PRIVATE_IP --job sbx-$id \
+            --advertise-addr $LOADGEN_PRIVATE_IP --job sbx-$id \
             --sessions $sessions --rate $rate --hold-ms $hold \
             --stage-timeout-ms 120000 --quiet --out $REMOTE_OUT/$id.json \
             >$REMOTE_OUT/$id.out 2>&1

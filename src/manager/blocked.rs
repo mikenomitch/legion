@@ -39,7 +39,7 @@ pub const ESCAPED_KEY: &str = "escaped";
 /// A plan could not place a task on any node. Carried as the error of the
 /// failed plan so the eval worker can block the eval instead of failing it;
 /// its `Display` is the same message the failed eval used to record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementBlocked {
     pub key: String,
     /// `{task, taskConfigId, cpu, memory, message}`: what could not place and

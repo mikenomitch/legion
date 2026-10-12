@@ -34,10 +34,25 @@ legion exec 4217 --task api -it -- /bin/bash
 
 # Target the newest running allocation of a job instead of an id.
 legion exec --job web -it -- /bin/sh
+
+# For scripts and agents: collect the output into one JSON envelope.
+legion exec 4217 --json -- cat /etc/resolv.conf
+# {"ok":true,"data":{"allocationId":4217,"exitCode":0,"stdout":"nameserver …\n",
+#  "stderr":"","message":""}}
 ```
 
 Flags match docker and kubectl: `-i/--stdin` forwards local stdin, `-t/--tty`
 allocates a pseudo-terminal, and everything after `--` is the remote argv.
+
+`--json` is for one-shot commands: it buffers the output (decoded as UTF-8,
+invalid bytes replaced) instead of streaming it, and cannot be combined with
+`-i` or `-t`. The process still exits with the remote exit code, so a command
+that fails gives `"ok": true` with a non-zero `exitCode` and a non-zero exit.
+A request that never ran (an unknown allocation, an exec the ACLs refuse, an
+unreachable node) is the standard `"ok": false` error envelope, with the
+manager's or the worker's own message: for example `FailedPrecondition` when
+the allocation is not running, or `Unavailable` naming the node and port the
+manager could not reach.
 
 In the UI, open a task (Jobs → a job → a task), go to its **Actions** tab
 and pick **Open a shell** at the bottom of the list, or press **Open shell** in
@@ -119,6 +134,8 @@ legion action list web                                   # discover actions
 legion action run web flush-cache --param scope=assets   # newest running alloc
 legion action run web tail-slowlog --alloc 4217 --param lines=500
 legion action run web debug-shell --alloc 4217 -it       # a tty action
+legion action list web --json                            # the actions as data
+legion action run web flush-cache --json                 # one envelope, as for exec
 ```
 
 In the UI, the task page's **Actions** tab lists the task's actions. The
@@ -139,7 +156,7 @@ doesn't, `legion exec` fails fast with a clear error.
 
 | Kind | Exec | Interactive (tty) | Notes |
 | --- | --- | --- | --- |
-| `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. Host-level, so it requires the `host` ACL grant. |
+| `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. Host-level, so it requires the `host` ACL grant. The env is the task's own, built the same way: Legion's allocation env (`LEGION_ALLOC_ID`, `LEGION_JOB_ID`, `LEGION_TASK_NAME`, `LEGION_PORT_*` / `LEGION_ADDR_*`, `LEGION_UPSTREAM_*`), then worker-injected env (`LEGION_TASK_DIR`, artifacts, volumes, identities), then the task's `env`. `TERM` is set for tty sessions unless the task sets it. Raw exec and actions get the same env. The process stays in the host's network namespace, also for a `network.mode = "gated"` task. |
 | `container` (Apple `container`) | ✅ | ✅ | `container exec` inside the container's namespaces (sandboxed). |
 | `container` (youki / runc / crun) | ✅ | ✅ | `<runtime> exec` inside the container's namespaces (sandboxed). The process spec comes from the bundle Legion generated, so env, cwd, and user match the task. Only argv is replaced, and the exit status is the process's own. |
 | `sandbox` (microVM) | ❌ | ❌ | Not yet supported, because exec into a guest needs a vsock agent. Reports unsupported up front instead of failing at session open. |
@@ -194,9 +211,9 @@ The MCP server (`legion mcp serve`) exposes exec/actions to agents:
 
 - `legion_action_list` (read-only): list a job's declared actions and params.
 - `legion_action_run` (mutating, needs `--allow-write`): run an action
-  one-shot and return combined output and exit code.
+  one-shot and return `exitCode`, `stdout`, `stderr`, and `message`.
 - `legion_exec_run` (mutating, needs `--allow-write`): run a one-shot command
-  and return stdout, stderr, and exit code.
+  and return the same shape.
 
 There is no interactive PTY over MCP. These tools are one-shot only.
 

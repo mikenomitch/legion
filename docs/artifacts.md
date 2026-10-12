@@ -19,10 +19,10 @@ This page is the user-facing reference.
 > finished. **Task `identity` auth** (and `assumeRole`) is validated at
 > admission but fails at fetch time (see
 > [Auth](#workload-identity-auth-pending)). The
-> [node content store](#the-node-content-store) caches only artifacts that
-> declare a `checksum` on an `http(s)`, `s3`, or `file` source. Everything
-> else fetches from origin for each new allocation (see
-> [Limitations](#limitations)).
+> [node content store](#the-node-content-store) caches artifacts that
+> declare a `checksum` on an `http(s)`, `s3`, or `file` source, and container
+> images (`oci://` images, per layer). Everything else fetches from origin for
+> each new allocation (see [Limitations](#limitations)).
 
 ## Declaring artifacts
 
@@ -487,6 +487,15 @@ So a second allocation of a digest-pinned artifact on the same node does not
 touch the origin. That includes scale-outs, restarts after a reschedule back
 to the node, and new versions of a job that kept the same artifact.
 
+**Container images** go through the store too, one blob per manifest, config,
+and layer, whether they were staged as an `oci://` artifact or pulled by the
+`container` or `sandbox` runtime itself. A digest reference the node holds
+needs no registry request; a tag costs one `HEAD` to check where it points,
+and a moved tag downloads only the layers the node lacks. The details, and
+how a registry outage is handled, are in
+[docs/task-runtime-container.md](task-runtime-container.md#image-cache).
+ORAS artifacts (`oci://` with a `mediaType`) are not cached yet.
+
 Tasks always get their own copy. A task that writes to its staged file cannot
 change what the next allocation receives. A blob that fails digest
 verification (disk damage, someone editing files under the state dir) is
@@ -874,10 +883,11 @@ Remember the allowlists. Add a custom scheme to the cluster's
 
 ## Limitations
 
-- **The node content store caches only digest-pinned single files.** An
-  artifact needs a `checksum` and an `http(s)`, `s3`, or `file` source. Git
-  trees, `file://` directories, OCI images, ORAS layers, and artifacts
-  without a `checksum` fetch from origin for every new allocation. There is
+- **The node content store caches digest-pinned single files and container
+  images.** A file artifact needs a `checksum` and an `http(s)`, `s3`, or
+  `file` source; an `oci://` image is cached per blob. Git trees, `file://`
+  directories, ORAS layers, and artifacts without a `checksum` fetch from
+  origin for every new allocation. There is
   no TTL-based revalidation of mutable URLs, so a plain URL without a
   checksum is never served from the store. Add a `checksum` to opt in.
 - **No pre-warming for artifacts.** The store fills only when an allocation

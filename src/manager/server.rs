@@ -27,59 +27,59 @@ use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
 // KV encryption keyring surface (docs/kv-encryption.md).
 use crate::structs::{
-    validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
-    AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
-    AllocationLog, BootTicket, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
-    CreateInstancesRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteKvReply,
-    DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply,
-    DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
-    DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
-    GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
-    GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply,
-    GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply,
-    GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest,
-    GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
-    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
-    GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest,
-    GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodeUsageReply,
-    GetNodeUsageRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest,
-    GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IngressCertificate,
-    Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
-    IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest,
-    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
-    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
-    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
-    JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvJobReference,
-    KvValueType, LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply,
-    ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply,
-    ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
-    ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply,
-    ListKvRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply,
-    ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
-    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
-    ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest,
-    ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node,
-    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
-    PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent,
-    RaftStatus, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest,
-    RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest,
-    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
-    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
-    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RotateMeshCaReply,
-    RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest,
-    SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, ServiceEdge,
-    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
-    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
-    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
-    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
-    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    validate_keyed_instance_id, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
+    AdvanceRolloutRequest, AllocationHealth, AllocationLog, BootTicket, CreateInstanceReply,
+    CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, DeleteJobTemplateReply,
+    DeleteJobTemplateRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply,
+    DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply,
+    DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, FailedAllocation,
+    GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply,
+    GetArtifactCredentialRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest,
+    GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply,
+    GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply,
+    GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest,
+    GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply,
+    GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
+    GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNodeContentReply,
+    GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodeUsageReply, GetNodeUsageRequest,
+    GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest,
+    GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest,
+    GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest,
+    GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetStateBackupReply,
+    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
+    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, IngressCertificate, Instance, InstanceInfo, InstanceMode,
+    InstanceState, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply,
+    IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest,
+    IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
+    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, JobTemplate,
+    JobTemplateProvenance, JobTemplateSummary, JobTemplateVariable, JobTemplateVersionInfo,
+    KvEntry, KvInjectionAction, KvJobReference, KvValueType, LedgerNode, ListBootTicketsReply,
+    ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply,
+    ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply,
+    ListJobSpecHistoryRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply,
+    ListJobsRequest, ListKvReply, ListKvRequest, ListNodeUsageReply, ListNodeUsageRequest,
+    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
+    ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest,
+    ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
+    ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
+    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
+    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
+    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
+    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
+    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
+    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
+    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
+    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
+    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
+    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
+    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
+    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
@@ -109,7 +109,6 @@ use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
 
 // Phase 6: ForkInstance, `from_snapshot` creates, and snapshot names.
@@ -128,8 +127,24 @@ pub use snapshot_rpcs::{
 pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, IdleSweeper};
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
-    error!("{action}: {:?}", err);
+    let status = store_error_status(action, &err);
+    // Log by what the error means for the server. A refused or missing-thing
+    // answer (NotFound, FailedPrecondition, a non-leader redirect, ...) is
+    // the caller's to act on and is returned to it in full, so it is not a
+    // server error: an ERROR line for every `legion job info typo` or every
+    // heartbeat that races its node's registration buried the real ones.
+    match status.code() {
+        tonic::Code::Internal | tonic::Code::DataLoss | tonic::Code::Unknown => {
+            error!("{action}: {:?}", err)
+        }
+        tonic::Code::Unavailable => warn!("{action}: {err:#}"),
+        _ => debug!("{action}: {err:#}"),
+    }
+    status
+}
 
+/// The gRPC status for a store error (see [`map_store_error`]).
+fn store_error_status(action: &str, err: &anyhow::Error) -> Status {
     // A write proposed on a raft non-leader: FAILED_PRECONDITION with the
     // leader name+address in the message so callers can redial (plan §A4,
     // JC-4). Checked before the storage-error classes because the raft
@@ -138,11 +153,31 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
         .chain()
         .find_map(|cause| cause.downcast_ref::<crate::storage::raft::driver::NotRaftLeader>())
     {
-        return Status::failed_precondition(format!("{action}: {not_leader}"));
+        let mut status = Status::failed_precondition(format!("{action}: {not_leader}"));
+        // Machine-readable leader address: the leader-forward layer replays
+        // the request there, so a caller of any manager gets the leader's
+        // answer instead of this rejection (spot-check P2-5).
+        if let Some(value) = not_leader
+            .leader_addr
+            .as_deref()
+            .and_then(|addr| addr.parse().ok())
+        {
+            status.metadata_mut().insert(
+                crate::manager::leader_forward::RAFT_LEADER_METADATA_KEY,
+                value,
+            );
+        }
+        return status;
     }
 
-    let Some(storage_error) = StorageError::from_anyhow(&err) else {
-        return Status::internal(action);
+    let Some(storage_error) = StorageError::from_anyhow(err) else {
+        // An untyped error is a bug or an unexpected failure, not a caller
+        // mistake, so INTERNAL — but with its cause: the caller gets the same
+        // sentence the server just logged rather than a bare "Internal
+        // error". Errors that ARE a caller's state problem are typed
+        // (`StorageError::FailedPrecondition`, `NotFound`, ...) and mapped
+        // below.
+        return Status::internal(format!("{action}: {err:#}"));
     };
 
     let message = format!("{action}: {storage_error}");
@@ -150,6 +185,7 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
         StorageError::NotFound { .. } => Status::not_found(message),
         StorageError::Conflict { .. } => Status::already_exists(message),
         StorageError::InvalidInput { .. } => Status::invalid_argument(message),
+        StorageError::FailedPrecondition { .. } => Status::failed_precondition(message),
         StorageError::ForeignKey { .. } => Status::failed_precondition(message),
         StorageError::DatabaseBusy | StorageError::DatabaseLocked => Status::unavailable(message),
         StorageError::DatabaseReadOnly => Status::failed_precondition(message),
@@ -1674,6 +1710,24 @@ impl ManagerDaemonService {
         self.auth.authenticate(request.metadata(), &self.store)
     }
 
+    /// Every manager a worker may dial (`HeartbeatReply.manager_addresses`,
+    /// `WorkerRegisterReply.manager_addresses`): the replicated raft
+    /// membership's advertised listeners, with this manager's own API scheme
+    /// (`https` when `server.tls` is on). Empty outside raft mode, which
+    /// leaves a worker's known set unchanged.
+    fn worker_manager_addresses(&self) -> Vec<String> {
+        let scheme = if self.advertise_addr.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        };
+        self.store
+            .raft_member_addresses()
+            .into_iter()
+            .map(|host_port| format!("{scheme}://{host_port}"))
+            .collect()
+    }
+
     /// Job scope for read/lifecycle endpoints, carrying the job's stored
     /// template provenance so `templates`-scoped rules cover the jobs their
     /// templates created. Provenance lookup failures degrade to a scope
@@ -1766,6 +1820,10 @@ impl ManagerDaemonService {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
         })?;
+        self.validate_job_capabilities(&config).map_err(|e| {
+            error!("Error validating capabilities: {:?}", e);
+            Status::invalid_argument(format!("Error validating capabilities: {e:#}"))
+        })?;
         // Artifact admission: desugar/auth/pin. Pin resolution can reach
         // registries, so it runs as blocking work.
         let artifact_pins =
@@ -1788,7 +1846,8 @@ impl ManagerDaemonService {
         // status so the instance-management RPCs accept it again. Stopped
         // keyed instances stay stopped — each needs an explicit
         // `instance start` (see docs/stateful-workloads.md).
-        self.store
+        let was_stopped = self
+            .store
             .clear_job_stopped_status(&config.name)
             .map_err(|e| map_store_error("Error clearing stopped job status", e))?;
 
@@ -1797,7 +1856,8 @@ impl ManagerDaemonService {
         // auto-recovers). Clearing the failed status here re-runs the job's
         // allocations through the normal submit/eval flow with the latest KV
         // state (see docs/kv-store.md).
-        self.store
+        let was_failed = self
+            .store
             .clear_job_failed_status(&config.name)
             .map_err(|e| map_store_error("Error clearing failed job status", e))?;
 
@@ -1854,8 +1914,37 @@ impl ManagerDaemonService {
                         Some("job_update"),
                         "Job config unchanged; forced reschedule queued",
                     )
+                } else if was_stopped {
+                    // Re-running a stopped job's unchanged spec starts it
+                    // again. It used to answer "no update needed" and place
+                    // nothing, which left no obvious way to restart a job.
+                    (
+                        Some("job_update"),
+                        "Job config unchanged; job was stopped, starting it again",
+                    )
+                } else if was_failed {
+                    (
+                        Some("job_update"),
+                        "Job config unchanged; job had failed, starting it again",
+                    )
+                } else if self
+                    .store
+                    .job_is_idle(&config.name)
+                    .map_err(|e| map_store_error("Error loading job allocations", e))?
+                {
+                    // Nothing of the job is running or queued to run (it
+                    // finished, or nothing could be placed): a re-run means
+                    // run it again.
+                    (
+                        Some("job_update"),
+                        "Job config unchanged; job was not running, starting it again",
+                    )
                 } else {
-                    (None, "Job config unchanged; no update needed")
+                    (
+                        None,
+                        "Job config unchanged; no update needed (the job is running; use \
+                         --force-reschedule to restart it)",
+                    )
                 }
             }
             JobSubmitOutcome::Created { .. } => (Some("job_submit"), "Job submit success"),
@@ -2437,6 +2526,78 @@ impl ManagerDaemonService {
             }
         }
         Ok(notes)
+    }
+
+    /// Admission check for `container` tasks' capabilities against the
+    /// worker types' `container.allowCaps`.
+    ///
+    /// The real gate is on the worker, which refuses to start a container
+    /// whose effective capability set leaves its node's allowlist. This is
+    /// the cheap half of it: when *no* worker type allows a task's set, the
+    /// task could never start anywhere, so the job is rejected at submit
+    /// with the same advice instead of placing and failing. A set some
+    /// worker type allows passes, even if placement then lands the task on a
+    /// node of another type; that start fails on the node.
+    fn validate_job_capabilities(&self, config: &JobConfig) -> R<()> {
+        let mut requested = Vec::new();
+        for task in &config.tasks {
+            if let Some(caps) = crate::task_plugins::container_task_capabilities(task)? {
+                requested.push((task.name.as_str(), caps));
+            }
+        }
+        if requested.is_empty() {
+            return Ok(());
+        }
+        let allowlists: Vec<(String, crate::task_plugins::CapabilityAllowlist)> = self
+            .store
+            .list_worker_types()?
+            .into_iter()
+            .map(|worker_type| {
+                let allowlist =
+                    crate::structs::WorkerContainerConfig::from_payload(&worker_type.container)
+                        .and_then(|container| {
+                            crate::task_plugins::CapabilityAllowlist::from_config(
+                                container.allow_caps.as_deref(),
+                            )
+                        })
+                        .unwrap_or_default();
+                (worker_type.name, allowlist)
+            })
+            .collect();
+        if allowlists.is_empty() {
+            // No worker types configured: nothing to judge against.
+            return Ok(());
+        }
+        for (task, caps) in requested {
+            if allowlists
+                .iter()
+                .any(|(_, allowlist)| allowlist.refused(&caps).is_empty())
+            {
+                continue;
+            }
+            // Name what the most permissive type still refuses, so the
+            // message points at the smallest change.
+            let (_, closest) = allowlists
+                .iter()
+                .min_by_key(|(_, allowlist)| allowlist.refused(&caps).len())
+                .expect("at least one worker type");
+            let refused: Vec<String> = closest
+                .refused(&caps)
+                .iter()
+                .map(|cap| cap.trim_start_matches("CAP_").to_string())
+                .collect();
+            let types: Vec<&str> = allowlists.iter().map(|(name, _)| name.as_str()).collect();
+            bail!(
+                "task {task} would run with capabilities no worker type allows container tasks \
+                 to have: {refused}. An operator allows them with container.allowCaps in a \
+                 worker type's config (worker types: {types}); otherwise take them out of the \
+                 task (remove them from security.capabilities.add, or list them in \
+                 security.capabilities.drop)",
+                refused = refused.join(", "),
+                types = types.join(", "),
+            );
+        }
+        Ok(())
     }
 
     /// Admission check for volume declarations, against what the cluster
@@ -4283,6 +4444,10 @@ impl Manager for ManagerDaemonService {
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
+        })?;
+        self.validate_job_capabilities(&config).map_err(|e| {
+            error!("Error validating capabilities: {:?}", e);
+            Status::invalid_argument(format!("Error validating capabilities: {e:#}"))
         })?;
         // Artifact admission for plan mirrors run: pins resolve here too so
         // the plan shows the digests a submit would ship.
@@ -6296,20 +6461,33 @@ impl Manager for ManagerDaemonService {
         self.store
             .get_node(&req.node_id)
             .map_err(|_| Status::not_found(format!("node {:?} is not registered", req.node_id)))?;
+        // The worker generates its key and sends a CSR; the manager never
+        // generates (or sees) a node's private key.
+        if req.csr_pem.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "csr_pem is required: the worker generates its own key and sends a certificate \
+                 signing request (worker protocol 3); upgrade the worker",
+            ));
+        }
+        crate::manager::mesh_ca::check_csr(&req.csr_pem)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
         let ca = self
             .store
             .ensure_mesh_ca()
             .map_err(|e| map_store_error("Error creating the mesh CA", e))?;
-        let (cert_pem, key_pem, expires_at) =
-            crate::manager::mesh_ca::issue_node_cert(&ca.cert_pem, &ca.key_pem, &req.node_id)
-                .map_err(|e| {
-                    error!(error = ?e, "Error signing a node certificate");
-                    Status::internal("failed to sign the node certificate")
-                })?;
-        info!(node_id = %req.node_id, expires_at, "Issued mesh node certificate");
+        let (cert_pem, expires_at) = crate::manager::mesh_ca::sign_node_csr(
+            &ca.cert_pem,
+            &ca.key_pem,
+            &req.node_id,
+            &req.csr_pem,
+        )
+        .map_err(|e| {
+            error!(error = ?e, "Error signing a node certificate");
+            Status::internal("failed to sign the node certificate")
+        })?;
+        info!(node_id = %req.node_id, expires_at, "Issued node certificate");
         Ok(Response::new(IssueNodeCertificateReply {
             cert_pem,
-            key_pem,
             ca_pem: ca.cert_pem,
             expires_at,
         }))
@@ -6614,6 +6792,7 @@ impl Manager for ManagerDaemonService {
             next_interval_seconds,
             checkpoint_requests,
             content_resync,
+            manager_addresses: self.worker_manager_addresses(),
             desired_via_stream: stream.via_stream,
             work_resync: stream.resync,
         };
@@ -6776,6 +6955,7 @@ impl Manager for ManagerDaemonService {
             heartbeat_seconds: worker_config.heartbeat_seconds,
             resource_enforcement: worker_config.resource_enforcement,
             edge_boot: worker_config.edge_boot,
+            container: worker_config.container,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -6841,11 +7021,17 @@ impl Manager for ManagerDaemonService {
         .to_string();
 
         // Re-registration (a worker restart, or a token rotation) keeps the
-        // operator's availability: a drained or ineligible node must not
-        // silently become schedulable again. Only a new node starts
+        // operator's availability: a drained node must not silently become
+        // schedulable again. `unavailable` is NOT operator intent — node
+        // loss sets it — and a registering worker is by definition alive,
+        // so it returns to `available` here, the same way a recovering
+        // heartbeat does. Keeping it registered the node `active` but
+        // unschedulable, which the scheduler then reported as "No nodes
+        // available" (spot-check P0-6). Only a new node starts
         // `available`. The value is resolved here, not in the store's apply
         // step, so every replica applies the same explicit value.
         let availability = match self.store.get_node(&node_id) {
+            Ok(existing) if existing.availability == "unavailable" => "available".to_string(),
             Ok(existing) => existing.availability,
             Err(err)
                 if matches!(
@@ -6881,12 +7067,24 @@ impl Manager for ManagerDaemonService {
             warn!(node_id = %node_id, error = %err, "Failed to queue the capacity pass after registration");
         }
 
-        let node_token = if self.auth.enabled {
-            let secret = self.auth.mint_node_token(&self.store, &node_id)?;
-            info!(node_id = %node_id, "Minted node token for registered worker");
-            Some(secret)
-        } else {
-            None
+        // A worker that re-registers with its own node token (a restart:
+        // the token is persisted in its state directory) keeps it — the
+        // reply carries none, meaning "keep the one you presented". Rotating
+        // it here would make every restart depend on the worker persisting
+        // the new secret before anything else goes wrong, and would gain
+        // nothing: the caller already proved it holds this node's credential.
+        // A join-token (or management) registration mints and rotates.
+        let node_token = match &grant {
+            _ if !self.auth.enabled => None,
+            RegistrationGrant::Node(_) => {
+                info!(node_id = %node_id, "Worker re-registered with its node token; keeping it");
+                None
+            }
+            _ => {
+                let secret = self.auth.mint_node_token(&self.store, &node_id)?;
+                info!(node_id = %node_id, "Minted node token for registered worker");
+                Some(secret)
+            }
         };
 
         info!(
@@ -6903,6 +7101,7 @@ impl Manager for ManagerDaemonService {
             node_token,
             manager_build_version: env!("CARGO_PKG_VERSION").to_string(),
             manager_protocol_version: PROTOCOL_VERSION,
+            manager_addresses: self.worker_manager_addresses(),
         };
 
         Ok(Response::new(reply))
@@ -7038,18 +7237,17 @@ impl Manager for ManagerDaemonService {
             &AclScope::pool(&node.pool),
         )?;
 
-        let worker_address = worker_address_for_node(&node)
-            .ok_or_else(|| Status::failed_precondition("Worker address missing"))?;
-
-        let mut client = WorkerClient::connect(worker_address)
-            .await
-            .map_err(|e| Status::unavailable(format!("Failed to connect to worker: {e}")))?;
+        // The worker plane (mTLS, manager certificate, node name verified):
+        // see `crate::manager::worker_plane`.
+        let target = crate::manager::worker_plane::target(&self.store, &node)
+            .map_err(|err| err.to_status())?;
+        let mut client = target.client.clone();
         let response = client
             .restart_worker(tonic::Request::new(RestartWorkerRequest {
                 node_id: node_id.clone(),
             }))
             .await
-            .map_err(|e| Status::unavailable(format!("Worker restart failed: {e}")))?;
+            .map_err(|status| target.explain(status))?;
 
         let reply = RestartWorkerReply {
             message: response.into_inner().message,
@@ -7162,24 +7360,59 @@ impl Manager for ManagerDaemonService {
     ) -> Result<Response<GetAllocationLogsReply>, Status> {
         let identity = self.authenticate_acl(&request)?;
         let req = request.into_inner();
+        // Coarse gate before any lookup ("check before you fetch"), so a
+        // caller with no job read anywhere cannot probe which allocation ids
+        // exist; the precise job scope is enforced once the job is known.
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::any(),
+        )?;
 
         // Resolve which allocations to read: a single allocation id when given,
-        // otherwise every allocation belonging to the named job.
+        // otherwise every allocation belonging to the named job. Removed
+        // allocations come from the manager's allocation history
+        // (docs/logging.md, "Logs of removed allocations").
+        let mut removed: Vec<crate::storage::store::RemovedAllocation> = Vec::new();
         let allocations = if let Some(allocation_id) = req.allocation_id {
-            let alloc = self
+            let live = self
                 .store
                 .get_allocation_by_id(allocation_id)
-                .map_err(|e| map_store_error("Error loading allocation", e))?
-                .ok_or_else(|| {
-                    Status::not_found(format!("allocation {allocation_id} not found"))
-                })?;
-            acl::enforce(
-                &identity,
-                AclResource::Job,
-                AclAction::Read,
-                &AclScope::job(&alloc.job_id),
-            )?;
-            vec![alloc]
+                .map_err(|e| map_store_error("Error loading allocation", e))?;
+            match live {
+                Some(alloc) => {
+                    acl::enforce(
+                        &identity,
+                        AclResource::Job,
+                        AclAction::Read,
+                        &AclScope::job(&alloc.job_id),
+                    )?;
+                    vec![alloc]
+                }
+                None => {
+                    let gone = self
+                        .store
+                        .removed_allocations(None, Some(allocation_id), 1)
+                        .map_err(|e| map_store_error("Error loading allocation history", e))?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            Status::not_found(format!(
+                                "allocation {allocation_id} not found (removed allocations are \
+                                 remembered for 24 hours)"
+                            ))
+                        })?;
+                    acl::enforce(
+                        &identity,
+                        AclResource::Job,
+                        AclAction::Read,
+                        &AclScope::job(&gone.job_id),
+                    )?;
+                    removed.push(gone);
+                    Vec::new()
+                }
+            }
         } else {
             acl::enforce(
                 &identity,
@@ -7192,18 +7425,44 @@ impl Manager for ManagerDaemonService {
                     "either job or allocation_id is required",
                 ));
             }
-            let job = self
-                .store
-                .get_job(&req.job)
-                .map_err(|e| map_store_error("Error loading job", e))?;
-            self.store
-                .allocs_for_job(&job.id)
-                .map_err(|e| map_store_error("Error loading job allocations", e))?
+            // A destroyed job is gone, but its removed allocations' logs are
+            // not: fall through to the history before reporting NotFound.
+            let (live, job_missing) = match self.store.get_job(&req.job) {
+                Ok(job) => (
+                    self.store
+                        .allocs_for_job(&job.id)
+                        .map_err(|e| map_store_error("Error loading job allocations", e))?,
+                    false,
+                ),
+                Err(err)
+                    if matches!(
+                        StorageError::from_anyhow(&err),
+                        Some(StorageError::NotFound { .. })
+                    ) =>
+                {
+                    (Vec::new(), true)
+                }
+                Err(err) => return Err(map_store_error("Error loading job", err)),
+            };
+            if live.is_empty() || req.include_removed {
+                removed = self
+                    .store
+                    .removed_allocations(Some(&req.job), None, REMOVED_ALLOCATION_LOGS_LIMIT)
+                    .map_err(|e| map_store_error("Error loading allocation history", e))?;
+            }
+            if job_missing && removed.is_empty() {
+                return Err(Status::not_found(format!(
+                    "Error loading job: job {} not found",
+                    req.job
+                )));
+            }
+            live
         };
 
         // Caches keyed by node / job config so we reuse worker connections and
         // task-config lookups across the (often co-located) allocations.
-        let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
+        let mut clients: HashMap<String, crate::manager::worker_plane::WorkerTarget> =
+            HashMap::new();
         let mut task_names: HashMap<String, HashMap<i64, String>> = HashMap::new();
         let mut logs = Vec::new();
 
@@ -7241,6 +7500,10 @@ impl Manager for ManagerDaemonService {
                 task_name,
                 streams: Vec::new(),
                 error: String::new(),
+                removed: false,
+                removal_cause: String::new(),
+                removed_at_unix: 0,
+                status: allocation.status.clone(),
             };
 
             match fetch_allocation_logs(&self.store, &allocation, &req, &mut clients).await {
@@ -7248,6 +7511,38 @@ impl Manager for ManagerDaemonService {
                 Err(message) => entry.error = message,
             }
 
+            logs.push(entry);
+        }
+
+        // Removed allocations: the worker still holds their files (until its
+        // log retention expires), so the read is the same proxied call.
+        for gone in removed {
+            let allocation = crate::structs::Allocation {
+                id: gone.allocation_id,
+                status: gone.status.clone(),
+                resources: Value::Null,
+                node_id: gone.node_id.clone(),
+                job_config_id: gone.job_config_id.clone(),
+                task_config_id: gone.task_config_id,
+                job_id: gone.job_id.clone(),
+                instance_id: None,
+                network: None,
+            };
+            let mut entry = AllocationLog {
+                allocation_id: gone.allocation_id,
+                node_id: gone.node_id,
+                task_name: gone.task_name,
+                streams: Vec::new(),
+                error: String::new(),
+                removed: true,
+                removal_cause: gone.cause,
+                removed_at_unix: gone.removed_at_unix,
+                status: gone.status,
+            };
+            match fetch_allocation_logs(&self.store, &allocation, &req, &mut clients).await {
+                Ok(streams) => entry.streams = streams,
+                Err(message) => entry.error = message,
+            }
             logs.push(entry);
         }
 
@@ -7555,10 +7850,20 @@ impl Manager for ManagerDaemonService {
         )?;
         let req = request.into_inner();
         let actor = req.actor.unwrap_or_else(|| "api".to_string());
-        let outcome = self
-            .store
-            .issue_raft_command(&req.command, req.target_node_id.as_deref(), &actor)
-            .map_err(|e| map_store_error("Error issuing raft command", e))?;
+        // Off the async workers: `transfer-leader` / `step-down` wait (up to
+        // their deadline) for leadership to move, and membership changes
+        // wait for commits.
+        let outcome = {
+            let store = self.store.clone();
+            let command = req.command.clone();
+            let target = req.target_node_id.clone();
+            tokio::task::spawn_blocking(move || {
+                store.issue_raft_command(&command, target.as_deref(), &actor)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft command task failed: {e}")))?
+            .map_err(|e| map_store_error("Error issuing raft command", e))?
+        };
         let status = self
             .store
             .raft_status()
@@ -9885,14 +10190,6 @@ enum RegistrationGrant {
     Node(String),
 }
 
-fn worker_address_for_node(node: &Node) -> Option<String> {
-    let attrs = node.config_attrs.as_object()?;
-    attrs
-        .get("workerAddress")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
-}
-
 /// Marker error: the StreamEvents client went away, stop the stream task.
 struct StreamSendStopped;
 
@@ -9947,27 +10244,24 @@ async fn fetch_allocation_logs(
     store: &Store,
     allocation: &crate::structs::Allocation,
     req: &GetAllocationLogsRequest,
-    clients: &mut HashMap<String, WorkerClient<Channel>>,
+    clients: &mut HashMap<String, crate::manager::worker_plane::WorkerTarget>,
 ) -> Result<Vec<crate::structs::TaskLogStream>, String> {
-    let node = store
-        .get_node(&allocation.node_id)
-        .map_err(|e| format!("failed to load node {}: {e}", allocation.node_id))?;
-    let worker_address = worker_address_for_node(&node)
-        .ok_or_else(|| format!("worker address missing for node {}", allocation.node_id))?;
-
-    if !clients.contains_key(&worker_address) {
-        let endpoint = Endpoint::from_shared(worker_address.clone())
-            .map_err(|e| format!("invalid worker address {worker_address}: {e}"))?;
-        clients.insert(
-            worker_address.clone(),
-            WorkerClient::new(endpoint.connect_lazy()),
-        );
+    if !clients.contains_key(&allocation.node_id) {
+        let node = store
+            .get_node(&allocation.node_id)
+            .map_err(|e| format!("failed to load node {}: {e}", allocation.node_id))?;
+        // The worker plane (mTLS, manager certificate, node name verified):
+        // see `crate::manager::worker_plane`.
+        let target =
+            crate::manager::worker_plane::target(store, &node).map_err(|err| err.to_string())?;
+        clients.insert(allocation.node_id.clone(), target);
     }
-    let client = clients
-        .get_mut(&worker_address)
-        .expect("worker client just inserted");
+    let target = clients
+        .get_mut(&allocation.node_id)
+        .expect("worker target just inserted");
 
-    let reply = client
+    let reply = target
+        .client
         .get_task_logs(GetTaskLogsRequest {
             allocation_id: allocation.id,
             stream: req.stream.clone(),
@@ -9976,7 +10270,21 @@ async fn fetch_allocation_logs(
             offset: req.offset,
         })
         .await
-        .map_err(|status| format!("worker on {} returned {}", allocation.node_id, status))?;
+        .map_err(|status| {
+            // A failure to reach the worker at all is explained in full (node,
+            // address, port); an answer from the worker is relayed by message.
+            let reached = std::error::Error::source(&status).is_none();
+            let status = target.explain(status);
+            if reached {
+                format!(
+                    "worker on {} returned {}",
+                    allocation.node_id,
+                    status.message()
+                )
+            } else {
+                status.message().to_string()
+            }
+        })?;
 
     Ok(reply.into_inner().streams)
 }
@@ -10105,6 +10413,7 @@ fn handle_terminated_allocations(
     node_id: &str,
     terminated: &[crate::structs::TerminatedAllocation],
 ) -> R<()> {
+    let mut freed_capacity = false;
     for report in terminated {
         let allocation_id = report.allocation_id;
         let Some(existing) = store.get_allocation_by_id(allocation_id)? else {
@@ -10127,6 +10436,18 @@ fn handle_terminated_allocations(
         let Some(allocation) = store.complete_allocation(allocation_id, report.success)? else {
             continue;
         };
+        freed_capacity = true;
+        // Tasks that depend on this one were held until it exited; queue
+        // the eval that places them. Best effort: a failure here must not
+        // fail the heartbeat, and the next eval of the job re-checks.
+        if let Err(error) = store.queue_dependency_progress(&allocation) {
+            warn!(
+                allocation_id,
+                job_id = %allocation.job_id,
+                error = %format!("{error:#}"),
+                "Failed to queue dependency progress after a terminal report"
+            );
+        }
 
         store.events().allocation_terminated(
             allocation_id,
@@ -10146,6 +10467,11 @@ fn handle_terminated_allocations(
             "Allocation reached a terminal state"
         );
     }
+    // A finished allocation no longer holds node capacity: retry jobs that
+    // are short of room (no-op unless some plan left replicas unplaced).
+    if freed_capacity {
+        store.request_capacity_reconcile_if_waiting();
+    }
     Ok(())
 }
 
@@ -10155,6 +10481,7 @@ fn handle_failed_allocations(
     node_id: &str,
     failed: &[FailedAllocation],
 ) -> R<()> {
+    let mut freed_capacity = false;
     for failure in failed {
         let allocation_id = failure.allocation_id;
         let allocation_context = {
@@ -10180,6 +10507,7 @@ fn handle_failed_allocations(
         }
 
         store.remove_allocation_by_id(allocation_id)?;
+        freed_capacity = true;
 
         store.events().allocation_failed(
             allocation_id,
@@ -10216,6 +10544,19 @@ fn handle_failed_allocations(
             }
             MoveDecision::JobFailed => {
                 store.mark_job_failed(&context.job_id)?;
+                // The task failed for good: say so in its status, so a
+                // `complete` dependent can run and a `success` one never does.
+                if let Err(error) = store.set_task_status(
+                    context.task_config_id,
+                    crate::structs::TaskStatusState::Failed,
+                ) {
+                    warn!(
+                        allocation_id,
+                        job_id = %context.job_id,
+                        error = %format!("{error:#}"),
+                        "Failed to record the failed task status"
+                    );
+                }
                 warn!(
                     allocation_id,
                     job_id = %context.job_id,
@@ -10239,6 +10580,13 @@ fn handle_failed_allocations(
         );
     }
 
+    // The removed rows freed node capacity (see
+    // `Store::request_capacity_reconcile_if_waiting`). Reports that were
+    // ignored (unknown, or from a node that does not own the allocation)
+    // freed nothing.
+    if freed_capacity {
+        store.request_capacity_reconcile_if_waiting();
+    }
     Ok(())
 }
 
@@ -11714,8 +12062,6 @@ mod tests {
     use futures::StreamExt;
     use serde_json::{json, Map, Value};
     use tempfile::Builder;
-    use tokio::sync::oneshot;
-    use tonic::transport::Server;
 
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
@@ -11740,6 +12086,123 @@ mod tests {
     /// leader's name and address in the message (plan §A4, JC-4) — even
     /// when the typed error is buried under pipeline context, as the raft
     /// driver produces it.
+    #[test]
+    fn map_store_error_keeps_the_cause_of_a_refused_request() {
+        // P2-2: a precondition the caller can fix is FAILED_PRECONDITION
+        // with the store's own sentence, not a bare "Internal error".
+        let err = anyhow::Error::new(StorageError::failed_precondition(
+            "Job web must be stopped before it can be destroyed (it is running)",
+        ))
+        .context("raft op destroy_job");
+        let status = map_store_error("Error deleting job", err);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status
+                .message()
+                .contains("must be stopped before it can be destroyed"),
+            "{}",
+            status.message()
+        );
+        assert!(!status.message().contains("foreign key"));
+
+        // An untyped failure is still INTERNAL, but carries its cause.
+        let err = anyhow!("disk quota exceeded").context("failed writing plan");
+        let status = map_store_error("Error running job", err);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(
+            status.message(),
+            "Error running job: failed writing plan: disk quota exceeded"
+        );
+    }
+
+    /// The submit half of the capability allowlist: a container task whose
+    /// effective set no worker type allows is rejected before it places; a
+    /// set some type allows, and any drop-only adjustment, passes.
+    #[test]
+    fn capabilities_no_worker_type_allows_are_rejected_at_submit() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let job = |security: Value| -> R<crate::structs::JobConfig> {
+            Ok(serde_json::from_value(json!({
+                "name": "caps",
+                "tasks": [{
+                    "name": "tool",
+                    "runtime": "container",
+                    "config": { "image": "alpine", "command": ["true"], "security": security },
+                }],
+            }))?)
+        };
+        let admin = job(json!({ "capabilities": { "add": ["SYS_ADMIN"] } }))?;
+        let dropper = job(json!({ "capabilities": { "drop": ["ALL"] } }))?;
+
+        // No worker types yet: nothing to judge against.
+        manager.validate_job_capabilities(&admin)?;
+
+        let worker_type = |name: &str, container: &str| crate::structs::WorkerConfig {
+            name: name.into(),
+            pool: "default".into(),
+            resources: "{}".into(),
+            reserved_resources: "{}".into(),
+            container: container.into(),
+            ..Default::default()
+        };
+        store.insert_worker_type(&worker_type("default", ""))?;
+        let err = manager
+            .validate_job_capabilities(&admin)
+            .expect_err("no worker type allows SYS_ADMIN")
+            .to_string();
+        assert!(err.contains("task tool"), "{err}");
+        assert!(err.contains("SYS_ADMIN"), "{err}");
+        assert!(err.contains("container.allowCaps"), "{err}");
+        assert!(err.contains("worker types: default"), "{err}");
+        manager.validate_job_capabilities(&dropper)?;
+        manager.validate_job_capabilities(&job(json!({}))?)?;
+
+        // One worker type allows it: admitted (that type's nodes can run it).
+        store.insert_worker_type(&worker_type("privileged", r#"{"allowCaps":["ALL"]}"#))?;
+        manager.validate_job_capabilities(&admin)?;
+
+        // A task pinned to macOS ignores capabilities, so it is not judged.
+        let mut mac = admin.clone();
+        store.insert_worker_type(&worker_type("privileged", ""))?;
+        assert!(manager.validate_job_capabilities(&mac).is_err());
+        mac.tasks[0].constraints = json!({ "os": "macos" });
+        manager.validate_job_capabilities(&mac)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn destroying_a_running_job_is_a_failed_precondition_with_the_reason() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let config: crate::structs::JobConfig = serde_json::from_value(json!({
+            "name": "still-running",
+            "tasks": [{ "name": "web", "runtime": "noop" }],
+        }))?;
+        store.handle_job_submit(
+            &config,
+            &[crate::structs::Submission {
+                path: "job.json".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let status = manager
+            .destroy_job(Request::new(crate::structs::DestroyJobRequest {
+                name: "still-running".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a running job cannot be destroyed");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().contains("legion job stop still-running"),
+            "{}",
+            status.message()
+        );
+        Ok(())
+    }
+
     #[test]
     fn map_store_error_surfaces_raft_leader_hint() {
         let err = anyhow::Error::new(crate::storage::raft::driver::NotRaftLeader {
@@ -12499,6 +12962,36 @@ mod tests {
         Ok(())
     }
 
+    /// A worker that re-registers after its node was marked LOST must come
+    /// back schedulable (spot-check P0-6). `unavailable` is what loss sets,
+    /// not operator intent, so keeping it registered an `active` node that
+    /// every placement then skipped ("No nodes available").
+    #[tokio::test]
+    async fn re_registration_after_loss_makes_the_node_schedulable() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let register = || {
+            tonic::Request::new(WorkerRegisterRequest {
+                name: "lost-node".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                ..Default::default()
+            })
+        };
+        manager.worker_register(register()).await?;
+        store.mark_nodes_as_lost(&["lost-node".to_string()])?;
+        assert_eq!(store.get_node("lost-node")?.availability, "unavailable");
+
+        manager.worker_register(register()).await?;
+        let node = store.get_node("lost-node")?;
+        assert_eq!(node.status, "active");
+        assert_eq!(node.availability, "available");
+        assert!(store.available_node_ids()?.contains("lost-node"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn replace_instance_rejects_allocations_on_healthy_nodes() -> R<()> {
         let store = setup_store()?;
@@ -12701,44 +13194,53 @@ mod tests {
         }
     }
 
+    /// The restart is proxied over the mTLS worker plane: the manager dials
+    /// with its own certificate and verifies the node's name. A listener
+    /// serving another node's certificate at the registered address is
+    /// refused with an actionable message instead of receiving the call.
     #[tokio::test]
     async fn manager_forwards_worker_restart() -> R<()> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let addr = listener.local_addr()?;
-        drop(listener);
-        let worker_address = format!("http://{}", addr);
-
-        let called = Arc::new(Mutex::new(None));
-        let worker = TestWorker {
-            called: called.clone(),
+        let store = setup_store()?;
+        let ca = store.ensure_mesh_ca()?;
+        let identity_for = |node_id: &str| -> R<crate::worker::plane::NodeIdentity> {
+            let (cert, key, _) =
+                crate::manager::mesh_ca::issue_node_cert(&ca.cert_pem, &ca.key_pem, node_id)?;
+            crate::worker::plane::NodeIdentity::new(node_id, cert, key, ca.cert_pem.clone())
         };
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            Server::builder()
-                .add_service(crate::structs::worker_server::WorkerServer::new(worker))
-                .serve_with_shutdown(addr, async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .ok();
-        });
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let called = Arc::new(Mutex::new(None));
+        let (addr, server) = crate::worker::plane::serve_for_test(
+            TestWorker {
+                called: called.clone(),
+            },
+            identity_for("node-1")?,
+        )
+        .await?;
+        let (impostor_addr, impostor) = crate::worker::plane::serve_for_test(
+            TestWorker {
+                called: Arc::new(Mutex::new(None)),
+            },
+            identity_for("node-9")?,
+        )
+        .await?;
 
-        let store = setup_store()?;
-        let node = Node {
-            id: "node-1".into(),
+        let node = |id: &str, address: String| Node {
+            id: id.into(),
             status: "ready".into(),
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
             heartbeat_source: String::new(),
-            config_attrs: json!({ "workerAddress": worker_address }),
+            config_attrs: json!({ "workerAddress": address }),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),
             health_checks: json!({}),
         };
-        store.insert_node(NodeMsg::from(node))?;
+        store.insert_node(NodeMsg::from(node("node-1", format!("https://{addr}"))))?;
+        store.insert_node(NodeMsg::from(node(
+            "node-2",
+            format!("https://{impostor_addr}"),
+        )))?;
         let manager = ManagerDaemonService::new(store);
 
         let response = manager
@@ -12746,12 +13248,24 @@ mod tests {
                 node_id: "node-1".into(),
             }))
             .await?;
-
         assert_eq!(response.into_inner().message, "ok");
-        let guard = called.lock().expect("mutex");
-        assert_eq!(guard.as_deref(), Some("node-1"));
+        assert_eq!(called.lock().expect("mutex").as_deref(), Some("node-1"));
 
-        let _ = shutdown_tx.send(());
+        let refused = manager
+            .restart_worker(Request::new(RestartWorkerRequest {
+                node_id: "node-2".into(),
+            }))
+            .await
+            .expect_err("a listener with node-9's certificate is not node-2");
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert!(
+            refused.message().contains("node-2") && refused.message().contains("TLS"),
+            "{}",
+            refused.message()
+        );
+
+        server.abort();
+        impostor.abort();
         Ok(())
     }
 
@@ -12768,10 +13282,73 @@ mod tests {
                 max_bytes: 0,
                 tail: false,
                 offset: 0,
+                include_removed: false,
             }))
             .await
             .expect_err("missing target should error");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        Ok(())
+    }
+
+    /// P1-9: once an allocation is removed, `legion job logs` still finds
+    /// it (job, task, node from the allocation history) and asks its node.
+    /// Here the node has no worker address, so the entry carries an error
+    /// rather than streams — but it is there, marked removed, with its cause,
+    /// instead of "No allocations found". A destroyed job's logs too.
+    #[tokio::test]
+    async fn get_allocation_logs_reaches_removed_allocations() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let alloc =
+            submit_and_place_identity_task(&store, "gone", TaskConfig::new("fetch", "noop"))?;
+        store.remove_allocs_for_job("gone")?;
+        assert!(store.allocs_for_job("gone")?.is_empty());
+
+        let request = |job: &str, allocation_id: Option<i64>| {
+            Request::new(GetAllocationLogsRequest {
+                job: job.into(),
+                allocation_id,
+                stream: "all".into(),
+                ..Default::default()
+            })
+        };
+        let reply = manager
+            .get_allocation_logs(request("gone", None))
+            .await?
+            .into_inner();
+        assert_eq!(reply.allocations.len(), 1, "{reply:?}");
+        let entry = &reply.allocations[0];
+        assert_eq!(entry.allocation_id, alloc.id);
+        assert!(entry.removed);
+        assert_eq!(entry.removal_cause, "stop");
+        assert_eq!(entry.task_name, "fetch");
+        assert_eq!(entry.node_id, "node-1");
+        assert!(entry.removed_at_unix > 0);
+        assert!(!entry.error.is_empty(), "node-1 has no worker address");
+
+        // By id.
+        let reply = manager
+            .get_allocation_logs(request("", Some(alloc.id)))
+            .await?
+            .into_inner();
+        assert_eq!(reply.allocations.len(), 1);
+        assert!(reply.allocations[0].removed);
+
+        // An id that never existed is still NotFound.
+        let status = manager
+            .get_allocation_logs(request("", Some(alloc.id + 1000)))
+            .await
+            .expect_err("unknown allocation");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+
+        // The job is destroyed; its removed allocations stay readable.
+        store.stop_job("gone")?;
+        store.destroy_job("gone")?;
+        let reply = manager
+            .get_allocation_logs(request("gone", None))
+            .await?
+            .into_inner();
+        assert_eq!(reply.allocations.len(), 1);
         Ok(())
     }
 
@@ -12788,6 +13365,7 @@ mod tests {
                 max_bytes: 0,
                 tail: false,
                 offset: 0,
+                include_removed: false,
             }))
             .await
             .expect_err("unknown job should error");
@@ -14351,18 +14929,23 @@ mod tests {
         )?;
         // The reschedule is enqueued from a spawned thread, so poll rather
         // than sleep a fixed 10ms, which flaked under a loaded machine.
+        // The freed capacity can also queue a capacity pass (`node_join`), in
+        // either order, so look for the reschedule rather than take the
+        // first eval.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let evals = loop {
-            let evals = store.get_evals()?;
-            if !evals.is_empty() || std::time::Instant::now() >= deadline {
-                break evals;
+        let eval = loop {
+            let reschedule = store
+                .get_evals()?
+                .into_iter()
+                .find(|eval| eval.kind == "job_reschedule");
+            if reschedule.is_some() || std::time::Instant::now() >= deadline {
+                break reschedule;
             }
             std::thread::sleep(Duration::from_millis(10));
         };
 
         assert!(store.get_allocation_by_id(allocation.id)?.is_none());
-        let eval = evals.first().context("missing eval")?;
-        assert_eq!(eval.kind, "job_reschedule");
+        let eval = eval.context("missing job_reschedule eval")?;
         assert_eq!(eval.job_config_id, job_config_id);
         assert_eq!(eval.node_name, "node-a");
 
@@ -15077,6 +15660,151 @@ mod tests {
             "complete"
         );
 
+        Ok(())
+    }
+
+    /// A terminal report for a task other tasks depend on queues the eval
+    /// that places them (they were held until it exited); a report for a
+    /// task nothing depends on queues nothing.
+    #[test]
+    fn a_terminal_report_queues_the_dependents_eval() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "dag-report".into(),
+            tasks: vec![
+                TaskConfig {
+                    lifecycle: crate::structs::TaskLifecycle::Batch,
+                    group: "prep".into(),
+                    ..TaskConfig::new("prep", "noop")
+                },
+                TaskConfig {
+                    group: "api".into(),
+                    depends_on: vec![crate::structs::TaskDependency {
+                        task: "prep".into(),
+                        condition: crate::structs::TaskDependencyCondition::Success,
+                    }],
+                    ..TaskConfig::new("api", "noop")
+                },
+            ],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let placed = crate::manager::scheduler::Scheduler::new(&store)?
+            .plan_and_apply(&job_config_id, crate::manager::scheduler::PlanMode::Fresh)?;
+        assert_eq!(placed.allocations.len(), 1, "api waits for prep");
+        assert_eq!(evals_of_kind(&store, "dag-report", "job_reschedule")?, 0);
+
+        handle_terminated_allocations(
+            &store,
+            "node-a",
+            &[crate::structs::TerminatedAllocation {
+                allocation_id: placed.allocations[0].id,
+                success: true,
+                exit_code: Some(0),
+                signal: None,
+                message: "exited with status 0".into(),
+            }],
+        )?;
+        assert_eq!(evals_of_kind(&store, "dag-report", "job_reschedule")?, 1);
+        Ok(())
+    }
+
+    /// Re-running the unchanged spec of a stopped job starts it again (it
+    /// used to reply "no update needed" and place nothing). A job that is
+    /// running keeps the old answer.
+    #[tokio::test]
+    async fn rerunning_an_unchanged_stopped_job_starts_it_again() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        insert_node(&store, "node-a")?;
+        let jobspec = json!({
+            "name": "revive",
+            "task": { "runtime": "exec", "config": { "command": ["true"] } }
+        })
+        .to_string();
+        let run = || {
+            manager.run_job(Request::new(RunJobRequest {
+                parsed_jobspec: jobspec.clone(),
+                submissions: vec![submission()],
+                priority: None,
+                force_reschedule: false,
+                idempotency_key: None,
+            }))
+        };
+
+        run().await?;
+        let job_config_id = store.get_job_config("revive")?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        store.place_alloc("node-a", task_id)?;
+        let running = run().await?.into_inner();
+        assert!(
+            running.message.contains("no update needed"),
+            "{}",
+            running.message
+        );
+        assert_eq!(evals_of_kind(&store, "revive", "job_update")?, 0);
+
+        store.stop_job("revive")?;
+        store.remove_allocs_for_job("revive")?;
+        let revived = run().await?.into_inner();
+        assert!(
+            revived.message.contains("starting it again"),
+            "{}",
+            revived.message
+        );
+        assert_eq!(store.get_job("revive")?.status, "active");
+        assert_eq!(evals_of_kind(&store, "revive", "job_update")?, 1);
+        Ok(())
+    }
+
+    /// GetJobInfo reports what the job is doing, not the stored `active`.
+    #[tokio::test]
+    async fn job_info_reports_the_derived_status() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "status-job".into(),
+            tasks: vec![TaskConfig::new("api", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        async fn status_of(manager: &ManagerDaemonService) -> R<String> {
+            let reply = manager
+                .get_job_info(Request::new(GetJobInfoRequest {
+                    name: "status-job".into(),
+                }))
+                .await?;
+            Ok(reply.into_inner().job.expect("job").status)
+        }
+        assert_eq!(
+            status_of(&manager).await?,
+            "pending",
+            "accepted, nothing placed yet"
+        );
+
+        let job_config_id = store.get_job_config("status-job")?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        store.place_alloc("node-a", task_id)?;
+        assert_eq!(status_of(&manager).await?, "running");
+
+        let listed = manager
+            .list_jobs(Request::new(ListJobsRequest::default()))
+            .await?
+            .into_inner();
+        assert_eq!(listed.jobs[0].status, "running");
+        assert_eq!(listed.status_counts.get("running"), Some(&1));
+
+        store.stop_job("status-job")?;
+        assert_eq!(status_of(&manager).await?, "stopped");
         Ok(())
     }
 

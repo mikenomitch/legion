@@ -15,29 +15,34 @@ How to use it:
 
 ---
 
-- [ ] **Launch blocker: workers on another host lose exec, logs, and the
-      mesh, and any task can take over the cluster.** The worker binds
-      `127.0.0.1:4848` and always advertises `http://127.0.0.1:4848`
-      (`src/worker/daemon.rs:155`, `:376-379`). Opening the port is not the
-      fix, because `PostWork`, `ExecTask`, `GetTaskLogs`, and `RestartWorker`
-      authenticate nobody. Separately, Linux containers and `exec` tasks share
+- [ ] **Launch blocker: any task can take over the cluster.** The
+      multi-host half (workers on another host losing exec, logs, and the
+      mesh behind an unauthenticated worker port) shipped as Phase 1 in
+      [#17](https://github.com/mikenomitch/legion/pull/17); see Done,
+      "Pre-launch spot check (2026-10-11)". Linux containers and `exec` tasks share
       the host network, so they reach the manager (ACLs off by default), the
       worker port, the cloud metadata service, and other allocations'
-      datapath listeners. Found while preparing the pre-launch AWS spot
-      check, which runs on a temporary shim
-      (`tests/spot-check/shims.patch`) until Phase 1 lands. Its host-guard
-      rows need Phases 2 and 3. Plan:
-      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (PLANNED)
+      datapath listeners. The spot check's host-guard rows need Phases 2
+      and 3. Plan:
+      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (IN EXECUTION)
       · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
       Phases in ship order, most dangerous gap first:
   - [ ] Phase 0: ACLs on by default. The first management token is minted at
         first start into `<dataDir>/bootstrap-token` and `~/.legion/token`
         (`0600`), and the open `BootstrapAcl` RPC and `legion acl bootstrap`
         are removed (plan §6.10).
-  - [ ] Phase 1: the mTLS worker plane with per-RPC caller classes,
-        including the sandbox-exec plan's `ticket` class on `ExecTask`, CSR
-        issuance, the CA pin in join tokens, reachable bind and advertise,
-        and two-step CA rotation (plan §6.1 to §6.6, §6.9).
+  - [x] Phase 1 core: the mTLS worker plane with per-RPC caller classes,
+        manager certificates and one client factory, CSR issuance, reachable
+        bind and advertise (plan §6.1 to §6.4, §6.6), in
+        [#17](https://github.com/mikenomitch/legion/pull/17).
+  - [ ] Phase 1 remainder: two-step CA rotation (plan §6.9, calls 11).
+        Until then, after `legion net ca rotate` the first exec, logs, or
+        restart against each node can fail, and a node nothing dials keeps
+        its old certificate for up to 8 hours. Cheap first step: carry the
+        CA fingerprint on the heartbeat reply.
+  - [ ] The sandbox-exec plan's `ticket` class on `ExecTask` (plan §6.1,
+        calls 15): `ExecTask` admits only a manager certificate today.
+  - [ ] The CA pin in join tokens (plan §6.5), moved to Phase 4 (calls 10).
   - [ ] Phase 2: the host guard in the datapath. The gated egress proxy
         dials loopback, link-local, and node-local addresses from the host
         namespace today, and CIDR rules never see hostnames
@@ -99,24 +104,15 @@ How to use it:
 
 - [ ] **Pre-launch spot check findings (2026-10-11), from reading the code
       while preparing the AWS run.** Each is verified in source unless marked
-      otherwise.
-  - [ ] **README says `legion start manager` works without a config file.**
-        It does not. With no `-c`, it evaluates `./configs/manager.ncl`
-        (`src/constants.rs:55`) and fails outside a repo checkout, so the
-        `cargo install legion-rs` quickstart breaks on its second command.
-  - [ ] **`configs/jobs/redis.ncl` cannot work.** The `exec` runtime does not
-        run argv through a shell, so redis-server receives the literal string
-        `$LEGION_STORAGE_DIR`. Its `kind = "exec"` health check has the same
-        problem. Wrap in `sh -c` and use a TCP check.
-  - [ ] **`legion action run -p` does not exist.** The flag is `--param`
-        (`src/cmd/action.rs:37-41`), but `configs/jobs/redis.ncl`,
-        `docs/guides/redis.md`, and `docs/volumes.md` all show `-p`.
-  - [ ] **Nothing says where to get a guest kernel for microVM sandboxes.**
-        `docs/task-runtime-sandbox.md` names the path and env var but no
-        source. cloud-hypervisor's [linux releases](https://github.com/cloud-hypervisor/linux/releases)
-        publish `vmlinux-x86_64`. Also document that AWS now offers
-        [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html)
-        on C7i/M7i/R7i and 8i types, so microVMs need no bare metal.
+      otherwise. The fixed ones (README quickstart, `redis.ncl`,
+      `action run -p`, the guest kernel docs, `WorkerRegister` on a
+      follower, `tls-edge.ncl`, and the dev guide's `:4748`) are in Done,
+      "Pre-launch spot check (2026-10-11)".
+  - [ ] **The installation guide's release versions are placeholders.**
+        `docs/installation.md` names youki, cloud-hypervisor, and guest
+        kernel release tags that were not checked against the upstream
+        release pages (GitHub was unreachable when it was written). Confirm
+        the tags and asset names before launch.
   - [ ] **No exec into microVM sandboxes.** Documented
         (`docs/task-runtime-sandbox.md`, "Current Scope and Limitations"), but
         it is the headline agent-sandbox use case. macOS dev mode can exec, so
@@ -125,21 +121,91 @@ How to use it:
         TAP device, guest IP config, and host DNAT. Gated mode has no
         host-to-guest ingress relay (`src/worker/daemon.rs:1934-1936`, gated
         sandboxes never get a netns).
-  - [ ] **A worker whose join token names a raft follower likely cannot
-        register.** `WorkerRegister` is not in the follower-forwarding list
-        (`src/storage/raft/forward.rs`), so it returns `FAILED_PRECONDITION`.
-        Workers also learn only the one manager in their token. Inferred from
-        code, not yet reproduced.
   - [ ] **The worker never uses TLS to reach the manager**, even when
-        `server.tls` is on (`src/worker/daemon.rs:799-811`), and raft peers
-        dial `http://` only. `docs/auth-and-acls.md` claims listener TLS
-        "already covers transport encryption." Phase 4 of the worker-plane
-        plan covers the worker half. Fix the doc claim now.
-  - [ ] **`configs/jobs/tls-edge.ncl` listens on the wrong port on Linux.** It
-        declares `static = 9443, to = 443`, but `to` only applies on macOS, so
-        nginx binds host :443 while the comment curls :9443.
-  - [ ] **`internal_docs/development.md` still points workers at :4748**, which
-        is now the exec WebSocket. `scripts/dev/join.sh` uses 4747.
+        `server.tls` is on, and raft peers dial `http://` only. Phase 4 of
+        the worker-plane plan covers the worker half. (The false "listener
+        TLS already covers transport encryption" claim in
+        `docs/auth-and-acls.md` was corrected in
+        [#17](https://github.com/mikenomitch/legion/pull/17).)
+
+- [ ] **Follow-ups from the 2026-10-11 spot-check fixes**
+      ([#17](https://github.com/mikenomitch/legion/pull/17);
+      [plan](plans/launch-spot-check-fixes-plan.md) §8.7 ·
+      [calls](calls/launch-spot-check-fixes-plan_calls.md)). Each was
+      deliberately deferred or found along the way.
+  - [ ] **Re-run the AWS spot check without the shims**
+        (`tests/spot-check/smoke.sh` and the RUNBOOK human pass on the
+        `spot-check/launch` branch). Nothing in #17 ran on the real rig.
+        Smoke-test edge-boot speculative dispatch in particular: the
+        dispatcher read `protocolVersion` from the wrong attribute map, so
+        it had never fired for a real worker before #17.
+  - [ ] **Capability-aware placement.** A task that adds capabilities places
+        like any other and fails at start on a node whose
+        `container.allowCaps` refuses them; authors pin such tasks by pool
+        (calls 1). Also still open: the per-author ACL `host` grant
+        (worker-plane-auth-plan §6.16), since the allowlist bounds the node,
+        not the author.
+  - [ ] **User namespaces and seccomp matter more now** that containers get
+        Docker's 13 default capabilities instead of 3 (worker-plane-auth-plan
+        §6.14, Phase 6).
+  - [ ] **On Linux `command` replaces the image `ENTRYPOINT`; on macOS it
+        does not**, so one jobspec runs different commands per OS (calls 51).
+        Needs a plan.
+  - [ ] **Pre-vote for partitioned raft members.** A restarted member now
+        starts quiet (calls 17), but a member cut off by a partition still
+        deposes the leader when it heals; openraft 0.9 has no pre-vote.
+  - [ ] **Workers fail over to raft advertise addresses**
+        (`HeartbeatReply.manager_addresses`), which must be reachable from
+        workers. Consider serving each manager's `server.advertiseAddr`
+        instead (calls 7).
+  - [ ] **Fold the partial-placement remainder into blocked evals.** A plan
+        that places nothing blocks on main's blocked evals, but the unplaced
+        remainder of a partial plan still waits for the free-triggered
+        capacity pass (`capacity_waiters`), so there are two retry paths and
+        `job info` shows `blocked` only when nothing placed (calls 21).
+  - [ ] **A `legion_leader_forwards_total` metric** for follower-to-leader
+        write forwarding (calls 3).
+  - [ ] **Terminal batch reports are not persisted.** A worker restarted
+        between a batch exit and the heartbeat that reports it cannot know
+        the exit status, so the completed step is rescheduled and runs again.
+  - [ ] **`TerminatedAllocation.success = false` is never sent**: every
+        unsuccessful terminal exit takes the failure (reschedule) path,
+        including `restart.policy = "never"`. Route `never` through it or
+        drop the field.
+  - [ ] **`legion exec` into a gated `exec` task runs in the host network
+        namespace** (`ExecOptions` has no namespace field), and a pushed
+        gated task's datapath listeners bind only at the next heartbeat.
+  - [ ] **Removed-allocation history and worker log retention disagree**:
+        the manager forgets a removed allocation after 24h, the worker keeps
+        its logs 7 days. Add a `--node` override or a configurable retention.
+        The UI Logs tab never sets `include_removed`.
+  - [ ] **Destructive static-port rollouts race the old process's graceful
+        stop**; the new process may fail to bind once and fall back on its
+        restart policy. A worker can also stop an unwanted allocation and
+        start its static-port replacement in the same tick.
+  - [ ] **No-op `rollout_tick` evals still emit eval events** (backoff caps
+        them at about two every 30s).
+  - [ ] **`batch_task_outcome_tx` compares against the spec `count`**, not a
+        `job scale` override.
+  - [ ] **Image pulls**: the extracted rootfs is not cached (every new
+        allocation re-extracts), ORAS layers are not cached, a hung pull
+        blocks other starts of the same image (oci-client has no read
+        timeout), and oci-client's bundled webpki roots cannot pull through
+        a TLS-intercepting proxy (`rustls-tls-native-roots` would). On
+        macOS the pull happens inside the task process, so a pull failure is
+        reported as an exit with stderr rather than a staging failure.
+  - [ ] **Supplementary groups from the image's `/etc/group` are not
+        applied** in Linux containers.
+  - [ ] **CLI errors print twice**: `#[instrument(err)]` on command handlers
+        logs each human-mode error as ERROR trace lines before `Error:`.
+  - [ ] **Event metadata keys are still mixed case**; the camelCase rule now
+        covers API messages and CLI envelopes, not event metadata.
+  - [ ] **The https CA default (`configs/tls/rootca.pem`) is relative to the
+        working directory**, like the manager config path was.
+  - [ ] **`legion job info` prints only the job row**, not its allocations.
+  - [ ] **Not verified on real hardware**: cgroup v2 resource enforcement
+        turning on (P1-1), and the worker-plane throughput cost of TLS
+        dispatch at 1,000 nodes.
 
 - [ ] **Architecture audit (2026-10-09).** Design-level findings across the
       store, scheduler, manager API, worker, and lifecycle, each with an ID and
@@ -198,11 +264,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#27](https://github.com/mikenomitch/legion/pull/27) | Sandbox scaling Phases 0–3: 8-entry keyed lifecycles, `StreamWork` delivery, blocked evals, the AWS sandbox campaign | [plan](plans/sandbox-scaling-plan.md) · [calls](calls/sandbox-scaling-plan_calls.md); rate target missed at ~2× (calls #13) |
-| [#20](https://github.com/mikenomitch/legion/pull/20) | Operator UI gaps: instance and allocation pages, event filters by instance/allocation, KV values hidden until revealed, worker public addresses, stale rollouts cancel themselves | [plan](plans/operator-ui-gaps-plan.md) · [calls](calls/operator-ui-gaps-plan_calls.md) |
-| [#19](https://github.com/mikenomitch/legion/pull/19) | Task page tabs, guided template launch, Actions tab; template-launched jobs list their tasks again | UI only; [plan](plans/ui-task-and-template-redesign-plan.md) · [calls](calls/ui-task-and-template-redesign-plan_calls.md) |
-| [#24](https://github.com/mikenomitch/legion/pull/24) | Gated sandbox checkpoints Phases 1 to 4: gated memory checkpoints, `gated-default` deny, the static `legion-guest` agent, gated idle signals, Legion-addressed TAP guests (`tap`/`mac` removed) | Phase 0 (KVM) pending, so the gated-by-default flip is held; [plan](plans/gated-sandbox-checkpoints-plan.md) · [calls](calls/gated-sandbox-checkpoints-plan_calls.md) |
-| [#14](https://github.com/mikenomitch/legion/pull/14) | Live KV file updates (`onChange = "update"`) and KV-backed ingress certificates (`certFrom = { kv }`) | [plan](plans/kv-cert-delivery-plan.md) · [calls](calls/kv-cert-delivery-plan_calls.md) |
+| [#17](https://github.com/mikenomitch/legion/pull/17) | Fixes for every 2026-10-11 spot-check finding, including Phase 1 of the worker plane | [plan](plans/launch-spot-check-fixes-plan.md) · [calls](calls/launch-spot-check-fixes-plan_calls.md); AWS re-run pending |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
 | [#4](https://github.com/mikenomitch/legion/pull/4) | Rename crate to `legion-rs`, crates.io metadata, `cargo install` docs | Not published yet; follow-ups under Templates, registry & packaging |
@@ -4451,6 +4513,58 @@ now does about them so nobody re-derives it at 02:00.
   6x-470-crate rebuild from every campaign, but it is a cache, not a fix:
   the first build on a fresh box and any change under `plugins/` still pays
   in full, so the shared-target-dir item above stands.
+
+## Pre-launch spot check (2026-10-11)
+
+[findings](launch-spot-check-findings.md) ·
+[plan](plans/launch-spot-check-fixes-plan.md) ·
+[calls](calls/launch-spot-check-fixes-plan_calls.md) · fixed in
+[#17](https://github.com/mikenomitch/legion/pull/17) (open). Per-finding
+outcomes are in the plan's §8; what it deferred is open above under
+"Follow-ups from the 2026-10-11 spot-check fixes".
+
+- [x] **Workers on other hosts** (P0-1): Phase 1 of the worker plane:
+      reachable bind and advertise, mTLS with per-RPC caller classes, CSR
+      issuance ([architecture-managers-workers.md](../docs/architecture-managers-workers.md),
+      [auth-and-acls.md](../docs/auth-and-acls.md)).
+- [x] **Task lifecycle** (P0-2, P0-3, P1-1, P1-4, P1-9, P2-7, P2-8): batch
+      tasks finish and restart policies reach the worker; health checks start
+      for staged tasks; resource enforcement turns on; gated starts create
+      their namespace; failure reasons carry the task's stderr; the plugin
+      dir defaults next to the binary; exec sessions get the task env
+      ([task-supervision.md](../docs/task-supervision.md),
+      [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)).
+- [x] **Scheduler** (P0-4, P1-2, P1-3, P1-8): DAG dependencies wait for
+      reported status; static ports are planned, plans place what fits and
+      freed capacity retries the rest; reschedules fall back to the failed
+      node; job status is derived from live state
+      ([scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md),
+      [rollouts.md](../docs/rollouts.md)).
+- [x] **Manager availability** (P0-5, P0-6, P0-8, P1-5 in part, P2-5, P2-10,
+      `transfer-leader`): forwarded heartbeats in `single`, worker failover
+      across managers, an availability reconcile, re-registration with the
+      node's own token, follower write forwarding (also fixes
+      `WorkerRegister` on a follower), remote-election leadership moves, a
+      quiet restart for raft members
+      ([raft-operations.md](../docs/raft-operations.md),
+      [node-liveness.md](../docs/node-liveness.md)).
+- [x] **Linux containers** (P0-7, P1-6, P2-6, P2-9, P2-11): Docker's default
+      capabilities less `NET_RAW` with `security.capabilities` bounded by
+      `container.allowCaps`, ownership kept on extraction, reopenable stdio,
+      `ulimits`, the macOS 200 MiB floor, a per-blob image cache, a Linux
+      install guide with the guest kernel source and AWS nested
+      virtualization ([task-runtime-container.md](../docs/task-runtime-container.md),
+      [installation.md](../docs/installation.md)). `redis.ncl` runs through
+      `sh -c` with TCP checks and the docs use `--param`.
+- [x] **CLI and diagnostics** (P1-7, P1-9, P2-1 to P2-4, P2-6, P2-7):
+      allocation ids survive lane snapshots, removed allocations' logs stay
+      readable, the quickstart works outside a checkout, precondition errors
+      keep their cause, `kv get` misses exit non-zero, `--json` on every
+      command and camelCase everywhere ([logging.md](../docs/logging.md),
+      [agent-readiness.md](../docs/agent-readiness.md)).
+- [x] **Small fixes from the earlier read-through**: `tls-edge.ncl` listens
+      on its advertised port on Linux, and `internal_docs/development.md`
+      points workers at :4747.
 
 ## Architecture audit (2026-10-09)
 

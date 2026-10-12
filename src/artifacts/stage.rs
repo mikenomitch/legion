@@ -111,6 +111,7 @@ pub struct ArtifactSink {
     bytes_written: u64,
     progress: Option<ProgressFn>,
     bytes_total_hint: Option<u64>,
+    content: Option<Arc<ContentStore>>,
 }
 
 impl ArtifactSink {
@@ -123,7 +124,20 @@ impl ArtifactSink {
             bytes_written: 0,
             progress: None,
             bytes_total_hint: None,
+            content: None,
         })
+    }
+
+    /// Lets a fetcher that stores content-addressed pieces (the `oci://`
+    /// fetcher's image blobs) serve them from, and keep them in, the node
+    /// content store.
+    pub fn set_content_store(&mut self, store: Option<Arc<ContentStore>>) {
+        self.content = store;
+    }
+
+    /// The node content store, when the caller provided one.
+    pub fn content_store(&self) -> Option<&Arc<ContentStore>> {
+        self.content.as_ref()
     }
 
     pub fn set_progress(&mut self, progress: ProgressFn) {
@@ -763,6 +777,8 @@ impl ArtifactStager {
         store_as: Option<&ContentDigest>,
     ) -> R<StagedArtifact> {
         let mut sink = ArtifactSink::new(attempt_dir.to_path_buf(), limits.max_bytes)?;
+        // Image layers are cached per blob by the fetcher itself.
+        sink.set_content_store(self.content.clone());
         let progress_board = board.clone();
         let last_reported = std::sync::atomic::AtomicU64::new(0);
         sink.set_progress(Box::new(move |bytes_fetched, bytes_total| {

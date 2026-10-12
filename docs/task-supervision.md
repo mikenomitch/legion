@@ -70,7 +70,8 @@ task gets `on_unhealthy.restart_count` local restarts in total across both.
 }
 ```
 
-Defaults when you omit the `restart` block:
+Defaults when you omit the `restart` block, or declare one without a
+`policy` (for example only `delay`):
 
 | Lifecycle | Default policy | Why |
 | --- | --- | --- |
@@ -92,6 +93,27 @@ With `policy = "never"`, a `SIGKILL` is a failure.
 Restarts happen in place on the same node. The allocation keeps its id, its
 directory, its staged artifacts, and its volumes. The work moves to another
 node only after the local budget is spent.
+
+The worker learns each task's `lifecycle` and `restart` block from the
+manager's dispatch (`TaskAllocation.task_lifecycle` and `task_restart` in
+`proto/legion.proto`), so the policy above is the one the jobspec declared.
+
+An exit that is not a success carries the last three lines the process wrote
+to stderr (at most 400 characters, from the current run only) into the
+allocation's status message and, when it fails the allocation, into the
+failure reason and the `allocation.failed` event:
+
+```text
+exited with status 1; last stderr: Error: failed to pull image: 429 Too Many Requests
+```
+
+Worker logs record the exit status only, never task output.
+
+Health checks stand aside while the process is down: between an exit and the
+supervisor's relaunch, failed checks are not counted, so an allocation whose
+process keeps dying fails with its exit status and stderr rather than with
+`tcp check failed: Connection refused`. After a relaunch the checks start
+over, boot grace included.
 
 ## Batch tasks and real completion
 
@@ -117,7 +139,8 @@ Know two things before you upgrade:
   status message.
 
 A completed allocation keeps its row and its slot, and Legion never dispatches
-it to a worker again. Batch tasks with a `schedule` still re-run on their
+it to a worker again. It no longer counts against the node's resources or
+holds its ports, so other work can use them. Batch tasks with a `schedule` still re-run on their
 schedule.
 
 Version skew: exit reporting arrived with protocol version 2. You upgrade
@@ -232,8 +255,8 @@ config = {
 ## Diagnostics
 
 - `legion job info <job>` and the UI show the allocation's last status message:
-  `exited with status 2`, `killed by signal 9`, `exited with status 1;
-  restarting`.
+  `exited with status 2`, `killed by signal 9`, `exited with status 1; last
+  stderr: ...; restarting`.
 - `legion job logs <job> --follow` shows the task's output across restarts.
   The allocation directory and its logs survive an in-place restart.
 - The event stream ([Event Stream](event-stream.md)) carries
@@ -265,6 +288,11 @@ config = {
   falls back to a liveness check.
 - A restart resets only the process. Health-check state and the restart budget
   are per allocation, not per process.
+- The stderr lines a failed exit carries are the task's own output, copied
+  into its status message and failure event. A task that prints a secret to
+  stderr as it dies shows it to whoever can read the job's events, the same
+  readers who can already see it with `legion job logs`. Runtimes that capture
+  no logs (`noop`, third-party plugins without capture) carry none.
 - Enforcement is per worker, not per pool or per job. A cluster with mixed
   enforcement is a set of workers configured differently. The scheduler doesn't
   prefer an enforcing node for a task that sets limits.

@@ -213,7 +213,7 @@ async fn run_instances(matches: &clap::ArgMatches) -> Result<()> {
         stage_timeout: duration("stage-timeout-ms"),
         submit_job: !matches.get_flag("no-submit"),
         quiet: matches.get_flag("quiet"),
-        advertise_host: matches.get_one::<String>("advertise-host").unwrap().clone(),
+        advertise_addr: matches.get_one::<String>("advertise-addr").cloned(),
         sim_name_prefix: matches
             .get_one::<String>("sim-name-prefix")
             .cloned()
@@ -313,15 +313,11 @@ fn cli() -> Command {
                      fleet (sets its worker type and secret; overrides --worker-type and \
                      --join-secret)",
         ))
-        .arg(
-            Arg::new("advertise-host")
-                .long("advertise-host")
-                .default_value("127.0.0.1")
-                .help(
-                    "instances mode: host the manager dials to push work to the embedded \
-                     fleet (only used for a node whose work stream is down)",
-                ),
-        )
+        .arg(Arg::new("advertise-addr").long("advertise-addr").help(
+            "instances mode: address (host or host:port) the manager dials to push \
+                     work to the embedded fleet, auto-detected when unset (only used for a \
+                     node whose work stream is down)",
+        ))
         .arg(Arg::new("sim-name-prefix").long("sim-name-prefix").help(
             "instances mode: node-id prefix for the embedded fleet (default \
                      lg-<pid>); keep it fixed across runs against one cluster so each run \

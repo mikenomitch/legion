@@ -234,9 +234,12 @@ history with the actor who ran it):
 - `add-voter --target name`: promote to voter (address resolved from
   `raft.peers` or given as `name@host:port`).
 - `remove-member --target name`: demote and remove a member.
-- `step-down` / `transfer-leader`: **not supported**. openraft 0.9 has no
-  leader-transfer API, so these return an error. Run `trigger-election`
-  pointed at the desired new leader instead.
+- `transfer-leader --target name`: make that voter the leader, from any
+  manager. Built on a remote election (openraft 0.9 has no leader-transfer
+  API): the target campaigns, re-asked once per election timeout until it
+  leads or the deadline passes, which the reply reports as a warning.
+- `step-down`: hand leadership to the most caught-up other voter. Runs on
+  the leader; a follower forwards it there.
 
 `legion raft status` prints per-lane lines (`lane=... role=... term=...`)
 when more than one raft group is active, which means under the experimental
@@ -346,7 +349,9 @@ instead of failing, but there are costs:
 - **The control leader accepts job submits**, and they complete
   asynchronously. The control part (the operator's intent) must commit on
   the node you submitted to. A manager that does not lead the control lane
-  still rejects the submit with the typed leader hint. The owning lanes'
+  rejects the submit with the typed leader hint, and the API layer replays
+  it to the control leader (see "Non-leader write redirects and
+  forwarding"), so the caller sees the leader's answer. The owning lanes'
   leaders then complete the cross-lane parts: the `task_status` seed, the
   volume-claim rows, the rollout for an updated job, and the scheduling
   eval. Evals forward immediately. Per-lane reconcilers derive the rest from
@@ -473,8 +478,8 @@ An in-process 3-node test covers each of these, in
 
 | Scenario | Behavior |
 | --- | --- |
-| **Leader loss** | In-flight unacked writes fail with a typed error (retry them). Every acked write survives. A new leader is elected within the election timeout (600–1200 ms by default, see `electionTimeoutMinMs`/`electionTimeoutMaxMs`). Its eval workers and node status checker take over the replicated queues within about 1 s. Clients pointed at the dead leader redial using the leader hint. |
-| **Minority partition** | The majority side keeps electing and committing. Managers on the minority side cannot reach a quorum, so they reject writes with `FAILED_PRECONDITION` and a leader hint, and keep serving local reads. When the partition heals, the minority catches up and ends up byte-identical. |
+| **Leader loss** | In-flight unacked writes fail with a typed error (retry them). Every acked write survives. A new leader is elected within the election timeout (600–1200 ms by default, see `electionTimeoutMinMs`/`electionTimeoutMaxMs`). Its eval workers and node status checker take over the replicated queues within about 1 s. Clients pointed at the dead leader get a connection error and retry against another manager; clients pointed at a live manager are forwarded to the new leader. Workers fail over to another manager after two unreachable heartbeats. |
+| **Minority partition** | The majority side keeps electing and committing. Managers on the minority side cannot reach a quorum, so writes sent to them fail with `FAILED_PRECONDITION` (forwarding to a leader they cannot reach fails too), and they keep serving local reads. When the partition heals, the minority catches up and ends up byte-identical. |
 | **Follower loss** | No client impact. The cluster commits on the remaining quorum. When the follower returns, it catches up by log replay, or by snapshot install if the leader has compacted past its position. |
 | **Full-cluster restart** | Every node recovers from its raft log and state DB. A leader is re-elected, and the cluster resumes with all committed state. A restarted member that cannot yet hear the leader (its inbound transport shares the manager listener) starts without a leader, logs a warning, and catches up once it is serving. Startup never deadlocks on the election. |
 | **Operator double-start** | The second process fails fast on the `dataDir` advisory lock. |
@@ -484,16 +489,19 @@ An in-process 3-node test covers each of these, in
 ## Non-leader write redirects and forwarding
 
 **Client-plane** RPCs that write and are sent to a non-leader are rejected
-with `FAILED_PRECONDITION` and a message naming the current leader (`retry
-against leader mgr-a at 10.0.0.1:4747`). The CLI shows this message. The
-rejection happens **before** any capture work runs, so point write clients
-(`LEGION_ADDR`) at the leader. Every manager serves reads from its local
-replica. The same typed rejection covers leader-only operations that don't
-propose anything (`legion state backup`).
+internally with a typed not-the-leader error (`FAILED_PRECONDITION` naming
+the leader and its raft advertise address) **before** any capture work runs,
+and the receiving manager then replays the whole request to that leader and
+returns the leader's reply (the leader-forward layer; see
+[Writes on any manager](raft-operations.md#writes-on-any-manager)). Clients
+can point `LEGION_ADDR` at any manager. Every manager serves reads from its
+local replica. The same typed rejection, and the same forwarding, covers
+leader-only operations that don't propose anything (`legion state backup`,
+`raft command step-down`). The caller sees the rejection only when the
+leader is unreachable from the manager it asked.
 
-**Worker-plane** writes work differently. Workers dial one fixed manager and
-cannot follow leader hints, so their writes are forwarded instead of
-rejected. A manager may receive a heartbeat, health check, allocation-health
+**Worker-plane** writes are forwarded per operation, below the RPC layer. A
+manager may receive a heartbeat, health check, allocation-health
 snapshot, failure report, or volume report that it cannot propose, because
 it does not lead the owning lane. This happens after a failover in `single`
 topology, or during a lane split in `lanes`. The manager sends the operation
@@ -607,10 +615,11 @@ In order of impact:
    worker plane, which has the same known authentication gap. It will be
    upgraded along with worker mTLS. Forwarded lane writes use the same
    channel and the same auth.
-4. **Automatic forwarding covers only the worker plane and internal lane
-   writes.** Client-plane RPCs still reject with the leader hint (above).
-   Clients can redial, and every client-facing operation is anchored on the
-   control leader.
+4. **Client-plane forwarding replays the whole request** to the leader of
+   the lane that rejected it, one hop, over plaintext manager-to-manager
+   HTTP/2 like the raft transport. Under `lanes`, a composite whose first
+   half committed on a lane this manager leads is replayed whole on the
+   other lane's leader, the same converging shape as a client retry.
 5. The `legion_raft_*` engine series are emitted (quorum shape, per-lane
    term/indexes/apply-lag/leadership, and the capture-vs-propose latency
    histograms). OTLP metrics push and the opt-in worker `/metrics` listener
@@ -619,11 +628,19 @@ In order of impact:
    or voter-count warnings.
 6. There is no raft autopilot.
 
-`step-down`/`transfer-leader` need an openraft version with a
-leader-transfer API. This also affects decommissioning the current all-lane
-leader, because `remove-member` refuses self-removal. Move leadership first
-(`trigger-election` on another manager), then remove the old leader from the
-new one. Legion does not enforce an odd number of managers, so run 3 or 5.
+openraft 0.9 has no leader-transfer API, so `step-down` and
+`transfer-leader` are built on remote elections: the target is asked to
+campaign (`RaftTransport.TriggerElection`) until it leads the control group,
+while the manager handing leadership away stops campaigning. A move costs a
+few terms, and it is best effort under load (the command warns when
+leadership has not moved by its deadline). Decommissioning the current
+all-lane leader still takes two steps, because `remove-member` refuses
+self-removal: `transfer-leader` to another manager, then remove the old
+leader from the new one. Legion does not enforce an odd number of managers,
+so run 3 or 5. There is no pre-vote either: a restarted member stays quiet
+until a leader reaches it (see [raft-operations.md](raft-operations.md)),
+but a member cut off by a partition still campaigns, and its higher term
+deposes the leader when the partition heals.
 
 Two operational issues to know about:
 

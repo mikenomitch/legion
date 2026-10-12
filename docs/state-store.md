@@ -124,7 +124,17 @@ Main tables (see migrations):
   [node-liveness.md](node-liveness.md)).
 - `worker_type`
 - `job`, `job_config`, `task_config`, `task_status`, `job_update`
-- `allocation`
+- `allocation`. Ids are AUTOINCREMENT and never reused: not after the
+  newest allocation is deleted, not after a restart, and not on a replica
+  that caught up from a raft snapshot (a lane snapshot carries each table's
+  `sqlite_sequence` high-water mark with its rows) or that wins an election.
+  A stale id held by a script or a client therefore names nothing rather than
+  another job's task.
+- `allocation_history`: removed allocations (job, job config, task, node,
+  status, stop cause, removal time), kept for 24 hours so `legion job logs`
+  can still read their output from the node
+  ([logging.md](logging.md#logs-of-removed-allocations)). Written in the same
+  transaction as the removal, and expired by later removals.
 - `eval`
 - `manager_config`
 - `kv_entry`, `kv_lock`, `job_kv_reference`
@@ -232,10 +242,12 @@ Server-side backups work in every mode: `legion state backup` (a
 - Raft `topology = "lanes"` (independent per-domain raft groups) works but
   is opt-in. `single` is the recommended default. See `docs/multi-raft.md`
   § "Topology: `single` vs `lanes`".
-- Non-leader client writes are rejected with a leader hint instead of being
-  forwarded. Worker-plane writes (heartbeats, reports) do forward to the
-  owning lane's leader (`docs/multi-raft.md` § "Non-leader write redirects
-  and forwarding").
+- Write forwarding is one hop. A non-leader replays a client write to the
+  leader (`docs/raft-operations.md` § "Writes on any manager") and forwards
+  worker-plane writes per operation (`docs/multi-raft.md` § "Non-leader
+  write redirects and forwarding"); when the leader is unreachable from the
+  manager that received the write, it fails with the leader hint rather than
+  being retried elsewhere.
 - Managers dial each other's raft transport over plaintext HTTP/2 and
   authenticate with a shared cluster secret. There is no mTLS between
   managers.

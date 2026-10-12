@@ -44,15 +44,25 @@ legion service resolve redis-cache  # the pool
 
   config = {
     command = [
-      "redis-server",
-      "--dir", "$LEGION_STORAGE_DIR",
-      "--appendonly", "yes",
-      "--appendfsync", "everysec",
-      "--port", "$LEGION_PORT_REDIS",
+      "sh",
+      "-c",
+      "exec redis-server --dir \"$LEGION_STORAGE_DIR\" --appendonly yes --appendfsync everysec --port \"$LEGION_PORT_REDIS\"",
     ],
   },
+  network = { mode = "auto", ports = [{ name = "redis", to = 6379 }] },
+  service = { name = "redis", port = "redis" },
+  checks = [{ type = "health", name = "ping", kind = "tcp", port = "redis", every = "10s", timeout = "3s" }],
 }
 ```
+
+**Run the command through `sh -c`.** The `exec` runtime runs `command` as an
+argv, not through a shell, so `$LEGION_STORAGE_DIR` would reach `redis-server`
+as literal text. `sh -c` expands the env Legion sets for the task. `exec`
+replaces the shell, so signals reach Redis directly.
+
+**Use a TCP health check.** Exec checks run on the worker without the task's
+env or a shell, so `redis-cli -p $LEGION_PORT_REDIS ping` would not expand the
+port either. A `tcp` check on the `redis` port needs neither.
 
 **Use `$LEGION_STORAGE_DIR` instead of `path`.** This is an `exec` task. It
 runs in the host mount namespace, so there is nothing to mount
@@ -93,12 +103,9 @@ redis-cli -h <addr> -p <port> GET greeting   # "hello"
   # No `stateful` block at all.
   config = {
     command = [
-      "redis-server",
-      "--save", "",
-      "--appendonly", "no",
-      "--maxmemory", "256mb",
-      "--maxmemory-policy", "allkeys-lru",
-      "--port", "$LEGION_PORT_REDIS",
+      "sh",
+      "-c",
+      "exec redis-server --save '' --appendonly no --maxmemory 256mb --maxmemory-policy allkeys-lru --port \"$LEGION_PORT_REDIS\"",
     ],
   },
 }
@@ -151,7 +158,7 @@ resolves without you having to look up the port:
 
 ```bash
 legion action run redis cli --tty                    # interactive redis-cli
-legion action run redis command -p cmd='INFO keyspace'
+legion action run redis command --param cmd='INFO keyspace'
 legion action run redis save                         # BGREWRITEAOF now
 ```
 
@@ -199,8 +206,7 @@ group. The replica task points at the primary's service address:
 
 ```nickel
 config = {
-  command = ["redis-server", "--dir", "$LEGION_STORAGE_DIR",
-            "--replicaof", "redis.service.legion", "6379"],
+  command = ["sh", "-c", "exec redis-server --dir \"$LEGION_STORAGE_DIR\" --replicaof redis.service.legion 6379"],
 },
 ```
 

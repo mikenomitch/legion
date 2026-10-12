@@ -99,9 +99,13 @@ pub fn admit_and_launch(
 
     let claim_id = admitted.claim_id.clone();
     let manager = task_manager.clone();
+    // The launch ends by starting the claim's health monitor, a tokio task,
+    // so the thread runs inside the caller's runtime (an RPC handler's).
+    let runtime = crate::worker::task_manager::current_runtime();
     std::thread::Builder::new()
         .name(format!("provisional-launch-{claim_id}"))
         .spawn(move || {
+            let _runtime = crate::worker::task_manager::enter_runtime(runtime.as_ref());
             if let Err(err) =
                 launch_provisional_allocation(&manager, &launch_payload, &claim_id, gate)
             {
@@ -124,9 +128,13 @@ pub fn apply_verdict(
 ) {
     let metrics = crate::manager::telemetry::worker_metrics();
     let mut guard = task_manager.lock().expect("task manager");
+    let mut start_health_monitor = None;
     match confirmed {
         Some(payload) => match guard.ratify_claim(claim_id, payload) {
-            Ok(_) => {}
+            // A `stage`-gated claim starts its workload at ratification, and
+            // nothing else gives it a health monitor: without one it would
+            // never be reported healthy.
+            Ok(ratified) => start_health_monitor = ratified.start_health_monitor,
             Err(err) => {
                 // The gate could not be opened, or the held start could not be
                 // started. Killing is the only safe answer: the cluster now
@@ -148,6 +156,11 @@ pub fn apply_verdict(
     metrics
         .provisional_active
         .set(guard.unratified_claims().len() as i64);
+    // Off the lock: the monitor takes it to register itself.
+    drop(guard);
+    if let Some((allocation, task)) = start_health_monitor {
+        crate::worker::task_health::spawn_health_monitor(task_manager.clone(), allocation, task);
+    }
 }
 
 /// Kill every claim whose lease expired. Called from the worker's supervisor
@@ -256,6 +269,8 @@ mod worker_edge_test {
             task_suspend: String::new(),
             task_snapshots: String::new(),
             identity_epoch: 0,
+            task_lifecycle: String::new(),
+            task_restart: String::new(),
         }
     }
 

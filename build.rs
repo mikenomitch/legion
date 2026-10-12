@@ -11,6 +11,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .type_attribute(".", "#[derive(serde::Deserialize, serde::Serialize)]")
+        // Every JSON key Legion emits is camelCase: the jobspec, the CLI's
+        // hand-built envelopes, and (through this) every API message the CLI
+        // `--json` and MCP tools print. Enums and oneof variants keep their
+        // names; map keys are data and are never renamed.
+        .message_attribute(".", "#[serde(rename_all = \"camelCase\")]")
         .type_attribute("Job", "#[derive(tabled::Tabled)]")
         .type_attribute("Submission", "#[derive(tabled::Tabled)]")
         // A checkpoint part key must never reach a log line or a JSON dump:

@@ -20,6 +20,7 @@
 
 use crate::prelude::*;
 use crate::task_plugins::{STDERR_LOG_FILE, STDOUT_LOG_FILE};
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -249,13 +250,26 @@ fn rotate_stream(log_dir: &Path, file_name: &str, cfg: &LogConfig) -> R<()> {
 }
 
 /// Remove rotated generations beyond `max_files` or older than `retention_days`.
+///
+/// A log directory that does not exist has nothing to prune. An allocation is
+/// registered before its runtime opens its log files, and one that fails
+/// before then (an image pull, a staging error) never gets a directory at
+/// all, yet stays registered until the manager removes it — so the periodic
+/// sweep must not treat the missing directory as an error.
 fn prune_stream(log_dir: &Path, file_name: &str, cfg: &LogConfig) -> R<()> {
     let max_files = cfg.max_files.max(1);
     let now = std::time::SystemTime::now();
     let retention = std::time::Duration::from_secs(cfg.retention_days.max(1) * 24 * 60 * 60);
     let prefix = format!("{file_name}.");
 
-    for entry in std::fs::read_dir(log_dir)? {
+    let entries = match std::fs::read_dir(log_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to list {}", log_dir.display()))
+        }
+    };
+    for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -279,6 +293,227 @@ fn prune_stream(log_dir: &Path, file_name: &str, cfg: &LogConfig) -> R<()> {
         }
     }
     Ok(())
+}
+
+/// File in each allocation's log directory naming the allocation that owns
+/// it. Written before the task starts, so the worker can tell its own earlier
+/// output apart from a directory left behind by a different allocation.
+pub const LOG_OWNER_FILE: &str = "owner.json";
+
+/// The allocation a log directory belongs to. Every field is fixed for an
+/// allocation's whole life, so a relaunch of the same allocation (an in-place
+/// re-dispatch, a re-dispatch after a worker restart) matches and keeps
+/// appending, while anything else with the same id does not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogDirOwner {
+    pub allocation_id: i64,
+    pub job_id: String,
+    pub job_config_id: String,
+    pub task_config_id: i64,
+    pub task_name: String,
+}
+
+impl LogDirOwner {
+    pub fn for_allocation(allocation: &crate::structs::Allocation, task_name: &str) -> Self {
+        Self {
+            allocation_id: allocation.id,
+            job_id: allocation.job_id.clone(),
+            job_config_id: allocation.job_config_id.clone(),
+            task_config_id: allocation.task_config_id,
+            task_name: task_name.to_string(),
+        }
+    }
+}
+
+/// Make `log_dir` safe for a fresh launch of `owner`, and return it.
+///
+/// Allocation ids are never reused within a cluster, but a worker can outlive
+/// its cluster's state: rebuild the managers (or wipe their data dir) and ids
+/// start from 1 again while the worker still holds `logs/<id>/` from before.
+/// A new task must never append to, or be served with, that old output. So
+/// when the directory exists and its [`LOG_OWNER_FILE`] names a different
+/// allocation — or it has content and no owner file at all — it is renamed
+/// aside to `<id>.replaced-<unix seconds>` (pruned later like any inactive
+/// directory) and the launch gets an empty one. A matching owner keeps the
+/// directory: that is the same allocation starting again.
+///
+/// Never fails the launch: a directory that cannot be inspected or moved is
+/// logged and used as it is, which is no worse than before this check.
+pub fn claim_allocation_log_dir(
+    log_dir: std::path::PathBuf,
+    owner: &LogDirOwner,
+) -> std::path::PathBuf {
+    if let Err(err) = claim_log_dir_inner(&log_dir, owner) {
+        warn!(
+            allocation_id = owner.allocation_id,
+            log_dir = %log_dir.display(),
+            error = ?err,
+            "Could not check the allocation's log directory for output from an earlier allocation"
+        );
+    }
+    log_dir
+}
+
+fn claim_log_dir_inner(log_dir: &Path, owner: &LogDirOwner) -> R<()> {
+    let owner_path = log_dir.join(LOG_OWNER_FILE);
+    if log_dir.exists() {
+        let recorded = std::fs::read(&owner_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<LogDirOwner>(&bytes).ok());
+        match recorded {
+            Some(recorded) if &recorded == owner => return Ok(()),
+            None if dir_is_empty(log_dir)? => {}
+            previous => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let name = log_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("allocation");
+                let mut aside = log_dir.with_file_name(format!("{name}.replaced-{stamp}"));
+                let mut suffix = 1;
+                while aside.exists() {
+                    aside = log_dir.with_file_name(format!("{name}.replaced-{stamp}-{suffix}"));
+                    suffix += 1;
+                }
+                std::fs::rename(log_dir, &aside).with_context(|| {
+                    format!(
+                        "failed to move {} aside to {}",
+                        log_dir.display(),
+                        aside.display()
+                    )
+                })?;
+                info!(
+                    allocation_id = owner.allocation_id,
+                    job_id = %owner.job_id,
+                    previous_job_id = previous.as_ref().map(|p| p.job_id.as_str()).unwrap_or("-"),
+                    moved_to = %aside.display(),
+                    "Log directory held output from a different allocation with the same id; \
+                     moved it aside"
+                );
+            }
+        }
+    }
+    std::fs::create_dir_all(log_dir)
+        .with_context(|| format!("failed to create log dir {}", log_dir.display()))?;
+    crate::util::restrict_dir_to_owner(log_dir)?;
+    std::fs::write(&owner_path, serde_json::to_vec_pretty(owner)?)
+        .with_context(|| format!("failed to write {}", owner_path.display()))?;
+    Ok(())
+}
+
+fn dir_is_empty(dir: &Path) -> R<bool> {
+    Ok(std::fs::read_dir(dir)?.next().is_none())
+}
+
+/// Delete the log directories of allocations this worker no longer runs once
+/// nothing has been written to them for `retention`.
+///
+/// This is what bounds `legion job logs` for removed allocations: the manager
+/// remembers where a removed allocation ran for a while, and the files answer
+/// for as long as they are here. `active` holds the worker-local keys of every
+/// allocation still registered; their directories are never touched, however
+/// old. Directories moved aside by [`claim_allocation_log_dir`] are pruned by
+/// the same rule. Returns how many directories were removed.
+pub fn prune_inactive_log_dirs(
+    logs_base: &Path,
+    active: &std::collections::HashSet<i64>,
+    retention: std::time::Duration,
+    now: std::time::SystemTime,
+) -> R<usize> {
+    let entries = match std::fs::read_dir(logs_base) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to list {}", logs_base.display()))
+        }
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let key = name.split('.').next().and_then(|id| id.parse::<i64>().ok());
+        let Some(key) = key else { continue };
+        // A live allocation's own directory (not one moved aside from it).
+        if !name.contains('.') && active.contains(&key) {
+            continue;
+        }
+        let path = entry.path();
+        let newest = newest_mtime(&path).unwrap_or(None);
+        let stale = match newest {
+            Some(modified) => now.duration_since(modified).unwrap_or_default() > retention,
+            // Nothing inside to date it: fall back to the directory itself.
+            None => entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|modified| now.duration_since(modified).unwrap_or_default() > retention)
+                .unwrap_or(false),
+        };
+        if stale {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => removed += 1,
+                Err(err) => warn!(
+                    log_dir = %path.display(),
+                    error = ?err,
+                    "Failed to remove an expired allocation log directory"
+                ),
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn newest_mtime(dir: &Path) -> R<Option<std::time::SystemTime>> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    for entry in std::fs::read_dir(dir)? {
+        let modified = entry?.metadata()?.modified()?;
+        newest = Some(newest.map_or(modified, |current| current.max(modified)));
+    }
+    Ok(newest)
+}
+
+/// How often [`maybe_prune_inactive_log_dirs`] actually scans: the retention
+/// is measured in days, so a scan every few minutes is plenty, and it keeps
+/// the 10-second log sweep from listing the whole logs directory each time.
+const INACTIVE_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// [`prune_inactive_log_dirs`] at most once per [`INACTIVE_PRUNE_INTERVAL`]
+/// per logs directory, with the retention from `cfg`. Called from the
+/// worker's periodic log sweep; failures are logged, never returned.
+pub fn maybe_prune_inactive_log_dirs(
+    logs_base: &Path,
+    active: &std::collections::HashSet<i64>,
+    cfg: &LogConfig,
+) {
+    static LAST_RUN: std::sync::Mutex<Option<HashMap<std::path::PathBuf, std::time::Instant>>> =
+        std::sync::Mutex::new(None);
+    {
+        let mut last = LAST_RUN.lock().unwrap_or_else(|p| p.into_inner());
+        let map = last.get_or_insert_with(HashMap::new);
+        if let Some(at) = map.get(logs_base) {
+            if at.elapsed() < INACTIVE_PRUNE_INTERVAL {
+                return;
+            }
+        }
+        map.insert(logs_base.to_path_buf(), std::time::Instant::now());
+    }
+    let retention = std::time::Duration::from_secs(cfg.retention_days.max(1) * 24 * 60 * 60);
+    match prune_inactive_log_dirs(logs_base, active, retention, std::time::SystemTime::now()) {
+        Ok(0) => {}
+        Ok(removed) => info!(
+            removed,
+            retention_days = cfg.retention_days.max(1),
+            "Removed expired log directories of allocations this worker no longer runs"
+        ),
+        Err(err) => warn!(error = ?err, "Failed to prune expired allocation log directories"),
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +666,148 @@ mod tests {
             "small"
         );
         assert!(!dir.path().join("stdout.log.1").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_of_an_allocation_without_a_log_dir_is_a_noop() -> R<()> {
+        // An allocation that failed before its runtime opened its log files
+        // stays registered with no directory; the 10s sweep must not report
+        // `No such file or directory` for it forever.
+        let dir = TempDir::new()?;
+        let missing = dir.path().join("never-created");
+        maintain_logs(&missing, &LogConfig::default())?;
+        assert!(!missing.exists(), "maintenance must not create the dir");
+        Ok(())
+    }
+
+    fn owner(allocation_id: i64, job: &str) -> LogDirOwner {
+        LogDirOwner {
+            allocation_id,
+            job_id: job.to_string(),
+            job_config_id: format!("{job}-1"),
+            task_config_id: 7,
+            task_name: "web".to_string(),
+        }
+    }
+
+    fn aside_dirs(base: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".replaced-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_reused_allocation_id_never_appends_to_the_old_output() -> R<()> {
+        let base = TempDir::new()?;
+        let log_dir = base.path().join("3");
+
+        // The first allocation 3 (say, a DAG step) runs and writes output.
+        let first = claim_allocation_log_dir(log_dir.clone(), &owner(3, "dag"));
+        write(&first, STDOUT_LOG_FILE, "fetch: downloading\n");
+
+        // A rebuilt cluster hands id 3 to a different job.
+        let second = claim_allocation_log_dir(log_dir.clone(), &owner(3, "sandbox"));
+        assert_eq!(second, log_dir);
+        assert!(
+            !second.join(STDOUT_LOG_FILE).exists(),
+            "the new allocation starts with no output"
+        );
+        let recorded: LogDirOwner =
+            serde_json::from_slice(&std::fs::read(second.join(LOG_OWNER_FILE))?)?;
+        assert_eq!(recorded, owner(3, "sandbox"));
+
+        // The old output was moved aside, not deleted.
+        let aside = aside_dirs(base.path());
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(aside[0].starts_with("3.replaced-"));
+        assert_eq!(
+            std::fs::read_to_string(base.path().join(&aside[0]).join(STDOUT_LOG_FILE))?,
+            "fetch: downloading\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_same_allocation_starting_again_keeps_its_output() -> R<()> {
+        let base = TempDir::new()?;
+        let log_dir = base.path().join("9");
+        claim_allocation_log_dir(log_dir.clone(), &owner(9, "web"));
+        write(&log_dir, STDOUT_LOG_FILE, "first run\n");
+
+        claim_allocation_log_dir(log_dir.clone(), &owner(9, "web"));
+        assert_eq!(
+            std::fs::read_to_string(log_dir.join(STDOUT_LOG_FILE))?,
+            "first run\n"
+        );
+        assert!(aside_dirs(base.path()).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn output_with_no_owner_record_is_moved_aside_but_an_empty_dir_is_kept() -> R<()> {
+        let base = TempDir::new()?;
+        // Output written before owner records existed (or by anything else).
+        let legacy = base.path().join("4");
+        std::fs::create_dir_all(&legacy)?;
+        write(&legacy, STDERR_LOG_FILE, "old\n");
+        claim_allocation_log_dir(legacy.clone(), &owner(4, "web"));
+        assert!(!legacy.join(STDERR_LOG_FILE).exists());
+        assert_eq!(aside_dirs(base.path()).len(), 1);
+
+        // An empty directory has nothing to mix in.
+        let empty = base.path().join("5");
+        std::fs::create_dir_all(&empty)?;
+        claim_allocation_log_dir(empty.clone(), &owner(5, "web"));
+        assert!(empty.join(LOG_OWNER_FILE).exists());
+        assert_eq!(aside_dirs(base.path()).len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn inactive_log_dirs_are_kept_for_the_retention_then_pruned() -> R<()> {
+        let base = TempDir::new()?;
+        for id in ["1", "2", "3.replaced-100"] {
+            std::fs::create_dir_all(base.path().join(id))?;
+            write(&base.path().join(id), STDOUT_LOG_FILE, "x");
+        }
+        // Not an allocation directory: never touched.
+        std::fs::create_dir_all(base.path().join("notes"))?;
+        let active: std::collections::HashSet<i64> = [1].into_iter().collect();
+        let retention = std::time::Duration::from_secs(3600);
+
+        // Within the retention a removed allocation's logs stay readable.
+        let now = std::time::SystemTime::now();
+        assert_eq!(
+            prune_inactive_log_dirs(base.path(), &active, retention, now)?,
+            0
+        );
+        assert!(base.path().join("2").exists());
+
+        // Past it, only the live allocation's directory survives.
+        let later = now + std::time::Duration::from_secs(7200);
+        assert_eq!(
+            prune_inactive_log_dirs(base.path(), &active, retention, later)?,
+            2
+        );
+        assert!(
+            base.path().join("1").exists(),
+            "live allocations are never pruned"
+        );
+        assert!(!base.path().join("2").exists());
+        assert!(!base.path().join("3.replaced-100").exists());
+        assert!(base.path().join("notes").exists());
+
+        // A missing logs directory is not an error.
+        assert_eq!(
+            prune_inactive_log_dirs(&base.path().join("absent"), &active, retention, later)?,
+            0
+        );
         Ok(())
     }
 }

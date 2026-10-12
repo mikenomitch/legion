@@ -175,8 +175,8 @@ non-alphanumerics folded to `_`). The instance volume from `stateful.storage` is
 also exported as **`LEGION_STORAGE_DIR`**, which is what the guides use:
 
 ```nickel
-# exec — read the env var
-config = { command = ["redis-server", "--dir", "$LEGION_STORAGE_DIR"] }
+# exec — read the env var (through a shell: exec argv is not expanded)
+config = { command = ["sh", "-c", "exec redis-server --dir \"$LEGION_STORAGE_DIR\""] }
 
 # container — the path is real
 stateful = { mode = "slot", storage = { path = "/var/lib/postgresql/data" } }
@@ -473,7 +473,7 @@ and `local-dir` waits until the node returns or you abandon the data.
 ```bash
 legion volume delete <id> --force   # tombstone the stranded volume
 # the instance mints a fresh, empty volume and places on a healthy node
-legion action run postgres sql -p query="$(cat backup.sql)"   # or psql < backup.sql
+legion action run postgres sql --param query="$(cat backup.sql)"   # or psql < backup.sql
 ```
 
 `--force` confirms that the node is never coming back. It abandons the volume

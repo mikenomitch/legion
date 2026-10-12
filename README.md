@@ -40,7 +40,7 @@ cargo install legion-rs
 ```
 
 Start a manager with a worker running in the same process. The defaults work
-without a config file.
+without a config file, from any directory.
 
 ```bash
 legion start manager --run-worker
@@ -102,6 +102,15 @@ legion join-token create --ttl 24h
 # on the new machine, use the returned token
 legion join lgnjoin_...
 ```
+
+Managers dial workers back on port 4848 for `legion exec`, `legion job logs`,
+and dispatch, so allow TCP 4848 from the managers to the new machine (and
+4747 from it to the managers). That port is mutual TLS: only a manager's
+certificate can drive a worker through it. The worker advertises the address
+it uses to reach the manager. If managers must dial it somewhere else (NAT, a
+second interface), pass `--advertise-addr 10.0.1.7` or set
+`LEGION_WORKER_ADVERTISE_ADDR`. See
+[docs/architecture-managers-workers.md](docs/architecture-managers-workers.md#ports-and-who-dials-whom).
 
 ### Example job specs
 
@@ -369,6 +378,8 @@ add:
 The full index lives at **[docs/README.md](docs/README.md)**. Good places to
 start:
 
+- **Installing:** [Legion and its runtimes](docs/installation.md) (youki,
+  cloud-hypervisor, a guest kernel, Apple `container`)
 - **Concepts:** [Managers and Workers](docs/architecture-managers-workers.md) ·
   [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md) ·
   [Configuration Language](docs/configuration-language.md) ·
