@@ -122,6 +122,32 @@ export const fetchTaskStatusByName = async (jobId: string): Promise<Map<string, 
   return statusByName
 }
 
+// Every task_config id this task has had in the job, across config versions.
+// A failed allocation is deleted the moment its failure is reported, so its
+// events can only be tied back to a task through the `taskConfigId` they
+// carry. Empty on a denied state-store read or an older manager.
+export const fetchTaskConfigIds = async (jobId: string, taskName: string): Promise<Set<string>> => {
+  const job = jobId.replace(/'/g, "''")
+  const task = taskName.replace(/'/g, "''")
+  const sql = `SELECT id FROM task_config WHERE job_id = '${job}' AND name = '${task}'`
+  const ids = new Set<string>()
+  try {
+    const response = await managerClient.queryStateStore({ sql })
+    for (const row of response.rows) {
+      try {
+        const parsed = JSON.parse(row.json) as { id?: number }
+        if (parsed.id !== undefined) ids.add(String(parsed.id))
+      } catch {
+        // ignore malformed rows
+      }
+    }
+  } catch {
+    // Denied state-store read or an older manager: callers fall back to the
+    // task config ids of the allocations they can see.
+  }
+  return ids
+}
+
 // "unknown" is deliberate: no snapshot yet reads very differently from a
 // failing check, and the status vocabulary already tones it as a warning.
 export const allocationHealthLabel = (runtime: AllocationRuntime | undefined): string => {

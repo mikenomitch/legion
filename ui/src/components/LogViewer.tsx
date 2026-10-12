@@ -17,6 +17,9 @@ type LogViewerProps = {
   job: string
   // When set, restrict to these allocation ids (e.g. a single task's allocations).
   allocationIds?: bigint[]
+  // Allocation id the allocation filter starts on (a deep link to one
+  // instance). Read once at mount; the picker owns the filter after that.
+  initialAllocation?: string
 }
 
 type LogLine = {
@@ -35,7 +38,7 @@ type StreamFilter = 'all' | 'stdout' | 'stderr'
 export default function LogViewer(props: LogViewerProps) {
   const [lines, setLines] = createSignal<LogLine[]>([])
   const [streamFilter, setStreamFilter] = createSignal<StreamFilter>('all')
-  const [allocFilter, setAllocFilter] = createSignal<string>('all')
+  const [allocFilter, setAllocFilter] = createSignal<string>(props.initialAllocation ?? 'all')
   const [knownAllocs, setKnownAllocs] = createSignal<string[]>([])
   const [follow, setFollow] = createSignal(true)
   const [wrap, setWrap] = createSignal(true)
@@ -162,6 +165,18 @@ export default function LogViewer(props: LogViewerProps) {
     if (nearBottom !== follow()) setFollow(nearBottom)
   }
 
+  // The picker and per-line prefix show whenever more than one allocation is
+  // in view — a task can run several instances too. A filter seeded from
+  // `initialAllocation` keeps the picker (and its own option) on screen even
+  // before, or without, any output from it, so it can always be cleared.
+  const multipleAllocs = () => knownAllocs().length > 1
+  const showAllocPicker = () => multipleAllocs() || allocFilter() !== 'all'
+  const allocOptions = () => {
+    const known = knownAllocs()
+    const selected = allocFilter()
+    return selected === 'all' || known.includes(selected) ? known : [...known, selected]
+  }
+
   const allocLines = () => {
     const af = allocFilter()
     return af === 'all' ? lines() : lines().filter((l) => l.alloc === af)
@@ -236,7 +251,7 @@ export default function LogViewer(props: LogViewerProps) {
           {filterBtn('stderr', 'stderr')}
         </div>
 
-        <Show when={!props.allocationIds && knownAllocs().length > 1}>
+        <Show when={showAllocPicker()}>
           <select
             class={cx(selectClass, 'w-auto py-1 text-xs')}
             value={allocFilter()}
@@ -244,7 +259,7 @@ export default function LogViewer(props: LogViewerProps) {
             aria-label="Filter by allocation"
           >
             <option value="all">All allocations</option>
-            <For each={knownAllocs()}>{(id) => <option value={id}>alloc #{id}</option>}</For>
+            <For each={allocOptions()}>{(id) => <option value={id}>alloc #{id}</option>}</For>
           </select>
         </Show>
 
@@ -306,7 +321,7 @@ export default function LogViewer(props: LogViewerProps) {
           <For each={visibleLines()}>
             {(line) => (
               <div class={`flex gap-2 ${wrap() ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}>
-                <Show when={!props.allocationIds && knownAllocs().length > 1}>
+                <Show when={multipleAllocs()}>
                   <span class="shrink-0 select-none text-neutral-600">#{line.alloc}</span>
                 </Show>
                 <span

@@ -143,6 +143,7 @@ When one is required and what goes in it:
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
 | [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md) | shipped |
 | [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md) | shipped (2026-09-02; embedding the UI in the binary deliberately left open) |
+| [ui-task-and-template-redesign-plan.md](plans/ui-task-and-template-redesign-plan.md) | shipped 2026-10-12 (task page tabs, guided template launch, Actions tab; run history, server-side fan-out and a template plan RPC deferred) |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
 | [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
 | [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | superseded in part by suspend-resume-and-oversubscription (§0 convergence shipped; mechanics still the reference) |
@@ -192,6 +193,7 @@ by project impact. The full template and a worked example:
 - [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)
 - [read-model-coherence-plan_calls.md](calls/read-model-coherence-plan_calls.md)
 - [ui-holistic-polish-plan_calls.md](calls/ui-holistic-polish-plan_calls.md)
+- [ui-task-and-template-redesign-plan_calls.md](calls/ui-task-and-template-redesign-plan_calls.md)
 - [checkpoint-encryption-plan_calls.md](calls/checkpoint-encryption-plan_calls.md)
 - [kv-encryption-plan_calls.md](calls/kv-encryption-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)

@@ -164,6 +164,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#19](https://github.com/mikenomitch/legion/pull/19) | Task page tabs, guided template launch, Actions tab; template-launched jobs list their tasks again | UI only; [plan](plans/ui-task-and-template-redesign-plan.md) · [calls](calls/ui-task-and-template-redesign-plan_calls.md) |
 | [#14](https://github.com/mikenomitch/legion/pull/14) | Live KV file updates (`onChange = "update"`) and KV-backed ingress certificates (`certFrom = { kv }`) | [plan](plans/kv-cert-delivery-plan.md) · [calls](calls/kv-cert-delivery-plan_calls.md) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
@@ -3180,6 +3181,38 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 - [ ] A toast primitive, should a feature need feedback away from the control
       that caused it; every message so far is an inline `Note`
 
+From [ui-task-and-template-redesign-plan.md](plans/ui-task-and-template-redesign-plan.md)
+(shipped; see Done):
+
+- [ ] A server-side action fan-out (an allocation list or selector on the
+      action RPC, one audit record, bounded concurrency). The Actions tab runs
+      on several instances as one browser session per allocation today
+      ([calls entry 3](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] Per-check, per-instance health results. `allocation_health` keeps one
+      healthy flag and status string per allocation, so the task Overview
+      can only show declared checks plus each instance's overall verdict
+- [ ] A restart counter per allocation. The task Overview counts
+      `allocation.failed` events from the job's last 200 instead, a floor on
+      a busy job ([calls entry 6](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] Queryable action/exec run history ("last run 3h ago by dana", re-run).
+      `exec_audit` is a tracing target today, not state
+- [ ] `PlanJobTemplate` — the template analogue of `legion job plan` — so the
+      guided launch's Review can say how many allocations a change replaces,
+      not just how the spec text changes
+      ([calls entry 1](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] A structured outcome on `RunJobTemplateReply` (created / updated with
+      rollout / unchanged); the Launch step reads it from the message text
+      today ([calls entry 8](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] Template-only tokens are denied `GetJobInfo` for a job that does not
+      exist yet (the request carries no template attribute), so their Review
+      cannot tell "creates" from "updates" and cannot follow the rollout
+      ([calls entry 10](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] `Store::get_submissions_for_config` has no `ORDER BY`; the UI now finds
+      the spec by name, but any other "first JSON submission" consumer has the
+      same latent bug ([calls entry 5](calls/ui-task-and-template-redesign-plan_calls.md))
+- [ ] Template catalog and authoring views: usage counts, jobs behind the
+      latest version, version-to-version source diff
+
 ## Cross-cutting
 
 - [ ] **Ship a Nickel contract library for the jobspec.** `legion job schema`
@@ -4085,6 +4118,34 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       deferrals (created/updated on the job header, per-page last-column
       label) and the stale "gen has drifted" item — the client was already
       current, and CI now keeps it so.
+- [x] Task page tabs (Overview · Logs · Exec & actions · Spec, in the URL as
+      `?tab=` / `?alloc=`): health tiles, one Instances table replacing the
+      three lists of the same allocations, declared checks, recent events;
+      one exec panel behind a target picker instead of one per allocation
+      ([plan](plans/ui-task-and-template-redesign-plan.md),
+      [calls](calls/ui-task-and-template-redesign-plan_calls.md),
+      [docs](../docs/ui-architecture.md#task-page)). The deferrals are open
+      items above.
+- [x] Actions tab on the task page (replaces "Exec & actions"): the task's
+      actions as a list with **Open a shell** last; the chosen one as a typed
+      form (segmented / chips for enums, bounded ints, patterned and masked
+      strings, switches), the argv it renders to, run on one / all running /
+      unhealthy instances, and an exit code and output per instance, with the
+      equivalent `legion action run` line. `?tab=actions&action=<name>|shell`;
+      `?tab=exec` still works
+      ([plan §3](plans/ui-task-and-template-redesign-plan.md#3-actions-tab-phase-3),
+      [calls](calls/ui-task-and-template-redesign-plan_calls.md),
+      [docs](../docs/exec-and-actions.md)).
+- [x] Guided template launch: Variables → Review (creates vs updates, changed
+      values, rendered-spec diff against the running job) → Launch (rollout
+      progress, Copy as CLI); source and versions on their own tab
+      ([plan](plans/ui-task-and-template-redesign-plan.md),
+      [calls](calls/ui-task-and-template-redesign-plan_calls.md),
+      [docs](../docs/ui-architecture.md#job-templates)).
+- [x] Template-launched jobs listed no tasks on the job and task pages: the
+      UI took the first JSON submission as the spec, which for a template run
+      can be `template.variables.json`. It now prefers `job.rendered.json`
+      ([calls entry 5](calls/ui-task-and-template-redesign-plan_calls.md)).
 
 ## AWS rig: mitigations in place for the node-deregistration and plugin-build gaps
 
