@@ -407,7 +407,7 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
         distribution(times.iter().filter_map(f).collect())
     };
     let mut top_errors: Vec<(String, usize)> = errors.into_iter().collect();
-    top_errors.sort_by(|a, b| b.1.cmp(&a.1));
+    top_errors.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     top_errors.truncate(5);
     Ok(json!({
         "mode": "instances",

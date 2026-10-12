@@ -118,6 +118,7 @@ mod make_room;
 mod node_content_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
+mod work_stream;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
 pub(crate) use snapshot_rpcs::snapshot_restore_payload;
 pub use snapshot_rpcs::{
@@ -4017,6 +4018,17 @@ impl Manager for ManagerDaemonService {
 
     type StreamEventsStream = ReceiverStream<Result<SchedulerEvent, Status>>;
 
+    type StreamWorkStream = ReceiverStream<Result<crate::structs::StreamWorkReply, Status>>;
+
+    /// Sequenced delivery of work to one worker (see `work_stream`).
+    #[instrument(skip_all)]
+    async fn stream_work(
+        &self,
+        request: Request<tonic::Streaming<crate::structs::StreamWorkRequest>>,
+    ) -> Result<Response<Self::StreamWorkStream>, Status> {
+        self.stream_work_rpc(request).await
+    }
+
     #[instrument(skip_all)]
     async fn stream_events(
         &self,
@@ -6344,20 +6356,39 @@ impl Manager for ManagerDaemonService {
             error!(node_id = %id, error = ?err, "Error handling pressure actions");
         }
 
-        let desired_allocations = build_desired_allocations(&self.store, &id, &req.allocation_ids)
-            .map_err(|e| map_store_error("Error building desired allocations", e))?;
+        // A worker that receives its work over `StreamWork` gets no desired
+        // set here: it holds it already, and the heartbeat carries only a
+        // digest of it (sandbox-scaling plan §6.13). Its connect and policy
+        // feeds are computed from the payloads the stream sent, and only
+        // when some allocation needs one, so a steady beat reads nothing.
+        let stream = req
+            .work_stream
+            .as_ref()
+            .map(|reported| self.store.work_log().check_heartbeat(&id, reported))
+            .unwrap_or_default();
+        let (desired_allocations, feed_allocations) = if stream.via_stream {
+            let held = self.store.work_log().held_payloads(&id, |allocation| {
+                !allocation.task_connect.is_empty()
+                    || !allocation.task_network.is_empty()
+                    || !allocation.network.is_empty()
+            });
+            (Vec::new(), held)
+        } else {
+            let desired = build_desired_allocations(&self.store, &id, &req.allocation_ids)
+                .map_err(|e| map_store_error("Error building desired allocations", e))?;
+            (desired.clone(), desired)
+        };
         // Endpoint feed for the node-local upstream forwarders. Costs nothing
         // (no store access at all) when no desired allocation uses connect, and
         // is infallible by construction: a connect-layer problem must never
         // stop this node from reconciling its allocations.
-        let mut upstream_endpoints = build_upstream_endpoints(&self.store, &desired_allocations);
+        let mut upstream_endpoints = build_upstream_endpoints(&self.store, &feed_allocations);
         // Effective network policy per desired allocation, as content hashes.
         // Same contract as the endpoint feed: no store access when no policy
         // exists and no task declares one; never fails the heartbeat.
-        let net_policies = self.build_net_policies(&id, &desired_allocations);
+        let net_policies = self.build_net_policies(&id, &feed_allocations);
         // `proxy` handler targets ride the same feed, flagged `for_handler`.
-        upstream_endpoints
-            .extend(self.build_handler_endpoints(&desired_allocations, &net_policies));
+        upstream_endpoints.extend(self.build_handler_endpoints(&feed_allocations, &net_policies));
         // Denials the node's datapath recorded, turned into events so "which
         // rule blocked it" is answerable without node access.
         for denial in &req.net_denials {
@@ -6401,7 +6432,7 @@ impl Manager for ManagerDaemonService {
         });
         // Service-graph samples: fold into per-(caller, service) windows.
         if !req.net_edges.is_empty() {
-            let callers: HashMap<i64, (String, String)> = desired_allocations
+            let callers: HashMap<i64, (String, String)> = feed_allocations
                 .iter()
                 .map(|a| (a.allocation_id, (a.job_id.clone(), a.task_name.clone())))
                 .collect();
@@ -6415,20 +6446,25 @@ impl Manager for ManagerDaemonService {
         let checkpoint_requests = snapshot_rpcs::build_checkpoint_requests(&self.store, &id);
         // Why this node's recently-removed allocations went away. Advisory:
         // a lookup failure costs the worker a cause, never a reconcile, so
-        // it is logged and dropped rather than failing the heartbeat.
-        let stop_notices = match self.store.stop_notices_for_node(&id) {
-            Ok(notices) => notices
-                .into_iter()
-                .map(|notice| StopNotice {
-                    allocation_id: notice.allocation_id,
-                    cause: notice.cause.as_str().to_string(),
-                    preemptor_job: notice.preemptor_job,
-                    preemptor_band: notice.preemptor_band,
-                })
-                .collect(),
-            Err(err) => {
-                debug!(node_id = %id, error = ?err, "Error loading stop notices");
-                Vec::new()
+        // it is logged and dropped rather than failing the heartbeat. A
+        // streaming worker got each one with its stop.
+        let stop_notices = if stream.via_stream {
+            Vec::new()
+        } else {
+            match self.store.stop_notices_for_node(&id) {
+                Ok(notices) => notices
+                    .into_iter()
+                    .map(|notice| StopNotice {
+                        allocation_id: notice.allocation_id,
+                        cause: notice.cause.as_str().to_string(),
+                        preemptor_job: notice.preemptor_job,
+                        preemptor_band: notice.preemptor_band,
+                    })
+                    .collect(),
+                Err(err) => {
+                    debug!(node_id = %id, error = ?err, "Error loading stop notices");
+                    Vec::new()
+                }
             }
         };
 
@@ -6469,6 +6505,8 @@ impl Manager for ManagerDaemonService {
             next_interval_seconds,
             checkpoint_requests,
             content_resync,
+            desired_via_stream: stream.via_stream,
+            work_resync: stream.resync,
         };
 
         Ok(Response::new(reply))

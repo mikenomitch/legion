@@ -69,7 +69,14 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         Vec::with_capacity(allocations.len());
     let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
 
+    let work_log = store.work_log();
     for allocation in allocations {
+        // A node streaming its work from this manager gets the placement on
+        // its stream within a round trip of the commit (sandbox-scaling plan
+        // §6.13); a push would only race it.
+        if work_log.streaming(&allocation.node_id) {
+            continue;
+        }
         if !task_cache.contains_key(&allocation.job_config_id) {
             // The read model's shared list: task configs are immutable per
             // `job_config_id`, and this used to be a SQL query (plus row

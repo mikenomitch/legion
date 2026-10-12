@@ -117,6 +117,16 @@ pub fn config() -> Command {
                 ),
         )
         .arg(
+            Arg::new("sim-no-work-stream")
+                .long("sim-no-work-stream")
+                .action(ArgAction::SetTrue)
+                .requires("simulate")
+                .help(
+                    "Take work from the heartbeat's desired set instead of `StreamWork`, \
+                     the delivery a worker without the work stream gets",
+                ),
+        )
+        .arg(
             Arg::new("sim-checkpoints")
                 .long("sim-checkpoints")
                 .action(ArgAction::SetTrue)
@@ -222,6 +232,7 @@ fn simulate_options(count: usize, arg_matches: &ArgMatches) -> R<SimulateOptions
             .unwrap_or(defaults.advertise_host),
         checkpoints: arg_matches.get_flag("sim-checkpoints"),
         observer: None,
+        work_stream: !arg_matches.get_flag("sim-no-work-stream"),
     })
 }
 

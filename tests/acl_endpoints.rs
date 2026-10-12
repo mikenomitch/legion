@@ -69,6 +69,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("WorkerPreRegister", Plane::Worker),
         ("WorkerRegister", Plane::Worker),
         ("Heartbeat", Plane::Worker),
+        ("StreamWork", Plane::Worker),
         ("HealthCheck", Plane::Worker),
         ("RunJob", Plane::Protected("job:write")),
         ("GetJobSpec", Plane::Protected("job:read")),
@@ -225,6 +226,17 @@ fn empty_exec_stream() -> tonic::Streaming<ExecClientFrame> {
     tonic::Streaming::new_empty(codec.decoder(), tonic::body::empty_body())
 }
 
+/// An empty client-streaming body for `StreamWork`, which authenticates
+/// the caller before it reads the `open` frame.
+fn empty_work_stream() -> tonic::Streaming<legion::structs::StreamWorkRequest> {
+    use tonic::codec::{Codec, ProstCodec};
+    let mut codec: ProstCodec<
+        legion::structs::StreamWorkRequest,
+        legion::structs::StreamWorkRequest,
+    > = ProstCodec::default();
+    tonic::Streaming::new_empty(codec.decoder(), tonic::body::empty_body())
+}
+
 fn req<T>(inner: T, token: Option<&str>) -> Request<T> {
     let mut request = Request::new(inner);
     if let Some(token) = token {
@@ -318,6 +330,10 @@ async fn call_endpoint(
                 },
                 token,
             ))
+            .await
+            .map(|_| ()),
+        "StreamWork" => svc
+            .stream_work(req(empty_work_stream(), token))
             .await
             .map(|_| ()),
         "HealthCheck" => svc

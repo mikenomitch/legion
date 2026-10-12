@@ -74,6 +74,9 @@ pub struct SimulateOptions {
     /// Called for every allocation a node learns about, the first time it
     /// does. A load generator embedding the fleet uses it to time delivery.
     pub observer: Option<SimObserver>,
+    /// Receive work over `Manager.StreamWork`, as real workers do, instead
+    /// of from the heartbeat's desired set (sandbox-scaling plan §6.13).
+    pub work_stream: bool,
 }
 
 impl Default for SimulateOptions {
@@ -87,6 +90,7 @@ impl Default for SimulateOptions {
             advertise_host: DEF_MANAGER_HOSTNAME.to_string(),
             checkpoints: false,
             observer: None,
+            work_stream: true,
         }
     }
 }
@@ -98,6 +102,8 @@ pub enum SimDelivery {
     Push,
     /// The desired set in a heartbeat reply.
     Heartbeat,
+    /// A `StreamWork` message.
+    Stream,
 }
 
 impl SimDelivery {
@@ -105,6 +111,7 @@ impl SimDelivery {
         match self {
             SimDelivery::Push => "push",
             SimDelivery::Heartbeat => "heartbeat",
+            SimDelivery::Stream => "stream",
         }
     }
 }
@@ -316,6 +323,12 @@ struct SimNode {
     allocations: Mutex<HashMap<i64, SimAlloc>>,
     /// Checkpoint reports owed to the manager (`checkpoints` mode).
     reports: Mutex<SimReports>,
+    /// The desired set as `StreamWork` delivered it (`work_stream` mode).
+    mirror: crate::worker::work_stream::SharedMirror,
+    /// Allocations whose health the manager has acknowledged, so a
+    /// streaming node reports each one once (a simulated allocation's health
+    /// never changes after it starts).
+    health_reported: Mutex<HashSet<i64>>,
     /// How many allocations this node reported on its last heartbeat. Only
     /// the *delta* against it feeds the fleet-wide gauge, so keeping the
     /// process-wide total current costs O(1) per heartbeat instead of a
@@ -551,6 +564,8 @@ struct SimFleet {
     checkpoints: bool,
     /// `SimulateOptions::observer`.
     observer: Option<SimObserver>,
+    /// `SimulateOptions::work_stream`.
+    work_stream: bool,
 }
 
 impl SimFleet {
@@ -862,6 +877,8 @@ pub async fn launch_simulated_fleet(
                     credentials: WorkerCredentials::with_join_secret(join_secret.clone()),
                     allocations: Mutex::new(HashMap::new()),
                     reports: Mutex::new(SimReports::default()),
+                    mirror: Default::default(),
+                    health_reported: Mutex::new(HashSet::new()),
                     reported_acked: AtomicUsize::new(0),
                 }),
             );
@@ -876,6 +893,7 @@ pub async fn launch_simulated_fleet(
         reported_allocations: AtomicI64::new(0),
         checkpoints: opts.checkpoints,
         observer: opts.observer.clone(),
+        work_stream: opts.work_stream,
     });
 
     // A sim host is exactly the host a scale campaign scrapes, so it exports
@@ -952,6 +970,29 @@ async fn run_sim_node(
                 backoff = std::cmp::min(backoff * 2, SIM_RETRY_MAX);
             }
         }
+    }
+
+    // Work over `StreamWork`, as a real worker receives it: each message
+    // reconciles the node's held set against the mirror at once.
+    if fleet.work_stream {
+        let attach_node = node.clone();
+        let applied_node = node.clone();
+        let applied_fleet = fleet.clone();
+        tokio::spawn(crate::worker::work_stream::run_work_stream(
+            client.clone(),
+            move |request| attach_node.credentials.attach(request),
+            node.name.clone(),
+            node.mirror.clone(),
+            move |_applied| {
+                let desired = applied_node
+                    .mirror
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .desired();
+                let adopted = applied_node.reconcile_allocations(&desired);
+                applied_fleet.observe(&applied_node, &adopted, SimDelivery::Stream);
+            },
+        ));
     }
 
     // Mutable for the same reason the real worker's is: a manager running
@@ -1083,11 +1124,27 @@ async fn heartbeat_sim_node(
 ) -> Result<Option<u32>, Status> {
     let acked = node.acked_ids(ready_after);
     fleet.record_reported_allocations(node, acked.len());
-    // Every running allocation's health, every beat, as a real worker
-    // reports it (`TaskManager::allocation_health_snapshot`): the manager's
-    // per-beat cost of a dense node is part of what a scale run measures.
-    let allocation_health = acked
+    let work_stream = if fleet.work_stream {
+        node.mirror
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .state()
+    } else {
+        None
+    };
+    // Every running allocation's health, as a real worker reports it
+    // (`TaskManager::allocation_health_snapshot`): every beat off the stream,
+    // and on it only what the manager has not acknowledged yet. The
+    // manager's per-beat cost of a dense node is part of what a scale run
+    // measures.
+    let reported_health = node
+        .health_reported
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let allocation_health: Vec<AllocationHealth> = acked
         .iter()
+        .filter(|id| work_stream.is_none() || !reported_health.contains(id))
         .map(|id| AllocationHealth {
             allocation_id: *id,
             healthy: true,
@@ -1095,6 +1152,15 @@ async fn heartbeat_sim_node(
             artifact_states: None,
         })
         .collect();
+    let health_ids: Vec<i64> = allocation_health
+        .iter()
+        .map(|health| health.allocation_id)
+        .collect();
+    let allocation_ids = if work_stream.is_some() {
+        Vec::new()
+    } else {
+        acked.clone()
+    };
     let snapshot_reports = if fleet.checkpoints {
         let mut reports =
             std::mem::take(&mut node.reports.lock().expect("sim reports lock").pending);
@@ -1115,7 +1181,8 @@ async fn heartbeat_sim_node(
         // path with nothing to model.
         provisional_claims: Vec::new(),
         id: node.name.clone(),
-        allocation_ids: acked,
+        allocation_ids,
+        work_stream,
         failed_allocations: Vec::new(),
         allocation_health,
         volume_reports: Vec::new(),
@@ -1139,8 +1206,23 @@ async fn heartbeat_sim_node(
             return Err(status);
         }
     };
-    let adopted = node.reconcile_allocations(&reply.desired_allocations);
-    fleet.observe(node, &adopted, SimDelivery::Heartbeat);
+    {
+        let mut reported = node
+            .health_reported
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if reply.desired_via_stream {
+            reported.extend(health_ids);
+            let running: HashSet<i64> = acked.iter().copied().collect();
+            reported.retain(|id| running.contains(id));
+        } else {
+            reported.clear();
+        }
+    }
+    if !reply.desired_via_stream {
+        let adopted = node.reconcile_allocations(&reply.desired_allocations);
+        fleet.observe(node, &adopted, SimDelivery::Heartbeat);
+    }
     if fleet.checkpoints {
         node.answer_checkpoint_requests(&reply.checkpoint_requests);
     }
@@ -1365,6 +1447,8 @@ mod tests {
             credentials: WorkerCredentials::default(),
             allocations: Mutex::new(HashMap::new()),
             reports: Mutex::new(SimReports::default()),
+            mirror: Default::default(),
+            health_reported: Mutex::new(HashSet::new()),
             reported_acked: AtomicUsize::new(0),
         })
     }
@@ -1382,6 +1466,7 @@ mod tests {
             reported_allocations: AtomicI64::new(0),
             checkpoints: false,
             observer: None,
+            work_stream: false,
         })
     }
 

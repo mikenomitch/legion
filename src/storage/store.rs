@@ -1241,6 +1241,10 @@ pub struct Store {
     task_status_seed_coalescer: Arc<crate::storage::coalesce::Coalescer<String, ()>>,
     job_submit_coalescer:
         Arc<crate::storage::coalesce::Coalescer<JobSubmitRequest, JobSubmitOutcome>>,
+    // Per-node work delivery log for `Manager.StreamWork` (sandbox-scaling
+    // plan, Phase 2): fed by the changeset projection on every replica,
+    // read by whichever manager a worker streams from.
+    work_log: Arc<crate::storage::work_log::WorkLog>,
     // Eval claims as leader memory (sandbox-scaling plan, Phase 1): which
     // evals this manager's eval workers hold. A claim writes nothing; see
     // `store/eval_claims.rs`.
@@ -1871,6 +1875,7 @@ impl Store {
                 "task_status_seed",
                 TASK_STATUS_SEED_BATCH_MAX,
             )),
+            work_log: Arc::new(crate::storage::work_log::WorkLog::new()),
             eval_claims: Arc::new(std::sync::Mutex::new(eval_claims::EvalClaims::default())),
             group_commit_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
                 "instance_group_commit",
@@ -10828,6 +10833,10 @@ impl Store {
         let mut epoch_node_scopes: BTreeSet<String> = BTreeSet::new();
         let mut epoch_job_scopes: BTreeSet<String> = BTreeSet::new();
         let mut task_reread_ids: HashSet<i64> = HashSet::new();
+        // Instance rows (and the instances and jobs of volume rows) this
+        // changeset touched, for the work delivery log.
+        let mut changed_instances: HashSet<String> = HashSet::new();
+        let mut changed_volume_jobs: HashSet<String> = HashSet::new();
         let mut event_ids: Vec<i64> = Vec::new();
         let mut evals_made_claimable = 0usize;
         // A replicated keyring change (a rotation, a rewrap of the root
@@ -10991,6 +11000,45 @@ impl Store {
                                 }
                                 None => alloc_delta.usable = false,
                             }
+                        }
+                    }
+                }
+                "instance" => {
+                    // An instance row change can change what its allocation's
+                    // payload carries (the restore source, the identity
+                    // epoch, the storage handle), so a streaming worker must
+                    // be sent the allocation again.
+                    let id_idx =
+                        self.changeset_column_index(&mut column_cache, "instance", "instance_id")?;
+                    let id = match action {
+                        Action::SQLITE_INSERT => item.new_value(id_idx).ok(),
+                        _ => item.old_value(id_idx).ok(),
+                    }
+                    .and_then(|value| value.as_str().ok().map(str::to_owned));
+                    if let Some(id) = id {
+                        changed_instances.insert(id);
+                    }
+                }
+                "volume" => {
+                    // A volume's mount state rides its allocations' payloads
+                    // (`volume_mounts`), so a streaming worker must be sent
+                    // them again. Instance volumes name their instance; a
+                    // job-level volume reaches the job's allocations.
+                    if self.work_log.has_nodes() {
+                        let value_of = |column: &str,
+                                        cache: &mut HashMap<String, Vec<String>>|
+                         -> R<Option<String>> {
+                            let idx = self.changeset_column_index(cache, "volume", column)?;
+                            Ok(match action {
+                                Action::SQLITE_INSERT => item.new_value(idx).ok(),
+                                _ => item.old_value(idx).ok(),
+                            }
+                            .and_then(|value| value.as_str().ok().map(str::to_owned)))
+                        };
+                        if let Some(instance) = value_of("instance_id", &mut column_cache)? {
+                            changed_instances.insert(instance);
+                        } else if let Some(job) = value_of("job_id", &mut column_cache)? {
+                            changed_volume_jobs.insert(job);
                         }
                     }
                 }
@@ -11175,6 +11223,15 @@ impl Store {
             self.cache_set_task_configs_for_job_config(&job_config_id, tasks)?;
         }
 
+        // Tell the work delivery log which allocations moved, on every
+        // replica and in every mode, after the read model reflects them.
+        self.note_work_changes(
+            &alloc_delta,
+            &refresh_nodes,
+            &changed_instances,
+            &changed_volume_jobs,
+        )?;
+
         if read_model_only {
             return Ok(());
         }
@@ -11221,6 +11278,72 @@ impl Store {
             self.eval_notify.notify_one();
         }
 
+        Ok(())
+    }
+
+    /// Feed a committed changeset's allocation changes to the work delivery
+    /// log (`Manager.StreamWork`, sandbox-scaling plan §6.13): every
+    /// allocation inserted, updated, moved, or removed, and the allocations
+    /// of every instance whose row (or volume) changed and of every job
+    /// whose job-level volume changed. A changeset whose allocation records
+    /// could not be classified marks its nodes for a full resync instead.
+    /// Costs nothing on a manager no worker streams from.
+    fn note_work_changes(
+        &self,
+        delta: &AllocationDelta,
+        refresh_nodes: &BTreeSet<String>,
+        changed_instances: &HashSet<String>,
+        changed_volume_jobs: &HashSet<String>,
+    ) -> R<()> {
+        if !self.work_log.has_nodes() {
+            return Ok(());
+        }
+        if !delta.usable {
+            self.work_log
+                .resync_nodes(refresh_nodes.iter().map(String::as_str));
+        }
+        let mut changes: Vec<(String, i64)> = delta
+            .removals
+            .iter()
+            .map(|(id, node)| (node.clone(), *id))
+            .collect();
+        let ids: Vec<i64> = delta.upserts.iter().copied().collect();
+        if !ids.is_empty() || !changed_instances.is_empty() || !changed_volume_jobs.is_empty() {
+            let conn = self.read_connection()?;
+            for id in ids {
+                let node: Option<String> = conn
+                    .prepare_cached("SELECT node_id FROM allocation WHERE id = ?1;")?
+                    .query_row([id], |row| row.get(0))
+                    .optional()?;
+                if let Some(node) = node {
+                    changes.push((node, id));
+                }
+            }
+            for instance_id in changed_instances {
+                let mut stmt = conn
+                    .prepare_cached("SELECT id, node_id FROM allocation WHERE instance_id = ?1;")?;
+                let rows = stmt.query_map([instance_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, node) = row?;
+                    changes.push((node, id));
+                }
+            }
+            for job_id in changed_volume_jobs {
+                let mut stmt =
+                    conn.prepare_cached("SELECT id, node_id FROM allocation WHERE job_id = ?1;")?;
+                let rows = stmt.query_map([job_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, node) = row?;
+                    changes.push((node, id));
+                }
+            }
+        }
+        self.work_log
+            .note_changes(changes.iter().map(|(node, id)| (node.as_str(), *id)));
         Ok(())
     }
 
@@ -16276,6 +16399,11 @@ impl Store {
             }
             EvalCompletion::Settled => Ok(()),
         }
+    }
+
+    /// This manager's per-node work delivery log (`Manager.StreamWork`).
+    pub fn work_log(&self) -> Arc<crate::storage::work_log::WorkLog> {
+        Arc::clone(&self.work_log)
     }
 
     // Expose a clone so runtime worker tasks can await wake notifications.

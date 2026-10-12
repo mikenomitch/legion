@@ -2,9 +2,9 @@ use crate::prelude::*;
 
 use crate::structs::token::JoinToken;
 use crate::structs::{
-    manager_client::ManagerClient, worker_server::WorkerServer, AllocNetwork, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints, WorkerConfig,
-    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterRequest,
+    manager_client::ManagerClient, worker_server::WorkerServer, AllocNetwork, AllocationHealth,
+    HealthCheckRequest, HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterRequest,
 };
 use crate::util::random_string;
 use crate::worker::{
@@ -100,6 +100,10 @@ fn worker_capabilities(publishing: bool) -> Vec<String> {
     let mut capabilities = vec![
         crate::structs::snapshot::CHECKPOINT_CAPABILITY.to_string(),
         crate::structs::snapshot::CHECKPOINT_FETCH_CAPABILITY.to_string(),
+        // Receives its work over `Manager.StreamWork` (sandbox-scaling plan
+        // §6.13). Informational: the manager recognizes a streaming worker
+        // by the stream position its heartbeat reports.
+        WORK_STREAM_CAPABILITY.to_string(),
     ];
     if publishing {
         capabilities.push(crate::structs::snapshot::CONTENT_PUBLISH_CAPABILITY.to_string());
@@ -448,6 +452,26 @@ async fn run_worker_with_manager(
     // Restored tasks are still running: give them their network back now,
     // not on the first successful heartbeat.
     restore_datapath(&forwarder, &task_manager).await;
+    // Work arrives over `Manager.StreamWork`: one long-lived stream, its
+    // deltas patching the mirror the heartbeat reconciles from. A new
+    // allocation starts as soon as its delta lands, through the same path a
+    // `PostWork` push takes; a stop, a payload change, or a resync wakes the
+    // heartbeat loop so its reconcile runs now instead of at the next beat.
+    {
+        let credentials = credentials.clone();
+        let launcher = Arc::new(WorkerDaemonService {
+            task_manager: task_manager.clone(),
+            identity: Some(identity_manager.clone()),
+            edge_boot: edge_boot.clone(),
+        });
+        tokio::spawn(crate::worker::work_stream::run_work_stream(
+            client.clone(),
+            move |request| credentials.attach(request),
+            name.clone(),
+            WORK_MIRROR.clone(),
+            move |applied| launch_streamed_work(&launcher, applied),
+        ));
+    }
     let heartbeat_fut = start_heartbeats(
         name.clone(),
         client.clone(),
@@ -1015,10 +1039,10 @@ async fn start_heartbeats(
                             "Manager served a new heartbeat interval; re-phasing once"
                         );
                         heartbeat_interval = next;
-                        tokio::time::sleep(rephase_sleep(next)).await;
+                        sleep_or_work(rephase_sleep(next)).await;
                     }
                     None => {
-                        tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
+                        sleep_or_work(jittered_heartbeat_interval(heartbeat_interval)).await;
                     }
                 }
             }
@@ -1256,7 +1280,28 @@ async fn heartbeat_tick(
                 }
             }
         };
+        // On the stream, the heartbeat stops listing what the node runs: it
+        // reports its stream position and a digest of its desired set, and
+        // only the allocation health that changed since the manager last
+        // acknowledged it (sandbox-scaling plan §6.13). Off the stream it
+        // sends the full lists, as every worker did before.
+        let work_stream = WORK_MIRROR
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .state();
+        let (allocations, allocation_health, health_sent) = if work_stream.is_some() {
+            let reported = HEALTH_REPORTED.lock().unwrap_or_else(|p| p.into_inner());
+            let changed: Vec<AllocationHealth> = allocation_health
+                .iter()
+                .filter(|health| reported.get(&health.allocation_id) != Some(*health))
+                .cloned()
+                .collect();
+            (Vec::new(), changed, allocation_health)
+        } else {
+            (allocations, allocation_health.clone(), allocation_health)
+        };
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
+            work_stream: work_stream.clone(),
             content_locations: content_report
                 .as_ref()
                 .map(|pending| pending.report.clone()),
@@ -1321,8 +1366,30 @@ async fn heartbeat_tick(
             }
         };
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
-        let reply = response.into_inner();
+        let mut reply = response.into_inner();
         served_interval = reply.next_interval_seconds;
+        // The manager acknowledged this health. Off the stream (or when the
+        // manager did not recognize the stream) the next beat starts from a
+        // full report again.
+        {
+            let mut reported = HEALTH_REPORTED.lock().unwrap_or_else(|p| p.into_inner());
+            reported.clear();
+            if reply.desired_via_stream {
+                reported.extend(
+                    health_sent
+                        .into_iter()
+                        .map(|health| (health.allocation_id, health)),
+                );
+            }
+        }
+        // A streaming worker's desired set is its mirror: the reply left it
+        // out and says so. Everything below reconciles against it exactly as
+        // it would against a desired set on the reply.
+        if reply.desired_via_stream {
+            let mut mirror = WORK_MIRROR.lock().unwrap_or_else(|p| p.into_inner());
+            reply.desired_allocations = mirror.desired();
+            reply.stop_notices = mirror.take_stops();
+        }
         if let Some(pending) = content_report {
             CONTENT_ADVERTISER
                 .lock()
@@ -2380,6 +2447,73 @@ static USAGE_SAMPLER: std::sync::LazyLock<Mutex<crate::worker::usage::UsageSampl
 static CONTENT_ADVERTISER: std::sync::LazyLock<
     Mutex<crate::worker::content_report::ContentAdvertiser>,
 > = std::sync::LazyLock::new(|| Mutex::new(Default::default()));
+
+/// Capability a worker that streams its work advertises at registration.
+pub const WORK_STREAM_CAPABILITY: &str = "work-stream";
+
+/// The desired set as `StreamWork` delivered it (`worker/work_stream.rs`).
+/// Process-wide: one worker per process, and a restarted process starts
+/// over with a full resync, which is the protocol.
+static WORK_MIRROR: std::sync::LazyLock<crate::worker::work_stream::SharedMirror> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Allocation health as the manager last acknowledged it, so a streaming
+/// worker's heartbeat sends only what changed (sandbox-scaling plan §6.13).
+static HEALTH_REPORTED: std::sync::LazyLock<Mutex<HashMap<i64, AllocationHealth>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Wakes the heartbeat loop before its interval: a `StreamWork` message
+/// arrived, and its new allocations should start (and its stops land) now
+/// rather than at the next beat.
+static HEARTBEAT_WAKE: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Act on one applied work-stream message: start the allocations it added,
+/// and wake the heartbeat's reconcile when it stopped or changed anything.
+/// A resync's additions go through the reconcile too, which knows what a
+/// restarted worker restored and what it must not start twice.
+fn launch_streamed_work(
+    launcher: &Arc<WorkerDaemonService>,
+    applied: crate::worker::work_stream::Applied,
+) {
+    if applied.reconcile {
+        HEARTBEAT_WAKE.notify_one();
+    }
+    if applied.resync {
+        return;
+    }
+    for allocation in applied.added {
+        let wanted = launcher
+            .task_manager
+            .lock()
+            .map(|manager| manager.wants_streamed_launch(&allocation))
+            .unwrap_or(false);
+        if !wanted {
+            continue;
+        }
+        let launcher = launcher.clone();
+        tokio::spawn(async move {
+            use crate::structs::worker_server::Worker;
+            let allocation_id = allocation.allocation_id;
+            let request = tonic::Request::new(crate::structs::PostWorkRequest {
+                allocation: Some(allocation),
+            });
+            if let Err(status) = launcher.post_work(request).await {
+                // Recorded as the allocation's failure by the launch path;
+                // the heartbeat reports it.
+                debug!(allocation_id, error = %status.message(), "Streamed allocation did not start");
+            }
+        });
+    }
+}
+
+/// Sleep for `duration`, or until a work-stream message wakes the loop.
+async fn sleep_or_work(duration: Duration) {
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => {}
+        _ = HEARTBEAT_WAKE.notified() => {}
+    }
+}
 
 /// The desired allocations from the last successful heartbeat, so the next
 /// request can report the datapath's status for them.
@@ -3595,6 +3729,8 @@ mod tests {
         let forwarder = UpstreamForwarder::new();
         let reply = HeartbeatReply {
             content_resync: false,
+            desired_via_stream: false,
+            work_resync: false,
             net_policies: Vec::new(),
             claim_verdicts: Vec::new(),
             next_interval_seconds: None,
