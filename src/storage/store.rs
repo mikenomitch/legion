@@ -21836,7 +21836,14 @@ mod tests {
         let claimed = store.claim_eval()?.expect("eval should be claimed");
         assert_eq!(claimed.id, "1");
         assert_eq!(claimed.status, "in_flight");
+        // The claim is leader memory: nothing was written, and the
+        // duplicate is held with it rather than claimable on its own.
+        assert!(
+            store.claim_eval()?.is_none(),
+            "the duplicate rides the claim"
+        );
 
+        store.complete_eval(&claimed.id, true)?;
         let conn = store.read_connection()?;
         let pending: i64 = conn.query_row(
             "SELECT COUNT(*) FROM eval WHERE status = 'pending';",
@@ -21845,7 +21852,7 @@ mod tests {
         )?;
         assert_eq!(
             pending, 0,
-            "duplicates for the same job/node should be removed"
+            "the settle removes duplicates for the same job/node"
         );
 
         Ok(())
@@ -21909,6 +21916,7 @@ mod tests {
         store.complete_eval(&claimed.id, true)?;
         let claimed = store.claim_eval()?.context("eval should be claimed")?;
         assert_eq!(claimed.kind, "job_reschedule");
+        store.complete_eval(&claimed.id, true)?;
 
         let remaining: Vec<String> = store
             .get_evals()?
