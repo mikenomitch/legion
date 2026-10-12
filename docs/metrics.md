@@ -423,6 +423,61 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   so alert on a rising `failed` rate, and watch `retrying` for a store going
   bad.
 
+- **`legion_instance_archived_total{mode}`** (counter): suspended instances
+  [archived](suspend-and-resume.md#archiving-idle-instances) once their
+  checkpoint published, by `mode`: `slim` (a slim instance row stays) or
+  `manifestOnly` (no row stays, the bucket holds the instance). Counted on
+  the manager that recorded the publish.
+
+### Sessions
+
+Counted on the manager that served the request, so with several managers sum
+across them. See [session-mode.md](session-mode.md).
+
+- **`legion_session_starts_total{outcome}`** (counter): session creates the
+  session router answered, by `outcome`: `started`, `deduplicated` (an
+  idempotent retry found the session running), `no_envelope` (no node holds
+  an envelope for the task yet), `no_room` (every envelope was full by the
+  router's view), or `refused` (the nodes tried all refused). None of them
+  writes the replicated store. A rising `no_room` or `refused` rate means
+  the envelopes are too small for the arrival rate.
+- **`legion_session_stops_total{reason}`** (counter): sessions this manager
+  ended on their nodes, by `reason`: `stop`, `destroy`, or `duplicate` (the
+  later copy of a session id running on two nodes).
+- **`legion_session_promotions_total`** (counter): running sessions promoted
+  to keyed instances, one scheduler-lane raft entry each.
+
+Two more are counted on the worker that holds the sessions, on its own
+listener ([Worker](#worker)):
+
+- **`legion_session_evictions_total{reason}`** (counter): suspended
+  sessions whose local checkpoint the node evicted, by `reason`:
+  `keep_for` (`suspend.keepFor` passed), `envelope_gone` (the job stopped
+  or the node was drained), `disk_pressure` (below `content.minFreeDisk`),
+  or `other`. A later `instance start` on one answers `NOT_FOUND`
+  "evicted". A rising `disk_pressure` count means the node's disk is too
+  small for its suspended sessions and their `keepFor`.
+- **`legion_session_checkpoints_skipped_total`** (counter): periodic
+  session checkpoints (`suspend.checkpointEvery`) skipped because the
+  node's capture backlog exceeded one interval. Any steady rate means the
+  node cannot capture its sessions that often: lengthen the interval or
+  run fewer sessions per node.
+- **`legion_session_superseded_total{via}`** (counter): copies of
+  `suspend.durability = "store"` sessions this node ended because a newer
+  generation of the session runs elsewhere, by how it learned: `write` (its
+  own conditional manifest write failed), `fence_list` (a fence marker a
+  move left), `resume` (a resume found the manifest moved on), or
+  `reconnect` (a self-fenced session the content store no longer names
+  this node for). Each is a split brain that converged
+  ([No split brain](session-mode.md#no-split-brain)); a steady rate means
+  sessions are being moved while their old node still runs them, usually
+  forced moves or a partition.
+- **`legion_session_moves_total`** (counter): `store` sessions this node
+  resumed from their manifest after they ran or slept on another node.
+- **`legion_session_self_fenced_total`** (counter): running `store`
+  sessions this node suspended because it reached neither a manager nor
+  its content store for `stateful.fenceAfter`.
+
 ### Heartbeat cadence
 
 Reported on the status-lane leader (the manager that owns node liveness), and
@@ -772,6 +827,17 @@ that has never taken a provisional start.
 - **`legion_provisional_active`** (gauge): unratified claims held right now.
   It makes started-but-unconfirmed capacity visible. A value that does not
   return to zero means claims are leaking.
+
+Session starts on the node ([session-mode.md](session-mode.md)) add two:
+
+- **`legion_worker_launch_refusals_total`** (counter): provisional starts
+  (sessions and claims) refused because no launch slot freed within
+  `edgeBoot.queueTimeout`. Each one answered `RESOURCE_EXHAUSTED` and the
+  caller tried another node. A steady rise means starts arrive faster than
+  `edgeBoot.launchConcurrency` launches finish.
+- **`legion_worker_edge_session_starts_total`** (counter): sessions this
+  node started from a session ticket (`Worker.StartSession`), not counting
+  deduplicated retries.
 
 #### Simulated fleets
 

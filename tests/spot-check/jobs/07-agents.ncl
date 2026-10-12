@@ -11,8 +11,10 @@
 # Two flavors, because they differ in what works today:
 #
 # - `vm`: a cloud-hypervisor microVM with its own kernel and a block volume.
-#   The real isolation boundary for untrusted agents. Exec is NOT supported
-#   on the microVM path yet (no guest agent), so on Linux you only get logs.
+#   The real isolation boundary for untrusted agents. Exec goes through the
+#   guest agent over vsock, which needs legion-guest installed beside the
+#   worker binary for this Alpine image (RUNBOOK 12.0); without it exec fails
+#   closed with a "guest agent" error.
 # - `box`: a container in a `gated` network namespace. Its only way out is the
 #   node's egress proxy, which allows package registries and GitHub and denies
 #   everything else. Exec works.

@@ -23,6 +23,13 @@ Phases 3-5 of the *findings* series
 [5](../aws-phase5-findings.md)) were Legion-only optimization sessions;
 none of their numbers is a cross-system result.
 
+2026-10-12: a planned, not-yet-run section, "Bottleneck measurements
+without a big fleet", was added to
+[`benchmarks/aws/README.md`](../../benchmarks/aws/README.md). It measures
+14 sandbox-path bottlenecks on a laptop, a simulated fleet, or one KVM
+worker, and names the harnesses that do not exist yet. It is Legion-only and
+separate from the cross-system campaign.
+
 Packing density is **measured at 4,000 nodes/instance** (99% cadence, 1%
 CPU, 3% memory on a `c7i.2xlarge`). The campaign still slices at 1,250
 nodes per instance because the storm drill kills one instance, and 1,250

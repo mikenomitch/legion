@@ -202,6 +202,7 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
             allocation_id,
             local_suspension: false,
             pause_ms: 0,
+            manifest_url: String::new(),
         };
         store.apply_snapshot_report(&node_id, &report("capture", false))?;
         if published {

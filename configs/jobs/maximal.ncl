@@ -760,6 +760,18 @@
                 # nfs. This task's local-dir volume keeps it at "local"
                 # (job validation refuses "store" here).
                 durability = "local",
+                # Once a "store" checkpoint is published, move its record
+                # out of the replicated store into the bucket, next to its
+                # parts (docs/suspend-and-resume.md, "Archiving idle
+                # instances"). "slim": the instance row stays, recording the
+                # archive manifest's URL, and the snapshot row is dropped.
+                # "manifestOnly": an unnamed instance without a
+                # stateful.storage volume keeps no row at all (any other
+                # instance keeps a slim row). Unset (default): nothing is
+                # archived. Needs durability = "store", a memory checkpoint,
+                # and no reserve, so this exec task leaves it out (job
+                # validation refuses it here):
+                # archive = "slim",
                 # argv a sandbox guest runs after every memory restore, once
                 # its identity is refreshed. Sandbox memory checkpoints only,
                 # so this exec task leaves it out (job validation refuses it
@@ -812,6 +824,114 @@
                 cpu = 250,
                 memory = 128,
             },
+            constraints = {
+                os = "linux",
+            },
+            affinities = {
+                node_class = "sandbox",
+            },
+        },
+        {
+            name = "scratch",
+            runtime = "exec",
+            group = "scratch",
+            # Session-mode task (see docs/session-mode.md): `legion instance
+            # create maximal-demo --group scratch` without --id starts an
+            # unnamed session straight on a node with envelope room and
+            # writes nothing to the replicated store. It is lost with its
+            # node, listed from the nodes' reports, and becomes a keyed
+            # instance with `legion instance promote <id>`. The task sees
+            # LEGION_INSTANCE_MODE = "session". A session task may not
+            # declare storage, volumes, ports, a service, connect upstreams,
+            # identities, requireId, or initialInstances.
+            stateful = {
+                mode = "session",
+                # The room each eligible node keeps for this task's sessions.
+                # Legion places one generated `scratch-envelope` allocation
+                # per node (on workers with the `sessions` capability) with
+                # these resources, and admits sessions against it.
+                envelope = {
+                    # Must set cpu and memory, and every amount `resources`
+                    # below declares; a session must fit.
+                    resources = { cpu = 4000, memory = 4096 },
+                    # Extra placement constraints for the envelopes, on top
+                    # of the task's own `constraints`. Optional.
+                    constraints = { node_class = "sandbox" },
+                },
+                # Whether a caller-chosen id is accepted (`instance create
+                # --id`, a keyed instance from birth; `instance promote
+                # --id`, a rename). Default true. With false, every create
+                # starts an unnamed session and a promotion keeps its id.
+                promote = {
+                    onName = true,
+                },
+                # How long a node may reach neither a manager nor its
+                # contentStore before it suspends this task's running
+                # sessions on its own disk, so a copy cut off from the
+                # cluster stops before a moved copy can start
+                # (docs/session-mode.md, "No split brain"). On reconnect it
+                # resumes only the sessions whose manifest still names it.
+                # Default "2m", at least "10s". Session tasks with
+                # suspend.durability = "store" only.
+                fenceAfter = "2m",
+            },
+            config = {
+                command = ["sleep", "600"],
+            },
+            # Idle sessions (docs/session-mode.md, "Idle sessions"): a
+            # session task may suspend. The node captures the checkpoint,
+            # frees the session's share of the envelope, and resumes it on
+            # `legion instance start <id>` (on another node, with
+            # durability = "store", when its own lost it or is full), with
+            # no raft entry at any step. Every keyed `suspend` field applies except
+            # `reserve` (the envelope is the reservation). This exec task
+            # suspends to disk, which keeps nothing but the session's id and
+            # spec: a resume boots it fresh under the same id. A `sandbox`
+            # session keeps its memory.
+            suspend = {
+                # "store": every checkpoint is also published, sealed, to the
+                # node's contentStore with a session manifest
+                # (<contentStore.url>/sessions/<job>/<prefix>/<id>.json), so
+                # the session resumes on any node with an envelope, claiming
+                # a new generation each time (docs/session-mode.md, "Moving a
+                # session"). Needs a contentStore on the workers. "local"
+                # keeps the checkpoint on the session's node only, lost with
+                # it.
+                durability = "store",
+                # Suspend a session automatically once quiet (needs
+                # resourceEnforcement on the worker). Decided on the node.
+                idle = { after = "5m" },
+                # How long the node keeps a suspended session's checkpoint
+                # before it evicts it, and then how long it remembers the
+                # eviction so the session answers `evicted` rather than
+                # `not found`. Default "24h", at least "1m". Session tasks
+                # only. Disk pressure (content.minFreeDisk) can evict
+                # earlier, oldest first.
+                keepFor = "24h",
+                # What a gracefully stopping worker (SIGTERM, an upgrade)
+                # does with running sessions: "keep" (default) leaves them
+                # running for the restarted worker to re-adopt;
+                # "checkpoint" checkpoints each one first, within the
+                # worker's edgeBoot.stopCheckpointTimeout, so a session
+                # whose process did not survive is restored on this node.
+                # Session tasks only.
+                onWorkerStop = "checkpoint",
+                # Checkpoint each running session this often without
+                # stopping it, replacing the previous checkpoint. Off by
+                # default; a full memory image per session per interval, at
+                # least "1m". Needs a memory checkpoint (runtime = "sandbox"),
+                # so this exec task leaves it out (job validation refuses it
+                # here). Session tasks only.
+                # checkpointEvery = "10m",
+            },
+            # One session's size, in the envelope's units.
+            resources = {
+                cpu = 250,
+                memory = 256,
+            },
+            # The task's constraints and affinities place its envelopes
+            # (the generated `scratch-envelope` task inherits both, plus
+            # envelope.constraints above).
             constraints = {
                 os = "linux",
             },

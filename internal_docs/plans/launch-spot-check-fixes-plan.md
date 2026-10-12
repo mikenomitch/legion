@@ -12,6 +12,10 @@ rig. The worker-plane half (P0-1) executes Phase 1 of
 [worker-plane-auth-plan.md](worker-plane-auth-plan.md), which stays the
 design of record for it.
 
+A sandbox and session section was added to the spot check on 2026-10-12
+(RUNBOOK §12, `smoke.sh sandboxes`, jobs `09`-`13`). It is planned and has
+not been run.
+
 ## 1. Problem statement
 
 The spot check ran every headline feature on real machines: three raft

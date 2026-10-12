@@ -113,6 +113,9 @@ fn submit_keyed(store: &Store) -> R<()> {
             initial_instances: None,
             on_lost: None,
             storage: None,
+            envelope: None,
+            promote: None,
+            fence_after: None,
         }),
         ..TaskConfig::new(TASK, "noop")
     };

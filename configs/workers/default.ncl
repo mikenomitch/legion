@@ -75,6 +75,17 @@
     #     # object from KV, the same shape artifact auth.kv takes:
     #     # auth = { kv = "legion/content-store" },
     # },
+    # Sessions (docs/session-mode.md, "No split brain"). Only acts on
+    # sessions whose task sets suspend.durability = "store", which need a
+    # contentStore: their manifests live at
+    # <contentStore.url>/sessions/<job>/<id-prefix>/<id>.json.
+    sessions = {
+        # How often this node lists <contentStore.url>/sessions/fence/<node>/
+        # for markers a move left (a session that moved away from this node
+        # while it could not be told) and stops those copies. One LIST per
+        # interval. At least 1s.
+        fenceListEvery = "30s",
+    },
     # Turn a task's declared `resources` into real kernel limits
     # (docs/resource-enforcement.md). On by default: memory pressure,
     # oversubscription, memoryMax, usage reports, and sandbox confinement
@@ -175,6 +186,16 @@
     #     jwksRefresh = "5m",
     #     # Tolerance for clock disagreement with the minting manager.
     #     clockSkew = "30s",
+    #     # Provisional starts (sessions and claims) run through the runtime
+    #     # at once. 0 means twice the node's cores.
+    #     launchConcurrency = 0,
+    #     # How long a start waits for a launch slot before the node refuses
+    #     # it with RESOURCE_EXHAUSTED (retryable), so the picker tries the
+    #     # next node.
+    #     queueTimeout = "1s",
+    #     # How long a gracefully stopping worker spends checkpointing
+    #     # sessions whose task sets suspend.onWorkerStop = "checkpoint".
+    #     stopCheckpointTimeout = "60s",
     # },
     # The host guard (docs/network-handlers.md, "The host guard"): the fixed
     # floor of destinations no allocation on this node may reach through the

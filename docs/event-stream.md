@@ -48,12 +48,14 @@ It is available from the CLI, the MCP server, the UI, and raw gRPC.
 | `snapshot.warmed` | info | A node fetched a published snapshot's parts after `legion snapshot warm`. Node-scoped. Metadata carries `fetchedBytes`. |
 | `snapshot.warm_failed` | warn | A node could not warm a snapshot. Node-scoped. Metadata carries the `error`. |
 | `instance.suspended` | info | A [suspend](suspend-and-resume.md) landed: the instance is `suspended` and its allocation is gone (or, with `suspend.reserve`, kept only as its reservation). Metadata carries the checkpoint's `snapshotId`, `kind`, `totalBytes`, `durationMs`, `reserved`, and `reason`: `manual` (SuspendInstance), `idle` (the task's [idle policy](suspend-and-resume.md#idle-policy)), `pressure` (the node's `suspend` pressure step), or `make_room` (suspended to make room for a resume on its node, see [Capacity for resumes](suspend-and-resume.md#capacity-for-resumes)). With a [held share](suspend-and-resume.md#holding-a-share-of-the-reservation), `reserved` is true. |
+| `instance.archived` | info | A suspended instance's published checkpoint was [archived](suspend-and-resume.md#archiving-idle-instances) to the bucket (`suspend.archive`), in the entry that recorded the publish. Metadata carries `instanceId`, `snapshotId`, `manifestUrl`, and `manifestOnly` (true when the instance row was dropped too). |
 | `instance.make_room` | info | A resume did not fit on its checkpoint's node, and the manager started suspends of idle suspendable instances there (manager `suspend.makeRoom`). Metadata carries the resume's `instanceId` and the instance ids it is `suspending`. |
 | `instance.suspend_failed` | warn | A suspend's capture failed on the node. The instance keeps running. Metadata carries the `error`. |
 | `instance.resumed` | info | A suspended instance restored from its checkpoint as a new allocation. Metadata carries `snapshotId` and `restoreMs`. |
 | `instance.restore_failed` | warn | A resume, a [fork](suspend-and-resume.md#fork), or a create from a snapshot could not restore. Metadata carries `error` and `outcome`: `cold` (booted fresh on its storage), `suspended` (a resume under `onRestoreFailure = "fail"`), or `stopped` (a fork or new instance under `"fail"`). |
 | `instance.forked` | info | A [fork](suspend-and-resume.md#fork)'s checkpoint landed and its forks are being placed on the origin's node (for a `--spread` fork, the checkpoint was published and each fork goes to its own node). Metadata carries `origin`, `instances`, `pauseMs`, and the checkpoint's `snapshotId`, `kind`, and `totalBytes`. |
 | `instance.fork_failed` | warn | A fork's capture failed, or a spread fork's publish failed for good. The origin keeps running and the forks in `instances` were terminated. Metadata carries the `error`. |
+| `instance.promoted` | info | A running [session](session-mode.md) was promoted to a keyed instance (PromoteInstance). Its node adopts the session in place as the new allocation. Metadata carries `instanceId` and `promotedFrom` (the session id); the event names the job, node, and allocation. Per-session starts and stops are not events (see [session mode](session-mode.md#limitations)). |
 | `node.registered` | info | A worker registered (or re-registered). |
 | `node.ready` | info | A known node rejoined and was marked ready. |
 | `node.lost` | warn | A node was marked lost (explicitly or through missed heartbeats). |
@@ -128,7 +130,7 @@ no ids and never matches.
 `--instance` matches an event that is *about* the stateful instance:
 
 - its metadata names it as `instanceId` (suspend, resume, restore, fork,
-  snapshot, volume, and provisional-start events) or `instance_id`
+  snapshot, volume, promotion, and provisional-start events) or `instance_id`
   (`node.pressure`);
 - it lists it in `instances` (the forks of `instance.forked` and
   `instance.fork_failed`) or `suspending` (`instance.make_room`);

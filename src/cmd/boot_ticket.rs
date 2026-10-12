@@ -82,6 +82,17 @@ pub fn config() -> Command {
                 .value_name("KEY")
                 .help("Retry-safe mint: a repeat with the same key returns the same ticket"),
         )
+        .arg(
+            Arg::new("scope")
+                .long("scope")
+                .value_name("SCOPE")
+                .value_parser(["boot", "session"])
+                .help(
+                    "boot (default): one edge start of a named instance. session: any number \
+                     of sessions of a session task on any node of the pool that holds its \
+                     envelope (Worker.StartSession), until the ticket expires",
+                ),
+        )
         .arg(json_flag());
 
     let list_cmd = Command::new("list")
@@ -128,12 +139,20 @@ async fn create(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<String>("pool")
         .cloned()
         .context("Must provide --pool")?;
+    let scope = arg_matches
+        .get_one::<String>("scope")
+        .cloned()
+        .unwrap_or_else(|| "boot".to_string());
+    let session = scope == "session";
     let gate = match arg_matches.get_one::<String>("gate") {
         Some(raw) => Gate::parse(raw)?,
+        // A session ticket has no gate: sessions always serve.
+        None if session => Gate::Off,
         None => Gate::Boot,
     };
     let uses = match arg_matches.get_one::<String>("uses") {
         Some(raw) => raw.parse::<u32>().context("--uses must be a number")?,
+        None if session => 0,
         None => 1,
     };
 
@@ -165,6 +184,7 @@ async fn create(arg_matches: &ArgMatches) -> R<()> {
                     .unwrap_or_default(),
                 uses,
                 idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
+                scope,
             }))
             .await,
     )?;

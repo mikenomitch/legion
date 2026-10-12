@@ -167,6 +167,7 @@ impl Cluster {
                 instance_id: ID.into(),
                 idempotency_key: None,
                 cold: false,
+                force_move: false,
             }))
             .await
             .map(|reply| reply.into_inner())
@@ -301,6 +302,9 @@ fn job(durability: &str) -> JobConfig {
             initial_instances: None,
             on_lost: None,
             storage: None,
+            envelope: None,
+            promote: None,
+            fence_after: None,
         }),
         suspend: Some(SuspendConfig {
             durability: Some(durability.into()),
@@ -936,6 +940,7 @@ async fn restores_with_different_compat_in_one_plan_bind_their_own_nodes() -> R<
                 instance_id: id.into(),
                 idempotency_key: None,
                 cold: false,
+                force_move: false,
             }))
             .await?;
     }

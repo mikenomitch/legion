@@ -31,4 +31,17 @@
             },
         },
     },
+    # Edge starts (Worker.StartSession / StartClaim on a boot ticket) and
+    # direct exec, for RUNBOOK 12.10 and smoke.sh sessions-edge. Port 4848
+    # only accepts the managers' security group, so nothing outside the rig
+    # can reach either (docs/edge-boot.md, docs/exec-and-actions.md).
+    edgeBoot = { acceptClaims = true },
+    exec = { direct = true },
+    # For suspend.durability = "store" (RUNBOOK 12.6), add a content store.
+    # Not on by default: the workers have no instance profile, so it needs a
+    # KV credential first (RUNBOOK 12.0 shows how to make one):
+    # contentStore = {
+    #     url = "s3://legion-spot-check-<account>/content/",  # region comes from the credential
+    #     auth = { kv = "secrets/content-store" },
+    # },
 }

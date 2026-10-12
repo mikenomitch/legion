@@ -161,6 +161,10 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ReplaceInstance", Plane::Protected("job:write")),
         ("ListInstances", Plane::Protected("job:read")),
         ("GetInstance", Plane::Protected("job:read")),
+        // The session's job is known only after the index lookup, so the
+        // coarse gate is `job:write` on any job.
+        ("PromoteInstance", Plane::Protected("job:write")),
+        ("ListSessionNodes", Plane::Protected("job:read")),
         // Snapshots are their own resource: a memory snapshot holds the
         // workload's in-memory secrets, which `job:write` must not imply.
         // RestoreInstance also needs `job:write` (it replaces an allocation);
@@ -954,6 +958,26 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "ListSessionNodes" => svc
+            .list_session_nodes(req(
+                legion::structs::ListSessionNodesRequest {
+                    job_id: JOB_NAME.into(),
+                    task_name: String::new(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "PromoteInstance" => svc
+            .promote_instance(req(
+                PromoteInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "ForkInstance" => svc
             .fork_instance(req(
                 ForkInstanceRequest {
@@ -1279,6 +1303,7 @@ async fn call_endpoint(
                     ttl: "5m".into(),
                     uses: 1,
                     idempotency_key: None,
+                    scope: String::new(),
                 },
                 token,
             ))
@@ -2705,8 +2730,10 @@ async fn upstream_credential_needs_kv_read_on_the_path() -> R<()> {
         let jobspec = serde_json::json!({
             "name": "agent",
             "task": {
-                "runtime": "exec",
-                "config": { "command": ["sleep", "30"] },
+                // A container, not `exec`: submitting a host-level task
+                // needs `host = true`, which is not what this test is about.
+                "runtime": "container",
+                "config": { "image": "alpine", "command": ["sleep", "30"] },
                 "connect": {
                     "upstreams": [{
                         "name": "openai",

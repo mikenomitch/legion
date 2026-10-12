@@ -265,13 +265,15 @@ impl ManagerDaemonService {
             }));
         }
 
-        let instance = self
+        let Some(instance) = self
             .store
             .get_instance(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?
-            .ok_or_else(|| {
-                Status::not_found(format!("instance {} not found", inner.instance_id))
-            })?;
+        else {
+            return Err(self
+                .missing_instance(&identity, &inner.instance_id, "forked")
+                .await);
+        };
         for resource in [AclResource::Job, AclResource::Snapshot] {
             acl::enforce(
                 &identity,

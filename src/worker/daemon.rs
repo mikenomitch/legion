@@ -191,7 +191,7 @@ struct RegistrationPayload {
 /// What this worker advertises at registration: it always takes
 /// checkpoints and fetches published snapshot parts it does not hold, and it
 /// publishes snapshot parts when a `contentStore` is configured (and usable).
-fn worker_capabilities(publishing: bool) -> Vec<String> {
+fn worker_capabilities(publishing: bool, edge_sessions: bool) -> Vec<String> {
     let mut capabilities = vec![
         crate::structs::snapshot::CHECKPOINT_CAPABILITY.to_string(),
         crate::structs::snapshot::CHECKPOINT_FETCH_CAPABILITY.to_string(),
@@ -199,9 +199,19 @@ fn worker_capabilities(publishing: bool) -> Vec<String> {
         // §6.13). Informational: the manager recognizes a streaming worker
         // by the stream position its heartbeat reports.
         WORK_STREAM_CAPABILITY.to_string(),
+        // Runs session envelopes and admits sessions into them
+        // (docs/session-mode.md). Envelope tasks require it, so a worker
+        // that predates sessions is never given one.
+        crate::structs::session::SESSIONS_CAPABILITY.to_string(),
     ];
     if publishing {
         capabilities.push(crate::structs::snapshot::CONTENT_PUBLISH_CAPABILITY.to_string());
+    }
+    // Serves `Worker.StartSession` on a session ticket
+    // (`edgeBoot.acceptClaims`). `ListSessionNodes` reports a node without
+    // it as not accepting edge starts.
+    if edge_sessions {
+        capabilities.push(crate::structs::session::EDGE_SESSIONS_CAPABILITY.to_string());
     }
     capabilities
 }
@@ -381,6 +391,17 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 None,
             )
         });
+    let sessions_config = parse_sessions_payload(&config.artifacts);
+    let session_manifests = build_session_manifests(
+        content_store_target.as_ref(),
+        Arc::new(ManagerCredentialSource::new(
+            managers.clone(),
+            name.clone(),
+            credentials.clone(),
+        )),
+        &name,
+        &advertised,
+    );
     let content_store = open_content_store(&content_dir, content_config);
     let content_publishing = build_content_publishing(
         content_store.clone(),
@@ -442,6 +463,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         // Before `configure_artifacts`, which hands the store to the stager.
         manager.configure_content_store(content_store.clone());
         manager.configure_content_publishing(content_publishing);
+        manager.configure_session_manifests(session_manifests);
         manager.configure_artifacts(
             artifact_fetch_config,
             Box::new(ManagerCredentialSource::new(
@@ -549,12 +571,19 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         _ => None,
     };
 
+    // One launch pool per node, shared by every path that starts a session
+    // or claim (PostWork, StartClaim, StartSession, the work stream).
+    let launch_pool = Arc::new(crate::worker::launch_pool::LaunchPool::from_config(
+        &edge_boot_config,
+    ));
     let worker_node = WorkerDaemonService {
         node_id: name.clone(),
         task_manager: task_manager.clone(),
         identity: Some(identity_manager.clone()),
         edge_boot: edge_boot.clone(),
         direct_exec: direct_exec.clone(),
+        launch_pool: launch_pool.clone(),
+        node_identity: Some(node_identity.clone()),
     };
     let worker_router = Server::builder().add_service(WorkerServer::new(worker_node));
 
@@ -656,6 +685,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 .expect("task manager")
                 .content_publishing()
                 .is_some(),
+            edge_boot_config.accept_claims,
         ),
     };
     let reported_managers = register_self(client.clone(), &registration, &credentials).await?;
@@ -753,6 +783,8 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             identity: Some(identity_manager.clone()),
             edge_boot: edge_boot.clone(),
             direct_exec: direct_exec.clone(),
+            launch_pool: launch_pool.clone(),
+            node_identity: Some(node_identity.clone()),
         });
         tokio::spawn(crate::worker::work_stream::run_work_stream(
             client.clone(),
@@ -777,7 +809,8 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         edge_boot.as_ref().map(|runtime| runtime.spec_cache.clone()),
         Some(managers.clone()),
     );
-    let self_fence_fut = start_self_fence_watchdog(task_manager.clone(), last_successful_heartbeat);
+    let self_fence_fut =
+        start_self_fence_watchdog(task_manager.clone(), last_successful_heartbeat.clone());
     let checks_fut = start_node_checks(
         name.clone(),
         config.additional_node_checks.clone(),
@@ -789,16 +822,253 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // Notices task processes exiting, reaps them, and applies each task's
     // `restart` policy (see docs/task-supervision.md).
     let supervisor_fut = start_task_supervisor(task_manager.clone());
-    let _res = join!(
-        heartbeat_fut,
-        self_fence_fut,
-        checks_fut,
-        log_maintenance_fut,
-        supervisor_fut,
-        worker_server_fut
+    // Idle sessions: expiry, eviction, periodic checkpoints, and the
+    // restores a restart left (docs/session-mode.md#idle-sessions).
+    let session_fut = start_session_maintenance(
+        task_manager.clone(),
+        launch_pool.clone(),
+        last_successful_heartbeat,
+        sessions_config
+            .fence_list_every()
+            .unwrap_or(crate::structs::DEFAULT_FENCE_LIST_EVERY),
     );
+    let stop_checkpoint_timeout =
+        humantime::parse_duration(&edge_boot_config.stop_checkpoint_timeout)
+            .unwrap_or(Duration::from_secs(60));
+    let shutdown_task_manager = task_manager.clone();
+    tokio::select! {
+        _ = async {
+            join!(
+                heartbeat_fut,
+                self_fence_fut,
+                checks_fut,
+                log_maintenance_fut,
+                supervisor_fut,
+                worker_server_fut,
+                session_fut
+            )
+        } => {}
+        signal = worker_shutdown_signal() => {
+            stop_worker_daemon(shutdown_task_manager, signal, stop_checkpoint_timeout).await;
+        }
+    }
 
     Ok(())
+}
+
+/// How often the session maintenance loop runs: the keepFor sweep, disk
+/// pressure eviction, and the periodic checkpoint round.
+const SESSION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Idle-session upkeep on this node. First resumes the sessions a restart
+/// found dead with an `onWorkerStop` checkpoint, then every
+/// [`SESSION_MAINTENANCE_INTERVAL`] sweeps expired and orphaned checkpoints
+/// (and evicts the oldest under `content.minFreeDisk` pressure), and runs a
+/// `suspend.checkpointEvery` round. For `store` sessions it also
+/// (docs/session-mode.md, "No split brain"): self-fences when neither a
+/// manager nor the content store answered for `stateful.fenceAfter`, and
+/// unfences once the store answers again; retries publishes that did not
+/// land; deletes the manifests of sessions that ended; and every
+/// `fence_list_every` lists this node's fence markers.
+async fn start_session_maintenance(
+    task_manager: Arc<Mutex<WorkerTaskManager>>,
+    launch_pool: Arc<crate::worker::launch_pool::LaunchPool>,
+    last_successful_heartbeat: Arc<Mutex<std::time::Instant>>,
+    fence_list_every: Duration,
+) -> R<()> {
+    use crate::worker::task_manager::session_sleep;
+    use crate::worker::task_manager::session_store;
+    let restores = task_manager
+        .lock()
+        .expect("task manager")
+        .take_pending_session_restores();
+    for session_id in restores {
+        let slot = match launch_pool.acquire().await {
+            Ok(slot) => slot,
+            Err(err) => {
+                warn!(session_id = %session_id, error = %err, "No launch slot to restore a session; it stays suspended");
+                continue;
+            }
+        };
+        let manager = task_manager.clone();
+        let id = session_id.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            session_sleep::resume_session(&manager, &id, false)
+        })
+        .await;
+        drop(slot);
+        match outcome {
+            Ok(Ok(_)) => info!(session_id = %session_id, "Restored session after worker restart"),
+            Ok(Err(err)) => {
+                warn!(session_id = %session_id, error = %err, "Session restore after restart failed; it stays suspended")
+            }
+            Err(err) => {
+                warn!(session_id = %session_id, error = %err, "Session restore task failed")
+            }
+        }
+    }
+    let mut per_capture = Duration::from_secs(5);
+    let mut last_fence_list = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(SESSION_MAINTENANCE_INTERVAL).await;
+        let manifests = task_manager
+            .lock()
+            .expect("task manager")
+            .session_manifests();
+        if let Some(manifests) = manifests {
+            let since_manager = last_successful_heartbeat.lock().map(|at| at.elapsed()).ok();
+            let since_store = manifests.last_success().map(|at| at.elapsed());
+            let manager = task_manager.clone();
+            let list_fences = last_fence_list.elapsed() >= fence_list_every;
+            if list_fences {
+                last_fence_list = std::time::Instant::now();
+            }
+            let pool = launch_pool.clone();
+            let handle = tokio::runtime::Handle::current();
+            let upkeep = tokio::task::spawn_blocking(move || {
+                session_store::self_fence(&manager, since_manager, since_store);
+                if list_fences {
+                    match session_store::process_fence_list(&manager) {
+                        Ok(0) => {}
+                        Ok(ended) => info!(ended, "Ended session copies a move fenced"),
+                        Err(err) => {
+                            debug!(error = %err, "Fence list failed; retried next interval")
+                        }
+                    }
+                }
+                let fenced = !manager
+                    .lock()
+                    .expect("task manager")
+                    .fenced_sessions()
+                    .is_empty();
+                if fenced {
+                    session_store::unfence(&manager, || handle.block_on(pool.acquire()).ok());
+                }
+                session_store::retry_unpublished(&manager);
+                session_store::run_manifest_deletes(&manager);
+            })
+            .await;
+            if let Err(err) = upkeep {
+                warn!(error = %err, "Store session upkeep failed");
+            }
+        }
+        let manager = task_manager.clone();
+        let mut estimate = per_capture;
+        let round = tokio::task::spawn_blocking(move || {
+            manager
+                .lock()
+                .expect("task manager")
+                .sweep_idle_sessions(std::time::Instant::now(), crate::util::now_unix_ms());
+            let counts = session_sleep::run_checkpoint_round(&manager, &mut estimate);
+            (counts, estimate)
+        })
+        .await;
+        match round {
+            Ok(((ran, skipped), estimate)) => {
+                per_capture = estimate;
+                if ran > 0 || skipped > 0 {
+                    debug!(ran, skipped, "Session checkpoint round");
+                }
+            }
+            Err(err) => warn!(error = %err, "Session maintenance round failed"),
+        }
+    }
+}
+
+/// Suspend the sessions the idle policy found quiet past `idle.after`, each
+/// on the blocking pool. A session already capturing answers busy and is
+/// tried again at the next usage report.
+fn suspend_idle_sessions(task_manager: &Arc<Mutex<WorkerTaskManager>>, local_keys: Vec<i64>) {
+    for local_key in local_keys {
+        let Some(session_id) = task_manager
+            .lock()
+            .expect("task manager")
+            .session_id_for_local_key(local_key)
+        else {
+            continue;
+        };
+        let manager = task_manager.clone();
+        tokio::task::spawn_blocking(move || {
+            match crate::worker::task_manager::session_sleep::suspend_session(
+                &manager,
+                &session_id,
+                "idle",
+            ) {
+                Ok(_) => info!(session_id = %session_id, "Suspended idle session"),
+                Err(err) => {
+                    debug!(session_id = %session_id, error = %err, "Idle session not suspended")
+                }
+            }
+        });
+    }
+}
+
+/// Resolves with the signal's name on SIGTERM or SIGINT (Ctrl-C).
+async fn worker_shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(error = ?err, "Failed installing the SIGINT handler");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = ctrl_c => "SIGINT",
+            },
+            Err(err) => {
+                warn!(error = ?err, "Failed installing the SIGTERM handler");
+                ctrl_c.await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+        "SIGINT"
+    }
+}
+
+/// The worker's orderly stop: checkpoint the sessions whose task sets
+/// `suspend.onWorkerStop = "checkpoint"` (least recently checkpointed
+/// first, within `edgeBoot.stopCheckpointTimeout`), flush the session log,
+/// and exit. Workloads keep running, as on any worker stop: a restarted
+/// worker re-adopts them, and restores from these checkpoints only the
+/// sessions whose process died meanwhile.
+async fn stop_worker_daemon(
+    task_manager: Arc<Mutex<WorkerTaskManager>>,
+    signal: &'static str,
+    timeout: Duration,
+) {
+    info!(signal, "Worker stopping");
+    let deadline = std::time::Instant::now() + timeout;
+    let manager = task_manager.clone();
+    let checkpointed = tokio::task::spawn_blocking(move || {
+        let counts = crate::worker::task_manager::session_sleep::checkpoint_sessions_on_stop(
+            &manager, deadline,
+        );
+        manager
+            .lock()
+            .expect("task manager")
+            .sync_session_log(Duration::from_secs(5));
+        counts
+    });
+    match tokio::time::timeout(timeout + Duration::from_secs(10), checkpointed).await {
+        Ok(Ok((done, 0))) if done > 0 => info!(done, "Checkpointed sessions before stopping"),
+        Ok(Ok((done, left))) if left > 0 => {
+            warn!(
+                done,
+                left, "Stop checkpoint timeout reached; some sessions were not checkpointed"
+            )
+        }
+        Ok(_) => {}
+        Err(_) => warn!("Stop checkpoints did not finish in time; exiting anyway"),
+    }
+    std::process::exit(0);
 }
 
 /// The worker type's `exec` block, from the security payload.
@@ -1183,6 +1453,39 @@ fn parse_artifacts_payload(
         content,
         payload.content_store,
     ))
+}
+
+/// The worker config's `sessions` block, from the artifacts payload it rides
+/// in (defaults when absent or unreadable).
+fn parse_sessions_payload(raw: &str) -> crate::structs::WorkerSessionsConfig {
+    if raw.trim().is_empty() {
+        return Default::default();
+    }
+    serde_json::from_str::<crate::structs::WorkerArtifactsPayload>(raw)
+        .ok()
+        .and_then(|payload| payload.sessions)
+        .unwrap_or_default()
+}
+
+/// The session manifests in the worker's `contentStore`, when one is
+/// configured: what `store` sessions claim generations in (docs/session-mode.md,
+/// "No split brain").
+fn build_session_manifests(
+    target: Option<&crate::content_publish::ContentStoreTarget>,
+    credentials: Arc<dyn crate::artifacts::CredentialSource>,
+    node_id: &str,
+    advertised: &str,
+) -> Option<Arc<crate::session_manifest::SessionManifests>> {
+    let target = target?;
+    match crate::session_manifest::backend_for(target, credentials) {
+        Ok(backend) => Some(Arc::new(crate::session_manifest::SessionManifests::new(
+            backend, node_id, advertised,
+        ))),
+        Err(err) => {
+            warn!(error = ?err, "Invalid contentStore config; store sessions cannot suspend here");
+            None
+        }
+    }
 }
 
 /// The publisher for the worker's `contentStore`, when one is configured.
@@ -1700,7 +2003,15 @@ async fn heartbeat_tick(
             sampler.note_network_activity(net_edges.iter().map(|edge| edge.allocation_id));
             let now = std::time::Instant::now();
             sampler.due(now).then(|| {
-                let targets = task_manager.lock().expect("task manager").usage_targets();
+                // Sessions ride along under their negative local keys, for
+                // the idle policy only (docs/session-mode.md#idle-sessions):
+                // their entries come back out before the report is sent.
+                let targets = {
+                    let manager = task_manager.lock().expect("task manager");
+                    let mut targets = manager.usage_targets();
+                    targets.extend(manager.session_idle_targets());
+                    targets
+                };
                 // What the datapath and exec server saw, for activity and
                 // the idle policy (docs/suspend-and-resume.md, "Idle policy").
                 let activity = forwarder.context().activity();
@@ -1735,10 +2046,23 @@ async fn heartbeat_tick(
                     crate::worker::usage::read_node_memory(),
                     &inputs,
                 );
+                let (session_usage, allocations): (Vec<_>, Vec<_>) =
+                    std::mem::take(&mut report.allocations)
+                        .into_iter()
+                        .partition(|usage| usage.allocation_id < 0);
+                report.allocations = allocations;
+                suspend_idle_sessions(
+                    task_manager,
+                    crate::worker::task_manager::session_sleep::idle_sessions_to_suspend(
+                        &session_usage,
+                        chrono::Utc::now().timestamp(),
+                    ),
+                );
                 // "Who goes first", from the same ordering the responder
                 // acts with, so `legion node usage` previews it.
                 let metas = targets
                     .iter()
+                    .filter(|target| target.allocation_id >= 0)
                     .map(|target| (target.allocation_id, target.pressure.clone()))
                     .collect();
                 let view = PRESSURE_SETTINGS
@@ -1816,6 +2140,19 @@ async fn heartbeat_tick(
                 }
             }
         };
+        // The sessions this node runs (docs/session-mode.md), as a delta
+        // against what the manager last acknowledged; same no-restore
+        // contract as the content report above.
+        let session_report = {
+            let current = task_manager
+                .lock()
+                .expect("task manager")
+                .session_statuses();
+            SESSION_ADVERTISER
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .prepare(current)
+        };
         let exec_audit = crate::worker::direct_exec::take_audit();
         // On the stream, the heartbeat stops listing what the node runs: it
         // reports its stream position and a digest of its desired set, and
@@ -1842,6 +2179,7 @@ async fn heartbeat_tick(
             content_locations: content_report
                 .as_ref()
                 .map(|pending| pending.report.clone()),
+            session_report: Some(session_report.report.clone()),
             usage,
             pressure_actions,
             net_denials,
@@ -1945,6 +2283,17 @@ async fn heartbeat_tick(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .acknowledge(pending, reply.content_resync);
+        }
+        SESSION_ADVERTISER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .acknowledge(session_report, reply.session_resync);
+        // The later copy of a session id another node also runs.
+        if !reply.stop_sessions.is_empty() {
+            task_manager.lock().expect("task manager").stop_sessions(
+                &reply.stop_sessions,
+                "duplicate of a session on another node",
+            );
         }
         // The desired set is the other place a node learns job configs it may
         // later be asked to start from a ticket.
@@ -3176,6 +3525,12 @@ pub const WORK_STREAM_CAPABILITY: &str = "work-stream";
 static WORK_MIRROR: std::sync::LazyLock<crate::worker::work_stream::SharedMirror> =
     std::sync::LazyLock::new(Default::default);
 
+/// The epoch protocol for this node's session report (docs/session-mode.md),
+/// mirroring [`CONTENT_ADVERTISER`].
+static SESSION_ADVERTISER: std::sync::LazyLock<
+    Mutex<crate::worker::session_report::SessionAdvertiser>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Allocation health as the manager last acknowledged it, so a streaming
 /// worker's heartbeat sends only what changed (sandbox-scaling plan §6.13).
 static HEALTH_REPORTED: std::sync::LazyLock<Mutex<HashMap<i64, AllocationHealth>>> =
@@ -4271,7 +4626,7 @@ mod tests {
                 config_attrs: "{}".into(),
                 fingerprint_attrs: "{}".into(),
                 health_checks: "[]".into(),
-                capabilities: worker_capabilities(false),
+                capabilities: worker_capabilities(false, false),
             },
             Arc::new(UpstreamForwarder::new()),
             Duration::from_secs(WORKER_HEARTBEAT_DURATION_SEC),
@@ -5065,6 +5420,8 @@ mod tests {
             exec_keys_version: String::new(),
             desired_via_stream: false,
             work_resync: false,
+            session_resync: false,
+            stop_sessions: Vec::new(),
             net_policies: Vec::new(),
             claim_verdicts: Vec::new(),
             next_interval_seconds: None,

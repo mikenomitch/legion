@@ -143,6 +143,7 @@ const asKind = (value: string | undefined): 'memory' | 'disk' | undefined =>
  * a keyed, running instance on a worker that can checkpoint.
  */
 export const suspendPlan = (instance: InstanceInfo, jobName: string, task?: JobTask): SuspendPlan => {
+  if (instance.mode === 'session') return { blocker: 'A session cannot be suspended: promote it first', choices: [] }
   if (!keyed(instance)) return { blocker: 'Only keyed instances can be suspended', choices: [] }
   if (instance.pendingOp) return { blocker: pendingOpLabel(instance.pendingOp), choices: [] }
   if (!running(instance)) return { blocker: `The instance is ${instance.state}; only an active instance can be suspended`, choices: [] }
@@ -178,6 +179,7 @@ export type ForkPlan = {
 }
 
 export const forkPlan = (instance: InstanceInfo, jobName: string): ForkPlan => {
+  if (instance.mode === 'session') return { blocker: 'A session cannot be forked: promote it first' }
   if (!keyed(instance)) return { blocker: 'Only keyed instances can be forked' }
   if (instance.pendingOp) return { blocker: pendingOpLabel(instance.pendingOp) }
   if (!running(instance)) return { blocker: `The instance is ${instance.state}; only an active instance can be forked` }
@@ -211,6 +213,11 @@ const STOPPABLE = new Set(['pending', 'active', 'rescheduling', 'suspended'])
  * follow `count.num` instead, and a destroyed one is a tombstone.
  */
 export const stopBlocker = (instance: InstanceInfo, jobName: string): string | undefined => {
+  // A session has no row to keep: Stop ends it (docs/session-mode.md).
+  if (instance.mode === 'session') {
+    const write = writeBlocker(jobName)
+    return write ? `Ending a session ${write.toLowerCase()}` : undefined
+  }
   if (!keyed(instance)) return 'Slot instances follow count.num: scale the task or stop the job instead'
   if (instance.state === 'terminated') return 'Destroyed instances are tombstones and cannot be stopped'
   if (instance.state === 'stopped') return 'Already stopped'
@@ -221,6 +228,7 @@ export const stopBlocker = (instance: InstanceInfo, jobName: string): string | u
 
 /** Why Start is unavailable for a stopped instance, or undefined. A suspended one resumes instead. */
 export const startBlocker = (instance: InstanceInfo, jobName: string): string | undefined => {
+  if (instance.mode === 'session') return 'A session that ends is gone; start a new one with legion instance create'
   if (!keyed(instance)) return 'Slot instances follow count.num'
   if (instance.state !== 'stopped') return `Only a stopped instance can be started; this one is ${instance.state}`
   const write = writeBlocker(jobName)

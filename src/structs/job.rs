@@ -1045,6 +1045,26 @@ pub struct StatefulConfig {
     /// "Node loss and fencing".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_lost: Option<StatefulOnLostConfig>,
+    /// Session mode only: the per-node capacity reservation this task's
+    /// unnamed sessions run inside (`stateful.envelope`; see
+    /// docs/session-mode.md). Its presence on a stored keyed task is what
+    /// marks the task a session task: parsing normalizes
+    /// `mode = "session"` to `keyed` and keeps this block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<crate::structs::session::SessionEnvelopeConfig>,
+    /// Session mode only: when a session becomes a keyed instance
+    /// (`stateful.promote`). Absent = the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promote: Option<crate::structs::session::SessionPromoteConfig>,
+    /// Session tasks with `suspend.durability = "store"` only (session
+    /// durability plan §6.7, mechanism 4): how long a node that has reached
+    /// neither a manager nor its content store keeps the task's sessions
+    /// running. Past it the node suspends them on its own disk and stops
+    /// serving them, because a newer generation may be running elsewhere;
+    /// once it reconnects it resumes only the ones the content store says
+    /// it still owns. A duration such as `"2m"` (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_after: Option<String>,
 }
 
 /// Default worker self-fence window for stateful tasks (see
@@ -2219,7 +2239,9 @@ impl TaskConfigInput {
         // `count` on a keyed task would be silently meaningless, so reject it
         // loudly at parse time (only here do we still know it was explicit).
         if let Some(stateful) = self.stateful.as_ref() {
-            if stateful.mode == InstanceMode::Keyed && self.count.is_some() {
+            if matches!(stateful.mode, InstanceMode::Keyed | InstanceMode::Session)
+                && self.count.is_some()
+            {
                 return Err(format!(
                     "task {name} is stateful keyed mode and cannot define count: keyed \
                      instance cardinality is driven by the instance management API \
@@ -2349,14 +2371,20 @@ impl<'de> Deserialize<'de> for JobConfig {
             Some(raw) => Band::parse(raw).map_err(D::Error::custom)?,
         };
 
-        Ok(JobConfig {
+        let mut config = JobConfig {
             name: input.name,
             tasks,
             priority,
             rollout: input.rollout,
             rollout_by_group: input.rollout_by_group,
             version: input.version,
-        })
+        };
+        // Session tasks become a keyed task plus a generated envelope task
+        // here, at parse, so validation, storage, and every reader see one
+        // shape. Idempotent, so a stored config parses back unchanged.
+        crate::structs::session::normalize_session_tasks(&mut config)
+            .map_err(|err| D::Error::custom(format!("{err:#}")))?;
+        Ok(config)
     }
 }
 
@@ -2643,6 +2671,11 @@ impl TaskConfig {
                     );
                 }
             }
+            InstanceMode::Session => bail!(
+                "task {} sets stateful.mode = \"session\" but was not normalized into a keyed \
+                 task and its envelope task; build it from a jobspec, which normalizes it",
+                self.name
+            ),
             InstanceMode::Keyed => {
                 if stateful
                     .storage
@@ -2724,6 +2757,8 @@ impl TaskConfig {
         stateful
             .resolved_on_lost()
             .map_err(|err| anyhow::anyhow!("task {}: {err}", self.name))?;
+
+        crate::structs::session::validate_session_task(self)?;
 
         Ok(())
     }
@@ -4180,6 +4215,9 @@ mod tests {
                         retain_on_scale_in: None,
                         retain_on_stop: Some(value),
                     }),
+                    envelope: None,
+                    promote: None,
+                    fence_after: None,
                 }),
                 ..TaskConfig::new("sandbox", "container")
             };
@@ -4204,6 +4242,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
+                envelope: None,
+                promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -4223,6 +4264,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
+                envelope: None,
+                promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -4242,6 +4286,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
+                envelope: None,
+                promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -4268,6 +4315,9 @@ mod tests {
                         retain_on_scale_in: None,
                         retain_on_stop: None,
                     }),
+                    envelope: None,
+                    promote: None,
+                    fence_after: None,
                 }),
                 ..TaskConfig::new("db", "exec")
             };
@@ -4291,6 +4341,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
+                envelope: None,
+                promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("sandbox", "container")
         };
@@ -4313,6 +4366,9 @@ mod tests {
                     initial_instances: None,
                     on_lost: None,
                     storage: None,
+                    envelope: None,
+                    promote: None,
+                    fence_after: None,
                 }),
                 ..TaskConfig::new("sandbox", "container")
             };
@@ -4434,6 +4490,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: Some(on_lost),
                 storage: None,
+                envelope: None,
+                promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         }
@@ -4450,6 +4509,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
+                envelope: None,
+                promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         };

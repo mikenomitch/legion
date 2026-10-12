@@ -16,6 +16,16 @@ happens when things go wrong.
 
 Runnable spec: [`configs/jobs/agent-sandboxes.ncl`](../../configs/jobs/agent-sandboxes.ncl).
 
+> **Keyed or session?** Use `keyed` when each sandbox must survive its
+> node dying (it is rescheduled with its storage), when sandboxes keep
+> volumes or need suspend and resume, or when you need an exact, durable
+> record of every sandbox: per-user workspaces people come back to. Use
+> `session` when sandboxes are disposable, created by the thousands per
+> second, and numerous enough that a row per sandbox would weigh on the
+> control plane: per-task agent sandboxes, tool executions, CI. A session
+> that turns out to matter can be promoted to a keyed instance without
+> stopping it. The trade-offs are in [Session mode](../session-mode.md).
+
 ## Run it
 
 ```bash

@@ -1050,6 +1050,26 @@ impl Keyring {
         crate::checkpoint_seal::PartKey::derive(&loaded.key, &row.key_id, digest)
     }
 
+    /// A job's session sealing keys (session durability plan §6.6): one per
+    /// loaded checkpoint key, the newest first. Empty when the keyring has
+    /// no loaded checkpoint key. Never logs key material.
+    pub fn session_seal_keys(&self, job_id: &str) -> Vec<crate::structs::SessionSealKey> {
+        let state = self.read();
+        let mut rows: Vec<&KeyringRow> = state
+            .rows
+            .iter()
+            .filter(|row| row.state == KEY_STATE_CHECKPOINT)
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse((row.created_at, row.key_id.clone())));
+        rows.into_iter()
+            .filter_map(|row| {
+                let loaded = state.keys.get(&row.key_id)?;
+                crate::checkpoint_seal::derive_session_seal_key(&loaded.key, &row.key_id, job_id)
+                    .ok()
+            })
+            .collect()
+    }
+
     /// Re-wrap every loaded data key under the provider's CURRENT root key
     /// (`legion keyring root-key rewrap`). Returns the rewritten rows; the
     /// caller persists them in one replicated write. Locked keys cannot be

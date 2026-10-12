@@ -12,6 +12,7 @@ pub mod persistence;
 pub mod queries;
 pub mod raft;
 pub(crate) mod s3_credentials;
+pub mod session_index;
 pub mod snapshot_warm;
 pub mod store;
 pub mod work_log;

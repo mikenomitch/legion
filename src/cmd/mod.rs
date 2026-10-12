@@ -29,6 +29,7 @@ pub mod raft;
 pub mod sandbox;
 pub mod scheduler;
 pub mod service;
+pub mod session;
 pub mod snapshot;
 pub mod start;
 pub mod state;
@@ -59,6 +60,7 @@ pub fn cli() -> Command {
         .subcommand(join_token::config())
         .subcommand(boot_ticket::config())
         .subcommand(sandbox::config())
+        .subcommand(session::config())
         .subcommand(join::config())
         .subcommand(ledger::config())
         .subcommand(events::config())

@@ -6063,6 +6063,9 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -6345,6 +6348,9 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new(name, "noop")
         }

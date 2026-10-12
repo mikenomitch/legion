@@ -179,6 +179,9 @@ fn sandbox_job() -> JobConfig {
             initial_instances: None,
             on_lost: None,
             storage: None,
+            envelope: None,
+            promote: None,
+            fence_after: None,
         }),
         suspend: Some(SuspendConfig {
             checkpoint: Some("memory".into()),
@@ -473,6 +476,7 @@ fn measure_lifecycle(topology: &str, keys: bool) -> R<Lifecycle> {
                 instance_id: instance_id.clone(),
                 idempotency_key: h.key(),
                 cold: false,
+                force_move: false,
             })))?;
             h.run_eval_worker()?;
             let resumed_alloc = h.alloc_of(&instance_id)?;
@@ -532,7 +536,15 @@ fn measure_lifecycle(topology: &str, keys: bool) -> R<Lifecycle> {
             Ok(())
         })?,
     ));
-    assert_eq!(h.info(&instance_id)?.state, "terminated");
+    // The measured instance's id was minted, so it is unnamed and its row
+    // goes with the destroy instead of staying as a tombstone
+    // (sandbox-scaling plan, Phase 4), in the same entry.
+    let gone =
+        h.rt.block_on(h.svc.get_instance(Request::new(GetInstanceRequest {
+            instance_id: instance_id.clone(),
+        })))
+        .expect_err("an unnamed instance leaves no row after destroy");
+    assert_eq!(gone.code(), tonic::Code::NotFound);
     Ok(stages)
 }
 

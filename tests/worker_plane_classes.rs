@@ -63,6 +63,18 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         ("ExecTask", &[Caller::Manager, Caller::Ticket]),
         ("StartClaim", &[Caller::Ticket]),
         ("Probe", &[Caller::Manager]),
+        ("StopSessions", &[Caller::Manager]),
+        // Session suspend and resume are routed by a manager, like
+        // StopSessions (session durability plan §6.6).
+        ("SuspendSessions", &[Caller::Manager]),
+        ("ResumeSession", &[Caller::Manager]),
+        // A manager certificate (the manager's routed read), or a session
+        // ticket (a front-end reading a session it started at the edge).
+        ("GetSession", &[Caller::Manager, Caller::Ticket]),
+        // Session tickets only: the manager starts and stops sessions with
+        // PostWork and StopSessions.
+        ("StartSession", &[Caller::Ticket]),
+        ("StopSession", &[Caller::Ticket]),
     ]
 }
 
@@ -137,6 +149,8 @@ async fn serve_worker(dir: &tempfile::TempDir) -> R<Cluster> {
         identity: None,
         edge_boot: None,
         direct_exec: None,
+        launch_pool: Default::default(),
+        node_identity: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = format!("https://127.0.0.1:{}", listener.local_addr()?.port());
@@ -215,6 +229,52 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
             .map(|_| ()),
         "Probe" => client
             .probe(legion::structs::ProbeRequest {})
+            .await
+            .map(|_| ()),
+        // An id this worker does not run: ignored once admitted.
+        "StopSessions" => client
+            .stop_sessions(legion::structs::StopSessionsRequest {
+                session_ids: vec!["workspace-not-running".into()],
+                reason: "stop".into(),
+            })
+            .await
+            .map(|_| ()),
+        "SuspendSessions" => client
+            .suspend_sessions(legion::structs::SuspendSessionsRequest {
+                session_ids: vec!["workspace-not-running".into()],
+                reason: "manual".into(),
+            })
+            .await
+            .map(|_| ()),
+        // An id this worker does not hold: NotFound once admitted.
+        "ResumeSession" => client
+            .resume_session(legion::structs::ResumeSessionRequest {
+                session_id: "workspace-not-running".into(),
+                cold: false,
+                ..Default::default()
+            })
+            .await
+            .map(|_| ()),
+        "GetSession" => client
+            .get_session(legion::structs::GetSessionRequest {
+                session_id: "workspace-not-running".into(),
+                ticket: String::new(),
+            })
+            .await
+            .map(|_| ()),
+        "StartSession" => client
+            .start_session(legion::structs::StartSessionRequest {
+                job_id: "job".into(),
+                task_name: "workspace".into(),
+                ..Default::default()
+            })
+            .await
+            .map(|_| ()),
+        "StopSession" => client
+            .stop_session(legion::structs::StopSessionRequest {
+                session_id: "workspace-not-running".into(),
+                ticket: String::new(),
+            })
             .await
             .map(|_| ()),
         other => panic!("no request builder for Worker RPC {other}"),

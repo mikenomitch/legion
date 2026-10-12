@@ -20,6 +20,7 @@ import { fetchNodeUsage } from '../utils/usage'
 import { nodePublicAddress } from '../utils/services'
 import type { Tone } from '../utils/status'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../utils/volumes'
+import { ENVELOPE_COPY, envelopeServes, jobInstancesHref } from '../utils/sessions'
 
 export interface NodeDeepViewProps {
   nodes: Resource<readonly NodeMsg[] | undefined>
@@ -777,6 +778,19 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                         >
                                           {allocation.taskName}
                                         </A>
+                                        {/* An envelope holds this node's room for a session task;
+                                            its sessions are listed on the job page, filtered here. */}
+                                        <Show when={envelopeServes(allocation.taskName)}>
+                                          {(served) => (
+                                            <A
+                                              class="ml-1.5"
+                                              href={jobInstancesHref(allocation.jobId, { mode: 'session', node: node()?.id })}
+                                              title={`${ENVELOPE_COPY} Open ${served()}'s sessions on this node.`}
+                                            >
+                                              <Badge tone="info">envelope · sessions</Badge>
+                                            </A>
+                                          )}
+                                        </Show>
                                       </Show>
                                     </td>
                                     <td class={tdClass}>

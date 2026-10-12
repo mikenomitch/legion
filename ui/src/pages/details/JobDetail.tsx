@@ -1,15 +1,16 @@
-import { A, useNavigate, useParams } from '@solidjs/router'
+import { A, useLocation, useNavigate, useParams } from '@solidjs/router'
 import { AccessGate } from '../../components/AccessGate'
-import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
-import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
+import { For, Show, createEffect, createMemo, createResource, createSignal, on } from 'solid-js'
+import { Badge, Button, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
 import ScalePanel from '../../components/ScalePanel'
 import InstancesPanel from '../../components/InstancesPanel'
+import SessionNodesCard from '../../components/SessionNodesCard'
 import type { InstanceRow } from '../../components/InstancesTable'
 import { PressureHistoryCard } from '../../components/PressureHistory'
 import SnapshotsPanel from '../../components/SnapshotsPanel'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
-import { InstanceInfo } from '../../gen/legion_pb'
+import { InstanceInfo, type ListSessionNodesReply } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
 import { nodePublicAddress } from '../../utils/services'
@@ -19,7 +20,26 @@ import { formatDate, pluralize } from '../../utils/format'
 import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecFromReply, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
 import { stableList } from '../../utils/instances'
+import {
+  ENVELOPE_COPY,
+  LARGE_LISTING,
+  SESSION_COPY,
+  SESSION_PAGE,
+  sessionsPerEnvelope,
+  countMap,
+  createSessionPager,
+  envelopeServes,
+  envelopeTaskName,
+  formatCount,
+  isSession,
+  isSessionTask,
+  jobInstancesHref,
+  sessionsOnNodes,
+} from '../../utils/sessions'
 import { bytesToMiB, fetchAllocationUsageByNode, formatIdle, formatMiB, reservationLabel } from '../../utils/usage'
+
+// Allocation rows the job page renders per "Show more".
+const ALLOCATION_PAGE = 200
 
 // What each derived job status means on this page (the badge's tooltip).
 const JOB_STATUS_HINTS: Record<string, string> = {
@@ -160,35 +180,153 @@ function JobDetailContent() {
   )
 
   const statefulTasks = createMemo(() => (jobData()?.taskSpec?.tasks ?? []).filter((task) => task.stateful))
-  // Keyed tasks have no count, so the scale panel shows them read-only.
+  // Session tasks (docs/session-mode.md): their sessions are not allocations,
+  // and their envelopes (`<task>-envelope`, one per eligible node) are.
+  const sessionTasks = createMemo(() => statefulTasks().filter((task) => isSessionTask(task)))
+  // Keyed and session tasks have no count, so the scale panel shows them read-only.
   const keyedTaskNames = createMemo(
-    () => new Set(statefulTasks().filter((task) => task.stateful?.mode === 'keyed').map((task) => task.name)),
+    () =>
+      new Set(
+        statefulTasks()
+          .filter((task) => task.stateful?.mode === 'keyed' || isSessionTask(task))
+          .flatMap((task) => (isSessionTask(task) ? [task.name, envelopeTaskName(task.name)] : [task.name])),
+      ),
   )
 
-  // Stateful instances for this job, polled at the standard interval while the
-  // page is mounted (scoped to this route; the interval is torn down on
-  // navigation). Unchanged instances keep their objects across polls, so a
-  // row with an armed Suspend or Resume is not re-rendered by a poll that
-  // changed some other row.
+  const specLoaded = () => jobData.state === 'ready' || jobData.state === 'refreshing'
+
+  // Stateful instances and running sessions for this job, polled at the
+  // standard interval while the page is mounted (scoped to this route; the
+  // interval is torn down on navigation). Unchanged instances keep their
+  // objects across polls, so a row with an armed Suspend or Resume is not
+  // re-rendered by a poll that changed some other row.
+  //
+  // Sessions come one page of SESSION_PAGE at a time, in id order
+  // (`session_limit`), so a poll re-reads the job's rows and one page, never
+  // every session; the pager walks the rest with the reply's token. Every
+  // count on the page comes from the reply (`session_count`,
+  // `sessions_by_node`) or from ListSessionNodes, not from the page.
+  //
+  // A listing of LARGE_LISTING or more (only a job with that many keyed or
+  // slot rows) is not re-polled. It refreshes on request (the card's Refresh
+  // button, or after an action).
   const instanceTick = usePoll()
+  const [instanceForce, setInstanceForce] = createSignal(0)
+  const refetchInstances = () => setInstanceForce((value) => value + 1)
+  const sessionPager = createSessionPager(SESSION_PAGE)
   // Instance ids are unique cluster-wide, so one merge serves every job.
   const mergeInstances = stableList<InstanceInfo>((instance) => instance.instanceId, (a, b) => InstanceInfo.equals(a, b))
-  let lastInstances: InstanceInfo[] = []
-  const [instances, { refetch: refetchInstances }] = createResource(
-    () => [jobName(), instanceTick()] as const,
-    async ([name]) => {
+  type Listing = {
+    job: string
+    instances: InstanceInfo[]
+    complete: boolean
+    asOf: string
+    force: number
+    token: string
+    nextToken: string
+    sessionCount: number
+    sessionsByNode: Map<string, number>
+  }
+  let lastListing: Listing | undefined
+  const [instanceListing] = createResource(
+    () => (specLoaded() ? ([jobName(), instanceTick(), instanceForce(), sessionPager.token()] as const) : undefined),
+    async ([name, , force, token]): Promise<Listing> => {
+      const previous = lastListing?.job === name ? lastListing : undefined
+      if (previous && previous.instances.length >= LARGE_LISTING && previous.force === force && previous.token === token) return previous
       try {
-        const response = await managerClient.listInstances({ jobId: name })
+        const response = await managerClient.listInstances({ jobId: name, sessionLimit: SESSION_PAGE, sessionPageToken: token })
         const next = mergeInstances(response.instances)
-        const unchanged = next.length === lastInstances.length && next.every((instance, index) => instance === lastInstances[index])
-        if (!unchanged) lastInstances = next
-        return lastInstances
+        const unchanged =
+          previous !== undefined && next.length === previous.instances.length && next.every((instance, index) => instance === previous.instances[index])
+        lastListing = {
+          job: name,
+          instances: unchanged ? previous!.instances : next,
+          complete: response.complete,
+          asOf: response.asOf,
+          force,
+          token,
+          nextToken: response.nextSessionPageToken,
+          sessionCount: Number(response.sessionCount),
+          sessionsByNode: countMap(response.sessionsByNode),
+        }
+        return lastListing
       } catch {
         // Stateless jobs (or older managers) simply have no instances to show.
-        return lastInstances
+        return previous ?? { job: name, instances: [], complete: true, asOf: '', force, token, nextToken: '', sessionCount: 0, sessionsByNode: new Map() }
       }
     },
   )
+  // Each session task's nodes (ListSessionNodes): their envelopes, whether
+  // they take edge starts, and how many sessions each holds. Cheap at any
+  // session count, so it feeds the task cards' and envelope rows' counts and
+  // the Edge nodes card; read at the page's slower cadence.
+  type NodesByTask = { job: string; tasks: Map<string, ListSessionNodesReply | Error> }
+  const [sessionNodes] = createResource(
+    () => (sessionTasks().length > 0 ? ([jobName(), sessionTasks().map((task) => task.name).join('\n'), pageTick()] as const) : undefined),
+    async ([name, names]): Promise<NodesByTask> => {
+      const entries = await Promise.all(
+        names.split('\n').map(async (taskName) => {
+          try {
+            return [taskName, await managerClient.listSessionNodes({ jobId: name, taskName })] as const
+          } catch (failure) {
+            return [taskName, failure instanceof Error ? failure : new Error(String(failure))] as const
+          }
+        }),
+      )
+      return { job: name, tasks: new Map<string, ListSessionNodesReply | Error>(entries) }
+    },
+  )
+  const sessionNodesFor = (taskName: string): ListSessionNodesReply | Error | undefined => {
+    const nodes = sessionNodes()
+    return nodes?.job === jobName() ? nodes.tasks.get(taskName) : undefined
+  }
+  // Sessions per node for one session task, when ListSessionNodes answered;
+  // with a single session task, the listing's per-node totals serve too.
+  const taskSessionsByNode = (taskName: string): ReadonlyMap<string, number> | undefined => {
+    const reply = sessionNodesFor(taskName)
+    if (reply && !(reply instanceof Error)) return sessionsOnNodes(reply.nodes)
+    return sessionTasks().length === 1 && instanceListing()?.job === jobName() ? instanceListing()!.sessionsByNode : undefined
+  }
+  const taskSessionCount = (taskName: string): number | undefined => {
+    const byNode = taskSessionsByNode(taskName)
+    if (!byNode) return undefined
+    let total = 0
+    for (const count of byNode.values()) total += count
+    return total
+  }
+  const instances = createMemo(() => {
+    const listing = instanceListing()
+    return listing?.job === jobName() ? listing.instances : undefined
+  })
+  // Snapshots are of keyed instances only; a session has nothing to snapshot.
+  const durableInstances = createMemo(() => {
+    const all = instances() ?? []
+    return all.some(isSession) ? all.filter((instance) => !isSession(instance)) : all
+  })
+  // The job's session total, as the manager counted it (not the page).
+  const sessionTotal = () => (instanceListing()?.job === jobName() ? instanceListing()!.sessionCount : 0)
+  // The Allocations card renders a page at a time: a session job places one
+  // envelope per eligible node, so a large fleet means thousands of rows.
+  const [allocationLimit, setAllocationLimit] = createSignal(ALLOCATION_PAGE)
+  // A new job starts from the first page and its own listing choice.
+  createEffect(
+    on(jobName, () => {
+      setAllocationLimit(ALLOCATION_PAGE)
+      sessionPager.first()
+    }, { defer: true }),
+  )
+
+  // Land on the Instances card when a link asks for it (`#instances`), once
+  // it has rendered.
+  const location = useLocation()
+  let scrolledFor = ''
+  createEffect(() => {
+    const key = `${location.pathname}${location.search}${location.hash}`
+    if (scrolledFor === key || location.hash !== '#instances') return
+    if (instances() === undefined) return
+    scrolledFor = key
+    queueMicrotask(() => document.getElementById('instances')?.scrollIntoView({ block: 'start' }))
+  })
   // Measured usage per allocation, from GetNodeUsage on each node this job
   // runs on. Needs node:read; without it (or on an older manager) the map is
   // empty and the usage columns fall back to the instances' own `usage`.
@@ -197,14 +335,13 @@ function JobDetailContent() {
     ([, nodeIds]) => fetchAllocationUsageByNode(nodeIds ? nodeIds.split(',') : []),
   )
 
-  const instanceRows = createMemo<InstanceRow[]>(() => {
-    const tasks = new Map((jobData()?.taskSpec?.tasks ?? []).map((task) => [task.name, task]))
-    const usage = allocationUsage()
-    return (instances() ?? []).map((instance) => ({
-      instance,
-      task: tasks.get(instance.task),
-      allocation: instance.currentAllocId !== undefined ? usage?.get(Number(instance.currentAllocId)) : undefined,
-    }))
+  // Rows are built only for the instances the card shows, never for the
+  // whole listing.
+  const tasksByName = createMemo(() => new Map((jobData()?.taskSpec?.tasks ?? []).map((task) => [task.name, task])))
+  const instanceRow = (instance: InstanceInfo): InstanceRow => ({
+    instance,
+    task: tasksByName().get(instance.task),
+    allocation: instance.currentAllocId !== undefined ? allocationUsage()?.get(Number(instance.currentAllocId)) : undefined,
   })
 
   // The manager derives the status from the job's workload (see
@@ -217,10 +354,11 @@ function JobDetailContent() {
   // have instance rows anyway (e.g. the spec failed to parse but the manager
   // knows about instances).
   const showInstancesPanel = createMemo(() => statefulTasks().length > 0 || (instances()?.length ?? 0) > 0)
-  const hasKeyedTasks = createMemo(
+  // Keyed instances and sessions have per-row controls; slot instances follow count.num.
+  const hasInstanceActions = createMemo(
     () =>
-      statefulTasks().some((task) => task.stateful?.mode === 'keyed') ||
-      (instances() ?? []).some((instance) => instance.mode === 'keyed'),
+      statefulTasks().some((task) => task.stateful?.mode === 'keyed' || isSessionTask(task)) ||
+      (instances() ?? []).some((instance) => instance.mode === 'keyed' || isSession(instance)),
   )
 
   // The DAG is only meaningful when tasks actually depend on each other.
@@ -299,6 +437,11 @@ function JobDetailContent() {
                   )}
                 </Show>
                 <Badge tone="neutral">{pluralize(jobData()!.allocations.length, 'allocation')}</Badge>
+                <Show when={sessionTotal() > 0}>
+                  <Badge tone="info" title={SESSION_COPY}>
+                    {formatCount(sessionTotal())} {sessionTotal() === 1 ? 'session' : 'sessions'}
+                  </Badge>
+                </Show>
                 <Show when={jobData()!.template}>
                   {(template) => (
                     <A href={`/templates/${encodeURIComponent(template().name)}`}>
@@ -398,9 +541,12 @@ function JobDetailContent() {
                           <div class="grid gap-2.5 md:grid-cols-2 xl:grid-cols-3">
                             <For each={jobData()!.taskSpec!.tasks.filter((task) => task.group === groupName)}>
                               {(task) => {
-                                const runtime = () => taskInstances().get(task.name)
+                                // A session task has no allocations of its own: its
+                                // envelopes are what the scheduler places.
+                                const session = isSessionTask(task)
+                                const runtime = () => taskInstances().get(task.name) ?? (session ? taskInstances().get(envelopeTaskName(task.name)) : undefined)
                                 const primaryStatus = () =>
-                                  runtime()?.statuses[0] ?? (statusLoading() ? 'loading' : 'not allocated')
+                                  runtime()?.statuses[0] ?? (statusLoading() ? 'loading' : session ? 'no envelopes' : 'not allocated')
                                 return (
                                   <A
                                     href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(task.name)}`}
@@ -416,7 +562,16 @@ function JobDetailContent() {
                                     <Show when={task.stateful || task.dependsOn.length > 0 || task.lifecycle === 'sidecar'}>
                                       <div class="mt-2 flex flex-wrap items-center gap-1.5">
                                         <Show when={task.stateful}>
-                                          <Badge tone="accent">stateful · {task.stateful!.mode}</Badge>
+                                          <Badge tone="accent" title={session ? SESSION_COPY : undefined}>
+                                            stateful · {task.stateful!.mode}
+                                          </Badge>
+                                        </Show>
+                                        <Show when={session ? taskSessionCount(task.name) : undefined}>
+                                          {(running) => (
+                                            <Badge tone="info" title={`Running sessions, from the session index. Each node's envelope (${envelopeTaskName(task.name)}) reserves their room.`}>
+                                              {formatCount(running())} running
+                                            </Badge>
+                                          )}
                                         </Show>
                                         <Show when={task.lifecycle === 'sidecar'}>
                                           <Badge tone="neutral">sidecar</Badge>
@@ -505,19 +660,53 @@ function JobDetailContent() {
               </Show>
 
               <Show when={showInstancesPanel()}>
-                <Show when={instances() !== undefined} fallback={<SectionCard title="Instances"><p class="text-sm text-muted">Loading instances…</p></SectionCard>}>
-                  <InstancesPanel
-                    jobName={jobName()}
-                    rows={instanceRows()}
-                    keyed={hasKeyedTasks()}
-                    onChanged={() => void refetchInstances()}
-                  />
-                </Show>
+                <div id="instances" class="scroll-mt-20">
+                  <Show when={instances() !== undefined} fallback={<SectionCard title="Instances"><p class="text-sm text-muted">Loading instances…</p></SectionCard>}>
+                    <InstancesPanel
+                      jobName={jobName()}
+                      instances={instances()!}
+                      toRow={instanceRow}
+                      actions={hasInstanceActions()}
+                      onChanged={refetchInstances}
+                      listing={{
+                        complete: instanceListing()?.complete ?? true,
+                        asOf: instanceListing()?.asOf || undefined,
+                        paused: (instances()?.length ?? 0) >= LARGE_LISTING,
+                        refreshing: instanceListing.loading,
+                        onRefresh: refetchInstances,
+                        sessions:
+                          sessionTasks().length > 0 || sessionTotal() > 0
+                            ? {
+                                count: sessionTotal(),
+                                byNode: instanceListing()?.sessionsByNode ?? new Map(),
+                                offset: sessionPager.offset(),
+                                onPage: (instances() ?? []).reduce((total, instance) => total + (isSession(instance) ? 1 : 0), 0),
+                                hasPrev: sessionPager.hasPrev(),
+                                hasNext: Boolean(instanceListing()?.nextToken),
+                                onPrev: sessionPager.prev,
+                                onNext: () => sessionPager.next(instanceListing()?.nextToken ?? ''),
+                                onFirst: sessionPager.first,
+                              }
+                            : undefined,
+                      }}
+                    />
+                  </Show>
+                </div>
+                <For each={sessionTasks()}>
+                  {(task) => (
+                    <SessionNodesCard
+                      jobId={jobName()}
+                      taskName={task.name}
+                      perEnvelope={sessionsPerEnvelope(task)}
+                      reply={sessionNodesFor(task.name)}
+                    />
+                  )}
+                </For>
                 <SnapshotsPanel
                   jobName={jobName()}
-                  instances={instances() ?? []}
+                  instances={durableInstances()}
                   tasks={jobData()!.taskSpec?.tasks ?? []}
-                  onChanged={() => void refetchInstances()}
+                  onChanged={refetchInstances}
                 />
               </Show>
 
@@ -560,7 +749,7 @@ function JobDetailContent() {
                         </tr>
                       </thead>
                       <tbody class="divide-y divide-line">
-                        <For each={jobData()!.allocations}>
+                        <For each={jobData()!.allocations.slice(0, allocationLimit())}>
                           {(allocation) => {
                             const health = () => allocationHealth()?.get(Number(allocation.id))
                             const usage = () => allocationUsage()?.get(Number(allocation.id))
@@ -579,6 +768,21 @@ function JobDetailContent() {
                                   >
                                     {allocation.taskName}
                                   </A>
+                                  <Show when={envelopeServes(allocation.taskName, jobData()!.taskSpec?.tasks)}>
+                                    {(served) => (
+                                      <A
+                                        href={jobInstancesHref(jobName(), { mode: 'session', envelope: String(allocation.id) })}
+                                        class="ml-1.5"
+                                        title={`${ENVELOPE_COPY} It holds ${served()}'s sessions on this node. Open them.`}
+                                      >
+                                        <Badge tone="info">
+                                          {taskSessionsByNode(served()) === undefined
+                                            ? 'envelope'
+                                            : `envelope · ${formatCount(taskSessionsByNode(served())!.get(allocation.nodeId) ?? 0)} sessions`}
+                                        </Badge>
+                                      </A>
+                                    )}
+                                  </Show>
                                 </Show>
                               </td>
                               <td class={tdClass}>
@@ -631,6 +835,19 @@ function JobDetailContent() {
                       </tbody>
                     </table>
                   </TableShell>
+                  <Show when={jobData()!.allocations.length > allocationLimit()}>
+                    <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-line px-4 py-2.5 text-xs text-muted">
+                      <span>
+                        Showing the first {formatCount(allocationLimit())} of {formatCount(jobData()!.allocations.length)} allocations.
+                      </span>
+                      <Button size="xs" onClick={() => setAllocationLimit((value) => value + ALLOCATION_PAGE)}>
+                        Show {formatCount(Math.min(ALLOCATION_PAGE, jobData()!.allocations.length - allocationLimit()))} more
+                      </Button>
+                      <span class="text-faint">
+                        or list them from the CLI with <code class="rounded bg-surface2 px-1 font-mono">legion ledger -j</code>
+                      </span>
+                    </div>
+                  </Show>
                 </Show>
               </SectionCard>
 

@@ -68,6 +68,10 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Sandboxes at Scale](sandboxes-at-scale.md): running many keyed sandboxes:
   what each lifecycle step costs the control plane, delivery within a round
   trip, blocked creates when capacity runs out, and measuring it.
+- [Session Mode](session-mode.md): `stateful.mode = "session"`, units that
+  start and stop with no raft write inside per-node envelopes, the session
+  index and its `complete` flag, duplicates, and promotion to a keyed
+  instance in place.
 - [Volumes](volumes.md): persistent storage for stateful tasks. Covers plugins,
   the driver contract, node pinning, and reclaim.
 - [Suspend and Resume](suspend-and-resume.md): suspending a keyed instance to

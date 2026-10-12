@@ -1428,6 +1428,70 @@ impl MultiRaftDriver {
         }
     }
 
+    /// Ask every other member for its session index's answer to `request`
+    /// (`RaftTransport.QuerySessions`, docs/session-mode.md), concurrently,
+    /// each bounded by the lane-forward timeout. Members that fail are left
+    /// out of the result. Runs on the caller's runtime, like
+    /// [`Self::send_liveness_digest`].
+    pub(crate) async fn query_peer_sessions(
+        &self,
+        request: crate::structs::QuerySessionsRequest,
+    ) -> Vec<crate::structs::QuerySessionsReply> {
+        let Some(engine) = self.engine.get() else {
+            return Vec::new();
+        };
+        let Some(metrics) = Self::control_metrics(engine) else {
+            return Vec::new();
+        };
+        let Ok(secret) = engine
+            .cluster_secret
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+        else {
+            return Vec::new();
+        };
+        let calls = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .filter(|(id, _)| **id != self.raft_id)
+            .map(|(id, node)| {
+                let name = member_name(&metrics, *id);
+                let host_port = node_addr_host_port(&node.addr).to_string();
+                let channel = engine.pool.get(&host_port);
+                let mut call = tonic::Request::new(request.clone());
+                call.set_timeout(FORWARD_LANE_WRITE_TIMEOUT);
+                call.metadata_mut()
+                    .insert(RAFT_CLUSTER_SECRET_METADATA_KEY, secret.clone());
+                async move {
+                    let channel = match channel {
+                        Ok(channel) => channel,
+                        Err(err) => {
+                            debug!(member = %name, "Session query skipped: {err}");
+                            return None;
+                        }
+                    };
+                    let mut client =
+                        crate::structs::raft_transport_client::RaftTransportClient::new(channel)
+                            .max_decoding_message_size(
+                                crate::storage::raft::network::RAFT_MAX_MESSAGE_BYTES,
+                            );
+                    match client.query_sessions(call).await {
+                        Ok(reply) => Some(reply.into_inner()),
+                        Err(status) => {
+                            debug!(member = %name, code = ?status.code(), "Session query failed");
+                            None
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        futures::future::join_all(calls)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     /// Fetch the cluster's KV root key from another member and store it
     /// with `keyring`'s provider (R3). Tries the control-lane leader first,
     /// then every other member, and stops at the first one that delivers a

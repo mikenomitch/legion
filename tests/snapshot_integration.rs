@@ -198,6 +198,9 @@ fn workspace_job(
                 retain_on_scale_in: None,
                 retain_on_stop: None,
             }),
+            envelope: None,
+            promote: None,
+            fence_after: None,
         }),
         snapshots,
         ..TaskConfig::new(TASK, runtime)
@@ -606,6 +609,7 @@ async fn restore_is_pinned_to_the_snapshot_node_and_refused_on_a_compat_mismatch
             cold: false,
             instance_id: "user-42".into(),
             idempotency_key: None,
+            force_move: false,
         }))
         .await?;
     cluster.reschedule()?;

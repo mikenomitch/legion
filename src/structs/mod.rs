@@ -5,6 +5,7 @@
 tonic::include_proto!("legion");
 
 pub mod acl;
+pub mod archive;
 pub mod artifact;
 pub mod band;
 pub mod checkpoint;
@@ -20,6 +21,7 @@ pub mod ledger;
 pub mod netpolicy;
 pub mod network;
 pub mod node;
+pub mod session;
 pub mod snapshot;
 pub mod stop;
 pub mod suspend;

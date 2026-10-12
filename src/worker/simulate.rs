@@ -761,6 +761,76 @@ impl Worker for SimWorkerService {
             protocol_version: u64::from(crate::constants::PROTOCOL_VERSION),
         }))
     }
+
+    /// Simulated nodes run no sessions: they do not advertise the
+    /// `sessions` capability, so no envelope is placed on them and no router
+    /// sends them a start.
+    async fn stop_sessions(
+        &self,
+        request: Request<crate::structs::StopSessionsRequest>,
+    ) -> Result<Response<crate::structs::StopSessionsReply>, Status> {
+        crate::worker::plane::require_manager(&request, "StopSessions")?;
+        Ok(Response::new(crate::structs::StopSessionsReply::default()))
+    }
+
+    async fn suspend_sessions(
+        &self,
+        request: Request<crate::structs::SuspendSessionsRequest>,
+    ) -> Result<Response<crate::structs::SuspendSessionsReply>, Status> {
+        crate::worker::plane::require_manager(&request, "SuspendSessions")?;
+        let failed = request
+            .into_inner()
+            .session_ids
+            .into_iter()
+            .map(|session_id| crate::structs::SessionSleepFailure {
+                session_id,
+                code: "NotFound".into(),
+                message: "not_found: a simulated node runs no sessions".into(),
+            })
+            .collect();
+        Ok(Response::new(crate::structs::SuspendSessionsReply {
+            suspended: Vec::new(),
+            failed,
+        }))
+    }
+
+    async fn resume_session(
+        &self,
+        request: Request<crate::structs::ResumeSessionRequest>,
+    ) -> Result<Response<crate::structs::ResumeSessionReply>, Status> {
+        crate::worker::plane::require_manager(&request, "ResumeSession")?;
+        Err(Status::not_found(
+            "not_found: a simulated node runs no sessions",
+        ))
+    }
+
+    async fn get_session(
+        &self,
+        request: Request<crate::structs::GetSessionRequest>,
+    ) -> Result<Response<crate::structs::GetSessionReply>, Status> {
+        crate::worker::plane::require_manager(&request, "GetSession")?;
+        Err(Status::not_found(
+            "not_found: a simulated node runs no sessions",
+        ))
+    }
+
+    async fn start_session(
+        &self,
+        _request: Request<crate::structs::StartSessionRequest>,
+    ) -> Result<Response<crate::structs::StartSessionReply>, Status> {
+        Err(Status::failed_precondition(
+            "a simulated node does not accept edge starts",
+        ))
+    }
+
+    async fn stop_session(
+        &self,
+        _request: Request<crate::structs::StopSessionRequest>,
+    ) -> Result<Response<crate::structs::StopSessionReply>, Status> {
+        Err(Status::failed_precondition(
+            "a simulated node does not accept edge starts",
+        ))
+    }
 }
 
 /// A launched fleet: observability for tests and drivers, plus the point
@@ -1337,6 +1407,8 @@ async fn heartbeat_sim_node(
         usage: None,
         // Nor anything to checkpoint, unless faking the channel.
         snapshot_reports: snapshot_reports.clone(),
+        // Nor sessions (no `sessions` capability).
+        session_report: None,
     }));
     let reply = match client.clone().heartbeat(req).await {
         Ok(reply) => reply.into_inner(),

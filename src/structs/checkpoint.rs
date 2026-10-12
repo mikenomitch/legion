@@ -317,6 +317,16 @@ impl fmt::Debug for crate::structs::CheckpointPartKey {
     }
 }
 
+/// Never prints the key bytes (build.rs turns off the generated Debug).
+impl fmt::Debug for crate::structs::SessionSealKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionSealKey")
+            .field("key_id", &self.key_id)
+            .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
+            .finish()
+    }
+}
+
 /// Why a node cannot restore a checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompatMismatch {

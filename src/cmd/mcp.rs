@@ -16,7 +16,7 @@
 //! By default only read-only / introspection tools are exposed. Mutating tools
 //! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`,
 //! `legion_job_destroy`, `legion_instance_create`, `legion_instance_stop`,
-//! `legion_instance_start`,
+//! `legion_instance_start`, `legion_instance_promote`,
 //! `legion_instance_destroy`) are gated behind `--allow-write`, mirroring the
 //! `read_only_safe` flag in the capabilities catalog. Even with
 //! `--allow-write`, `legion_state_query` always runs in read-only mode (no SQL
@@ -42,6 +42,8 @@ use crate::structs::{
 };
 // Phase 6 (fork and named snapshots).
 use crate::structs::{ForkInstanceRequest, SetSnapshotAliasRequest};
+// Sandbox-scaling Phase 6 (session mode).
+use crate::structs::PromoteInstanceRequest;
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -193,12 +195,17 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_list",
-            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `coldBoot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`coldBoot.reason` says why).",
+            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `coldBoot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`coldBoot.reason` says why). An `archived` instance is suspended with its checkpoint moved to an archive manifest (`manifestUrl`); start it as usual. With `include_idle`, archived instances that have no row (suspend.archive = \"manifestOnly\") are listed from the bucket after the rows, one page at a time: pass `nextIdlePageToken` back as `idle_page_token`. A session task's running sessions are listed too, with `durable: false`, a page at a time (session_limit, default 5000; pass nextSessionPageToken back as session_page_token), with sessionCount and sessionsByNode totals; `complete: false` means some node's sessions could not be read, so the list may be missing some.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "string", "description": "Job name." },
-                    "group": { "type": "string", "description": "Optional task-group filter." }
+                    "group": { "type": "string", "description": "Optional task-group filter." },
+                    "include_idle": { "type": "boolean", "description": "Also list archived instances with no row, from the contentStore. Default false." },
+                    "idle_page_token": { "type": "string", "description": "With include_idle: the previous reply's nextIdlePageToken." },
+                    "idle_page_size": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "With include_idle: the most bucket-listed instances to return (default 1000)." },
+                    "session_limit": { "type": "integer", "minimum": 0, "maximum": 50000, "description": "The most running sessions to list, in id order (default 5000). 0 lists none and returns only sessionCount and sessionsByNode, which is the cheap way to count sessions at any scale." },
+                    "session_page_token": { "type": "string", "description": "The previous reply's nextSessionPageToken, for the next page of sessions." }
                 },
                 "required": ["job_id"],
                 "additionalProperties": false
@@ -442,7 +449,8 @@ fn tool_defs() -> Vec<ToolDef> {
                     "job_config_id": { "type": "string", "description": "Pin to an exact job config. Default: the job's current config." },
                     "ttl": { "type": "string", "description": "Lifetime, e.g. 5m. Default: edgeBoot.defaultTicketTtl." },
                     "uses": { "type": "integer", "description": "Redemptions allowed. Default 1." },
-                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the ticket already minted." }
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the ticket already minted." },
+                    "scope": { "type": "string", "enum": ["boot", "session"], "description": "boot (default): start one instance. session: a reusable ticket a front-end presents to Worker.StartSession/StopSession/GetSession on any node of the pool to start sessions of a session-mode task with no manager call (docs/session-mode.md). Session tickets take no instance, prefix, gate, or job_config_id, and default to unlimited uses." }
                 },
                 "required": ["job", "task", "pool"],
                 "additionalProperties": false
@@ -843,7 +851,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_create",
-            description: "Create keyed-mode stateful instance(s) for a job's keyed task (never-recycled ids). A single instance_id (or neither instance_ids nor count) uses CreateInstance; instance_ids and/or count use the atomic all-or-nothing batch CreateInstances. Mutating.",
+            description: "Create keyed-mode stateful instance(s) for a job's keyed task (never-recycled ids). A single instance_id (or neither instance_ids nor count) uses CreateInstance; instance_ids and/or count use the atomic all-or-nothing batch CreateInstances. On a session task (stateful.mode = \"session\"), omitting instance_id starts an unnamed session on a node with envelope room and no raft write: the reply has mode=session, durable=false, and nodeId; pass idempotency_key so a retry finds the same session, and call legion_instance_promote to keep it. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -857,6 +865,35 @@ fn tool_defs() -> Vec<ToolDef> {
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["job_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_session_nodes",
+            description: "List the nodes that hold an envelope for a session task (stateful.mode = \"session\"): each node's worker address, its node tag (the 8 characters a session id minted there carries before its final '.'), whether it accepts edge starts and why not (lost, down, draining, ineligible, no-address, no-edge-sessions, full), the room left, a weight in sessions of the task's size, and its session count. Use it to build a picker's ring (accepting nodes) and its tag-to-address map (all nodes) for starting sessions at the edge with a session ticket. Answered from the manager's own state; advisory. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "The job." },
+                    "task": { "type": "string", "description": "The session task. Optional when the job has one." }
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_instance_promote",
+            description: "Promote a running session (mode=session, durable=false) to a keyed instance in place: one raft entry writes its row and an allocation the node adopts it as, so nothing restarts. From then on it is listed exactly, rescheduled on node loss, and can be suspended or forked. new_id names it (refused when the task sets stateful.promote.onName = false); omit it to keep the session id. A repeat reports the same instance with deduplicated=true. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Id of the running session to promote." },
+                    "new_id": { "type": "string", "description": "Name for the promoted instance ([A-Za-z0-9._-]{1,128}, never used before). Keeps the session id when omitted." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["instance_id"],
                 "additionalProperties": false
             }),
             mutates: true,
@@ -883,6 +920,7 @@ fn tool_defs() -> Vec<ToolDef> {
                 "properties": {
                     "instance_id": { "type": "string", "description": "Instance id to start." },
                     "cold": { "type": "boolean", "description": "Suspended instances only: discard the checkpoint and boot fresh. Default false." },
+                    "force_move": { "type": "boolean", "description": "Sessions with suspend.durability = \"store\" only: move the session to another node even when its old node did not answer the probe. Use only once that node is known to be down. Default false." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["instance_id"],
@@ -1315,15 +1353,18 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_boot_ticket_create" => {
+            let scope = opt_str_arg(&args, "scope").unwrap_or_else(|| "boot".to_string());
+            let session = scope == "session";
             let gate = match opt_str_arg(&args, "gate") {
                 Some(raw) => crate::structs::edge_boot::Gate::parse(&raw)
                     .map_err(|err| format!("{err:#}"))?,
+                None if session => crate::structs::edge_boot::Gate::Off,
                 None => crate::structs::edge_boot::Gate::Boot,
             };
             let uses = args
                 .get("uses")
                 .and_then(|value| value.as_u64())
-                .unwrap_or(1) as u32;
+                .unwrap_or(if session { 0 } else { 1 }) as u32;
             let mut client = connect().await?;
             grpc(
                 client.issue_boot_ticket(crate::structs::IssueBootTicketRequest {
@@ -1337,6 +1378,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     ttl: opt_str_arg(&args, "ttl").unwrap_or_default(),
                     uses,
                     idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                    scope,
                 }),
             )
             .await
@@ -1505,8 +1547,32 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_instance_list" => {
             let job_id = str_arg(&args, "job_id")?;
             let group = opt_str_arg(&args, "group");
+            let include_idle = args
+                .get("include_idle")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let idle_page_token = opt_str_arg(&args, "idle_page_token").unwrap_or_default();
+            let idle_page_size = args
+                .get("idle_page_size")
+                .and_then(Value::as_u64)
+                .map(|size| size.min(u64::from(u32::MAX)) as u32)
+                .unwrap_or(0);
+            let session_limit = args
+                .get("session_limit")
+                .and_then(Value::as_u64)
+                .map(|limit| limit.min(u64::from(u32::MAX)) as u32);
+            let session_page_token = opt_str_arg(&args, "session_page_token").unwrap_or_default();
             let mut client = connect().await?;
-            grpc(client.list_instances(ListInstancesRequest { job_id, group })).await
+            grpc(client.list_instances(ListInstancesRequest {
+                job_id,
+                group,
+                include_idle,
+                idle_page_token,
+                idle_page_size,
+                session_limit,
+                session_page_token,
+            }))
+            .await
         }
         "legion_instance_get" => {
             let instance_id = str_arg(&args, "instance_id")?;
@@ -1678,6 +1744,30 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 .await
             }
         }
+        "legion_session_nodes" => {
+            let job_id = str_arg(&args, "job_id")?;
+            let task_name = opt_str_arg(&args, "task").unwrap_or_default();
+            let mut client = connect().await?;
+            grpc(
+                client.list_session_nodes(crate::structs::ListSessionNodesRequest {
+                    job_id,
+                    task_name,
+                }),
+            )
+            .await
+        }
+        "legion_instance_promote" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let new_id = opt_str_arg(&args, "new_id").unwrap_or_default();
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.promote_instance(PromoteInstanceRequest {
+                instance_id,
+                new_id,
+                idempotency_key,
+            }))
+            .await
+        }
         "legion_instance_stop" => {
             let instance_id = str_arg(&args, "instance_id")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
@@ -1695,11 +1785,16 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 .get("cold")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
+            let force_move = args
+                .get("force_move")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
             let mut client = connect().await?;
             grpc(client.start_instance(StartInstanceRequest {
                 instance_id,
                 idempotency_key,
                 cold,
+                force_move,
             }))
             .await
         }
@@ -2274,6 +2369,7 @@ mod tests {
         assert!(!names.contains(&"legion_instance_create"));
         assert!(!names.contains(&"legion_instance_stop"));
         assert!(!names.contains(&"legion_instance_start"));
+        assert!(!names.contains(&"legion_instance_promote"));
         assert!(!names.contains(&"legion_instance_destroy"));
     }
 
@@ -2323,6 +2419,7 @@ mod tests {
         assert!(names.contains(&"legion_instance_create"));
         assert!(names.contains(&"legion_instance_stop"));
         assert!(names.contains(&"legion_instance_start"));
+        assert!(names.contains(&"legion_instance_promote"));
         assert!(names.contains(&"legion_instance_destroy"));
     }
 

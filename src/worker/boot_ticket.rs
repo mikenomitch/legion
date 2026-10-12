@@ -159,7 +159,12 @@ pub struct BootTicketVerifier {
     /// ticket lifetime rather than by count: a ticket that has expired can
     /// never be replayed, so its entry has no further job.
     spent: Mutex<HashMap<String, i64>>,
+    /// Session tickets already verified, by a SHA-256 of their bytes.
+    verified_sessions: Mutex<HashMap<[u8; 32], crate::structs::edge_boot::SessionTicketClaims>>,
 }
+
+/// Distinct verified session tickets a node remembers at once.
+const VERIFIED_SESSION_TICKETS_MAX: usize = 4_096;
 
 #[derive(Default)]
 struct KeyCache {
@@ -183,6 +188,7 @@ impl BootTicketVerifier {
             clock_skew,
             keys: Mutex::new(KeyCache::default()),
             spent: Mutex::new(HashMap::new()),
+            verified_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -222,6 +228,78 @@ impl BootTicketVerifier {
 
         claims.authorizes(instance_id, &self.pool)?;
         self.check_unspent(&claims)?;
+        Ok(claims)
+    }
+
+    /// Verify a session ticket (session durability plan §6.4): signature,
+    /// issuer, audience, lifetime with this node's skew, scope, and this
+    /// node's pool. Never spent: a session ticket is good for any number of
+    /// sessions until it expires.
+    ///
+    /// A verified ticket is cached by its exact bytes until it expires, so a
+    /// node taking thousands of starts a second on one ticket verifies its
+    /// signature once.
+    pub fn verify_session(
+        &self,
+        token: &str,
+        now_unix: i64,
+    ) -> R<crate::structs::edge_boot::SessionTicketClaims> {
+        let skew = self.clock_skew.as_secs() as i64;
+        let cache_key = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(token.as_bytes());
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&digest);
+            key
+        };
+        if let Some(claims) = self
+            .verified_sessions
+            .lock()
+            .expect("verified session tickets")
+            .get(&cache_key)
+            .cloned()
+        {
+            if now_unix - skew > claims.expires_at_unix {
+                bail!(
+                    "session ticket expired at {} (node clock {now_unix}, skew {skew}s)",
+                    claims.expires_at_unix
+                );
+            }
+            return Ok(claims);
+        }
+        let raw = self.decode(token, BOOT_TICKET_AUDIENCE)?;
+        let claims = crate::structs::edge_boot::SessionTicketClaims::from_claims(&raw)?;
+        if now_unix - skew > claims.expires_at_unix {
+            bail!(
+                "session ticket expired at {} (node clock {now_unix}, skew {skew}s)",
+                claims.expires_at_unix
+            );
+        }
+        if let Some(not_before) = raw.get("nbf").and_then(Value::as_i64) {
+            if now_unix + skew < not_before {
+                bail!("session ticket is not valid until {not_before} (node clock {now_unix})");
+            }
+        }
+        if claims.pool != self.pool {
+            bail!(
+                "session ticket is scoped to pool {} but this node is in pool {}",
+                claims.pool,
+                self.pool
+            );
+        }
+        let mut cache = self
+            .verified_sessions
+            .lock()
+            .expect("verified session tickets");
+        // Bounded by expiry, and by count against a flood of distinct
+        // tickets: past the cap the expired go first, then everything.
+        if cache.len() >= VERIFIED_SESSION_TICKETS_MAX {
+            cache.retain(|_, cached| cached.expires_at_unix + skew >= now_unix);
+            if cache.len() >= VERIFIED_SESSION_TICKETS_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(cache_key, claims.clone());
         Ok(claims)
     }
 
@@ -464,6 +542,39 @@ mod boot_ticket_test {
         let other = ticket(&issuer, json!({ "legion.io/instance": "user-43" }));
         verifier.verify(&other, "user-43", 1_000_100)?;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_ticket_verifies_once_and_is_never_spent_test() -> R<()> {
+        let (issuer, jwks) = issuer_with_key();
+        let session = json!({
+            "legion.io/scope": "session",
+            "legion.io/instance": Value::Null,
+            "legion.io/uses": 0,
+        });
+        let token = ticket(&issuer, session);
+        let (edge_eu, calls) = verifier(jwks.clone(), "edge-eu");
+        let verifier_for = verifier;
+        let verifier = edge_eu;
+        for _ in 0..3 {
+            let claims = verifier.verify_session(&token, 1_000_100)?;
+            assert_eq!(
+                (claims.job.as_str(), claims.task.as_str()),
+                ("agent-sandboxes", "workspace")
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Expiry holds for a cached ticket too.
+        let expired = verifier
+            .verify_session(&token, 1_000_300 + 31)
+            .expect_err("expired");
+        assert!(expired.to_string().contains("expired"), "{expired}");
+        // A boot ticket is not a session ticket, and the pool must match.
+        let boot = ticket(&issuer, json!({}));
+        assert!(verifier.verify_session(&boot, 1_000_100).is_err());
+        let (other_pool, _) = verifier_for(jwks, "edge-us");
+        assert!(other_pool.verify_session(&token, 1_000_100).is_err());
         Ok(())
     }
 
