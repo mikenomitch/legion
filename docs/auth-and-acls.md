@@ -228,6 +228,43 @@ configs, and observability. Gating bands on it would make everyone who may
 submit a critical job a raft administrator, and it could not express "team A
 may use `critical` for their jobs".
 
+#### Host-level jobs
+
+Some tasks run on the host as root, or close to it. Submitting or updating a
+job with one of them needs a `job:write` rule with `host = true`, the same
+flag `exec` rules use for exec into host-level runtimes:
+
+| Task | Host-level when |
+| --- | --- |
+| `exec` | always: it is a process on the host, root unless it sets `user` |
+| `container` | `network.mode = "host"`, `security.userNamespace = false`, or `security.seccomp = "unconfined"` |
+| `sandbox` | `hypervisor = "dev"` (a container standing in for a VM, not a security boundary) |
+| a runtime plugin other than `noop` | always: Legion cannot vouch for its isolation |
+
+```nickel
+# Deploy containers and sandboxes, but nothing that runs on the host:
+{ resources = ["job"], actions = ["write"], names = ["team-a-*"] },
+# Platform admins may deploy host-level jobs too:
+{ resources = ["job"], actions = ["write"], names = ["*"], host = true },
+```
+
+A refusal names the task and why, and only when the host grant is what is
+missing:
+
+```console
+$ legion job run backup.ncl
+error: permission denied: job "backup" has a host-level task ("dump" uses runtime "exec").
+Submitting it needs a job:write rule with host = true (docs/auth-and-acls.md, "Host-level jobs")
+```
+
+Management tokens hold every grant, so the first-start token and single-box
+flows are unaffected. The check runs on every path that submits a spec
+(`RunJob` and `RunJobTemplate`), after the spec parses. Scaling, instances,
+and stopping a job that already exists don't change what runs, so they need
+only `job:write`. A stored `require` policy that imposes `mode = "host"`
+makes every job it matches host-level; writing one needs `net:write`, which
+is already an admin grant.
+
 Manage policies with `legion acl policy apply|list|get|delete`. A policy file
 is Nickel (`.ncl`) or JSON (`.json`), read by the same rules as every other
 Legion config (see [Configuration Language](configuration-language.md)). It

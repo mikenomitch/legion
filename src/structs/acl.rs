@@ -174,6 +174,11 @@ pub struct AclRule {
     /// On `exec` rules: when true, the rule also grants exec into host-level
     /// (unsandboxed) kinds. When absent/false, it matches only sandboxed
     /// kinds. Mirrors Nomad's `alloc-exec` vs `alloc-node-exec` split.
+    ///
+    /// On `job` rules: when true, `write` also covers jobs with a host-level
+    /// task (an `exec` task, a host-network or floor-less container, a `dev`
+    /// sandbox), which run on the host as root or close to it
+    /// (worker-plane-auth plan §6.16). Reads are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<bool>,
 }
@@ -221,8 +226,9 @@ pub struct AclScope {
     /// reads — a `bands` rule is about what you may *claim*, not about what
     /// you may look at.
     pub band: Option<String>,
-    /// True when the exec target is a host-level (unsandboxed) kind. Only an
-    /// `exec` rule with `host: true` matches such a scope.
+    /// True when the exec target is a host-level (unsandboxed) kind, or a
+    /// submitted job has a host-level task. Only an `exec` (or `job`) rule
+    /// with `host: true` matches such a scope.
     pub host: bool,
 }
 
@@ -326,6 +332,13 @@ impl AclScope {
         self.band = Some(band.as_str().to_string());
         self
     }
+
+    /// Marks a job write as host-level: only `job` rules with `host = true`
+    /// match it.
+    pub fn with_host(mut self, host: bool) -> Self {
+        self.host = host;
+        self
+    }
 }
 
 /// Glob match supporting `*` (any run of characters, including empty).
@@ -408,7 +421,10 @@ fn rule_matches(
     }
     // A host-level exec target requires an exec rule that opts into `host`.
     // Sandboxed targets (scope.host == false) are unaffected by the flag.
-    if resource == AclResource::Exec && scope.host && rule.host != Some(true) {
+    if matches!(resource, AclResource::Exec | AclResource::Job)
+        && scope.host
+        && rule.host != Some(true)
+    {
         return false;
     }
     selector_matches(&rule.namespaces, &scope.namespace)

@@ -949,3 +949,60 @@ and keeps the worker's namespace code unchanged. Verified with runc 1.5, gated
 and host, in `container_start_latency_host_vs_gated_benchmark` and the
 `oci_runtime_security_*` tests; youki and crun were not available here.
 **Portability won.**
+
+## 40. Any runtime plugin but `noop` is host-level
+
+Made while implementing Phase 7. The plan's table classifies `exec`,
+`container`, and `sandbox`. Runtimes also load as plugins
+(`plugins/tasks/<name>`), and a plugin can run anything on the host. Legion
+classifies every runtime it does not know as host-level, except `noop`, which
+runs nothing.
+
+```text
+permission denied: job "x" has a host-level task ("t" uses runtime "custom", a plugin
+whose isolation Legion cannot vouch for). Submitting it needs a job:write rule with host = true
+```
+
+**Alternative.** Treat unknown runtimes as sandboxed, or let a plugin declare
+its own isolation.
+
+**Trade-off.** A plugin that is in fact sandboxed needs the host grant to
+deploy until a plugin can declare that.
+
+**Why.** A security classification that defaults to "safe" for code Legion
+has never seen is the wrong default. A plugin-declared isolation flag can
+come later without changing this rule for built-ins. **The safe default
+won.**
+
+## 41. A `dev` sandbox is host-level on every OS
+
+Made while implementing Phase 7. The plan says `hypervisor = "dev"` is
+host-level "on Linux", where it is an OCI bundle. On macOS it is an Apple
+`container` VM. Submit happens before placement, so the node's OS is not known
+then; any `dev` sandbox needs the host grant.
+
+**Alternative.** Classify by the job's constraints, or re-check at placement.
+
+**Trade-off.** A macOS developer with a scoped token needs `host` for a `dev`
+sandbox that would have run in a VM. Single-box flows use the management
+token, which has every grant.
+
+**Why.** A check at placement would turn a permission error into a stuck
+allocation. Dev mode is for development, where the management token is the
+norm. **A check that fails at submit, by name, won.**
+
+## 42. The host grant gates spec submission, not scale or instances
+
+Made while implementing Phase 7. `RunJob` and `RunJobTemplate` check `host`.
+`ScaleTask`, `CreateInstance(s)`, `StartInstance`, and `StopJob` do not: they
+change how many copies of an already admitted spec run, not what runs.
+
+**Alternative.** Check `host` on every `job:write`.
+
+**Trade-off.** A `job:write` token without `host` can scale up an `exec` job
+someone with the grant deployed.
+
+**Why.** The grant is about what code runs where, which only a spec decides.
+Gating scale would make every operator who resizes jobs a host administrator,
+the same over-broad grant the plan avoided for bands. **The narrow grant
+won.**

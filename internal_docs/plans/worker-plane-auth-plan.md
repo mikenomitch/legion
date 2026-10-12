@@ -5,7 +5,8 @@
 **Status: IN EXECUTION.** Phases 0 (ACLs on by default), 1 (the mTLS worker
 plane), 2 (the host guard in the datapath), 3 (Linux containers gated by
 default), 4 (the encrypted worker-to-manager channel), 5 (the host guard in
-the kernel), and 6 (the container privilege floor) shipped. The plan
+the kernel), 6 (the container privilege floor), and 7 (exec trust and the
+`host` grant) shipped. The plan
 has two halves that share one threat: something reaching a node's control
 plane that shouldn't.
 

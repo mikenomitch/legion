@@ -165,7 +165,11 @@ Rule selectors:
 - `action_names`: action names (glob), on `action` rules.
 - `host = true`: on `exec` rules, also allows exec into host-level runtimes
   (the `exec` runtime). Without it, an `exec` rule matches only sandboxed
-  runtimes (`container`, `sandbox`).
+  runtimes (`container`, `sandbox`). The same flag on `job` rules gates
+  submitting a job with a host-level task
+  ([Host-level jobs](auth-and-acls.md#host-level-jobs)), so a token that may
+  deploy but not reach the host can't do it by submitting an `exec` task
+  either.
 
 ```nickel
 [

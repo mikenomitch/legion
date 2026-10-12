@@ -677,7 +677,12 @@ fn configure_linux_process_options(
             }
 
             // 4. Become the task user, now that the privileged work is done.
+            //    Supplementary groups go first: without `setgroups`, the
+            //    task would keep every group the worker belongs to.
             if let Some(ref user) = options.user {
+                if libc::setgroups(0, std::ptr::null()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if libc::setgid(user.gid) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }

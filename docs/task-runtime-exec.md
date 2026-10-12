@@ -8,6 +8,32 @@ image. It is implemented in `src/task_plugins/exec.rs`.
 
 Run a host process directly using `std::process::Command`.
 
+## Trust
+
+An `exec` task is a process on the host, with host paths, host users, and
+host binaries. Without `user` it runs as root on the node: it can read the
+worker's credentials (its node token, its node key) and, on a node that also
+runs a manager, the cluster's. Run untrusted code in `container` or
+`sandbox`, never `exec`.
+
+- Submitting a job with an `exec` task needs the `host` grant on
+  `job:write` ([Host-level jobs](auth-and-acls.md#host-level-jobs)).
+- `user` drops to that user's uid and gid, and drops every supplementary
+  group first (`setgroups`), so the task does not inherit the worker's
+  groups.
+- `network.mode = "gated"` refuses to run as root, because a root process
+  with `CAP_SYS_ADMIN` can `setns` out of its namespace:
+
+  ```text
+  Error: task "worker" sets network.mode = "gated" but runs as root. A root exec task can
+  leave its network namespace, so gated would not hold.
+  Hint: set user = "nobody" (or another unprivileged user), or use runtime = "container"
+  ```
+
+- The [kernel host guard](network-handlers.md#the-host-guard-in-the-kernel)
+  keeps a host-mode task off Legion's ports and the metadata service, but a
+  root task can delete its table. It holds for tasks with a `user`.
+
 ## Config Schema
 
 Required:

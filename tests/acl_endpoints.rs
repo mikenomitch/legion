@@ -248,9 +248,9 @@ fn template_source(job_name: &str) -> String {
     name = "{job_name}",
     tasks = [{{
       name = "main",
-      runtime = "exec",
+      runtime = "container",
       count = 1,
-      config = {{ command = ["echo", "ok"] }},
+      config = {{ image = "alpine", command = ["echo", "ok"] }},
       resources = {{}},
       constraints = {{}},
     }}],
@@ -2138,6 +2138,113 @@ async fn template_scoped_policy_gates_submission_channel() -> R<()> {
     Ok(())
 }
 
+/// Worker-plane-auth plan §6.16: a job with a host-level task (`exec`, a
+/// host-network or floor-less container) needs a `job:write` rule with
+/// `host = true`. Same reason as the band test for living here: the check is
+/// conditional logic inside an endpoint that already has an ACL check.
+#[tokio::test]
+async fn host_level_jobs_need_the_host_grant_test() -> R<()> {
+    let (svc, _fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    svc.store.upsert_acl_policy(
+        "deployer",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+    )?;
+    svc.store.upsert_acl_policy(
+        "platform",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"], "host": true}]"#,
+    )?;
+    let mint = |policy: &str| {
+        authenticator
+            .mint_token(&svc.store, policy, "client", &[policy.into()], None)
+            .map(|(_, secret)| secret)
+            .map_err(|s| anyhow!(s.to_string()))
+    };
+    let deployer = mint("deployer")?;
+    let platform = mint("platform")?;
+    let spec = |name: &str, task: serde_json::Value| {
+        serde_json::json!({ "name": name, "tasks": [task] }).to_string()
+    };
+    let exec_task = serde_json::json!({
+        "name": "dump", "runtime": "exec", "count": 1,
+        "config": { "command": ["echo", "ok"] }, "resources": {}, "constraints": {},
+    });
+    let container = |extra: serde_json::Value| {
+        let mut task = serde_json::json!({
+            "name": "web", "runtime": "container", "count": 1,
+            "config": { "image": "alpine", "command": ["echo", "ok"] },
+            "resources": {}, "constraints": {},
+        });
+        if let Some(object) = extra.as_object() {
+            for (key, value) in object {
+                task[key] = value.clone();
+            }
+        }
+        task
+    };
+    let run = |spec: String, secret: String| {
+        let svc = &svc;
+        async move {
+            svc.run_job(req(
+                RunJobRequest {
+                    parsed_jobspec: spec,
+                    submissions: vec![],
+                    priority: None,
+                    force_reschedule: false,
+                    idempotency_key: None,
+                },
+                Some(&secret),
+            ))
+            .await
+        }
+    };
+
+    // A container with the floor and gated (default) networking is not
+    // host-level: any job:write may submit it.
+    run(
+        spec("web", container(serde_json::json!({}))),
+        deployer.clone(),
+    )
+    .await
+    .expect("an ordinary container needs no host grant");
+
+    // An exec task, a host-network container, and a floor-less container
+    // are host-level: refused without the grant, naming the task and why.
+    for (name, task, why) in [
+        ("backup", exec_task.clone(), "uses runtime \"exec\""),
+        (
+            "hostnet",
+            container(serde_json::json!({ "network": { "mode": "host" } })),
+            "network.mode = \"host\"",
+        ),
+        (
+            "rootful",
+            container(serde_json::json!({
+                "config": { "image": "alpine", "command": ["true"],
+                            "security": { "userNamespace": false } }
+            })),
+            "security.userNamespace = false",
+        ),
+    ] {
+        let status = run(spec(name, task.clone()), deployer.clone())
+            .await
+            .expect_err("a host-level job needs the host grant");
+        assert_eq!(status.code(), Code::PermissionDenied, "{name}");
+        assert!(
+            status.message().contains("host-level") && status.message().contains(why),
+            "{name}: {}",
+            status.message()
+        );
+        // The host grant admits it.
+        run(spec(name, task), platform.clone())
+            .await
+            .unwrap_or_else(|status| panic!("{name} with the host grant: {status}"));
+    }
+    Ok(())
+}
+
 /// Priority-band scoping: the `bands` selector on `job` rules is what makes
 /// `critical` a privilege instead of a label anyone can claim.
 ///
@@ -2172,9 +2279,9 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
             "name": name,
             "tasks": [{
                 "name": "main",
-                "runtime": "exec",
+                "runtime": "container",
                 "count": 1,
-                "config": { "command": ["echo", "ok"] },
+                "config": { "image": "alpine", "command": ["echo", "ok"] },
                 "resources": {},
                 "constraints": {},
             }],
@@ -2406,8 +2513,8 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
         let jobspec = serde_json::json!({
             "name": "edge",
             "task": {
-                "runtime": "exec",
-                "config": { "command": ["sleep", "30"] },
+                "runtime": "container",
+                "config": { "image": "alpine", "command": ["sleep", "30"] },
                 "network": {
                     "ports": [{ "name": "https", "static": 8443 }],
                     "ingress": { "tls": { "mode": "server", "certFrom": { "kv": "certs/edge" } } },

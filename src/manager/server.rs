@@ -1752,15 +1752,33 @@ impl ManagerDaemonService {
         // template that renders `priority: 'critical'` is gated by the same
         // rule as a hand-written spec — a RunJob-only check would be
         // bypassable by rendering.
+        // A job with a host-level task (worker-plane-auth plan §6.16) needs a
+        // `job:write` rule with `host = true`: "can deploy" must not quietly
+        // mean "is root on every node".
+        let host_level = config
+            .tasks
+            .iter()
+            .find_map(crate::task_plugins::task_host_level_reason);
         let scope = match template {
             Some(template) => AclScope::job_via_template(&config.name, &template.name),
             None => AclScope::job(&config.name),
         }
         .with_band(config.priority);
-        acl::enforce(identity, AclResource::Job, AclAction::Write, &scope).map_err(|status| {
-            if status.code() == tonic::Code::PermissionDenied
-                && config.priority != crate::structs::Band::default()
-            {
+        let host_scope = scope.clone().with_host(host_level.is_some());
+        acl::enforce(identity, AclResource::Job, AclAction::Write, &host_scope).map_err(|status| {
+            let denied = status.code() == tonic::Code::PermissionDenied;
+            if let (true, Some(reason)) = (denied, host_level.as_deref()) {
+                // Name the host grant only when it is what is missing.
+                if acl::enforce(identity, AclResource::Job, AclAction::Write, &scope).is_ok() {
+                    return Status::permission_denied(format!(
+                        "job {:?} has a host-level task ({reason}). Submitting it needs a \
+                         job:write rule with host = true (docs/auth-and-acls.md, \
+                         \"Host-level jobs\")",
+                        config.name
+                    ));
+                }
+            }
+            if denied && config.priority != crate::structs::Band::default() {
                 Status::permission_denied(format!(
                     "{}: this token's policy does not allow submitting jobs in the `{}`                      priority band (see the `bands` selector in docs/auth-and-acls.md)",
                     status.message(),

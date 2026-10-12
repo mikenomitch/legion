@@ -108,10 +108,12 @@ How to use it:
         `..._enforces_a_declared_memory_limit`, `..._stop_force_kills_at_the_deadline`,
         `..._stop_lets_a_trapping_container_drain`). Re-run them on a cgroup v2
         host to tell environment from bug.
-  - [ ] Phase 7: `exec` trust. Gated `exec` refuses root, the user switch
-        drops supplementary groups (it never calls `setgroups` today,
-        `src/task_plugins/exec.rs:679-687`), and host-level jobs need `host`
-        on `job:write` (plan §6.15, §6.16).
+  - [x] Phase 7: `exec` trust. Gated `exec` refuses root at submit, the user
+        switch drops supplementary groups (`setgroups(0, NULL)`), and
+        host-level jobs need `host` on `job:write`, with a refusal naming the
+        task (plan §6.15, §6.16; calls 40 to 42). Docs:
+        [task-runtime-exec.md](../docs/task-runtime-exec.md#trust),
+        [auth-and-acls.md](../docs/auth-and-acls.md#host-level-jobs).
   - [ ] Phase 8: reachability diagnostics: `Worker/Probe`,
         `WORKER_UNREACHABLE` (plan §6.7).
   - [x] Fix the public docs' "cannot be bypassed" claims for gated

@@ -1107,6 +1107,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
             crate::structs::network::sandbox_gated_by_default(),
         )
         .map_err(|err| anyhow!(err))?;
+        validate_gated_exec_user(task)?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.runtime, false)?;
             let plugin = registry
@@ -1476,6 +1477,84 @@ fn tiny_cpu_warning(task: &TaskConfig) -> Option<String> {
 /// the runtime cannot enforce, and whatever each runtime's
 /// [`TaskPlugin::check_resources`] has to say. Never fails: a runtime that
 /// will not load is a validation error reported elsewhere.
+/// Why a task is host-level, when it is (worker-plane-auth plan §6.16):
+/// submitting it needs a `job:write` rule with `host = true`.
+///
+/// | Runtime | Host-level when |
+/// | --- | --- |
+/// | `exec` | always: it is a process on the host |
+/// | `container` | `network.mode = "host"`, `security.userNamespace = false`, or `security.seccomp = "unconfined"` |
+/// | `sandbox` | `hypervisor = "dev"` (a container standing in for a VM) |
+/// | `noop` | never: it runs nothing |
+/// | anything else | always: a plugin Legion cannot classify runs code on the host |
+pub fn task_host_level_reason(task: &crate::structs::TaskConfig) -> Option<String> {
+    let name = &task.name;
+    match task.runtime.as_str() {
+        "exec" => Some(format!("{name:?} uses runtime \"exec\"")),
+        "container" => {
+            let host_network = task.network.as_ref().is_some_and(|network| {
+                network
+                    .mode
+                    .trim()
+                    .eq_ignore_ascii_case(crate::structs::netpolicy::MODE_HOST)
+            });
+            let security = container::container_security(&task.config);
+            if host_network {
+                Some(format!("{name:?} sets network.mode = \"host\""))
+            } else if !security.user_namespace {
+                Some(format!("{name:?} sets security.userNamespace = false"))
+            } else if security.seccomp == container::SECCOMP_UNCONFINED {
+                Some(format!("{name:?} sets security.seccomp = \"unconfined\""))
+            } else {
+                None
+            }
+        }
+        "sandbox" => task
+            .config
+            .get("hypervisor")
+            .and_then(Value::as_str)
+            .filter(|hypervisor| hypervisor.trim().eq_ignore_ascii_case("dev"))
+            .map(|_| format!("{name:?} runs sandbox hypervisor \"dev\", a container, not a VM")),
+        "noop" => None,
+        other => Some(format!(
+            "{name:?} uses runtime {other:?}, a plugin whose isolation Legion cannot vouch for"
+        )),
+    }
+}
+
+/// A gated `exec` task must run as an unprivileged user (worker-plane-auth
+/// plan §6.15): a root process with `CAP_SYS_ADMIN` can `setns` out of its
+/// network namespace, so gated would not hold.
+pub fn validate_gated_exec_user(task: &crate::structs::TaskConfig) -> R<()> {
+    if task.runtime != "exec" {
+        return Ok(());
+    }
+    let gated = task.network.as_ref().is_some_and(|network| {
+        network
+            .mode
+            .trim()
+            .eq_ignore_ascii_case(crate::structs::netpolicy::MODE_GATED)
+    });
+    if !gated {
+        return Ok(());
+    }
+    let user = task
+        .config
+        .get("user")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if user.is_empty() || user == "root" || user == "0" {
+        bail!(
+            "task {:?} sets network.mode = \"gated\" but runs as root. A root exec task can \
+             leave its network namespace, so gated would not hold. Hint: set user = \"nobody\" \
+             (or another unprivileged user), or use runtime = \"container\"",
+            task.name
+        );
+    }
+    Ok(())
+}
+
 /// Warnings for a container that opts out of the privilege floor
 /// (worker-plane-auth plan §6.14): each opt-out names its cost, because it
 /// makes container root host root or removes the syscall filter.
@@ -1787,6 +1866,75 @@ pub(crate) fn validate_schema(schema: &Value, config: &Value) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task(value: serde_json::Value) -> crate::structs::TaskConfig {
+        serde_json::from_value(value).expect("task config")
+    }
+
+    #[test]
+    fn a_gated_exec_task_must_not_run_as_root_test() {
+        let gated = |user: Option<&str>| {
+            let mut config = serde_json::json!({ "command": ["true"] });
+            if let Some(user) = user {
+                config["user"] = serde_json::json!(user);
+            }
+            task(serde_json::json!({
+                "name": "worker", "runtime": "exec", "config": config,
+                "network": { "mode": "gated" },
+            }))
+        };
+        for user in [None, Some("root"), Some("0")] {
+            let err = validate_gated_exec_user(&gated(user)).expect_err("root is refused");
+            assert!(err.to_string().contains("runs as root"), "{err}");
+            assert!(
+                err.to_string().contains("Hint: set user = \"nobody\""),
+                "{err}"
+            );
+        }
+        validate_gated_exec_user(&gated(Some("nobody"))).expect("an unprivileged user is fine");
+        // Host mode is unaffected (host-level anyway, gated by the host grant).
+        validate_gated_exec_user(&task(serde_json::json!({
+            "name": "worker", "runtime": "exec", "config": { "command": ["true"] },
+        })))
+        .expect("host mode");
+    }
+
+    #[test]
+    fn host_level_tasks_are_classified_per_runtime_test() {
+        let reason = |value: serde_json::Value| task_host_level_reason(&task(value));
+        assert!(reason(serde_json::json!({
+            "name": "e", "runtime": "exec", "config": { "command": ["true"] },
+        }))
+        .is_some_and(|why| why.contains("exec")));
+        let container = serde_json::json!({
+            "name": "c", "runtime": "container", "config": { "image": "a", "command": ["true"] },
+        });
+        assert_eq!(reason(container.clone()), None);
+        let mut host_net = container.clone();
+        host_net["network"] = serde_json::json!({ "mode": "host" });
+        assert!(reason(host_net).is_some());
+        let mut unconfined = container.clone();
+        unconfined["config"]["security"] = serde_json::json!({ "seccomp": "unconfined" });
+        assert!(reason(unconfined).is_some());
+        assert_eq!(
+            reason(serde_json::json!({
+                "name": "s", "runtime": "sandbox", "config": { "image": "a", "command": ["true"] },
+            })),
+            None
+        );
+        assert!(reason(serde_json::json!({
+            "name": "s", "runtime": "sandbox",
+            "config": { "image": "a", "command": ["true"], "hypervisor": "dev" },
+        }))
+        .is_some());
+        assert_eq!(
+            reason(serde_json::json!({ "name": "n", "runtime": "noop", "config": {} })),
+            None
+        );
+        assert!(
+            reason(serde_json::json!({ "name": "p", "runtime": "custom", "config": {} })).is_some()
+        );
+    }
     use serde_json::json;
     use std::path::Path;
 
