@@ -267,11 +267,12 @@ impl ManagerDaemonService {
 
     /// StartInstance on a session: running answers that it already runs;
     /// suspended resumes it on its node (`Worker.ResumeSession`) under the
-    /// same id. `None` when no session has the id.
+    /// same id, from its checkpoint or, `cold`, booted fresh. `None` when no session has the id.
     pub(super) async fn start_session_instance(
         &self,
         identity: &AclIdentity,
         session_id: &str,
+        cold: bool,
     ) -> Result<Option<StartInstanceReply>, Status> {
         let Some(found) = self
             .locate_session(identity, session_id, AclAction::Write)
@@ -291,7 +292,7 @@ impl ManagerDaemonService {
                 ..Default::default()
             }));
         }
-        let reply = sessions::resume_on_node(&self.store, &found.node_id, session_id, false)
+        let reply = sessions::resume_on_node(&self.store, &found.node_id, session_id, cold)
             .await
             .map_err(|status| {
                 if status.code() == tonic::Code::ResourceExhausted {

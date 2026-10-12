@@ -6050,7 +6050,7 @@ impl Manager for ManagerDaemonService {
                 // A running session needs no start; a suspended one resumes
                 // on its own node (docs/session-mode.md).
                 return match self
-                    .start_session_instance(&identity, &inner.instance_id)
+                    .start_session_instance(&identity, &inner.instance_id, inner.cold)
                     .await?
                 {
                     Some(reply) => Ok(Response::new(reply)),
