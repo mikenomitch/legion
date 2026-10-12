@@ -1677,4 +1677,364 @@ mod tests {
         assert!(env.iter().any(|e| e == "HOME=/from-image"));
         assert!(!env.iter().any(|e| e == "HOME=/var/lib/postgresql"));
     }
+
+    fn caps(spec: &Value, set: &str) -> Vec<String> {
+        spec["process"]["capabilities"][set]
+            .as_array()
+            .expect("capability set")
+            .iter()
+            .map(|cap| cap.as_str().expect("name").to_string())
+            .collect()
+    }
+
+    /// Stock images chown their directories and drop to a service user at
+    /// start (nginx, the Postgres entrypoint's `su-exec`/`gosu`). The default
+    /// spec must grant what that takes, as Docker does — and withhold
+    /// `CAP_NET_RAW`, because a Legion container shares the node's network.
+    #[test]
+    fn the_default_spec_grants_dockers_capabilities_without_net_raw() {
+        let spec = spec_with(None);
+        let bounding = caps(&spec, "bounding");
+        for needed in [
+            "CAP_CHOWN",
+            "CAP_DAC_OVERRIDE",
+            "CAP_FOWNER",
+            "CAP_FSETID",
+            "CAP_SETUID",
+            "CAP_SETGID",
+            "CAP_KILL",
+            "CAP_NET_BIND_SERVICE",
+            "CAP_AUDIT_WRITE",
+        ] {
+            assert!(bounding.iter().any(|cap| cap == needed), "{needed} in {bounding:?}");
+        }
+        assert!(!bounding.iter().any(|cap| cap == "CAP_NET_RAW"));
+        assert!(!bounding.iter().any(|cap| cap == "CAP_SYS_ADMIN"));
+        assert_eq!(bounding.len(), DEFAULT_CAPABILITIES.len());
+        // One set, applied to bounding, effective, and permitted alike;
+        // nothing inheritable or ambient.
+        assert_eq!(caps(&spec, "effective"), bounding);
+        assert_eq!(caps(&spec, "permitted"), bounding);
+        assert!(spec["process"]["capabilities"]["inheritable"].is_null());
+        assert!(spec["process"]["capabilities"]["ambient"].is_null());
+        assert_eq!(spec["process"]["noNewPrivileges"], true);
+    }
+
+    /// The open-file limit is no longer the OCI runtime's hard 1024.
+    #[test]
+    fn the_default_spec_raises_the_open_file_limit() {
+        let spec = spec_with(None);
+        let rlimits = spec["process"]["rlimits"].as_array().expect("rlimits");
+        let nofile = rlimits
+            .iter()
+            .find(|limit| limit["type"] == "RLIMIT_NOFILE")
+            .expect("RLIMIT_NOFILE set");
+        let soft = nofile["soft"].as_u64().unwrap();
+        assert_eq!(soft, nofile["hard"].as_u64().unwrap());
+        assert!(soft <= DEFAULT_NOFILE);
+        // Only a host whose own limits are lower than that clamps it.
+        if running_as_root() {
+            let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_NOFILE);
+            assert_eq!(soft, DEFAULT_NOFILE.min(nr_open));
+        }
+    }
+
+    #[test]
+    fn capability_adjustments_follow_docker_semantics() -> R<()> {
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Nothing adjusted: the default set.
+        assert_eq!(resolve_capabilities(&[], &[])?, default_capabilities());
+
+        // Names are case-insensitive and the CAP_ prefix is optional.
+        let caps = resolve_capabilities(&names(&["net_raw", "CAP_SYS_PTRACE"]), &names(&["mknod"]))?;
+        assert!(caps.contains(&"CAP_NET_RAW".to_string()));
+        assert!(caps.contains(&"CAP_SYS_PTRACE".to_string()));
+        assert!(!caps.contains(&"CAP_MKNOD".to_string()));
+        assert!(caps.contains(&"CAP_CHOWN".to_string()), "defaults kept");
+
+        // drop = ALL starts from nothing.
+        assert_eq!(
+            resolve_capabilities(&names(&["NET_BIND_SERVICE"]), &names(&["all"]))?,
+            vec!["CAP_NET_BIND_SERVICE".to_string()]
+        );
+        assert!(resolve_capabilities(&[], &names(&["ALL"]))?.is_empty());
+
+        // add = ALL is every capability, less what drop names.
+        let everything = resolve_capabilities(&names(&["ALL"]), &names(&["SYS_ADMIN"]))?;
+        assert_eq!(everything.len(), ALL_CAPABILITIES.len() - 1);
+        assert!(!everything.contains(&"CAP_SYS_ADMIN".to_string()));
+
+        // A name in both lists ends up granted, as in Docker.
+        assert!(resolve_capabilities(&names(&["NET_RAW"]), &names(&["NET_RAW"]))?
+            .contains(&"CAP_NET_RAW".to_string()));
+
+        // Typos fail loudly, naming the list.
+        let err = resolve_capabilities(&names(&["NET_ADMINN"]), &[]).unwrap_err();
+        assert!(err.to_string().contains("security.capabilities.add"), "{err}");
+        assert!(err.to_string().contains("NET_ADMINN"), "{err}");
+        let err = resolve_capabilities(&names(&["ALL"]), &names(&["ALL"])).unwrap_err();
+        assert!(err.to_string().contains("both add and drop"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn ulimits_replace_the_matching_default_and_validate() -> R<()> {
+        let parse = |value: Value| -> R<Vec<Rlimit>> {
+            let map: BTreeMap<String, Value> = serde_json::from_value(value)?;
+            resolve_rlimits(&map)
+        };
+
+        // Nothing declared: the defaults.
+        assert_eq!(parse(json!({}))?, default_rlimits());
+
+        // A bare number sets soft and hard; the declared nofile replaces the
+        // default one instead of adding a second entry.
+        let limits = parse(json!({ "nofile": 65536, "nproc": { "soft": 1024, "hard": 4096 } }))?;
+        let nofile: Vec<&Rlimit> = limits
+            .iter()
+            .filter(|limit| limit.kind == "RLIMIT_NOFILE")
+            .collect();
+        assert_eq!(nofile.len(), 1);
+        assert_eq!((nofile[0].soft, nofile[0].hard), (65536, 65536));
+        let nproc = limits
+            .iter()
+            .find(|limit| limit.kind == "RLIMIT_NPROC")
+            .expect("nproc");
+        assert_eq!((nproc.soft, nproc.hard), (1024, 4096));
+
+        // "unlimited" is RLIM_INFINITY.
+        let limits = parse(json!({ "memlock": "unlimited" }))?;
+        let memlock = limits
+            .iter()
+            .find(|limit| limit.kind == "RLIMIT_MEMLOCK")
+            .expect("memlock");
+        assert_eq!(memlock.hard, u64::MAX);
+
+        for (bad, needle) in [
+            (json!({ "nofiles": 10 }), "unknown ulimit"),
+            (json!({ "nofile": { "soft": 10, "hard": 5 } }), "must not exceed"),
+            (json!({ "nofile": { "soft": 10 } }), "both soft and hard"),
+            (json!({ "nofile": -1 }), "non-negative"),
+            (json!({ "nofile": "lots" }), "unlimited"),
+            (json!({ "nofile": { "soft": 1, "hard": 2, "max": 3 } }), "unknown field"),
+        ] {
+            let err = parse(bad.clone()).expect_err("rejected");
+            assert!(err.to_string().contains(needle), "{bad}: {err}");
+        }
+        Ok(())
+    }
+
+    /// A jobspec's capability set and rlimits reach the generated spec.
+    #[test]
+    fn a_task_policy_lands_in_the_spec() -> R<()> {
+        let policy = ProcessPolicy {
+            capabilities: resolve_capabilities(&["NET_RAW".to_string()], &["ALL".to_string()])?,
+            rlimits: vec![Rlimit {
+                kind: "RLIMIT_NOFILE".into(),
+                soft: 4096,
+                hard: 8192,
+            }],
+        };
+        let spec = build_spec(
+            &["true".to_string()],
+            &HashMap::new(),
+            &bare_image(),
+            &ResolvedUser::default(),
+            &BundleContext {
+                hostname: "h",
+                volumes: &[],
+                task_dir: None,
+                assignment: None,
+                resolver: None,
+                resolv_conf: None,
+                netns: None,
+                policy: &policy,
+            },
+        );
+        assert_eq!(caps(&spec, "bounding"), vec!["CAP_NET_RAW".to_string()]);
+        assert_eq!(
+            spec["process"]["rlimits"],
+            json!([{ "type": "RLIMIT_NOFILE", "soft": 4096, "hard": 8192 }])
+        );
+        Ok(())
+    }
+
+    /// One PAX extended-header record: `"<len> <key>=<value>\n"`, where the
+    /// length counts the whole record including its own digits.
+    fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+        let body_len = 1 + key.len() + 1 + value.len() + 1;
+        let mut len = body_len + 1;
+        while len.to_string().len() + body_len != len {
+            len = len.to_string().len() + body_len;
+        }
+        let mut record = format!("{len} {key}=").into_bytes();
+        record.extend_from_slice(value);
+        record.push(b'\n');
+        record
+    }
+
+    /// A synthetic image layer the way `RUN chown`/`chmod u+s`/`setcap`
+    /// leave one: a directory owned by a service user, a setuid binary, and a
+    /// file carrying an extended attribute.
+    fn ownership_layer(dir: &Path) -> R<PathBuf> {
+        let blob = dir.join("layer.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&blob)?);
+
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_path("var/cache/nginx/")?;
+        header.set_mode(0o755);
+        header.set_uid(101);
+        header.set_gid(102);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, std::io::empty())?;
+
+        let mut header = tar::Header::new_ustar();
+        header.set_path("usr/bin/helper")?;
+        header.set_mode(0o4755);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_size(2);
+        header.set_cksum();
+        builder.append(&header, &b"#!"[..])?;
+
+        // A PAX header carrying an xattr for the entry that follows.
+        let records = [
+            pax_record("SCHILY.xattr.user.legion-test", b"kept"),
+            pax_record("SCHILY.xattr.trusted.overlay.opaque", b"y"),
+        ]
+        .concat();
+        let mut pax = tar::Header::new_ustar();
+        pax.set_entry_type(tar::EntryType::XHeader);
+        pax.set_path("PaxHeaders/data")?;
+        pax.set_size(records.len() as u64);
+        pax.set_mode(0o644);
+        pax.set_cksum();
+        builder.append(&pax, records.as_slice())?;
+        let mut header = tar::Header::new_ustar();
+        header.set_path("var/cache/nginx/data")?;
+        header.set_mode(0o640);
+        header.set_uid(101);
+        header.set_gid(102);
+        header.set_size(2);
+        header.set_cksum();
+        builder.append(&header, &b"ok"[..])?;
+
+        builder.finish()?;
+        Ok(blob)
+    }
+
+    /// The root cause of "a `chown nginx` in the image shows up as 0:0":
+    /// extraction dropped every owner. As root it now keeps owners, the
+    /// setuid bit (applied after the chown that would clear it), and the
+    /// layer's extended attributes.
+    #[test]
+    fn extraction_as_root_keeps_owners_setuid_bits_and_xattrs() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        if !running_as_root() {
+            // Only root can chown to another user; the non-root path is
+            // covered below.
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let blob = ownership_layer(dir.path())?;
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        extract_layer_as(&blob, &rootfs, true)?;
+
+        let cache = std::fs::metadata(rootfs.join("var/cache/nginx"))?;
+        assert_eq!((cache.uid(), cache.gid()), (101, 102));
+        let data = std::fs::metadata(rootfs.join("var/cache/nginx/data"))?;
+        assert_eq!((data.uid(), data.gid()), (101, 102));
+        assert_eq!(data.mode() & 0o7777, 0o640);
+        let helper = std::fs::metadata(rootfs.join("usr/bin/helper"))?;
+        assert_eq!(helper.mode() & 0o7777, 0o4755, "setuid bit kept");
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let read = |name: &str| -> Option<Vec<u8>> {
+                let path = std::ffi::CString::new(
+                    rootfs.join("var/cache/nginx/data").as_os_str().as_bytes(),
+                )
+                .unwrap();
+                let name = std::ffi::CString::new(name).unwrap();
+                let mut buf = [0u8; 64];
+                // SAFETY: valid NUL-terminated strings and a sized buffer.
+                let len = unsafe {
+                    libc::lgetxattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                    )
+                };
+                (len >= 0).then(|| buf[..len as usize].to_vec())
+            };
+            // Filesystems without user xattrs (some tmpfs) skip it; where the
+            // host supports it, the value arrives intact.
+            if let Some(value) = read("user.legion-test") {
+                assert_eq!(value, b"kept");
+            }
+            assert_eq!(read("trusted.overlay.opaque"), None, "overlay bookkeeping skipped");
+        }
+        Ok(())
+    }
+
+    /// A worker that is not root cannot chown, so extraction must not try:
+    /// everything belongs to the worker's own user and the start succeeds.
+    #[test]
+    fn extraction_without_root_keeps_modes_and_skips_owners() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir()?;
+        let blob = ownership_layer(dir.path())?;
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        extract_layer_as(&blob, &rootfs, false)?;
+        // SAFETY: geteuid cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let data = std::fs::metadata(rootfs.join("var/cache/nginx/data"))?;
+        assert_eq!(data.uid(), me);
+        assert_eq!(data.mode() & 0o777, 0o640);
+        Ok(())
+    }
+
+    /// Non-root containers reopen `/dev/stdout` (`/proc/self/fd/1`), which
+    /// checks the log file's own permissions. The files are handed to the
+    /// container's user; the directory stays owner-only.
+    #[test]
+    fn task_logs_are_handed_to_the_container_user() -> R<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !running_as_root() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700))?;
+        for file in ["stdout.log", "stderr.log"] {
+            std::fs::write(log_dir.join(file), b"")?;
+        }
+
+        hand_task_logs_to(Some(&log_dir), 101, 101);
+        for file in ["stdout.log", "stderr.log"] {
+            let meta = std::fs::metadata(log_dir.join(file))?;
+            assert_eq!((meta.uid(), meta.gid()), (101, 101), "{file}");
+        }
+        let dir_meta = std::fs::metadata(&log_dir)?;
+        assert_eq!(dir_meta.uid(), 0, "the directory stays the worker's");
+        assert_eq!(dir_meta.mode() & 0o777, 0o700);
+
+        // A later start as root hands them back.
+        hand_task_logs_to(Some(&log_dir), 0, 0);
+        assert_eq!(std::fs::metadata(log_dir.join("stdout.log"))?.uid(), 0);
+        // No log dir: nothing to do, and no panic.
+        hand_task_logs_to(None, 101, 101);
+        Ok(())
+    }
 }

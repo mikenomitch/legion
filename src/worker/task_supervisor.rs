@@ -222,7 +222,7 @@ mod task_supervisor_test {
         let task = task(
             TaskLifecycle::Batch,
             Some(TaskRestartConfig {
-                policy: RestartPolicy::Never,
+                policy: Some(RestartPolicy::Never),
                 ..Default::default()
             }),
         );
@@ -238,7 +238,7 @@ mod task_supervisor_test {
         let task = task(
             TaskLifecycle::Batch,
             Some(TaskRestartConfig {
-                policy: RestartPolicy::OnFailure,
+                policy: Some(RestartPolicy::OnFailure),
                 success_exit_codes: vec![0, 2],
                 ..Default::default()
             }),
@@ -257,7 +257,7 @@ mod task_supervisor_test {
         let task = task(
             TaskLifecycle::Batch,
             Some(TaskRestartConfig {
-                policy: RestartPolicy::Never,
+                policy: Some(RestartPolicy::Never),
                 ..Default::default()
             }),
         );

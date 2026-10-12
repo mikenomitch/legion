@@ -1,5 +1,5 @@
 use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
-use crate::cmd::output::{self, OutputFormat};
+use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
     DeleteKvRequest, GetKvRequest, KvEntry, KvValueType, ListKvRequest, PatchKvRequest,
@@ -272,11 +272,22 @@ async fn get_kv(key: &str, format: OutputFormat) -> R<()> {
     )?;
     match response.into_inner().entry {
         Some(entry) => print_entry(&entry, format)?,
-        None if format.is_json() => output::print_success(&Value::Null),
-        None => println!("kv entry not found"),
+        // A missing key is a failure, in both formats: `{ok:false}` with
+        // `NotFound` and a non-zero exit, so `legion kv get k || legion kv put
+        // k v` does what it reads like (docs/kv-store.md).
+        None => return Err(output::fail_local(format, missing_key_error(key))),
     }
 
     Ok(())
+}
+
+/// The error `kv get` reports for a key with no entry.
+fn missing_key_error(key: &str) -> CliError {
+    CliError::local(
+        "NotFound",
+        format!("kv key {key} not found"),
+        Some("`legion kv list` shows the keys that exist; `legion kv put` creates one"),
+    )
 }
 
 #[instrument(err, skip_all)]
@@ -379,4 +390,21 @@ fn print_entry(entry: &KvEntry, format: OutputFormat) -> R<()> {
     println!("Value:\n{}", entry.value);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_key_is_a_not_found_failure() {
+        // P2-3: `kv get` on a missing key used to exit 0 with
+        // `{ok:true,data:null}`, which breaks `kv get || kv put`.
+        let err = missing_key_error("app/flag");
+        assert_eq!(err.code, "NotFound");
+        assert!(err.message.contains("app/flag"));
+        assert!(!err.retryable);
+        let human = output::fail_local(OutputFormat::Human, err);
+        assert!(human.to_string().contains("[code=NotFound]"), "{human}");
+    }
 }

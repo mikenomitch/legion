@@ -42,6 +42,10 @@ fn setup_store() -> R<Store> {
 }
 
 fn insert_node(store: &Store, id: &str) -> R<()> {
+    insert_node_with(store, id, json!({}))
+}
+
+fn insert_node_with(store: &Store, id: &str, dynamic_attrs: serde_json::Value) -> R<()> {
     let node = NodeMsg {
         id: id.to_string(),
         pool: "default".into(),
@@ -55,7 +59,7 @@ fn insert_node(store: &Store, id: &str) -> R<()> {
             }
         })
         .to_string(),
-        dynamic_attrs: "{}".into(),
+        dynamic_attrs: dynamic_attrs.to_string(),
         health_checks: json!({ "worker": "pass" }).to_string(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
         heartbeat_source: String::new(),
@@ -837,6 +841,168 @@ fn allocations_without_artifacts_skip_staging_entirely() -> R<()> {
     assert!(
         entry.artifact_states.is_none(),
         "no artifact rows for plain tasks"
+    );
+    Ok(())
+}
+
+/// A node whose worker reports task exits (protocol version 2+), so the
+/// manager waits for a batch task's real exit instead of assuming success at
+/// placement.
+fn insert_supervising_node(store: &Store, id: &str) -> R<()> {
+    insert_node_with(store, id, json!({ "protocolVersion": 2 }))
+}
+
+/// Batch lifecycle end to end (spot-check P0-2): the manager dispatches a
+/// batch task through a real heartbeat reply, the worker stages its artifact
+/// and runs it, the process exits 0, the supervisor reports it terminal
+/// exactly once and never relaunches it, and the next heartbeat records
+/// allocation `complete` / task `success` and stops dispatching it.
+///
+/// Before the dispatch payload carried `lifecycle`, the worker ran every task
+/// as a service with `restart = always`: this task was relaunched every
+/// restart delay forever and its status never reached `success`.
+#[test]
+fn batch_task_completes_through_heartbeats_and_is_not_restarted() -> R<()> {
+    use legion::structs::{HeartbeatRequest, TaskStatusState, TerminatedAllocation};
+    use legion::worker::task_supervisor::handle_exit;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let store = setup_store()?;
+    let manager = ManagerDaemonService::new(store.clone());
+    insert_supervising_node(&store, "node-a")?;
+
+    let fixtures = TempDir::new()?;
+    let input = fixtures.path().join("input.txt");
+    std::fs::write(&input, "payload\n")?;
+    let runs = fixtures.path().join("runs");
+    let jobspec = json!({
+        "name": "batch-e2e",
+        "tasks": [{
+            "name": "fetch",
+            "runtime": "exec",
+            "lifecycle": "batch",
+            "artifacts": [{
+                "source": format!("file://{}", input.display()),
+                "name": "input",
+                "unpack": "file",
+            }],
+            // A restart, were one wrongly decided, lands inside the wait
+            // below rather than 30s later.
+            "restart": { "delay": "100ms" },
+            "config": {
+                "command": ["sh", "-c",
+                    format!("test -f \"$LEGION_ARTIFACT_INPUT\" && echo ran >> {}", runs.display())],
+            },
+        }],
+    })
+    .to_string();
+    runtime
+        .block_on(manager.run_job(Request::new(run_request(jobspec, "batch-e2e"))))
+        .map_err(|status| anyhow::anyhow!("run_job failed: {status}"))?;
+    while let Some(eval) = store.get_next_eval()? {
+        let id = eval.id.clone();
+        eval.handle(&store)?;
+        store.set_eval_status(&id, "complete")?;
+    }
+    let job_config_id = store.get_job_config("batch-e2e")?.id();
+    let task_status = || -> R<Option<TaskStatusState>> {
+        Ok(store
+            .task_statuses_for_job_config(&job_config_id)?
+            .into_values()
+            .next())
+    };
+    assert_eq!(
+        task_status()?,
+        Some(TaskStatusState::Running),
+        "a supervising node's batch task is running until it reports"
+    );
+
+    // The dispatch the worker actually receives.
+    let heartbeat = |terminated: Vec<TerminatedAllocation>| {
+        runtime
+            .block_on(manager.heartbeat(Request::new(HeartbeatRequest {
+                id: "node-a".into(),
+                terminated_allocations: terminated,
+                ..Default::default()
+            })))
+            .map(|reply| reply.into_inner())
+            .map_err(|status| anyhow::anyhow!("heartbeat failed: {status}"))
+    };
+    let reply = heartbeat(Vec::new())?;
+    assert_eq!(reply.desired_allocations.len(), 1);
+    let payload = reply.desired_allocations[0].clone();
+    assert_eq!(payload.task_lifecycle, "batch");
+    let allocation_id = payload.allocation_id;
+
+    let temp_dir = TempDir::new()?;
+    let worker = worker_manager(&temp_dir);
+    {
+        let worker = worker.clone();
+        runtime.block_on(tokio::task::spawn_blocking(move || {
+            launch_task_allocation(&worker, &payload)
+        }))??;
+    }
+
+    // The supervisor loop, one tick at a time.
+    let mut reports = Vec::new();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let exits = worker.lock().unwrap().poll_task_exits();
+            for exit in exits {
+                runtime.block_on(handle_exit(&worker, exit));
+            }
+            reports.extend(worker.lock().unwrap().drain_terminations());
+            !reports.is_empty()
+        }),
+        "the batch task never reported a terminal exit: {:?}",
+        worker.lock().unwrap().allocation_health_snapshot()
+    );
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].success, "{reports:?}");
+    assert_eq!(reports[0].exit_code, Some(0));
+
+    // Well past the restart delay: no relaunch, no second report, no
+    // failure, and exactly one run.
+    std::thread::sleep(Duration::from_millis(500));
+    {
+        let mut guard = worker.lock().unwrap();
+        assert!(guard.poll_task_exits().is_empty());
+        assert!(guard.drain_terminations().is_empty());
+        assert!(guard.drain_failures().is_empty());
+    }
+    assert_eq!(std::fs::read_to_string(&runs)?.lines().count(), 1);
+
+    // The worker's next heartbeat carries the terminal report.
+    let reply = heartbeat(
+        reports
+            .into_iter()
+            .map(|report| TerminatedAllocation {
+                allocation_id: report.allocation_id,
+                success: report.success,
+                exit_code: report.exit_code,
+                signal: report.signal,
+                message: report.message,
+            })
+            .collect(),
+    )?;
+    let allocation = store
+        .get_allocation_by_id(allocation_id)?
+        .context("completed allocation keeps its row")?;
+    assert_eq!(allocation.status, "complete");
+    assert_eq!(task_status()?, Some(TaskStatusState::Success));
+    // A finished allocation is never dispatched again, so the worker's
+    // reconcile releases it.
+    assert!(reply.desired_allocations.is_empty());
+    let _ = worker
+        .lock()
+        .unwrap()
+        .reconcile_allocations(&reply.desired_allocations);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            worker.lock().unwrap().reap_terminating();
+            !worker.lock().unwrap().is_allocation_active(allocation_id)
+        }),
+        "the completed allocation is released once the manager drops it"
     );
     Ok(())
 }

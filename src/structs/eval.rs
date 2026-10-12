@@ -188,10 +188,13 @@ impl Eval {
         self.schedule_batch_follow_up(store)?;
         observe_phase(&self.kind, "finish", finish_started.elapsed());
 
-        Ok(format!(
-            "Job {} submitted with {} placements",
-            self.job_id,
-            outcome.allocations.len()
+        Ok(Self::outcome_message(
+            format!(
+                "Job {} submitted with {} placements",
+                self.job_id,
+                outcome.allocations.len()
+            ),
+            &outcome,
         ))
     }
 
@@ -219,6 +222,11 @@ impl Eval {
         store.clear_job_restart_request(&self.job_id)?;
 
         store.remove_allocs_for_job(&self.job_id)?;
+        // A restart (a batch schedule's next run, a forced reschedule, a KV
+        // restart) runs the job again from the top: its tasks' statuses from
+        // the previous run must not satisfy this run's `dependsOn`, or every
+        // step of a DAG would start at once again.
+        store.reset_task_statuses(&self.job_config_id)?;
         observe_phase(&self.kind, "prepare", prepare_started.elapsed());
         let outcome = match self.schedule_job_allocations(store, PlanMode::Fresh) {
             Ok(outcome) => outcome,
@@ -243,10 +251,13 @@ impl Eval {
         self.schedule_batch_follow_up(store)?;
         observe_phase(&self.kind, "finish", finish_started.elapsed());
 
-        Ok(format!(
-            "Job {} updated with {} placements",
-            self.job_id,
-            outcome.allocations.len()
+        Ok(Self::outcome_message(
+            format!(
+                "Job {} updated with {} placements",
+                self.job_id,
+                outcome.allocations.len()
+            ),
+            &outcome,
         ))
     }
 
@@ -331,11 +342,26 @@ impl Eval {
         self.schedule_batch_follow_up(store)?;
         observe_phase(&self.kind, "finish", finish_started.elapsed());
 
-        Ok(format!(
-            "Job {} rescheduled with {} placements",
-            self.job_id,
-            outcome.allocations.len()
+        Ok(Self::outcome_message(
+            format!(
+                "Job {} rescheduled with {} placements",
+                self.job_id,
+                outcome.allocations.len()
+            ),
+            &outcome,
         ))
+    }
+
+    /// An eval's outcome line, naming what the plan left undone (replicas
+    /// no node had room for, tasks waiting on a dependency) so the
+    /// `eval.completed` event says why a job is short.
+    fn outcome_message(message: String, outcome: &PlanOutcome) -> String {
+        let shortfall = outcome.shortfall_summary();
+        if shortfall.is_empty() {
+            message
+        } else {
+            format!("{message}; {shortfall}")
+        }
     }
 
     /// Reconcile a job's allocation set to its EFFECTIVE desired counts
@@ -375,16 +401,93 @@ impl Eval {
         let init_started = Instant::now();
         let scheduler = Scheduler::new(store)?;
         observe_phase(&self.kind, "scheduler_init", init_started.elapsed());
-        let excluded = self.excluded_nodes_for_mode(&mode);
-        let outcome =
-            self.plan_with_conflict_retries(store, &scheduler, mode, excluded.as_ref())?;
+        let avoided = self.excluded_nodes_for_mode(&mode);
+        let Some(avoided) = avoided else {
+            let outcome = self.plan_with_conflict_retries(store, &scheduler, mode, None)?;
+            let dispatch_started = Instant::now();
+            dispatch_allocations(store, &outcome.allocations)?;
+            observe_phase(&self.kind, "dispatch", dispatch_started.elapsed());
+            return Ok(outcome);
+        };
 
-        let dispatch_started = Instant::now();
-        dispatch_allocations(store, &outcome.allocations)?;
-        observe_phase(&self.kind, "dispatch", dispatch_started.elapsed());
+        // A reschedule after a failure AVOIDS the node the allocation failed
+        // on rather than excluding it: the first pass plans without it, and
+        // only what that pass could not place is planned again with the node
+        // allowed. On a one- or two-node cluster the failed node is often
+        // the only one that fits, and a hard exclusion left the job with
+        // nothing ("No nodes available to place allocations") for good.
+        let first = match self.plan_with_conflict_retries(
+            store,
+            &scheduler,
+            mode.clone(),
+            Some(&avoided),
+        ) {
+            Ok(outcome) => Some(outcome),
+            Err(error)
+                if !Self::is_conflict_error(&error)
+                    && !crate::storage::raft::driver::NotRaftLeader::in_chain(&error) =>
+            {
+                info!(
+                    job_id = %self.job_id,
+                    job_config_id = %self.job_config_id,
+                    avoided_node = %self.node_name,
+                    error = %format!("{error:#}"),
+                    "Reschedule found no other node; retrying with the failed node allowed"
+                );
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let mut dispatch_time = Duration::ZERO;
+        let mut dispatch = |allocations: &[crate::structs::Allocation]| -> R<()> {
+            let started = Instant::now();
+            dispatch_allocations(store, allocations)?;
+            dispatch_time += started.elapsed();
+            Ok(())
+        };
+        let outcome = match first {
+            Some(first) if first.unplaced.is_empty() => {
+                dispatch(&first.allocations)?;
+                first
+            }
+            Some(mut first) => {
+                dispatch(&first.allocations)?;
+                match self.plan_with_conflict_retries(store, &scheduler, mode, None) {
+                    Ok(second) => {
+                        dispatch(&second.allocations)?;
+                        first.allocations.extend(second.allocations);
+                        first.deltas.extend(second.deltas);
+                        first.evictions.extend(second.evictions);
+                        first.unplaced = second.unplaced;
+                        first
+                    }
+                    // The first pass placed something and dispatched it; the
+                    // rest stays reported as unplaced on the first outcome.
+                    Err(error)
+                        if !crate::storage::raft::driver::NotRaftLeader::in_chain(&error) =>
+                    {
+                        info!(
+                            job_id = %self.job_id,
+                            error = %format!("{error:#}"),
+                            "Failed node could not take the remainder either"
+                        );
+                        first
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            None => {
+                let outcome = self.plan_with_conflict_retries(store, &scheduler, mode, None)?;
+                dispatch(&outcome.allocations)?;
+                outcome
+            }
+        };
+        observe_phase(&self.kind, "dispatch", dispatch_time);
         Ok(outcome)
     }
 
+    /// The node a reschedule should avoid: the one the failed allocation ran
+    /// on. Avoided, not excluded — see `schedule_job_allocations`.
     fn excluded_nodes_for_mode(&self, mode: &PlanMode) -> Option<HashSet<String>> {
         if matches!(mode, PlanMode::Reschedule) && !self.node_name.trim().is_empty() {
             return Some(HashSet::from([self.node_name.clone()]));

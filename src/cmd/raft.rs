@@ -1,10 +1,17 @@
-use crate::cmd::helpers::{connect_manager_client, friendly_status};
+use crate::cmd::helpers::{connect_manager_client, json_flag};
+use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 
 pub fn config() -> Command {
     Command::new("raft")
         .about("Inspect and operate manager Raft control-plane state")
-        .subcommand(Command::new("status").about("Show local manager raft status"))
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("status")
+                .about("Show local manager raft status")
+                .arg(json_flag()),
+        )
         .subcommand(
             Command::new("history")
                 .about("Show recent raft events")
@@ -15,7 +22,8 @@ pub fn config() -> Command {
                         .value_parser(clap::value_parser!(u32))
                         .default_value("25")
                         .help("Maximum number of events to return"),
-                ),
+                )
+                .arg(json_flag()),
         )
         .subcommand(
             Command::new("command")
@@ -38,7 +46,8 @@ pub fn config() -> Command {
                         .value_name("ACTOR")
                         .default_value("cli")
                         .help("Actor tag written into raft history"),
-                ),
+                )
+                .arg(json_flag()),
         )
         .subcommand(
             Command::new("join-token")
@@ -49,7 +58,8 @@ pub fn config() -> Command {
                         .value_name("ACTOR")
                         .default_value("cli")
                         .help("Actor tag written into raft history"),
-                ),
+                )
+                .arg(json_flag()),
         )
 }
 
@@ -57,12 +67,20 @@ pub fn config() -> Command {
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     let mut client = connect_manager_client().await?;
     match sub_matches.subcommand() {
-        Some(("status", _)) => {
-            let reply = client
-                .get_raft_status(crate::structs::GetRaftStatusRequest {})
-                .await
-                .map_err(|status| friendly_status("failed to fetch raft status", status))?
-                .into_inner();
+        Some(("status", args)) => {
+            let format = OutputFormat::from_matches(args);
+            let reply = output::resolve(
+                format,
+                "failed to fetch raft status",
+                client
+                    .get_raft_status(crate::structs::GetRaftStatusRequest {})
+                    .await,
+            )?
+            .into_inner();
+            if format.is_json() {
+                output::print_success(&reply.status);
+                return Ok(());
+            }
             let status = reply.status.context("raft status missing from response")?;
             println!(
                 "enabled={} backend={} node={} role={} leader={} term={} commit={} applied={}",
@@ -109,11 +127,21 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         }
         Some(("history", args)) => {
             let limit = args.get_one::<u32>("limit").copied().unwrap_or(25);
-            let reply = client
-                .list_raft_history(crate::structs::ListRaftHistoryRequest { limit: Some(limit) })
-                .await
-                .map_err(|status| friendly_status("failed to fetch raft history", status))?
-                .into_inner();
+            let format = OutputFormat::from_matches(args);
+            let reply = output::resolve(
+                format,
+                "failed to fetch raft history",
+                client
+                    .list_raft_history(crate::structs::ListRaftHistoryRequest {
+                        limit: Some(limit),
+                    })
+                    .await,
+            )?
+            .into_inner();
+            if format.is_json() {
+                output::print_success(&reply.events);
+                return Ok(());
+            }
             for event in reply.events {
                 println!(
                     "#{} {} [{}] actor={} target={} term={} leader={} {}",
@@ -138,15 +166,23 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 .get_one::<String>("actor")
                 .cloned()
                 .unwrap_or_else(|| "cli".to_string());
-            let reply = client
-                .issue_raft_command(crate::structs::IssueRaftCommandRequest {
-                    command,
-                    target_node_id,
-                    actor: Some(actor),
-                })
-                .await
-                .map_err(|status| friendly_status("failed to issue raft command", status))?
-                .into_inner();
+            let format = OutputFormat::from_matches(args);
+            let reply = output::resolve(
+                format,
+                "failed to issue raft command",
+                client
+                    .issue_raft_command(crate::structs::IssueRaftCommandRequest {
+                        command,
+                        target_node_id,
+                        actor: Some(actor),
+                    })
+                    .await,
+            )?
+            .into_inner();
+            if format.is_json() {
+                output::print_success(&reply);
+                return Ok(());
+            }
             let status = reply.status.context("raft status missing from response")?;
             let event = reply.event.context("raft event missing from response")?;
             println!(
@@ -168,11 +204,21 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 .get_one::<String>("actor")
                 .cloned()
                 .unwrap_or_else(|| "cli".to_string());
-            let reply = client
-                .get_raft_join_token(crate::structs::GetRaftJoinTokenRequest { actor: Some(actor) })
-                .await
-                .map_err(|status| friendly_status("failed to issue raft join token", status))?
-                .into_inner();
+            let format = OutputFormat::from_matches(args);
+            let reply = output::resolve(
+                format,
+                "failed to issue raft join token",
+                client
+                    .get_raft_join_token(crate::structs::GetRaftJoinTokenRequest {
+                        actor: Some(actor),
+                    })
+                    .await,
+            )?
+            .into_inner();
+            if format.is_json() {
+                output::print_success(&reply);
+                return Ok(());
+            }
             println!("token={}", reply.token);
             println!("expires_at={}", reply.expires_at);
         }

@@ -636,6 +636,19 @@ impl WorkerTaskManager {
                 }
             }
         }
+        // Removed allocations' logs stay readable (`legion job logs`) until
+        // they age out; see `logs::prune_inactive_log_dirs`.
+        let active: std::collections::HashSet<i64> = self
+            .allocations
+            .keys()
+            .chain(self.instances.keys())
+            .copied()
+            .collect();
+        crate::worker::logs::maybe_prune_inactive_log_dirs(
+            &self.state_store.logs_base_dir(),
+            &active,
+            &crate::worker::logs::LogConfig::from_env(),
+        );
     }
 
     /// Task directories live beside the worker state file:
@@ -2589,7 +2602,10 @@ impl WorkerTaskManager {
             .registry
             .plugin(&task.runtime)
             .context("Task plugin not loaded")?;
-        let log_dir = self.state_store.allocation_log_dir(allocation.id);
+        let log_dir = crate::worker::logs::claim_allocation_log_dir(
+            self.state_store.allocation_log_dir(allocation.id),
+            &crate::worker::logs::LogDirOwner::for_allocation(allocation, &task.name),
+        );
         let instance = self
             .instances
             .get_mut(&allocation.id)
@@ -2669,8 +2685,7 @@ impl WorkerTaskManager {
         }
 
         if let Some(log_dir) = instance.log_dir.as_deref() {
-            self.stderr_marks
-                .insert(allocation.id, stderr_len(log_dir));
+            self.stderr_marks.insert(allocation.id, stderr_len(log_dir));
         }
 
         if let Some(restore) = self.checkpoints.restores.get(&allocation.id).cloned() {
@@ -3300,7 +3315,10 @@ impl WorkerTaskManager {
                     task.name
                 )
             })?;
-        let log_dir = self.state_store.allocation_log_dir(allocation.id);
+        let log_dir = crate::worker::logs::claim_allocation_log_dir(
+            self.state_store.allocation_log_dir(allocation.id),
+            &crate::worker::logs::LogDirOwner::for_allocation(allocation, &task.name),
+        );
         self.stderr_marks
             .insert(allocation.id, stderr_len(&log_dir));
         instance.log_dir = Some(log_dir);
@@ -3565,8 +3583,7 @@ impl WorkerTaskManager {
 
         plugin.stop(allocation, task, instance)?;
         if let Some(log_dir) = instance.log_dir.as_deref() {
-            self.stderr_marks
-                .insert(allocation_id, stderr_len(log_dir));
+            self.stderr_marks.insert(allocation_id, stderr_len(log_dir));
         }
         plugin.start(allocation, task, instance)?;
         // A relaunched process is a live process again: drop the terminal flag
@@ -4661,6 +4678,8 @@ mod tests {
             task_suspend: String::new(),
             task_snapshots: String::new(),
             identity_epoch: 0,
+            task_lifecycle: String::new(),
+            task_restart: String::new(),
         }
     }
 
@@ -7619,5 +7638,343 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// P0-2: lifecycle and restart ride the dispatch payload. Before they
+    /// did, the worker rebuilt every task as a service with `restart =
+    /// always`, so a batch task that exited 0 was relaunched forever.
+    #[test]
+    fn dispatch_payload_carries_lifecycle_and_restart_policy() -> R<()> {
+        let batch = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            lifecycle: crate::structs::TaskLifecycle::Batch,
+            ..TaskConfig::new("fetch", "exec")
+        };
+        let wire = crate::manager::dispatcher::build_task_allocation(&batch, &alloc(), None, &[])?;
+        assert_eq!(wire.task_lifecycle, "batch");
+        // Undeclared stays undeclared: the policy follows the lifecycle.
+        assert_eq!(wire.task_restart, "");
+        let (_, parsed) = task_from_allocation(&wire)?;
+        assert_eq!(parsed.lifecycle, crate::structs::TaskLifecycle::Batch);
+        assert_eq!(parsed.restart, None);
+        assert_eq!(
+            parsed.restart_policy(),
+            crate::structs::RestartPolicy::OnFailure
+        );
+
+        let declared = TaskConfig {
+            restart: Some(crate::structs::TaskRestartConfig {
+                policy: Some(crate::structs::RestartPolicy::Never),
+                delay: Some(Duration::from_secs(5)),
+                success_exit_codes: vec![0, 3],
+            }),
+            ..batch.clone()
+        };
+        let wire =
+            crate::manager::dispatcher::build_task_allocation(&declared, &alloc(), None, &[])?;
+        let (_, parsed) = task_from_allocation(&wire)?;
+        assert_eq!(parsed.restart, declared.restart);
+        assert_eq!(
+            parsed.restart_policy(),
+            crate::structs::RestartPolicy::Never
+        );
+        assert!(parsed.exit_code_is_success(Some(3)));
+        assert_eq!(parsed.restart_delay(), Duration::from_secs(5));
+
+        // A block that only tunes the delay keeps the lifecycle's policy.
+        let delay_only = TaskConfig {
+            restart: Some(crate::structs::TaskRestartConfig {
+                delay: Some(Duration::from_secs(1)),
+                ..Default::default()
+            }),
+            ..batch
+        };
+        let wire =
+            crate::manager::dispatcher::build_task_allocation(&delay_only, &alloc(), None, &[])?;
+        let (_, parsed) = task_from_allocation(&wire)?;
+        assert_eq!(
+            parsed.restart_policy(),
+            crate::structs::RestartPolicy::OnFailure
+        );
+
+        // A hand-built payload with no lifecycle is a service.
+        let legacy = TaskAllocation {
+            task_lifecycle: String::new(),
+            ..wire
+        };
+        let (_, parsed) = task_from_allocation(&legacy)?;
+        assert_eq!(parsed.lifecycle, crate::structs::TaskLifecycle::Service);
+        Ok(())
+    }
+
+    /// P0-2 end to end on the worker: a batch task dispatched through the
+    /// real payload exits 0, is reported terminal-successful exactly once,
+    /// and is not relaunched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_task_exiting_zero_completes_and_is_not_restarted() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let runs = temp_dir.path().join("runs");
+        let mut task = TaskConfig {
+            config: json!({
+                "command": ["sh", "-c", format!("echo ran >> {}", runs.display())],
+            }),
+            lifecycle: crate::structs::TaskLifecycle::Batch,
+            ..TaskConfig::new("fetch", "exec")
+        };
+        // A restart, were one (wrongly) decided, would land well inside the
+        // test's wait below.
+        task.on_unhealthy.restart_delay = Duration::from_millis(50);
+        let payload =
+            crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+        let launcher = manager.clone();
+        tokio::task::spawn_blocking(move || launch_task_allocation(&launcher, &payload)).await??;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut exits = Vec::new();
+        while exits.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the task never exited"
+            );
+            exits = manager.lock().unwrap().poll_task_exits();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].exit_code, Some(0));
+        assert_eq!(exits[0].stderr_tail, None, "a success carries no stderr");
+        crate::worker::task_supervisor::handle_exit(&manager, exits.remove(0)).await;
+
+        let reports = manager.lock().unwrap().drain_terminations();
+        assert_eq!(reports.len(), 1, "one terminal report: {reports:?}");
+        assert!(reports[0].success);
+        assert_eq!(reports[0].exit_code, Some(0));
+        assert_eq!(reports[0].message, "exited with status 0");
+
+        // Well past the restart delay: still exactly one run, nothing new to
+        // report, and the allocation is held (not relaunched, not failed)
+        // until the manager drops it from the desired set.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut guard = manager.lock().unwrap();
+        assert!(guard.poll_task_exits().is_empty());
+        assert!(guard.drain_terminations().is_empty());
+        assert!(guard.drain_failures().is_empty());
+        assert!(guard.is_allocation_active(alloc().id));
+        assert!(guard.process_exit(alloc().id).is_some());
+        drop(guard);
+        assert_eq!(std::fs::read_to_string(&runs)?.lines().count(), 1);
+        Ok(())
+    }
+
+    /// P1-9: a failed exit carries what the process said on stderr, from
+    /// this run only, into the reason the user sees.
+    #[test]
+    fn failed_exit_carries_the_tail_of_this_runs_stderr() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({
+                "command": ["sh", "-c",
+                    "echo progress; echo 'line one' >&2; \
+                     echo 'Error: pull failed: 429 Too Many Requests' >&2; exit 3"],
+            }),
+            ..TaskConfig::new("puller", "exec")
+        };
+        // An earlier run's output must not be blamed on this one.
+        let log_dir = manager.state_store.allocation_log_dir(alloc().id);
+        std::fs::create_dir_all(&log_dir)?;
+        std::fs::write(
+            log_dir.join(crate::task_plugins::STDERR_LOG_FILE),
+            "stale error from a previous run\n",
+        )?;
+        manager.run_allocation(&alloc(), &task)?;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let exit = loop {
+            if let Some(exit) = manager.poll_task_exits().pop() {
+                break exit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the task never exited"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(exit.exit_code, Some(3));
+        let tail = exit.stderr_tail.clone().expect("stderr tail");
+        assert_eq!(tail, "line one | Error: pull failed: 429 Too Many Requests");
+        assert_eq!(exit.describe(), "exited with status 3");
+        assert_eq!(
+            exit.describe_with_output(),
+            "exited with status 3; last stderr: line one | Error: pull failed: 429 Too Many \
+             Requests"
+        );
+        manager.stop_allocation(alloc().id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stderr_tail_is_bounded_and_keeps_the_end() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join(crate::task_plugins::STDERR_LOG_FILE);
+        assert_eq!(stderr_tail(temp_dir.path(), 0), None, "no file");
+        std::fs::write(&path, "\n\n  \n")?;
+        assert_eq!(stderr_tail(temp_dir.path(), 0), None, "only blank lines");
+
+        let long = "x".repeat(STDERR_TAIL_MAX_CHARS * 2);
+        std::fs::write(&path, format!("a\nb\nc\nd\n{long}END\n"))?;
+        let tail = stderr_tail(temp_dir.path(), 0).expect("tail");
+        assert!(tail.starts_with('…'), "{tail}");
+        assert!(tail.ends_with("END"), "{tail}");
+        assert_eq!(tail.chars().count(), STDERR_TAIL_MAX_CHARS + 1);
+
+        // A mark past the end (the file was rotated) reads what is there.
+        std::fs::write(&path, "fresh\n")?;
+        assert_eq!(
+            stderr_tail(temp_dir.path(), 10_000).as_deref(),
+            Some("fresh")
+        );
+        Ok(())
+    }
+
+    /// A passing `exec` health check, run every `every`.
+    fn exec_check(every: Duration) -> TaskCheck {
+        TaskCheck {
+            check_type: TaskCheckType::Health,
+            name: Some("always-ok".into()),
+            kind: TaskCheckKind::Exec,
+            command: Some(vec!["true".into()]),
+            path: None,
+            port: None,
+            every,
+            timeout: Duration::from_secs(5),
+            unhealthy_after_count: 3,
+            boot_grace_time: None,
+            unhealthy_after_count_timespan: None,
+        }
+    }
+
+    /// P0-3: an artifact-bearing task starts on the staging thread, which
+    /// must run its health monitor inside the worker's runtime. It used to
+    /// call `tokio::spawn` on a bare OS thread, panic, and leave the
+    /// allocation at "health checks starting" forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn staged_task_gets_a_running_health_monitor() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        manager.lock().unwrap().configure_artifacts(
+            WorkerArtifactFetchConfigFull {
+                allowed_schemes: vec!["file".into()],
+                ..Default::default()
+            },
+            Box::new(crate::artifacts::AnonymousCredentials),
+        );
+        let source = temp_dir.path().join("tool.sh");
+        std::fs::write(&source, "#!/bin/sh\nsleep 30\n")?;
+        let mut artifact = ArtifactSpec::from_source(format!("file://{}", source.display()));
+        artifact.name = Some("tool".into());
+        artifact.unpack = crate::structs::ArtifactUnpack::File;
+        let task = TaskConfig {
+            config: json!({ "command": ["sleep", "30"] }),
+            artifacts: vec![artifact],
+            checks: vec![exec_check(Duration::from_millis(50))],
+            ..TaskConfig::new("staged", "exec")
+        };
+        let payload =
+            crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+        let launcher = manager.clone();
+        // The production call site: a blocking closure on the worker runtime.
+        tokio::task::spawn_blocking(move || launch_task_allocation(&launcher, &payload)).await??;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let health = manager
+                .lock()
+                .unwrap()
+                .allocation_health_snapshot()
+                .into_iter()
+                .find(|entry| entry.allocation_id == alloc().id);
+            if health.as_ref().is_some_and(|entry| entry.healthy) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the staged task never became healthy: {health:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(manager
+            .lock()
+            .unwrap()
+            .health_monitors
+            .contains_key(&alloc().id));
+        manager.lock().unwrap().stop_allocation(alloc().id)?;
+        Ok(())
+    }
+
+    /// The defensive half of P0-3: a caller with no runtime gets a visible
+    /// status and an error log, not a silently dead thread.
+    #[test]
+    fn health_monitor_without_a_runtime_says_so_instead_of_panicking() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let task = TaskConfig {
+            checks: vec![exec_check(Duration::from_secs(1))],
+            ..TaskConfig::new("checked", "exec")
+        };
+        thread::spawn({
+            let manager = manager.clone();
+            move || spawn_health_monitor(manager, alloc(), task)
+        })
+        .join()
+        .expect("spawning a monitor without a runtime must not panic");
+        let guard = manager.lock().unwrap();
+        let health = guard
+            .allocation_health
+            .get(&alloc().id)
+            .context("health entry")?;
+        assert!(!health.healthy);
+        assert!(
+            health.status.contains("could not start"),
+            "{}",
+            health.status
+        );
+        assert!(!guard.health_monitors.contains_key(&alloc().id));
+        Ok(())
+    }
+
+    /// P1-1: the governor follows the configuration it is handed, not
+    /// whatever the environment held when the task manager was built.
+    #[test]
+    fn resource_enforcement_follows_the_explicit_config() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut manager = manager_in(&temp_dir);
+        assert!(
+            !manager.resource_enforcement_enabled(),
+            "a fresh task manager governs nothing until configured"
+        );
+        let disabled = crate::structs::WorkerResourceEnforcementConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(!manager.configure_resource_enforcement(&disabled));
+        assert!(!manager.resource_enforcement_enabled());
+
+        // Enabled where the node can enforce, and an honest "no" elsewhere —
+        // the answer the worker logs.
+        let enabled = crate::structs::WorkerResourceEnforcementConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let can_enforce =
+            crate::worker::resources::NodeResourceGovernor::from_settings(true, "legion").enabled();
+        if !cfg!(target_os = "linux") {
+            assert!(!can_enforce, "nothing is enforced off Linux");
+        }
+        assert_eq!(
+            manager.configure_resource_enforcement(&enabled),
+            can_enforce
+        );
+        assert_eq!(manager.resource_enforcement_enabled(), can_enforce);
     }
 }

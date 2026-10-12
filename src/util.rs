@@ -85,7 +85,13 @@ fn default_plugin_root(exe_dir: Option<&Path>, build_dir: &Path) -> PathBuf {
     let mut candidates = Vec::new();
     if let Some(exe_dir) = exe_dir {
         candidates.push(exe_dir.join("plugins"));
-        candidates.push(exe_dir.join("..").join("lib").join("legion").join("plugins"));
+        candidates.push(
+            exe_dir
+                .join("..")
+                .join("lib")
+                .join("legion")
+                .join("plugins"),
+        );
     }
     candidates.push(build_dir.join("plugins"));
     candidates
@@ -107,10 +113,7 @@ mod tests {
         let build = root.path().join("src");
         std::fs::create_dir_all(bin.join("plugins")).expect("bundle dir");
         std::fs::create_dir_all(build.join("plugins")).expect("checkout dir");
-        assert_eq!(
-            default_plugin_root(Some(&bin), &build),
-            bin.join("plugins")
-        );
+        assert_eq!(default_plugin_root(Some(&bin), &build), bin.join("plugins"));
     }
 
     #[test]

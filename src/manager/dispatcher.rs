@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::RuntimeFlavor;
 use tokio::sync::Semaphore;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 /// Cap on concurrently in-flight `PostWork` sends across all evals.
 ///
@@ -24,33 +24,6 @@ const MAX_IN_FLIGHT_DISPATCHES: usize = 512;
 fn dispatch_permits() -> Arc<Semaphore> {
     static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     Arc::clone(PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT_DISPATCHES))))
-}
-
-/// Process-wide worker channel cache.
-///
-/// `dispatch_allocations` used to build a fresh lazy channel per CALL, so
-/// every eval re-dialed every worker it placed onto — a sampled manager
-/// under load showed `__connect` among its top kernel calls (~350
-/// connects/sec locally; an eval touching 44 workers at rig rates implies
-/// ~1,300/sec). A tonic `Channel` multiplexes and reconnects on its own,
-/// so one per worker address for the life of the process is the correct
-/// shape. Entries are never evicted: the value is a cheap handle, the key
-/// space is the fleet's address set, and a dead worker's channel simply
-/// fails sends until the address disappears from placements.
-fn cached_worker_client(address: &str) -> R<WorkerClient<Channel>> {
-    static CLIENTS: OnceLock<std::sync::Mutex<HashMap<String, WorkerClient<Channel>>>> =
-        OnceLock::new();
-    let cache = CLIENTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache
-        .lock()
-        .map_err(|_| anyhow::anyhow!("worker client cache poisoned"))?;
-    if let Some(client) = guard.get(address) {
-        return Ok(client.clone());
-    }
-    let endpoint = Endpoint::from_shared(address.to_owned())?;
-    let client = WorkerClient::new(endpoint.connect_lazy());
-    guard.insert(address.to_owned(), client.clone());
-    Ok(client)
 }
 
 #[instrument(err, skip_all)]
@@ -100,13 +73,23 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         let node = node_cache
             .get(&allocation.node_id)
             .context("Missing node in cache")?;
-        let Some(worker_address) = worker_address_for_node(node) else {
-            warn!(
-                node_id = %allocation.node_id,
-                "Skipping allocation dispatch; worker address missing"
-            );
-            continue;
+        // The worker plane factory caches one mTLS channel per (node name,
+        // address) for the life of the process, so the handshake amortizes
+        // to nothing (`crate::manager::worker_plane`). A node it cannot dial
+        // (no address, a pre-protocol-3 plaintext address) is skipped: the
+        // heartbeat reply carries the allocation anyway.
+        let target = match crate::manager::worker_plane::target(store, node) {
+            Ok(target) => target,
+            Err(err) => {
+                warn!(
+                    node_id = %allocation.node_id,
+                    error = %err,
+                    "Skipping push dispatch; the next heartbeat delivers the allocation"
+                );
+                continue;
+            }
         };
+        let worker_address = target.key.clone();
 
         let instance = match allocation.instance_id.as_deref() {
             Some(instance_id) => store.get_instance(instance_id)?,
@@ -123,10 +106,7 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         };
 
         if !clients.contains_key(&worker_address) {
-            clients.insert(
-                worker_address.clone(),
-                cached_worker_client(&worker_address)?,
-            );
+            clients.insert(worker_address.clone(), target.client);
         }
         pending.push((
             worker_address,
@@ -319,15 +299,22 @@ fn speculative_claim_for(
     };
 
     let node = store.get_node(node_id)?;
-    if worker_protocol_version(&node) < MIN_PROVISIONAL_PROTOCOL_VERSION {
+    if crate::manager::worker_plane::node_protocol_version(&node) < MIN_PROVISIONAL_PROTOCOL_VERSION
+    {
         debug!(
             node_id,
             "Node predates provisional dispatch; falling back to post-commit dispatch"
         );
         return Ok(None);
     }
-    let Some(worker_address) = worker_address_for_node(&node) else {
-        return Ok(None);
+    // The worker plane (mTLS, node name verified). A node it cannot dial
+    // falls back to post-commit dispatch, like an old one.
+    let target = match crate::manager::worker_plane::target(store, &node) {
+        Ok(target) => target,
+        Err(err) => {
+            debug!(node_id, error = %err, "Speculative dispatch skipped");
+            return Ok(None);
+        }
     };
 
     let claim_id = crate::structs::edge_boot::new_claim_id();
@@ -358,13 +345,13 @@ fn speculative_claim_for(
     let payload = build_task_allocation_with(task, &allocation, None, &[], Some(provisional))?;
 
     let sent = run_dispatch_future(async {
-        let endpoint = Endpoint::from_shared(worker_address.clone())?;
-        let mut client = WorkerClient::new(endpoint.connect_lazy());
+        let mut client = target.client.clone();
         client
             .post_work(crate::structs::PostWorkRequest {
                 allocation: Some(payload),
             })
-            .await?;
+            .await
+            .map_err(|status| target.explain(status))?;
         Ok::<(), anyhow::Error>(())
     });
     if let Err(err) = sent {
@@ -436,8 +423,8 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
         .get_task_config_by_id(allocation.task_config_id)?
         .with_context(|| format!("missing task config {}", allocation.task_config_id))?;
     let node = store.get_node(&allocation.node_id)?;
-    let worker_address =
-        worker_address_for_node(&node).context("worker address missing for ratification")?;
+    let target = crate::manager::worker_plane::target(store, &node)
+        .context("cannot dial the node for ratification")?;
     let instance = match allocation.instance_id.as_deref() {
         Some(instance_id) => store.get_instance(instance_id)?,
         None => None,
@@ -460,25 +447,15 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
     payload.provisional = Some(provisional);
 
     run_dispatch_future(async {
-        let endpoint = Endpoint::from_shared(worker_address.clone())?;
-        let mut client = WorkerClient::new(endpoint.connect_lazy());
+        let mut client = target.client.clone();
         client
             .post_work(crate::structs::PostWorkRequest {
                 allocation: Some(payload),
             })
-            .await?;
+            .await
+            .map_err(|status| target.explain(status))?;
         Ok::<(), anyhow::Error>(())
     })
-}
-
-/// The protocol version a node reported at registration. `0` when the node
-/// predates the field, which fences it out of provisional dispatch.
-fn worker_protocol_version(node: &crate::structs::Node) -> u64 {
-    node.config_attrs
-        .as_object()
-        .and_then(|attrs| attrs.get("protocolVersion"))
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0)
 }
 
 fn run_dispatch_future<F>(future: F) -> R<()>
@@ -497,14 +474,6 @@ where
             runtime.block_on(future)
         }
     }
-}
-
-fn worker_address_for_node(node: &crate::structs::Node) -> Option<String> {
-    let attrs = node.config_attrs.as_object()?;
-    attrs
-        .get("workerAddress")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
 }
 
 pub fn build_task_allocation(
@@ -1334,13 +1303,22 @@ mod tests {
             dynamic_attrs: json!({}),
             health_checks: json!({}),
         };
-        assert!(worker_protocol_version(&old) < MIN_PROVISIONAL_PROTOCOL_VERSION);
+        let version = crate::manager::worker_plane::node_protocol_version;
+        assert!(version(&old) < MIN_PROVISIONAL_PROTOCOL_VERSION);
 
+        // Registration records the version in the node's dynamic attributes
+        // (where a real worker's lands); reading only `config_attrs` fenced
+        // every real worker out of provisional dispatch.
         let current = crate::structs::Node {
+            dynamic_attrs: json!({ "protocolVersion": 2 }),
+            ..old.clone()
+        };
+        assert!(version(&current) >= MIN_PROVISIONAL_PROTOCOL_VERSION);
+        let configured = crate::structs::Node {
             config_attrs: json!({ "protocolVersion": 2 }),
             ..old
         };
-        assert!(worker_protocol_version(&current) >= MIN_PROVISIONAL_PROTOCOL_VERSION);
+        assert!(version(&configured) >= MIN_PROVISIONAL_PROTOCOL_VERSION);
     }
 
     #[test]
@@ -1352,15 +1330,15 @@ mod tests {
             availability: "available".into(),
             last_heartbeat: "now".into(),
             heartbeat_source: String::new(),
-            config_attrs: json!({"workerAddress": "http://127.0.0.1:4848"}),
+            config_attrs: json!({"workerAddress": "https://10.0.1.7:4848"}),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),
             health_checks: json!({}),
         };
 
         assert_eq!(
-            worker_address_for_node(&node),
-            Some("http://127.0.0.1:4848".to_string())
+            crate::manager::worker_plane::worker_address(&node),
+            Some("https://10.0.1.7:4848".to_string())
         );
     }
 

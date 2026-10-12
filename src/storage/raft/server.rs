@@ -266,6 +266,23 @@ impl RaftTransport for RaftTransportService {
         Ok(Response::new(RaftLaneReply { payload }))
     }
 
+    /// Start an election on this manager at a peer's request — the target
+    /// half of `legion raft command transfer-leader` (openraft 0.9 has no
+    /// leader-transfer API, so the transfer is built on a remote elect).
+    async fn trigger_election(
+        &self,
+        request: Request<crate::structs::TriggerElectionRequest>,
+    ) -> Result<Response<crate::structs::TriggerElectionReply>, Status> {
+        let registry = self.authenticate(&request)?;
+        let handler = registry.join_handler.clone().ok_or_else(|| {
+            Status::unimplemented("remote elections are not available on this manager")
+        })?;
+        handler
+            .trigger_election(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
     /// Merge a peer manager's liveness digest into this manager's table
     /// (liveness plan §6.3).
     ///

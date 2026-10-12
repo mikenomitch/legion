@@ -40,7 +40,7 @@ cargo install legion-rs
 ```
 
 Start a manager with a worker running in the same process. The defaults work
-without a config file.
+without a config file, from any directory.
 
 ```bash
 legion start manager --run-worker
@@ -76,7 +76,7 @@ Preview it, run it, and watch it come up:
 ```bash
 legion job plan hello.ncl       # what would change, without changing anything
 legion job run hello.ncl
-legion job status hello
+legion job info hello           # status, versions, and allocations
 legion job logs hello
 ```
 

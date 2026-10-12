@@ -17,10 +17,10 @@ use crate::prelude::*;
 
 use crate::structs::token::JoinToken;
 use crate::structs::{
-    manager_client::ManagerClient, worker_server::Worker, worker_server::WorkerServer,
-    ExecClientFrame, GetTaskLogsReply, GetTaskLogsRequest, HealthCheckRequest, HeartbeatRequest,
-    PostWorkReply, PostWorkRequest, RestartWorkerReply, RestartWorkerRequest, WorkerConfig,
-    WorkerPreRegisterRequest, WorkerRegisterRequest,
+    manager_client::ManagerClient, worker_server::Worker, ExecClientFrame, GetTaskLogsReply,
+    GetTaskLogsRequest, HealthCheckRequest, HeartbeatRequest, PostWorkReply, PostWorkRequest,
+    RestartWorkerReply, RestartWorkerRequest, WorkerConfig, WorkerPreRegisterRequest,
+    WorkerRegisterRequest,
 };
 use crate::worker::daemon::{
     connect_manager_with_retry, heartbeat_interval_for, jittered_heartbeat_interval,
@@ -29,7 +29,7 @@ use crate::worker::daemon::{
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tonic::{transport::Channel, Request, Response, Status, Streaming};
 
@@ -61,9 +61,11 @@ pub struct SimulateOptions {
     pub ready_after: Duration,
     /// Registration ramp, nodes per second.
     pub register_rate: f64,
-    /// Host the shared stub worker server advertises for dispatch
-    /// (`workerAddress` of every node in this process).
-    pub advertise_host: String,
+    /// Host (or `host:port`) the shared stub worker server advertises for
+    /// dispatch (`workerAddress` of every node in this process). `None`
+    /// detects it the way a real worker does: `--advertise-addr` /
+    /// `LEGION_WORKER_ADVERTISE_ADDR`, else the route to the manager.
+    pub advertise_addr: Option<String>,
 }
 
 impl Default for SimulateOptions {
@@ -74,7 +76,7 @@ impl Default for SimulateOptions {
             name_prefix: "sim".into(),
             ready_after: Duration::ZERO,
             register_rate: 100.0,
-            advertise_host: DEF_MANAGER_HOSTNAME.to_string(),
+            advertise_addr: None,
         }
     }
 }
@@ -194,12 +196,15 @@ fn fingerprint_for(profile: &SimNodeProfile) -> Value {
 
 /// `config_attrs` for a sim node: worker-type attributes, then profile
 /// attrs (profile wins), then the resource/limit keys the scheduler reads,
-/// then the markers every sim node carries — `simulated: true` and the
-/// shared `workerAddress` of this process's stub server.
+/// then the markers every sim node carries — `simulated: true`, the shared
+/// `workerAddress` of this process's stub server, and `workerPlaneName`, the
+/// fleet node whose certificate that one listener serves for every node in
+/// the process (managers verify that name for simulated nodes).
 fn config_attrs_for(
     profile: &SimNodeProfile,
     config: &WorkerConfig,
     worker_address: &str,
+    plane_name: &str,
 ) -> Value {
     let mut attrs = Map::new();
     for (key, value) in &config.attributes {
@@ -217,6 +222,10 @@ fn config_attrs_for(
     }
     attrs.insert("simulated".into(), json!(true));
     attrs.insert("workerAddress".into(), Value::String(worker_address.into()));
+    attrs.insert(
+        crate::manager::worker_plane::PLANE_NAME_ATTR.into(),
+        Value::String(plane_name.into()),
+    );
     // The cadence contract is SHARED with the real worker, not forked: a sim
     // node reports the interval it will beat at exactly as a real one does, so
     // the manager derives the same lost window for it and the benchmark rig
@@ -240,6 +249,9 @@ struct SimNode {
     config_attrs: String,
     fingerprint_attrs: String,
     credentials: WorkerCredentials,
+    /// Set once the node has registered (the fleet identity node can only
+    /// ask for its certificate after that).
+    registered: AtomicBool,
     /// Desired allocations and when each was first seen (for
     /// `--ready-after`). Fed by heartbeat replies and `PostWork` dispatch.
     allocations: Mutex<HashMap<i64, Instant>>,
@@ -367,6 +379,9 @@ impl Worker for SimWorkerService {
         &self,
         request: Request<PostWorkRequest>,
     ) -> Result<Response<PostWorkReply>, Status> {
+        // The same caller classes as a real worker: the simulator speaks the
+        // unmodified worker-plane contract, refusals included.
+        crate::worker::plane::authorize(&request, "PostWork")?;
         let allocation = request
             .into_inner()
             .allocation
@@ -390,8 +405,9 @@ impl Worker for SimWorkerService {
 
     async fn get_task_logs(
         &self,
-        _request: Request<GetTaskLogsRequest>,
+        request: Request<GetTaskLogsRequest>,
     ) -> Result<Response<GetTaskLogsReply>, Status> {
+        crate::worker::plane::authorize(&request, "GetTaskLogs")?;
         Err(Status::unimplemented(
             "simulated workers run no tasks and capture no logs",
         ))
@@ -411,8 +427,9 @@ impl Worker for SimWorkerService {
     /// capacity the fleet does not have.
     async fn start_claim(
         &self,
-        _request: Request<crate::structs::StartClaimRequest>,
+        request: Request<crate::structs::StartClaimRequest>,
     ) -> Result<Response<Self::StartClaimStream>, Status> {
+        crate::worker::plane::authorize(&request, "StartClaim")?;
         Err(Status::unimplemented(
             "simulated workers do not accept edge starts",
         ))
@@ -422,8 +439,9 @@ impl Worker for SimWorkerService {
 
     async fn exec_task(
         &self,
-        _request: Request<Streaming<ExecClientFrame>>,
+        request: Request<Streaming<ExecClientFrame>>,
     ) -> Result<Response<Self::ExecTaskStream>, Status> {
+        crate::worker::plane::authorize(&request, "ExecTask")?;
         Err(Status::unimplemented(
             "simulated workers run no tasks; exec is not available",
         ))
@@ -431,8 +449,9 @@ impl Worker for SimWorkerService {
 
     async fn restart_worker(
         &self,
-        _request: Request<RestartWorkerRequest>,
+        request: Request<RestartWorkerRequest>,
     ) -> Result<Response<RestartWorkerReply>, Status> {
+        crate::worker::plane::authorize(&request, "RestartWorker")?;
         Err(Status::unimplemented(
             "restarting a simulated node would restart the whole fleet process",
         ))
@@ -561,21 +580,46 @@ pub async fn launch_simulated_fleet(
         .context("No config found")?;
 
     // Stub worker server on an ephemeral port; every node in this process
-    // advertises it as its workerAddress.
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+    // advertises it as its workerAddress. It is a real mTLS worker plane:
+    // one listener serves one certificate, issued to the fleet's first node
+    // (the "fleet identity"), and every node registers that node's name as
+    // its `workerPlaneName` so managers verify it (docs/worker-simulation.md).
+    let listener = tokio::net::TcpListener::bind((crate::worker::plane::bind_ip()?, 0))
         .await
         .context("failed to bind the stub worker port")?;
-    let worker_address = format!(
-        "http://{}:{}",
-        opts.advertise_host,
-        listener.local_addr()?.port()
-    );
+    let listen_port = listener.local_addr()?.port();
+    let (advertise_host, advertise_port) = match &opts.advertise_addr {
+        Some(value) => {
+            let (host, port) =
+                crate::worker::plane::parse_advertise(value).context("invalid --advertise-addr")?;
+            (host, port.unwrap_or(listen_port))
+        }
+        None => {
+            let addrs = crate::worker::plane::PlaneAddrs::resolve_with(
+                &manager_addr,
+                listener.local_addr()?,
+                listen_port,
+            )
+            .await?;
+            (addrs.advertise_host, addrs.advertise_port)
+        }
+    };
+    let worker_address = crate::worker::plane::https_address(&advertise_host, advertise_port);
+    let prefix = opts.name_prefix.as_str();
+    let fleet_identity = shares
+        .iter()
+        .flat_map(|(profile, share)| {
+            (0..*share).map(move |idx| format!("{prefix}-{}-{idx}", profile.name))
+        })
+        .min()
+        .context("the fleet has no nodes")?;
 
     // Build the fleet.
     let mut nodes: HashMap<String, Arc<SimNode>> = HashMap::new();
     for (profile, share) in &shares {
         let fingerprint = fingerprint_for(profile).to_string();
-        let config_attrs = config_attrs_for(profile, &config, &worker_address).to_string();
+        let config_attrs =
+            config_attrs_for(profile, &config, &worker_address, &fleet_identity).to_string();
         for idx in 0..*share {
             let name = format!("{}-{}-{idx}", opts.name_prefix, profile.name);
             nodes.insert(
@@ -586,6 +630,7 @@ pub async fn launch_simulated_fleet(
                     config_attrs: config_attrs.clone(),
                     fingerprint_attrs: fingerprint.clone(),
                     credentials: WorkerCredentials::with_join_secret(join_secret.clone()),
+                    registered: AtomicBool::new(false),
                     allocations: Mutex::new(HashMap::new()),
                     reported_acked: AtomicUsize::new(0),
                 }),
@@ -612,15 +657,24 @@ pub async fn launch_simulated_fleet(
     metrics.simulated_nodes.set(0);
 
     let server_fleet = fleet.clone();
+    let plane_tls = crate::worker::plane::WorkerPlaneTls::new();
+    let server_tls = plane_tls.clone();
     let server_task = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(WorkerServer::new(SimWorkerService {
+        crate::worker::plane::serve_on(
+            listener,
+            server_tls,
+            SimWorkerService {
                 fleet: server_fleet,
-            }))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .context("stub worker server exited")
+            },
+        )
+        .await
+        .context("stub worker server exited")
     });
+    info!(
+        %worker_address,
+        %fleet_identity,
+        "Simulated fleet's worker plane listening (mTLS) once the fleet identity is issued"
+    );
 
     // One task per node: ramped registration, then the heartbeat loop.
     // The ramp itself staggers heartbeats across the interval.
@@ -638,6 +692,19 @@ pub async fn launch_simulated_fleet(
             run_sim_node(client, fleet, node, ready_after).await;
         }));
     }
+
+    // The fleet identity: issued once its node registers, refreshed like a
+    // real worker's.
+    let identity_node = fleet
+        .nodes
+        .get(&fleet_identity)
+        .cloned()
+        .context("fleet identity node missing")?;
+    node_tasks.push(tokio::spawn(run_fleet_identity(
+        clients[0].clone(),
+        identity_node,
+        plane_tls,
+    )));
 
     let summary_task = tokio::spawn(run_summary_loop(fleet.clone(), opts.clone()));
 
@@ -663,6 +730,7 @@ async fn run_sim_node(
     loop {
         match register_sim_node(&client, &node).await {
             Ok(()) => {
+                node.registered.store(true, Ordering::Relaxed);
                 let registered = fleet.registered.fetch_add(1, Ordering::Relaxed) + 1;
                 crate::manager::telemetry::worker_metrics()
                     .simulated_nodes
@@ -754,6 +822,54 @@ async fn run_sim_node(
                 backoff = std::cmp::min(backoff * 2, SIM_RETRY_MAX);
             }
         }
+    }
+}
+
+/// Keep the fleet's one worker-plane certificate current: issued (CSR, like
+/// a real worker) once the fleet identity node has registered, re-issued
+/// after a third of its lifetime or when a handshake suggests a rotated CA.
+async fn run_fleet_identity(
+    client: ManagerClient<Channel>,
+    node: Arc<SimNode>,
+    tls: Arc<crate::worker::plane::WorkerPlaneTls>,
+) {
+    let mut backoff = SIM_RETRY_MIN;
+    loop {
+        if node.registered.load(Ordering::Relaxed) && tls.needs_refresh() {
+            let mut client = client.clone();
+            match crate::worker::plane::issue_identity(&mut client, &node.credentials, &node.name)
+                .await
+            {
+                Ok(identity) => {
+                    let expires_at = identity.expires_at;
+                    match tls.install(identity) {
+                        Ok(_) => info!(
+                            fleet_identity = %node.name,
+                            expires_at,
+                            "Simulated fleet's worker-plane certificate issued"
+                        ),
+                        Err(err) => warn!(error = ?err, "Rejected the fleet certificate"),
+                    }
+                    backoff = SIM_RETRY_MIN;
+                }
+                Err(err) => {
+                    warn!(
+                        fleet_identity = %node.name,
+                        error = %format!("{err:#}"),
+                        "Failed to issue the fleet's worker-plane certificate; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, SIM_RETRY_MAX);
+                    continue;
+                }
+            }
+        }
+        let pause = if tls.identity().is_some() {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_millis(200)
+        };
+        tokio::time::sleep(pause).await;
     }
 }
 
@@ -938,13 +1054,14 @@ mod tests {
             resources: json!({"gpu": 1}).to_string(),
             ..WorkerConfig::default()
         };
-        let attrs = config_attrs_for(&profile, &config, "http://10.0.0.9:4848");
+        let attrs = config_attrs_for(&profile, &config, "https://10.0.0.9:4848", "sim-a-0");
         assert_eq!(attrs["class"], json!("web"));
         assert_eq!(attrs["tier"], json!("sim"));
         assert_eq!(attrs["simulated"], json!(true));
         assert_eq!(attrs["maxAllocations"], json!(40));
         assert_eq!(attrs["resources"], json!({"gpu": 1}));
-        assert_eq!(attrs["workerAddress"], json!("http://10.0.0.9:4848"));
+        assert_eq!(attrs["workerAddress"], json!("https://10.0.0.9:4848"));
+        assert_eq!(attrs["workerPlaneName"], json!("sim-a-0"));
     }
 
     #[test]
@@ -955,6 +1072,7 @@ mod tests {
             config_attrs: "{}".into(),
             fingerprint_attrs: "{}".into(),
             credentials: WorkerCredentials::default(),
+            registered: AtomicBool::new(false),
             allocations: Mutex::new(HashMap::new()),
             reported_acked: AtomicUsize::new(0),
         };
@@ -979,6 +1097,7 @@ mod tests {
             config_attrs: "{}".into(),
             fingerprint_attrs: "{}".into(),
             credentials: WorkerCredentials::default(),
+            registered: AtomicBool::new(false),
             allocations: Mutex::new(HashMap::new()),
             reported_acked: AtomicUsize::new(0),
         })

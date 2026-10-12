@@ -14,8 +14,7 @@ use crate::cmd::helpers::json_flag;
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::edge_boot::{Gate, RefusalReason};
-use crate::structs::{worker_client::WorkerClient, StartClaimRequest};
-use tonic::transport::Endpoint;
+use crate::structs::{GetMeshCaRequest, StartClaimRequest};
 
 pub fn config() -> Command {
     let start_cmd = Command::new("start")
@@ -38,7 +37,17 @@ pub fn config() -> Command {
                 .long("node")
                 .value_name("ADDR")
                 .required(true)
-                .help("Worker address to start on, e.g. http://10.0.1.7:4848"),
+                .help("Worker address to start on, e.g. https://10.0.1.7:4848"),
+        )
+        .arg(
+            Arg::new("ca-cert")
+                .long("ca-cert")
+                .value_name("FILE")
+                .value_hint(ValueHint::FilePath)
+                .help(
+                    "Cluster CA (PEM, from `legion net ca show`) the node's certificate must \
+                     chain to. Default: fetched from the manager with your token",
+                ),
         )
         .arg(
             Arg::new("ticket")
@@ -104,9 +113,26 @@ async fn start(arg_matches: &ArgMatches) -> R<()> {
         None => Gate::Off,
     };
 
-    let endpoint = Endpoint::from_shared(node.clone())
-        .with_context(|| format!("invalid worker address {node}"))?;
-    let mut client = WorkerClient::new(endpoint.connect_lazy());
+    // The worker plane is mTLS: verify the node's certificate against the
+    // cluster CA. No client certificate is sent; the ticket authorizes.
+    let ca_pem = match arg_matches.get_one::<String>("ca-cert") {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read --ca-cert {path}"))?,
+        None => {
+            let mut manager = crate::cmd::helpers::connect_manager_client().await?;
+            let reply = output::resolve(
+                format,
+                "Failed to fetch the cluster CA (pass --ca-cert to skip the manager)",
+                manager.get_mesh_ca(GetMeshCaRequest {}).await,
+            )?
+            .into_inner();
+            if reply.cert_pem.is_empty() {
+                bail!("the cluster has no CA yet: no worker has registered");
+            }
+            reply.cert_pem
+        }
+    };
+    let (mut client, _node_id) = crate::manager::worker_plane::edge_client(&node, &ca_pem).await?;
 
     let response = output::resolve(
         format,

@@ -1858,6 +1858,32 @@ fn migration_list() -> Vec<M<'static>> {
         // checkpoint. Scheduler lane, like `instance`.
         M::up("ALTER TABLE instance ADD COLUMN identity_epoch INTEGER NOT NULL DEFAULT 0;")
             .down(""),
+        // Removed allocations, remembered for `ALLOCATION_HISTORY_RETENTION_SECS`
+        // so `legion job logs` can still find where a removed allocation ran
+        // (docs/logging.md, "Logs of removed allocations"). Written by every
+        // allocation-removal op in the transaction that deletes the row, and
+        // expired by those same transactions, so it is a scheduler-lane
+        // table like `allocation_stop_notice`. No foreign keys: the rows it
+        // describes are gone, and a destroyed job's history outlives it.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_history (
+            allocation_id INTEGER PRIMARY KEY,
+            job_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            task_config_id INTEGER NOT NULL,
+            task_name STRING NOT NULL DEFAULT '',
+            node_id STRING NOT NULL,
+            status STRING NOT NULL,
+            cause STRING NOT NULL DEFAULT '',
+            removed_at_unix INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_allocation_history_job
+            ON allocation_history(job_id, removed_at_unix);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_allocation_history_job;
+        DROP TABLE IF EXISTS allocation_history;",
+        ),
     ]
 }
 

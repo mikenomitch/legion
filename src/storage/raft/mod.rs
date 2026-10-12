@@ -137,6 +137,13 @@ pub(crate) trait RaftJoinHandler: Send + Sync + 'static {
         &self,
         request: FetchRootKeyRequest,
     ) -> Result<FetchRootKeyReply, tonic::Status>;
+
+    /// Answers `RaftTransport.TriggerElection`: campaign for every raft
+    /// group this manager runs, now (the target half of `transfer-leader`).
+    async fn trigger_election(
+        &self,
+        request: crate::structs::TriggerElectionRequest,
+    ) -> Result<crate::structs::TriggerElectionReply, tonic::Status>;
 }
 
 /// Everything the `RaftTransport` tonic service needs to route an inbound

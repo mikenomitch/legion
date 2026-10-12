@@ -61,7 +61,9 @@ pub fn create(allocation_id: i64) -> R<PathBuf> {
     // see `task_plugins::ensure_gated_namespace`). Unserialized, both could
     // pass the existence check and stack two bind mounts on one path.
     static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _serialized = CREATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _serialized = CREATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = netns_path(allocation_id);
     if path.exists() {
         return Ok(path);

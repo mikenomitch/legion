@@ -613,13 +613,19 @@ impl std::fmt::Display for NotRaftLeader {
             None => String::new(),
         };
         match (&self.leader_name, &self.leader_addr) {
+            // `addr` is the leader's raft advertise address — what PEER
+            // managers dial. It is said as such: from a laptop or another
+            // network it may not be reachable, and API callers never need
+            // it, because any manager forwards a rejected write to the
+            // leader (`manager::leader_forward`).
             (Some(name), Some(addr)) => write!(
                 f,
-                "this manager is not the raft leader{scope}; retry against its leader {name} at {addr}"
+                "this manager is not the raft leader{scope}; its leader is {name} (raft \
+                 advertise address {addr})"
             ),
             (Some(name), None) => write!(
                 f,
-                "this manager is not the raft leader{scope}; retry against its leader {name}"
+                "this manager is not the raft leader{scope}; its leader is {name}"
             ),
             _ => write!(
                 f,
@@ -1138,6 +1144,42 @@ impl MultiRaftDriver {
     /// The lane's current leader address, when this node knows one.
     pub(crate) fn lane_leader_addr(&self, lane: Lane) -> Option<String> {
         self.not_leader_error(lane).leader_addr
+    }
+
+    /// A (lazily connected) channel to a peer manager's listener from the
+    /// engine's shared pool. `None` before the engine starts or for a
+    /// malformed address. Call inside a tokio runtime: building the channel
+    /// spawns its connection task (see `forward_lane_write`).
+    pub(crate) fn peer_channel(&self, host_port: &str) -> Option<tonic::transport::Channel> {
+        self.engine.get()?.pool.get(host_port).ok()
+    }
+
+    /// Every raft member's advertised `host:port` (voters and learners of
+    /// the control group, which every lane's membership mirrors), sorted and
+    /// deduplicated. The raft transport shares each manager's API listener,
+    /// so these are also the managers' API addresses — what workers are told
+    /// so they can fail over (spot-check P0-5). One metrics borrow; no I/O.
+    pub(crate) fn member_addresses(&self) -> Vec<String> {
+        let Some(engine) = self.engine.get() else {
+            return Vec::new();
+        };
+        let Some(raft) = engine.lanes.get(&Lane::Control) else {
+            return Vec::new();
+        };
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow();
+        let mut addrs: Vec<String> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(_, node)| {
+                crate::storage::raft::types::node_addr_host_port(&node.addr).to_string()
+            })
+            .filter(|addr| !addr.is_empty())
+            .collect();
+        addrs.sort();
+        addrs.dedup();
+        addrs
     }
 
     /// Send one liveness digest to the status-lane leader (liveness plan
@@ -2910,6 +2952,55 @@ fn voter_in_every_config(
 
 #[tonic::async_trait]
 impl RaftJoinHandler for EngineJoinHandler {
+    async fn trigger_election(
+        &self,
+        request: crate::structs::TriggerElectionRequest,
+    ) -> Result<crate::structs::TriggerElectionReply, tonic::Status> {
+        let mut lanes_started = Vec::new();
+        let mut term = 0;
+        let mut leader = None;
+        for (lane, raft) in lanes_in_order(&self.lanes) {
+            if lane == Lane::Control {
+                let metrics = raft.metrics().borrow().clone();
+                term = metrics.current_term;
+                leader = metrics.current_leader.map(|id| member_name(&metrics, id));
+            }
+            raft.trigger().elect().await.map_err(|e| {
+                tonic::Status::internal(format!(
+                    "failed starting an election on lane {}: {e}",
+                    lane.wire_name()
+                ))
+            })?;
+            lanes_started.push(lane.wire_name().to_string());
+        }
+        let actor = if request.actor.is_empty() {
+            "api"
+        } else {
+            request.actor.as_str()
+        };
+        info!(
+            requested_by = %request.requested_by,
+            actor,
+            "Campaigning for raft leadership at a peer's request (transfer-leader)"
+        );
+        MultiRaftDriver::push_history(
+            &self.history,
+            "election",
+            format!(
+                "Election started on {} at {}'s request (transfer-leader by {actor})",
+                self.node_id, request.requested_by
+            ),
+            actor,
+            Some(self.node_id.clone()),
+            term,
+            leader,
+        );
+        Ok(crate::structs::TriggerElectionReply {
+            node_id: self.node_id.clone(),
+            lanes: lanes_started,
+        })
+    }
+
     async fn join(
         &self,
         request: JoinRaftClusterRequest,

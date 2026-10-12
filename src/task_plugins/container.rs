@@ -37,10 +37,50 @@ struct ContainerTaskConfig {
     #[serde(default)]
     files: Vec<ContainerInjectedFile>,
 
+    /// The container's privileges (Linux). Today this is the capability set;
+    /// see `security.capabilities`.
+    #[serde(default)]
+    security: ContainerSecurity,
+
+    /// Resource limits (`setrlimit`) for the container's process (Linux), by
+    /// lowercase name: `nofile`, `nproc`, `memlock`, `core`, `stack`, ...
+    /// Each value is a number (soft and hard alike), `"unlimited"`, or
+    /// `{ soft, hard }`. Each declared limit replaces the default of the same
+    /// name; the only default is `nofile = 1048576` (lowered to the host's
+    /// `fs.nr_open` when that is smaller).
+    #[serde(default)]
+    ulimits: std::collections::BTreeMap<String, Value>,
+
     /// Additional plugin-specific fields reserved for forward compatibility.
     #[serde(default, flatten)]
     #[schemars(skip)]
     _extra: HashMap<String, Value>,
+}
+
+/// `config.security`: what the container process may do.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ContainerSecurity {
+    /// Adjustments to the default Linux capability set (Docker's default
+    /// set, less `NET_RAW`), with `docker run --cap-add/--cap-drop`
+    /// semantics. Names are case-insensitive, with or without the `CAP_`
+    /// prefix; `ALL` means every capability.
+    #[serde(default)]
+    capabilities: CapabilityAdjustments,
+}
+
+/// `config.security.capabilities`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CapabilityAdjustments {
+    /// Capabilities to grant on top of the defaults, e.g. `["NET_RAW"]`.
+    /// `["ALL"]` grants every capability except those in `drop`.
+    #[serde(default)]
+    add: Vec<String>,
+    /// Capabilities to remove from the defaults, e.g. `["MKNOD"]`.
+    /// `["ALL"]` starts from nothing, so the container gets exactly `add`.
+    #[serde(default)]
+    drop: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -66,8 +106,63 @@ impl ContainerTaskConfig {
         if self.command.is_empty() {
             bail!("container task command must include at least one entry");
         }
+        self.process_policy()?;
         Ok(())
     }
+
+    /// The bundle's capability set and rlimits for this task: the defaults,
+    /// adjusted by `security.capabilities` and `ulimits`.
+    fn process_policy(&self) -> R<oci_bundle::ProcessPolicy> {
+        let capabilities = &self.security.capabilities;
+        Ok(oci_bundle::ProcessPolicy {
+            capabilities: oci_bundle::resolve_capabilities(&capabilities.add, &capabilities.drop)?,
+            rlimits: oci_bundle::resolve_rlimits(&self.ulimits)?,
+        })
+    }
+
+    /// Whether the task adjusts anything only the Linux OCI path applies.
+    fn adjusts_linux_process(&self) -> bool {
+        !self.security.capabilities.add.is_empty()
+            || !self.security.capabilities.drop.is_empty()
+            || !self.ulimits.is_empty()
+    }
+}
+
+/// The smallest VM Apple `container` boots, in MiB. Below it, `container run`
+/// refuses the launch, and the error used to surface only in the task's
+/// stderr.
+pub(crate) const APPLE_CONTAINER_MIN_MEMORY_MIB: u64 = 200;
+
+/// The guest size an Apple `container` launch would get from `resources`:
+/// `memoryMax` when set (the ceiling the task may use), else `memory`.
+/// `None` when neither is declared, which leaves the runtime's own default.
+fn apple_guest_memory_mib(resources: &Value) -> Option<f64> {
+    resource_amount(resources, crate::resources::MEMORY_MAX_KEY)
+        .or_else(|| resource_amount(resources, "memory"))
+}
+
+/// Whether a task's own constraints pin it to macOS nodes (`os = "macos"`),
+/// which is the only case where the manager knows at submit that the task
+/// will run on Apple `container`.
+pub(crate) fn constrained_to_macos(task: &TaskConfig) -> bool {
+    crate::constraints::ConstraintSet::new(&task.constraints)
+        .map(|set| {
+            set.equality_bindings()
+                .get("os")
+                .and_then(Value::as_str)
+                .is_some_and(|os| os == "macos")
+        })
+        .unwrap_or(false)
+}
+
+/// The error for a guest below Apple `container`'s floor. `what` names the
+/// field that sized it, so the message points at the line to change.
+pub(crate) fn apple_memory_floor_error(task: &str, what: &str, mib: f64) -> anyhow::Error {
+    anyhow!(
+        "task {task} sizes its macOS VM at {mib} MiB ({what}), below the \
+         {APPLE_CONTAINER_MIN_MEMORY_MIB} MiB Apple `container` requires; raise it to at least \
+         {APPLE_CONTAINER_MIN_MEMORY_MIB}, or constrain the task to Linux nodes"
+    )
 }
 
 /// Env override selecting the Linux OCI runtime binary. Defaults to `youki`;
@@ -157,6 +252,25 @@ impl ContainerRuntime {
                 Ok(_) => Ok(()),
             },
         }
+    }
+}
+
+/// Fails a macOS start whose VM would be under Apple `container`'s floor,
+/// with a message naming the floor and the field to raise. Submit already
+/// rejects this for a task constrained to macOS; this catches the rest, which
+/// only become macOS tasks at placement. A no-op on Linux, where `memory` is a
+/// cgroup limit and has no floor.
+fn check_apple_memory_floor(oci_runtime: &ContainerRuntime, task: &TaskConfig) -> R<()> {
+    if *oci_runtime != ContainerRuntime::AppleContainer {
+        return Ok(());
+    }
+    match apple_guest_memory_mib(&task.resources) {
+        Some(mib) if mib < APPLE_CONTAINER_MIN_MEMORY_MIB as f64 => Err(apple_memory_floor_error(
+            &task.name,
+            "resources.memoryMax, else resources.memory",
+            mib,
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -553,6 +667,36 @@ impl TaskPlugin for ContainerTaskPlugin {
         derived_schema::<ContainerTaskConfig>()
     }
 
+    /// The JSON schema, then the typed parse the worker runs at start, so a
+    /// misspelled capability, a bad `ulimits` entry, or an empty `command`
+    /// fails at submit instead of on some node at start.
+    fn validate_config(&self, config: &Value) -> R<()> {
+        crate::task_plugins::validate_schema(&self.schema(), config)?;
+        ContainerTaskConfig::from_value(config)?;
+        Ok(())
+    }
+
+    /// Apple `container` refuses a VM under
+    /// [`APPLE_CONTAINER_MIN_MEMORY_MIB`]. When the task's own constraints
+    /// pin it to macOS, that is known at submit and the job is rejected.
+    /// Otherwise the target OS is only known at placement, and a macOS worker
+    /// fails the start with the same message (see [`Self::start`]) instead of
+    /// letting the runtime's error land in the task's stderr.
+    fn check_resources(&self, task: &TaskConfig) -> R<Vec<String>> {
+        if constrained_to_macos(task) {
+            if let Some(mib) = apple_guest_memory_mib(&task.resources) {
+                if mib < APPLE_CONTAINER_MIN_MEMORY_MIB as f64 {
+                    return Err(apple_memory_floor_error(
+                        &task.name,
+                        "resources.memoryMax, else resources.memory",
+                        mib,
+                    ));
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
     /// Reported per node so operators can see which nodes can actually run
     /// containers. The key is omitted (rather than reported as failing) when
     /// the runtime is unusable: a node without a container runtime is still a
@@ -765,7 +909,16 @@ impl TaskPlugin for ContainerTaskPlugin {
     ) -> R<()> {
         let config = ContainerTaskConfig::from_value(&task.config)?;
         let oci_runtime = ContainerRuntime::detect()?;
+        check_apple_memory_floor(&oci_runtime, task)?;
         oci_runtime.preflight()?;
+        if oci_runtime == ContainerRuntime::AppleContainer && config.adjusts_linux_process() {
+            info!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                "security.capabilities and ulimits apply to Linux containers only; Apple \
+                 `container` runs this one in its own VM with the runtime's defaults"
+            );
+        }
 
         // Legion-provided env (allocation identity + assigned ports) first;
         // user-declared env overrides on key conflicts.
@@ -796,6 +949,8 @@ impl TaskPlugin for ContainerTaskPlugin {
         // fail; restarts and worker crashes both leave one behind.
         remove_stale_container(&oci_runtime, &container_name(allocation));
 
+        // The uid/gid the Linux container runs as, to hand it its logs.
+        let mut log_owner: Option<(u32, u32)> = None;
         let mut cmd = match &oci_runtime {
             ContainerRuntime::AppleContainer => {
                 // `consume_artifact` already imported the staged layout, so
@@ -842,7 +997,8 @@ impl TaskPlugin for ContainerTaskPlugin {
                 // has not made it yet; failing to create it is a hard stop
                 // rather than a silent fall back to host networking.
                 let gated_netns = crate::task_plugins::ensure_gated_namespace(allocation)?;
-                let image_stop_signal = oci_bundle::build_bundle(
+                let policy = config.process_policy()?;
+                let built = oci_bundle::build_bundle(
                     &layout,
                     &bundle,
                     &config.command,
@@ -855,12 +1011,14 @@ impl TaskPlugin for ContainerTaskPlugin {
                         resolver: resolver.as_deref(),
                         resolv_conf: None,
                         netns: gated_netns.as_deref(),
+                        policy: &policy,
                     },
                 )?;
+                log_owner = Some((built.uid, built.gid));
                 // Recorded now, while the layout is still on disk: teardown
                 // needs it (`destroy` removes the scratch tree) and it is the
                 // middle layer of the stop-signal default chain.
-                if let Some(signal) = image_stop_signal {
+                if let Some(signal) = built.stop_signal {
                     let signal = Value::String(signal);
                     match instance.state.as_object_mut() {
                         Some(state) => {
@@ -886,6 +1044,11 @@ impl TaskPlugin for ContainerTaskPlugin {
         };
 
         configure_task_log_capture(&mut cmd, instance)?;
+        // A non-root image user must be able to reopen /dev/stdout and
+        // /dev/stderr, which are these files (see `hand_task_logs_to`).
+        if let Some((uid, gid)) = log_owner {
+            oci_bundle::hand_task_logs_to(instance.log_dir.as_deref(), uid, gid);
+        }
         let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(
                 "Failed to spawn container task {} for allocation {}",
@@ -2239,6 +2402,113 @@ mod tests {
         );
 
         plugin.stop(&allocation, &task, &mut instance)?;
+        Ok(())
+    }
+
+    /// `security.capabilities` and `ulimits` are validated at submit (the
+    /// typed parse runs in `validate_config`), not first noticed on a node.
+    #[test]
+    fn capability_and_ulimit_mistakes_fail_at_submit() -> R<()> {
+        let plugin = ContainerTaskPlugin;
+        plugin.validate_config(&json!({
+            "image": "alpine",
+            "command": ["ping", "-c1", "1.1.1.1"],
+            "security": { "capabilities": { "add": ["NET_RAW"], "drop": ["mknod"] } },
+            "ulimits": { "nofile": 65536, "nproc": { "soft": 512, "hard": 1024 } },
+        }))?;
+
+        for (config, needle) in [
+            (
+                json!({ "image": "a", "command": ["x"],
+                        "security": { "capabilities": { "add": ["NET_RAWW"] } } }),
+                "NET_RAWW",
+            ),
+            (
+                json!({ "image": "a", "command": ["x"],
+                        "security": { "capabilites": { "add": ["NET_RAW"] } } }),
+                "capabilites",
+            ),
+            (
+                json!({ "image": "a", "command": ["x"], "ulimits": { "nofile": { "soft": 9, "hard": 1 } } }),
+                "must not exceed",
+            ),
+            (json!({ "image": "a", "command": [] }), "at least one entry"),
+        ] {
+            let err = plugin.validate_config(&config).expect_err("rejected");
+            assert!(format!("{err:#}").contains(needle), "{config}: {err:#}");
+        }
+        Ok(())
+    }
+
+    /// The jobspec's adjustments become the bundle's process policy.
+    #[test]
+    fn process_policy_carries_the_jobspec_adjustments() -> R<()> {
+        let config = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine",
+            "command": ["true"],
+            "security": { "capabilities": { "drop": ["ALL"], "add": ["NET_BIND_SERVICE"] } },
+            "ulimits": { "nofile": 4096 },
+        }))?;
+        let policy = config.process_policy()?;
+        assert_eq!(policy.capabilities, vec!["CAP_NET_BIND_SERVICE".to_string()]);
+        let nofile = policy
+            .rlimits
+            .iter()
+            .find(|limit| limit.kind == "RLIMIT_NOFILE")
+            .expect("nofile");
+        assert_eq!((nofile.soft, nofile.hard), (4096, 4096));
+        assert!(config.adjusts_linux_process());
+
+        // Nothing adjusted: the defaults.
+        let bare = ContainerTaskConfig::from_value(&json!({ "image": "a", "command": ["x"] }))?;
+        assert_eq!(bare.process_policy()?, oci_bundle::ProcessPolicy::default());
+        assert!(!bare.adjusts_linux_process());
+        Ok(())
+    }
+
+    /// P2-6: Apple `container` refuses VMs under 200 MiB. A task constrained
+    /// to macOS is rejected at submit; any other macOS start fails early with
+    /// the same message; Linux has no floor.
+    #[test]
+    fn apple_memory_floor_is_enforced_where_the_target_is_known() -> R<()> {
+        let mut small = task_with(json!({ "memory": 128 }), Some("web"));
+        // Not pinned to macOS: nothing to say at submit (it may never land on
+        // a Mac), and Linux starts are unaffected.
+        assert!(ContainerTaskPlugin.check_resources(&small)?.is_empty());
+        let linux = ContainerRuntime::Oci {
+            binary: "youki".into(),
+        };
+        check_apple_memory_floor(&linux, &small)?;
+
+        // On a macOS worker the start fails before the runtime is invoked,
+        // naming the floor and the field to raise.
+        let err = check_apple_memory_floor(&ContainerRuntime::AppleContainer, &small)
+            .expect_err("below the floor");
+        let message = err.to_string();
+        assert!(message.contains("200 MiB"), "{message}");
+        assert!(message.contains("128"), "{message}");
+        assert!(message.contains("resources.memory"), "{message}");
+
+        // Constrained to macOS: rejected at submit.
+        small.constraints = json!({ "os": "macos" });
+        let err = ContainerTaskPlugin
+            .check_resources(&small)
+            .expect_err("rejected at submit");
+        assert!(err.to_string().contains("200 MiB"), "{err}");
+        // `memoryMax` sizes the VM when set, so it is what must clear the floor.
+        let burst = TaskConfig {
+            resources: json!({ "memory": 128, "memoryMax": 256 }),
+            ..small.clone()
+        };
+        assert!(ContainerTaskPlugin.check_resources(&burst)?.is_empty());
+        check_apple_memory_floor(&ContainerRuntime::AppleContainer, &burst)?;
+        // Unsized: the runtime's own (1 GiB) default applies.
+        let unsized_task = TaskConfig {
+            resources: json!({}),
+            ..small
+        };
+        check_apple_memory_floor(&ContainerRuntime::AppleContainer, &unsized_task)?;
+        assert!(ContainerTaskPlugin.check_resources(&unsized_task)?.is_empty());
         Ok(())
     }
 

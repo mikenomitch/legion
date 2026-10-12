@@ -211,6 +211,69 @@ impl WorkerStateStore {
         let last = self.last_manager_contact()?;
         Some(now.duration_since(last).unwrap_or_default())
     }
+
+    /// File holding this node's manager-issued node token, beside the state
+    /// file. Mode 0600 in a directory restricted to the worker's user.
+    pub fn node_token_path(&self) -> PathBuf {
+        self.path.with_file_name("node_token")
+    }
+
+    /// Persist the node token so a restarted worker re-registers with it
+    /// instead of its join token, which may have expired or been revoked
+    /// (docs/auth-and-acls.md). Fsynced: losing it costs a rejoin.
+    pub fn save_node_token(&self, token: &str) -> R<()> {
+        self.ensure_private_dir()?;
+        write_owner_only(&self.node_token_path(), token.as_bytes(), true)
+    }
+
+    /// The node token a previous worker process persisted, if any.
+    pub fn load_node_token(&self) -> Option<String> {
+        let raw = fs::read_to_string(self.node_token_path()).ok()?;
+        let token = raw.trim();
+        (!token.is_empty()).then(|| token.to_string())
+    }
+
+    /// Forget the persisted node token (the manager refused it).
+    pub fn clear_node_token(&self) -> R<()> {
+        match fs::remove_file(self.node_token_path()) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// File holding every manager address this worker has learned
+    /// (`HeartbeatReply.manager_addresses`), beside the state file.
+    pub fn known_managers_path(&self) -> PathBuf {
+        self.path.with_file_name("managers.json")
+    }
+
+    /// Persist the manager set so a restarted worker can reach the cluster
+    /// even when the manager its join token names is down.
+    pub fn save_known_managers(&self, addresses: &[String]) -> R<()> {
+        self.ensure_private_dir()?;
+        let contents = serde_json::to_vec_pretty(addresses)?;
+        write_owner_only(&self.known_managers_path(), &contents, false)
+    }
+
+    /// The manager addresses a previous worker process learned; empty when
+    /// none were recorded or the file is unreadable.
+    pub fn load_known_managers(&self) -> Vec<String> {
+        fs::read(self.known_managers_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn ensure_private_dir(&self) -> R<()> {
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                ensure_dir(parent)?;
+                crate::util::restrict_dir_to_owner(parent)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Atomically write `contents` to `path` with mode 0600 (temp file created at
@@ -327,6 +390,42 @@ mod tests {
             store.since_last_manager_contact(now - Duration::from_secs(600)),
             Some(Duration::ZERO)
         );
+        Ok(())
+    }
+
+    /// The node token survives a worker restart, owner-only, and can be
+    /// forgotten when the manager refuses it (spot-check P0-8).
+    #[test]
+    fn node_token_round_trips_owner_only_and_clears() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let store = WorkerStateStore::new(temp_dir.path().join("w1").join("worker_state.json"));
+        assert_eq!(store.load_node_token(), None);
+        store.save_node_token("lgntok_secret")?;
+        assert_eq!(store.load_node_token().as_deref(), Some("lgntok_secret"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(store.node_token_path())?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the node token must be owner-only");
+        }
+        store.clear_node_token()?;
+        assert_eq!(store.load_node_token(), None);
+        // Clearing twice is fine.
+        store.clear_node_token()?;
+        Ok(())
+    }
+
+    #[test]
+    fn known_managers_round_trip() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        assert!(store.load_known_managers().is_empty());
+        let managers = vec![
+            "http://10.0.0.1:4747".to_string(),
+            "http://10.0.0.2:4747".to_string(),
+        ];
+        store.save_known_managers(&managers)?;
+        assert_eq!(store.load_known_managers(), managers);
         Ok(())
     }
 

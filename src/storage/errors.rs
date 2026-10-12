@@ -17,6 +17,14 @@ pub enum StorageError {
     InvalidInput {
         message: String,
     },
+    /// The request is well-formed but the system is not in a state that
+    /// allows it: a running job cannot be destroyed, a stopped instance
+    /// cannot be restored, a key is disabled. `message` is the full
+    /// operator-facing sentence; the RPC layer maps it to
+    /// `FAILED_PRECONDITION` and passes it through unchanged.
+    FailedPrecondition {
+        message: String,
+    },
     DatabaseBusy,
     DatabaseLocked,
     DatabaseReadOnly,
@@ -48,6 +56,13 @@ impl StorageError {
         Self::NotFound {
             entity,
             id: id.into(),
+        }
+    }
+
+    /// See [`StorageError::FailedPrecondition`].
+    pub fn failed_precondition(message: impl Into<String>) -> Self {
+        Self::FailedPrecondition {
+            message: message.into(),
         }
     }
 
@@ -115,6 +130,7 @@ impl fmt::Display for StorageError {
                 write!(f, "foreign key constraint failed: {message}")
             }
             StorageError::InvalidInput { message } => write!(f, "invalid data: {message}"),
+            StorageError::FailedPrecondition { message } => write!(f, "{message}"),
             StorageError::DatabaseBusy => write!(f, "storage is busy; retry the request"),
             StorageError::DatabaseLocked => write!(f, "storage is locked; retry the request"),
             StorageError::DatabaseReadOnly => write!(f, "storage is read-only"),

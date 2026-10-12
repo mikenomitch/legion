@@ -132,6 +132,15 @@ pub fn node_csr(node_id: &str) -> R<(String, String)> {
     Ok((csr.pem()?, key.serialize_pem()))
 }
 
+/// Check that `csr_pem` is a PEM certificate request whose self-signature
+/// verifies (proof the requester holds the key). The error is fit to show
+/// the caller.
+pub fn check_csr(csr_pem: &str) -> R<()> {
+    CertificateSigningRequestParams::from_pem(csr_pem)
+        .map(|_| ())
+        .map_err(|err| anyhow!("invalid CSR (expected a PEM `CERTIFICATE REQUEST`): {err}"))
+}
+
 /// Sign a node's CSR: (certificate PEM, expiry as Unix seconds).
 ///
 /// Only the CSR's public key is used (and its self-signature checked as
@@ -192,9 +201,7 @@ pub fn issue_manager_cert(
     dn.push(DnType::CommonName, format!("legion-manager-{manager_id}"));
     let mut params = CertificateParams::default();
     params.distinguished_name = dn;
-    params.subject_alt_names = vec![SanType::URI(Ia5String::try_from(manager_uri(
-        manager_id,
-    ))?)];
+    params.subject_alt_names = vec![SanType::URI(Ia5String::try_from(manager_uri(manager_id))?)];
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - NOT_BEFORE_SKEW;
     let not_after = now + time::Duration::try_from(MANAGER_CERT_TTL)?;

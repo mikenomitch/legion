@@ -269,6 +269,8 @@ mod worker_edge_test {
             task_suspend: String::new(),
             task_snapshots: String::new(),
             identity_epoch: 0,
+            task_lifecycle: String::new(),
+            task_restart: String::new(),
         }
     }
 

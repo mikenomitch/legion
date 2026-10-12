@@ -7528,15 +7528,17 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        // build runs first; api waits for it to exit 0.
+        let first = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(first.allocations.len(), 1);
+        assert_eq!(first.held_tasks, vec!["api".to_string()]);
+        store.complete_allocation(first.allocations[0].id, true)?;
 
-        assert_eq!(outcome.allocations.len(), 2);
-        let node_ids: HashSet<_> = outcome
-            .allocations
-            .iter()
-            .map(|alloc| alloc.node_id.as_str())
-            .collect();
-        assert_eq!(node_ids.len(), 1);
+        // The completed build row still pins the group, so api lands beside it.
+        let second = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert_eq!(second.allocations.len(), 1);
+        assert!(second.held_tasks.is_empty());
+        assert_eq!(second.allocations[0].node_id, first.allocations[0].node_id);
 
         Ok(())
     }
@@ -7576,11 +7578,19 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let first = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(first.allocations.len(), 1, "web waits for seed to exit");
+        store.complete_allocation(first.allocations[0].id, true)?;
+        let second = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
 
-        assert_eq!(outcome.allocations.len(), 2);
+        let placed = first
+            .allocations
+            .iter()
+            .chain(second.allocations.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(placed.len(), 2);
         let mut roles = HashSet::new();
-        for allocation in &outcome.allocations {
+        for allocation in placed {
             let node = store.get_node(&allocation.node_id)?;
             let role = node
                 .config_attrs
@@ -7881,13 +7891,77 @@ mod tests {
             ..TaskConfig::new("api", "noop")
         };
 
-        let ready = Scheduler::ready_tasks(
-            vec![(1, build, 1), (2, seed, 1), (3, api, 1)],
-            &HashMap::new(),
-        )?;
+        let tasks = vec![(1, build, 1), (2, seed, 1), (3, api, 1)];
 
-        assert_eq!(ready.len(), 3);
+        // A dry run shows the whole chain: planned batch steps count.
+        let preview =
+            Scheduler::ready_tasks(tasks.clone(), &HashMap::new(), DependencyGate::Preview)?;
+        assert_eq!(preview.ready.len(), 3);
+        assert!(preview.held.is_empty());
+
+        // Real placement: only the root, until it has actually exited.
+        let live = Scheduler::ready_tasks(tasks.clone(), &HashMap::new(), DependencyGate::Live)?;
+        assert_eq!(
+            live.ready
+                .iter()
+                .map(|(_, task, _)| task.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["build"]
+        );
+        assert_eq!(live.held, vec!["seed".to_string(), "api".to_string()]);
+
+        // build exited 0: seed is next, api still waits on seed.
+        let statuses = HashMap::from([("build".to_string(), TaskStatusState::Success)]);
+        let live = Scheduler::ready_tasks(tasks.clone(), &statuses, DependencyGate::Live)?;
+        assert_eq!(live.ready.len(), 2);
+        assert_eq!(live.held, vec!["api".to_string()]);
         Ok(())
+    }
+
+    #[test]
+    fn dependency_conditions_follow_reported_status() {
+        let dependency = |condition| crate::structs::TaskDependency {
+            task: "step".into(),
+            condition,
+        };
+        let step = TaskConfig {
+            lifecycle: TaskLifecycle::Batch,
+            ..TaskConfig::new("step", "exec")
+        };
+        let tasks_by_name = HashMap::from([("step".to_string(), &step)]);
+        let planned = HashSet::from(["step".to_string()]);
+        let none = HashSet::new();
+        let satisfied = |condition, status: TaskStatusState, planned: &HashSet<String>| {
+            Scheduler::dependency_satisfied(
+                &dependency(condition),
+                &HashMap::from([("step".to_string(), status)]),
+                planned,
+                &tasks_by_name,
+                DependencyGate::Live,
+            )
+        };
+
+        // Being placed in the same pass satisfies only `start`.
+        assert!(satisfied(TaskDependencyCondition::Start, TaskStatusState::Pending, &planned));
+        assert!(!satisfied(TaskDependencyCondition::Complete, TaskStatusState::Pending, &planned));
+        assert!(!satisfied(TaskDependencyCondition::Success, TaskStatusState::Pending, &planned));
+        // Running is not finished.
+        assert!(!satisfied(TaskDependencyCondition::Success, TaskStatusState::Running, &none));
+        assert!(!satisfied(TaskDependencyCondition::Complete, TaskStatusState::Running, &none));
+        // Exited 0.
+        assert!(satisfied(TaskDependencyCondition::Success, TaskStatusState::Success, &none));
+        assert!(satisfied(TaskDependencyCondition::Complete, TaskStatusState::Success, &none));
+        // Exited non-zero: finished, but not a success.
+        assert!(!satisfied(TaskDependencyCondition::Success, TaskStatusState::Failed, &none));
+        assert!(satisfied(TaskDependencyCondition::Complete, TaskStatusState::Failed, &none));
+        // A preview never lets a failed dependency through `success`.
+        assert!(!Scheduler::dependency_satisfied(
+            &dependency(TaskDependencyCondition::Success),
+            &HashMap::from([("step".to_string(), TaskStatusState::Failed)]),
+            &planned,
+            &tasks_by_name,
+            DependencyGate::Preview,
+        ));
     }
 
     #[test]
@@ -7955,11 +8029,15 @@ mod tests {
         let scheduler = Scheduler::new(&store)?;
         let outcome_one =
             scheduler.plan_and_apply(&store.get_job_config("job-one")?.id(), PlanMode::Fresh)?;
-        let outcome_two =
-            scheduler.plan_and_apply(&store.get_job_config("job-two")?.id(), PlanMode::Fresh)?;
+        let job_two_config = store.get_job_config("job-two")?.id();
+        let outcome_two = scheduler.plan_and_apply(&job_two_config, PlanMode::Fresh)?;
 
         assert_eq!(outcome_one.allocations.len(), 2);
-        assert_eq!(outcome_two.allocations.len(), 2);
+        // `worker` waits for `prepare` to exit 0, then places.
+        assert_eq!(outcome_two.allocations.len(), 1);
+        store.complete_allocation(outcome_two.allocations[0].id, true)?;
+        let outcome_two_rest = scheduler.plan_and_apply(&job_two_config, PlanMode::Reschedule)?;
+        assert_eq!(outcome_two_rest.allocations.len(), 1);
 
         let ledger = store.get_ledger()?;
         for entry in ledger {
@@ -8663,6 +8741,154 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
         assert_eq!(outcome.allocations.len(), 1);
 
+        Ok(())
+    }
+
+    fn static_port_task(name: &str, port: u16, count: u32) -> TaskConfig {
+        TaskConfig {
+            count: TaskCount::new(count),
+            network: Some(crate::structs::network::NetworkConfig {
+                labels: Default::default(),
+                egress: None,
+                ingress: None,
+                mode: "host".into(),
+                ports: vec![crate::structs::network::PortConfig {
+                    name: "http".into(),
+                    static_port: Some(port),
+                    to: None,
+                }],
+            }),
+            ..TaskConfig::new(name, "noop")
+        }
+    }
+
+    /// P1-2: two replicas of a static-port task on a one-node cluster. The
+    /// planner used to put both on the node, the apply refused the second,
+    /// the whole plan was rejected as a conflict, and the eval requeued
+    /// forever with nothing placed. Now one replica places and the other is
+    /// reported unplaced, naming the port.
+    #[test]
+    fn static_port_replicas_place_what_fits_and_report_the_rest() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        let job_config_id = submit_job(&store, "web", vec![static_port_task("web", 18080, 2)])?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.unplaced.len(), 1);
+        assert_eq!(outcome.unplaced[0].count, 1);
+        assert_eq!(outcome.unplaced[0].static_port, Some(18080));
+        assert!(
+            outcome.unplaced[0].reason.contains("static port 18080"),
+            "{}",
+            outcome.unplaced[0].reason
+        );
+
+        // The reschedule that follows places nothing more and is a typed
+        // placement failure, not a plan conflict (which would requeue it).
+        let error = scheduler
+            .plan_and_apply(&job_config_id, PlanMode::Reschedule)
+            .expect_err("no node has the port free");
+        assert!(error.downcast_ref::<PlacementBlocked>().is_some(), "{error:#}");
+        assert!(!crate::structs::Eval::error_is_plan_conflict(&error));
+        Ok(())
+    }
+
+    #[test]
+    fn static_port_replicas_spread_one_per_node() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+        let job_config_id = submit_job(&store, "web", vec![static_port_task("web", 18080, 2)])?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+        assert!(outcome.unplaced.is_empty());
+        let nodes: HashSet<_> = outcome
+            .allocations
+            .iter()
+            .map(|allocation| allocation.node_id.as_str())
+            .collect();
+        assert_eq!(nodes.len(), 2, "a static port fits one replica per node");
+        Ok(())
+    }
+
+    /// The planner sees ports held by OTHER jobs too, so it picks the free
+    /// node instead of planning onto the taken one and losing at apply.
+    #[test]
+    fn a_node_whose_static_port_is_taken_is_not_a_candidate() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let first = submit_job(&store, "first", vec![static_port_task("first", 18080, 1)])?;
+        let held = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
+        assert_eq!(held.allocations.len(), 1);
+        let taken = held.allocations[0].node_id.clone();
+
+        let second = submit_job(&store, "second", vec![static_port_task("second", 18080, 1)])?;
+        for _ in 0..5 {
+            let probe = scheduler.plan_only(&second, PlanMode::Fresh)?;
+            assert_eq!(probe.len(), 1);
+            assert_ne!(probe[0].node_id, taken);
+            assert!(!probe[0].candidates.contains(&taken));
+        }
+        let outcome = scheduler.plan_and_apply(&second, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_ne!(outcome.allocations[0].node_id, taken);
+        Ok(())
+    }
+
+    /// A plan that can place nothing at all still fails, as before partial
+    /// placement, but with a typed error a rollout or eval can inspect.
+    #[test]
+    fn a_plan_that_places_nothing_fails_with_a_typed_error() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        let job_config_id = submit_job(
+            &store,
+            "huge",
+            vec![TaskConfig {
+                resources: json!({ "memory": 999_999 }),
+                ..TaskConfig::new("huge", "noop")
+            }],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let error = scheduler
+            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+            .expect_err("nothing fits");
+        let blocked = error
+            .downcast_ref::<PlacementBlocked>()
+            .expect("typed placement failure");
+        assert_eq!(blocked.unplaced.len(), 1);
+        assert_eq!(blocked.static_port(), None);
+        assert!(format!("{error:#}").contains("Failed to place task huge"));
+        Ok(())
+    }
+
+    /// P1-3: the stateful pin message only calls a node unavailable (and
+    /// only suggests deleting data) when it really is gone.
+    #[test]
+    fn pinned_node_message_does_not_blame_a_healthy_node() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let healthy = scheduler.pinned_node_absent_reason("node-a");
+        assert!(healthy.contains("healthy"), "{healthy}");
+        assert!(!healthy.contains("unavailable"), "{healthy}");
+        assert!(!healthy.contains("volume delete"), "{healthy}");
+
+        store.set_node_availability("node-a", "drained")?;
+        let drained = scheduler.pinned_node_absent_reason("node-a");
+        assert!(drained.contains("uncordon"), "{drained}");
+        assert!(!drained.contains("volume delete"), "{drained}");
+
+        let missing = scheduler.pinned_node_absent_reason("node-gone");
+        assert!(missing.contains("volume delete"), "{missing}");
         Ok(())
     }
 

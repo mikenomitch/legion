@@ -209,6 +209,11 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // commutative: the insert is an upsert (`INSERT OR REPLACE`), which the
     // commutative class forbids.
     ("allocation_stop_notice", Owner::Lane(Lane::Scheduler)),
+    // `allocation_history` remembers removed allocations (job, task, node)
+    // for `legion job logs`. Same writers as `allocation_stop_notice`: every
+    // removal op inserts in the transaction that deletes the row and expires
+    // old rows there too. NOT commutative (`INSERT OR REPLACE`).
+    ("allocation_history", Owner::Lane(Lane::Scheduler)),
     // `node_alloc_usage` caches the aggregated allocation usage of a node
     // for the plan-apply capacity recheck, next to a fingerprint of the rows
     // it was derived from (see the migration that creates it). Written by

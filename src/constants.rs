@@ -10,7 +10,14 @@ use std::path::PathBuf;
 // version (workers reporting 0 are pre-versioning builds and are accepted
 // with a warning); they reject newer workers so operators upgrade managers
 // before workers. See docs/upgrades.md for the full skew policy.
-pub const PROTOCOL_VERSION: u32 = 2;
+//
+// Version 3: the worker serves the mTLS worker plane (its own node
+// certificate from a CSR, manager-only RPCs need a manager certificate) and
+// advertises a reachable `https://` workerAddress. Managers never dial a
+// plaintext (`http://`) worker address, so exec, logs, and restart against a
+// protocol-2 worker fail with an error naming its version until it is
+// upgraded; dispatch still reaches it through heartbeat replies.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // === Worker → task-runtime environment ===
 // Task runtimes are in-process dylibs with no config channel of their own, so
@@ -66,10 +73,16 @@ pub fn allocation_status_is_terminal(status: &str) -> bool {
 }
 
 // === Manager ===
-pub const DEF_CONFIG_PATH: &str = "./configs/manager.ncl";
-
-// Manager config file
-pub const DEF_WORKER_CONFIG_PATH: &str = "./configs/workers/";
+// `legion start manager` reads a config file only when `-c` names one;
+// without it the manager runs on built-in defaults, wherever it is started.
+//
+// `workerConfigPath` default: none. With no worker config directory the
+// manager registers the built-in `default` worker type (pool `default`,
+// every setting at its default) so `legion join` works out of the box; a
+// configured directory replaces it with the types it declares.
+pub const DEF_WORKER_CONFIG_PATH: &str = "";
+// The worker type registered when no worker config directory is configured.
+pub const DEF_WORKER_TYPE: &str = "default";
 pub const DEF_MANAGER_HOSTNAME: &str = "127.0.0.1";
 pub const DEF_MANAGER_SERVER_PORT: u64 = 4747;
 pub const DEF_MANAGER_INSECURE_PORT: u64 = 4748;
@@ -241,6 +254,16 @@ pub fn default_raft_data_dir() -> String {
 // slack for a partitioned or restarting worker, not a delivery window. See
 // `docs/graceful-stop.md`.
 pub const STOP_NOTICE_RETENTION_SECS: i64 = 600;
+
+// How long the manager remembers a removed allocation (its job, task, and
+// node) so `legion job logs` can still fetch its output from the worker,
+// which keeps the files for `LEGION_LOG_RETENTION_DAYS`. See
+// `docs/logging.md`, "Logs of removed allocations".
+pub const ALLOCATION_HISTORY_RETENTION_SECS: i64 = 24 * 60 * 60;
+// How many removed allocations `legion job logs <job>` returns at most when
+// it falls back to (or is asked for) the job's removed allocations, newest
+// first. `--allocation <id>` reaches any one of them.
+pub const REMOVED_ALLOCATION_LOGS_LIMIT: usize = 10;
 
 // Default per-stream cap (bytes) when reading captured task logs and no explicit
 // limit is requested. 256 KiB keeps replies small enough for an agent context.

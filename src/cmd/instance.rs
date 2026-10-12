@@ -530,12 +530,12 @@ async fn fork_instance(arg_matches: &ArgMatches) -> R<()> {
         output::print_success(&json!({
             "origin": reply.origin,
             "snapshot": reply.snapshot,
-            "pause_ms": pause_ms,
+            "pauseMs": pause_ms,
             "instances": reply.instances,
             "kind": reply.kind,
             "node": reply.node_id,
             "durability": reply.durability,
-            "checkpoint_state": state.unwrap_or_else(|| "capturing".into()),
+            "checkpointState": state.unwrap_or_else(|| "capturing".into()),
             "deduplicated": reply.deduplicated,
         }));
     } else {
@@ -661,11 +661,11 @@ async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
         output::print_success(&json!({
             "instance": id,
             "state": state,
-            "resumed_from": (resuming).then_some(reply.resuming_from.clone()),
+            "resumedFrom": (resuming).then_some(reply.resuming_from.clone()),
             "node": (!reply.node_id.is_empty()).then_some(reply.node_id.clone()),
-            "restore_ms": restore_ms,
-            "cold_boot": instance.as_ref().and_then(|info| info.cold_boot.as_ref()).map(|cold| {
-                json!({ "snapshot_id": cold.snapshot_id, "reason": cold.reason, "at": cold.at })
+            "restoreMs": restore_ms,
+            "coldBoot": instance.as_ref().and_then(|info| info.cold_boot.as_ref()).map(|cold| {
+                json!({ "snapshotId": cold.snapshot_id, "reason": cold.reason, "at": cold.at })
             }),
             "detail": instance.as_ref().and_then(|info| info.detail.clone()),
             "message": reply.message,
@@ -753,10 +753,10 @@ async fn suspend_instance(arg_matches: &ArgMatches) -> R<()> {
             "checkpoint": reply.snapshot_id,
             "kind": reply.kind,
             "bytes": instance.as_ref().and_then(|info| info.checkpoint_bytes),
-            "duration_ms": instance.as_ref().and_then(|info| info.last_suspend_ms),
+            "durationMs": instance.as_ref().and_then(|info| info.last_suspend_ms),
             "node": reply.node_id,
             "durability": if reply.durability.is_empty() { "local" } else { reply.durability.as_str() },
-            "checkpoint_state": instance.as_ref().and_then(|info| info.checkpoint_state.clone()),
+            "checkpointState": instance.as_ref().and_then(|info| info.checkpoint_state.clone()),
             "message": reply.message,
             "deduplicated": reply.deduplicated,
         }));

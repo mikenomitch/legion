@@ -881,6 +881,25 @@ fn build_stamp(layout: &Path, payload: &GuestPayload, artifacts: &[StagedArtifac
     format!("{:x}", hasher.finalize())
 }
 
+/// Fails a macOS dev-mode start whose VM would be under Apple `container`'s
+/// floor, naming the floor and the field to raise, instead of letting
+/// `container run` fail with the reason only in the task's stderr. Only an
+/// explicit size is checked: an unsized guest gets the runtime's default.
+fn check_apple_memory_floor(task: &str, config: &SandboxTaskConfig) -> R<()> {
+    match config.memory_mib {
+        Some(mib)
+            if u64::from(mib) < crate::task_plugins::container::APPLE_CONTAINER_MIN_MEMORY_MIB =>
+        {
+            Err(crate::task_plugins::container::apple_memory_floor_error(
+                task,
+                "config.memory_mib, else resources.memoryMax or resources.memory",
+                f64::from(mib),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Builds the dev-mode Apple `container` launch (macOS). Same shape as the
 /// container runtime's, plus the sandbox's guest sizing, with filesystem volumes
 /// bind-mounted where the microVM path would attach block devices.
@@ -1242,6 +1261,7 @@ impl SandboxTaskPlugin {
         backend: &Backend,
     ) -> R<Command> {
         reject_block_volumes_in_dev_mode(&instance.volumes, backend)?;
+        check_apple_memory_floor(&task.name, config)?;
         let name = apple_container_name(allocation);
         remove_stale_dev_sandbox(backend, &name);
         // Named for the usage sampler: `container stats` is how an idle
@@ -1282,7 +1302,7 @@ impl SandboxTaskPlugin {
         env: &HashMap<String, String>,
         instance: &TaskInstance,
         backend: &Backend,
-    ) -> R<Command> {
+    ) -> R<(Command, oci_bundle::BuiltBundle)> {
         reject_block_volumes_in_dev_mode(&instance.volumes, backend)?;
         let scratch = work_root(allocation, instance);
         let name = sandbox_name(allocation);
@@ -1293,7 +1313,7 @@ impl SandboxTaskPlugin {
         env.extend(instance.volume_env());
 
         let bundle = scratch.join("bundle");
-        oci_bundle::build_bundle(
+        let built = oci_bundle::build_bundle(
             &layout,
             &bundle,
             &config.command,
@@ -1314,11 +1334,14 @@ impl SandboxTaskPlugin {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                // Docker's defaults, like a `container` task that adjusts
+                // nothing: a dev-mode sandbox runs the same stock images.
+                policy: &oci_bundle::ProcessPolicy::default(),
             },
         )?;
         let mut cmd = Command::new(binary);
         cmd.arg("run").arg("--bundle").arg(&bundle).arg(&name);
-        Ok(cmd)
+        Ok((cmd, built))
     }
 }
 
@@ -1395,6 +1418,21 @@ impl TaskPlugin for SandboxTaskPlugin {
         };
         // An undeclared `memory` becomes this runtime's 512 MiB at submit.
         let derived = resources_guest_mib(&task.resources).or(Some(DEFAULT_MEMORY_MIB));
+        // A task pinned to macOS runs in dev mode on Apple `container`, which
+        // refuses a VM under its floor. Known at submit only through the
+        // task's constraints; any other task meets the same check at start
+        // on a macOS worker.
+        if let Some(guest) = config.memory_mib.or(derived) {
+            if crate::task_plugins::container::constrained_to_macos(task)
+                && u64::from(guest) < crate::task_plugins::container::APPLE_CONTAINER_MIN_MEMORY_MIB
+            {
+                return Err(crate::task_plugins::container::apple_memory_floor_error(
+                    &task.name,
+                    "config.memory_mib, else resources.memoryMax or resources.memory",
+                    f64::from(guest),
+                ));
+            }
+        }
         let mut warnings = Vec::new();
         match (config.memory_mib, derived) {
             (None, Some(guest)) if guest < MIN_MEMORY_MIB => bail!(
@@ -1739,6 +1777,8 @@ impl TaskPlugin for SandboxTaskPlugin {
                 .collect();
         env.extend(config.env.clone());
 
+        // The uid/gid a dev-mode OCI bundle runs as, to hand it its logs.
+        let mut log_owner: Option<(u32, u32)> = None;
         let mut cmd = match &hypervisor {
             Backend::CloudHypervisor { .. } | Backend::Firecracker { .. } => {
                 self.start_microvm(&hypervisor, allocation, task, &config, &env, instance)?
@@ -1748,7 +1788,16 @@ impl TaskPlugin for SandboxTaskPlugin {
             }
             Backend::OciRuntime { binary } => {
                 let binary = binary.clone();
-                self.start_oci_runtime(&binary, allocation, &config, &env, instance, &hypervisor)?
+                let (cmd, built) = self.start_oci_runtime(
+                    &binary,
+                    allocation,
+                    &config,
+                    &env,
+                    instance,
+                    &hypervisor,
+                )?;
+                log_owner = Some((built.uid, built.gid));
+                cmd
             }
         };
 
@@ -1761,6 +1810,11 @@ impl TaskPlugin for SandboxTaskPlugin {
             "Starting sandbox task"
         );
         configure_task_log_capture(&mut cmd, instance)?;
+        // A non-root image user must be able to reopen /dev/stdout and
+        // /dev/stderr, which are these files (see `hand_task_logs_to`).
+        if let Some((uid, gid)) = log_owner {
+            oci_bundle::hand_task_logs_to(instance.log_dir.as_deref(), uid, gid);
+        }
         let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(
                 "Failed to spawn sandbox task {} for allocation {}",
@@ -2831,6 +2885,54 @@ mod tests {
         assert!(!args.contains(&"--cpus".to_string()));
         assert!(!args.contains(&"--memory".to_string()));
         assert!(!args.contains(&"--volume".to_string()));
+        Ok(())
+    }
+
+    /// P1-6: Apple `container` runs a `--` after the image as the command
+    /// ("failed to find target executable --"). The exec argv into a dev-mode
+    /// sandbox must not carry one either, even for a command that starts with
+    /// a dash.
+    #[test]
+    fn apple_exec_passes_the_command_without_a_separator() {
+        let argv = build_exec_command("legion-sbx-7", true, &["-l".to_string()]);
+        assert_eq!(
+            argv,
+            vec!["container", "exec", "--tty", "--interactive", "legion-sbx-7", "-l"]
+        );
+        assert!(!argv.contains(&"--".to_string()), "{argv:?}");
+        let argv = build_exec_command("legion-sbx-7", false, &["/bin/true".to_string()]);
+        assert_eq!(argv, vec!["container", "exec", "legion-sbx-7", "/bin/true"]);
+    }
+
+    /// P2-6: a dev-mode sandbox on macOS is an Apple `container` VM, which
+    /// refuses less than 200 MiB. Pinned to macOS, that fails at submit;
+    /// otherwise the macOS start fails early with the same message. The
+    /// microVM floor (64 MiB) is unchanged for everything else.
+    #[test]
+    fn apple_memory_floor_applies_to_dev_mode_on_macos() -> R<()> {
+        let small = json!({ "image": "a", "command": ["x"], "memory_mib": 128 });
+        let config = SandboxTaskConfig::from_value(&small)?;
+        let err = check_apple_memory_floor("workspace", &config).expect_err("below the floor");
+        assert!(err.to_string().contains("200 MiB"), "{err}");
+        assert!(err.to_string().contains("memory_mib"), "{err}");
+        check_apple_memory_floor(
+            "workspace",
+            &SandboxTaskConfig::from_value(&json!({ "image": "a", "command": ["x"], "memory_mib": 256 }))?,
+        )?;
+
+        // Not pinned to macOS: 128 MiB is a valid microVM guest.
+        let mut task = task_with(small);
+        assert!(SandboxTaskPlugin.check_resources(&task)?.is_empty());
+        // Pinned to macOS: rejected at submit, naming the floor.
+        task.constraints = json!({ "os": "macos" });
+        let err = SandboxTaskPlugin
+            .check_resources(&task)
+            .expect_err("rejected at submit");
+        assert!(err.to_string().contains("200 MiB"), "{err}");
+        // The default 512 MiB guest clears it.
+        let mut default_sized = task_with(json!({ "image": "a", "command": ["x"] }));
+        default_sized.constraints = json!({ "os": "macos" });
+        assert!(SandboxTaskPlugin.check_resources(&default_sized)?.is_empty());
         Ok(())
     }
 

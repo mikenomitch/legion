@@ -424,6 +424,9 @@ pub async fn run_manager_with(
         diverged_since_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
     };
 
+    // Follower-side forwarding of rejected writes to the raft leader
+    // (docs/raft-operations.md, "Writes on any manager").
+    let leader_forward = crate::manager::leader_forward::LeaderForwardLayer::new(store.clone());
     let manager_node = ManagerDaemonService::with_manager_config(store, &full_config)
         .with_workload_identity(workload_identity_state.clone())
         .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
@@ -538,6 +541,10 @@ pub async fn run_manager_with(
         .layer(cors)
         .layer(GrpcWebLayer::new())
         .layer(crate::manager::telemetry::GrpcMetricsLayer)
+        // Innermost, on native gRPC: a write a follower rejects as
+        // not-the-leader is replayed to the leader and the leader's reply
+        // returned, so every manager accepts every request.
+        .layer(leader_forward)
         .add_service(manager_service)
         .add_service(raft_transport_service)
         .serve_with_shutdown(addr, async move {
@@ -2765,19 +2772,47 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
 #[instrument(err, skip_all)]
 async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
     let worker_conf_path = config.with_defaults().worker_config_path.clone();
-    let sub_paths = fs::read_dir(worker_conf_path)?;
-
-    for path in sub_paths {
-        let path = path.unwrap().path();
-        // Only the two configuration extensions. The directory is a normal
-        // one an operator edits, so it collects `README.md` files and editor
-        // swap files, and neither should be fed to a config parser.
-        if !crate::config_lang::is_config_file(&path) {
-            debug!(path = %path.display(), "skipping non-config file in worker config directory");
-            continue;
+    // No worker config directory configured (the default): register the
+    // built-in `default` worker type, so `legion join` works with zero
+    // configuration wherever the manager runs. A configured directory
+    // declares the types instead, and must exist.
+    let worker_configs: Vec<(String, WorkerConfigAlt)> = if worker_conf_path.trim().is_empty() {
+        vec![(
+            "<built-in default worker type>".to_string(),
+            serde_json::from_value(json!({
+                "workerType": DEF_WORKER_TYPE,
+                "pool": "default",
+            }))?,
+        )]
+    } else {
+        let mut configs = Vec::new();
+        let entries = fs::read_dir(&worker_conf_path).with_context(|| {
+            format!(
+                "failed to read the worker config directory {worker_conf_path} (workerConfigPath)"
+            )
+        })?;
+        for path in entries {
+            let path = path?.path();
+            // Only the two configuration extensions. The directory is a
+            // normal one an operator edits, so it collects `README.md`
+            // files and editor swap files, and neither should be fed to a
+            // config parser.
+            if !crate::config_lang::is_config_file(&path) {
+                debug!(path = %path.display(), "skipping non-config file in worker config directory");
+                continue;
+            }
+            let path_str = path
+                .to_str()
+                .with_context(|| format!("worker config path {} is not utf-8", path.display()))?
+                .to_string();
+            let wcp = parse_worker_config(&path_str)?;
+            configs.push((path_str, wcp));
         }
-        let path_str = path.to_str().unwrap();
-        let wcp = parse_worker_config(path_str)?;
+        configs
+    };
+
+    for (path_str, wcp) in worker_configs {
+        let path_str = path_str.as_str();
 
         let af = wcp.additional_node_checks.unwrap_or([].to_vec());
         let attrs = wcp.attributes.unwrap_or(HashMap::new());

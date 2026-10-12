@@ -40,6 +40,7 @@ pub fn config() -> Command {
                 .value_name("NAME")
                 .help("Override the worker name/ID"),
         )
+        .arg(crate::cmd::start::advertise_addr_arg())
 }
 
 #[instrument(err, skip_all)]
@@ -62,6 +63,9 @@ pub async fn handle(arg_matches: &ArgMatches) -> R<()> {
     };
 
     let name = arg_matches.get_one::<String>("name").map(String::as_str);
+    if let Some(addr) = arg_matches.get_one::<String>("advertise-addr") {
+        crate::worker::plane::set_advertise_addr_flag(addr);
+    }
     run_worker(&token, name).await
 }
 

@@ -526,15 +526,16 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_logs",
-            description: "Fetch captured stdout/stderr for a job's allocations (or one allocation). Use this to diagnose task failures.",
+            description: "Fetch captured stdout/stderr for a job's allocations (or one allocation). Use this to diagnose task failures. Allocations removed in the last 24 hours (failed and rescheduled, stopped, the job destroyed) are still readable: a job with no live allocation returns its most recently removed ones, each marked `removed` with its `removalCause`.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Job name to gather allocation logs for." },
-                    "allocation_id": { "type": "integer", "description": "Optional: read a single allocation id instead of a whole job." },
+                    "allocation_id": { "type": "integer", "description": "Optional: read a single allocation id (live, or removed in the last 24 hours) instead of a whole job." },
                     "stream": { "type": "string", "enum": ["stdout", "stderr", "all"], "description": "Which stream to read (default all)." },
                     "max_bytes": { "type": "integer", "description": "Max bytes per stream (0 = worker default cap)." },
-                    "tail": { "type": "boolean", "description": "Return trailing bytes instead of leading bytes." }
+                    "tail": { "type": "boolean", "description": "Return trailing bytes instead of leading bytes." },
+                    "include_removed": { "type": "boolean", "description": "Also return the job's recently removed allocations when it has live ones (default false)." }
                 },
                 "additionalProperties": false
             }),
@@ -1631,6 +1632,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let stream = opt_str_arg(&args, "stream").unwrap_or_else(|| "all".to_string());
             let max_bytes = args.get("max_bytes").and_then(Value::as_i64).unwrap_or(0);
             let tail = args.get("tail").and_then(Value::as_bool).unwrap_or(false);
+            let include_removed = args
+                .get("include_removed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let mut client = connect().await?;
             grpc(client.get_allocation_logs(GetAllocationLogsRequest {
                 job,
@@ -1639,6 +1644,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 max_bytes,
                 tail,
                 offset: 0,
+                include_removed,
             }))
             .await
         }

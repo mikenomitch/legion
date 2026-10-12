@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use oci_client::client::{ClientConfig, ClientProtocol};
-use oci_client::manifest::{ImageIndexEntry, OciDescriptor, OciImageManifest};
+use oci_client::manifest::{ImageIndexEntry, OciDescriptor, OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
@@ -19,6 +19,7 @@ use crate::artifacts::fetcher::{
     ArtifactFetcher, Credential, FetchRequest, FetchedArtifact, FetchedPayload, ResolvedIdentity,
 };
 use crate::artifacts::stage::ArtifactSink;
+use crate::content_store::{ContentClass, ContentDigest, ContentStore, PutOptions};
 use crate::prelude::*;
 
 /// Annotation carrying an ORAS layer's preferred file name.
@@ -213,32 +214,187 @@ impl ArtifactFetcher for OciFetcher {
         let client = oci_client(protocol, req.media_type.is_none());
         let runtime = blocking_runtime()?;
 
-        // Resolve (possibly via an image index) to one platform manifest.
-        let (manifest, manifest_digest) = runtime
-            .block_on(client.pull_image_manifest(&reference, &auth))
-            .with_context(|| format!("pull manifest for {}", req.redacted_source))?;
-
         match req.media_type {
-            Some(media_type) => self.fetch_oras_layers(
-                req,
-                sink,
-                &runtime,
-                &client,
-                &reference,
-                manifest,
-                manifest_digest,
-                media_type,
-            ),
-            None => self.fetch_image_layout(
-                req,
-                sink,
-                &runtime,
-                &client,
-                &reference,
-                &auth,
-                manifest,
-                manifest_digest,
-            ),
+            Some(media_type) => {
+                // Resolve (possibly via an image index) to one platform manifest.
+                let (manifest, manifest_digest) = runtime
+                    .block_on(client.pull_image_manifest(&reference, &auth))
+                    .with_context(|| format!("pull manifest for {}", req.redacted_source))?;
+                self.fetch_oras_layers(
+                    req,
+                    sink,
+                    &runtime,
+                    &client,
+                    &reference,
+                    manifest,
+                    manifest_digest,
+                    media_type,
+                )
+            }
+            None => self.fetch_image_layout(req, sink, &runtime, &client, &reference, &auth),
+        }
+    }
+}
+
+/// The manifest media types an image pull accepts: single-platform manifests
+/// and multi-platform indexes, in both the OCI and Docker v2 dialects.
+const MANIFEST_MEDIA_TYPES: &[&str] = &[
+    oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+    oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
+    oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,
+    oci_client::manifest::IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+];
+
+/// Image references being pulled on this node right now. A second start of
+/// the same image waits for the first pull instead of downloading the same
+/// layers alongside it, then finds them in the node content store.
+static IMAGE_PULLS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static IMAGE_PULL_DONE: std::sync::Condvar = std::sync::Condvar::new();
+
+/// A claim on one image reference's pull; released on drop.
+struct ImagePullClaim(String);
+
+impl ImagePullClaim {
+    fn claim(reference: &str) -> Self {
+        let mut pulls = IMAGE_PULLS.lock().unwrap_or_else(|p| p.into_inner());
+        while pulls.contains(reference) {
+            pulls = IMAGE_PULL_DONE
+                .wait(pulls)
+                .unwrap_or_else(|p| p.into_inner());
+        }
+        pulls.insert(reference.to_string());
+        ImagePullClaim(reference.to_string())
+    }
+}
+
+impl Drop for ImagePullClaim {
+    fn drop(&mut self) {
+        let mut pulls = IMAGE_PULLS.lock().unwrap_or_else(|p| p.into_inner());
+        pulls.remove(&self.0);
+        IMAGE_PULL_DONE.notify_all();
+    }
+}
+
+/// Image blobs (manifests, configs, layers) in the node content store
+/// (`artifacts` class), by digest. Every blob of an image is immutable and
+/// named by its digest, so a blob the store holds is the blob the registry
+/// would send: serving it skips the download and, for a manifest, the
+/// registry request that pull-rate limits count.
+///
+/// Everything here is best effort. A blob the store cannot keep (budget full
+/// of pinned content, disk low) costs the next start a download, never this
+/// start its image.
+struct ImageBlobCache<'a> {
+    store: &'a ContentStore,
+}
+
+impl ImageBlobCache<'_> {
+    /// A cached blob's bytes, for manifests and indexes (small JSON).
+    fn read(&self, digest: &str) -> Option<Vec<u8>> {
+        let digest = ContentDigest::parse(digest).ok()?;
+        let entry = self.store.get(&digest).ok()??;
+        std::fs::read(&entry.path).ok()
+    }
+
+    /// Places a cached blob at `dest`: a hard link into the store's blob
+    /// (same filesystem, no bytes copied), else a copy. `false` on a miss.
+    fn place(&self, digest: &str, dest: &std::path::Path) -> bool {
+        let Ok(digest) = ContentDigest::parse(digest) else {
+            return false;
+        };
+        let Ok(Some(entry)) = self.store.get(&digest) else {
+            return false;
+        };
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(dest);
+        std::fs::hard_link(&entry.path, dest).is_ok() || std::fs::copy(&entry.path, dest).is_ok()
+    }
+
+    /// Keeps bytes fetched from the registry, verified against `digest`.
+    fn keep_bytes(&self, digest: &str, bytes: &[u8]) {
+        let Ok(digest) = ContentDigest::parse(digest) else {
+            return;
+        };
+        if let Err(err) = self.store.put_bytes(
+            ContentClass::Artifacts,
+            bytes,
+            PutOptions::default().expect(digest.clone()),
+        ) {
+            debug!(%digest, error = %format!("{err:#}"), "Could not cache image manifest");
+        }
+    }
+
+    /// Keeps a blob just pulled into `path`, without copying it when the
+    /// layout and the store share a filesystem: a hard link moves into the
+    /// store, which re-verifies the digest and makes the shared file
+    /// read-only. `path` stays in place either way.
+    fn keep_file(&self, digest: &str, path: &std::path::Path) {
+        let Ok(digest) = ContentDigest::parse(digest) else {
+            return;
+        };
+        let opts = PutOptions::default()
+            .expect(digest.clone())
+            .label("image blob");
+        let result = match self.store.staging_path("image-blob") {
+            Ok(staged) if std::fs::hard_link(path, &staged).is_ok() => {
+                self.store
+                    .import_file(ContentClass::Artifacts, &staged, opts)
+            }
+            _ => self.store.put_file(ContentClass::Artifacts, path, opts),
+        };
+        if let Err(err) = result {
+            warn!(
+                %digest,
+                error = %format!("{err:#}"),
+                "Could not cache image layer in node content store"
+            );
+        }
+    }
+
+    /// The manifest digest an image *tag* names now, for a node that may
+    /// already hold it.
+    ///
+    /// One `HEAD` request: it carries the digest, downloads nothing, and
+    /// Docker Hub does not count it toward the anonymous pull limit. A tag
+    /// that moved is therefore picked up on the next start. When the
+    /// registry cannot answer (rate limited, down, offline), the digest the
+    /// tag last resolved to on this node is used, so a cached image still
+    /// starts; with no record, the registry's error stands.
+    fn resolve_tag(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        client: &Client,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        redacted: &str,
+    ) -> R<String> {
+        let key = reference.whole();
+        match runtime.block_on(client.fetch_manifest_digest(reference, auth)) {
+            Ok(digest) => {
+                if let Ok(parsed) = ContentDigest::parse(&digest) {
+                    if let Err(err) = self.store.record_image_ref(&key, &parsed) {
+                        debug!(error = %format!("{err:#}"), "Could not record image tag digest");
+                    }
+                }
+                Ok(digest)
+            }
+            Err(err) => match self.store.image_ref(&key) {
+                Ok(Some((digest, resolved_at))) => {
+                    warn!(
+                        image = %redacted,
+                        %digest,
+                        resolved_at,
+                        error = %err,
+                        "Registry did not answer for this tag; using the digest it last resolved                          to on this node"
+                    );
+                    Ok(digest.as_str().to_string())
+                }
+                _ => Err(anyhow::Error::from(err))
+                    .with_context(|| format!("resolve manifest digest for {redacted}")),
+            },
         }
     }
 }
@@ -311,7 +467,15 @@ impl OciFetcher {
     /// Image materialization: write a complete on-disk OCI layout
     /// (`oci-layout`, `index.json`, `blobs/`) that image-consuming runtimes
     /// hand to their runtime.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// With a node content store on the sink, every blob is looked up there
+    /// first and kept there after a download (see [`ImageBlobCache`]):
+    ///
+    /// - a digest reference already held is served with no registry request;
+    /// - a tag costs one `HEAD` to learn its current digest, then nothing
+    ///   more when the node holds that digest's blobs;
+    /// - a tag that moved downloads the new manifest and only the layers the
+    ///   node does not hold yet.
     fn fetch_image_layout(
         &self,
         req: &FetchRequest<'_>,
@@ -320,9 +484,38 @@ impl OciFetcher {
         client: &Client,
         reference: &Reference,
         auth: &RegistryAuth,
-        manifest: OciImageManifest,
-        manifest_digest: String,
     ) -> R<FetchedArtifact> {
+        let store = sink.content_store().cloned();
+        let cache = store.as_deref().map(|store| ImageBlobCache { store });
+        let _claim = cache
+            .as_ref()
+            .map(|_| ImagePullClaim::claim(&reference.whole()));
+
+        // The digest the reference names: given, or (with a cache to serve
+        // it from) a tag's current digest.
+        let top_digest = match (reference.digest(), cache.as_ref()) {
+            (Some(digest), _) => Some(digest.to_string()),
+            (None, Some(cache)) => Some(cache.resolve_tag(
+                runtime,
+                client,
+                reference,
+                auth,
+                req.redacted_source,
+            )?),
+            (None, None) => None,
+        };
+        let (raw_manifest, manifest_digest, manifest_cached) = self.platform_manifest(
+            req,
+            runtime,
+            client,
+            reference,
+            auth,
+            top_digest.as_deref(),
+            cache.as_ref(),
+        )?;
+        let manifest: OciImageManifest = serde_json::from_slice(&raw_manifest)
+            .with_context(|| format!("parse image manifest for {}", req.redacted_source))?;
+
         let mut descriptors: Vec<&OciDescriptor> = vec![&manifest.config];
         descriptors.extend(manifest.layers.iter());
         let total = check_size_budget(req, &descriptors)?;
@@ -330,32 +523,39 @@ impl OciFetcher {
 
         let layout_root = sink.dir().join("layout");
         std::fs::create_dir_all(&layout_root)?;
-
-        // Byte-exact manifest content for the digest-addressed blob: re-pull
-        // raw at the pinned digest (serializing the parsed struct would not
-        // reproduce the original bytes).
-        let pinned = reference.clone_with_digest(manifest_digest.clone());
-        let (raw_manifest, _) = runtime
-            .block_on(client.pull_manifest_raw(
-                &pinned,
-                auth,
-                &[
-                    oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
-                    oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
-                ],
-            ))
-            .with_context(|| format!("pull raw manifest for {}", req.redacted_source))?;
         let manifest_path = blob_path(&layout_root, &manifest_digest)?;
         if let Some(parent) = manifest_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&manifest_path, &raw_manifest)?;
 
+        let (mut cached, mut pulled) = (0usize, 0usize);
         for descriptor in descriptors {
             req.limits.check_deadline(req.redacted_source)?;
             let path = blob_path(&layout_root, &descriptor.digest)?;
-            runtime.block_on(pull_blob_to_file(client, reference, descriptor, &path))?;
+            if cache
+                .as_ref()
+                .is_some_and(|cache| cache.place(&descriptor.digest, &path))
+            {
+                cached += 1;
+            } else {
+                runtime.block_on(pull_blob_to_file(client, reference, descriptor, &path))?;
+                if let Some(cache) = cache.as_ref() {
+                    cache.keep_file(&descriptor.digest, &path);
+                }
+                pulled += 1;
+            }
             sink.record_external_bytes(descriptor.size.max(0) as u64)?;
+        }
+        if cache.is_some() {
+            info!(
+                image = %req.redacted_source,
+                digest = %manifest_digest,
+                blobs_cached = cached,
+                blobs_pulled = pulled,
+                manifest_cached,
+                "Image layout ready (node content store)"
+            );
         }
 
         let manifest_media_type = manifest
@@ -387,6 +587,69 @@ impl OciFetcher {
                 digest: manifest_digest,
             },
         })
+    }
+
+    /// The `linux/<arch>` image manifest for `reference`, byte-exact (the
+    /// layout stores it under its digest, which only the original bytes
+    /// reproduce), with its digest and whether the store served it.
+    ///
+    /// `top_digest` is what the reference names (a manifest or an index).
+    /// The store is tried first; the registry is asked for whatever it does
+    /// not hold, and what the registry sends is kept for next time.
+    #[allow(clippy::too_many_arguments)]
+    fn platform_manifest(
+        &self,
+        req: &FetchRequest<'_>,
+        runtime: &tokio::runtime::Runtime,
+        client: &Client,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        top_digest: Option<&str>,
+        cache: Option<&ImageBlobCache<'_>>,
+    ) -> R<(Vec<u8>, String, bool)> {
+        let pull = |target: &Reference| -> R<(Vec<u8>, String)> {
+            let (raw, digest) = runtime
+                .block_on(client.pull_manifest_raw(target, auth, MANIFEST_MEDIA_TYPES))
+                .with_context(|| format!("pull manifest for {}", req.redacted_source))?;
+            if let Some(cache) = cache {
+                cache.keep_bytes(&digest, &raw);
+            }
+            Ok((raw, digest))
+        };
+
+        // The top-level manifest: cached, else fetched (by digest when known,
+        // so the bytes match what the HEAD reported).
+        let cached_top = match (cache, top_digest) {
+            (Some(cache), Some(digest)) => cache.read(digest).map(|raw| (raw, digest.to_string())),
+            _ => None,
+        };
+        let top_from_cache = cached_top.is_some();
+        let (raw, digest) = match cached_top {
+            Some(hit) => hit,
+            None => pull(&match top_digest {
+                Some(digest) => reference.clone_with_digest(digest.to_string()),
+                None => reference.clone(),
+            })?,
+        };
+
+        let parsed: OciManifest = serde_json::from_slice(&raw)
+            .with_context(|| format!("parse manifest for {}", req.redacted_source))?;
+        let index = match parsed {
+            OciManifest::Image(_) => return Ok((raw, digest, top_from_cache)),
+            OciManifest::ImageIndex(index) => index,
+        };
+        let platform_digest = linux_platform_resolver(&index.manifests).with_context(|| {
+            format!(
+                "{} has no linux/{} image in its index",
+                req.redacted_source,
+                image_arch()
+            )
+        })?;
+        if let Some(raw) = cache.and_then(|cache| cache.read(&platform_digest)) {
+            return Ok((raw, platform_digest, top_from_cache));
+        }
+        let (raw, digest) = pull(&reference.clone_with_digest(platform_digest))?;
+        Ok((raw, digest, false))
     }
 }
 
@@ -467,6 +730,299 @@ mod tests {
         assert_eq!(sanitize_title("../../escape"), "escape");
         assert_eq!(sanitize_title(".."), "layer");
         assert_eq!(sanitize_title(""), "layer");
+    }
+
+    /// A registry small enough to read: `GET /v2/`, manifests by tag or
+    /// digest (`HEAD` and `GET`), and blobs, over plain HTTP with one request
+    /// per connection. Every request is logged as `"<METHOD> <path>"`, and
+    /// `down` makes it answer 503 to everything, like a rate-limited or
+    /// failing registry.
+    struct FakeRegistry {
+        port: u16,
+        /// path -> (content type, body); manifests are keyed by both tag
+        /// and digest.
+        routes: Arc<std::sync::Mutex<HashMap<String, (String, Vec<u8>)>>>,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        down: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FakeRegistry {
+        fn start() -> Self {
+            use std::io::{BufRead, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let routes: Arc<std::sync::Mutex<HashMap<String, (String, Vec<u8>)>>> =
+                Arc::default();
+            let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+            let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (thread_routes, thread_log, thread_down) =
+                (routes.clone(), log.clone(), down.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    loop {
+                        let mut header = String::new();
+                        if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts.next().unwrap_or_default().to_string();
+                    thread_log.lock().unwrap().push(format!("{method} {path}"));
+                    let found = if thread_down.load(std::sync::atomic::Ordering::SeqCst) {
+                        None
+                    } else if path == "/v2/" {
+                        Some(("application/json".to_string(), b"{}".to_vec()))
+                    } else {
+                        thread_routes.lock().unwrap().get(&path).cloned()
+                    };
+                    let response = match found {
+                        Some((content_type, body)) => {
+                            let digest = ContentDigest::of_bytes(&body);
+                            let mut head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                                 Docker-Content-Digest: {}\r\nContent-Length: {}\r\n\
+                                 Connection: close\r\n\r\n",
+                                digest.as_str(),
+                                body.len()
+                            )
+                            .into_bytes();
+                            if method != "HEAD" {
+                                head.extend_from_slice(&body);
+                            }
+                            head
+                        }
+                        None => {
+                            let status = if thread_down.load(std::sync::atomic::Ordering::SeqCst) {
+                                "503 Service Unavailable"
+                            } else {
+                                "404 Not Found"
+                            };
+                            format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .into_bytes()
+                        }
+                    };
+                    let _ = stream.write_all(&response);
+                }
+            });
+            FakeRegistry {
+                port,
+                routes,
+                log,
+                down,
+            }
+        }
+
+        fn serve(&self, path: String, content_type: &str, body: Vec<u8>) {
+            self.routes
+                .lock()
+                .unwrap()
+                .insert(path, (content_type.to_string(), body));
+        }
+
+        /// Publishes `lib/img:<tag>` as a one-platform index over a manifest
+        /// with a config and the given layers, returning the index digest.
+        fn publish(&self, tag: &str, config: &[u8], layers: &[&[u8]]) -> String {
+            let descriptor = |media_type: &str, bytes: &[u8]| {
+                json!({
+                    "mediaType": media_type,
+                    "digest": ContentDigest::of_bytes(bytes).as_str(),
+                    "size": bytes.len(),
+                })
+            };
+            let manifest = serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+                "config": descriptor(oci_client::manifest::IMAGE_CONFIG_MEDIA_TYPE, config),
+                "layers": layers
+                    .iter()
+                    .map(|layer| descriptor(oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE, layer))
+                    .collect::<Vec<_>>(),
+            }))
+            .unwrap();
+            let mut platform_entry = descriptor(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE, &manifest);
+            platform_entry["platform"] = json!({ "os": "linux", "architecture": image_arch() });
+            let index = serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,
+                "manifests": [platform_entry],
+            }))
+            .unwrap();
+            let index_digest = ContentDigest::of_bytes(&index).as_str().to_string();
+            let manifest_digest = ContentDigest::of_bytes(&manifest).as_str().to_string();
+            for blob in std::iter::once(config).chain(layers.iter().copied()) {
+                self.serve(
+                    format!("/v2/lib/img/blobs/{}", ContentDigest::of_bytes(blob).as_str()),
+                    "application/octet-stream",
+                    blob.to_vec(),
+                );
+            }
+            self.serve(
+                format!("/v2/lib/img/manifests/{manifest_digest}"),
+                oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+                manifest,
+            );
+            for name in [tag.to_string(), index_digest.clone()] {
+                self.serve(
+                    format!("/v2/lib/img/manifests/{name}"),
+                    oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,
+                    index.clone(),
+                );
+            }
+            index_digest
+        }
+
+        /// Requests logged since the last call.
+        fn take_log(&self) -> Vec<String> {
+            std::mem::take(&mut *self.log.lock().unwrap())
+        }
+    }
+
+    fn open_store(dir: &std::path::Path) -> Arc<ContentStore> {
+        Arc::new(
+            ContentStore::open(
+                dir.join("content"),
+                crate::content_store::ContentStoreConfig {
+                    min_free_disk: 0,
+                    ..Default::default()
+                },
+            )
+            .expect("open content store"),
+        )
+    }
+
+    /// Pulls `source` into a fresh directory under `dir`, through `store`.
+    fn pull(
+        dir: &std::path::Path,
+        name: &str,
+        source: &str,
+        store: Option<Arc<ContentStore>>,
+    ) -> R<std::path::PathBuf> {
+        let parsed = parse_artifact_source(source)?;
+        let limits = FetchLimits::default();
+        let mut sink = ArtifactSink::new(dir.join(name), limits.max_bytes)?;
+        sink.set_content_store(store);
+        let fetched = OciFetcher::new().fetch(&request(&parsed, &limits, source), &mut sink)?;
+        match fetched.payload {
+            FetchedPayload::Image { oci_layout, .. } => Ok(oci_layout),
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    fn blob_pulls(log: &[String]) -> Vec<&String> {
+        log.iter()
+            .filter(|line| line.starts_with("GET") && line.contains("/blobs/"))
+            .collect()
+    }
+
+    fn manifest_gets(log: &[String]) -> Vec<&String> {
+        log.iter()
+            .filter(|line| line.starts_with("GET") && line.contains("/manifests/"))
+            .collect()
+    }
+
+    /// P2-9: every start pulled the image again, and anonymous registries
+    /// rate-limit that. With a node content store, a repeated start of the
+    /// same tag costs one HEAD, a registry that stops answering does not stop
+    /// a cached image from starting, and a moved tag downloads only the
+    /// layers the node does not hold.
+    #[test]
+    fn repeated_pulls_are_served_from_the_node_content_store() -> R<()> {
+        let registry = FakeRegistry::start();
+        let dir = tempfile::tempdir()?;
+        let store = open_store(dir.path());
+        let source = format!("oci://127.0.0.1:{}/lib/img:v1?protocol=http", registry.port);
+        let (base, app_v1, app_v2) = (b"base-layer".as_slice(), b"app-v1".as_slice(), b"app-v2".as_slice());
+        registry.publish("v1", br#"{"config":{"Env":["V=1"]}}"#, &[base, app_v1]);
+
+        // First pull: everything comes from the registry and is kept.
+        let layout = pull(dir.path(), "first", &source, Some(store.clone()))?;
+        assert!(layout.join("index.json").is_file());
+        let log = registry.take_log();
+        assert_eq!(blob_pulls(&log).len(), 3, "config + 2 layers: {log:?}");
+        assert_eq!(manifest_gets(&log).len(), 2, "index + platform manifest: {log:?}");
+        assert_eq!(store.list()?.len(), 5, "index, manifest, config, 2 layers");
+        let layer = layout
+            .join("blobs/sha256")
+            .join(ContentDigest::of_bytes(app_v1).hex());
+        assert_eq!(std::fs::read(&layer)?, app_v1);
+
+        // Second pull of the same tag: one HEAD, no manifest or blob GETs.
+        let again = pull(dir.path(), "second", &source, Some(store.clone()))?;
+        let log = registry.take_log();
+        assert!(log.iter().any(|line| line.starts_with("HEAD") && line.ends_with("/manifests/v1")), "{log:?}");
+        assert!(manifest_gets(&log).is_empty(), "{log:?}");
+        assert!(blob_pulls(&log).is_empty(), "{log:?}");
+        assert_eq!(
+            std::fs::read(again.join("index.json"))?,
+            std::fs::read(layout.join("index.json"))?
+        );
+
+        // The registry stops answering: the tag's last digest on this node
+        // still starts.
+        registry.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        pull(dir.path(), "offline", &source, Some(store.clone()))?;
+        assert!(blob_pulls(&registry.take_log()).is_empty());
+        registry.down.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // The tag moves: the new manifests and the changed layer are pulled,
+        // the shared base layer is not.
+        registry.publish("v1", br#"{"config":{"Env":["V=2"]}}"#, &[base, app_v2]);
+        let moved = pull(dir.path(), "moved", &source, Some(store.clone()))?;
+        let log = registry.take_log();
+        let pulled = blob_pulls(&log);
+        assert_eq!(pulled.len(), 2, "new config + changed layer only: {log:?}");
+        assert!(
+            !pulled
+                .iter()
+                .any(|line| line.contains(ContentDigest::of_bytes(base).hex())),
+            "{log:?}"
+        );
+        assert!(moved
+            .join("blobs/sha256")
+            .join(ContentDigest::of_bytes(app_v2).hex())
+            .is_file());
+        Ok(())
+    }
+
+    /// A digest reference the node holds needs no registry at all, and a
+    /// node without a store pulls everything, as before.
+    #[test]
+    fn digest_references_and_storeless_pulls() -> R<()> {
+        let registry = FakeRegistry::start();
+        let dir = tempfile::tempdir()?;
+        let store = open_store(dir.path());
+        let index = registry.publish("v1", br#"{"config":{}}"#, &[b"only-layer"]);
+        let pinned = format!(
+            "oci://127.0.0.1:{}/lib/img@{index}?protocol=http",
+            registry.port
+        );
+
+        pull(dir.path(), "warm", &pinned, Some(store.clone()))?;
+        registry.take_log();
+        registry.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        pull(dir.path(), "hit", &pinned, Some(store.clone()))?;
+        let log = registry.take_log();
+        assert!(
+            log.iter().all(|line| line == "GET /v2/"),
+            "a held digest asks the registry for nothing: {log:?}"
+        );
+        registry.down.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // No store: the full pull, every time.
+        let tag = format!("oci://127.0.0.1:{}/lib/img:v1?protocol=http", registry.port);
+        pull(dir.path(), "plain-1", &tag, None)?;
+        pull(dir.path(), "plain-2", &tag, None)?;
+        assert_eq!(blob_pulls(&registry.take_log()).len(), 4);
+        Ok(())
     }
 
     #[test]

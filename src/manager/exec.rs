@@ -15,17 +15,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Endpoint;
 use tonic::Status;
 
 use crate::manager::acl;
 use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
-use crate::structs::{
-    exec_client_frame, worker_client::WorkerClient, ExecClientFrame, ExecServerFrame, ExecStart,
-    ExecWinsize, Node,
-};
+use crate::structs::{exec_client_frame, ExecClientFrame, ExecServerFrame, ExecStart, ExecWinsize};
 use crate::task_plugins::runtime_is_host_level;
 
 /// The response stream type for `Manager.ExecAllocation`.
@@ -35,7 +31,8 @@ pub type ExecAllocationStream = ReceiverStream<Result<ExecServerFrame, Status>>;
 struct ResolvedExec {
     allocation_id: i64,
     node_id: String,
-    worker_address: String,
+    /// The worker plane client for the node running the allocation.
+    target: crate::manager::worker_plane::WorkerTarget,
     job_id: String,
     task_name: String,
     /// Final argv the worker will run (action commands already rendered).
@@ -187,17 +184,15 @@ fn resolve_exec_start(
     let node = store
         .get_node(&allocation.node_id)
         .map_err(|e| Status::internal(format!("failed to load node: {e}")))?;
-    let worker_address = worker_address_for_node(&node).ok_or_else(|| {
-        Status::failed_precondition(format!(
-            "worker address missing for node {}",
-            allocation.node_id
-        ))
-    })?;
+    // The worker plane: mTLS with this manager's certificate, the node's
+    // name verified (see `crate::manager::worker_plane`).
+    let target =
+        crate::manager::worker_plane::target(store, &node).map_err(|err| err.to_status())?;
 
     Ok(ResolvedExec {
         allocation_id: allocation.id,
         node_id: allocation.node_id.clone(),
-        worker_address,
+        target,
         job_id: allocation.job_id.clone(),
         task_name: task.name.clone(),
         command,
@@ -212,14 +207,6 @@ fn resolve_exec_start(
 /// dispatched/running state; the rest are the running aliases used elsewhere.
 fn is_runnable_status(status: &str) -> bool {
     matches!(status, "placed" | "active" | "running")
-}
-
-fn worker_address_for_node(node: &Node) -> Option<String> {
-    let attrs = node.config_attrs.as_object()?;
-    attrs
-        .get("workerAddress")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
 }
 
 /// Authorize, resolve, and proxy an exec session. `inbound` is a channel of
@@ -254,10 +241,8 @@ pub async fn run_exec_session(
         "exec session authorized"
     );
 
-    // Dial the worker running the allocation.
-    let endpoint = Endpoint::from_shared(resolved.worker_address.clone())
-        .map_err(|e| Status::internal(format!("invalid worker address: {e}")))?;
-    let mut worker = WorkerClient::new(endpoint.connect_lazy());
+    // Dial the worker running the allocation over the worker plane.
+    let mut worker = resolved.target.client.clone();
 
     // Build the outbound stream to the worker: a freshly-rendered ExecStart
     // (raw argv only — the worker never sees action names), then the client's
@@ -294,10 +279,13 @@ pub async fn run_exec_session(
         }
     });
 
+    // A worker that cannot be reached at all gets a message naming the
+    // node, its address, and the port; an answer from the worker (a missing
+    // allocation, a refused command) passes through with its own code.
     let worker_stream = worker
         .exec_task(ReceiverStream::new(fwd_rx))
         .await
-        .map_err(|e| Status::internal(format!("worker exec failed: {e}")))?
+        .map_err(|status| resolved.target.explain(status))?
         .into_inner();
 
     // Pump the worker's server frames back to the caller, logging the exit.
