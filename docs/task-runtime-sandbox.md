@@ -8,7 +8,9 @@
 Run an OCI image inside a microVM instead of a container. The workload gets
 its own kernel, so escaping it means escaping a hypervisor instead of a
 syscall filter. Use it for untrusted code, agent workspaces, CI runners, and
-multi-tenant exec sandboxes.
+multi-tenant exec sandboxes. For running many of them (what each create,
+suspend, and resume costs, and how to measure it), see
+[Sandboxes at scale](sandboxes-at-scale.md).
 
 The job config is close to [`container`](task-runtime-container.md) (`image`,
 `command`, `env`). It adds what a VM needs and a container does not: guest size

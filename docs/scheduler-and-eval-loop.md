@@ -786,9 +786,12 @@ re-plan, and blocks again if there is still no room.
 
 ### Seeing it
 
-`legion job info <job>` and `ListJobs` report `status: blocked` for a job
-that is neither stopped nor failed while its eval waits, with a `blocked`
-block (the human table prints it as a line under the job):
+`legion job info <job>` and `ListJobs` report a `blocked` block for a job
+with a blocked eval, and `status: blocked` where the
+[derived job status](jobs-tasks-and-scheduling.md) would otherwise read
+`pending` (nothing of the job is live). A job with live allocations keeps
+`running` and still carries the block. The human table prints the block as
+a line under the job:
 
 ```console
 $ legion job info agents -j
@@ -800,8 +803,8 @@ $ legion job info agents -j
 ```
 
 `shortfall` is what one placement of the task asks for, not the job's total.
-The status is a read-side overlay: the job row keeps its stored status, so
-`stopped` and `failed` jobs never show `blocked`. The UI's job page shows
+Both are read-side overlays: nothing is stored on the job, and a stopped
+job never shows `blocked`. The UI's job page shows
 the same block as a note, the MCP `legion_job_info` tool returns it, and
 `legion eval list` shows the eval with status `blocked`.
 

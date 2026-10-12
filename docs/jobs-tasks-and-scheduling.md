@@ -396,7 +396,8 @@ The first matching row wins:
 | `failed` | A required KV key vanished (`onDelete = "fail"`; see [KV store](kv-store.md#fail-semantics-and-recovery)). |
 | `running` | At least one allocation of the job is live: placed and not yet terminal. |
 | `failed` | Nothing is live, and a task's last run failed: it spent its restart and move budgets, or exited unsuccessfully under a policy that does not restart it ([task supervision](task-supervision.md)). |
-| `pending` | Nothing is live, and a task that wants an allocation hasn't finished. It is waiting to be placed (no node fits, or no node is up) or waiting on a `dependsOn` condition. |
+| `blocked` | Nothing is live, and the job's placement found no room: its eval waits [blocked](scheduler-and-eval-loop.md#blocked-evals) for capacity that could host it, and the job places on its own when that capacity appears. `Job.blocked` says what it waits for. |
+| `pending` | Nothing is live, and a task that wants an allocation hasn't finished. It is waiting to be placed or waiting on a `dependsOn` condition. |
 | `scheduled` | Nothing is live or pending, and a cron task (`schedule`) finished its last run and is waiting for the next. |
 | `complete` | Nothing is live, and every task that wants an allocation finished successfully. |
 | `suspended` | No task wants an allocation, and at least one keyed instance is [suspended](suspend-and-resume.md). |
@@ -415,6 +416,10 @@ How the inputs are read:
 - **A task wants an allocation** when its `count` is above zero, or, for a
   keyed stateful task, when it has at least one pending, active, or
   rescheduling instance.
+- **`blocked` takes the place of `pending`** only. A job with something live
+  reads `running` even while another of its placements waits for room; its
+  `blocked` block (`legion job info -j`, the UI's job page) still says what
+  that placement waits for.
 
 `legion job list --status <value>` and `ListJobsRequest.status` filter on the
 derived status, and `ListJobsReply.status_counts` counts it.

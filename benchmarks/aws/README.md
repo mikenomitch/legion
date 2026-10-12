@@ -31,7 +31,7 @@ against a stubbed `aws`, no image baked against real AWS yet.
 | `scripts/` | The runbook, as executables (below). `bootstrap-operator-box.sh` builds the box you drive from (`bake-operator-ami.sh` bakes its toolchain into an AMI first, from the one shared `operator-toolchain.sh`); `phase1.sh` is the whole of phase 1, checkpointed. |
 | `experiments/` | Piggyback drills: storm, failover, streaming RPO, 24h soak, upgrade-under-load. See `experiments/README.md`. |
 | `dashboards/` | Grafana boards provisioned onto the loadgen box. |
-| `analysis/` | `fit_curves.py`: scaling fits + 20k/50k projections with prediction intervals and validation deltas. |
+| `analysis/` | `fit_curves.py`: scaling fits + 20k/50k projections with prediction intervals and validation deltas. `sandbox_report.py`: the sandbox-scaling campaign's report and projections. |
 | `results/` | Campaign archives land here (gitignored) and in `s3://<bucket>/campaigns/`. |
 
 ## Start here: one command
@@ -259,6 +259,88 @@ measures a scheduler holding 3,000 corpses while reporting itself as a
 1,000-node result. Every cell now also gates on an exact node census —
 right count, all active and available, all named from this fleet's
 slices — and refuses to run otherwise, printing what it actually saw.
+
+## Sandbox-scaling campaign (cheap, standalone)
+
+`scripts/run-sandbox-campaign.sh` measures the sandbox path: keyed-instance
+lifecycles (create → running → suspend → resume → destroy) driven at a
+ladder of open-loop rates against the real 3-manager control plane, plus one
+density cell that holds thousands of sandboxes resident at once. It is
+separate from the job campaigns, needs no spot fleet, and is the cheapest
+campaign the rig runs
+([sandbox-scaling plan](../../internal_docs/plans/sandbox-scaling-plan.md),
+Phase 0 on AWS).
+
+```bash
+# The cheap shape: 3 control-plane boxes + one load box, no worker fleet.
+scripts/bringup.sh -var worker_instances=0 -var loadgen_type=c7i.2xlarge
+scripts/build-and-upload.sh
+
+scripts/run-sandbox-campaign.sh --smoke     # ~5 min: one 25/s rung + 2,000 resident
+scripts/run-sandbox-campaign.sh             # ladder 25 → 800/s, then 10,000 resident
+
+scripts/teardown.sh
+```
+
+**What it costs.** Three `m6id.xlarge` ($0.237/h each) and one
+`c7i.2xlarge` ($0.357/h) on demand in us-east-1 are about **$1.07/hour**.
+Bringup and the build take ~20 minutes, the default campaign ~30-45 (it
+stops climbing at the first rung that does not hold, and resets the control
+plane once before the density cell). A full run, bringup to teardown, is
+about **$1-2**. `--smoke` proves the path for well under a dollar.
+
+**How it works.** `legion-loadgen --mode instances` runs on the load box
+and embeds its simulated nodes (`--simulate`, checkpoint channel faked,
+shaped by `workloads/sandbox_nodes.json`: a 48-vCPU, 192 GiB host holding
+~3,000 sandboxes). The nodes speak the real worker protocol over the VPC:
+registration, the `StreamWork` stream, heartbeats, checkpoint reports. So
+the control plane under test, its raft quorum, and the network between
+them are real; only the sandbox runtime is not.
+
+| Cell | What runs | Default |
+| --- | --- | --- |
+| `ladder-r<rate>` | `rate × 20` sessions (200-20,000) at `<rate>`/s on `--sim-nodes` nodes, each running create → running → suspend → resume → destroy | rates 25, 50, 100, 200, 400, 800; 100 nodes |
+| `density-<n>` | `<n>` sessions created at `--density-rate` and held running for `--density-hold` seconds on `--density-nodes` nodes (~1,000 per node: the dense-node case the heartbeat path is about) | 10,000 on 10 nodes, 250/s, 120 s |
+
+Every cell records the loadgen summary and before/after snapshots of every
+manager (CPU seconds and RSS of the `legion` process, applied raft
+entries, heartbeats served); the density cell also samples them every 10 s
+while the sandboxes are held. Flags: `--rates`, `--sim-nodes`,
+`--sessions-max`, `--density*`, `--no-stop` (climb past the ceiling),
+`--no-reset-control-plane`, `--system legion-b` (streaming persistence).
+
+**The report.** The campaign ends with `analysis/sandbox_report.py`, which
+writes `results/<campaign>/sandbox/report.md` (and `report.json`):
+
+- per rung: offered and achieved lifecycles/s, failures, latency p50/p99
+  per stage (create → running, placement, dispatch, suspend, resume,
+  destroy), **raft entries per lifecycle**, and **manager CPU-seconds per
+  lifecycle**;
+- the **ceiling** (highest rung that held: every session completed at
+  ≥ 90% of the offered rate) and the **operating point** (the held rung
+  nearest 80% of it, whose latencies are the ones to quote);
+- the density cell: peak resident sandboxes, **manager memory per resident
+  sandbox**, and manager CPU and heartbeats/s while they were held;
+- **projections**, each labelled with the measured number it scales and the
+  assumption it makes: lifecycles per hour and per day at the operating
+  point, **control-plane cost per million lifecycles**, and resident
+  sandboxes a manager's memory holds.
+
+`python3 analysis/sandbox_report.py --campaign results/<id>` re-renders it;
+`--cp-hourly-usd` sets the price for a control-plane type the built-in
+table does not know.
+
+**What the numbers can and cannot claim.** Every latency is the control
+plane's share of a sandbox start (from accepting `CreateInstance` to the
+node holding the allocation, and the same for resume), measured on an HA
+3-voter cluster across real network hops. Add the runtime's own boot or
+restore time for the end-to-end figure: this rig has no KVM, so it cannot
+boot a guest. Sustained rates and per-lifecycle costs are measured;
+per-hour, per-day, per-million-lifecycle and resident-capacity figures are
+projections, and the report prints them as such. Suspend and resume
+latencies are bounded by the heartbeat cadence (checkpoint requests and
+reports still ride heartbeats), so they say more about that protocol than
+about throughput.
 
 ## Unattended runs (overnight, or from a cloud shell)
 

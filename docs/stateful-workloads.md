@@ -51,6 +51,32 @@ the manager's state store (`instance` table) and outlives any allocation.
   sets the cardinality (zero instances means zero allocations). See
   [Keyed Mode: the Management API](#keyed-mode-the-management-api).
 
+### Choosing a mode
+
+Pick by how the work comes into existence and what must survive a failure:
+
+| You have | Use | Why |
+| --- | --- | --- |
+| A fixed number of interchangeable replicas with no per-replica state (web, API, workers) | no `stateful` block: `count` | Nothing to keep across a reschedule; the cheapest path, and `count` scales it |
+| A fixed set of replicas, each owning its own data (a database replica set, a quorum, a sharded cache) | `slot` | Replica *N* must come back as replica *N* with replica *N*'s disk; ids are readable and reused within the pool |
+| Units created and destroyed on demand by an API, each with its own identity and possibly its own state (per-user sandboxes, per-agent or per-session workspaces, a dev environment per branch, a game server per match, a CI runner per job) | `keyed` | Each unit is created by `CreateInstance`, survives node loss and reschedules under its own id, can be suspended, resumed, and forked, and its id is never recycled |
+
+What each mode guarantees and costs:
+
+| | `count` (stateless) | `slot` | `keyed` |
+| --- | --- | --- | --- |
+| How units appear | the job's `count` | the job's `count` (one slot each) | `CreateInstance` / `legion instance create`, one at a time or in batches |
+| Identity across reschedules | none (a new allocation id) | the slot's id, reused within the pool | the instance's id, unique and never recycled while the job exists |
+| Survives node loss | replaced elsewhere | the slot is replaced, bound to its storage | the instance is replaced, bound to its storage (`onLost` decides when) |
+| Suspend, resume, fork | no | no | yes ([suspend-and-resume.md](suspend-and-resume.md)) |
+| Durable record | the allocation row | one instance row per slot | one instance row per instance, kept as a tombstone after destroy |
+| Control-plane writes per unit | one placement | one placement | about 8 raft entries for a full create → place → suspend → resume → destroy ([Sandboxes at scale](sandboxes-at-scale.md)) |
+
+Sandboxes are the canonical `keyed` workload, and
+[Sandboxes at scale](sandboxes-at-scale.md) covers running many of them:
+what each lifecycle step costs, how fast work reaches a node, what happens
+when capacity runs out, and how to measure it on your own hardware.
+
 Legion guarantees at most one live allocation per instance. Every placement
 binds inside the transaction that inserts the allocation. The one rollout
 strategy that would run two live allocations at once, `createFirst`
@@ -549,8 +575,11 @@ CreateInstance ──> pending ──placed──> active ──alloc dies──
 ```
 
 - **Create** registers the instance (state `pending`) and enqueues placement,
-  in one write (concurrent creates group-commit into one write between
-  them). The scheduler sets a keyed task's desired allocation count from its
+  in one write. Concurrent instance operations (creates, stops, starts,
+  destroys, suspends, resumes, forks, edge ratifications) share one
+  scheduler-lane write between them, each in its own savepoint, so one that
+  fails rolls back alone (`schedulerSettings.instance_group_commit`, default
+  `true`). The scheduler sets a keyed task's desired allocation count from its
   live (pending, active, or rescheduling) instances. Keyed tasks define no
   `count`, and a keyed task with zero instances runs zero allocations.
   Stopped instances are **not** in the desired set. An instance that finds

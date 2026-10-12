@@ -3,7 +3,7 @@
 Decisions made while writing
 [`plans/sandbox-scaling-plan.md`](../plans/sandbox-scaling-plan.md), and
 while implementing its Phases 0–3 (entries 5, 10, 11, 13, 14, 16, 17, 22,
-and 28–38). **Entries are ranked by project impact, highest first. The
+and 28–40). **Entries are ranked by project impact, highest first. The
 number is the rank.** Implementation-time calls get inserted at their rank
 as the phases execute. If a citation elsewhere names an entry by number,
 fix it when you renumber. The plan cites entries by number throughout.
@@ -295,9 +295,11 @@ a consumer instead of a second implementation.
 **Call.** A `job_submit`, `job_update`, `job_reschedule`, or `job_scale`
 whose plan finds no room is written `status = 'blocked'` with its key and
 detail, in the settle that used to write `failed`. A job with a blocked
-eval that is neither stopped nor failed reports `status: blocked` and a
-`blocked { key, task, shortfall, message, since, evalId }` block from
-`GetJobInfo` and `ListJobs`. The job row keeps its stored status.
+eval reports a `blocked { key, task, shortfall, message, since, evalId }`
+block from `GetJobInfo` and `ListJobs`, and `status: blocked` where the
+derived job status (job-status plan, merged alongside this work) would
+read `pending`. A job with live allocations keeps `running`. Nothing is
+stored on the job.
 
 ```console
 $ legion job info agents -j
@@ -311,6 +313,8 @@ $ legion job info agents -j
 - (b) A `legion job status` verb, as the plan's console sketch shows.
 - (c) A cluster-wide shortfall: the job's total unmet request against the
   class's free capacity.
+- (d) Let `blocked` outrank `running` in the derived status, so any job
+  with a waiting placement reads `blocked`.
 
 **Trade-off.** `failed` no longer means "no room" for these evals, so a
 script that read `eval.failed` as a capacity signal must read
@@ -325,7 +329,10 @@ composite for a value derivable from one indexed read. There is no `job
 status` verb today and `job info` is where a job's state already lives, so
 (b) would have added a second command for the same record. (c) needs a
 capacity model of the class the scheduler does not keep, and computing it
-on every read of `ListJobs` is the cost a list should not pay.
+on every read of `ListJobs` is the cost a list should not pay. (d) would
+make a 10,000-instance sandbox job serving traffic read `blocked` because
+one create is waiting; the job-status plan's rule that live work reads
+`running` is the right first answer, and the block carries the rest.
 
 ## 11. Eval claims are leader memory, not a raft entry
 
@@ -918,3 +925,63 @@ write on the wrong lane at runtime.
 
 **Why (simplicity).** Extending it means classifying about a dozen
 existing ops from earlier work, which is its own change. Open in TODO.md.
+
+## 39. Session mode's user documentation is drafted in the plan, not published
+
+**Call.** The documentation for `stateful.mode = "session"` (when to use
+it, what it gives up against `keyed`, its use cases with sandboxes among
+them, and the paragraph the sandbox guides gain) is written now as plan
+§15, ready to move into `docs/` unchanged when Phase 6 ships. What is
+public now is what exists: `docs/sandboxes-at-scale.md` and the "Choosing
+a mode" section of `docs/stateful-workloads.md`, covering `count`, `slot`,
+and `keyed`.
+
+**Alternatives.**
+- (a) Publish the session-mode page now, marked "planned".
+- (b) Write nothing about session mode until Phase 6.
+
+**Trade-off.** A reader of the public docs cannot learn today that a
+session mode is coming or what it will cost them; the owner asked for the
+trade-offs to be clear, and they are clear only in the plan until Phase 6.
+
+**Why (simplicity).** `AGENTS.md` keeps promises of unshipped work out of
+`docs/`: a page describing a mode the binary rejects would be read as a
+feature that exists. (b) would leave the trade-off discussion to be
+reconstructed at Phase 6 from code, after the decisions it should have
+shaped. Writing the public text now, in the plan, settles the trade-offs
+before the code and costs only a move when it ships.
+
+## 40. The AWS sandbox campaign embeds its nodes on the load box and labels every projection
+
+**Call.** `benchmarks/aws/scripts/run-sandbox-campaign.sh` runs on the rig
+with no spot fleet: `legion-loadgen --mode instances` embeds its simulated
+nodes (checkpoint channel faked) on the load box, against the real
+3-voter control plane. It climbs a rate ladder and stops at the first rung
+that does not hold, then resets the control plane and holds a density cell
+on fewer, denser nodes. `analysis/sandbox_report.py` reports measured
+numbers and, separately, projections (lifecycles per day, cost per million
+lifecycles, resident capacity per manager), each with the measured number
+it scales and its assumption.
+
+**Alternatives.**
+- (a) Run the sim nodes on the spot fleet, as the job campaigns do.
+- (b) Add a KVM-capable (bare-metal) worker so sandbox boot and restore are
+  real.
+- (c) Report only measured numbers, no projections.
+
+**Trade-off.** The load box runs the fleet and the load, so a very high
+rung can be bound by the load box rather than the control plane (the
+report's busiest-manager CPU column is how to tell). Boot and restore are
+simulated, so every latency is the control plane's share. Projections can
+be quoted out of context.
+
+**Why (simplicity, then cost).** The owner asked for a baseline on a few
+real servers that can run on its own. The control plane is what the
+sandbox-scaling work changes, and the embedded fleet speaks the real
+protocol over the real network, so four on-demand boxes (about $1.07/hour)
+measure it; (a) adds a fleet and its quota for no extra signal, and (b)
+costs a metal instance (about $4/hour) to measure the runtime, which is a
+separate number (Phase 8 measures density per node). (c) would leave the
+owner to extrapolate by hand, which is where unlabelled numbers come from;
+the report does it once, with the basis printed beside every figure. Open
+in TODO.md: run it on AWS.

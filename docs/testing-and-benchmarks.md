@@ -339,6 +339,17 @@ achieved rate, and p50/p99 latency per stage (`create_rpc`, `placement`,
 split the time a running sandbox took into the control plane's share and
 the node's. The sandbox-scaling plan's Phase 0 baseline and every later
 phase's numbers in `benchmarks/scheduler/README.md` were measured with it.
+
+On AWS, `benchmarks/aws/scripts/run-sandbox-campaign.sh` runs it against the
+rig's 3-manager raft control plane with no worker fleet (four on-demand
+boxes, about $1/hour), climbs a rate ladder to the ceiling, holds a density
+cell, and `benchmarks/aws/analysis/sandbox_report.py` writes the report:
+ceiling, latencies, raft entries and manager CPU per lifecycle, manager
+memory per resident sandbox, and labelled projections. See
+`benchmarks/aws/README.md`, "Sandbox-scaling campaign". Rig flags the
+campaign uses: `--join-token` (the fleet's worker type and secret),
+`--advertise-host`, `--sim-name-prefix` (a fixed prefix so successive runs
+re-register the same nodes), and `--sim-profiles` (the node shape).
 Use isolated ports for a local manager: never the defaults another cluster
 on the machine may be using.
 

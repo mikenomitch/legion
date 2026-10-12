@@ -1597,3 +1597,127 @@ Each phase ships alone and is worth having alone.
   correct accounting.
 - **Phase 10:** built only with the trigger met, with its own plan
   amendment.
+
+## 14. Results, Phases 0-3
+
+Measured 2026-10-12 while the phases shipped. Every number here is from the
+stated local substitute (calls entry 13), not the AWS rig.
+
+### 14.1 Method
+
+- **Host.** One 4-vCPU Intel Xeon at 2.1 GHz, 15 GiB, no KVM. Release
+  builds. Manager, loadgen, and simulated fleet share the four cores.
+- **Cluster.** One manager on isolated ports (gRPC `15747`, telemetry
+  `15749`), `persistence.type = "raft"`, a single voter, `single` topology,
+  a fresh data directory per rung.
+- **Load.** `legion-loadgen --mode instances --simulate 50` (50 simulated
+  nodes with the checkpoint channel faked, heartbeat 2 s), driving
+  create → running → suspend → resume → destroy at an open-loop `--rate`,
+  `--sessions = 20 × rate` (minimum 100), `--hold-ms 0`. A rung "holds" when
+  it completes every session without timeouts; the ceiling is the highest
+  completed rate.
+- **Entries.** `tests/raft_lifecycle_ops.rs`, exact, on `single` and `lanes`
+  (calls entry 36). Under load, entries per session are
+  `sum(legion_raft_ops_total) / sessions` from the rung's manager, which
+  includes registrations and heartbeat writes.
+- **Sizes and heartbeat bytes.** `tests/instance_scale_measure.rs` (release,
+  `--ignored`), and `tests/work_stream.rs` for the streaming heartbeat.
+- **Scheduler micro-benchmarks.** `benchmarks/micro/scheduler_bench.rs`,
+  before and after, recorded in `benchmarks/scheduler/README.md`.
+- **Runtime boot and restore are simulated** (no KVM): the §7.2 runtime
+  rows below are the control-plane share only.
+
+## 15. Public documentation for session mode (draft, publish with Phase 6)
+
+Session mode is not built: this section is the user-facing documentation it
+ships with, written now so the trade-offs are settled before the code and
+the docs cannot drift from the plan. It does not go in `docs/` until Phase 6
+lands (public docs describe only what exists; calls entry 39). When it does:
+§15.1 becomes `docs/session-mode.md`, §15.2 is added to
+`docs/stateful-workloads.md` "Choosing a mode", and §15.3 is added to
+`docs/sandboxes-at-scale.md` and `docs/guides/agent-sandboxes.md`.
+
+### 15.1 `docs/session-mode.md`: Session mode
+
+`stateful.mode = "session"` runs very large numbers of short-lived,
+on-demand units, such as an agent's sandbox, a CI job's runner, or a
+function invocation, without writing anything to the control plane's
+replicated store when one starts or stops. It trades durability per unit
+for start rate and count: a session is held by the node running it, not by
+raft.
+
+**How it works.** The job reserves capacity ahead of time as **envelopes**,
+one per eligible node (`stateful.envelope.resources`). Envelopes are
+ordinary allocations, placed and replicated like any other. A create is
+admitted by the session router into an envelope with room, from soft
+state, and started on that node: no raft entry, no eval, no plan. The node
+records the session in its local session log and reports it on its
+heartbeats; the scheduler-lane leader keeps an in-memory index of running
+sessions, rebuilt from those reports after a failover. An idle session
+suspends to a published checkpoint (`suspend.durability = "store"`,
+required), and its manifest in the content store is its only record until
+it resumes.
+
+**When to use it.**
+
+- Many units created by an API, at rates of thousands per second, each
+  living seconds to hours: agent sandboxes and tool executions, per-request
+  workers, CI runners, function-style invocations, preview environments.
+- Units that are disposable on node loss, or that checkpoint often enough
+  that resuming the last checkpoint is an acceptable recovery.
+- Counts where a row per unit, kept forever as a tombstone, would make the
+  store grow with history: millions running, hundreds of millions idle.
+
+**When not to use it.** Anything that must be rescheduled when its node
+dies, keep a node-local volume, or appear in an exact listing at every
+instant: databases, quorum members, long-lived services, and stateful
+workloads with local disks. Use `keyed` (units by API, durable) or `slot`
+(a fixed replica set) for those. A session can be **promoted** to a keyed
+instance (`PromoteInstance`, or automatically when created with a caller id
+or given a network volume), which gives it a row and every keyed guarantee
+from then on.
+
+**What you give up, against `keyed`:**
+
+| Guarantee | `keyed` | `session` |
+| --- | --- | --- |
+| Durable record | A raft row from create on, a tombstone after destroy | None while running (the node's log); the published manifest while idle |
+| Node loss while running | Rescheduled elsewhere, bound to its storage | Lost, unless suspended; a running session is not rescheduled |
+| At most one live copy | Exact | Converges to one within a heartbeat: a retried unnamed create can briefly run on two nodes |
+| Ids never recycled | Exact for the job's life | Probabilistic: 130 random bits, no tombstone |
+| `instance list` | An exact read | Running sessions from the leader's index, marked `complete: false` until every node has reported after a failover; idle ones from the bucket (`--include-idle`) |
+| Idempotent create | A replicated record | A derived id: a retry gets the same id, no record |
+| Events | The replicated journal | A live tail, and the node logs shipped to the bucket |
+| Capacity | Reserved per instance at placement | Reserved per node as envelopes, whether or not sessions fill them |
+| Start cost | About 8 raft entries per lifecycle | 0 for an unnamed session; 1 to promote |
+
+**What stays the same.** ACLs (a session belongs to its job and
+namespace), workload identity (issued from the session's lease, refused for
+a session that has ended or a node that does not hold it), exec, suspend
+and resume, and the `legion instance` commands and RPCs, which report a
+`durable` field saying which column above applies.
+
+**Capacity planning.** Burst headroom is the envelopes' free room. A create
+that finds no envelope with room is refused with `ENVELOPE_FULL` rather
+than queued, so size envelopes for the peak you want to absorb, and watch
+`legion_sessions_envelope_free{job}`. Envelope capacity is reserved whether
+sessions use it or not.
+
+### 15.2 Row for `docs/stateful-workloads.md`, "Choosing a mode"
+
+| You have | Use | Why |
+| --- | --- | --- |
+| Very many short-lived units created by an API, disposable on node loss or checkpointed (agent sandboxes and tool runs, CI runners, function-style invocations) | `session` | Starts write nothing to the replicated store, so the start rate and the count are bound by nodes, not by the control plane; you give up rescheduling on node loss, an exact instant listing, and a durable record per unit ([Session mode](session-mode.md)) |
+
+### 15.3 Paragraph for the sandbox guides
+
+> **Keyed or session?** Use `keyed` when each sandbox must survive its
+> node dying (it is rescheduled with its storage), when sandboxes keep
+> node-local disks, or when you need an exact, durable record of every
+> sandbox: per-user workspaces people come back to. Use `session` when
+> sandboxes are disposable or checkpointed, created by the thousands per
+> second, and numerous enough that a row per sandbox would make the store
+> grow with history: per-task agent sandboxes, tool executions, CI. A
+> session that turns out to matter can be promoted to a keyed instance
+> without stopping it. The trade-offs are in
+> [Session mode](../session-mode.md).
