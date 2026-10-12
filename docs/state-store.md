@@ -232,10 +232,12 @@ Server-side backups work in every mode: `legion state backup` (a
 - Raft `topology = "lanes"` (independent per-domain raft groups) works but
   is opt-in. `single` is the recommended default. See `docs/multi-raft.md`
   § "Topology: `single` vs `lanes`".
-- Non-leader client writes are rejected with a leader hint instead of being
-  forwarded. Worker-plane writes (heartbeats, reports) do forward to the
-  owning lane's leader (`docs/multi-raft.md` § "Non-leader write redirects
-  and forwarding").
+- Write forwarding is one hop. A non-leader replays a client write to the
+  leader (`docs/raft-operations.md` § "Writes on any manager") and forwards
+  worker-plane writes per operation (`docs/multi-raft.md` § "Non-leader
+  write redirects and forwarding"); when the leader is unreachable from the
+  manager that received the write, it fails with the leader hint rather than
+  being retried elsewhere.
 - Managers dial each other's raft transport over plaintext HTTP/2 and
   authenticate with a shared cluster secret. There is no mTLS between
   managers.

@@ -34,10 +34,25 @@ legion exec 4217 --task api -it -- /bin/bash
 
 # Target the newest running allocation of a job instead of an id.
 legion exec --job web -it -- /bin/sh
+
+# For scripts and agents: collect the output into one JSON envelope.
+legion exec 4217 --json -- cat /etc/resolv.conf
+# {"ok":true,"data":{"allocationId":4217,"exitCode":0,"stdout":"nameserver …\n",
+#  "stderr":"","message":""}}
 ```
 
 Flags match docker and kubectl: `-i/--stdin` forwards local stdin, `-t/--tty`
 allocates a pseudo-terminal, and everything after `--` is the remote argv.
+
+`--json` is for one-shot commands: it buffers the output (decoded as UTF-8,
+invalid bytes replaced) instead of streaming it, and cannot be combined with
+`-i` or `-t`. The process still exits with the remote exit code, so a command
+that fails gives `"ok": true` with a non-zero `exitCode` and a non-zero exit.
+A request that never ran (an unknown allocation, an exec the ACLs refuse, an
+unreachable node) is the standard `"ok": false` error envelope, with the
+manager's or the worker's own message: for example `FailedPrecondition` when
+the allocation is not running, or `Unavailable` naming the node and port the
+manager could not reach.
 
 In the UI, open a task (Jobs → a job → a task) and use the **Exec &
 Actions** panel on any running allocation. Type a command and toggle
@@ -114,6 +129,8 @@ legion action list web                                   # discover actions
 legion action run web flush-cache --param scope=assets   # newest running alloc
 legion action run web tail-slowlog --alloc 4217 --param lines=500
 legion action run web debug-shell --alloc 4217 -it       # a tty action
+legion action list web --json                            # the actions as data
+legion action run web flush-cache --json                 # one envelope, as for exec
 ```
 
 In the UI, the same **Exec & Actions** panel shows each action with a form
@@ -182,9 +199,9 @@ The MCP server (`legion mcp serve`) exposes exec/actions to agents:
 
 - `legion_action_list` (read-only): list a job's declared actions and params.
 - `legion_action_run` (mutating, needs `--allow-write`): run an action
-  one-shot and return combined output and exit code.
+  one-shot and return `exitCode`, `stdout`, `stderr`, and `message`.
 - `legion_exec_run` (mutating, needs `--allow-write`): run a one-shot command
-  and return stdout, stderr, and exit code.
+  and return the same shape.
 
 There is no interactive PTY over MCP. These tools are one-shot only.
 

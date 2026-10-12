@@ -266,26 +266,37 @@ fn drain_evals(store: &Store) -> R<Vec<(String, Result<String, String>)>> {
     let mut outcomes = Vec::new();
     while let Some(eval) = store.get_next_eval()? {
         let result = eval.handle(store);
-        store.set_eval_status(
-            &eval.id,
-            if result.is_ok() { "complete" } else { "failed" },
-        )?;
-        outcomes.push((eval.kind.clone(), result.map_err(|error| format!("{error:#}"))));
+        store.set_eval_status(&eval.id, if result.is_ok() { "complete" } else { "failed" })?;
+        outcomes.push((
+            eval.kind.clone(),
+            result.map_err(|error| format!("{error:#}")),
+        ));
     }
     Ok(outcomes)
 }
 
+/// Register a worker that reports task exits (protocol 2+), the kind whose
+/// batch tasks stay `running` until their exit is reported.
 fn add_node(store: &Store, node: &str) -> R<()> {
-    store.insert_eval(&Eval {
-        id: format!("join-{node}"),
-        status: "pending".into(),
-        kind: "node_join".into(),
-        job_id: String::new(),
-        job_config_id: String::new(),
-        node_name: node.into(),
-        priority: 90,
+    store.insert_node(legion::structs::NodeMsg {
+        id: node.to_string(),
+        pool: "default".into(),
+        status: "active".into(),
+        availability: "available".into(),
+        config_attrs: "{}".into(),
+        fingerprint_attrs: json!({
+            "memory_total": "8589934592",
+            "cpus": {
+                "cpu-1": { "frequency": "2400" },
+                "cpu-2": { "frequency": "2400" },
+            }
+        })
+        .to_string(),
+        dynamic_attrs: json!({ "protocolVersion": 2 }).to_string(),
+        health_checks: json!({ "worker": "pass" }).to_string(),
+        last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
     })?;
-    drain_evals(store)?;
     Ok(())
 }
 
@@ -309,7 +320,13 @@ fn batch_step(name: &str, after: Option<&str>) -> TaskConfig {
 fn submit(store: &Store, job: &JobConfig) -> R<String> {
     store.handle_job_submit(job, &[primary_submission(&job.name)])?;
     let job_config_id = store.get_job_config(&job.name)?.id();
-    store.enqueue_eval("job_submit", Some(&job.name), Some(&job_config_id), None, None)?;
+    store.enqueue_eval(
+        "job_submit",
+        Some(&job.name),
+        Some(&job_config_id),
+        None,
+        None,
+    )?;
     Ok(job_config_id)
 }
 
@@ -400,7 +417,10 @@ fn dag_steps_wait_for_their_dependency_to_succeed() -> R<()> {
     )?;
     drain_evals(&store)?;
     assert!(allocations_of(&store, "pipeline", "validate")?.is_empty());
-    assert_eq!(store.derived_job_statuses(Some("pipeline"))?["pipeline"], "running");
+    assert_eq!(
+        store.derived_job_statuses(Some("pipeline"))?["pipeline"],
+        "running"
+    );
 
     let fetch = allocations_of(&store, "pipeline", "fetch")?[0].id;
     report_exit(&store, fetch, true)?;
@@ -412,7 +432,10 @@ fn dag_steps_wait_for_their_dependency_to_succeed() -> R<()> {
     report_exit(&store, validate, true)?;
     drain_evals(&store)?;
     assert_eq!(allocations_of(&store, "pipeline", "serve")?.len(), 1);
-    assert_eq!(task_status(&store, "pipeline", "validate")?, TaskStatusState::Success);
+    assert_eq!(
+        task_status(&store, "pipeline", "validate")?,
+        TaskStatusState::Success
+    );
     Ok(())
 }
 
@@ -432,13 +455,19 @@ fn a_failed_step_blocks_its_success_dependent() -> R<()> {
     report_exit(&store, validate, false)?;
     drain_evals(&store)?;
 
-    assert_eq!(task_status(&store, "broken", "validate")?, TaskStatusState::Failed);
+    assert_eq!(
+        task_status(&store, "broken", "validate")?,
+        TaskStatusState::Failed
+    );
     assert!(
         allocations_of(&store, "broken", "serve")?.is_empty(),
         "serve must not start after validate failed"
     );
     // Nothing is live, and a task failed for good.
-    assert_eq!(store.derived_job_statuses(Some("broken"))?["broken"], "failed");
+    assert_eq!(
+        store.derived_job_statuses(Some("broken"))?["broken"],
+        "failed"
+    );
     Ok(())
 }
 
@@ -456,12 +485,18 @@ fn a_multi_replica_step_succeeds_only_when_every_replica_has() -> R<()> {
     assert_eq!(fetches.len(), 2);
     report_exit(&store, fetches[0].id, true)?;
     drain_evals(&store)?;
-    assert_eq!(task_status(&store, "fanout", "fetch")?, TaskStatusState::Running);
+    assert_eq!(
+        task_status(&store, "fanout", "fetch")?,
+        TaskStatusState::Running
+    );
     assert!(allocations_of(&store, "fanout", "validate")?.is_empty());
 
     report_exit(&store, fetches[1].id, true)?;
     drain_evals(&store)?;
-    assert_eq!(task_status(&store, "fanout", "fetch")?, TaskStatusState::Success);
+    assert_eq!(
+        task_status(&store, "fanout", "fetch")?,
+        TaskStatusState::Success
+    );
     assert_eq!(allocations_of(&store, "fanout", "validate")?.len(), 1);
     Ok(())
 }
@@ -473,19 +508,39 @@ fn a_finished_batch_job_reads_complete_and_reruns_from_the_top() -> R<()> {
     let store = setup_store()?;
     add_node(&store, "node-1")?;
     let job = JobConfig {
-        tasks: vec![batch_step("fetch", None), batch_step("validate", Some("fetch"))],
+        tasks: vec![
+            batch_step("fetch", None),
+            batch_step("validate", Some("fetch")),
+        ],
         ..dag_job("nightly")
     };
     let job_config_id = submit(&store, &job)?;
     drain_evals(&store)?;
-    report_exit(&store, allocations_of(&store, "nightly", "fetch")?[0].id, true)?;
+    report_exit(
+        &store,
+        allocations_of(&store, "nightly", "fetch")?[0].id,
+        true,
+    )?;
     drain_evals(&store)?;
-    report_exit(&store, allocations_of(&store, "nightly", "validate")?[0].id, true)?;
+    report_exit(
+        &store,
+        allocations_of(&store, "nightly", "validate")?[0].id,
+        true,
+    )?;
     drain_evals(&store)?;
-    assert_eq!(store.derived_job_statuses(Some("nightly"))?["nightly"], "complete");
+    assert_eq!(
+        store.derived_job_statuses(Some("nightly"))?["nightly"],
+        "complete"
+    );
 
     // The next run (a schedule tick, a forced reschedule) starts at fetch.
-    store.enqueue_eval("job_update", Some("nightly"), Some(&job_config_id), None, None)?;
+    store.enqueue_eval(
+        "job_update",
+        Some("nightly"),
+        Some(&job_config_id),
+        None,
+        None,
+    )?;
     drain_evals(&store)?;
     assert_eq!(allocations_of(&store, "nightly", "fetch")?.len(), 1);
     assert!(
@@ -507,7 +562,10 @@ fn a_job_with_nothing_placed_reads_pending() -> R<()> {
     assert!(outcomes
         .iter()
         .any(|(kind, result)| kind == "job_submit" && result.is_err()));
-    assert_eq!(store.derived_job_statuses(Some("too-big"))?["too-big"], "pending");
+    assert_eq!(
+        store.derived_job_statuses(Some("too-big"))?["too-big"],
+        "pending"
+    );
 
     let mut fits = make_job_config("fits", 1);
     fits.tasks[0].resources = json!({ "memory": 64 });
@@ -587,7 +645,11 @@ fn a_scheduled_dag_keeps_one_next_run_timer() -> R<()> {
     };
     let job_config_id = submit(&store, &job)?;
     drain_evals(&store)?;
-    report_exit(&store, allocations_of(&store, "hourly", "fetch")?[0].id, true)?;
+    report_exit(
+        &store,
+        allocations_of(&store, "hourly", "fetch")?[0].id,
+        true,
+    )?;
     drain_evals(&store)?;
     assert_eq!(allocations_of(&store, "hourly", "validate")?.len(), 1);
 

@@ -12046,7 +12046,7 @@ impl Store {
             "SELECT EXISTS (SELECT 1 FROM eval
                WHERE type = ?1 AND job_config_id = ?2
                  AND status = 'pending' AND ready_at > ?3);",
-            params![kind, job_config_id, Self::now_rfc3339()?],
+            params![kind, job_config_id, Self::sortable_now()?],
             |row| row.get(0),
         )?;
         Ok(pending)
@@ -12068,7 +12068,7 @@ impl Store {
                      AND e.type IN ('job_submit', 'job_update', 'job_reschedule', 'rollout_tick')
                      AND (e.status = 'in_flight' OR (e.status = 'pending' AND e.ready_at <= ?2)));"
             ),
-            params![job_id, Self::now_rfc3339()?],
+            params![job_id, Self::sortable_now()?],
             |row| row.get(0),
         )?;
         Ok(!busy)

@@ -7942,18 +7942,54 @@ mod tests {
         };
 
         // Being placed in the same pass satisfies only `start`.
-        assert!(satisfied(TaskDependencyCondition::Start, TaskStatusState::Pending, &planned));
-        assert!(!satisfied(TaskDependencyCondition::Complete, TaskStatusState::Pending, &planned));
-        assert!(!satisfied(TaskDependencyCondition::Success, TaskStatusState::Pending, &planned));
+        assert!(satisfied(
+            TaskDependencyCondition::Start,
+            TaskStatusState::Pending,
+            &planned
+        ));
+        assert!(!satisfied(
+            TaskDependencyCondition::Complete,
+            TaskStatusState::Pending,
+            &planned
+        ));
+        assert!(!satisfied(
+            TaskDependencyCondition::Success,
+            TaskStatusState::Pending,
+            &planned
+        ));
         // Running is not finished.
-        assert!(!satisfied(TaskDependencyCondition::Success, TaskStatusState::Running, &none));
-        assert!(!satisfied(TaskDependencyCondition::Complete, TaskStatusState::Running, &none));
+        assert!(!satisfied(
+            TaskDependencyCondition::Success,
+            TaskStatusState::Running,
+            &none
+        ));
+        assert!(!satisfied(
+            TaskDependencyCondition::Complete,
+            TaskStatusState::Running,
+            &none
+        ));
         // Exited 0.
-        assert!(satisfied(TaskDependencyCondition::Success, TaskStatusState::Success, &none));
-        assert!(satisfied(TaskDependencyCondition::Complete, TaskStatusState::Success, &none));
+        assert!(satisfied(
+            TaskDependencyCondition::Success,
+            TaskStatusState::Success,
+            &none
+        ));
+        assert!(satisfied(
+            TaskDependencyCondition::Complete,
+            TaskStatusState::Success,
+            &none
+        ));
         // Exited non-zero: finished, but not a success.
-        assert!(!satisfied(TaskDependencyCondition::Success, TaskStatusState::Failed, &none));
-        assert!(satisfied(TaskDependencyCondition::Complete, TaskStatusState::Failed, &none));
+        assert!(!satisfied(
+            TaskDependencyCondition::Success,
+            TaskStatusState::Failed,
+            &none
+        ));
+        assert!(satisfied(
+            TaskDependencyCondition::Complete,
+            TaskStatusState::Failed,
+            &none
+        ));
         // A preview never lets a failed dependency through `success`.
         assert!(!Scheduler::dependency_satisfied(
             &dependency(TaskDependencyCondition::Success),
@@ -8790,7 +8826,10 @@ mod tests {
         let error = scheduler
             .plan_and_apply(&job_config_id, PlanMode::Reschedule)
             .expect_err("no node has the port free");
-        assert!(error.downcast_ref::<PlacementBlocked>().is_some(), "{error:#}");
+        assert!(
+            error.downcast_ref::<PlacementBlocked>().is_some(),
+            "{error:#}"
+        );
         assert!(!crate::structs::Eval::error_is_plan_conflict(&error));
         Ok(())
     }

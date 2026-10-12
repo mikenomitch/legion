@@ -747,7 +747,12 @@ fn static_port_service_rollout_replaces_instead_of_waiting_forever() -> R<()> {
 
     let rollout = latest_rollout_for_job(&store, "static-svc")?;
     assert_eq!(rollout.status, "completed", "message: {}", rollout.message);
-    assert_eq!(store.allocs_for_job_config(&rollout.to_job_config_id)?.len(), 1);
+    assert_eq!(
+        store
+            .allocs_for_job_config(&rollout.to_job_config_id)?
+            .len(),
+        1
+    );
     assert!(store.allocs_for_job_config(&v1_id)?.is_empty());
     let events = store.list_rollout_events(rollout.id, Some(200))?;
     assert!(
@@ -755,7 +760,10 @@ fn static_port_service_rollout_replaces_instead_of_waiting_forever() -> R<()> {
             .iter()
             .any(|event| event.message.contains("cannot surge")),
         "expected a destructive-update event, got {:?}",
-        events.iter().map(|event| &event.message).collect::<Vec<_>>()
+        events
+            .iter()
+            .map(|event| &event.message)
+            .collect::<Vec<_>>()
     );
     Ok(())
 }

@@ -239,8 +239,9 @@ node-0007   default  active   available     2026-08-03T09:14:21Z
 node-0008   default  active   available     2026-08-03T09:13:58Z (checkpoint)
 ```
 
-`NodeMsg.heartbeat_source` carries the distinction. `--json` emits it, and the
-UI shows it as a tooltip on the relative time:
+`NodeMsg.heartbeat_source` carries the distinction. `--json` emits it as
+`heartbeatSource` (CLI JSON keys are camelCase), and the UI shows it as a
+tooltip on the relative time:
 
 - `live`: this manager owns liveness and observed the beat. Current.
 - `checkpoint`: from the replicated checkpoint, accurate to within
@@ -258,7 +259,7 @@ Two rules keep the checkpoint safe:
 
 Set `checkpointInterval: "0s"` to turn checkpoints off. No heartbeat-derived
 writes reach raft at all, and managers that don't own liveness report
-`heartbeat_source: ""` with an empty column. Use this if you prefer a blank
+`heartbeatSource: ""` with an empty column. Use this if you prefer a blank
 field to an approximate one.
 
 Sorting `legion node list` by last heartbeat still works. It sorts on whatever

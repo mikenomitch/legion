@@ -2269,8 +2269,14 @@ mod tests {
         let secs = time::Duration::seconds;
         assert_eq!(placement_wait_delay(secs(0), None), Duration::from_secs(2));
         assert_eq!(placement_wait_delay(secs(3), None), Duration::from_secs(2));
-        assert_eq!(placement_wait_delay(secs(20), None), Duration::from_secs(10));
-        assert_eq!(placement_wait_delay(secs(600), None), Duration::from_secs(30));
+        assert_eq!(
+            placement_wait_delay(secs(20), None),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            placement_wait_delay(secs(600), None),
+            Duration::from_secs(30)
+        );
         assert_eq!(
             placement_wait_delay(secs(600), Some(secs(5))),
             Duration::from_secs(5)

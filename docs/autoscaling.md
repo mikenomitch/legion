@@ -132,7 +132,9 @@ a job without the right to redeploy it. See [auth-and-acls.md](auth-and-acls.md)
   reschedules jobs short of their count
   ([jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#node-added)).
   Capacity freed by other jobs stopping does not trigger it.
-- **Manager is not the scheduler-lane leader**: the standard retryable
+- **Manager is not the scheduler-lane leader**: the manager forwards the
+  request to the leader and returns its answer. Only when that leader cannot
+  be reached does the caller get the standard retryable
   `failed_precondition` envelope with the leader hint.
 
 ## Known limitations (v1)

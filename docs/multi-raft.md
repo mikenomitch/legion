@@ -344,7 +344,9 @@ instead of failing, but there are costs:
 - **The control leader accepts job submits**, and they complete
   asynchronously. The control part (the operator's intent) must commit on
   the node you submitted to. A manager that does not lead the control lane
-  still rejects the submit with the typed leader hint. The owning lanes'
+  rejects the submit with the typed leader hint, and the API layer replays
+  it to the control leader (see "Non-leader write redirects and
+  forwarding"), so the caller sees the leader's answer. The owning lanes'
   leaders then complete the cross-lane parts: the `task_status` seed, the
   volume-claim rows, the rollout for an updated job, and the scheduling
   eval. Evals forward immediately. Per-lane reconcilers derive the rest from
@@ -471,8 +473,8 @@ An in-process 3-node test covers each of these, in
 
 | Scenario | Behavior |
 | --- | --- |
-| **Leader loss** | In-flight unacked writes fail with a typed error (retry them). Every acked write survives. A new leader is elected within the election timeout (600–1200 ms by default, see `electionTimeoutMinMs`/`electionTimeoutMaxMs`). Its eval workers and node status checker take over the replicated queues within about 1 s. Clients pointed at the dead leader redial using the leader hint. |
-| **Minority partition** | The majority side keeps electing and committing. Managers on the minority side cannot reach a quorum, so they reject writes with `FAILED_PRECONDITION` and a leader hint, and keep serving local reads. When the partition heals, the minority catches up and ends up byte-identical. |
+| **Leader loss** | In-flight unacked writes fail with a typed error (retry them). Every acked write survives. A new leader is elected within the election timeout (600–1200 ms by default, see `electionTimeoutMinMs`/`electionTimeoutMaxMs`). Its eval workers and node status checker take over the replicated queues within about 1 s. Clients pointed at the dead leader get a connection error and retry against another manager; clients pointed at a live manager are forwarded to the new leader. Workers fail over to another manager after two unreachable heartbeats. |
+| **Minority partition** | The majority side keeps electing and committing. Managers on the minority side cannot reach a quorum, so writes sent to them fail with `FAILED_PRECONDITION` (forwarding to a leader they cannot reach fails too), and they keep serving local reads. When the partition heals, the minority catches up and ends up byte-identical. |
 | **Follower loss** | No client impact. The cluster commits on the remaining quorum. When the follower returns, it catches up by log replay, or by snapshot install if the leader has compacted past its position. |
 | **Full-cluster restart** | Every node recovers from its raft log and state DB. A leader is re-elected, and the cluster resumes with all committed state. A restarted member that cannot yet hear the leader (its inbound transport shares the manager listener) starts without a leader, logs a warning, and catches up once it is serving. Startup never deadlocks on the election. |
 | **Operator double-start** | The second process fails fast on the `dataDir` advisory lock. |
