@@ -264,7 +264,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#17](https://github.com/mikenomitch/legion/pull/17) | Fixes for every 2026-10-11 spot-check finding, including Phase 1 of the worker plane | [plan](plans/launch-spot-check-fixes-plan.md) · [calls](calls/launch-spot-check-fixes-plan_calls.md); AWS re-run pending |
+| [#31](https://github.com/mikenomitch/legion/pull/31) | Wake on request (`legion start gateway`, `suspend.wake`) and credential injection on egress (`connect.upstreams[].credentials`, KV and identity providers) | [wake plan](plans/wake-on-request-plan.md) · [credential plan](plans/egress-credential-injection-plan.md); sandbox ingress and upstream relays still landing |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
 | [#4](https://github.com/mikenomitch/legion/pull/4) | Rename crate to `legion-rs`, crates.io metadata, `cargo install` docs | Not published yet; follow-ups under Templates, registry & packaging |
