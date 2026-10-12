@@ -291,12 +291,17 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\nservice ").next())
             .expect("Manager service in proto");
+        // Client-streaming means `stream` in the REQUEST position (the
+        // first parenthesis); server-streaming replies are not buffered.
         let mut streaming: Vec<&str> = manager
             .lines()
             .map(str::trim)
-            .filter(|line| line.starts_with("rpc ") && line.contains("(stream "))
-            .filter_map(|line| line.strip_prefix("rpc ")?.split_whitespace().next())
-            .map(|name| name.trim_end_matches('('))
+            .filter_map(|line| line.strip_prefix("rpc "))
+            .filter(|rest| {
+                rest.split_once('(')
+                    .is_some_and(|(_, request)| request.trim_start().starts_with("stream "))
+            })
+            .filter_map(|rest| rest.split(|c: char| c == '(' || c.is_whitespace()).next())
             .collect();
         streaming.sort();
         let mut expected = CLIENT_STREAMING_RPCS.to_vec();

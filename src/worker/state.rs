@@ -483,7 +483,9 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         assert!(!pid_is_running(child), "the orphaned child was killed");
-        assert!(!kill_orphaned_task_group(leader_pid), "nothing left to kill");
+        // (A second call may still find the group: an unreaped zombie stays a
+        // member until its new parent reaps it, and signalling it is
+        // harmless.)
         assert!(!kill_orphaned_task_group(1), "never signal every process");
         assert!(!kill_orphaned_task_group(0));
         Ok(())

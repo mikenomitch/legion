@@ -102,10 +102,10 @@ pub(crate) const ALL_CAPABILITIES: &[&str] = &[
     "CAP_WAKE_ALARM",
 ];
 
-/// Normalizes one capability name from a jobspec: case-insensitive, with or
-/// without the `CAP_` prefix (`net_admin`, `NET_ADMIN`, and `CAP_NET_ADMIN`
-/// are the same capability), plus the `ALL` keyword. `field` names the list
-/// for the error.
+/// Normalizes one capability name from a jobspec or worker config:
+/// case-insensitive, with or without the `CAP_` prefix (`net_admin`,
+/// `NET_ADMIN`, and `CAP_NET_ADMIN` are the same capability), plus the `ALL`
+/// keyword. `field` is the list's full path, for the error.
 fn normalize_capability(raw: &str, field: &str) -> R<String> {
     let upper = raw.trim().to_ascii_uppercase();
     if upper == "ALL" {
@@ -120,8 +120,8 @@ fn normalize_capability(raw: &str, field: &str) -> R<String> {
         Ok(name)
     } else {
         bail!(
-            "unknown capability {raw:?} in security.capabilities.{field}: use a Linux capability \
-             name such as NET_ADMIN (the CAP_ prefix is optional), or ALL"
+            "unknown capability {raw:?} in {field}: use a Linux capability name such as \
+             NET_ADMIN (the CAP_ prefix is optional), or ALL"
         )
     }
 }
@@ -140,11 +140,11 @@ fn normalize_capability(raw: &str, field: &str) -> R<String> {
 pub(crate) fn resolve_capabilities(add: &[String], drop: &[String]) -> R<Vec<String>> {
     let add = add
         .iter()
-        .map(|raw| normalize_capability(raw, "add"))
+        .map(|raw| normalize_capability(raw, "security.capabilities.add"))
         .collect::<R<Vec<_>>>()?;
     let drop = drop
         .iter()
-        .map(|raw| normalize_capability(raw, "drop"))
+        .map(|raw| normalize_capability(raw, "security.capabilities.drop"))
         .collect::<R<Vec<_>>>()?;
     let add_all = add.iter().any(|cap| cap == "ALL");
     let drop_all = drop.iter().any(|cap| cap == "ALL");
@@ -177,6 +177,163 @@ pub(crate) fn default_capabilities() -> Vec<String> {
         .iter()
         .map(|cap| cap.to_string())
         .collect()
+}
+
+/// The capabilities a node lets container tasks end up with: the worker
+/// type's `container.allowCaps`, Nomad's `allow_caps` for its Docker driver.
+///
+/// A task's effective set ([`resolve_capabilities`]: the default, less
+/// `drop`, plus `add`) must fit inside it, or the start fails on that node.
+/// Dropping is therefore always allowed. The default allowlist is exactly
+/// [`DEFAULT_CAPABILITIES`], so out of the box a job can narrow its set but
+/// not widen it: granting `SYS_ADMIN` (container root becomes host root) is
+/// the node operator's decision, not the job author's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityAllowlist {
+    /// `allowCaps = ["ALL"]`: any capability.
+    All,
+    /// These capabilities (normalized, sorted, deduplicated) and no others.
+    Only(Vec<String>),
+}
+
+impl Default for CapabilityAllowlist {
+    fn default() -> Self {
+        Self::Only(default_capabilities())
+    }
+}
+
+impl CapabilityAllowlist {
+    /// The operator's `container.allowCaps`, validated: names are
+    /// normalized like a jobspec's, `ALL` anywhere in the list allows
+    /// everything, and an unknown name fails the config load. `None` (the
+    /// field is absent) is the default set; an empty list allows nothing, so
+    /// every container task there must drop every capability.
+    pub fn from_config(raw: Option<&[String]>) -> R<Self> {
+        let Some(raw) = raw else {
+            return Ok(Self::default());
+        };
+        let mut caps = raw
+            .iter()
+            .map(|name| normalize_capability(name, "container.allowCaps"))
+            .collect::<R<Vec<_>>>()?;
+        if caps.iter().any(|cap| cap == "ALL") {
+            return Ok(Self::All);
+        }
+        caps.sort();
+        caps.dedup();
+        Ok(Self::Only(caps))
+    }
+
+    /// The list as it is written back into worker config: `["ALL"]` or the
+    /// normalized names.
+    pub fn to_config(&self) -> Vec<String> {
+        match self {
+            Self::All => vec!["ALL".to_string()],
+            Self::Only(caps) => caps.clone(),
+        }
+    }
+
+    /// The value of [`crate::constants::ENV_CONTAINER_ALLOW_CAPS`], which is
+    /// how the worker hands the allowlist to its in-process runtimes.
+    pub fn to_env_value(&self) -> String {
+        self.to_config().join(",")
+    }
+
+    /// This node's allowlist, as the worker published it. Absent means the
+    /// worker was not given one (the default set). A value that does not
+    /// parse also falls back to the default set, which is the safe direction.
+    pub(crate) fn from_env() -> Self {
+        Self::from_env_value(
+            std::env::var(crate::constants::ENV_CONTAINER_ALLOW_CAPS)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// [`Self::from_env`] on a given value, so tests need not touch the
+    /// process environment.
+    fn from_env_value(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::default();
+        };
+        let names: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        Self::from_config(Some(&names)).unwrap_or_else(|err| {
+            warn!(
+                error = %format!("{err:#}"),
+                "Invalid container capability allowlist from the worker config; using the default"
+            );
+            Self::default()
+        })
+    }
+
+    /// Whether `cap` (normalized, `CAP_` prefixed) is allowed.
+    pub fn allows(&self, cap: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(caps) => caps.iter().any(|allowed| allowed == cap),
+        }
+    }
+
+    /// The capabilities in `caps` this allowlist refuses.
+    pub fn refused(&self, caps: &[String]) -> Vec<String> {
+        caps.iter()
+            .filter(|cap| !self.allows(cap))
+            .cloned()
+            .collect()
+    }
+
+    /// `caps` without what this allowlist refuses.
+    pub(crate) fn intersect(&self, caps: Vec<String>) -> Vec<String> {
+        caps.into_iter().filter(|cap| self.allows(cap)).collect()
+    }
+
+    /// The allowlist for an error message: `ALL`, `none`, or the names.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::All => "ALL".to_string(),
+            Self::Only(caps) if caps.is_empty() => "none".to_string(),
+            Self::Only(caps) => caps
+                .iter()
+                .map(|cap| cap.trim_start_matches("CAP_"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+}
+
+/// Fails when a container task's effective capability set holds anything
+/// the node's allowlist refuses, naming each such capability, the worker
+/// config field that would allow it, and the jobspec fields that would avoid
+/// it.
+pub(crate) fn check_capabilities_allowed(
+    task: &str,
+    capabilities: &[String],
+    allowlist: &CapabilityAllowlist,
+) -> R<()> {
+    let refused = allowlist.refused(capabilities);
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let short: Vec<&str> = refused
+        .iter()
+        .map(|cap| cap.trim_start_matches("CAP_"))
+        .collect();
+    let quoted: Vec<String> = short.iter().map(|cap| format!("{cap:?}")).collect();
+    bail!(
+        "task {task} would run with capabilities this node does not allow container tasks to \
+         have: {refused}. This node allows: {allowed} (the worker type's container.allowCaps). \
+         An operator can allow them by adding {quoted} to container.allowCaps in this worker \
+         type's config; otherwise take them out of the task (remove them from \
+         security.capabilities.add, or list them in security.capabilities.drop)",
+        refused = short.join(", "),
+        allowed = allowlist.describe(),
+        quoted = quoted.join(", "),
+    )
 }
 
 /// One `process.rlimits` entry.
@@ -1952,6 +2109,152 @@ mod tests {
         assert_eq!(
             spec["process"]["rlimits"],
             json!([{ "type": "RLIMIT_NOFILE", "soft": 4096, "hard": 8192 }])
+        );
+        Ok(())
+    }
+
+    fn caps_of(add: &[&str], drop: &[&str]) -> Vec<String> {
+        let owned = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        resolve_capabilities(&owned(add), &owned(drop)).expect("valid capabilities")
+    }
+
+    fn allow(names: &[&str]) -> CapabilityAllowlist {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        CapabilityAllowlist::from_config(Some(&names)).expect("valid allowlist")
+    }
+
+    /// The operator's `container.allowCaps`: normalized like a jobspec's,
+    /// `ALL` anywhere means everything, typos fail the config load, and
+    /// absent means exactly the default set.
+    #[test]
+    fn the_allowlist_parses_like_a_jobspec_and_defaults_to_the_default_set() -> R<()> {
+        assert_eq!(
+            CapabilityAllowlist::from_config(None)?,
+            CapabilityAllowlist::Only(default_capabilities())
+        );
+        assert_eq!(
+            CapabilityAllowlist::default().to_config(),
+            default_capabilities()
+        );
+        assert_eq!(
+            allow(&["net_raw", "CAP_CHOWN", "chown"]),
+            CapabilityAllowlist::Only(vec!["CAP_CHOWN".into(), "CAP_NET_RAW".into()])
+        );
+        assert_eq!(allow(&["chown", "all"]), CapabilityAllowlist::All);
+        assert_eq!(
+            CapabilityAllowlist::All.to_config(),
+            vec!["ALL".to_string()]
+        );
+        assert_eq!(allow(&[]), CapabilityAllowlist::Only(vec![]));
+        assert_eq!(allow(&[]).describe(), "none");
+
+        let names = vec!["SYS_ADMN".to_string()];
+        let err = CapabilityAllowlist::from_config(Some(&names)).unwrap_err();
+        assert!(err.to_string().contains("container.allowCaps"), "{err}");
+        assert!(err.to_string().contains("SYS_ADMN"), "{err}");
+
+        // The worker hands it to the runtime as one env value and back.
+        let widened = allow(&["CHOWN", "NET_RAW", "SYS_ADMIN"]);
+        assert_eq!(
+            CapabilityAllowlist::from_env_value(Some(&widened.to_env_value())),
+            widened
+        );
+        assert_eq!(
+            CapabilityAllowlist::from_env_value(Some("ALL")),
+            CapabilityAllowlist::All
+        );
+        // Unset, or unreadable: the default, which is the narrow side.
+        assert_eq!(
+            CapabilityAllowlist::from_env_value(None),
+            CapabilityAllowlist::default()
+        );
+        assert_eq!(
+            CapabilityAllowlist::from_env_value(Some("CHOWN,NOT_A_CAP")),
+            CapabilityAllowlist::default()
+        );
+        Ok(())
+    }
+
+    /// Nomad's `allow_caps` model: the task's effective set (the default,
+    /// less drop, plus add) must fit inside the node's allowlist.
+    #[test]
+    fn the_allowlist_admits_what_it_lists_and_refuses_the_rest() -> R<()> {
+        let default_node = CapabilityAllowlist::default();
+
+        // Nothing adjusted: the default set fits the default allowlist.
+        check_capabilities_allowed("web", &caps_of(&[], &[]), &default_node)?;
+
+        // Dropping is always fine, down to nothing.
+        check_capabilities_allowed("web", &caps_of(&[], &["MKNOD", "CHOWN"]), &default_node)?;
+        check_capabilities_allowed("web", &caps_of(&[], &["ALL"]), &default_node)?;
+        check_capabilities_allowed("web", &caps_of(&[], &["ALL"]), &allow(&[]))?;
+        // Re-adding a default capability after dropping everything is fine.
+        check_capabilities_allowed(
+            "web",
+            &caps_of(&["NET_BIND_SERVICE"], &["ALL"]),
+            &default_node,
+        )?;
+
+        // An add inside the node's allowlist is admitted.
+        let raw_node = allow(&[
+            "AUDIT_WRITE",
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "FSETID",
+            "KILL",
+            "MKNOD",
+            "NET_BIND_SERVICE",
+            "SETFCAP",
+            "SETGID",
+            "SETPCAP",
+            "SETUID",
+            "SYS_CHROOT",
+            "NET_RAW",
+        ]);
+        check_capabilities_allowed("pinger", &caps_of(&["NET_RAW"], &[]), &raw_node)?;
+        // ...but not on a node with the default allowlist.
+        let err = check_capabilities_allowed("pinger", &caps_of(&["NET_RAW"], &[]), &default_node)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("task pinger"), "{err}");
+        assert!(err.contains("NET_RAW"), "{err}");
+
+        // SYS_ADMIN: refused by default, naming the capability and the
+        // field an operator sets...
+        let admin = caps_of(&["SYS_ADMIN"], &[]);
+        let err = check_capabilities_allowed("tool", &admin, &default_node)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SYS_ADMIN"), "{err}");
+        assert!(err.contains("container.allowCaps"), "{err}");
+        assert!(err.contains("\"SYS_ADMIN\""), "the value to add: {err}");
+        assert!(err.contains("security.capabilities.add"), "{err}");
+        // ...admitted once the operator allows it, or allows everything.
+        let mut with_admin = DEFAULT_CAPABILITIES.to_vec();
+        with_admin.push("SYS_ADMIN");
+        check_capabilities_allowed("tool", &admin, &allow(&with_admin))?;
+        check_capabilities_allowed("tool", &admin, &CapabilityAllowlist::All)?;
+        check_capabilities_allowed("tool", &caps_of(&["ALL"], &[]), &CapabilityAllowlist::All)?;
+        assert!(
+            check_capabilities_allowed("tool", &caps_of(&["ALL"], &[]), &allow(&with_admin))
+                .is_err()
+        );
+
+        // An operator who narrows the allowlist below the default makes a
+        // task that keeps those capabilities fail until it drops them.
+        let narrow = allow(&["NET_BIND_SERVICE", "KILL"]);
+        let err = check_capabilities_allowed("web", &caps_of(&[], &[]), &narrow)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CHOWN"), "{err}");
+        assert!(err.contains("security.capabilities.drop"), "{err}");
+        check_capabilities_allowed("web", &caps_of(&["KILL"], &["ALL"]), &narrow)?;
+
+        // The dev-mode sandbox, which cannot drop, is trimmed instead.
+        assert_eq!(
+            narrow.intersect(default_capabilities()),
+            vec!["CAP_KILL".to_string(), "CAP_NET_BIND_SERVICE".to_string()]
         );
         Ok(())
     }

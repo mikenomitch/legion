@@ -2984,6 +2984,22 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             Some(block) => serde_json::to_string(&block.with_defaults())?,
         };
 
+        // `container` settings ride as JSON with the capability names
+        // normalized, so a typo in `allowCaps` fails here instead of on the
+        // node, and the worker and the submit check read one spelling.
+        let container = match wcp.container.as_ref() {
+            None => String::new(),
+            Some(block) => {
+                let allowlist = crate::task_plugins::CapabilityAllowlist::from_config(
+                    block.allow_caps.as_deref(),
+                )
+                .with_context(|| format!("invalid worker config {path_str}"))?;
+                serde_json::to_string(&crate::structs::WorkerContainerConfig {
+                    allow_caps: Some(allowlist.to_config()),
+                })?
+            }
+        };
+
         if let Some(seconds) = wcp.heartbeat_seconds {
             // The clamp widened from 1..=30 the moment the lost window began
             // moving with the cadence (heartbeat-cadence plan §7). Under the
@@ -3044,6 +3060,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             heartbeat_seconds: wcp.heartbeat_seconds,
             resource_enforcement,
             edge_boot,
+            container,
         };
 
         store.insert_worker_type(&wc)?;
@@ -3085,6 +3102,44 @@ mod tests {
             settings.budgets,
             crate::content_store::ContentBudgetSpecs::default()
         );
+        Ok(())
+    }
+
+    /// The shipped worker config's `container.allowCaps` parses, keeps the
+    /// whole default set (so default jobs still start), and adds NET_RAW.
+    /// A misspelled name fails the load, naming the field.
+    #[test]
+    fn the_default_worker_config_allow_caps_are_the_default_set_test() -> R<()> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/configs/workers/default.ncl");
+        let config = parse_worker_config(path)?;
+        let container = config.container.context("container block")?;
+        let allowlist =
+            crate::task_plugins::CapabilityAllowlist::from_config(container.allow_caps.as_deref())?;
+        let defaults = crate::task_plugins::CapabilityAllowlist::default().to_config();
+        assert!(allowlist.refused(&defaults).is_empty(), "{allowlist:?}");
+        // The shipped config is exactly the default set: raw sockets and
+        // anything beyond are an operator's explicit opt-in.
+        assert!(!allowlist.allows("CAP_NET_RAW"));
+        assert!(!allowlist.allows("CAP_SYS_ADMIN"));
+
+        let typo: WorkerConfigAlt = serde_json::from_value(json!({
+            "workerType": "bad",
+            "container": { "allowCaps": ["SYS_ADMN"] },
+        }))?;
+        let err = crate::task_plugins::CapabilityAllowlist::from_config(
+            typo.container
+                .context("container block")?
+                .allow_caps
+                .as_deref(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("container.allowCaps"), "{err}");
+        // Unknown keys in the block are refused too.
+        assert!(serde_json::from_value::<WorkerConfigAlt>(json!({
+            "workerType": "bad",
+            "container": { "allow_caps": ["NET_RAW"] },
+        }))
+        .is_err());
         Ok(())
     }
 

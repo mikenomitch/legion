@@ -48,7 +48,6 @@ struct LedgerJsonEntry {
 
 struct TestCluster {
     store: Store,
-    eval_seq: u64,
     job_config_ids: HashMap<String, String>,
 }
 
@@ -77,7 +76,6 @@ impl TestCluster {
         let store = Store::start_storage(&store_config)?;
         Ok(Self {
             store,
-            eval_seq: 0,
             job_config_ids: HashMap::new(),
         })
     }
@@ -99,9 +97,9 @@ impl TestCluster {
         let job_config_id = self.store.get_job_config(&job_name)?.id();
         self.job_config_ids
             .insert(job_name.clone(), job_config_id.clone());
-        self.enqueue_eval("job_submit", Some(&job_name), Some(&job_config_id), None)?;
-        self.process_next_eval()?
-            .context("expected job_submit eval")?;
+        let eval_id =
+            self.enqueue_eval("job_submit", Some(&job_name), Some(&job_config_id), None)?;
+        self.process_eval(&eval_id)?;
         Ok(())
     }
 
@@ -116,23 +114,22 @@ impl TestCluster {
             .insert(job_name.clone(), job_config_id.clone());
         let eval_id =
             self.enqueue_eval("job_submit", Some(&job_name), Some(&job_config_id), None)?;
-        let _ = self.process_next_eval();
+        let _ = self.process_eval(&eval_id);
         Ok(eval_id)
     }
 
     fn stop_job(&mut self, job_name: &str) -> R<()> {
         let job_config_id = self.job_config_id(job_name)?;
-        self.enqueue_eval("job_stop", Some(job_name), Some(&job_config_id), None)?;
-        self.process_next_eval()?
-            .context("expected job_stop eval")?;
+        let eval_id = self.enqueue_eval("job_stop", Some(job_name), Some(&job_config_id), None)?;
+        self.process_eval(&eval_id)?;
         Ok(())
     }
 
     fn reschedule_job(&mut self, job_name: &str) -> R<()> {
         let job_config_id = self.job_config_id(job_name)?;
-        self.enqueue_eval("job_reschedule", Some(job_name), Some(&job_config_id), None)?;
-        self.process_next_eval()?
-            .context("expected job_reschedule eval")?;
+        let eval_id =
+            self.enqueue_eval("job_reschedule", Some(job_name), Some(&job_config_id), None)?;
+        self.process_eval(&eval_id)?;
         Ok(())
     }
 
@@ -146,9 +143,8 @@ impl TestCluster {
     }
 
     fn join_node(&mut self, node_id: &str) -> R<()> {
-        self.enqueue_eval("node_join", None, None, Some(node_id))?;
-        self.process_next_eval()?
-            .context("expected node_join eval")?;
+        let eval_id = self.enqueue_eval("node_join", None, None, Some(node_id))?;
+        self.process_eval(&eval_id)?;
         Ok(())
     }
 
@@ -173,32 +169,32 @@ impl TestCluster {
         job_config_id: Option<&str>,
         node_name: Option<&str>,
     ) -> R<String> {
-        self.eval_seq += 1;
-        let id = self.eval_seq.to_string();
-        let eval = Eval {
-            id: id.clone(),
-            status: "pending".into(),
-            kind: kind.into(),
-            job_id: job_id.unwrap_or_default().to_string(),
-            job_config_id: job_config_id.unwrap_or_default().to_string(),
-            node_name: node_name.unwrap_or_default().to_string(),
-            priority: 50,
-        };
-        self.store.insert_eval(&eval)?;
-        Ok(id)
+        // The store mints the id, so it can never collide with an eval the
+        // store queues on its own (a capacity pass after a stop frees room,
+        // for example).
+        let eval = self
+            .store
+            .enqueue_eval(kind, job_id, job_config_id, node_name, Some(50))?;
+        Ok(eval.id)
     }
 
-    fn process_next_eval(&self) -> R<Option<Eval>> {
-        match self.store.get_next_eval()? {
-            Some(eval) => {
-                let result = eval.handle(&self.store);
-                match result {
-                    Ok(_) => self.store.set_eval_status(&eval.id, "complete")?,
-                    Err(_) => self.store.set_eval_status(&eval.id, "failed")?,
-                }
-                result.map(|_| Some(eval))
+    /// Run the eval loop until the eval `id` has been handled, the way the
+    /// manager's loop would: evals the store queued on its own along the way
+    /// (capacity passes, dependency progress) run first if they are ahead.
+    fn process_eval(&self, id: &str) -> R<Eval> {
+        loop {
+            let eval = self
+                .store
+                .get_next_eval()?
+                .with_context(|| format!("eval {id} was never handled"))?;
+            let result = eval.handle(&self.store);
+            match result {
+                Ok(_) => self.store.set_eval_status(&eval.id, "complete")?,
+                Err(_) => self.store.set_eval_status(&eval.id, "failed")?,
             }
-            None => Ok(None),
+            if eval.id == id {
+                return result.map(|_| eval);
+            }
         }
     }
 

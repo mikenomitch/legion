@@ -128,8 +128,11 @@ Worker startup (`run_worker`) flow:
    up even when the manager its token names is down. See
    [Managers a worker can reach](#managers-a-worker-can-reach).
 3. Call `WorkerPreRegister` to fetch worker-type config (`pool`, attributes,
-   resource limits, additional checks). A restarted worker presents the node
-   token it persisted; a new one presents its join secret.
+   resource limits, additional checks, and runtime settings such as
+   `resourceEnforcement` and the `container.allowCaps` capability allowlist,
+   see [docs/task-runtime-container.md](task-runtime-container.md#which-capabilities-a-node-allows)).
+   A restarted worker presents the node token it persisted; a new one
+   presents its join secret.
 4. Resolve worker ID:
    - Use `--name` if provided.
    - Else reuse existing single worker state dir.

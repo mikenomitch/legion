@@ -316,6 +316,7 @@ async fn run_worker_with_manager(
     let enforcement_config =
         usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
     apply_resource_enforcement_env(&enforcement_config);
+    apply_container_env(&config.container);
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
         // Worker core's own governor takes the config directly, before any
@@ -733,6 +734,38 @@ fn apply_resource_enforcement_env(config: &crate::structs::WorkerResourceEnforce
         std::env::remove_var(crate::constants::ENV_RESOURCE_ENFORCEMENT);
         std::env::remove_var(crate::constants::ENV_CGROUP_PARENT);
         std::env::remove_var(crate::constants::ENV_SANDBOX_VMM_OVERHEAD_MIB);
+    }
+}
+
+/// Publishes the worker type's `container.allowCaps` into the environment the
+/// `container` runtime reads at each start. An empty payload (no `container`
+/// block) clears it, which is the default allowlist. A payload that does not
+/// parse also falls back to the default, with a warning: the default is the
+/// narrow side, so a bad config never grants more than it meant to.
+fn apply_container_env(raw: &str) {
+    let allowlist = crate::structs::WorkerContainerConfig::from_payload(raw)
+        .and_then(|config| {
+            crate::task_plugins::CapabilityAllowlist::from_config(config.allow_caps.as_deref())
+        })
+        .unwrap_or_else(|err| {
+            warn!(
+                error = %format!("{err:#}"),
+                "Invalid worker container config; container tasks get the default capability \
+                 allowlist"
+            );
+            crate::task_plugins::CapabilityAllowlist::default()
+        });
+    if allowlist == crate::task_plugins::CapabilityAllowlist::default() {
+        std::env::remove_var(crate::constants::ENV_CONTAINER_ALLOW_CAPS);
+    } else {
+        info!(
+            allow_caps = %allowlist.describe(),
+            "Container capability allowlist set by the worker type (container.allowCaps)"
+        );
+        std::env::set_var(
+            crate::constants::ENV_CONTAINER_ALLOW_CAPS,
+            allowlist.to_env_value(),
+        );
     }
 }
 
@@ -3482,7 +3515,9 @@ mod tests {
         };
 
         // First join: the join token mints a node token, persisted at once.
-        let first = Arc::new(WorkerCredentials::with_join_secret(Some(join_secret.clone())));
+        let first = Arc::new(WorkerCredentials::with_join_secret(Some(
+            join_secret.clone(),
+        )));
         first.persist_to(state.clone());
         pre_register_self(client.clone(), "default".into(), &first).await?;
         register_self(client.clone(), &payload, &first).await?;

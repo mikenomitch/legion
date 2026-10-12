@@ -620,12 +620,12 @@ impl std::fmt::Display for NotRaftLeader {
             // leader (`manager::leader_forward`).
             (Some(name), Some(addr)) => write!(
                 f,
-                "this manager is not the raft leader{scope}; its leader is {name} (raft \
-                 advertise address {addr})"
+                "this manager is not the raft leader{scope}; retry on its leader {name} \
+                 (raft advertise address {addr})"
             ),
             (Some(name), None) => write!(
                 f,
-                "this manager is not the raft leader{scope}; its leader is {name}"
+                "this manager is not the raft leader{scope}; retry on its leader {name}"
             ),
             _ => write!(
                 f,

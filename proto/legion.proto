@@ -1754,6 +1754,21 @@ message WorkerConfig {
   //
   // Default: empty string (this node accepts no edge starts).
   string edge_boot = 13;
+
+  // JSON-encoded `container` runtime settings for this worker type (see
+  // docs/task-runtime-container.md, "Capabilities"). Shape:
+  // `{"allowCaps":["CAP_CHOWN","CAP_NET_RAW",...]}` or `{"allowCaps":["ALL"]}`.
+  //
+  // `allowCaps` is the set of Linux capabilities a `container` task on this
+  // node may end up with after its `security.capabilities` adjustments (the
+  // default set, less `drop`, plus `add`). A task whose effective set holds
+  // anything outside it fails at start on this node, with a message naming
+  // each refused capability and this field. The manager writes the names
+  // normalized (`CAP_` prefixed, sorted); `["ALL"]` allows every capability.
+  //
+  // Default: empty string (the default set: Docker's default capabilities
+  // less `CAP_NET_RAW`, so jobs may drop capabilities but add none).
+  string container = 14;
 }
 
 // Reply payload for WorkerPreRegister.

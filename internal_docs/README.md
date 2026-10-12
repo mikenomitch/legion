@@ -37,6 +37,11 @@ architecture and behavior docs are public.
 
 ## Notes
 
+- [spot-check-2026-10-11-findings.md](spot-check-2026-10-11-findings.md) —
+  the pre-launch spot check on real machines (three raft managers and two
+  spot workers on AWS, plus macOS): single-node demos worked, the multi-node
+  story did not. Every finding is fixed in #17; outcomes and deferrals are
+  in [launch-spot-check-fixes-plan.md](plans/launch-spot-check-fixes-plan.md).
 - [aws-phase1-findings.md](aws-phase1-findings.md) — the first real AWS
   benchmark run (2026-08-02/03): phase 1 passed, and it surfaced a
   manager heartbeat ceiling that was fsync-bound through raft. Start here
@@ -131,7 +136,8 @@ When one is required and what goes in it:
 | [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md) | **shipped** 2026-08-03 (D8: heartbeats leave raft — leader-memory liveness, transitions-only replication, failover grace, digest, display checkpoint); phase 1's AWS measurement is not run |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (phases 0-2 run on real AWS; phases 3-5 blocked on the scheduler, not the rig — see [aws-phase2-findings.md](aws-phase2-findings.md)) |
 | [worker-simulation-plan.md](plans/worker-simulation-plan.md) | shipped (2026-07-30) |
-| [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) | planned (launch blocker: workers on other hosts lose exec, logs, and the mesh. Also owns local workload isolation: ACLs on by default, the host guard, gated containers by default, the container privilege floor, and the `host` grant for host-level jobs. Carries the sandbox-exec plan's ticket caller class) |
+| [launch-spot-check-fixes-plan.md](plans/launch-spot-check-fixes-plan.md) | in execution (every 2026-10-11 spot-check finding fixed in #17, open; P1-5 in part; deferrals in §8.7; AWS re-run pending) |
+| [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) | in execution (Phase 1 core shipped in #17: reachable bind and advertise, the mTLS worker plane with caller classes, CSR issuance; CA rotation, the CA pin, and the exec ticket class deferred. Also owns local workload isolation: ACLs on by default, the host guard, gated containers by default, the container privilege floor, and the `host` grant for host-level jobs. Carries the sandbox-exec plan's ticket caller class) |
 | [scheduler-diagnosis-tooling-plan.md](plans/scheduler-diagnosis-tooling-plan.md) | planned (`legion scheduler diagnose` + the metric gaps that blocked the 2026-08-04 diagnosis) |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
 | [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; group-path + backlog deferred) |
@@ -196,6 +202,7 @@ by project impact. The full template and a worked example:
 - [kv-encryption-plan_calls.md](calls/kv-encryption-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [kv-cert-delivery-plan_calls.md](calls/kv-cert-delivery-plan_calls.md)
+- [launch-spot-check-fixes-plan_calls.md](calls/launch-spot-check-fixes-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)
 - [manager-contention-instrumentation_calls.md](calls/manager-contention-instrumentation_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)

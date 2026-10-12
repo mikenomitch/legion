@@ -182,16 +182,10 @@ function JobDetailContent() {
     }))
   })
 
-  // The manager stores `done` for every accepted job, running or not. A job
-  // with live allocations or active instances reads as running, so a keyed
-  // job with active instances never says DONE beside them.
-  const displayStatus = createMemo(() => {
-    const status = jobData()?.job?.status || 'unknown'
-    if (status.toLowerCase() !== 'done') return status
-    const liveAllocation = (jobData()?.allocations ?? []).some((allocation) => !['complete', 'failed'].includes(allocation.status.toLowerCase()))
-    const liveInstance = (instances() ?? []).some((instance) => ['active', 'pending', 'rescheduling'].includes(instance.state))
-    return liveAllocation || liveInstance ? 'running' : status
-  })
+  // The manager derives the status from live state (`running`, `pending`,
+  // `complete`, `failed`, `stopped`; docs/jobs-tasks-and-scheduling.md), so
+  // the page shows it as is.
+  const displayStatus = createMemo(() => jobData()?.job?.status || 'unknown')
 
   // The instances panel appears for jobs that declare stateful tasks, or that
   // have instance rows anyway (e.g. the spec failed to parse but the manager
@@ -215,8 +209,7 @@ function JobDetailContent() {
 
   const mayWrite = () => allows('job', 'write', jobScope(jobName(), jobData()?.template?.name))
   // Stop is offered while there is something to stop; destroy needs a
-  // stopped job first, which is why both live here. Note that `done` is the
-  // manager's word for "submission accepted and scheduled", not "finished".
+  // stopped job first, which is why both live here.
   const isStoppable = () => !['stopped', 'failed', 'destroyed'].includes((jobData()?.job?.status ?? '').toLowerCase())
 
   const stopJob = async () => {
@@ -261,16 +254,7 @@ function JobDetailContent() {
             }
             badges={
               <>
-                <StatusBadge
-                  status={displayStatus()}
-                  title={
-                    (jobData()!.job?.status ?? '').toLowerCase() === 'done'
-                      ? displayStatus() === 'running'
-                        ? 'Allocations or instances of this job are running. The manager records the job itself as "done", its word for an accepted job.'
-                        : 'Submitted and scheduled. "done" is the manager\'s word for an accepted job, not a finished one — see the task cards for what is running.'
-                      : undefined
-                  }
-                />
+                <StatusBadge status={displayStatus()} />
                 {/* The priority band decides what this job can displace and
                     what can displace it, so it belongs beside the status
                     rather than buried in the spec. */}

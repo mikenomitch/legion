@@ -1754,6 +1754,10 @@ impl ManagerDaemonService {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
         })?;
+        self.validate_job_capabilities(&config).map_err(|e| {
+            error!("Error validating capabilities: {:?}", e);
+            Status::invalid_argument(format!("Error validating capabilities: {e:#}"))
+        })?;
         // Artifact admission: desugar/auth/pin. Pin resolution can reach
         // registries, so it runs as blocking work.
         let artifact_pins =
@@ -2455,6 +2459,78 @@ impl ManagerDaemonService {
             }
         }
         Ok(notes)
+    }
+
+    /// Admission check for `container` tasks' capabilities against the
+    /// worker types' `container.allowCaps`.
+    ///
+    /// The real gate is on the worker, which refuses to start a container
+    /// whose effective capability set leaves its node's allowlist. This is
+    /// the cheap half of it: when *no* worker type allows a task's set, the
+    /// task could never start anywhere, so the job is rejected at submit
+    /// with the same advice instead of placing and failing. A set some
+    /// worker type allows passes, even if placement then lands the task on a
+    /// node of another type; that start fails on the node.
+    fn validate_job_capabilities(&self, config: &JobConfig) -> R<()> {
+        let mut requested = Vec::new();
+        for task in &config.tasks {
+            if let Some(caps) = crate::task_plugins::container_task_capabilities(task)? {
+                requested.push((task.name.as_str(), caps));
+            }
+        }
+        if requested.is_empty() {
+            return Ok(());
+        }
+        let allowlists: Vec<(String, crate::task_plugins::CapabilityAllowlist)> = self
+            .store
+            .list_worker_types()?
+            .into_iter()
+            .map(|worker_type| {
+                let allowlist =
+                    crate::structs::WorkerContainerConfig::from_payload(&worker_type.container)
+                        .and_then(|container| {
+                            crate::task_plugins::CapabilityAllowlist::from_config(
+                                container.allow_caps.as_deref(),
+                            )
+                        })
+                        .unwrap_or_default();
+                (worker_type.name, allowlist)
+            })
+            .collect();
+        if allowlists.is_empty() {
+            // No worker types configured: nothing to judge against.
+            return Ok(());
+        }
+        for (task, caps) in requested {
+            if allowlists
+                .iter()
+                .any(|(_, allowlist)| allowlist.refused(&caps).is_empty())
+            {
+                continue;
+            }
+            // Name what the most permissive type still refuses, so the
+            // message points at the smallest change.
+            let (_, closest) = allowlists
+                .iter()
+                .min_by_key(|(_, allowlist)| allowlist.refused(&caps).len())
+                .expect("at least one worker type");
+            let refused: Vec<String> = closest
+                .refused(&caps)
+                .iter()
+                .map(|cap| cap.trim_start_matches("CAP_").to_string())
+                .collect();
+            let types: Vec<&str> = allowlists.iter().map(|(name, _)| name.as_str()).collect();
+            bail!(
+                "task {task} would run with capabilities no worker type allows container tasks \
+                 to have: {refused}. An operator allows them with container.allowCaps in a \
+                 worker type's config (worker types: {types}); otherwise take them out of the \
+                 task (remove them from security.capabilities.add, or list them in \
+                 security.capabilities.drop)",
+                refused = refused.join(", "),
+                types = types.join(", "),
+            );
+        }
+        Ok(())
     }
 
     /// Admission check for volume declarations, against what the cluster
@@ -4272,6 +4348,10 @@ impl Manager for ManagerDaemonService {
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
+        })?;
+        self.validate_job_capabilities(&config).map_err(|e| {
+            error!("Error validating capabilities: {:?}", e);
+            Status::invalid_argument(format!("Error validating capabilities: {e:#}"))
         })?;
         // Artifact admission for plan mirrors run: pins resolve here too so
         // the plan shows the digests a submit would ship.
@@ -6742,6 +6822,7 @@ impl Manager for ManagerDaemonService {
             heartbeat_seconds: worker_config.heartbeat_seconds,
             resource_enforcement: worker_config.resource_enforcement,
             edge_boot: worker_config.edge_boot,
+            container: worker_config.container,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -10034,6 +10115,7 @@ fn handle_terminated_allocations(
     node_id: &str,
     terminated: &[crate::structs::TerminatedAllocation],
 ) -> R<()> {
+    let mut freed_capacity = false;
     for report in terminated {
         let allocation_id = report.allocation_id;
         let Some(existing) = store.get_allocation_by_id(allocation_id)? else {
@@ -10056,6 +10138,7 @@ fn handle_terminated_allocations(
         let Some(allocation) = store.complete_allocation(allocation_id, report.success)? else {
             continue;
         };
+        freed_capacity = true;
         // Tasks that depend on this one were held until it exited; queue
         // the eval that places them. Best effort: a failure here must not
         // fail the heartbeat, and the next eval of the job re-checks.
@@ -10088,7 +10171,7 @@ fn handle_terminated_allocations(
     }
     // A finished allocation no longer holds node capacity: retry jobs that
     // are short of room (no-op unless some plan left replicas unplaced).
-    if !terminated.is_empty() {
+    if freed_capacity {
         store.request_capacity_reconcile_if_waiting();
     }
     Ok(())
@@ -10100,6 +10183,7 @@ fn handle_failed_allocations(
     node_id: &str,
     failed: &[FailedAllocation],
 ) -> R<()> {
+    let mut freed_capacity = false;
     for failure in failed {
         let allocation_id = failure.allocation_id;
         let allocation_context = {
@@ -10125,6 +10209,7 @@ fn handle_failed_allocations(
         }
 
         store.remove_allocation_by_id(allocation_id)?;
+        freed_capacity = true;
 
         store.events().allocation_failed(
             allocation_id,
@@ -10198,8 +10283,10 @@ fn handle_failed_allocations(
     }
 
     // The removed rows freed node capacity (see
-    // `Store::request_capacity_reconcile_if_waiting`).
-    if !failed.is_empty() {
+    // `Store::request_capacity_reconcile_if_waiting`). Reports that were
+    // ignored (unknown, or from a node that does not own the allocation)
+    // freed nothing.
+    if freed_capacity {
         store.request_capacity_reconcile_if_waiting();
     }
     Ok(())
@@ -11623,6 +11710,62 @@ mod tests {
             status.message(),
             "Error running job: failed writing plan: disk quota exceeded"
         );
+    }
+
+    /// The submit half of the capability allowlist: a container task whose
+    /// effective set no worker type allows is rejected before it places; a
+    /// set some type allows, and any drop-only adjustment, passes.
+    #[test]
+    fn capabilities_no_worker_type_allows_are_rejected_at_submit() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let job = |security: Value| -> R<crate::structs::JobConfig> {
+            Ok(serde_json::from_value(json!({
+                "name": "caps",
+                "tasks": [{
+                    "name": "tool",
+                    "runtime": "container",
+                    "config": { "image": "alpine", "command": ["true"], "security": security },
+                }],
+            }))?)
+        };
+        let admin = job(json!({ "capabilities": { "add": ["SYS_ADMIN"] } }))?;
+        let dropper = job(json!({ "capabilities": { "drop": ["ALL"] } }))?;
+
+        // No worker types yet: nothing to judge against.
+        manager.validate_job_capabilities(&admin)?;
+
+        let worker_type = |name: &str, container: &str| crate::structs::WorkerConfig {
+            name: name.into(),
+            pool: "default".into(),
+            resources: "{}".into(),
+            reserved_resources: "{}".into(),
+            container: container.into(),
+            ..Default::default()
+        };
+        store.insert_worker_type(&worker_type("default", ""))?;
+        let err = manager
+            .validate_job_capabilities(&admin)
+            .expect_err("no worker type allows SYS_ADMIN")
+            .to_string();
+        assert!(err.contains("task tool"), "{err}");
+        assert!(err.contains("SYS_ADMIN"), "{err}");
+        assert!(err.contains("container.allowCaps"), "{err}");
+        assert!(err.contains("worker types: default"), "{err}");
+        manager.validate_job_capabilities(&dropper)?;
+        manager.validate_job_capabilities(&job(json!({}))?)?;
+
+        // One worker type allows it: admitted (that type's nodes can run it).
+        store.insert_worker_type(&worker_type("privileged", r#"{"allowCaps":["ALL"]}"#))?;
+        manager.validate_job_capabilities(&admin)?;
+
+        // A task pinned to macOS ignores capabilities, so it is not judged.
+        let mut mac = admin.clone();
+        store.insert_worker_type(&worker_type("privileged", ""))?;
+        assert!(manager.validate_job_capabilities(&mac).is_err());
+        mac.tasks[0].constraints = json!({ "os": "macos" });
+        manager.validate_job_capabilities(&mac)?;
+        Ok(())
     }
 
     #[tokio::test]

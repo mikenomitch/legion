@@ -1,0 +1,100 @@
+# Spot-check findings (2026-10-11) — verbatim from the report
+
+Date: 2026-10-11. Branch: spot-check/launch (off main @ af0b57a). Rig: tests/spot-check/, with 3 raft managers (t3.small, ACLs on) and 2 spot m7i.large workers on AWS, plus a local macOS cluster. (The rig and the shims are NOT in this checkout; we fix main.)
+
+The goal was to spot check every headline feature on real machines before sharing Legion. The short version: single-node demos mostly work, and the multi-node story does not yet. Several failures only show up once a cluster has two workers, a restart, or a leader change, which is exactly what a first external user will do.
+
+Severity. P0 breaks a headline feature on a normal multi-node cluster. P1 breaks a common path or loses work. P2 is a papercut, a misleading message, or a docs gap.
+Status. Open means untouched. Shimmed means the spot-check branch carries a not-for-merge patch so testing could continue. Every root cause below was read in the source, unless the entry says otherwise. (Line numbers may have drifted.)
+
+## P0
+
+P0-1. Workers on other hosts lose exec, logs, discovery, and the mesh
+Shimmed; planned. The worker binds and advertises 127.0.0.1:4848 (src/worker/daemon.rs:137-138, :315-318), and its API is unauthenticated. Fix designed in internal_docs/plans/worker-plane-auth-plan.md. The shim adds LEGION_WORKER_HOST and LEGION_WORKER_ADVERTISE_ADDR, and the rig limits 4848 to the managers' security group.
+
+P0-2. Batch tasks never finish, and restart policies are ignored
+Open. The worker rebuilds each task's TaskConfig from the dispatch payload with no lifecycle or restart (src/worker/task_manager.rs, task_from_allocation), because TaskAllocation carries neither field. Every task therefore runs as a service with restart = always.
+- A batch task that exits 0 restarts every 30 seconds forever. The DAG's fetch ran 11 times in one run. Worker log: `Task process exited; restarting ... status: exited with status 0`.
+- A jobspec's restart = { policy = ... } has no effect on the worker.
+- Batch status never reaches success, so anything waiting on it waits forever.
+Fix: carry lifecycle and restart in TaskAllocation, or serialize the whole task config, and add an end-to-end test where a batch task exits 0.
+
+P0-3. Health checks never start for tasks with artifacts, including every container image when containerImageDesugar is on
+Shimmed. Artifact staging runs on a plain OS thread (spawn_staging_thread, src/worker/task_manager.rs), which then starts the health monitor. That calls tokio::spawn outside a runtime and panics: there is no reactor running at src/worker/task_health.rs:73. The task runs, but it sits at "health checks starting" forever. It is never healthy, so service discovery returns no endpoints, the mesh routes nothing, and health-gated rollouts never advance. The shim enters the caller's runtime handle inside the thread, and is probably the real fix.
+
+P0-4. DAG dependencies are not enforced at runtime
+Open. The scheduler counts a batch dependency as satisfied when it is merely planned in the same pass (dependency_satisfied, src/manager/scheduler.rs, the planned_dep && Batch arms), and the worker has no dependency gating at all (src/worker never reads depends_on). A whole chain of batch steps starts at once.
+- On macOS, validate crashed with FileNotFoundError before fetch had written its input, and serve started although report had failed.
+- On AWS, the DAG "finished" only because P0-2 kept restarting crashed steps until their inputs happened to exist.
+- The shipped DAG examples only sleep, so nothing ever noticed. Fix: satisfy success/complete only from real task status (and re-evaluate the job when a batch task completes), or gate starts on the worker.
+
+P0-5. Losing one manager can take every worker offline
+Open. Two bugs compound:
+- Workers know one manager. A worker only dials the address in its join token, so every worker joined through sc-mgr-1 depends on it.
+- Followers cannot forward heartbeats in the single topology. When sc-mgr-1 came back as a follower, every forwarded heartbeat failed: `ForwardLaneWrite lane mismatch: envelope says control, op update_node_heartbeat belongs to status` (src/storage/raft/server.rs:240). The sender tags the physical lane, and the receiver checks the logical one. `single` is the topology the docs recommend.
+Stopping sc-mgr-1 (a follower at the time) marked both workers lost. After restarting it, the workers stayed lost for as long as it was not the leader. Workloads kept running throughout. Recovery was `legion raft command trigger-election` on sc-mgr-1 (see P2-5 for why not transfer-leader).
+
+P0-6. After nodes come back, the scheduler still sees them as unavailable
+Open, root cause inferred. After P0-5, `legion node list` showed both workers active/available, but the stored rows said availability = unavailable (`legion state query "select id, availability from node"`). Every placement failed with `No nodes available to place allocations`, and the volume validator rejected stateful jobs with `local-dir ... installed on sc-wkr-1, sc-wkr-2 but unusable everywhere`. `legion node uncordon` on each node fixed it. Our reading: liveness lives in the leader's memory and only transitions are replicated, so a new leader that first sees a node healthy never writes the unavailable -> available transition.
+
+P0-7. Stock images fail in Linux containers
+Open. Three behaviors of the Linux container runtime, each of which breaks common images:
+- Minimal capabilities. Containers get only CAP_AUDIT_WRITE, CAP_KILL, and CAP_NET_BIND_SERVICE (src/task_plugins/oci_bundle.rs:639-642), where Docker also grants CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, and more, and there is no jobspec knob. Stock nginx fails with `chown("/var/cache/nginx/client_temp", 101) failed (1: Operation not permitted)`. The Postgres entrypoint's chown and gosu fail the same way. The repo's own container-service.ncl, fullstack.ncl, and postgres.ncl cannot run on Linux.
+- Ownership is dropped on layer extraction. A `chown nginx` in the image shows up as 0:0 in the extracted rootfs, so images that run as a non-root USER cannot write their own directories.
+- Non-root processes cannot reopen /dev/stdout or /dev/stderr. The task's stdout and stderr are root-owned log files, so opening them by path fails with EACCES, which breaks nginx's default log symlinks.
+Also, RLIMIT_NOFILE is a hard 1024 (Redis warns at start). The spot-check images work around all of this. Fix: default to Docker's capability set (with a jobspec override), keep ownership when extracting layers, and hand containers pipes or fds that non-root users can reopen.
+
+P0-8. A restarted worker cannot rejoin once its join token expires
+Open. With ACLs on, a worker re-registers with its original join secret every time the process starts. After the token's TTL it dies at startup with `Unauthenticated: unknown or revoked join token`, and systemd gives up. The node's per-node token is not persisted for re-registration. docs/auth-and-acls.md tells operators to give join tokens short TTLs and revoke them once the fleet has joined, which guarantees this on the first upgrade or reboot. The rig now mints 720h tokens as a workaround.
+
+## P1
+
+P1-1. Resource enforcement never turns on
+Open. In run_worker_with_manager (src/worker/daemon.rs), the worker creates its task manager, whose NodeResourceGovernor::from_env() reads the enforcement env, about fifteen lines before apply_resource_enforcement_env sets that env. The governor is always disabled, but the worker logs `Resource enforcement enabled`. Tasks run in the worker's own cgroup with memory.max = max, and /sys/fs/cgroup/legion is never created.
+
+P1-2. Static ports deadlock scheduling, reschedules, and rollouts
+Open.
+- Too many replicas. count = 2 with a static port on one node: the planner puts both replicas on the node, the second cannot bind, and the whole plan is rejected. The eval requeues about twice a second forever (60 rejections in 30 seconds), nothing places (not even replica 1), and the job reports done.
+- Reschedules of a failed static-port allocation loop on `requeued after plan conflicts` indefinitely.
+- Rollouts. Updating a single-replica static-port service (kv-demo) left the rollout at `waiting for placement capacity` with 0 allocations. The service was down, and 500+ rollout_tick events piled up.
+Fix: let a plan place what fits and report the rest as unplaced, account for in-plan static ports when picking candidates, and stop rather than replace when a static-port service cannot surge.
+
+P1-3. A reschedule excludes the node the task failed on, even when it is the only option
+Open. After a failure, the reschedule eval fails with `No nodes available to place allocations` on a one- or two-node cluster, and the job is dead for good, even though the node is healthy. For a node-local stateful instance the message is worse: `instance ... holds node-local storage on node sc-wkr-1, which is unavailable ... use legion volume delete --force <id>`. That node was healthy, so the advice tells a user to delete data they haven't lost.
+
+P1-4. Gated containers race their network namespace
+Open, intermittent. An allocation failed with `gated network namespace /var/run/netns/legion-60 is not ready; the worker creates it before start and retries on its next heartbeat`, but it was marked failed rather than retried, which then hit P1-3. The race is between artifact staging finishing and the heartbeat that creates the namespace.
+
+P1-5. Tasks are orphaned when a worker re-joins
+Open, observed; root cause not confirmed. After the P0-8 re-join, processes from the previous worker run kept running unmanaged (systemd: `Unit process 8793 (python3) remains running after unit stopped`, still bound to :8082), while the manager placed replacements that collided with them on ports and the TAP device.
+
+P1-6. macOS sandboxes do not start
+Shimmed. Dev mode passes a `--` after the image (src/task_plugins/sandbox.rs:563), which Apple container runs as the command: `failed to find target executable --`. The container runtime avoids exactly this, and its test asserts no separator. After the shim, exec into a macOS sandbox works end to end, including from the launcher's browser terminal.
+
+P1-7. Allocation ids are reused
+Open. Ids restart from low numbers once older allocations are gone. A worker's logs/<id>/ directory then mixes the old allocation's output into the new one's (a sandbox's stdout started with the DAG's fetch lines), and a stale id held by a client or script can point at a different job's task. That is how the smoke test once exec'd into the wrong workload.
+
+P1-8. Job status is misleading
+Open. A running service job shows `done`. A job with zero allocations after a failed placement also shows `done`. Re-running an unchanged spec for a dead job is a silent no-op (`Job config unchanged; no update needed`), so there is no obvious way to retry.
+
+P1-9. The real failure is hard to find
+Open.
+- Misattributed failures. An image pull failure (a 429 from the registry) shows up in events only as `health check failed: tcp check failed: Connection refused`, and the pull error is in task stderr alone.
+- Logs vanish. Once an allocation is removed, `legion job logs` returns `No allocations found`, although the files are still on the worker. On macOS the Apple container 200 MiB minimum-memory error was only findable that way.
+
+## P2
+
+P2-1. The README quickstart fails. `legion start manager` with no -c evaluates ./configs/manager.ncl and exits outside a repo checkout (`failed to read ./configs/manager.ncl`), and `legion job status` does not exist (it is `legion job info`).
+P2-2. Errors hide their cause. `job destroy` on a running job and `raft command transfer-leader` both return `Internal error` while the server logs a clear reason (`Job must be stopped before it can be destroyed`, `not supported by openraft 0.9`). Worker errors reach the CLI as raw tonic Status debug output, response headers included, coded Internal instead of FailedPrecondition.
+P2-3. `legion kv get` on a missing key exits 0 with `{ "ok": true, "data": null }`, not a NOT_FOUND error, which breaks the obvious `kv get || kv put` pattern.
+P2-4. Agent-readiness gaps. `legion raft join-token` has no --json. Instance JSON is snake_case (current_alloc_id) while hand-built envelopes are camelCase (instanceIds).
+P2-5. Writes to a follower fail with an unreachable hint. The CLI does not follow the leader, and the hint names the leader's private advertise address (172.31.90.175:4747), which a laptop cannot reach. transfer-leader is unsupported, so moving leadership means trigger-election on the target manager.
+P2-6. macOS. Apple container rejects VMs under 200 MiB, and Legion does not check resources.memory at submit. A fresh start logs `ERROR ... node not found`.
+P2-7. Worker noise. Every worker logs `ERROR missing plugin manifest at /src/plugins/tasks/noop/plugin.json`, because the plugin dir defaults to the build machine's path, plus `Log sink maintenance failed ... No such file or directory` every 10 seconds.
+P2-8. `legion exec` into an exec task does not get the task's environment (LEGION_PORT_HTTP is empty), while actions do.
+P2-9. No image cache. Every start pulls again. Anonymous public.ecr.aws rate-limited a laptop with 429s after a few rebuilds and restarts.
+P2-10. Raft terms climb fast. Term 10 after two leader stops, 16 after one manual election, which suggests several failed rounds per election. Observation only.
+P2-11. Install docs gaps. No Linux instructions for installing youki (the default runtime), cloud-hypervisor, or a guest kernel. Existing TODO items cover the kernel and redis.ncl.
+
+## Not covered
+The web UI, the MCP server, edge boot, mesh mTLS (ingress.tls), workload identity, node drain, and the streaming persistence mode.

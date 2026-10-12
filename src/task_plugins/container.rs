@@ -113,11 +113,17 @@ impl ContainerTaskConfig {
     /// The bundle's capability set and rlimits for this task: the defaults,
     /// adjusted by `security.capabilities` and `ulimits`.
     fn process_policy(&self) -> R<oci_bundle::ProcessPolicy> {
-        let capabilities = &self.security.capabilities;
         Ok(oci_bundle::ProcessPolicy {
-            capabilities: oci_bundle::resolve_capabilities(&capabilities.add, &capabilities.drop)?,
+            capabilities: self.capabilities()?,
             rlimits: oci_bundle::resolve_rlimits(&self.ulimits)?,
         })
+    }
+
+    /// The task's effective capability set: the default, less
+    /// `security.capabilities.drop`, plus `add`.
+    fn capabilities(&self) -> R<Vec<String>> {
+        let capabilities = &self.security.capabilities;
+        oci_bundle::resolve_capabilities(&capabilities.add, &capabilities.drop)
     }
 
     /// Whether the task adjusts anything only the Linux OCI path applies.
@@ -126,6 +132,20 @@ impl ContainerTaskConfig {
             || !self.security.capabilities.drop.is_empty()
             || !self.ulimits.is_empty()
     }
+}
+
+/// The effective capability set a `container` task asks for (the default,
+/// less `security.capabilities.drop`, plus `add`), for the manager's submit
+/// check against the worker types' `container.allowCaps`. `None` for any
+/// other runtime, and for a task constrained to macOS, where Apple
+/// `container` ignores the capability fields.
+pub fn container_task_capabilities(task: &TaskConfig) -> R<Option<Vec<String>>> {
+    if task.runtime != "container" || constrained_to_macos(task) {
+        return Ok(None);
+    }
+    Ok(Some(
+        ContainerTaskConfig::from_value(&task.config)?.capabilities()?,
+    ))
 }
 
 /// The smallest VM Apple `container` boots, in MiB. Below it, `container run`
@@ -272,6 +292,22 @@ fn check_apple_memory_floor(oci_runtime: &ContainerRuntime, task: &TaskConfig) -
         )),
         _ => Ok(()),
     }
+}
+
+/// Holds a Linux container's effective capability set to the node's
+/// allowlist (worker type `container.allowCaps`, published by the worker).
+/// Apple `container` ignores the capability fields, so there is nothing to
+/// hold it to on macOS.
+fn check_node_capabilities(
+    oci_runtime: &ContainerRuntime,
+    task: &str,
+    config: &ContainerTaskConfig,
+    allowlist: &oci_bundle::CapabilityAllowlist,
+) -> R<()> {
+    if *oci_runtime == ContainerRuntime::AppleContainer {
+        return Ok(());
+    }
+    oci_bundle::check_capabilities_allowed(task, &config.capabilities()?, allowlist)
 }
 
 /// Deterministic per-allocation container name / OCI container id.
@@ -910,6 +946,14 @@ impl TaskPlugin for ContainerTaskPlugin {
         let config = ContainerTaskConfig::from_value(&task.config)?;
         let oci_runtime = ContainerRuntime::detect()?;
         check_apple_memory_floor(&oci_runtime, task)?;
+        // Before any image work: a task that asks for more than the operator
+        // allows here fails now, naming what to change.
+        check_node_capabilities(
+            &oci_runtime,
+            &task.name,
+            &config,
+            &oci_bundle::CapabilityAllowlist::from_env(),
+        )?;
         oci_runtime.preflight()?;
         if oci_runtime == ContainerRuntime::AppleContainer && config.adjusts_linux_process() {
             info!(
@@ -2678,6 +2722,84 @@ mod tests {
         let bare = ContainerTaskConfig::from_value(&json!({ "image": "a", "command": ["x"] }))?;
         assert_eq!(bare.process_policy()?, oci_bundle::ProcessPolicy::default());
         assert!(!bare.adjusts_linux_process());
+        Ok(())
+    }
+
+    /// The node allowlist gates the Linux start: an add inside it starts,
+    /// SYS_ADMIN is refused on a default node and admitted where the
+    /// operator allows it, and drop-only adjustments always pass. Apple
+    /// `container` ignores the fields, so macOS never refuses.
+    #[test]
+    fn the_node_allowlist_gates_linux_container_starts() -> R<()> {
+        let linux = ContainerRuntime::Oci {
+            binary: "youki".into(),
+        };
+        let with = |security: Value| {
+            ContainerTaskConfig::from_value(&json!({
+                "image": "alpine", "command": ["true"], "security": security,
+            }))
+        };
+        let default_node = oci_bundle::CapabilityAllowlist::default();
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut raw_names = names(oci_bundle::DEFAULT_CAPABILITIES);
+        raw_names.push("NET_RAW".into());
+        let raw_node = oci_bundle::CapabilityAllowlist::from_config(Some(&raw_names))?;
+        let mut admin_names = names(oci_bundle::DEFAULT_CAPABILITIES);
+        admin_names.push("sys_admin".into());
+        let admin_node = oci_bundle::CapabilityAllowlist::from_config(Some(&admin_names))?;
+
+        let pinger = with(json!({ "capabilities": { "add": ["NET_RAW"] } }))?;
+        check_node_capabilities(&linux, "pinger", &pinger, &raw_node)?;
+        assert!(check_node_capabilities(&linux, "pinger", &pinger, &default_node).is_err());
+
+        let admin = with(json!({ "capabilities": { "add": ["SYS_ADMIN"] } }))?;
+        let err = check_node_capabilities(&linux, "tool", &admin, &default_node)
+            .expect_err("SYS_ADMIN is not in the default allowlist")
+            .to_string();
+        assert!(
+            err.contains("SYS_ADMIN") && err.contains("container.allowCaps"),
+            "{err}"
+        );
+        check_node_capabilities(&linux, "tool", &admin, &admin_node)?;
+        check_node_capabilities(
+            &linux,
+            "tool",
+            &admin,
+            &oci_bundle::CapabilityAllowlist::All,
+        )?;
+
+        let dropper = with(json!({ "capabilities": { "drop": ["MKNOD", "SETFCAP"] } }))?;
+        check_node_capabilities(&linux, "web", &dropper, &default_node)?;
+        let minimal = with(json!({ "capabilities": { "drop": ["ALL"] } }))?;
+        check_node_capabilities(
+            &linux,
+            "web",
+            &minimal,
+            &oci_bundle::CapabilityAllowlist::Only(vec![]),
+        )?;
+
+        // macOS: the fields are ignored, so nothing is refused.
+        check_node_capabilities(
+            &ContainerRuntime::AppleContainer,
+            "tool",
+            &admin,
+            &default_node,
+        )?;
+
+        // The submit check's view: the effective set, and nothing for other
+        // runtimes or for tasks pinned to macOS.
+        let mut task = task_with(json!({}), Some("tool"));
+        task.config = json!({
+            "image": "alpine", "command": ["true"],
+            "security": { "capabilities": { "add": ["SYS_ADMIN"], "drop": ["MKNOD"] } },
+        });
+        let caps = container_task_capabilities(&task)?.expect("a container task");
+        assert!(caps.contains(&"CAP_SYS_ADMIN".to_string()));
+        assert!(!caps.contains(&"CAP_MKNOD".to_string()));
+        task.constraints = json!({ "os": "macos" });
+        assert_eq!(container_task_capabilities(&task)?, None);
+        let exec_task = TaskConfig::new("web", "exec");
+        assert_eq!(container_task_capabilities(&exec_task)?, None);
         Ok(())
     }
 

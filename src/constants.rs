@@ -32,6 +32,10 @@ pub const ENV_CGROUP_PARENT: &str = "LEGION_CGROUP_PARENT";
 pub const ENV_SANDBOX_VMM_OVERHEAD_MIB: &str = "LEGION_SANDBOX_VMM_OVERHEAD_MIB";
 /// Default for [`ENV_SANDBOX_VMM_OVERHEAD_MIB`].
 pub const DEF_SANDBOX_VMM_OVERHEAD_MIB: u64 = 64;
+/// The capabilities `container` tasks on this node may end up with (worker
+/// type `container.allowCaps`), comma-separated, or `ALL`. Unset means the
+/// default set (docs/task-runtime-container.md, "Capabilities").
+pub const ENV_CONTAINER_ALLOW_CAPS: &str = "LEGION_CONTAINER_ALLOW_CAPS";
 
 // === Task filesystem ===
 /// Where a runtime with an isolated filesystem mounts the allocation's host

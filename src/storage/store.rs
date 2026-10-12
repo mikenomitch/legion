@@ -40,8 +40,8 @@ use crate::storage::queries::{
     GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS, GET_INSTANCE, GET_INSTANCES_FOR_JOB,
     GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID, GET_JOB_UPDATE_FOR_CONFIG,
     GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_SIGNING_KEYS,
-    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
-    INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
+    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, GET_WORKER_TYPES, INSERT_ALLOCATION, INSERT_EVAL,
+    INSERT_JOB, INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
     INSERT_SIGNING_KEY, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_JOINED_ATTRS,
     NODE_JOINED_FROM, SEED_NODE_HEALTH, UPDATE_SIGNING_KEY_STATE, UPSERT_INSTANCE,
     UPSERT_MANAGER_CONFIG,
@@ -3647,8 +3647,7 @@ impl Store {
                 let node_id = allocation.node_id.clone();
                 // A row that turned terminal (a batch task finished) stops
                 // holding capacity: its usage comes out and nothing goes in.
-                let added_resources =
-                    Self::capacity_resources(&allocation).cloned();
+                let added_resources = Self::capacity_resources(&allocation).cloned();
                 let (as_expected, replaced) =
                     Self::cache_splice_allocation_entry(&mut guard, allocation, expected);
                 if !as_expected {
@@ -6751,6 +6750,7 @@ impl Store {
             heartbeat_seconds: row.get(10)?,
             resource_enforcement: row.get(11)?,
             edge_boot: row.get(12)?,
+            container: row.get(13)?,
         })
     }
 
@@ -8723,6 +8723,17 @@ impl Store {
         Ok(config)
     }
 
+    /// Every worker type the manager was configured with.
+    #[instrument(err, skip_all)]
+    pub fn list_worker_types(&self) -> R<Vec<WorkerConfig>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(&GET_WORKER_TYPES)?;
+        let types = stmt
+            .query_map([], |row| self.worker_type_from_row(row))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(types)
+    }
+
     #[instrument(err, skip_all)]
     pub fn insert_worker_type(&self, config: &WorkerConfig) -> R<WorkerConfig> {
         let config = config.clone();
@@ -8760,6 +8771,7 @@ impl Store {
             ":heartbeat_seconds": config.heartbeat_seconds,
             ":resource_enforcement": config.resource_enforcement,
             ":edge_boot": config.edge_boot,
+            ":container": config.container,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -15200,8 +15212,7 @@ impl Store {
     /// follower that handles a worker report never writes. Best effort: a
     /// failure is logged, and the next node join or freed capacity retries.
     pub fn request_capacity_reconcile_if_waiting(&self) {
-        if !self.capacity_waiters.load(Ordering::Relaxed) || !self.is_raft_leader(Lane::Scheduler)
-        {
+        if !self.capacity_waiters.load(Ordering::Relaxed) || !self.is_raft_leader(Lane::Scheduler) {
             return;
         }
         if let Err(error) = self.request_capacity_reconcile() {
@@ -21199,6 +21210,7 @@ mod tests {
             host_volumes: String::new(),
             resource_enforcement: String::new(),
             edge_boot: String::new(),
+            container: String::new(),
             name: "test".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -21218,6 +21230,22 @@ mod tests {
         assert_eq!(returned_config.name, worker_config.name);
         assert_eq!(returned_config.pool, worker_config.pool);
         assert_eq!(returned_config.heartbeat_seconds, Some(5));
+        assert_eq!(returned_config.container, "");
+
+        // The `container` payload (capability allowlist) round-trips, and
+        // an update replaces it.
+        let allowing = WorkerConfig {
+            container: r#"{"allowCaps":["CAP_NET_RAW"]}"#.into(),
+            ..worker_config.clone()
+        };
+        store.insert_worker_type(&allowing)?;
+        assert_eq!(
+            store.get_worker_type("test".to_string())?.container,
+            allowing.container
+        );
+        let listed = store.list_worker_types()?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].container, allowing.container);
         let val = returned_config
             .attributes
             .get("test")
@@ -21236,6 +21264,7 @@ mod tests {
             host_volumes: String::new(),
             resource_enforcement: String::new(),
             edge_boot: String::new(),
+            container: String::new(),
             name: "empty".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],

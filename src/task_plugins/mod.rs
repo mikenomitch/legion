@@ -32,9 +32,10 @@ mod schema_docs;
 mod vmm_api;
 
 pub use checkpoint::{AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport};
-pub use container::ContainerTaskPlugin;
+pub use container::{container_task_capabilities, ContainerTaskPlugin};
 pub use exec::ExecTaskPlugin;
 pub use exec_session::{spawn_pipe, spawn_pty, ExecOptions, ExecOutputStreams, ExecSession};
+pub use oci_bundle::CapabilityAllowlist;
 pub use resource_enforcement::{
     join_assignment_cgroup, ResourceAssignment, ResourceEnforcement, Slice, CGROUP_ROOT,
 };

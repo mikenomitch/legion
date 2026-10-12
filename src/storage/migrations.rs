@@ -1884,6 +1884,12 @@ fn migration_list() -> Vec<M<'static>> {
             "DROP INDEX IF EXISTS idx_allocation_history_job;
         DROP TABLE IF EXISTS allocation_history;",
         ),
+        // Worker-type `container` settings (docs/task-runtime-container.md,
+        // "Capabilities"): the capability allowlist container tasks on the
+        // type's nodes are held to. JSON like `edge_boot`; empty on every
+        // existing row, which reads as the default allowlist. Control lane,
+        // like the rest of `worker_type`.
+        M::up("ALTER TABLE worker_type ADD COLUMN container TEXT NOT NULL DEFAULT '';").down(""),
     ]
 }
 

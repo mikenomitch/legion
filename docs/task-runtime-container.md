@@ -152,7 +152,10 @@ inheritable or ambient, so a process running as a non-root user keeps no
 capabilities across `execve`, exactly as under Docker.
 
 Adjust it with `security.capabilities`, which has the semantics of
-`docker run --cap-add` / `--cap-drop`:
+`docker run --cap-add` / `--cap-drop`. A job can always drop capabilities.
+It can add one only where the node's operator allows it (see
+[Which capabilities a node allows](#which-capabilities-a-node-allows)), and
+out of the box nodes allow nothing beyond the default set:
 
 ```nickel
 config = {
@@ -160,8 +163,8 @@ config = {
   command = ["ping", "-c", "3", "1.1.1.1"],
   security = {
     capabilities = {
-      add = ["NET_RAW"],    # on top of the defaults
-      drop = ["MKNOD"],     # removed from the defaults
+      add = ["NET_RAW"],    # on top of the defaults; the node must allow it
+      drop = ["MKNOD"],     # removed from the defaults; always allowed
     },
   },
 },
@@ -179,9 +182,66 @@ config = {
   capability name such as NET_ADMIN (the CAP_ prefix is optional), or ALL`.
 
 Without a user namespace, container root is host root with these
-capabilities. Adding `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYS_MODULE`, or
-`ALL` gives the container enough to act on the host, so add them only for
-workloads you trust as much as an `exec` task.
+capabilities. `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYS_MODULE`, or `ALL`
+give the container enough to act on the host, which is why granting them is
+the node operator's decision rather than the job author's.
+
+### Which capabilities a node allows
+
+Each worker type holds container tasks to a capability allowlist,
+`container.allowCaps` in its worker config (the same model as Nomad's
+`allow_caps` for its Docker driver). A task's *effective* set is the default
+set, less `drop`, plus `add`. If that set holds any capability outside the
+allowlist of the node it lands on, the start fails there:
+
+```text
+task tool would run with capabilities this node does not allow container tasks to have: SYS_ADMIN. This node allows: AUDIT_WRITE, CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, MKNOD, NET_BIND_SERVICE, SETFCAP, SETGID, SETPCAP, SETUID, SYS_CHROOT (the worker type's container.allowCaps). An operator can allow them by adding "SYS_ADMIN" to container.allowCaps in this worker type's config; otherwise take them out of the task (remove them from security.capabilities.add, or list them in security.capabilities.drop)
+```
+
+The allowlist defaults to exactly the default set, so on a node nobody
+configured a job can drop capabilities but add none. The shipped
+`configs/workers/default.ncl` spells out the same set, with `NET_RAW`
+commented out as the usual first opt-in. To let jobs opt into
+more, widen it in the worker type's config (`configs/workers/*.ncl`, loaded by
+the manager and handed to each worker when it registers):
+
+```nickel
+{
+  workerType = "default",
+  container = {
+    allowCaps = [
+      "AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL",
+      "MKNOD", "NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP",
+      "SETUID", "SYS_CHROOT",
+      "NET_RAW",   # jobs here may add NET_RAW
+    ],
+  },
+}
+```
+
+- The list is the whole allowlist, not additions to the default: write the
+  default names too, as above, or jobs that keep the defaults fail.
+- Names follow the jobspec's rules (case-insensitive, `CAP_` optional). An
+  unknown name fails the manager's config load. `["ALL"]` allows every
+  capability: use it only on worker types reserved for trusted workloads, for
+  example in their own pool.
+- Narrowing the list below the default set is allowed. Container tasks on
+  those nodes then have to drop what the list leaves out, for example with
+  `drop = ["ALL"]` and a short `add`.
+- Adding a capability to a task does not change where it places, and the
+  scheduler does not steer a task toward nodes that allow it. Pin such tasks
+  to the worker types that do, with a constraint on the type's `pool` or an
+  attribute.
+- At submit, `job run` and `job plan` reject a container task whose
+  effective set *no* worker type allows, with the same advice:
+  `task tool would run with capabilities no worker type allows container
+  tasks to have: SYS_ADMIN. An operator allows them with container.allowCaps
+  in a worker type's config (worker types: default); ...`. A set that some
+  type allows passes, and fails at start only if it lands elsewhere.
+- Tasks constrained to macOS (`os = "macos"`) are not checked: Apple
+  `container` ignores the capability fields.
+- A dev-mode `sandbox` (Linux, `hypervisor = "dev"`) gets the default set
+  trimmed to the allowlist, since a sandbox has no way to drop capabilities.
 
 **`noNewPrivileges` stays on.** It stops a setuid binary or a file
 capability from *raising* privileges at `execve`. It does not stop a root
@@ -583,7 +643,7 @@ bypass egress policy. The full model, the fail-closed rules, and the limits
 | Volumes (`volumes[]`, `stateful.storage`) | ✅ bind-mounted at the declared `path`. See [docs/volumes.md](volumes.md) |
 | Artifacts | ✅ image (staged via `containerImageDesugar`, or pulled by the runtime) and file/tree (readable under `/legion/task`) |
 | Exec / interactive PTY | ✅ / ✅ on both Apple `container` and the Linux OCI runtimes (sandboxed). See [docs/exec-and-actions.md](exec-and-actions.md) |
-| Capability adjustments (`security.capabilities`) | ✅ Linux. Ignored on macOS (VM boundary, runtime defaults) |
+| Capability adjustments (`security.capabilities`) | ✅ Linux, within the node's `container.allowCaps` (drops always allowed). Ignored on macOS (VM boundary, runtime defaults) |
 | Resource limits (`ulimits`) | ✅ Linux. Ignored on macOS |
 | Image layer cache | ✅ Linux, per node, in the content store. macOS: Apple `container`'s own image store |
 
@@ -671,9 +731,13 @@ only its changed layers.
   only `CMD`. Name the entrypoint in `command` for a jobspec that runs the
   same on both.
 - There is no user namespace yet, so container root is host root, limited
-  by the capability set, `noNewPrivileges`, and the mount namespace. Adding
-  privileged capabilities removes most of that limit (see
+  by the capability set, `noNewPrivileges`, and the mount namespace. A node
+  whose `container.allowCaps` admits privileged capabilities removes most of
+  that limit for the jobs that add them (see
   [Capabilities](#capabilities-security)). There is no seccomp profile.
+- The scheduler does not know which nodes allow which capabilities: a task
+  that adds one places like any other, and fails at start on a node that
+  refuses it. Pin it to the worker types that allow it.
 - Only the image's `USER` can reopen `/dev/stdout` and `/dev/stderr` by path;
   a process that switched to another user inside the container gets `EACCES`
   (see [Stdout and stderr](#stdout-and-stderr)).

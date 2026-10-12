@@ -647,8 +647,15 @@ fn a_new_leader_returns_a_heartbeating_node_to_the_pool() -> R<()> {
     // Liveness came back without the availability half.
     register_with_capacity(&store, "node-1", "unavailable")?;
     let node = store.get_node("node-1")?;
-    assert_eq!((node.status.as_str(), node.availability.as_str()), ("active", "unavailable"));
-    assert_eq!(submit_and_place(&store, "before")?, 0, "the scheduler skips it");
+    assert_eq!(
+        (node.status.as_str(), node.availability.as_str()),
+        ("active", "unavailable")
+    );
+    assert_eq!(
+        submit_and_place(&store, "before")?,
+        0,
+        "the scheduler skips it"
+    );
 
     // The new leader takes responsibility. A seed is not evidence.
     store.liveness().become_responsible(&["node-1".into()]);

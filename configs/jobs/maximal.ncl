@@ -903,6 +903,9 @@
                     # without NET_RAW). Case-insensitive, CAP_ prefix
                     # optional; ALL means every capability. `drop = ["ALL"]`
                     # plus a short `add` list is the least-privilege form.
+                    # Drops always work; an add needs the node's worker type
+                    # to allow it (container.allowCaps in
+                    # configs/workers/*.ncl), or the start fails there.
                     capabilities = {
                         add = ["NET_RAW"],
                         drop = ["MKNOD"],

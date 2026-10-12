@@ -2,11 +2,12 @@
 
 > **Judgement calls:** [launch-spot-check-fixes-plan_calls.md](../calls/launch-spot-check-fixes-plan_calls.md)
 
-**Status: IN EXECUTION.** One PR fixes the findings of the 2026-10-11
-pre-launch spot check
-([spot-check-2026-10-11-findings.md](../spot-check-2026-10-11-findings.md)).
-The per-finding outcome, including what was deliberately deferred, is in
-[§8](#8-outcome-per-finding). The worker-plane half (P0-1) executes Phase 1
+**Status: IN EXECUTION.** Every finding of the 2026-10-11 pre-launch spot
+check ([spot-check-2026-10-11-findings.md](../spot-check-2026-10-11-findings.md))
+is fixed in [PR #17](https://github.com/mikenomitch/legion/pull/17) (open).
+The per-finding outcome is in [§8](#8-outcome-per-finding); what was
+deliberately deferred is in [§8.7](#87-deliberately-deferred), and each of
+those items is open in [TODO.md](../TODO.md). Not yet re-run on the AWS rig. The worker-plane half (P0-1) executes Phase 1
 of [worker-plane-auth-plan.md](worker-plane-auth-plan.md), which stays the
 design of record for it.
 
@@ -121,6 +122,4 @@ vocabulary) change for every cluster; the PR description lists each break.
 The next AWS spot check re-runs `tests/spot-check/smoke.sh` without the
 shims to confirm the fixes on real machines.
 
-## 8. Outcome per finding
-
-Filled in as each workstream lands.
+@@S8@@

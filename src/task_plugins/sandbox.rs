@@ -1335,8 +1335,14 @@ impl SandboxTaskPlugin {
                 resolv_conf: None,
                 netns: None,
                 // Docker's defaults, like a `container` task that adjusts
-                // nothing: a dev-mode sandbox runs the same stock images.
-                policy: &oci_bundle::ProcessPolicy::default(),
+                // nothing: a dev-mode sandbox runs the same stock images. A
+                // sandbox cannot drop capabilities, so the node's container
+                // allowlist trims the set instead of failing the start.
+                policy: &oci_bundle::ProcessPolicy {
+                    capabilities: oci_bundle::CapabilityAllowlist::from_env()
+                        .intersect(oci_bundle::default_capabilities()),
+                    rlimits: oci_bundle::default_rlimits(),
+                },
             },
         )?;
         let mut cmd = Command::new(binary);
