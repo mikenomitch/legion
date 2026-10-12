@@ -134,15 +134,18 @@ Diagnostics: an eval that leaves tasks held says so in its outcome
 (`legion events list --job <job>`, the `eval.completed` message ends with
 `waiting on dependencies: validate, serve`).
 
+Each step needs room only while it runs. A finished allocation (`complete` or
+`failed`) keeps its row, so its task's slot stays spent, but it releases its
+CPU, memory, disk, allocation count, and static ports the moment its exit is
+reported. On one 8 GiB node, a pipeline whose steps each need 6 GiB runs every
+step, one after another.
+
 Known limitations:
 
 - A runtime that cannot report exits (`noop`, or a third-party plugin that
   does not supervise a process) reports a batch task complete as soon as it
   starts, so its dependents follow right away (see
   [Task Supervision](task-supervision.md)).
-- A completed batch allocation keeps its row, and with it its share of the
-  node's resources, until the job is stopped or restarted. A pipeline whose
-  steps together need more than a node has free can hold its last step.
 
 Lifecycle rules, enforced at submit and by `legion job validate`:
 
@@ -390,7 +393,8 @@ A batch task's terminal exit reaches the manager on the worker's next
 heartbeat (`HeartbeatRequest.terminated_allocations`), which is what moves its
 task status from `running` to `success` (or `failed` for a `never`-policy task
 that exited unsuccessfully), the status `dependsOn` conditions read. The
-completed allocation keeps its row and is never dispatched again. In
+completed allocation keeps its row and is never dispatched again, but it no
+longer holds node resources or ports. In
 `legion job events`, a finished batch task appears as `allocation.terminated`;
 a task that failed for good appears as `allocation.failed` with the exit
 status and the last lines the task wrote to stderr (for example `exited with

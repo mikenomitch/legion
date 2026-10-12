@@ -353,6 +353,7 @@ fn report_exit(store: &Store, allocation_id: i64, success: bool) -> R<()> {
         .complete_allocation(allocation_id, success)?
         .context("allocation exists")?;
     store.queue_dependency_progress(&allocation)?;
+    store.request_capacity_reconcile_if_waiting();
     Ok(())
 }
 
@@ -663,5 +664,119 @@ fn a_scheduled_dag_keeps_one_next_run_timer() -> R<()> {
         })
         .count();
     assert_eq!(timers, 1);
+    Ok(())
+}
+
+/// A service task needing `memory` MiB, `count` replicas.
+fn service(name: &str, count: u32, memory: u64) -> TaskConfig {
+    TaskConfig {
+        count: TaskCount::new(count),
+        group: name.to_string(),
+        resources: json!({ "memory": memory }),
+        ..TaskConfig::new(name, "noop")
+    }
+}
+
+fn job_of(name: &str, tasks: Vec<TaskConfig>) -> JobConfig {
+    JobConfig {
+        priority: Default::default(),
+        rollout: None,
+        rollout_by_group: Default::default(),
+        name: name.to_string(),
+        tasks,
+        version: None,
+    }
+}
+
+/// A finished step stops holding the node's resources. On one 8 GiB node,
+/// each step of a three-step DAG needs 6 GiB, so a step can run only once
+/// the one before it has finished and released its share. Before, finished
+/// batch allocations kept their resources until the job stopped and the
+/// second step never placed.
+#[test]
+fn a_dag_whose_steps_each_need_most_of_the_node_runs_every_step() -> R<()> {
+    let store = setup_store()?;
+    add_node(&store, "node-1")?;
+    let mut job = dag_job("heavy");
+    for task in &mut job.tasks {
+        task.resources = json!({ "memory": 6144 });
+    }
+    submit(&store, &job)?;
+    drain_evals(&store)?;
+    assert_eq!(allocations_of(&store, "heavy", "fetch")?.len(), 1);
+
+    report_exit(
+        &store,
+        allocations_of(&store, "heavy", "fetch")?[0].id,
+        true,
+    )?;
+    let outcomes = drain_evals(&store)?;
+    assert!(
+        outcomes.iter().all(|(_, result)| result.is_ok()),
+        "{outcomes:?}"
+    );
+    assert_eq!(allocations_of(&store, "heavy", "validate")?.len(), 1);
+
+    report_exit(
+        &store,
+        allocations_of(&store, "heavy", "validate")?[0].id,
+        true,
+    )?;
+    drain_evals(&store)?;
+    assert_eq!(allocations_of(&store, "heavy", "serve")?.len(), 1);
+    Ok(())
+}
+
+/// Minimal blocked evals: a replica left unplaced for lack of room is placed
+/// as soon as room frees up, here by another job stopping, with no node
+/// joining.
+#[test]
+fn an_unplaced_replica_is_placed_when_another_job_stops() -> R<()> {
+    let store = setup_store()?;
+    add_node(&store, "node-1")?;
+    let hog = submit(&store, &job_of("hog", vec![service("hog", 1, 4096)]))?;
+    drain_evals(&store)?;
+    submit(&store, &job_of("web", vec![service("web", 2, 3072)]))?;
+    drain_evals(&store)?;
+    assert_eq!(
+        allocations_of(&store, "web", "web")?.len(),
+        1,
+        "one fits beside hog"
+    );
+
+    store.stop_job("hog")?;
+    store.enqueue_eval("job_stop", Some("hog"), Some(&hog), None, None)?;
+    let outcomes = drain_evals(&store)?;
+    assert!(
+        outcomes.iter().any(|(kind, _)| kind == "node_join"),
+        "stopping hog queues a capacity pass: {outcomes:?}"
+    );
+    assert_eq!(allocations_of(&store, "web", "web")?.len(), 2);
+    Ok(())
+}
+
+/// The same when the room is freed by a batch task finishing.
+#[test]
+fn an_unplaced_replica_is_placed_when_a_batch_task_finishes() -> R<()> {
+    let store = setup_store()?;
+    add_node(&store, "node-1")?;
+    let mut crunch = batch_step("crunch", None);
+    crunch.resources = json!({ "memory": 4096 });
+    submit(&store, &job_of("crunch", vec![crunch]))?;
+    drain_evals(&store)?;
+    submit(&store, &job_of("web", vec![service("web", 2, 3072)]))?;
+    drain_evals(&store)?;
+    assert_eq!(allocations_of(&store, "web", "web")?.len(), 1);
+
+    report_exit(
+        &store,
+        allocations_of(&store, "crunch", "crunch")?[0].id,
+        true,
+    )?;
+    drain_evals(&store)?;
+    assert_eq!(allocations_of(&store, "web", "web")?.len(), 2);
+    // Nobody waits any more: the next freed capacity queues nothing.
+    store.request_capacity_reconcile_if_waiting();
+    assert!(drain_evals(&store)?.is_empty());
     Ok(())
 }

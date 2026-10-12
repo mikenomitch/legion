@@ -139,7 +139,8 @@ Know two things before you upgrade:
   status message.
 
 A completed allocation keeps its row and its slot, and Legion never dispatches
-it to a worker again. Batch tasks with a `schedule` still re-run on their
+it to a worker again. It no longer counts against the node's resources or
+holds its ports, so other work can use them. Batch tasks with a `schedule` still re-run on their
 schedule.
 
 Version skew: exit reporting arrived with protocol version 2. You upgrade

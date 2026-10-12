@@ -471,9 +471,23 @@ tasks of the job, and the replicas of this task that did fit, are applied.
 - A plan that can place **nothing** fails as before, with the same message,
   as a typed placement error (`PlacementBlocked`). It is not a plan conflict,
   so the eval is not requeued in a loop.
-- The unplaced remainder is placed by the next pass that has room. A node
-  registering or being uncordoned queues one for every job short of its
-  count (see [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md)).
+- The unplaced remainder is placed by the next pass that has room: the
+  **capacity pass**, a `node_join` eval with no node that re-plans every
+  active job short of its count. It is queued when a node registers or is
+  uncordoned, and, while some plan has left replicas unplaced, whenever
+  capacity frees up: a worker reports an allocation finished, a failed
+  allocation is removed, a job stops, or a job scales in. This is a minimal
+  form of Nomad's blocked evals. One pass covers any number of frees (it is
+  not queued again while one is pending), and when nothing is waiting a free
+  queues nothing.
+- Only the manager that leads the scheduler lane queues the pass. After a
+  restart or a leadership change the first freed capacity runs one pass,
+  which finds out whether anything is waiting.
+- A job with an eval already queued is skipped by the pass (that eval runs
+  against the new capacity anyway). A plan that placed nothing queues a
+  `job_reschedule` 5 seconds out, so such a job is retried by that eval.
+- A batch task is retried only while it has not finished (its status is not
+  `success`, `complete`, or `failed`).
 
 Tasks in a multi-task group (co-placed on one node) stay all-or-nothing: a
 member that cannot fit fails the plan. `legion job plan` also keeps

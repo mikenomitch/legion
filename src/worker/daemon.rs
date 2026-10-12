@@ -1188,6 +1188,9 @@ async fn start_heartbeats(
 
 /// One heartbeat round-trip: report running/failed allocations, then
 /// reconcile against the manager's desired set.
+// Same reason as `start_heartbeats`: each per-heartbeat subsystem is threaded
+// by parameter so its lifetime stays visible at the call site.
+#[allow(clippy::too_many_arguments)]
 async fn heartbeat_tick(
     name: &str,
     client: &ManagerClient<Channel>,

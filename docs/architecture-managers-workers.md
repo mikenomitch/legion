@@ -51,8 +51,12 @@ Where a worker listens and what it advertises:
 When neither is set, the worker advertises the local address of its route to
 the manager: it connects a UDP socket toward the manager's address and reads
 back the local address (no packet is sent). On a VPC that is the private IP
-managers on the same network dial. A worker on the same machine as its
-manager (`--run-worker`, `legion join` on one box) advertises `127.0.0.1`.
+managers on the same network dial. A worker that reaches its manager over
+loopback (`legion join` on the manager's box) advertises `127.0.0.1`. The
+in-process worker of `legion start manager --run-worker` is the exception:
+when the manager has a routable `server.advertiseAddr` (or, failing that, a
+routable raft `advertiseAddr`), the worker advertises that host instead, so
+the other managers of a multi-manager cluster can reach it.
 Behind NAT, or with asymmetric routing, the guess is wrong; set the override.
 The worker logs what it chose:
 

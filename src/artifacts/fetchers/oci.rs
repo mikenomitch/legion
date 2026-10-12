@@ -733,6 +733,9 @@ mod tests {
         assert_eq!(sanitize_title(""), "layer");
     }
 
+    /// Request path -> (content type, body).
+    type Routes = Arc<std::sync::Mutex<HashMap<String, (String, Vec<u8>)>>>;
+
     /// A registry small enough to read: `GET /v2/`, manifests by tag or
     /// digest (`HEAD` and `GET`), and blobs, over plain HTTP with one request
     /// per connection. Every request is logged as `"<METHOD> <path>"`, and
@@ -742,7 +745,7 @@ mod tests {
         port: u16,
         /// path -> (content type, body); manifests are keyed by both tag
         /// and digest.
-        routes: Arc<std::sync::Mutex<HashMap<String, (String, Vec<u8>)>>>,
+        routes: Routes,
         log: Arc<std::sync::Mutex<Vec<String>>>,
         down: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -752,7 +755,7 @@ mod tests {
             use std::io::{BufRead, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             let port = listener.local_addr().expect("addr").port();
-            let routes: Arc<std::sync::Mutex<HashMap<String, (String, Vec<u8>)>>> = Arc::default();
+            let routes: Routes = Arc::default();
             let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
             let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (thread_routes, thread_log, thread_down) =

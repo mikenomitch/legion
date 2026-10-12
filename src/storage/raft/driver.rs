@@ -3674,9 +3674,37 @@ impl PersistenceDriver for MultiRaftDriver {
                 // heartbeat arrived: the restart cost an election and several
                 // terms. openraft 0.9 has no pre-vote, which is what prevents
                 // this in other raft implementations.
-                let quiet = had_state && quiet_start_applies(&raft, raft_id);
-                if quiet {
+                //
+                // Elections go off FIRST, before the membership is known:
+                // `Raft::new` returns before the core has reported the
+                // membership it loaded (the metrics start empty), so deciding
+                // from them straight away would always say "not a
+                // multi-voter group". A sole voter gets its elections back
+                // as soon as the loaded membership shows it is one.
+                let quiet = if had_state {
                     raft.runtime_config().elect(false);
+                    let _ = raft
+                        .wait(Some(Duration::from_secs(2)))
+                        .metrics(
+                            |m| {
+                                m.membership_config
+                                    .membership()
+                                    .voter_ids()
+                                    .next()
+                                    .is_some()
+                            },
+                            "the loaded membership",
+                        )
+                        .await;
+                    let applies = quiet_start_applies(&raft, raft_id);
+                    if !applies {
+                        raft.runtime_config().elect(true);
+                    }
+                    applies
+                } else {
+                    false
+                };
+                if quiet {
                     let watched = raft.clone();
                     let seen = append_entries_seen.get(&lane).cloned().unwrap_or_default();
                     tokio::spawn(end_quiet_start(watched, lane, seen, quiet_window));

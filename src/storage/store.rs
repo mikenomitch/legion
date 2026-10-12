@@ -1188,6 +1188,14 @@ pub struct Store {
     // is repaired within one sweep of the fleet rather than never. Shared
     // across clones so the sweep is per-process, not per-clone.
     alloc_scrub_queue: Arc<std::sync::Mutex<Vec<String>>>,
+    // Whether some plan since the last capacity pass left replicas unplaced
+    // for lack of room ([`Store::note_capacity_waiters`]). Freed capacity (an
+    // allocation finishing or being removed, a job stopping) queues a
+    // capacity pass only while this is set, so the common case of nobody
+    // waiting costs nothing. Starts set: after a restart or a leadership
+    // change nothing is known, so the first freed capacity runs one pass,
+    // which clears it if nothing waits.
+    capacity_waiters: Arc<AtomicBool>,
     // The timed read-model scrub's own rotation (`scrub_read_model_slice`):
     // nodes still to visit this sweep, refilled from committed AND cached
     // node ids so a node missing from either side is visited too.
@@ -1784,6 +1792,7 @@ impl Store {
             snapshot_warms: Arc::new(crate::storage::snapshot_warm::SnapshotWarmQueue::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
+            capacity_waiters: Arc::new(AtomicBool::new(true)),
             read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             external_write_baseline: Arc::new(std::sync::Mutex::new(None)),
             keyring,
@@ -3198,9 +3207,7 @@ impl Store {
                                 .map(|allocations| allocations.as_slice())
                                 .unwrap_or(&[]);
                             match NodeUsage::from_rows(
-                                allocations
-                                    .iter()
-                                    .map(|allocation| (allocation.id, &allocation.resources)),
+                                crate::resources::capacity_rows(allocations),
                                 policy,
                             ) {
                                 Ok(usage) => {
@@ -3378,9 +3385,7 @@ impl Store {
             .iter()
             .map(|(node_id, allocs)| {
                 let usage = NodeUsage::from_rows(
-                    allocs
-                        .iter()
-                        .map(|allocation| (allocation.id, &allocation.resources)),
+                    crate::resources::capacity_rows(allocs),
                     &self.resource_policy,
                 )
                 .ok();
@@ -3596,9 +3601,7 @@ impl Store {
         // the write-lock hold.
         let scrubbed_usage: Option<NodeUsage> = scrubbed.as_ref().and_then(|(_, allocations)| {
             NodeUsage::from_rows(
-                allocations
-                    .iter()
-                    .map(|allocation| (allocation.id, &allocation.resources)),
+                crate::resources::capacity_rows(allocations),
                 &self.resource_policy,
             )
             .ok()
@@ -3621,7 +3624,7 @@ impl Store {
                         &mut guard,
                         &self.resource_policy,
                         node_id,
-                        Some(&removed.resources),
+                        Self::capacity_resources(&removed),
                         None,
                     ),
                     None => {
@@ -3642,7 +3645,10 @@ impl Store {
                     CachedEntry::Present
                 };
                 let node_id = allocation.node_id.clone();
-                let added_resources = allocation.resources.clone();
+                // A row that turned terminal (a batch task finished) stops
+                // holding capacity: its usage comes out and nothing goes in.
+                let added_resources =
+                    Self::capacity_resources(&allocation).cloned();
                 let (as_expected, replaced) =
                     Self::cache_splice_allocation_entry(&mut guard, allocation, expected);
                 if !as_expected {
@@ -3652,8 +3658,8 @@ impl Store {
                     &mut guard,
                     &self.resource_policy,
                     &node_id,
-                    replaced.as_ref().map(|replaced| &replaced.resources),
-                    Some(&added_resources),
+                    replaced.as_ref().and_then(Self::capacity_resources),
+                    added_resources.as_ref(),
                 );
                 touched.insert(node_id);
             }
@@ -3770,6 +3776,13 @@ impl Store {
         }
         model.index_allocation_ref(&job_id, &node_id, reference);
         (as_expected, replaced)
+    }
+
+    /// An allocation's resources when it holds node capacity, `None` when it
+    /// is terminal (see [`crate::resources::capacity_rows`]).
+    fn capacity_resources(allocation: &Allocation) -> Option<&Value> {
+        (!crate::constants::allocation_status_is_terminal(&allocation.status))
+            .then_some(&allocation.resources)
     }
 
     /// Applies one splice's effect to a node's [`NodeUsage`] memo: the
@@ -5841,7 +5854,8 @@ impl Store {
         // read must never enter the cache.
         let mut stmt = tx.prepare_cached(
             "SELECT a.id, a.resources FROM allocation a \
-             WHERE a.node_id = ?1 AND (?2 = 0 OR a.job_config_id NOT IN (\
+             WHERE a.node_id = ?1 AND a.status NOT IN ('complete', 'failed') \
+               AND (?2 = 0 OR a.job_config_id NOT IN (\
                  SELECT id FROM job_config WHERE job_id = \
                      (SELECT job_id FROM job_config WHERE id = ?3)));",
         )?;
@@ -5946,8 +5960,14 @@ impl Store {
             }
         }
 
-        let mut stmt =
-            tx.prepare_cached("SELECT a.id, a.resources FROM allocation a WHERE a.node_id = ?1;")?;
+        // Terminal rows hold no capacity (`resources::capacity_rows`). The
+        // fingerprint still sees them: a row turning terminal bumps the
+        // node's epoch (`complete_allocation_apply`), which is what
+        // invalidates an aggregate that still counted it.
+        let mut stmt = tx.prepare_cached(
+            "SELECT a.id, a.resources FROM allocation a \
+             WHERE a.node_id = ?1 AND a.status NOT IN ('complete', 'failed');",
+        )?;
         let rows = Self::collect_rows(stmt.query_map([node_id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?))
         })?)?;
@@ -5982,7 +6002,7 @@ impl Store {
     ) -> R<OwnAllocationUsage> {
         let mut stmt = tx.prepare_cached(
             "SELECT a.node_id, a.id, a.resources FROM allocation a \
-             WHERE a.job_config_id IN (\
+             WHERE a.status NOT IN ('complete', 'failed') AND a.job_config_id IN (\
                  SELECT id FROM job_config WHERE job_id = \
                      (SELECT job_id FROM job_config WHERE id = ?1));",
         )?;
@@ -12520,8 +12540,11 @@ impl Store {
 
         let mut used: HashSet<u16> = HashSet::new();
         let mut used_blocks: HashSet<String> = HashSet::new();
+        // A finished allocation's process is gone, and so is its hold on
+        // its ports: only rows that still hold capacity count.
         let mut stmt = tx.prepare_cached(
-            "SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL;",
+            "SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL \
+             AND status NOT IN ('complete', 'failed');",
         )?;
         let rows = stmt.query_map([node_id], |row| row.get::<_, Option<String>>(0))?;
         for row in rows {
@@ -14316,6 +14339,12 @@ impl Store {
             "UPDATE allocation SET status = ? WHERE id = ?;",
             params![status, allocation_id],
         )?;
+        // A terminal row stops holding node capacity and ports
+        // (`resources::capacity_rows`), so this is a capacity-bearing change
+        // like a removal: bump the node's epoch. That invalidates the node's
+        // cached usage aggregate (`node_usage_tx`) and fences any plan that
+        // sampled the node before the change.
+        self.bump_scope_epoch_tx(&tx, "node", &allocation.node_id)?;
         // The TASK is done only when every replica is: a `success`
         // dependent of a `count = 3` batch task must not start when the
         // first of the three exits. One failed replica fails the task.
@@ -15083,9 +15112,12 @@ impl Store {
     ///
     /// The count check is deliberately loose: keyed and staged-slot tasks
     /// can read short when they are not, and that only costs a no-op
-    /// reschedule plan. Batch tasks are skipped: one that ran to
-    /// completion must not run again, and its allocation count cannot tell
-    /// finished from never placed. Jobs with a queued
+    /// reschedule plan. A batch task counts only while its status says it
+    /// has not finished (not `success`, `complete`, or `failed`): one that
+    /// ran to completion must not run again, and a finished task's rows are
+    /// kept, so a short count on an unfinished one means replicas were never
+    /// placed. A batch task held by `dependsOn` also reads short; its plan
+    /// holds it again, a no-op. Jobs with a queued
     /// eval are skipped too, which is what keeps a burst of registrations
     /// from piling up reschedules: whatever is queued runs against the new
     /// capacity anyway.
@@ -15100,6 +15132,15 @@ impl Store {
                 (tc.count_per IS NOT NULL AND tc.count_per != '')
                 OR (
                   tc.lifecycle != 'batch'
+                  AND (SELECT COUNT(*) FROM allocation a WHERE a.task_config_id = tc.id)
+                      < COALESCE(ts.count, tc.count)
+                )
+                OR (
+                  tc.lifecycle = 'batch'
+                  AND COALESCE(
+                        (SELECT st.status FROM task_status st WHERE st.task_config_id = tc.id),
+                        'pending'
+                      ) NOT IN ('success', 'complete', 'failed')
                   AND (SELECT COUNT(*) FROM allocation a WHERE a.task_config_id = tc.id)
                       < COALESCE(ts.count, tc.count)
                 )
@@ -15140,6 +15181,35 @@ impl Store {
             }
         }
         Ok(waiting)
+    }
+
+    /// Record that a plan left replicas unplaced for lack of room, so the
+    /// next freed capacity queues a capacity pass
+    /// ([`Self::request_capacity_reconcile_if_waiting`]).
+    pub(crate) fn note_capacity_waiters(&self) {
+        self.capacity_waiters.store(true, Ordering::Relaxed);
+    }
+
+    /// The minimal form of Nomad's blocked evals: after capacity frees up (an
+    /// allocation finished or was removed, a job stopped), queue one
+    /// capacity pass, but only when some plan since the last pass left
+    /// replicas unplaced. The pass re-plans every job still short of its
+    /// count ([`Self::job_configs_waiting_on_capacity`]); a burst of frees
+    /// queues one pass, because [`Self::request_capacity_reconcile`] skips
+    /// while one is pending. Only the scheduler leader queues it, so a
+    /// follower that handles a worker report never writes. Best effort: a
+    /// failure is logged, and the next node join or freed capacity retries.
+    pub fn request_capacity_reconcile_if_waiting(&self) {
+        if !self.capacity_waiters.load(Ordering::Relaxed) || !self.is_raft_leader(Lane::Scheduler)
+        {
+            return;
+        }
+        if let Err(error) = self.request_capacity_reconcile() {
+            debug!(
+                error = %format!("{error:#}"),
+                "Could not queue a capacity pass after capacity was freed"
+            );
+        }
     }
 
     /// Queue the capacity pass ([`Self::reschedule_allocations_for_new_node`])
@@ -15358,6 +15428,9 @@ impl Store {
     /// convergence step, so no cross-op atomicity is needed.
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_new_node(&self) -> R<()> {
+        // Cleared before the scan: a plan in this pass (or racing it) that
+        // leaves replicas unplaced sets it again.
+        self.capacity_waiters.store(false, Ordering::Relaxed);
         let mut job_config_ids = self.job_configs_waiting_on_capacity()?;
         for job_config_id in self.job_config_ids_with_incomplete_rollouts()? {
             if !job_config_ids.contains(&job_config_id) {
@@ -24054,7 +24127,8 @@ mod tests {
     ) -> R<ResourcePool> {
         let mut stmt = tx.prepare(
             "SELECT a.id, a.resources FROM allocation a \
-             WHERE a.node_id = ?1 AND (?2 = 0 OR a.job_config_id NOT IN (\
+             WHERE a.node_id = ?1 AND a.status NOT IN ('complete', 'failed') \
+               AND (?2 = 0 OR a.job_config_id NOT IN (\
                  SELECT id FROM job_config WHERE job_id = \
                      (SELECT job_id FROM job_config WHERE id = ?3)));",
         )?;
@@ -29113,9 +29187,7 @@ mod tests {
                 .map(|allocations| allocations.as_slice())
                 .unwrap_or(&[]);
             let rebuilt = NodeUsage::from_rows(
-                allocations
-                    .iter()
-                    .map(|allocation| (allocation.id, &allocation.resources)),
+                crate::resources::capacity_rows(allocations),
                 &store.resource_policy,
             )
             .with_context(|| format!("{label}: node {node_id} memo list failed to aggregate"))?;

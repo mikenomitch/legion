@@ -451,17 +451,20 @@ fn a_restarted_follower_does_not_depose_the_leader() -> R<()> {
             .collect::<Vec<_>>()
             .join("; ")
     };
-    eprintln!("after restart: {}", dump(&nodes));
-    for _ in 0..12 {
-        std::thread::sleep(Duration::from_secs(1));
-        eprintln!("t+: {}", dump(&nodes));
-    }
-    assert!(nodes[leader].leads(), "{leader_name} must still lead: {}", dump(&nodes));
+    // Long enough for a campaign to have happened, and for the quiet window
+    // (5 x 2000 ms here) to have closed.
+    std::thread::sleep(Duration::from_secs(12));
+    assert!(
+        nodes[leader].leads(),
+        "{leader_name} must still lead: {}",
+        dump(&nodes)
+    );
     assert_eq!(
         nodes[leader].term(),
         term,
-        "a follower restart must not start an election"
+        "a follower restart must not start an election: {}",
+        dump(&nodes)
     );
-    assert_eq!(nodes[follower].term(), term);
+    assert_eq!(nodes[follower].term(), term, "{}", dump(&nodes));
     Ok(())
 }

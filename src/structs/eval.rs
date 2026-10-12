@@ -324,6 +324,8 @@ impl Eval {
         // `whenDeleted: Delete` analog), in which case the handles are
         // dropped and a re-run mints fresh ones. No-op for stateless jobs.
         store.stop_instances_for_job(&self.job_id)?;
+        // The stopped job's capacity is free: retry jobs waiting for room.
+        store.request_capacity_reconcile_if_waiting();
 
         Ok(format!("Job {} stopped", self.job_id))
     }
@@ -383,6 +385,10 @@ impl Eval {
         let outcome = self.schedule_job_allocations(store, PlanMode::Reschedule)?;
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job scale allocation deltas");
+        }
+        if !retired.is_empty() {
+            // Scale-in freed capacity: retry jobs waiting for room.
+            store.request_capacity_reconcile_if_waiting();
         }
 
         Ok(format!(

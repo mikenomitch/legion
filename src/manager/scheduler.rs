@@ -792,15 +792,20 @@ impl PortLedger {
 
 /// The host ports an allocation holds on its node: its assigned task ports
 /// and its upstream loopback ports. The same set the apply transaction
-/// treats as taken.
+/// treats as taken. A terminal allocation (its process exited) holds none.
 fn allocation_host_ports(allocation: &Allocation) -> impl Iterator<Item = u16> + '_ {
-    allocation.network.iter().flat_map(|network| {
-        network
-            .ports
-            .iter()
-            .map(|port| port.host_port)
-            .chain(network.upstreams.iter().map(|upstream| upstream.local_port))
-    })
+    let holds = !crate::constants::allocation_status_is_terminal(&allocation.status);
+    allocation
+        .network
+        .iter()
+        .filter(move |_| holds)
+        .flat_map(|network| {
+            network
+                .ports
+                .iter()
+                .map(|port| port.host_port)
+                .chain(network.upstreams.iter().map(|upstream| upstream.local_port))
+        })
 }
 
 /// The static host ports a task claims wherever it lands: `network.ports`
@@ -1838,6 +1843,9 @@ impl<'a> Scheduler<'a> {
             );
         }
         if !unplaced.is_empty() {
+            // Freed capacity (an allocation finishing or removed, a job
+            // stopping) now queues a capacity pass that retries this job.
+            self.store.note_capacity_waiters();
             let unplaced_count: u32 = unplaced.iter().map(|task| task.count).sum();
             if placements.is_empty() {
                 // Nothing fits anywhere: the plan fails as it always has, but
@@ -8889,6 +8897,79 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&second, PlanMode::Fresh)?;
         assert_eq!(outcome.allocations.len(), 1);
         assert_ne!(outcome.allocations[0].node_id, taken);
+        Ok(())
+    }
+
+    /// A finished allocation keeps its row (its slot stays spent) but holds
+    /// neither its static port nor its resources: both the planner and the
+    /// apply let the next job have them.
+    #[test]
+    fn a_finished_allocation_frees_its_static_port() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let first_task = TaskConfig {
+            lifecycle: TaskLifecycle::Batch,
+            ..static_port_task("first", 18080, 1)
+        };
+        let first = submit_job(&store, "first", vec![first_task])?;
+        let held = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
+        assert_eq!(held.allocations.len(), 1);
+
+        let second = submit_job(&store, "second", vec![static_port_task("second", 18080, 1)])?;
+        let error = scheduler
+            .plan_and_apply(&second, PlanMode::Fresh)
+            .expect_err("the port is held while first runs");
+        assert!(
+            error.downcast_ref::<PlacementBlocked>().is_some(),
+            "{error:#}"
+        );
+
+        store.complete_allocation(held.allocations[0].id, true)?;
+        let outcome = scheduler.plan_and_apply(&second, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert!(store
+            .get_allocation_by_id(held.allocations[0].id)?
+            .is_some());
+        Ok(())
+    }
+
+    /// The same for resources: a node full of a finished task's allocation
+    /// has room again, in the read model's pools and in the apply's cached
+    /// usage alike.
+    #[test]
+    fn a_finished_allocation_frees_its_resources() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-a",
+            json!({}),
+            json!({
+                "memory_total": "1073741824",
+                "cpus": { "cpu-1": { "frequency": "1000" } }
+            }),
+            json!({}),
+        ))?;
+        let scheduler = Scheduler::new(&store)?;
+        let big = |name: &str, lifecycle| TaskConfig {
+            lifecycle,
+            resources: json!({ "memory": 768 }),
+            ..TaskConfig::new(name, "noop")
+        };
+
+        let first = submit_job(&store, "first", vec![big("first", TaskLifecycle::Batch)])?;
+        let held = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
+        assert_eq!(held.allocations.len(), 1);
+        let second = submit_job(
+            &store,
+            "second",
+            vec![big("second", TaskLifecycle::Service)],
+        )?;
+        assert!(scheduler.plan_and_apply(&second, PlanMode::Fresh).is_err());
+
+        store.complete_allocation(held.allocations[0].id, true)?;
+        let outcome = scheduler.plan_and_apply(&second, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
         Ok(())
     }
 

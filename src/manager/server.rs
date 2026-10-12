@@ -10086,6 +10086,11 @@ fn handle_terminated_allocations(
             "Allocation reached a terminal state"
         );
     }
+    // A finished allocation no longer holds node capacity: retry jobs that
+    // are short of room (no-op unless some plan left replicas unplaced).
+    if !terminated.is_empty() {
+        store.request_capacity_reconcile_if_waiting();
+    }
     Ok(())
 }
 
@@ -10192,6 +10197,11 @@ fn handle_failed_allocations(
         );
     }
 
+    // The removed rows freed node capacity (see
+    // `Store::request_capacity_reconcile_if_waiting`).
+    if !failed.is_empty() {
+        store.request_capacity_reconcile_if_waiting();
+    }
     Ok(())
 }
 

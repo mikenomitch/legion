@@ -571,6 +571,20 @@ pub async fn run_manager_with(
     let eval_loop_fut = start_eval_loop(store_copy_b, full_config.eval_threads);
     let manager_host = resolve_manager_host(&full_config.server.host);
     let manager_addr = format!("http://{}:{}", manager_host, full_config.server.port);
+    // The in-process worker dials its manager over loopback, so the worker
+    // plane's auto-detection (the route toward the manager) would advertise
+    // 127.0.0.1, which no OTHER manager can reach. When this manager has a
+    // non-loopback advertised address, the co-located worker advertises the
+    // same host. An explicit LEGION_WORKER_ADVERTISE_ADDR still wins.
+    if run_worker && std::env::var_os(crate::worker::plane::ENV_WORKER_ADVERTISE_ADDR).is_none() {
+        if let Some(host) = in_process_worker_advertise_host(
+            full_config.server.advertise_addr.as_deref(),
+            full_config.persistence.raft.advertise_addr.as_deref(),
+        ) {
+            info!(%host, "In-process worker advertises this manager's host");
+            crate::worker::plane::set_advertise_addr_flag(&host);
+        }
+    }
     let worker_fut = async move {
         if run_worker {
             info!(%manager_addr, "Starting in-process worker");
@@ -655,6 +669,38 @@ pub async fn run_manager_with(
     shutdown_persistence(&store_for_shutdown).await;
     info!("Manager stopped");
     Ok(())
+}
+
+/// The host an in-process worker (`--run-worker`) should advertise for its
+/// worker plane: the host of this manager's advertised API address
+/// (`server.advertiseAddr`), else of its raft `advertiseAddr`, when that is
+/// a routable (non-loopback, non-wildcard) host. `None` leaves the worker's
+/// own detection in charge, which is right for a single-host setup.
+fn in_process_worker_advertise_host(
+    server_advertise: Option<&str>,
+    raft_advertise: Option<&str>,
+) -> Option<String> {
+    fn host_of(addr: &str) -> Option<String> {
+        let addr = addr.trim();
+        let addr = addr.split_once("://").map_or(addr, |(_, rest)| rest);
+        let authority = addr.split('/').next()?.trim();
+        let host = if let Some(rest) = authority.strip_prefix('[') {
+            rest.split_once(']')?.0.to_string()
+        } else {
+            match authority.rsplit_once(':') {
+                Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host.to_string(),
+                _ => authority.to_string(),
+            }
+        };
+        let routable = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+            Err(_) => !host.is_empty() && !host.eq_ignore_ascii_case("localhost"),
+        };
+        routable.then_some(host)
+    }
+    server_advertise
+        .and_then(host_of)
+        .or_else(|| raft_advertise.and_then(host_of))
 }
 
 /// How long a graceful shutdown waits for in-flight RPCs and open streams
@@ -3069,6 +3115,39 @@ mod tests {
     /// boots as follower (or leaderless after a full-cluster restart) and
     /// wins an election later would otherwise never requeue in-flight evals
     /// or load config data.
+    /// `--run-worker` on a manager in a multi-manager cluster must not
+    /// advertise its worker plane as loopback (other managers dial it).
+    #[test]
+    fn in_process_worker_advertises_the_managers_routable_host_test() {
+        assert_eq!(
+            in_process_worker_advertise_host(Some("http://10.0.1.7:4747"), None).as_deref(),
+            Some("10.0.1.7")
+        );
+        assert_eq!(
+            in_process_worker_advertise_host(Some("https://mgr-a.internal:4747/"), None).as_deref(),
+            Some("mgr-a.internal")
+        );
+        assert_eq!(
+            in_process_worker_advertise_host(None, Some("[fd00::7]:4747")).as_deref(),
+            Some("fd00::7")
+        );
+        // The raft address is the fallback, and loopback never qualifies.
+        assert_eq!(
+            in_process_worker_advertise_host(Some("http://127.0.0.1:4747"), Some("10.0.0.2:4747"))
+                .as_deref(),
+            Some("10.0.0.2")
+        );
+        assert_eq!(
+            in_process_worker_advertise_host(Some("http://localhost:4747"), None),
+            None
+        );
+        assert_eq!(
+            in_process_worker_advertise_host(None, Some("0.0.0.0:4747")),
+            None
+        );
+        assert_eq!(in_process_worker_advertise_host(None, None), None);
+    }
+
     #[test]
     fn leadership_acquired_fires_only_on_false_to_true() {
         assert!(leadership_acquired(false, true));
