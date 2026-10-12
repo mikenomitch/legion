@@ -89,9 +89,14 @@ issued identity. Every command takes `-j` for the standard JSON envelope.
 
 Suspend is for keyed stateful instances (`stateful.mode = "keyed"`), and for
 sessions (`stateful.mode = "session"`) whose task has a `suspend` block: a
-session suspends to its own node's disk only, resumes there under the same
-id, and adds `keepFor`, `checkpointEvery`, and `onWorkerStop`. See
-[Idle sessions](session-mode.md#idle-sessions). A
+session with `durability = "local"` suspends to its own node's disk and
+resumes there under the same id; one with `durability = "store"` also
+publishes its checkpoint and a session manifest to the node's
+`contentStore`, and resumes on any node with an envelope for its task,
+claiming a new generation so only one copy runs. Sessions add `keepFor`,
+`checkpointEvery`, and `onWorkerStop`. See
+[Idle sessions](session-mode.md#idle-sessions) and
+[Moving a session](session-mode.md#moving-a-session). A
 suspended instance survives a job stop: it holds nothing, and its checkpoint
 waits for the next `start`. `instance stop` on a suspended instance discards
 the checkpoint (the next `start` boots cold), and `instance destroy` discards
@@ -128,7 +133,7 @@ suspend = {
 | `archive` | none | Once a `durability = "store"` checkpoint is published, move its record out of the replicated store and into the bucket: `slim` keeps a small instance row, `manifestOnly` keeps nothing for an unnamed instance. See [Archiving idle instances](#archiving-idle-instances). |
 | `idle` | none | Suspend automatically once the instance has been quiet for `idle.after`. See [Idle policy](#idle-policy). |
 | `onPressure` | `false` | Let the node's memory pressure response suspend this instance (the `suspend` step) before it evicts anything. See [Under memory pressure](#under-memory-pressure). |
-| `keepFor`, `checkpointEvery`, `onWorkerStop` | `24h`, off, `keep` | Session tasks only: how long a suspended session's local checkpoint is kept, a periodic live checkpoint, and whether a stopping worker checkpoints running sessions. See [Idle sessions](session-mode.md#idle-sessions). |
+| `keepFor`, `checkpointEvery`, `onWorkerStop` | `24h`, off, `keep` | Session tasks only: how long a suspended session's local checkpoint is kept, a periodic live checkpoint, and whether a stopping worker checkpoints running sessions. See [Idle sessions](session-mode.md#idle-sessions). With `durability = "store"` each of these checkpoints is published and written to the session's manifest, and `stateful.fenceAfter` (default `2m`) sets when a node cut off from managers and the bucket suspends its running sessions ([No split brain](session-mode.md#no-split-brain)). |
 | `wake` | none | `{ port, timeout = "30s" }`: requests through `legion start gateway` for this instance go to the `network.ports` label `port`, and a request for a suspended instance resumes it and is held until it serves. Without it, the gateway refuses the instance. See [Waking on a request](#waking-on-a-request). |
 
 Submit refuses anything the block cannot honor, with the fix in the hint:

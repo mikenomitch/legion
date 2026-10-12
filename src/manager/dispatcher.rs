@@ -108,11 +108,12 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         let mut task_allocation =
             build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
         if let Some(tasks) = task_cache.get(&allocation.job_config_id) {
-            attach_session_task_spec(
+            let session_task = attach_session_task_spec(
                 &mut task_allocation,
                 task,
                 tasks.iter().map(|(id, task)| (*id, task)),
             )?;
+            attach_session_seal_keys(store, &mut task_allocation, session_task);
         }
         // The push must carry everything the heartbeat's desired set does:
         // a worker launches from whichever copy reaches it first, and a
@@ -678,6 +679,7 @@ pub fn build_task_allocation_with(
         task_restart,
         session_task_spec: String::new(),
         session_task_config_id: 0,
+        session_seal_keys: Vec::new(),
     })
 }
 
@@ -688,9 +690,9 @@ pub fn attach_session_task_spec<'a>(
     payload: &mut TaskAllocation,
     task: &TaskConfig,
     job_tasks: impl IntoIterator<Item = (i64, &'a TaskConfig)>,
-) -> R<()> {
+) -> R<Option<&'a TaskConfig>> {
     let Some(serves) = crate::structs::session::envelope_serves(task) else {
-        return Ok(());
+        return Ok(None);
     };
     if let Some((id, session_task)) = job_tasks
         .into_iter()
@@ -698,8 +700,28 @@ pub fn attach_session_task_spec<'a>(
     {
         payload.session_task_spec = serde_json::to_string(session_task)?;
         payload.session_task_config_id = id;
+        return Ok(Some(session_task));
     }
-    Ok(())
+    Ok(None)
+}
+
+/// On the envelope payload of a session task with `suspend.durability =
+/// "store"`, carry the job's session sealing keys (session durability plan
+/// §6.6): the node seals and opens its sessions' published checkpoints with
+/// them, with no manager on the path. Nothing for any other payload, so a
+/// node holds key material only for jobs that publish session checkpoints.
+pub fn attach_session_seal_keys(
+    store: &Store,
+    payload: &mut TaskAllocation,
+    session_task: Option<&TaskConfig>,
+) {
+    let Some(session_task) = session_task else {
+        return;
+    };
+    if !crate::structs::session::publishes_checkpoints(session_task) {
+        return;
+    }
+    payload.session_seal_keys = store.keyring().session_seal_keys(&payload.job_id);
 }
 
 /// Runtime env for a provisional start. Mirrors [`inject_runtime_env`] with
@@ -1101,6 +1123,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -1129,6 +1152,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -1324,6 +1348,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("workspace", "exec")
         };
@@ -1354,6 +1379,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("workspace", "exec")
         };

@@ -96,6 +96,20 @@ pub struct PersistedSession {
     /// Why a checkpoint was evicted, for the `evicted` answer.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub evicted_reason: String,
+    /// The task sets `suspend.durability = "store"`: the checkpoint is
+    /// published, the session may move, and every resume claims the next
+    /// generation (session durability plan §6.6, §6.7).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub store: bool,
+    /// For a `store` row, the session manifest's URL once the checkpoint is
+    /// published. Empty while the publish is pending (the node retries).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub published_url: String,
+    /// Suspended by self-fencing (mechanism 4): the node was cut off from
+    /// managers and the content store. On reconnect it resumes the session
+    /// only if the content store says it still owns this generation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fenced: bool,
     /// Unix ms of the last change: when it started, suspended, or was
     /// evicted. `keepFor` counts from here for non-running rows.
     pub updated_at_unix_ms: i64,
@@ -411,6 +425,9 @@ mod session_log_test {
             payload: None,
             keep_for_ms: 0,
             evicted_reason: String::new(),
+            store: false,
+            published_url: String::new(),
+            fenced: false,
             updated_at_unix_ms: 9,
         }
     }

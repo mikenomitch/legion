@@ -24,6 +24,7 @@ pub mod plugin_runtime;
 pub mod prelude;
 pub mod resources;
 pub mod scheduling_index;
+pub mod session_manifest;
 pub mod signals;
 pub mod storage;
 pub mod structs;

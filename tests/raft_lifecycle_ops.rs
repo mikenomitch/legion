@@ -181,6 +181,7 @@ fn sandbox_job() -> JobConfig {
             storage: None,
             envelope: None,
             promote: None,
+            fence_after: None,
         }),
         suspend: Some(SuspendConfig {
             checkpoint: Some("memory".into()),
@@ -475,6 +476,7 @@ fn measure_lifecycle(topology: &str, keys: bool) -> R<Lifecycle> {
                 instance_id: instance_id.clone(),
                 idempotency_key: h.key(),
                 cold: false,
+                force_move: false,
             })))?;
             h.run_eval_worker()?;
             let resumed_alloc = h.alloc_of(&instance_id)?;

@@ -23,6 +23,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // serde skips it.
         .skip_debug("legion.CheckpointPartKey")
         .field_attribute("legion.CheckpointPartKey.key", "#[serde(skip)]")
+        // The same for a session sealing key, which rides on envelope
+        // payloads: never logged, never in the state file or session log.
+        .skip_debug("legion.SessionSealKey")
+        .field_attribute("legion.SessionSealKey.key", "#[serde(skip)]")
         // The table shows the `blocked` status; the block itself is for
         // `-j` output and `job info`.
         .field_attribute("legion.Job.blocked", "#[tabled(skip)]")

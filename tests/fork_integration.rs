@@ -253,6 +253,7 @@ fn task(runtime: &str, storage: bool) -> TaskConfig {
             }),
             envelope: None,
             promote: None,
+            fence_after: None,
         }),
         ..TaskConfig::new(TASK, runtime)
     }
@@ -1315,6 +1316,7 @@ async fn a_fork_stopped_before_its_checkpoint_restores_when_started() -> R<()> {
             instance_id: fork.clone(),
             idempotency_key: None,
             cold: false,
+            force_move: false,
         }))
         .await?;
     cluster.reschedule()?;

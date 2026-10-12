@@ -381,6 +381,15 @@ enum NodeAnswer {
 }
 
 async fn ask_node(store: &Store, node_id: &str, session_id: &str) -> NodeAnswer {
+    ask_node_within(store, node_id, session_id, WORKER_CALL_TIMEOUT).await
+}
+
+async fn ask_node_within(
+    store: &Store,
+    node_id: &str,
+    session_id: &str,
+    timeout: Duration,
+) -> NodeAnswer {
     let (mut client, target) = match worker_client(store, node_id) {
         Ok(found) => found,
         Err(status) => return NodeAnswer::Failed(status),
@@ -389,7 +398,7 @@ async fn ask_node(store: &Store, node_id: &str, session_id: &str) -> NodeAnswer 
         session_id: session_id.to_string(),
         ticket: String::new(),
     });
-    request.set_timeout(WORKER_CALL_TIMEOUT);
+    request.set_timeout(timeout);
     match client.get_session(request).await {
         Ok(reply) => match reply.into_inner().session {
             Some(status) => NodeAnswer::Holds(status),
@@ -544,20 +553,29 @@ pub async fn suspend_on_node(
         })
 }
 
-/// Resume a suspended session on its node (`Worker.ResumeSession`). The
+/// Resume a suspended session on a node (`Worker.ResumeSession`). The
 /// node's own answers pass through: RESOURCE_EXHAUSTED when the envelope is
 /// full (the checkpoint stays), NOT_FOUND `evicted:` when it was evicted
-/// meanwhile.
+/// meanwhile. `from_manifest` names the session's job and task: the node
+/// then resumes a `store` session from its manifest even if it never held
+/// it, moving it (only with `force_move` when the manifest says another
+/// node runs it).
 pub async fn resume_on_node(
     store: &Store,
     node_id: &str,
     session_id: &str,
     cold: bool,
+    from_manifest: Option<(&str, &str)>,
+    force_move: bool,
 ) -> Result<crate::structs::ResumeSessionReply, Status> {
     let (mut client, target) = worker_client(store, node_id)?;
+    let (job_id, task_name) = from_manifest.unwrap_or_default();
     let mut request = tonic::Request::new(crate::structs::ResumeSessionRequest {
         session_id: session_id.to_string(),
         cold,
+        job_id: job_id.to_string(),
+        task_name: task_name.to_string(),
+        force_move,
     });
     request.set_timeout(SLEEP_CALL_TIMEOUT);
     client
@@ -578,6 +596,140 @@ pub async fn resume_on_node(
                 status
             }
         })
+}
+
+/// How long the manager waits for the node a `store` session's manifest
+/// names before it calls that node unreachable (session durability plan
+/// §6.7, "Moving is cautious for running sessions").
+pub const MOVE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What [`resume_store_session`] found.
+#[derive(Debug)]
+pub enum StoreResume {
+    /// Resumed on `node_id` from the session's manifest.
+    Resumed {
+        node_id: String,
+        reply: Box<crate::structs::ResumeSessionReply>,
+    },
+    /// It runs on `node_id` already (it moved there earlier, and the node
+    /// its id is tagged with no longer holds it).
+    Running { node_id: String },
+}
+
+/// Whether the node row says the node is gone: `down`, `lost`, or no row.
+fn node_is_down(store: &Store, node_id: &str) -> bool {
+    store
+        .get_node(node_id)
+        .map(|node| node.status == "down" || node.status == "lost")
+        .unwrap_or(true)
+}
+
+/// Resume a `store` session from its manifest on a node with room (session
+/// durability plan §6.6, "Resume"): the node its id is tagged with lost it,
+/// evicted its local copy, is full, or does not answer. Nodes are tried in
+/// the router's order. A node that finds the manifest naming another node
+/// as running the session answers `running_elsewhere`; the manager then
+/// probes that node itself (`GetSession`, [`MOVE_PROBE_TIMEOUT`]): running
+/// there, the answer is that it runs; not there, the move goes ahead; no
+/// answer, it goes ahead only when that node is marked down (or lost) or the
+/// caller passed `force_move`, and otherwise answers UNAVAILABLE.
+pub async fn resume_store_session(
+    store: &Store,
+    job_id: &str,
+    task: &TaskConfig,
+    session_id: &str,
+    cold: bool,
+    force_move: bool,
+) -> Result<StoreResume, Status> {
+    let view = room_view(store, job_id, &task.name).await?;
+    let needs = resource_amounts(&task.resources);
+    let candidates = rank(&view, &needs);
+    if candidates.is_empty() {
+        return Err(Status::resource_exhausted(format!(
+            "no envelope for {job_id}/{} has room to resume session {session_id} ({} nodes); \
+             its checkpoint stays in the content store, retry once sessions end",
+            task.name,
+            view.envelopes.len()
+        )));
+    }
+    let mut refusals = Vec::new();
+    for node_id in candidates.into_iter().take(ROUTER_ATTEMPTS) {
+        let mut force = force_move;
+        for _ in 0..2 {
+            let answer = resume_on_node(
+                store,
+                &node_id,
+                session_id,
+                cold,
+                Some((job_id, &task.name)),
+                force,
+            )
+            .await;
+            let status = match answer {
+                Ok(reply) => {
+                    return Ok(StoreResume::Resumed {
+                        node_id,
+                        reply: Box::new(reply),
+                    })
+                }
+                Err(status) => status,
+            };
+            let elsewhere = status.code() == tonic::Code::FailedPrecondition
+                && status.message().starts_with("running_elsewhere:");
+            if !elsewhere || force {
+                match status.code() {
+                    // The manifest is gone, the claim was lost, or the
+                    // caller cannot see it: the same everywhere.
+                    tonic::Code::NotFound
+                    | tonic::Code::Aborted
+                    | tonic::Code::PermissionDenied => return Err(status),
+                    _ => {
+                        if matches!(
+                            status.code(),
+                            tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
+                        ) {
+                            note_in_view(store, job_id, &task.name, &node_id, NoteUse::Full);
+                        }
+                        refusals.push(format!("{node_id}: {}", status.message()));
+                        break;
+                    }
+                }
+            }
+            let Some((holder, generation)) =
+                crate::session_manifest::winner_from_message(status.message())
+            else {
+                return Err(status);
+            };
+            match ask_node_within(store, &holder, session_id, MOVE_PROBE_TIMEOUT).await {
+                NodeAnswer::Holds(found) if found.state != "suspended" => {
+                    return Ok(StoreResume::Running { node_id: holder });
+                }
+                NodeAnswer::Holds(_)
+                | NodeAnswer::Absent
+                | NodeAnswer::Evicted(_)
+                | NodeAnswer::WrongNode => force = true,
+                NodeAnswer::Failed(cause) => {
+                    if !node_is_down(store, &holder) {
+                        return Err(Status::unavailable(format!(
+                            "running_elsewhere: session {session_id} runs on node {holder} \
+                             (generation {generation}), which did not answer within {}s ({}). \
+                             Its node is not marked down, so the session was not moved\nHint: \
+                             retry when the node is back, or pass --force-move once you know \
+                             it is down [winner node={holder} generation={generation}]",
+                            MOVE_PROBE_TIMEOUT.as_secs(),
+                            cause.message().split("\nHint:").next().unwrap_or_default()
+                        )));
+                    }
+                    force = true;
+                }
+            }
+        }
+    }
+    Err(Status::resource_exhausted(format!(
+        "no node resumed session {session_id} ({}); its checkpoint stays in the content store, \
+         retry once sessions end",
+        refusals.join("; ")
+    )))
 }
 
 /// Stop the later copies of a duplicated session, in the background.
@@ -1088,6 +1240,22 @@ pub async fn start(
                 });
             }
             Err(status) => {
+                // An idempotent `store` start that another node created
+                // first (session durability plan §6.7, row 3): the session
+                // exists, on the node the refusal names.
+                if status.code() == tonic::Code::AlreadyExists {
+                    if let Some((winner, _)) =
+                        crate::session_manifest::winner_from_message(status.message())
+                    {
+                        metrics.session_starts_total.inc(&["deduplicated"]);
+                        return Ok(StartedSession {
+                            session_id: session_id.to_string(),
+                            node_id: winner,
+                            state: "running".into(),
+                            deduplicated: true,
+                        });
+                    }
+                }
                 if matches!(
                     status.code(),
                     tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition

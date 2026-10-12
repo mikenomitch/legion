@@ -1056,6 +1056,15 @@ pub struct StatefulConfig {
     /// (`stateful.promote`). Absent = the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promote: Option<crate::structs::session::SessionPromoteConfig>,
+    /// Session tasks with `suspend.durability = "store"` only (session
+    /// durability plan §6.7, mechanism 4): how long a node that has reached
+    /// neither a manager nor its content store keeps the task's sessions
+    /// running. Past it the node suspends them on its own disk and stops
+    /// serving them, because a newer generation may be running elsewhere;
+    /// once it reconnects it resumes only the ones the content store says
+    /// it still owns. A duration such as `"2m"` (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_after: Option<String>,
 }
 
 /// Default worker self-fence window for stateful tasks (see
@@ -4208,6 +4217,7 @@ mod tests {
                     }),
                     envelope: None,
                     promote: None,
+                    fence_after: None,
                 }),
                 ..TaskConfig::new("sandbox", "container")
             };
@@ -4234,6 +4244,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -4255,6 +4266,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -4276,6 +4288,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -4304,6 +4317,7 @@ mod tests {
                     }),
                     envelope: None,
                     promote: None,
+                    fence_after: None,
                 }),
                 ..TaskConfig::new("db", "exec")
             };
@@ -4329,6 +4343,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("sandbox", "container")
         };
@@ -4353,6 +4368,7 @@ mod tests {
                     storage: None,
                     envelope: None,
                     promote: None,
+                    fence_after: None,
                 }),
                 ..TaskConfig::new("sandbox", "container")
             };
@@ -4476,6 +4492,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         }
@@ -4494,6 +4511,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
         };

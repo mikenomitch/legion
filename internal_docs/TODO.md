@@ -2869,10 +2869,42 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
         `instance start`, eviction (keepFor, envelope gone, minFreeDisk)
         with the `evicted` answer, UNAVAILABLE naming a silent node
         ([docs](../docs/session-mode.md#idle-sessions)).
-  - [ ] Phase 5b: `durability = "store"` for sessions (a node refuses it
-        today with FAILED_PRECONDITION), resume by manifest fallback, edge
-        resume on any node, and moves fenced by a generation claimed with a
-        conditional manifest write (plan §6.7).
+  - [x] Phase 5b: `durability = "store"` for sessions: suspend and live
+        checkpoints publish sealed parts (a per-job session sealing key on
+        the envelope payload) and write the session manifest at
+        `<contentStore.url>/sessions/<job>/<prefix>/<id>.json`; every
+        resume claims the next generation with a conditional write
+        (`file://` and `s3://`); `Worker.ResumeSession` with job/task and
+        `StartSession.resume_id` resume a session the node never held;
+        `instance start` falls back to the manifest when the tagged node
+        lost it, is full, or does not answer, probing a running copy first
+        (calls 28 to 39;
+        [docs](../docs/session-mode.md#moving-a-session)). Not yet run:
+        see the open items below.
+  - [ ] Phase 5b against real S3 (or MinIO): the `s3://` manifest backend
+        (`PutMode::Create` / `Update` with `S3ConditionalPut::ETagMatch`)
+        is unit-tested only against `object_store`'s in-memory store
+        (`src/session_manifest.rs`), not against a bucket.
+  - [ ] Phase 5b with the `sandbox` runtime: publishing and restoring a
+        session's memory parts (sealed with the session key, fetched on
+        another node) is not covered by a test; the unit tests run `exec`
+        sessions, whose disk checkpoint has no parts.
+  - [ ] Phase 5b edge move: `StartSession.resume_id`'s probe and
+        `StopSession` of the old copy over worker-to-worker TLS has no test
+        (it needs two real workers with mesh certificates); the manager
+        fallback is covered in `tests/session_integration.rs` with fake
+        nodes and a fake bucket.
+  - [ ] An edge picker (`legion session nodes`) should set `force_move`
+        itself when the node a session's tag names is listed `down` or
+        `lost`; today the caller passes `--force-move`.
+  - [ ] Manifests of `store` sessions that are never resumed or stopped
+        stay in the bucket (calls entry 33); consider a manager-side sweep
+        of manifests whose job is gone.
+  - [ ] A moved `store` session runs the receiving node's envelope job
+        version, not the one it started with (calls entry 29).
+  - [ ] Finding a moved session's job scans every job's session tasks
+        (calls entry 37); two jobs with a `store` session task of the same
+        name are ambiguous.
   - [ ] Evicted and unreachable session answers are given before the job's
         ACL scope is known; have the node return the job id with them so
         the precise scope is enforced first.
@@ -2884,9 +2916,13 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
         functions are.
   - [x] The managers' batched duplicate sweep and the generation-first
         winner rule (plan §6.7, mechanism 3; #36).
-  - [ ] No split brain for `store` sessions (plan §6.7): manifest create
-        for idempotent `store` starts, the fence list, and self-fencing
-        after `stateful.fenceAfter`.
+  - [x] No split brain for `store` sessions (plan §6.7): manifest create
+        for idempotent `store` starts (`ALREADY_EXISTS` naming the winner),
+        superseded-on-write, the fence list (`sessions.fenceListEvery`,
+        default 30s), probe-before-move, and self-fencing after
+        `stateful.fenceAfter` (default 2m) with resume of owned generations
+        on reconnect ([docs](../docs/session-mode.md#no-split-brain)).
+        Unit-tested on the `file://` backend.
   - [x] Optional `suspend.checkpointEvery` (memory checkpoints only,
         staggered, skipped past one interval and counted in
         `legion_session_checkpoints_skipped_total`) and

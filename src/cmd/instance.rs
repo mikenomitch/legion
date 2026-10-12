@@ -245,6 +245,15 @@ pub fn config() -> Command {
                     .action(ArgAction::SetTrue)
                     .help("Suspended instances: discard the checkpoint and boot fresh"),
             )
+            .arg(
+                Arg::new("force-move")
+                    .long("force-move")
+                    .action(ArgAction::SetTrue)
+                    .help(
+                        "Store sessions: move the session to another node even when its old \
+                         node did not answer the probe (only once that node is known to be down)",
+                    ),
+            )
             .arg(idempotency_arg())
             .arg(json_flag()),
         "the instance is running (and a resume has restored)",
@@ -770,6 +779,7 @@ async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
         instance_id: id.clone(),
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
         cold: arg_matches.get_flag("cold"),
+        force_move: arg_matches.get_flag("force-move"),
     });
 
     let mut client = connect_manager_client().await?;

@@ -406,6 +406,9 @@ roughly double it on ordinary disks for no durability gain.
 
 ## 17. A session suspends only when its task has a `suspend` block, and `store` is refused at the node
 
+> **Superseded in part by Phase 5b:** a node now serves `store` for
+> sessions (calls 28 to 39); the `suspend`-block rule stands.
+
 **Call.** `instance suspend` on a session routes to its node only when its
 task sets `suspend`; without one it keeps answering FAILED_PRECONDITION
 "promote it first". A task with `suspend.durability = "store"` passes
@@ -600,3 +603,246 @@ equal to Envoy.
 
 **Why (simplicity).** Each balancer's own range, and a node with room for
 over 128 sessions is not the one to steer away from.
+
+## 28. A store session's checkpoints are sealed with a per-job key the envelope payload carries
+
+**Call.** The manager derives a session sealing key per job from each
+checkpoint key in the keyring (HKDF-SHA256, salt `legion-session-seal-v1`,
+info = the job name; key id `<ck_id>/session/<job>`) and puts it on the
+envelope payloads of session tasks with `suspend.durability = "store"`
+(`TaskAllocation.session_seal_keys`). A node derives each part's key from
+it locally and records the key id on the part, so a node that later
+resumes the session opens it with the same job's key.
+
+```proto
+message SessionSealKey { string key_id = 1; bytes key = 2; }
+repeated SessionSealKey session_seal_keys = 31;   // on TaskAllocation
+```
+
+**Alternatives.**
+- (a) Ask the manager for part keys per checkpoint, as keyed snapshots do
+  (`RecordCheckpoint`).
+- (b) Send the checkpoint key itself to every node.
+- (c) A per-session key, minted by the node and stored in the manifest.
+
+**Trade-off.** Any node holding an envelope of the job can open every
+session checkpoint of that job, not just the sessions it ran. Keys reach a
+node only with an envelope payload, so a restarted worker cannot publish
+until its first payload arrives (the publish is retried, so the suspend
+still lands locally).
+
+**Why (simplicity, performance).** (a) puts a manager call on every
+suspend and every checkpoint, which this plan exists to remove. (b) gives
+every node every job's keys. (c) needs the key somewhere a resuming node
+can read it, which is the bucket, defeating sealing. A job is the ACL and
+envelope boundary already, so a key per job matches what a node may run.
+
+## 29. The manifest carries no launch payload; a move rebuilds the start from the receiving node's envelope
+
+**Call.** A manifest records the session's job, job config, task, lease,
+resources, generation, holder, state, and checkpoint, but not its launch
+payload. A node resuming a session it never held builds the payload from
+the session task's spec its own envelope carries, as an edge start does.
+
+**Alternatives.** (a) Store the full payload in the manifest, so the move
+relaunches exactly what ran.
+
+**Trade-off.** A session that moves runs the job version of the
+receiving node's envelope, which may be newer than the one it started
+with (a local resume keeps its original payload). Restoring a memory
+checkpoint across a job update that changed the runtime config can fail
+the restore, and `onRestoreFailure` decides.
+
+**Why (simplicity).** The payload holds env, artifacts, and config that
+can carry secrets, and the bucket is not where those belong; the envelope
+payload already reaches every node that can run the session. Moving onto
+the current job version is also what a keyed instance does on reschedule.
+
+## 30. The manager probes a running session's old node itself and moves past a silent one only when it is marked down
+
+**Call.** A receiving node never probes for a manager-routed move: it
+refuses `running_elsewhere` when the manifest names another node as
+running the session. The manager then asks that node (`GetSession`, 2 s):
+running there answers `already running on <node>`; absent moves; silent
+moves only when the node row is `down` or `lost`, or with `force_move`.
+
+```text
+UNAVAILABLE: running_elsewhere: session workspace-q4n7c2rd.01jbx... runs on node w-17 (generation 2), which did not answer within 2s (...). Its node is not marked down, so the session was not moved
+Hint: retry when the node is back, or pass --force-move once you know it is down [winner node=w-17 generation=2]
+```
+
+**Alternatives.**
+- (a) The receiving node probes the old node over the worker plane.
+- (b) Move whenever the probe fails, trusting fencing to stop the old
+  copy.
+
+**Trade-off.** A session on a node that is partitioned from managers but
+not yet marked down cannot be moved for up to the managers' lost-node
+window (or until the operator forces it). The manager probe adds one
+round trip to every fallback that meets a running manifest.
+
+**Why (simplicity, safety).** The manager already has the node row and an
+mTLS client for every worker; a worker has neither for its peers. (b)
+makes every transient blip a split brain that fencing must clean up,
+which is the outcome the generations are there to avoid.
+
+## 31. An edge move claims the generation before it asks the old node to stop
+
+**Call.** `StartSession` with `resume_id` probes the old node with the
+caller's ticket; if the session runs there, the receiving node claims
+g+1, then calls `StopSession` on the old node, then launches.
+
+**Alternatives.** (a) Stop the old copy first, then claim.
+
+**Trade-off.** Between the claim and the stop, the old copy runs at a
+superseded generation; its next manifest write or the fence marker ends
+it anyway, and `StopSession` failing is only logged.
+
+**Why (correctness).** Stopping first lets the old node's stop delete the
+manifest (it still owns it), leaving nothing to claim; and a stop that
+lands with no claim made can leave a session with no copy anywhere if the
+claim then loses.
+
+## 32. A self-fenced session is suspended locally, and reconnect resumes only what the bucket still names
+
+**Call.** A node that has reached neither a manager nor its content store
+for `stateful.fenceAfter` (default 2m) captures each running `store`
+session to its own disk without writing the manifest (it cannot), and
+marks the row `fenced`. When a manifest read succeeds again it resumes,
+claiming g+1, each fenced session the manifest still names at its
+generation (or that has no manifest), and ends the rest with
+`superseded (reconnect)`. A capture that fails stops the session.
+
+```nickel
+stateful = { mode = "session", envelope = { ... }, fenceAfter = "2m" },
+```
+
+**Alternatives.**
+- (a) Stop the sessions outright, as keyed tasks do with
+  `selfTerminateAfter`.
+- (b) Count only manager contact, as the existing self-fence watchdog does.
+
+**Trade-off.** A cut-off node spends disk and capture time on sessions
+that may have moved meanwhile, and a session that resumes after reconnect
+has been paused for the length of the partition.
+
+**Why (simplicity for users).** A short partition is common and a
+session's state is the point of keeping it; a node that was the only copy
+should not lose it. (b) would fence a node that can still reach the
+bucket, where mechanism 1 already ends a superseded copy on its next
+write.
+
+## 33. A published store session's local copy is dropped quietly, and its manifest outlives `keepFor`
+
+**Call.** When `keepFor`, disk pressure, or a lost envelope evicts a
+suspended `store` session whose checkpoint is published, the node drops
+its row with no `evicted` answer, so the manager falls back to the
+manifest. The manifest is deleted only when the session ends (stop,
+destroy, exit), never by `keepFor`.
+
+**Alternatives.** (a) Keep the `evicted` row as for `local`. (b) Delete
+the manifest when `keepFor` passes.
+
+**Trade-off.** Manifests of sessions nobody ever resumes or stops stay
+in the bucket indefinitely; the docs point at a bucket lifecycle rule.
+
+**Why (simplicity).** (a) would answer "gone" for a session that is
+fine. (b) needs a node to own the expiry of a record that by design is
+not its own once published; a lifecycle rule is the store's own tool for
+this.
+
+## 34. A resume of a store session needs the bucket, even on the node that holds it
+
+**Call.** Every resume of a `store` session claims g+1 first, including
+on the node that suspended it; when the content store is unreachable the
+resume answers `UNAVAILABLE` and nothing starts.
+
+**Alternatives.** (a) Resume locally when the node holds the checkpoint,
+and write the claim later.
+
+**Trade-off.** A bucket outage blocks resuming idle `store` sessions
+cluster-wide, including ones whose checkpoint is on the node.
+
+**Why (safety).** (a) is exactly the double-run the generations prevent:
+another node may have claimed the session while this one could not see
+the bucket. Self-fencing (call 32) covers running sessions during an
+outage; idle ones wait.
+
+## 35. A suspend that cannot publish still suspends, and the publish is retried
+
+**Call.** A `store` suspend whose publish fails (the bucket is
+unreachable, or no sealing key has arrived) still suspends the session on
+its node, with an empty `publishedUrl`; the session maintenance loop
+retries every 5 seconds. A manifest naming a newer generation instead
+fails the suspend with `ABORTED` and ends the row.
+
+**Alternatives.** (a) Fail the suspend and keep the session running.
+
+**Trade-off.** Until the publish lands, the session can resume only on
+this node, and a node loss loses it.
+
+**Why (simplicity).** An idle suspend frees envelope room; refusing it
+because the bucket blinked would keep idle sessions holding capacity.
+
+## 36. Only derived ids create their manifest at start; minted ids create it at their first write
+
+**Call.** An idempotent (derived-id) `store` start creates the manifest
+with `If-None-Match: *` before its gate opens, so two nodes that derived
+the same id cannot both run it (the loser answers `ALREADY_EXISTS` naming
+the winner). A minted id carries its node's tag and cannot collide, so
+its manifest is created by its first checkpoint or suspend.
+
+**Alternatives.** (a) Create a manifest for every `store` start.
+
+**Trade-off.** A minted `store` session that never checkpoints has no
+manifest, so it cannot move until it does (it is lost with its node like
+a `local` one).
+
+**Why (performance).** A bucket write per start would put object-store
+latency on the edge start path, which Phase 4 took to tens of
+milliseconds.
+
+## 37. The manager finds a moved session's job by scanning session tasks
+
+**Call.** When no node and no index has the session, the manager looks
+for a session task with `store` durability whose task name the id's shape
+matches, across the jobs, enforces `job:write` on it, and resumes from
+that job's manifest.
+
+**Alternatives.** (a) Put the job in the session id. (b) Keep an index
+of manifests.
+
+**Trade-off.** One read of every job config on each fallback; two jobs
+with a `store` session task of the same name are ambiguous, and the first
+found wins.
+
+**Why (simplicity).** Session ids already have a fixed shape that this
+plan shipped in Phase 3; (b) is a second source of truth beside the
+bucket.
+
+## 38. The worker's `sessions` block rides the artifacts payload
+
+**Call.** `sessions.fenceListEvery` travels in the JSON payload that
+already carries `content` and `contentStore`, not in a new worker-type
+field.
+
+**Alternatives.** (a) A new proto field and worker-type column.
+
+**Trade-off.** The payload's name says artifacts.
+
+**Why (simplicity).** No store migration, and the setting only means
+something next to `contentStore`, which rides there already.
+
+## 39. `file://` conditional writes take a lock file and compare a content hash
+
+**Call.** The `file://` manifest backend serializes writes with
+`flock` on `.<name>.lock` beside the manifest, uses the first 16 bytes of
+the content's SHA-256 as the ETag, and replaces the file by rename.
+
+**Alternatives.** (a) `O_EXCL` creates plus mtime as the version.
+
+**Trade-off.** Correct only where every writer honors `flock` on that
+filesystem (local disks; NFS needs lock support).
+
+**Why (simplicity).** mtime is too coarse to order two writes in one
+second, and a content hash is what S3 hands back as an ETag anyway.

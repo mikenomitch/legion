@@ -25,6 +25,7 @@ use std::path::PathBuf;
 /// Sessions sleeping on their node: suspend, resume, eviction, periodic and
 /// worker-stop checkpoints (session durability plan §6.6).
 pub mod session_sleep;
+pub mod session_store;
 
 #[derive(Debug, Clone)]
 pub struct FailedAllocationReport {
@@ -392,6 +393,33 @@ fn idle_session_status(
         generation: row.generation,
         origin: row.origin.clone(),
         ticket_jti: row.ticket_jti.clone(),
+        checkpoint: row.checkpoint.as_ref().map(|checkpoint| {
+            checkpoint_info(
+                checkpoint,
+                if row.store { "store" } else { "local" },
+                &row.published_url,
+            )
+        }),
+    }
+}
+
+/// A session checkpoint as `SessionStatus.checkpoint` reports it.
+pub(crate) fn checkpoint_info(
+    checkpoint: &crate::worker::session_log::SessionCheckpoint,
+    durability: &str,
+    published_url: &str,
+) -> crate::structs::SessionCheckpointInfo {
+    crate::structs::SessionCheckpointInfo {
+        durability: durability.to_string(),
+        snapshot_id: checkpoint.snapshot_id.clone(),
+        kind: checkpoint.kind.clone(),
+        bytes: checkpoint.total_bytes,
+        taken_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            checkpoint.taken_at_unix_ms,
+        )
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default(),
+        published_url: published_url.to_string(),
     }
 }
 
@@ -661,6 +689,25 @@ pub struct WorkerTaskManager {
     /// not survive the restart: restored from that checkpoint once the
     /// worker is up.
     pending_session_restores: Vec<String>,
+    /// Session manifests in the worker's `contentStore`, for `store`
+    /// sessions (session durability plan §6.6, §6.7). `None` without a
+    /// `contentStore`, in which case `store` sessions cannot suspend.
+    session_manifests: Option<Arc<crate::session_manifest::SessionManifests>>,
+    /// Each job's session sealing keys, from its envelope payloads
+    /// (`TaskAllocation.session_seal_keys`). In memory only.
+    session_seal_keys: HashMap<String, crate::checkpoint_seal::SessionSealKeys>,
+    /// The manifest URL of each running `store` session's last published
+    /// live checkpoint, for its status.
+    session_live_published: HashMap<String, String>,
+    /// Manifests of `store` sessions that ended for good on this node (job,
+    /// id, generation), deleted by the session maintenance loop off the
+    /// lock. Only a manifest still naming this node at that generation is
+    /// deleted.
+    pending_manifest_deletes: Vec<(String, String, u64)>,
+    /// Sessions stopped because their copy was stale (superseded, fenced, a
+    /// duplicate): their manifest belongs to the winner and is not deleted
+    /// when the stop settles.
+    keep_manifest: std::collections::HashSet<String>,
 }
 
 /// A session task's spec, as its envelope's payload carried it.
@@ -753,6 +800,11 @@ impl WorkerTaskManager {
             orphaned_idle_sessions: HashMap::new(),
             session_checkpoint_due: HashMap::new(),
             pending_session_restores: Vec::new(),
+            session_manifests: None,
+            session_seal_keys: HashMap::new(),
+            session_live_published: HashMap::new(),
+            pending_manifest_deletes: Vec::new(),
+            keep_manifest: std::collections::HashSet::new(),
         }
     }
 
@@ -1083,6 +1135,53 @@ impl WorkerTaskManager {
         publishing: Option<Arc<crate::content_publish::ContentPublishing>>,
     ) {
         self.content_publishing = publishing;
+    }
+
+    /// Sets the session manifests in the worker's `contentStore` (session
+    /// durability plan §6.6).
+    pub fn configure_session_manifests(
+        &mut self,
+        manifests: Option<Arc<crate::session_manifest::SessionManifests>>,
+    ) {
+        self.session_manifests = manifests;
+    }
+
+    /// The session manifests, when this worker has a `contentStore`.
+    pub fn session_manifests(&self) -> Option<Arc<crate::session_manifest::SessionManifests>> {
+        self.session_manifests.clone()
+    }
+
+    /// Remember the session sealing keys any payload carries, by job. Every
+    /// delivery path calls this (a push, the work stream, a heartbeat's
+    /// desired set), so keys survive a worker restart as soon as the first
+    /// payload arrives again; they are never written to disk.
+    pub fn remember_session_seal_keys(&mut self, payloads: &[TaskAllocation]) {
+        for payload in payloads {
+            if payload.session_seal_keys.is_empty() {
+                continue;
+            }
+            self.session_seal_keys.insert(
+                payload.job_id.clone(),
+                crate::checkpoint_seal::SessionSealKeys::from_proto(&payload.session_seal_keys),
+            );
+        }
+    }
+
+    /// A job's session sealing keys (empty when none arrived yet).
+    pub fn session_seal_keys(&self, job_id: &str) -> crate::checkpoint_seal::SessionSealKeys {
+        self.session_seal_keys
+            .get(job_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether the session running under `local_key` publishes its
+    /// checkpoints (`suspend.durability = "store"`).
+    pub(crate) fn session_is_store(&self, local_key: i64) -> bool {
+        self.session_suspend_config(local_key)
+            .is_some_and(|suspend| {
+                suspend.durability == crate::structs::snapshot::SnapshotDurability::Store
+            })
     }
 
     /// Publishing to the shared content store, when this worker has one.
@@ -3126,6 +3225,7 @@ impl WorkerTaskManager {
         self.ledger.release_hold(claim_id);
         self.orphaned_sessions.remove(claim_id);
         if claim.is_session() && !claim.is_ratified() {
+            self.queue_manifest_delete(&claim);
             self.unlog_session(&claim.instance_id);
             self.forget_session_extras(&claim.instance_id);
         }
@@ -3335,6 +3435,20 @@ impl WorkerTaskManager {
             generation: claim.session.map(|session| session.generation).unwrap_or(1),
             origin: claim.origin.clone(),
             ticket_jti: claim.ticket_jti.clone(),
+            checkpoint: self
+                .session_checkpoints
+                .get(&claim.instance_id)
+                .map(|checkpoint| {
+                    let store = self.session_is_store(claim.local_key);
+                    checkpoint_info(
+                        checkpoint,
+                        if store { "store" } else { "local" },
+                        self.session_live_published
+                            .get(&claim.instance_id)
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                    )
+                }),
         }
     }
 
@@ -3396,6 +3510,7 @@ impl WorkerTaskManager {
                 // The workload exited, or its stop finished. Nothing to
                 // report to the manager as a failed allocation: it never had
                 // one.
+                self.queue_manifest_delete(&claim);
                 self.claims.remove(&claim.claim_id);
                 self.unlog_session(&claim.instance_id);
                 self.forget_session_extras(&claim.instance_id);
@@ -3429,6 +3544,7 @@ impl WorkerTaskManager {
     /// it ended.
     pub fn stop_sessions(&mut self, session_ids: &[String], reason: &str) -> Vec<String> {
         let mut stopped = Vec::new();
+        let keep = session_store::reason_keeps_manifest(reason);
         for session_id in session_ids {
             // A suspended (or evicted) session runs nothing: ending it drops
             // its checkpoint and its row.
@@ -3441,8 +3557,15 @@ impl WorkerTaskManager {
                 .claims
                 .get(&claim_id)
                 .is_some_and(|claim| claim.is_session() && !claim.is_ratified());
-            if is_session && self.kill_claim(&claim_id, reason).is_some() {
-                stopped.push(session_id.clone());
+            if is_session {
+                if keep {
+                    self.keep_manifest.insert(session_id.clone());
+                }
+                if self.kill_claim(&claim_id, reason).is_some() {
+                    stopped.push(session_id.clone());
+                } else {
+                    self.keep_manifest.remove(session_id);
+                }
             }
         }
         stopped
@@ -3468,6 +3591,7 @@ impl WorkerTaskManager {
         allocation: &TaskAllocation,
         gate: Gate,
     ) -> R<BeginOutcome> {
+        self.remember_session_seal_keys(std::slice::from_ref(allocation));
         // A promoted session this node runs becomes the allocation in place
         // (docs/session-mode.md, "Promotion"). Every delivery path reaches
         // here, so a push, a desired set, and the work stream all adopt.
@@ -4660,6 +4784,9 @@ impl WorkerTaskManager {
                 .map(|suspend| suspend.keep_for.as_millis() as u64)
                 .unwrap_or_default(),
             evicted_reason: String::new(),
+            store: self.session_is_store(local_key),
+            published_url: String::new(),
+            fenced: false,
             updated_at_unix_ms: crate::util::now_unix_ms(),
         }
     }
@@ -5598,6 +5725,7 @@ mod tests {
             promoted_from_session: String::new(),
             session_task_spec: String::new(),
             session_task_config_id: 0,
+            session_seal_keys: Vec::new(),
             task_lifecycle: String::new(),
             task_restart: String::new(),
         }
@@ -7158,15 +7286,26 @@ mod tests {
         manager: &Arc<Mutex<WorkerTaskManager>>,
         session_id: &str,
     ) -> R<ClaimRecord> {
+        start_session_suspending(
+            manager,
+            session_id,
+            json!({ "durability": "local", "idle": { "after": "5m" }, "keepFor": "1h" }),
+        )
+    }
+
+    /// [`start_sleepy_session`] with a `suspend` block of the test's own.
+    fn start_session_suspending(
+        manager: &Arc<Mutex<WorkerTaskManager>>,
+        session_id: &str,
+        suspend: Value,
+    ) -> R<ClaimRecord> {
         let admitted = manager
             .lock()
             .expect("task manager")
             .admit_session(session_record(session_id))?;
         let mut payload = provisional_payload(admitted.local_key);
         payload.task_resources = admitted.resources.to_string();
-        payload.task_suspend =
-            json!({ "durability": "local", "idle": { "after": "5m" }, "keepFor": "1h" })
-                .to_string();
+        payload.task_suspend = suspend.to_string();
         // As a manager or edge start sends it: the resume rebuilds the claim
         // from this block.
         payload.provisional = Some(crate::structs::ProvisionalAllocation {
@@ -7305,6 +7444,352 @@ mod tests {
             resume_session(&manager, "workspace-a", false),
             Err(_) | Ok(ResumeOutcome::AlreadyRunning)
         ));
+        Ok(())
+    }
+
+    /// The session manifests of node `node` in a `file://` content store at
+    /// `bucket`.
+    fn file_manifests(
+        bucket: &std::path::Path,
+        node: &str,
+    ) -> Arc<crate::session_manifest::SessionManifests> {
+        Arc::new(crate::session_manifest::SessionManifests::new(
+            Arc::new(crate::session_manifest::FileManifestBackend::new(bucket)),
+            node,
+            format!("https://{node}:4848"),
+        ))
+    }
+
+    /// A worker with a node content store and session manifests in a
+    /// `file://` content store at `<temp>/bucket`, as node `node-a`, with
+    /// an envelope placed.
+    fn store_worker(
+        temp_dir: &TempDir,
+    ) -> R<(
+        Arc<Mutex<WorkerTaskManager>>,
+        Arc<crate::session_manifest::SessionManifests>,
+    )> {
+        let manager = worker_with_store(temp_dir, None)?;
+        let manifests = file_manifests(&temp_dir.path().join("bucket"), "node-a");
+        {
+            let mut guard = manager.lock().expect("task manager");
+            guard.configure_session_manifests(Some(manifests.clone()));
+            guard.begin_task_allocation(&envelope_payload(100))?;
+        }
+        Ok((manager, manifests))
+    }
+
+    fn store_suspend() -> Value {
+        json!({ "durability": "store", "idle": { "after": "5m" }, "keepFor": "1h" })
+    }
+
+    const JOB: &str = "agent-sandboxes";
+
+    fn sleep_error(err: &anyhow::Error) -> Option<session_sleep::SessionSleepError> {
+        err.downcast_ref::<session_sleep::SessionSleepError>()
+            .cloned()
+    }
+
+    /// Phase 5b: a `store` session's suspend writes its manifest
+    /// (`suspended`, generation 1, this node), its status names the
+    /// published manifest, a resume claims generation 2 before it starts,
+    /// and a stop deletes the manifest it still owns. An exec session's
+    /// checkpoint is a disk one with no memory parts, so nothing is sealed
+    /// or uploaded here: publishing memory parts needs the sandbox runtime.
+    #[test]
+    fn a_store_session_publishes_its_suspend_and_claims_a_generation_to_resume_test() -> R<()> {
+        use crate::session_manifest::ManifestState;
+        use crate::worker::task_manager::session_sleep::{
+            resume_session, suspend_session, ResumeOutcome,
+        };
+        let temp_dir = TempDir::new()?;
+        let (manager, manifests) = store_worker(&temp_dir)?;
+        start_session_suspending(&manager, "workspace-a", store_suspend())?;
+
+        suspend_session(&manager, "workspace-a", "manual")?;
+        let (written, _) = manifests
+            .read(JOB, "workspace-a")
+            .map_err(|e| anyhow!(e))?
+            .expect("published");
+        assert_eq!(written.state, ManifestState::Suspended);
+        assert_eq!(written.generation, 1);
+        assert_eq!(written.node, "node-a");
+        assert_eq!(written.node_address, "https://node-a:4848");
+        assert!(written.checkpoint.is_some());
+        let status = manager
+            .lock()
+            .expect("task manager")
+            .session_status("workspace-a")
+            .expect("suspended here");
+        let checkpoint = status.checkpoint.expect("checkpoint reported");
+        assert_eq!(checkpoint.durability, "store");
+        assert!(
+            checkpoint
+                .published_url
+                .ends_with("sessions/agent-sandboxes/workspace-a.json")
+                || checkpoint.published_url.contains("workspace-a.json"),
+            "{}",
+            checkpoint.published_url
+        );
+
+        assert!(matches!(
+            resume_session(&manager, "workspace-a", false)?,
+            ResumeOutcome::Resumed { from: "cold" }
+        ));
+        let (claimed, _) = manifests
+            .read(JOB, "workspace-a")
+            .map_err(|e| anyhow!(e))?
+            .expect("claimed");
+        assert_eq!(claimed.generation, 2);
+        assert_eq!(claimed.state, ManifestState::Running);
+        assert_eq!(
+            manager
+                .lock()
+                .expect("task manager")
+                .session_status("workspace-a")
+                .map(|status| status.generation),
+            Some(2)
+        );
+
+        manager
+            .lock()
+            .expect("task manager")
+            .stop_sessions(&["workspace-a".into()], "requested (stop)");
+        session_store::run_manifest_deletes(&manager);
+        assert!(manifests
+            .read(JOB, "workspace-a")
+            .map_err(|e| anyhow!(e))?
+            .is_none());
+        Ok(())
+    }
+
+    /// Mechanism 1: a copy whose generation another node claimed fails its
+    /// next own write (a live checkpoint, or the claim of a resume) and ends
+    /// itself; the manifest, which belongs to the winner, stays.
+    #[test]
+    fn a_superseded_copy_ends_itself_on_its_next_write_test() -> R<()> {
+        use crate::worker::task_manager::session_sleep::{
+            checkpoint_session, resume_session, suspend_session, SessionSleepError,
+        };
+        let temp_dir = TempDir::new()?;
+        let (manager, manifests) = store_worker(&temp_dir)?;
+        let other = file_manifests(&temp_dir.path().join("bucket"), "node-b");
+
+        // Running: a periodic checkpoint writes the manifest, then another
+        // node claims the session.
+        start_session_suspending(&manager, "workspace-a", store_suspend())?;
+        checkpoint_session(&manager, "workspace-a")?;
+        assert_eq!(
+            manifests
+                .read(JOB, "workspace-a")
+                .map_err(|e| anyhow!(e))?
+                .map(|(m, _)| (m.generation, m.node)),
+            Some((1, "node-a".to_string()))
+        );
+        other
+            .claim_next(JOB, "workspace-a")
+            .map_err(|e| anyhow!(e))?;
+        let err = checkpoint_session(&manager, "workspace-a").expect_err("superseded");
+        match sleep_error(&err) {
+            Some(SessionSleepError::Superseded(message)) => {
+                assert_eq!(
+                    crate::session_manifest::winner_from_message(&message),
+                    Some(("node-b".to_string(), 2))
+                );
+            }
+            other => panic!("expected Superseded, got {other:?}"),
+        }
+        assert!(manager
+            .lock()
+            .expect("task manager")
+            .claims
+            .by_instance("workspace-a")
+            .is_none());
+
+        // Suspended: the resume's claim finds the manifest moved on.
+        start_session_suspending(&manager, "workspace-b", store_suspend())?;
+        suspend_session(&manager, "workspace-b", "manual")?;
+        other
+            .claim_next(JOB, "workspace-b")
+            .map_err(|e| anyhow!(e))?;
+        let err = resume_session(&manager, "workspace-b", false).expect_err("superseded");
+        assert!(matches!(
+            sleep_error(&err),
+            Some(SessionSleepError::Superseded(_))
+        ));
+        assert!(manager
+            .lock()
+            .expect("task manager")
+            .session_status("workspace-b")
+            .is_none());
+
+        // Neither manifest was deleted: both belong to node-b.
+        session_store::run_manifest_deletes(&manager);
+        for id in ["workspace-a", "workspace-b"] {
+            assert_eq!(
+                manifests
+                    .read(JOB, id)
+                    .map_err(|e| anyhow!(e))?
+                    .map(|(m, _)| (m.generation, m.node)),
+                Some((2, "node-b".to_string())),
+                "{id}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Mechanism 2: a fence marker a move left stops this node's copy at or
+    /// below the fenced generation, and is deleted once acted on.
+    #[test]
+    fn the_fence_list_stops_copies_a_move_left_behind_test() -> R<()> {
+        use crate::worker::task_manager::session_sleep::checkpoint_session;
+        let temp_dir = TempDir::new()?;
+        let (manager, manifests) = store_worker(&temp_dir)?;
+        let other = file_manifests(&temp_dir.path().join("bucket"), "node-b");
+        start_session_suspending(&manager, "workspace-a", store_suspend())?;
+        start_session_suspending(&manager, "workspace-b", store_suspend())?;
+        checkpoint_session(&manager, "workspace-a")?;
+        let (_, claimed) = other
+            .claim_next(JOB, "workspace-a")
+            .map_err(|e| anyhow!(e))?;
+        other
+            .fence("node-a", "workspace-a", claimed.generation - 1)
+            .map_err(|e| anyhow!(e))?;
+        // A marker for a generation below the copy's: left running.
+        other
+            .fence("node-a", "workspace-b", 0)
+            .map_err(|e| anyhow!(e))?;
+
+        assert_eq!(
+            session_store::process_fence_list(&manager).map_err(|e| anyhow!(e))?,
+            1
+        );
+        {
+            let guard = manager.lock().expect("task manager");
+            assert!(guard.claims.by_instance("workspace-a").is_none());
+            assert!(guard.claims.by_instance("workspace-b").is_some());
+        }
+        assert!(manifests.fences().map_err(|e| anyhow!(e))?.is_empty());
+        session_store::run_manifest_deletes(&manager);
+        assert_eq!(
+            manifests
+                .read(JOB, "workspace-a")
+                .map_err(|e| anyhow!(e))?
+                .map(|(m, _)| m.node),
+            Some("node-b".to_string())
+        );
+        Ok(())
+    }
+
+    /// Mechanism 4: a node that reached neither a manager nor its content
+    /// store for `stateful.fenceAfter` (default 2m) suspends its running
+    /// `store` sessions locally, without writing; once the store answers it
+    /// resumes the ones the manifest still names it for (claiming the next
+    /// generation) and ends the ones that moved meanwhile.
+    #[test]
+    fn a_cut_off_node_fences_its_store_sessions_and_resumes_what_it_still_owns_test() -> R<()> {
+        use crate::session_manifest::ManifestState;
+        use crate::worker::task_manager::session_sleep::checkpoint_session;
+        let temp_dir = TempDir::new()?;
+        let (manager, manifests) = store_worker(&temp_dir)?;
+        let other = file_manifests(&temp_dir.path().join("bucket"), "node-b");
+        start_session_suspending(&manager, "workspace-a", store_suspend())?;
+        start_session_suspending(&manager, "workspace-b", store_suspend())?;
+        checkpoint_session(&manager, "workspace-a")?;
+        checkpoint_session(&manager, "workspace-b")?;
+
+        let minutes = |n: u64| Some(Duration::from_secs(60 * n));
+        {
+            let guard = manager.lock().expect("task manager");
+            assert!(guard
+                .store_sessions_to_fence(Some(Duration::from_secs(1)), None)
+                .is_empty());
+            assert!(guard
+                .store_sessions_to_fence(minutes(3), Some(Duration::from_secs(1)))
+                .is_empty());
+            assert!(guard
+                .store_sessions_to_fence(minutes(1), minutes(1))
+                .is_empty());
+            assert_eq!(
+                guard.store_sessions_to_fence(minutes(3), minutes(3)),
+                vec!["workspace-a".to_string(), "workspace-b".to_string()]
+            );
+        }
+        let fenced = session_store::self_fence(&manager, minutes(3), None);
+        assert_eq!(fenced.len(), 2);
+        assert_eq!(
+            manager.lock().expect("task manager").fenced_sessions(),
+            fenced
+        );
+        // Nothing written: the store was unreachable.
+        assert_eq!(
+            manifests
+                .read(JOB, "workspace-a")
+                .map_err(|e| anyhow!(e))?
+                .map(|(m, _)| m.state),
+            Some(ManifestState::Running)
+        );
+
+        // While it was cut off, b moved to node-b.
+        other
+            .claim_next(JOB, "workspace-b")
+            .map_err(|e| anyhow!(e))?;
+        let pool = crate::worker::launch_pool::LaunchPool::new(4, Duration::from_secs(1));
+        assert_eq!(
+            session_store::unfence(&manager, || pool.try_acquire()),
+            (1, 1)
+        );
+        let guard = manager.lock().expect("task manager");
+        assert_eq!(
+            guard
+                .session_status("workspace-a")
+                .map(|status| (status.state, status.generation)),
+            Some(("running".to_string(), 2))
+        );
+        assert!(guard.session_status("workspace-b").is_none());
+        assert!(guard.fenced_sessions().is_empty());
+        Ok(())
+    }
+
+    /// Plan §6.7 row 3 at the node: two nodes that derived the same id for
+    /// an idempotent `store` start; the first creates the manifest, the
+    /// second refuses with ALREADY_EXISTS naming the first.
+    #[test]
+    fn an_idempotent_store_start_creates_its_manifest_first_test() -> R<()> {
+        use crate::worker::task_manager::session_sleep::SessionSleepError;
+        let temp_dir = TempDir::new()?;
+        let (manager, _) = store_worker(&temp_dir)?;
+        let other_dir = TempDir::new()?;
+        let other = worker_with_store(&other_dir, None)?;
+        other
+            .lock()
+            .expect("task manager")
+            .configure_session_manifests(Some(file_manifests(
+                &temp_dir.path().join("bucket"),
+                "node-b",
+            )));
+        let mut payload = provisional_payload(-1);
+        payload.task_suspend = store_suspend().to_string();
+        payload.provisional = Some(crate::structs::ProvisionalAllocation {
+            instance_id: "workspace-derived".into(),
+            session: Some(crate::structs::SessionStart {
+                lease_issued_at_unix_ms: 1_000,
+            }),
+            ..Default::default()
+        });
+        session_store::claim_new_store_session(&manager, &payload)?;
+        let err = session_store::claim_new_store_session(&other, &payload)
+            .expect_err("node-a created it first");
+        match sleep_error(&err) {
+            Some(SessionSleepError::AlreadyExists(message)) => assert_eq!(
+                crate::session_manifest::winner_from_message(&message),
+                Some(("node-a".to_string(), 1))
+            ),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+        // A `local` task's start writes nothing.
+        payload.task_suspend = json!({ "durability": "local" }).to_string();
+        session_store::claim_new_store_session(&other, &payload)?;
         Ok(())
     }
 
