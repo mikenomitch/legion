@@ -239,25 +239,33 @@ credential its request to the origin fails, which would make credentials and
 proxies mutually exclusive. The proxy is operator-declared code already
 trusted with the request body.
 
-## 11. Sandbox guests are left out of Phase 1, as a documented gap
+## 11. Sandbox guests were left out of Phase 1; gated sandboxes are now covered
 
-**Call.** Phase 1 ships for `exec` and `container` tasks. A `sandbox` guest
-cannot reach its `connect.upstreams` at all today (the listeners are on the
-node's loopback, or in a namespace a sandbox lacks; a gated guest's only
-ways out are the vsock proxy and resolver), so injection does not reach
-sandboxes. Documented in the public limits and in TODO.md.
+**Call.** Phase 1 shipped for `exec` and `container` tasks, because no
+`sandbox` guest could reach its `connect.upstreams` (the listeners are on
+the node's loopback, or in a namespace a sandbox lacks; a gated guest's only
+ways out were the vsock proxy and resolver). The same PR then added
+upstreams to gated sandboxes, under the gated-sandbox plan (its calls #12
+and #14): the guest agent relays each upstream's loopback port and VIP over
+vsock to the node's own upstream listener. Injection rides that listener, so
+it applies to gated sandboxes with no credential-specific code. TAP-wired and
+loopback-only sandboxes still cannot reach their upstreams, documented in
+the public limits and TODO.md.
 
-**Alternatives.** Build guest-agent relays from guest loopback ports to host
-vsock ports bound as upstream listeners in this change.
+**Alternatives.** (a) Build the relays inside the credential feature. (b)
+Ship credentials only for `exec` and `container`, and leave sandboxes to a
+later change.
 
-**Trade-off.** The motivating use case (secrets absent from sandbox memory
-checkpoints) is not met yet for sandboxes.
+**Trade-off.** TAP-wired sandboxes, which have a NIC and could reach the
+origin directly, cannot use injection yet. Nothing about the gated path has
+run on a real VMM (G5.2 is open).
 
-**Why (scope).** Upstream reachability for sandboxes is its own datapath
-feature touching the guest agent, the generated init, listener binding,
-and gated readiness, and it cannot be exercised end to end in CI (no KVM).
-Shipping the credential surface on the paths that work keeps each change
-reviewable; the relay work lands under the gated-sandbox plan.
+**Why (scope, simplicity).** Upstream reachability for sandboxes is a
+datapath feature (the guest agent, listener binding, gated readiness, the
+restore path), not a credential feature, so it lives in the gated plan and
+every upstream feature (HTTP mode, policy, handlers, credentials) gets it at
+once. Gated sandboxes are the ones agent platforms run untrusted code in, so
+they are where keeping keys out of checkpoints matters first.
 
 ## 12. `authz` hops run before injection and never see the value
 

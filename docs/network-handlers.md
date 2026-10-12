@@ -418,6 +418,12 @@ through the egress proxy (`HTTPS_PROXY`, `CONNECT`) is an opaque tunnel, so
 **no credential is ever injected on proxy traffic**. Set the client's base
 URL to the upstream instead, as above.
 
+**Sandboxes.** A gated `sandbox` reaches its upstreams over vsock, through
+the same listener (see [Sandboxes](#sandboxes)), so injection works there
+unchanged: the guest calls `http://$LEGION_UPSTREAM_OPENAI/v1` with a
+placeholder, and the key is added on the node. It is never in the guest's
+memory, so never in its memory checkpoints, forks, or published snapshots.
+
 **Limits.**
 
 - The providers are `kv` and `identity`. There is no webhook provider (a
@@ -425,11 +431,8 @@ URL to the upstream instead, as above.
   header: not a query parameter or basic-auth pair.
 - HTTP/1.1 only, like the rest of HTTP mode. A client that needs HTTP/2 to
   the origin cannot use an upstream.
-- A `sandbox` guest cannot reach its upstreams yet. A gated guest's only
-  ways out are the vsock egress proxy and resolver, and a TAP or
-  loopback-only guest cannot reach the node's loopback listeners. Credential
-  injection therefore works for `exec` and `container` tasks today, not for
-  `sandbox` tasks.
+- A TAP-wired or loopback-only `sandbox` cannot reach its upstreams, so
+  injection reaches `exec`, `container`, and gated `sandbox` tasks only.
 - There is no per-request audit event for an injected credential; the
   access log (if on) records the request, not which credential it carried.
 

@@ -264,7 +264,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#31](https://github.com/mikenomitch/legion/pull/31) | Wake on request (`legion start gateway`, `suspend.wake`) and credential injection on egress (`connect.upstreams[].credentials`, KV and identity providers) | [wake plan](plans/wake-on-request-plan.md) · [credential plan](plans/egress-credential-injection-plan.md); sandbox ingress and upstream relays still landing |
+| [#31](https://github.com/mikenomitch/legion/pull/31) | Wake on request (`legion start gateway`, `suspend.wake`), credential injection on egress (`connect.upstreams[].credentials`, KV and identity providers), ingress into gated and TAP sandboxes, and upstreams in gated sandboxes | [wake plan](plans/wake-on-request-plan.md) · [credential plan](plans/egress-credential-injection-plan.md) · [gated plan](plans/gated-sandbox-checkpoints-plan.md) Phase 5; KVM checks G5.1 and G5.2 pending |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
 | [#4](https://github.com/mikenomitch/legion/pull/4) | Rename crate to `legion-rs`, crates.io metadata, `cargo install` docs | Not published yet; follow-ups under Templates, registry & packaging |
@@ -1822,7 +1822,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 - [ ] **Gated sandboxes by default, with memory checkpoints**:
       [plan](plans/gated-sandbox-checkpoints-plan.md) (IN EXECUTION) ·
       [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Phases 1 to 5
-      are built (see Done, Task runtimes) on a host without KVM, Phases 1
+      and upstreams in gated sandboxes are built (see Done, Task runtimes) on a host without KVM, Phases 1
       to 4 merged in PR [#24](https://github.com/mikenomitch/legion/pull/24).
       What is left:
   - [ ] Phase 0, the gate: boot a gated sandbox on a real VMM for the first
@@ -1844,24 +1844,31 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         checkpoints on both VMMs), G2.1 (glibc and musl images), G3.1
         (model-call wake), G4.1 (TAP re-addressing), G5.1 (`curl` an
         advertised port of a gated sandbox, suspend, resume, `curl` again;
-        repeat on a TAP sandbox), and record them in the verification doc.
+        repeat on a TAP sandbox), G5.2 (a gated sandbox reaches an upstream
+        by `LEGION_UPSTREAM_<KEY>` and by `<key>.svc.legion` across suspend,
+        resume, and a fork), and record them in the verification doc.
   - [ ] Found while building Phase 5: decide the Firecracker floor for
         ingress. 1.17 fixes host-initiated RX sticking after a bare pause
         and resume (#6100), which a live memory snapshot or fork does to
         the origin; nothing enforces it yet, and G5.1 should measure it
-        ([calls entry 17](calls/gated-sandbox-checkpoints-plan_calls.md#17-ingress-takes-no-firecracker-117-floor-until-phase-0-measures-6100)).
+        ([calls entry 20](calls/gated-sandbox-checkpoints-plan_calls.md#20-ingress-takes-no-firecracker-117-floor-until-phase-0-measures-6100)).
   - [ ] Found while building Phase 5: an ingress `proxy` hop cannot reach a
         port inside a sandbox guest (the same gap as a gated task's private
         port; [docs](../docs/network-handlers.md#ingress-into-a-sandbox)).
-  - [ ] Found while building Phase 5: a gated guest's `127.0.0.1:1080` is
-        the agent's proxy relay, so a workload advertising port 1080 cannot
-        bind it. Submit does not refuse a static port 1080 on a gated
-        sandbox yet.
+  - [ ] TAP-wired and loopback-only sandboxes cannot reach their
+        `connect.upstreams` (nor, so, use credential injection), and submit
+        does not refuse them. Serve a TAP guest's upstreams on its bridge
+        address, or refuse at submit
+        ([calls entry 25](calls/gated-sandbox-checkpoints-plan_calls.md#25-upstreams-on-tap-and-loopback-only-sandboxes-stay-unreachable-and-are-not-refused)).
+  - [ ] An upstream removed from the job while an instance is suspended
+        leaves a dead listener in the restored guest (the agent retargets
+        the upstreams it is told about and never drops one)
+        ([calls entry 14](calls/gated-sandbox-checkpoints-plan_calls.md#14-a-restore-retargets-the-guest-agents-upstream-relays-not-the-nodes-listener)).
   - [ ] Found while building Phase 5: after a restore that moved a port,
         the new allocation's own `LEGION_PORT_<label>` (its env, and what
         `alloc get` shows) differs from the port the restored guest listens
         on; `resume.env` and the datapath use the recorded port
-        ([calls entry 12](calls/gated-sandbox-checkpoints-plan_calls.md#12-a-restored-sandbox-keeps-the-ports-it-was-captured-with-and-the-datapath-dials-those)).
+        ([calls entry 13](calls/gated-sandbox-checkpoints-plan_calls.md#13-a-restored-sandbox-keeps-the-ports-it-was-captured-with-and-the-datapath-dials-those)).
   - [ ] Found during the plan: gated `container` and `exec` tasks without
         upstreams get no VIP block and so no resolver
         ([plan §6.5](plans/gated-sandbox-checkpoints-plan.md#65-gated-is-the-sandbox-default-and-it-denies-by-default)).
@@ -1875,7 +1882,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] Found while building: a gated resolver forwards queries while the
         allocation's policy is still pending (the first heartbeat after
         placement), a narrow DNS channel the proxy does not have
-        ([calls entry 19](calls/gated-sandbox-checkpoints-plan_calls.md#19-a-gated-resolver-forwards-while-the-allocations-policy-is-pending)).
+        ([calls entry 22](calls/gated-sandbox-checkpoints-plan_calls.md#22-a-gated-resolver-forwards-while-the-allocations-policy-is-pending)).
         Revisit if boot-time resolution failures turn out to be rare.
   - [ ] Found while building: TAP guests are IPv4 only (`sandbox.bridges`
         takes an IPv4 subnet), and a guest kernel without `CONFIG_IP_PNP`
@@ -2853,17 +2860,10 @@ Credential injection: [egress-credential-injection-plan.md](plans/egress-credent
 · docs: [network-handlers.md#credential-injection](../docs/network-handlers.md#credential-injection).
 Phases 1 and 2 shipped (see Done, KV & secrets).
 
-- [ ] **Reach `connect.upstreams` from a `sandbox` guest.** No sandbox shape
-      can reach its upstream listeners today: they bind on the node's
-      loopback (or inside a gated namespace a sandbox does not have,
-      `upstream_specs` in `src/worker/daemon.rs`), and a gated guest's only
-      ways out are the vsock proxy and resolver (`guest/src/agent.rs`). So
-      credential injection, whose point is keeping API keys out of sandbox
-      memory checkpoints, serves `exec` and `container` only. Likely shape:
-      guest-agent relays from guest loopback ports to host vsock ports bound
-      as the upstream listeners, counted in gated readiness. A gated sandbox
-      with upstreams probably also reports `capture_ready = false` today
-      (its upstream listeners never bind); confirm with a test
+- [x] **Reach `connect.upstreams` from a gated `sandbox` guest**, so
+      credential injection keeps API keys out of gated sandboxes and their
+      memory checkpoints (vsock relays; see Task runtimes, gated sandboxes).
+      TAP-wired and loopback-only sandboxes are still open there
       ([calls #11](calls/egress-credential-injection-plan_calls.md)).
 - [ ] Credential injection Phase 3: webhook provider
       (`from = { handler = "<name>" }`) and non-header placements (query
@@ -4027,6 +4027,19 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         loopback-only sandbox. G5.1 is open above.
         [docs](../docs/network-handlers.md#ingress-into-a-sandbox) ·
         [plan §6.10](plans/gated-sandbox-checkpoints-plan.md#610-ingress-into-a-gated-sandbox-phase-5)
+  - [x] Found while building Phase 5, now fixed: a gated guest's
+        `127.0.0.1:1080` is the agent's proxy relay, so submit refuses an
+        advertised port the guest would bind on 1080, and an upstream
+        `localPort` of 1080 or 53
+        ([calls entry 38](calls/gated-sandbox-checkpoints-plan_calls.md#38-an-upstream-localport-of-1080-or-53-and-a-guest-port-of-1080-are-refused-on-a-gated-sandbox)).
+  - [x] Upstreams in gated sandboxes: the guest agent listens on each
+        upstream's loopback port and VIP and relays over vsock to the
+        node's own upstream listener (bound on
+        `<alloc>/.sandbox/vsock.sock_<local port>`), so HTTP mode, policy,
+        handlers, and credential injection apply unchanged; a restore
+        retargets the agent's relays to the new allocation's ports. G5.2 is
+        open above. [docs](../docs/network-handlers.md#sandboxes) ·
+        [plan §6.10, "As built"](plans/gated-sandbox-checkpoints-plan.md#610-ingress-into-a-gated-sandbox-phase-5)
 - [x] **Sandbox guest size follows `resources`** (`memoryMax`, else
       `memory`), so the scheduler's reservation and the VM's size can no
       longer drift apart
@@ -4206,8 +4219,9 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       path from the allocation's own declaration and sends each value once
       per version; values stay in worker memory. A missing value answers a
       local `503 credential-unavailable` without dialing; deleting the key
-      revokes it. Naming a path needs `kv:read`. Sandbox guests are not
-      covered yet (open item under Networking).
+      revokes it. Naming a path needs `kv:read`. Gated sandboxes are
+      covered through their vsock upstreams; TAP-wired and loopback-only
+      sandboxes are not.
 - [x] **Credential injection, Phase 2: the identity provider** (2026-10-12):
       `from = { identity = "<task identity>" }` injects a workload-identity
       token the manager mints in `GetUpstreamCredentials` (the token's expiry

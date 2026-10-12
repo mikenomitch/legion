@@ -482,6 +482,8 @@ suspend = {
 network = { ports = [{ name = "http" }] },
 ```
 
+A sandbox's port is reachable when it runs gated or on a TAP (see
+[Ingress into a sandbox](network-handlers.md#ingress-into-a-sandbox)).
 Concurrent requests share one resume. Past `wake.timeout` the client gets
 `503` with `Retry-After`. A `stopped` instance is never woken this way.
 `instance get` on a task with `wake` shows where each port is served while
@@ -1763,11 +1765,12 @@ entries.
   holds cannot be captured, forked, or published. For HTTP APIs, declare it
   on an `https://` upstream with
   [credential injection](network-handlers.md#credential-injection): the
-  node sets the header on the way out, from KV, and the value lives only in
-  the worker's memory and on the TLS connection to the origin. Rotation is a
-  `legion kv put`, and no checkpoint taken before or after it contains the
-  key. Today this reaches `exec` and `container` tasks; a `sandbox` guest
-  cannot reach its upstreams yet (see that page's limits).
+  node sets the header on the way out, from KV or as a workload-identity
+  token, and the value lives only in the worker's memory and on the TLS
+  connection to the origin. Rotation is a `legion kv put`, and no checkpoint
+  taken before or after it contains the key. This reaches `exec`,
+  `container`, and gated `sandbox` tasks; a TAP-wired or loopback-only
+  sandbox cannot reach its upstreams.
 
 ## Published checkpoint encryption
 

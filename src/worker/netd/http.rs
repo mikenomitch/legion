@@ -1776,6 +1776,7 @@ mod integration {
                 vip: None,
                 canonical_port: None,
                 netns: None,
+                vsock: None,
             }])
             .await;
         let send = "GET /v1/models HTTP/1.1\r\nHost: x\r\nAuthorization: placeholder\r\nX-Api-Key: dummy\r\nx-api-key: dummy-2\r\n\r\n";
@@ -1880,6 +1881,69 @@ mod integration {
         context.retain_allocations(&std::collections::HashSet::new());
         assert_eq!(context.credential_version(9, "openai", "authorization"), 0);
         assert!(format!("{:?}", SecretValue::new("sk-live-1")).contains("redacted"));
+    }
+
+    /// A gated sandbox reaches its upstream over the VMM's vsock host
+    /// socket, and the same listener state injects the credential there, so
+    /// the key stays out of the guest and its memory checkpoints.
+    #[tokio::test]
+    async fn credentials_are_injected_on_a_gated_sandboxs_vsock_upstream() {
+        use tokio::net::UnixStream;
+        let (origin, _hits) = start_origin(0).await;
+        let forwarder = UpstreamForwarder::new();
+        let context = forwarder.context();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vsock.sock_20010");
+        let credentials: Vec<UpstreamCredential> = serde_json::from_value(serde_json::json!([
+            { "header": "authorization", "prefix": "Bearer ", "from": { "identity": "api" } },
+        ]))
+        .unwrap();
+        forwarder
+            .sync(&[UpstreamSpec {
+                allocation_id: 9,
+                service: "api".into(),
+                local_port: 20010,
+                balance: "round_robin".into(),
+                to: Some(format!("http://127.0.0.1:{origin}")),
+                http: None,
+                handlers: Vec::new(),
+                credentials,
+                vip: None,
+                canonical_port: None,
+                netns: None,
+                vsock: Some(path.clone()),
+            }])
+            .await;
+        context.set_credential(
+            9,
+            "api",
+            "authorization",
+            "identity api",
+            1_900_000_000,
+            SecretValue::new("eyJ.token"),
+        );
+
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream
+            .write_all(
+                b"GET /v1/x HTTP/1.1\r\nHost: x\r\nAuthorization: placeholder\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("the vsock upstream answered in time")
+        .unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(
+            text.contains("auth=[authorization:Bearer eyJ.token]"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

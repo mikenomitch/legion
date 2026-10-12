@@ -24,7 +24,7 @@ sleep:
     runtime = "sandbox",
     config = { image = "ghcr.io/acme/agent:latest", command = ["/start.sh"] },
     stateful = { mode = "keyed", storage = { path = "/workspace" } },
-    network = { ports = [{ name = "http" }] },
+    network = { mode = "gated", ports = [{ name = "http" }] },
     suspend = {
       checkpoint = "memory",
       idle = { after = "3m" },
@@ -212,8 +212,10 @@ requests should keep it awake. See
 The gateway dials an instance's advertised port, and for a sandbox the node
 datapath owns that port and carries connections into the microVM: over the
 host-initiated vsock for a gated sandbox, and over the bridge for a TAP
-sandbox. See [Ingress](network-handlers.md#ingress). Nothing in the gateway
-is sandbox-specific. A memory checkpoint closes the guest's open
+sandbox. See [Ingress into a sandbox](network-handlers.md#ingress-into-a-sandbox).
+A sandbox that is neither has loopback only, and submit refuses its
+`network.ports`, so it cannot set `wake` either. Nothing in the gateway is
+sandbox-specific. A memory checkpoint closes the guest's open
 connections, so a client connected when the instance suspends sees its
 connection close, and its next request wakes the instance.
 

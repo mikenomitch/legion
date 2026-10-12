@@ -5,9 +5,11 @@
 **Status: IN EXECUTION.** Phase 1 (KV-backed header credentials on external
 `https://` upstreams) and Phase 2 (the workload-identity provider) are
 shipped. Phases 3 and 4 (a webhook provider with non-header placements,
-per-request audit events) are planned. Deliberately deferred and tracked in
-[TODO.md](../TODO.md): reaching upstreams (and so credentials) from a
-`sandbox` guest, which the gated vsock path does not carry today.
+per-request audit events) are planned. Gated sandboxes reach their
+upstreams (and so injection) over vsock since the gated plan's upstream
+relays (calls #11). Deliberately deferred and tracked in
+[TODO.md](../TODO.md): upstreams, and so credentials, from TAP-wired and
+loopback-only sandboxes.
 
 Public reference: [docs/network-handlers.md, "Credential injection"](../../docs/network-handlers.md#credential-injection).
 
@@ -268,8 +270,10 @@ problems on the datapath layer. No proto change to the status message.
 
 Separately (not a phase of this plan, a dependency for sandboxes): reach
 upstreams from a `sandbox` guest, e.g. guest-agent relays from guest
-loopback ports to host vsock ports bound as upstream listeners. Until then
-injection serves `exec` and `container` tasks.
+loopback ports to host vsock ports bound as upstream listeners. *Built for
+gated sandboxes* in the same PR, under the gated plan (§6.10, "As built"),
+so injection serves `exec`, `container`, and gated `sandbox` tasks. TAP-wired
+and loopback-only sandboxes remain open.
 
 ## 9. Testing
 
