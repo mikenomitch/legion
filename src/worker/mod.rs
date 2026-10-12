@@ -11,6 +11,7 @@ pub mod exec;
 pub mod forwarder;
 pub mod identity;
 pub mod idle;
+pub mod launch_pool;
 pub mod log_sink;
 pub mod logs;
 pub mod managers;

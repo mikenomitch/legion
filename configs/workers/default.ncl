@@ -175,6 +175,16 @@
     #     jwksRefresh = "5m",
     #     # Tolerance for clock disagreement with the minting manager.
     #     clockSkew = "30s",
+    #     # Provisional starts (sessions and claims) run through the runtime
+    #     # at once. 0 means twice the node's cores.
+    #     launchConcurrency = 0,
+    #     # How long a start waits for a launch slot before the node refuses
+    #     # it with RESOURCE_EXHAUSTED (retryable), so the picker tries the
+    #     # next node.
+    #     queueTimeout = "1s",
+    #     # How long a gracefully stopping worker spends checkpointing
+    #     # sessions whose task sets suspend.onWorkerStop = "checkpoint".
+    #     stopCheckpointTimeout = "60s",
     # },
     # The host guard (docs/network-handlers.md, "The host guard"): the fixed
     # floor of destinations no allocation on this node may reach through the

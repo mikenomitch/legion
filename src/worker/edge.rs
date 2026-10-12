@@ -70,10 +70,15 @@ pub fn record_from_payload(
 /// the claim is *held* — which is the point at which the caller may report
 /// `admitted` and the ledger is already protecting the node from a second
 /// admission it has no room for.
+///
+/// `slot` is the launch slot the caller took from the node's
+/// [`crate::worker::launch_pool::LaunchPool`] before admitting; the launch
+/// thread holds it until the runtime call returns. `None` only in tests.
 pub fn admit_and_launch(
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
     payload: &TaskAllocation,
     provisional: &ProvisionalAllocation,
+    slot: Option<crate::worker::launch_pool::LaunchSlot>,
 ) -> R<ClaimRecord> {
     let resources: Value = if payload.task_resources.trim().is_empty() {
         serde_json::json!({})
@@ -122,6 +127,7 @@ pub fn admit_and_launch(
         .name(format!("provisional-launch-{claim_id}"))
         .spawn(move || {
             let _runtime = crate::worker::task_manager::enter_runtime(runtime.as_ref());
+            let _slot = slot;
             if let Err(err) =
                 launch_provisional_allocation(&manager, &launch_payload, &claim_id, gate)
             {

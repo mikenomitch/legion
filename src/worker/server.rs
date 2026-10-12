@@ -64,7 +64,21 @@ pub struct WorkerDaemonService {
     /// Direct exec: the exec ticket verifier, `None` unless the worker
     /// config sets `exec = { direct = true }`.
     pub direct_exec: Option<Arc<crate::worker::direct_exec::ExecTicketVerifier>>,
+    /// Bounds the provisional starts (sessions and claims) this node runs
+    /// through its runtime at once (`edgeBoot.launchConcurrency`).
+    pub launch_pool: Arc<crate::worker::launch_pool::LaunchPool>,
 }
+
+impl WorkerDaemonService {
+    /// Take a launch slot, or refuse the start as retryable on another node.
+    async fn launch_slot(&self) -> Result<crate::worker::launch_pool::LaunchSlot, Status> {
+        self.launch_pool
+            .acquire()
+            .await
+            .map_err(|full| Status::resource_exhausted(full.to_string()))
+    }
+}
+
 #[tonic::async_trait]
 impl Worker for WorkerDaemonService {
     #[instrument(err, skip_all)]
@@ -91,9 +105,14 @@ impl Worker for WorkerDaemonService {
         // by whether the payload yet has an allocation id.
         if let Some(provisional) = allocation.provisional.clone() {
             if allocation.allocation_id == 0 {
-                let admitted =
-                    edge::admit_and_launch(&self.task_manager, &allocation, &provisional)
-                        .map_err(|err| admission_status(&err))?;
+                let slot = self.launch_slot().await?;
+                let admitted = edge::admit_and_launch(
+                    &self.task_manager,
+                    &allocation,
+                    &provisional,
+                    Some(slot),
+                )
+                .map_err(|err| admission_status(&err))?;
                 return Ok(Response::new(PostWorkReply {
                     message: format!("Provisional start {} admitted", admitted.claim_id),
                 }));
@@ -372,13 +391,17 @@ impl Worker for WorkerDaemonService {
             .provisional
             .clone()
             .expect("provisional block was just set");
+        let slot = self.launch_slot().await.inspect_err(|_| {
+            edge_boot.verifier.unspend(&claims.jti);
+        })?;
         let admitted =
-            edge::admit_and_launch(&self.task_manager, &payload, &provisional).map_err(|err| {
-                // The start never happened, so the ticket was not really
-                // redeemed; let an operator's retry work.
-                edge_boot.verifier.unspend(&claims.jti);
-                Status::resource_exhausted(format!("{err:#}"))
-            })?;
+            edge::admit_and_launch(&self.task_manager, &payload, &provisional, Some(slot))
+                .map_err(|err| {
+                    // The start never happened, so the ticket was not really
+                    // redeemed; let an operator's retry work.
+                    edge_boot.verifier.unspend(&claims.jti);
+                    Status::resource_exhausted(format!("{err:#}"))
+                })?;
         edge_boot.verifier.spend(&claims, now_unix);
 
         let (tx, rx) = tokio::sync::mpsc::channel(8);

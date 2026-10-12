@@ -553,12 +553,18 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         _ => None,
     };
 
+    // One launch pool per node, shared by every path that starts a session
+    // or claim (PostWork, StartClaim, StartSession, the work stream).
+    let launch_pool = Arc::new(crate::worker::launch_pool::LaunchPool::from_config(
+        &edge_boot_config,
+    ));
     let worker_node = WorkerDaemonService {
         node_id: name.clone(),
         task_manager: task_manager.clone(),
         identity: Some(identity_manager.clone()),
         edge_boot: edge_boot.clone(),
         direct_exec: direct_exec.clone(),
+        launch_pool: launch_pool.clone(),
     };
     let worker_router = Server::builder().add_service(WorkerServer::new(worker_node));
 
@@ -757,6 +763,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             identity: Some(identity_manager.clone()),
             edge_boot: edge_boot.clone(),
             direct_exec: direct_exec.clone(),
+            launch_pool: launch_pool.clone(),
         });
         tokio::spawn(crate::worker::work_stream::run_work_stream(
             client.clone(),

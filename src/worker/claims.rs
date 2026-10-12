@@ -83,9 +83,24 @@ impl ClaimRecord {
 }
 
 /// The node's provisional claims, keyed by claim id.
+///
+/// Every lookup a start makes is O(1): a node holding thousands of sessions
+/// admits the next one without scanning them (session durability plan
+/// §6.1). The indexes below are kept in step by `insert`, `remove`, and
+/// `ratify`, the only mutations of a claim's identity.
 #[derive(Debug, Default)]
 pub struct ClaimTable {
     claims: HashMap<String, ClaimRecord>,
+    /// Instance id -> claim id, for the one-live-claim-per-instance rule.
+    by_instance: HashMap<String, String>,
+    /// Local key -> claim id.
+    by_key: HashMap<i64, String>,
+    /// Manager allocation id -> claim id, for ratified claims.
+    by_allocation: HashMap<i64, String>,
+    /// What each session task's claims hold, by `(job_id, task_name)`: the
+    /// running totals envelope admission checks instead of summing every
+    /// session on each start.
+    session_usage: HashMap<(String, String), HashMap<String, f64>>,
     /// Local keys, handed out downward from -1. Seeded below any restored
     /// key at startup so a restart cannot reissue a key a ratified claim is
     /// still using.
@@ -95,9 +110,33 @@ pub struct ClaimTable {
 impl ClaimTable {
     pub fn new() -> Self {
         ClaimTable {
-            claims: HashMap::new(),
             next_local_key: -1,
+            ..ClaimTable::default()
         }
+    }
+
+    fn add_usage(&mut self, record: &ClaimRecord, sign: f64) {
+        if !record.is_session() {
+            return;
+        }
+        let key = (record.job_id.clone(), record.task_name.clone());
+        let totals = self.session_usage.entry(key.clone()).or_default();
+        for (name, amount) in crate::structs::session::resource_amounts(&record.resources) {
+            *totals.entry(name).or_insert(0.0) += sign * amount;
+        }
+        if totals.values().all(|amount| amount.abs() < 1e-9) {
+            self.session_usage.remove(&key);
+        }
+    }
+
+    /// What the session claims of one task hold on this node, promoted ones
+    /// included (a promoted session runs inside the envelope until it
+    /// stops).
+    pub fn session_usage(&self, job_id: &str, task_name: &str) -> HashMap<String, f64> {
+        self.session_usage
+            .get(&(job_id.to_string(), task_name.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Ensure future keys stay below every key already in use. Called with
@@ -131,6 +170,44 @@ impl ClaimTable {
         }
         record.local_key = self.mint_local_key();
         let stored = record.clone();
+        self.index(&record);
+        self.claims.insert(record.claim_id.clone(), record);
+        Ok(stored)
+    }
+
+    fn index(&mut self, record: &ClaimRecord) {
+        if !record.instance_id.is_empty() {
+            self.by_instance
+                .insert(record.instance_id.clone(), record.claim_id.clone());
+        }
+        self.by_key
+            .insert(record.local_key, record.claim_id.clone());
+        if let Some(allocation_id) = record.allocation_id {
+            self.by_allocation
+                .insert(allocation_id, record.claim_id.clone());
+        }
+        self.add_usage(record, 1.0);
+    }
+
+    /// Re-register a claim restored after a worker restart under the local
+    /// key it already runs with (its directories, files, and process are
+    /// keyed by it). Future keys are seeded below it.
+    pub fn insert_restored(&mut self, record: ClaimRecord) -> R<ClaimRecord> {
+        if self.claims.contains_key(&record.claim_id) {
+            bail!("claim {} already exists on this node", record.claim_id);
+        }
+        if !record.instance_id.is_empty() && self.instance_is_claimed(&record.instance_id) {
+            bail!(
+                "instance {} is already claimed on this node",
+                record.instance_id
+            );
+        }
+        if self.by_key.contains_key(&record.local_key) {
+            bail!("local key {} is already in use", record.local_key);
+        }
+        self.reserve_below([record.local_key]);
+        let stored = record.clone();
+        self.index(&record);
         self.claims.insert(record.claim_id.clone(), record);
         Ok(stored)
     }
@@ -139,12 +216,24 @@ impl ClaimTable {
         self.claims.get(claim_id)
     }
 
-    pub fn get_mut(&mut self, claim_id: &str) -> Option<&mut ClaimRecord> {
-        self.claims.get_mut(claim_id)
+    /// Record how far a claim's launch has progressed.
+    pub fn set_stage(&mut self, claim_id: &str, stage: ClaimStage) {
+        if let Some(claim) = self.claims.get_mut(claim_id) {
+            claim.stage = stage;
+        }
     }
 
     pub fn remove(&mut self, claim_id: &str) -> Option<ClaimRecord> {
-        self.claims.remove(claim_id)
+        let record = self.claims.remove(claim_id)?;
+        if self.by_instance.get(&record.instance_id) == Some(&record.claim_id) {
+            self.by_instance.remove(&record.instance_id);
+        }
+        self.by_key.remove(&record.local_key);
+        if let Some(allocation_id) = record.allocation_id {
+            self.by_allocation.remove(&allocation_id);
+        }
+        self.add_usage(&record, -1.0);
+        Some(record)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -157,9 +246,14 @@ impl ClaimTable {
 
     /// Whether a live claim already holds this instance id on this node.
     pub fn instance_is_claimed(&self, instance_id: &str) -> bool {
-        self.claims
-            .values()
-            .any(|claim| claim.instance_id == instance_id)
+        self.by_instance.contains_key(instance_id)
+    }
+
+    /// The live claim holding an instance id on this node.
+    pub fn by_instance(&self, instance_id: &str) -> Option<&ClaimRecord> {
+        self.by_instance
+            .get(instance_id)
+            .and_then(|claim_id| self.claims.get(claim_id))
     }
 
     /// Whether an unratified claim on this node may be running the work a
@@ -181,16 +275,16 @@ impl ClaimTable {
     }
 
     pub fn by_local_key(&self, local_key: i64) -> Option<&ClaimRecord> {
-        self.claims
-            .values()
-            .find(|claim| claim.local_key == local_key)
+        self.by_key
+            .get(&local_key)
+            .and_then(|claim_id| self.claims.get(claim_id))
     }
 
     /// The claim that became this allocation id, if any.
     pub fn by_allocation_id(&self, allocation_id: i64) -> Option<&ClaimRecord> {
-        self.claims
-            .values()
-            .find(|claim| claim.allocation_id == Some(allocation_id))
+        self.by_allocation
+            .get(&allocation_id)
+            .and_then(|claim_id| self.claims.get(claim_id))
     }
 
     /// Local keys of claims that are NOT yet ratified. These are exempt from
@@ -209,7 +303,11 @@ impl ClaimTable {
     /// Record the manager's verdict. Returns the updated record.
     pub fn ratify(&mut self, claim_id: &str, allocation_id: i64) -> Option<ClaimRecord> {
         let claim = self.claims.get_mut(claim_id)?;
-        claim.allocation_id = Some(allocation_id);
+        if let Some(previous) = claim.allocation_id.replace(allocation_id) {
+            self.by_allocation.remove(&previous);
+        }
+        self.by_allocation
+            .insert(allocation_id, claim_id.to_string());
         Some(claim.clone())
     }
 
@@ -470,6 +568,37 @@ mod claims_test {
         table.reserve_below([-1, -7, -3]);
         let fresh = table.insert(record("clm_a", "user-1"))?;
         assert!(fresh.local_key < -7, "got {}", fresh.local_key);
+        Ok(())
+    }
+
+    #[test]
+    fn a_restored_claim_keeps_its_key_and_its_room_test() -> R<()> {
+        let mut table = ClaimTable::new();
+        let mut restored = record("clm_r", "workspace-x");
+        restored.local_key = -40;
+        restored.session = Some(SessionClaim {
+            lease_issued_at_unix_ms: 1,
+        });
+        restored.resources = serde_json::json!({ "cpu": 250 });
+        let stored = table.insert_restored(restored)?;
+        assert_eq!(stored.local_key, -40, "the key the process runs under");
+        assert_eq!(
+            table.by_local_key(-40).map(|c| c.claim_id.as_str()),
+            Some("clm_r")
+        );
+        assert_eq!(
+            table
+                .session_usage("agent-sandboxes", "workspace")
+                .get("cpu"),
+            Some(&250.0)
+        );
+        let fresh = table.insert(record("clm_b", "user-2"))?;
+        assert!(fresh.local_key < -40, "got {}", fresh.local_key);
+        table.remove("clm_r");
+        assert!(table
+            .session_usage("agent-sandboxes", "workspace")
+            .is_empty());
+        assert!(!table.instance_is_claimed("workspace-x"));
         Ok(())
     }
 

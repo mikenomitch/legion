@@ -2059,6 +2059,9 @@ pub struct WorkerMetrics {
     /// `legion_provisional_active` — unratified claims held right now, so
     /// started-but-unconfirmed capacity is visible rather than invisible.
     pub provisional_active: Arc<Gauge>,
+    /// `legion_worker_launch_refusals_total` — starts refused because every
+    /// launch slot stayed busy for `edgeBoot.queueTimeout`.
+    pub launch_pool_refusals_total: Arc<Counter>,
     /// `legion_worker_simulated_nodes` — simulated nodes registered by this
     /// process (`--simulate N`); 0 in a real worker.
     pub simulated_nodes: Arc<Gauge>,
@@ -2163,6 +2166,15 @@ impl WorkerMetrics {
             cell: GaugeCell::default(),
         });
 
+        let launch_pool_refusals_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_worker_launch_refusals_total",
+                help: "Session and claim starts refused because every launch slot (edgeBoot.launchConcurrency) stayed busy for edgeBoot.queueTimeout. Refused starts are retryable on another node.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
         // Simulated-fleet families. A `--simulate N` process is a worker
         // process that happens to carry N nodes, so it reports through this
         // same registry: the families above become fleet-wide aggregates and
@@ -2252,6 +2264,7 @@ impl WorkerMetrics {
             Arc::clone(&net_handler_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&launch_pool_refusals_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_active) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_killed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_ratify_seconds) as Arc<dyn RenderMetric>,
@@ -2274,6 +2287,7 @@ impl WorkerMetrics {
             provisional_killed_total,
             provisional_ratify_seconds,
             provisional_active,
+            launch_pool_refusals_total,
             simulated_nodes,
             simulated_nodes_target,
             simulated_registrations_total,

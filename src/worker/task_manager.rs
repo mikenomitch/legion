@@ -348,6 +348,30 @@ impl std::fmt::Display for SessionRefusal {
 
 impl std::error::Error for SessionRefusal {}
 
+/// Whether a session needing `needs` fits an envelope of `room` whose
+/// sessions already hold `used`. A resource the envelope does not size is
+/// not limited by it.
+fn envelope_refusal(
+    room: &std::collections::BTreeMap<String, f64>,
+    used: &HashMap<String, f64>,
+    needs: &std::collections::BTreeMap<String, f64>,
+) -> Option<SessionRefusal> {
+    for (name, needs) in needs {
+        let Some(capacity) = room.get(name) else {
+            continue;
+        };
+        let free = capacity - used.get(name).copied().unwrap_or(0.0);
+        if *needs > free + 1e-9 {
+            return Some(SessionRefusal::EnvelopeFull {
+                resource: name.clone(),
+                free: free.max(0.0),
+                needs: *needs,
+            });
+        }
+    }
+    None
+}
+
 /// How long a session may outlive its envelope on the node before it is
 /// ended. Covers a job update replacing the envelope (stop, then start, in
 /// one reconcile, unless a slow-stopping neighbour holds the start back); a
@@ -370,6 +394,14 @@ pub const SESSION_ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_
 /// runtime call returns.
 pub struct UnlockedLaunch {
     generation: u64,
+    /// [`Gate::Off`] for manager-dispatched work. A session launches here
+    /// too (docs/session-mode.md), at its claim's gate: `Boot` shuts the
+    /// runtime's network gate before `start`, exactly as the locked path
+    /// does.
+    gate: Gate,
+    /// The claim a session launch belongs to. Its failure settles the claim
+    /// (`kill_claim`) instead of reaching the manager as a failed allocation.
+    claim_id: Option<String>,
     allocation: Allocation,
     task: TaskConfig,
     instance: TaskInstance,
@@ -414,12 +446,20 @@ impl UnlockedLaunch {
             "Preparing task allocation"
         );
         plugin.prepare(&self.allocation, &self.task, &mut self.instance)?;
+        if self.gate == Gate::Boot {
+            plugin.set_network_gate(&self.allocation, &self.task, &mut self.instance, false)?;
+        }
         info!(
             allocation_id = self.allocation.id,
             task_name = %self.task.name,
             "Starting task allocation"
         );
         plugin.start(&self.allocation, &self.task, &mut self.instance)
+    }
+
+    /// The claim this launch belongs to, for a session launch.
+    pub fn claim_id(&self) -> Option<&str> {
+        self.claim_id.as_deref()
     }
 }
 
@@ -2802,7 +2842,7 @@ impl WorkerTaskManager {
         self.task_configs.insert(allocation.id, task.clone());
         self.set_allocation_health(allocation.id, false, "starting");
         self.notify_log_sinks_started(allocation, task);
-        self.persist_state();
+        self.persist_state_unless_provisional(allocation.id);
 
         // A batch task on a runtime that tracks no process can never report
         // an exit, and the manager is now waiting for one before it will call
@@ -3059,9 +3099,7 @@ impl WorkerTaskManager {
     /// Record how far a claim has progressed, for the heartbeat report and
     /// the `StartClaim` stream.
     pub fn set_claim_stage(&mut self, claim_id: &str, stage: ClaimStage) {
-        if let Some(claim) = self.claims.get_mut(claim_id) {
-            claim.stage = stage;
-        }
+        self.claims.set_stage(claim_id, stage);
     }
 
     /// Whether this node already holds a live claim for an instance.
@@ -3090,28 +3128,6 @@ impl WorkerTaskManager {
             .map(|(local, task)| (*local, task))
     }
 
-    /// What a task's live sessions on this node use, promoted ones included:
-    /// a promoted session still runs inside the envelope until it stops.
-    fn session_usage(
-        &self,
-        job_id: &str,
-        task_name: &str,
-    ) -> std::collections::BTreeMap<String, f64> {
-        let mut used = std::collections::BTreeMap::new();
-        for claim in self.claims.sessions() {
-            if claim.job_id != job_id || claim.task_name != task_name {
-                continue;
-            }
-            if claim.is_ratified() && !self.instances.contains_key(&claim.local_key) {
-                continue;
-            }
-            for (name, amount) in crate::structs::session::resource_amounts(&claim.resources) {
-                *used.entry(name).or_insert(0.0) += amount;
-            }
-        }
-        used
-    }
-
     /// Admit a session into its task's envelope on this node.
     ///
     /// The envelope's resources are the room; the node's free capacity is
@@ -3128,23 +3144,36 @@ impl WorkerTaskManager {
             .into());
         };
         let room = crate::structs::session::resource_amounts(&envelope.resources);
-        let used = self.session_usage(&record.job_id, &record.task_name);
-        for (name, needs) in crate::structs::session::resource_amounts(&record.resources) {
-            // A resource the envelope does not size is not limited by it.
-            let Some(capacity) = room.get(&name) else {
-                continue;
-            };
-            let free = capacity - used.get(&name).copied().unwrap_or(0.0);
-            if needs > free + 1e-9 {
-                return Err(SessionRefusal::EnvelopeFull {
-                    resource: name,
-                    free: free.max(0.0),
-                    needs,
-                }
-                .into());
+        let needs = crate::structs::session::resource_amounts(&record.resources);
+        // Running totals, not a scan of every session (plan §6.1). They
+        // still count a promoted session that stopped until the heartbeat
+        // settles it, so a refusal is re-checked against the settled set
+        // before it is given: the fast path stays O(1), refusals stay exact.
+        let used = self.claims.session_usage(&record.job_id, &record.task_name);
+        if envelope_refusal(&room, &used, &needs).is_some() {
+            self.forget_stopped_promotions();
+            let used = self.claims.session_usage(&record.job_id, &record.task_name);
+            if let Some(refusal) = envelope_refusal(&room, &used, &needs) {
+                return Err(refusal.into());
             }
         }
         self.claims.insert(record)
+    }
+
+    /// Forget promoted sessions whose allocation has stopped, so their
+    /// share of the envelope is free again. The heartbeat's settle does the
+    /// same; admission calls this before refusing for room.
+    fn forget_stopped_promotions(&mut self) {
+        for claim in self.claims.sessions() {
+            let local = claim.local_key;
+            if claim.is_ratified()
+                && !self.instances.contains_key(&local)
+                && !self.terminating.contains_key(&local)
+                && !self.draining.contains_key(&local)
+            {
+                self.claims.remove(&claim.claim_id);
+            }
+        }
     }
 
     /// The sessions this node runs, for the heartbeat's session report.
@@ -3342,6 +3371,27 @@ impl WorkerTaskManager {
         // start, which records its outcome on the checkpoint channel.
         let provisional = self.claims.by_local_key(alloc.id).is_some();
         let restoring = self.checkpoints.restores.contains_key(&alloc.id);
+        // A session launches off the lock too (session durability plan
+        // §6.1): a node runs its sessions' starts side by side, and a slow
+        // sandbox boot holds up no other start, stop, or heartbeat. Its
+        // failure still settles the claim, through `launch_provisional_allocation`.
+        let session_claim = self
+            .claims
+            .by_local_key(alloc.id)
+            .filter(|claim| claim.is_session() && !claim.is_ratified())
+            .map(|claim| claim.claim_id.clone());
+        if let Some(claim_id) = session_claim {
+            if task.artifacts.is_empty() && !restoring && matches!(gate, Gate::Serve | Gate::Boot) {
+                self.registry
+                    .load_plugin(&task.runtime, true)
+                    .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
+                let instance = self.prepare_instance(&alloc, &task)?;
+                let mut launch = self.begin_unlocked_launch(&alloc, &task, instance)?;
+                launch.gate = gate;
+                launch.claim_id = Some(claim_id);
+                return Ok(BeginOutcome::Launching(Box::new(launch)));
+            }
+        }
         if task.artifacts.is_empty() && gate == Gate::Off && !provisional && !restoring {
             self.registry
                 .load_plugin(&task.runtime, true)
@@ -3661,6 +3711,8 @@ impl WorkerTaskManager {
 
         Ok(UnlockedLaunch {
             generation,
+            gate: Gate::Off,
+            claim_id: None,
             allocation: allocation.clone(),
             task: task.clone(),
             instance,
@@ -3705,7 +3757,7 @@ impl WorkerTaskManager {
         }
         self.set_allocation_health(allocation_id, false, "starting");
         self.notify_log_sinks_started(&allocation, &task);
-        self.persist_state();
+        self.persist_state_unless_provisional(allocation_id);
         // See `start_registered_allocation`: a batch task on a runtime that
         // tracks no process reports its completion at start.
         if !plugin.task_plugin().supervises_process()
@@ -4097,7 +4149,7 @@ impl WorkerTaskManager {
                     lease_issued_at_unix_ms: 0,
                 }),
             };
-            if let Err(err) = self.claims.insert(record) {
+            if let Err(err) = self.claims.insert_restored(record) {
                 warn!(external_id, error = ?err, "Failed to restore provisional allocation alias");
             }
         }
@@ -4140,6 +4192,23 @@ impl WorkerTaskManager {
         }
 
         Ok(restored)
+    }
+
+    /// [`Self::persist_state`], skipped for an unratified provisional start.
+    ///
+    /// Such a start is never written to the state file (see below), so
+    /// rewriting and fsyncing the whole file for it bought nothing and cost a
+    /// synchronous disk flush on every session start, under this lock
+    /// (session durability plan §6.1).
+    fn persist_state_unless_provisional(&self, local_key: i64) {
+        if self
+            .claims
+            .by_local_key(local_key)
+            .is_some_and(|claim| !claim.is_ratified())
+        {
+            return;
+        }
+        self.persist_state();
     }
 
     fn persist_state(&self) {
@@ -4574,11 +4643,34 @@ pub fn launch_provisional_allocation(
                 .set_claim_stage(claim_id, ClaimStage::Staged);
             Ok(())
         }
+        // A session's runtime calls run with the lock released, so a node's
+        // session starts overlap (session durability plan §6.1).
+        BeginOutcome::Launching(launch) => {
+            match complete_unlocked_launch(manager, *launch, "") {
+                Ok(Some((alloc, task))) => {
+                    manager
+                        .lock()
+                        .expect("task manager")
+                        .set_claim_stage(claim_id, stage_for(gate));
+                    spawn_health_monitor(manager.clone(), alloc, task);
+                    Ok(())
+                }
+                // Stopped while it started: the stop already ended the claim.
+                Ok(None) => Ok(()),
+                Err(err) => {
+                    manager
+                        .lock()
+                        .expect("task manager")
+                        .kill_claim(claim_id, &format!("provisional start failed: {err:#}"));
+                    Err(err)
+                }
+            }
+        }
         // None is produced for a claim: its local key is fresh per
-        // admission (no duplicate), claims keep the locked launch path, and
-        // a provisional payload is never a promotion.
-        BeginOutcome::InFlight | BeginOutcome::Launching(_) | BeginOutcome::Adopted => {
-            bail!("provisional start {claim_id} took the unlocked launch path")
+        // admission (no duplicate), and a provisional payload is never a
+        // promotion.
+        BeginOutcome::InFlight | BeginOutcome::Adopted => {
+            bail!("provisional start {claim_id} was treated as a duplicate or a promotion")
         }
         BeginOutcome::Staging(job) => {
             spawn_provisional_staging_thread(manager.clone(), *job, claim_id.to_string());
@@ -6261,7 +6353,17 @@ mod tests {
         let admitted = manager.admit_session(session_record(session_id))?;
         let mut payload = provisional_payload(admitted.local_key);
         payload.task_resources = admitted.resources.to_string();
-        manager.begin_task_allocation_gated(&payload, Gate::Serve)?;
+        // A session launches off the lock; run that half inline here.
+        if let BeginOutcome::Launching(mut launch) =
+            manager.begin_task_allocation_gated(&payload, Gate::Serve)?
+        {
+            let result = launch.run();
+            match manager.finish_unlocked_launch(*launch, result, "") {
+                LaunchFinish::Started(_) => {}
+                LaunchFinish::Failed(reason) => bail!(reason),
+                LaunchFinish::Cancelled(_) => bail!("session launch cancelled"),
+            }
+        }
         manager.set_claim_stage(&admitted.claim_id, ClaimStage::Serving);
         Ok(admitted)
     }
@@ -6269,6 +6371,111 @@ mod tests {
     fn refusal(err: anyhow::Error) -> SessionRefusal {
         err.downcast::<SessionRefusal>()
             .expect("a typed session refusal")
+    }
+
+    /// Session durability plan §6.1: a session's runtime calls run with the
+    /// task-manager lock released, so a node's session starts overlap, and
+    /// a session start never rewrites the worker's state file.
+    #[test]
+    fn session_starts_launch_off_the_lock_and_skip_the_state_file_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope_payload(100))?;
+        let state_file = temp_dir.path().join("worker_state.json");
+        let before = std::fs::read(&state_file).ok();
+
+        // Begin two sessions under the lock: both register and come back to
+        // be launched without it, neither has started yet.
+        let mut launches = Vec::new();
+        let mut claims = Vec::new();
+        {
+            let mut guard = manager.lock().expect("task manager");
+            for id in ["workspace-a", "workspace-b"] {
+                let admitted = guard.admit_session(session_record(id))?;
+                let mut payload = provisional_payload(admitted.local_key);
+                payload.task_resources = admitted.resources.to_string();
+                match guard.begin_task_allocation_gated(&payload, Gate::Serve)? {
+                    BeginOutcome::Launching(launch) => {
+                        assert_eq!(launch.claim_id(), Some(admitted.claim_id.as_str()));
+                        launches.push(*launch);
+                    }
+                    _ => panic!("a session must launch off the lock"),
+                }
+                claims.push(admitted);
+            }
+        }
+        // Both runtime calls run while another thread holds the lock: they
+        // never need it.
+        let held = manager.lock().expect("task manager");
+        let results: Vec<_> = launches
+            .iter_mut()
+            .map(|launch| launch.run())
+            .collect::<Vec<_>>();
+        drop(held);
+        {
+            let mut guard = manager.lock().expect("task manager");
+            for (launch, result) in launches.into_iter().zip(results) {
+                assert!(matches!(
+                    guard.finish_unlocked_launch(launch, result, ""),
+                    LaunchFinish::Started(_)
+                ));
+            }
+            for claim in &claims {
+                assert!(guard
+                    .instances
+                    .get(&claim.local_key)
+                    .and_then(|i| i.pid)
+                    .is_some());
+            }
+            assert_eq!(guard.session_statuses().len(), 2);
+        }
+        assert_eq!(
+            std::fs::read(&state_file).ok(),
+            before,
+            "a session start must not rewrite the worker state file"
+        );
+        let mut guard = manager.lock().expect("task manager");
+        for claim in &claims {
+            guard.kill_claim(&claim.claim_id, "test over");
+        }
+        Ok(())
+    }
+
+    /// A session whose runtime fails is ended as a claim, never reported to
+    /// the manager as a failed allocation, and its envelope share is free.
+    #[test]
+    fn a_failed_session_launch_ends_the_claim_and_frees_its_room_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope_payload(100))?;
+        let admitted = manager
+            .lock()
+            .expect("task manager")
+            .admit_session(session_record("workspace-a"))?;
+        let mut payload = provisional_payload(admitted.local_key);
+        payload.task_resources = admitted.resources.to_string();
+        payload.task_config = json!({ "command": ["/nonexistent/legion-test-binary"] }).to_string();
+        let result =
+            launch_provisional_allocation(&manager, &payload, &admitted.claim_id, Gate::Serve);
+        assert!(result.is_err(), "the runtime refused the command");
+        let mut guard = manager.lock().expect("task manager");
+        assert!(guard.claims.get(&admitted.claim_id).is_none());
+        assert!(
+            guard.failed.is_empty(),
+            "never reported as a failed allocation"
+        );
+        assert!(guard
+            .claims
+            .session_usage("agent-sandboxes", "workspace")
+            .is_empty());
+        assert!(guard.session_statuses().is_empty());
+        Ok(())
     }
 
     #[test]

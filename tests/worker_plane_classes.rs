@@ -138,6 +138,7 @@ async fn serve_worker(dir: &tempfile::TempDir) -> R<Cluster> {
         identity: None,
         edge_boot: None,
         direct_exec: None,
+        launch_pool: Default::default(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = format!("https://127.0.0.1:{}", listener.local_addr()?.port());
