@@ -11,6 +11,7 @@ without full shell access.
 - [Which task runtimes support exec](#which-task-runtimes-support-exec)
 - [ACLs](#acls)
 - [Agents (MCP)](#agents-mcp)
+- [Direct exec](#direct-exec)
 - [Disabling exec](#disabling-exec)
 - [How it works](#how-it-works)
 
@@ -34,6 +35,10 @@ legion exec 4217 --task api -it -- /bin/bash
 
 # Target the newest running allocation of a job instead of an id.
 legion exec --job web -it -- /bin/sh
+
+# Target an instance: the manager resolves it to whichever allocation
+# fulfils it now, so the same id works across reschedules and resumes.
+legion exec --instance user-42 -it -- /bin/bash
 ```
 
 Flags match docker and kubectl: `-i/--stdin` forwards local stdin, `-t/--tty`
@@ -202,7 +207,116 @@ The MCP server (`legion mcp serve`) exposes exec/actions to agents:
 - `legion_exec_run` (mutating, needs `--allow-write`): run a one-shot command
   and return stdout, stderr, and exit code.
 
-There is no interactive PTY over MCP. These tools are one-shot only.
+There is no interactive PTY over MCP. These tools are one-shot only. Both
+run tools take `instance_id` in place of `allocation_id`.
+
+- `legion_exec_ticket_mint` (mutating, needs `--allow-write`): mint an exec
+  ticket for [direct exec](#direct-exec). It is authorized like
+  `legion_exec_run` (or `legion_action_run` for an action ticket) and returns
+  the ticket, the worker address, the node name, and the cluster CA.
+
+## Direct exec
+
+By default every exec session runs through a manager: two streams for the
+session's life, and every byte twice. Direct exec takes the manager off the
+data path. A manager mints a short-lived **exec ticket**, and the client opens
+`Worker.ExecTask` on the worker running the target, presenting the ticket in
+the first frame. The worker verifies the ticket offline. The manager does one
+unary call per session and writes nothing.
+
+It is opt-in twice: the worker must set `exec = { direct = true }`, and the
+client must ask with `--direct` (or call `MintExecTicket` itself).
+
+```nickel
+# configs/workers/<type>.ncl
+{
+  workerType = "agents",
+  exec = { direct = true },
+}
+```
+
+```console
+$ legion exec --instance user-42 --direct -it -- /bin/bash
+root@user-42:/workspace#
+
+$ legion exec-ticket mint --instance user-42 --tty -j -- /bin/bash
+{"ok":true,"data":{"ticket":"eyJ…","worker":"https://10.0.3.17:4848",
+ "node":"w-17","expiresAt":"2026-11-02T18:05:11Z","allocationId":88213,
+ "jti":"ext_91ab…","maxSessionSeconds":3600,"caPem":"-----BEGIN CERTIFICATE-----…"}}
+```
+
+`legion exec --direct` mints and redeems in one step. `legion exec-ticket
+mint` is for platforms that dial the worker themselves: present the ticket in
+`ExecStart.exec_ticket` on `legion.Worker/ExecTask`, over TLS that trusts only
+`caPem` and verifies the server name `<node>.node.legion`, with no client
+certificate. `allocation_id` may be 0 and `command` empty; the worker runs
+what the ticket names.
+
+### What a ticket allows
+
+A ticket is a JWT signed with the cluster's workload-identity key (audience
+`legion:exec`), so the manager must run with `workloadIdentity.enabled: true`.
+
+| Question | Answer |
+| --- | --- |
+| Who can mint | Anyone `ExecAllocation` would admit for the same target: `exec:write` on the job (with `host = true` for host-level runtimes), or `action:write` for an action ticket. The same coarse gate runs before any lookup, so a caller without exec learns nothing about what exists. |
+| What it allows | One session, on one node, in one allocation, with the ticket's argv (rendered by the manager for an action; any argv for an `exec` ticket minted without a command) and its tty flag. |
+| How long | Redeemable for `ttl` (default 60s, at most 10m). The session runs at most `max_session` (default and ceiling 1h), never past the minting token's own expiry. |
+| Replay | Single use: the worker records each redeemed `jti` until the ticket expires. A ticket names its node, so it can't be redeemed elsewhere. A restarted worker refuses tickets issued before it started; mint again. |
+| Revocation | Every heartbeat, the worker reports its open direct sessions and the manager re-checks each minting token, as the proxied path does every 30 seconds. A deleted or expired token, or a policy that no longer grants the session, ends it within one heartbeat interval. |
+| A stolen ticket | Opens the one session it names, inside its redeem window, if the thief redeems it first. It reaches no other allocation, node, or command. |
+| Transport | The mutual-TLS worker plane. The worker proves itself with its node certificate; the client presents no certificate, because the ticket is its credential. |
+| A compromised worker | Sees tickets presented to it, which are already spent and name only itself. It can mint nothing. |
+
+Minting is audited at the manager under `exec_audit` (`exec ticket minted`).
+The worker reports each finished session on its next heartbeat, and the manager
+logs it under `exec_audit` too (`direct exec session ended`, with the exit code
+and what ended it). An action session's report carries the action name, never
+its rendered argv, which can hold sensitive parameters.
+
+### Manager settings
+
+```nickel
+# configs/manager.ncl
+{
+  workloadIdentity = { enabled = true },
+  exec = { tickets = { defaultTtl = "60s", maxTtl = "10m", maxSession = "1h" } },
+}
+```
+
+An unparseable duration, or a `defaultTtl` above `maxTtl`, stops the manager at
+startup.
+
+### Failure modes
+
+| Symptom | Cause |
+| --- | --- |
+| `FailedPrecondition: exec tickets are signed by the workload-identity issuer, which is not enabled` | Set `workloadIdentity.enabled: true` on the manager, or drop `--direct`. |
+| `FailedPrecondition: this worker does not admit exec tickets` | The node's worker type has no `exec = { direct = true }`. |
+| `could not reach node w-17 at https://10.0.3.17:4848 for direct exec` | The client has no route to the worker port. Direct exec needs one; drop `--direct` to go through the manager. |
+| `PermissionDenied: exec ticket rejected: the ticket expired at …` | It was not redeemed within its `ttl`. Mint again. |
+| `… has already been redeemed` | Tickets are single use. |
+| `… was issued before this worker restarted` | The worker forgot its redeemed set when it restarted. Mint again. |
+| `… is for node w-18, not this node` / `allocation 7 is not running on this node` | The ticket names another node, or the allocation moved. Mint again for the current target. |
+| `… names the command ["/bin/bash"], not ["/bin/sh"]` | The session must run the ticket's argv and tty mode. |
+| `InvalidArgument: ttl 1h is above this manager's ceiling of 10m` | Ask for less, or raise `exec.tickets`. |
+| Session ends with `max_session elapsed` | The session ran its `max_session`. |
+| Session ends with `PermissionDenied: session ended: the token that minted this session was deleted` | Revoked on a heartbeat. |
+
+### Limitations
+
+- The client must be able to reach the worker port. There is no gateway tier
+  for browsers or private workers yet; the UI terminal always goes through the
+  manager.
+- Revocation is bounded by one heartbeat interval (2s by default, longer on a
+  large fleet with adaptive cadence), not immediate. A credential with no
+  accessor id (a JWT auth method) can't be looked up again, so its sessions
+  are bounded by `max_session`, which the mint clamps to that credential's
+  expiry.
+- A ticket is not bound to the client that minted it: whoever presents it
+  first, inside its window, gets the session.
+- Exec into a sandbox is root in the guest, the same promise as the proxied
+  path.
 
 ## Disabling exec
 
@@ -230,7 +344,9 @@ UI   ──WebSocket /v1/exec/ws───────┘        (proxies frames)
   bidirectional streaming.
 - The manager is the trust boundary. It authorizes the request, renders any
   action's argv from the stored spec, and proxies the stream to the worker.
-  Clients never learn worker addresses.
+  Clients never learn worker addresses, except through
+  [direct exec](#direct-exec), where the mint reply names the worker and the
+  ticket carries what the manager authorized.
 - The WebSocket listener runs on the manager port + 1, because tonic's gRPC
   server doesn't perform HTTP upgrades. Browsers can't set WebSocket request
   headers, so they authenticate with the bearer token carried in the first

@@ -1139,6 +1139,45 @@ service Manager {
   // Lists the actions declared on a job's tasks (for CLI + UI discovery).
   rpc ListJobActions (ListJobActionsRequest) returns (ListJobActionsReply);
 
+  // Mints an exec ticket: a short-lived credential for direct exec, where
+  // the client opens `Worker.ExecTask` on the worker itself instead of
+  // streaming every byte through a manager (docs/exec-and-actions.md,
+  // "Direct exec").
+  //
+  // Authorization is exactly `ExecAllocation`'s: a coarse `exec:write` or
+  // `action:write` gate before any lookup, then `exec:write` on the job
+  // (with `host` for host-level runtimes) for a command, or `action:write`
+  // on the (job, action) — or `exec:write` on the job — for an action, whose
+  // argv is rendered here from the stored job spec. The ticket names what
+  // was authorized and nothing else: one node, one allocation, the job and
+  // task, the rendered argv (absent for an `exec` ticket minted without a
+  // command, which allows any command), the tty flag, and how long the
+  // session may run.
+  //
+  // Minting is a signature, not a write: no raft entry, no idempotency
+  // record. The mint is logged under the `exec_audit` target; the worker
+  // reports the redemption and the exit code on its next heartbeat, logged
+  // under `exec_audit` too. A ticket is single use on its node and expires
+  // after `ttl` (default `exec.tickets.defaultTtl`, 60s). The session it
+  // opens ends after `max_session` (default `exec.tickets.maxSession`, 1h),
+  // never later than the minting credential expires, and within one worker
+  // heartbeat of the minting token being deleted or losing the grant.
+  //
+  // The ticket is signed with the workload-identity key, so the manager
+  // must run with `workloadIdentity.enabled: true`.
+  //
+  // Errors:
+  // - PermissionDenied: the caller could not open this session through
+  //   `ExecAllocation`.
+  // - NotFound: no such allocation, instance, task, or action (only after
+  //   the coarse gate, so it reveals nothing to a caller without exec).
+  // - FailedPrecondition: exec or workload identity is disabled on this
+  //   manager; the allocation is not running; the instance has no running
+  //   allocation; the node advertises no authenticated worker address.
+  // - InvalidArgument: neither a command nor an action; a bad `ttl` or
+  //   `max_session`, or one above the manager's ceiling; bad action params.
+  rpc MintExecTicket (MintExecTicketRequest) returns (MintExecTicketReply);
+
   // Returns node + allocation view of cluster state (the "ledger").
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
 
@@ -4662,6 +4701,70 @@ message HeartbeatRequest {
   // Absent from workers that predate content locality. The manager treats
   // such a node as holding nothing, so it scores 0 on locality.
   optional ContentLocationReport content_locations = 14;
+
+  // Direct exec sessions this worker has finished since its last heartbeat
+  // (docs/exec-and-actions.md, "Direct exec"): one record per redeemed exec
+  // ticket, so the manager's `exec_audit` log holds direct sessions as it
+  // holds proxied ones. Restored and re-sent on a failed heartbeat; a
+  // worker keeps at most 1,024 records and drops the oldest past that, with
+  // a warning.
+  //
+  // Default: empty list.
+  repeated ExecAuditRecord exec_audit = 15;
+
+  // Direct exec sessions open on this worker right now. The manager checks
+  // each one's minting credential again, as the proxied path does every 30
+  // seconds, and names the sessions that no longer hold in
+  // `HeartbeatReply.revoked_exec_sessions`.
+  //
+  // Default: empty list.
+  repeated ExecSessionRef exec_sessions = 16;
+}
+
+// One finished (or refused-after-verification) direct exec session.
+message ExecAuditRecord {
+  // The ticket's `jti`.
+  string jti = 1;
+  // The ticket's `sub`: `accessor:<id>` of the minting token, or
+  // `principal:<name>` for a credential without an accessor.
+  string subject = 2;
+  int64 allocation_id = 3;
+  string job = 4;
+  string task = 5;
+  // The argv that ran. Empty for an action session: a rendered action argv
+  // can carry sensitive parameter values, so only `action` is reported.
+  repeated string command = 6;
+  // Set when the ticket was minted for an action.
+  string action = 7;
+  bool tty = 8;
+  // The process's exit code; -1 when it was killed or never reported one.
+  int32 exit_code = 9;
+  // Unix seconds.
+  int64 started_at = 10;
+  int64 ended_at = 11;
+  // Why the session ended when the process did not end it:
+  // `"max_session"`, `"revoked: <reason>"`, `"client disconnected"`.
+  string ended_by = 12;
+}
+
+// A direct exec session open on a worker, for the manager's re-check.
+message ExecSessionRef {
+  string jti = 1;
+  // The ticket's `sub`.
+  string subject = 2;
+  string job = 3;
+  // Set for an action ticket: re-checked as `action:write` on the (job,
+  // action), or `exec:write` on the job.
+  string action = 4;
+  int64 allocation_id = 5;
+}
+
+// A direct exec session the worker must end.
+message RevokedExecSession {
+  string jti = 1;
+  // Ends the session's stream with this message, e.g. "the token that
+  // minted this session was deleted".
+  string reason = 2;
 }
 
 // Content locality. One heartbeat's content advertisement. See
@@ -5095,6 +5198,16 @@ message HeartbeatReply {
   // how a `legion net ca rotate` reaches every node within one heartbeat.
   // Empty when no cluster CA exists yet.
   string cluster_ca_pin = 11;
+
+  // The direct exec sessions from `HeartbeatRequest.exec_sessions` whose
+  // minting credential no longer holds: the token was deleted or expired,
+  // or its policies no longer grant the session. The worker kills each
+  // session's process and ends its stream with `PermissionDenied` and the
+  // reason. This bounds revocation of a direct session to one heartbeat
+  // interval.
+  //
+  // Default: empty list.
+  repeated RevokedExecSession revoked_exec_sessions = 12;
 }
 
 // Why one allocation is being stopped.
@@ -7791,11 +7904,29 @@ service Worker {
   // certificate.
   rpc GetTaskLogs (GetTaskLogsRequest) returns (GetTaskLogsReply);
 
-  // Runs an exec session against a local allocation. Caller class: manager.
-  // The manager has already authorized the caller and rendered any action
-  // command into a raw argv on the `ExecStart` frame. Errors:
-  // Unauthenticated without a manager certificate ("ExecTask admits a
-  // manager certificate or an exec ticket; this request carried neither").
+  // Runs an exec session against a local allocation. Caller classes:
+  // manager, ticket.
+  //
+  // - manager: the manager has already authorized the caller and rendered
+  //   any action command into a raw argv on the `ExecStart` frame.
+  // - ticket (direct exec, docs/exec-and-actions.md "Direct exec"): no
+  //   client certificate, and `ExecStart.exec_ticket` carries a ticket from
+  //   `Manager.MintExecTicket`. Admitted only on a worker whose config sets
+  //   `exec = { direct = true }`. The worker verifies the ticket offline
+  //   against the cluster JWKS: signature, `aud = legion:exec`, expiry with
+  //   the worker's clock skew, issued after this worker process started,
+  //   `legion.io/node` is this node, the allocation is running here under
+  //   the ticket's job and task, the `ExecStart` argv and tty fit the ticket,
+  //   and the `jti` has not been redeemed on this node. The session ends
+  //   after the ticket's `legion.io/max_session` seconds, or when a manager
+  //   names it in `HeartbeatReply.revoked_exec_sessions`.
+  //
+  // Errors: Unauthenticated when the request carries neither a manager
+  // certificate nor a ticket ("ExecTask admits a manager certificate or an
+  // exec ticket; this request carried neither"), or presents a certificate
+  // that is not a manager's; FailedPrecondition for a ticket on a worker
+  // without `exec.direct`; PermissionDenied for a ticket that fails any
+  // check above, with the check named.
   rpc ExecTask (stream ExecClientFrame) returns (stream ExecServerFrame);
 
   // Starts work on this node from a boot ticket, without any call to a
@@ -7883,6 +8014,25 @@ message ExecStart {
   // cannot set request headers. Ignored on native gRPC legs, where the
   // `authorization` metadata is used instead.
   string bearer_token = 8;
+
+  // Target an instance instead of an allocation: the manager resolves it to
+  // the instance's current allocation after the coarse ACL gate, so a
+  // caller holding a stable instance id reaches it across reschedules and
+  // resumes (each of which is a new allocation). Takes precedence over
+  // `allocation_id` when set. Manager legs only; a worker ignores it.
+  //
+  // Errors: NotFound for an unknown instance; FailedPrecondition when the
+  // instance has no running allocation (suspended, stopped, or between
+  // placements).
+  string instance_id = 9;
+
+  // An exec ticket from `Manager.MintExecTicket`, presented to
+  // `Worker.ExecTask` by a direct-exec client with no client certificate.
+  // `allocation_id` may be 0 (the ticket names the allocation) and
+  // `command` may be empty (the ticket's argv runs); when set they must
+  // match the ticket. `action` and `action_params` are ignored: an action
+  // ticket carries its rendered argv. Ignored on manager legs.
+  string exec_ticket = 10;
 }
 
 // Standard-input chunk. `eof` half-closes stdin (the k8s v5 lesson) so piped
@@ -7932,6 +8082,77 @@ message ExecExit {
 // receipt. `session_id` identifies the session in audit events.
 message ExecStarted {
   string session_id = 1;
+}
+
+// Request payload for MintExecTicket. The target and command fields mean
+// what they mean on `ExecStart`.
+message MintExecTicketRequest {
+  // Target allocation. Ignored when `instance_id` is set.
+  int64 allocation_id = 1;
+
+  // Target instance, resolved to its current allocation.
+  string instance_id = 2;
+
+  // Task within the allocation. Optional when the allocation runs one task.
+  string task_name = 3;
+
+  // Raw argv the ticket allows (`exec:write`). Empty with an empty
+  // `action` mints a ticket that allows any command in the target, which
+  // needs the same `exec:write` grant.
+  repeated string command = 4;
+
+  // Action to run (`action:write`, or `exec:write`). Its argv is rendered
+  // here from the stored job spec and written into the ticket.
+  string action = 5;
+
+  // Action parameter values, validated and substituted as for
+  // `ExecAllocation`. Sensitive values never appear in the audit log.
+  map<string, string> action_params = 6;
+
+  // Whether the session is interactive. For an action, the action's own
+  // `tty` wins.
+  bool tty = 7;
+
+  // How long the ticket can be redeemed, e.g. `"30s"`. Default:
+  // `exec.tickets.defaultTtl` (60s); at most `exec.tickets.maxTtl` (10m).
+  string ttl = 8;
+
+  // How long the session may run once opened, e.g. `"15m"`. Default and
+  // ceiling: `exec.tickets.maxSession` (1h). Clamped to the minting
+  // credential's own expiry.
+  string max_session = 9;
+}
+
+// Reply payload for MintExecTicket.
+message MintExecTicketReply {
+  // The ticket (a JWT). A credential: pass it to the worker in
+  // `ExecStart.exec_ticket` and nowhere else.
+  string ticket = 1;
+
+  // The worker's advertised worker-plane address,
+  // e.g. `"https://10.0.3.17:4848"`.
+  string worker_address = 2;
+
+  // The node the ticket is redeemable on. The worker's certificate names
+  // `<node>.node.legion`; a client verifies that name, not the address.
+  string node = 3;
+
+  // When the ticket stops being redeemable, RFC 3339 UTC.
+  string expires_at = 4;
+
+  // The cluster CA bundle, PEM: the only roots a client should trust for
+  // the worker connection.
+  string ca_pem = 5;
+
+  // The allocation the ticket opens a session in (resolved from
+  // `instance_id` when the request named one).
+  int64 allocation_id = 6;
+
+  // The ticket's id, as the audit log and the worker's report name it.
+  string jti = 7;
+
+  // Seconds the session may run once opened.
+  uint64 max_session_seconds = 8;
 }
 
 // Request payload for ListJobActions.

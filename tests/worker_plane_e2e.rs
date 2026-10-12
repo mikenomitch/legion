@@ -112,16 +112,24 @@ impl Drop for Cluster {
 }
 
 fn start(dir: tempfile::TempDir) -> Cluster {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    start_with(dir, serde_json::json!({}), &repo.join("configs/workers"))
+}
+
+/// [`start`] with extra top-level manager config and a worker config dir.
+fn start_with(dir: tempfile::TempDir, extra: serde_json::Value, workers: &Path) -> Cluster {
     let port = free_port_pair();
     let worker_port = free_port();
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "server": { "host": "127.0.0.1", "port": port },
         "storePath": dir.path().join("store").to_str().expect("utf-8"),
-        "workerConfigPath": repo.join("configs/workers").to_str().expect("utf-8"),
+        "workerConfigPath": workers.to_str().expect("utf-8"),
         "telemetry": { "enabled": false },
         "taskResourceDefaults": { "cpu": 0, "memory": 0, "allocations": 100 },
     });
+    for (key, value) in extra.as_object().expect("object") {
+        config[key] = value.clone();
+    }
     let config_path = dir.path().join("manager.json");
     std::fs::write(&config_path, config.to_string()).expect("write config");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
@@ -260,4 +268,239 @@ fn logs_exec_and_ca_rotation_work_over_the_mtls_worker_plane_test() {
             >= 2
     });
     exec("after the worker re-issued");
+}
+
+/// The repo's default worker type with `exec = { direct = true }`.
+fn direct_exec_workers(dir: &Path) -> PathBuf {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let default = std::fs::read_to_string(repo.join("configs/workers/default.ncl"))
+        .expect("default worker config");
+    let end = default.rfind('}').expect("record");
+    let workers = dir.join("workers");
+    std::fs::create_dir_all(&workers).expect("workers dir");
+    std::fs::write(
+        workers.join("default.ncl"),
+        format!("{}    exec = {{ direct = true }},\n}}\n", &default[..end]),
+    )
+    .expect("write worker config");
+    workers
+}
+
+fn first_node(cluster: &Cluster) -> Option<String> {
+    let nodes = cluster.cli_json(&["node", "list"]);
+    nodes["data"]
+        .as_array()
+        .or_else(|| nodes["data"]["nodes"].as_array())
+        .and_then(|nodes| nodes.first())
+        .and_then(|node| node["id"].as_str())
+        .map(str::to_string)
+}
+
+fn running_allocation(cluster: &Cluster, job: &str) -> Option<i64> {
+    // `legion ledger -j` prints a bare array of `{node, allocations}`.
+    let out = cluster.cli(&["ledger", "-j"]);
+    let ledger: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    ledger
+        .as_array()?
+        .iter()
+        .flat_map(|node| node["allocations"].as_array().cloned().unwrap_or_default())
+        .filter(|alloc| alloc["jobId"] == job && alloc["status"] == "placed")
+        .filter_map(|alloc| alloc["id"].as_i64())
+        .max()
+}
+
+#[test]
+fn direct_exec_runs_on_the_worker_and_ends_when_its_token_is_revoked_test() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workers = direct_exec_workers(dir.path());
+    let cluster = start_with(
+        dir,
+        serde_json::json!({ "workloadIdentity": { "enabled": true } }),
+        &workers,
+    );
+    cluster.wait_for("the worker to register", || first_node(&cluster).is_some());
+    cluster.wait_for("the worker plane to listen", || {
+        std::fs::read_to_string(cluster.dir.path().join("manager.log"))
+            .unwrap_or_default()
+            .contains("Direct exec enabled")
+    });
+
+    let job = cluster.dir.path().join("direct.json");
+    std::fs::write(
+        &job,
+        serde_json::json!({
+            "name": "direct",
+            "task": {
+                "name": "main",
+                "runtime": "exec",
+                "lifecycle": "service",
+                "config": { "command": ["sh", "-c", "exec sleep 600"] },
+                "resources": { "cpus": 0.1, "memory": 32 },
+            },
+        })
+        .to_string(),
+    )
+    .expect("write job");
+    let run = cluster.cli_json(&["job", "run", job.to_str().expect("utf-8")]);
+    assert_eq!(run["ok"], true, "{run}");
+    cluster.wait_for("the allocation to run", || {
+        running_allocation(&cluster, "direct").is_some()
+    });
+    let allocation = running_allocation(&cluster, "direct").expect("allocation");
+
+    // `legion exec --direct`: one mint, then the session runs against the
+    // worker, with the process's own exit status.
+    let mut ran = false;
+    let mut last = String::new();
+    for _ in 0..40 {
+        let out = cluster.cli(&[
+            "exec",
+            "--job",
+            "direct",
+            "--direct",
+            "--",
+            "sh",
+            "-c",
+            "echo direct-ok; exit 4",
+        ]);
+        if String::from_utf8_lossy(&out.stdout).contains("direct-ok") {
+            assert_eq!(out.status.code(), Some(4), "exit status");
+            ran = true;
+            break;
+        }
+        last = format!(
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The allocation can be placed before its process is up.
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if !ran {
+        let log =
+            std::fs::read_to_string(cluster.dir.path().join("manager.log")).unwrap_or_default();
+        let tail: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("panic") || line.contains("rror") || line.contains("exec"))
+            .collect();
+        panic!(
+            "legion exec --direct never ran: {last}\n{}",
+            tail.join("\n")
+        );
+    }
+    let log = std::fs::read_to_string(cluster.dir.path().join("manager.log")).unwrap_or_default();
+    assert!(log.contains("exec ticket minted"), "the mint is audited");
+    cluster.wait_for("the redemption to be audited on a heartbeat", || {
+        std::fs::read_to_string(cluster.dir.path().join("manager.log"))
+            .unwrap_or_default()
+            .contains("direct exec session ended")
+    });
+
+    // A ticket names its command: the mint reply carries everything a
+    // client needs, and nothing that lets it run something else.
+    // `-j` before `--`: everything after it is the ticket's argv.
+    let out = cluster.cli(&[
+        "exec-ticket",
+        "mint",
+        "-j",
+        &allocation.to_string(),
+        "--",
+        "true",
+    ]);
+    let minted: serde_json::Value = serde_json::from_slice(&out.stdout).expect("mint JSON");
+    assert_eq!(minted["ok"], true, "{minted}");
+    assert!(minted["data"]["worker"]
+        .as_str()
+        .is_some_and(|worker| worker.starts_with("https://")));
+    assert!(minted["data"]["caPem"]
+        .as_str()
+        .is_some_and(|pem| pem.contains("BEGIN CERTIFICATE")));
+
+    // Revocation: a token that may exec, a long direct session opened with
+    // it, then the token deleted. The session ends within a heartbeat or two.
+    let policy = cluster.cli_json(&[
+        "acl",
+        "policy",
+        "apply",
+        "direct-exec",
+        "--rules",
+        r#"[{"resources":["exec"],"actions":["write"],"names":["direct"],"host":true},{"resources":["job"],"actions":["read"]}]"#,
+    ]);
+    assert_eq!(policy["ok"], true, "{policy}");
+    let token = cluster.cli_json(&[
+        "acl",
+        "token",
+        "create",
+        "--name",
+        "direct-exec-user",
+        "--policy",
+        "direct-exec",
+    ]);
+    assert_eq!(token["ok"], true, "{token}");
+    let secret = token["data"]["secret"]
+        .as_str()
+        .or_else(|| token["data"]["secretId"].as_str())
+        .expect("token secret")
+        .to_string();
+    let accessor = token["data"]["accessorId"]
+        .as_str()
+        .expect("accessor")
+        .to_string();
+
+    let session = Command::new(env!("CARGO_BIN_EXE_legion"))
+        .args([
+            "exec",
+            &allocation.to_string(),
+            "--direct",
+            "--",
+            "sh",
+            "-c",
+            "echo session-open; exec sleep 300",
+        ])
+        .env("LEGION_ADDR", format!("http://127.0.0.1:{}", cluster.port))
+        .env("LEGION_TOKEN", &secret)
+        .env("HOME", cluster.dir.path().join("home"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn direct session");
+    // An `exec` task is host-level, so the rule needs `host: true`.
+    let mut session = session;
+    cluster.wait_for("the direct session to open", || {
+        if let Ok(Some(status)) = session.try_wait() {
+            panic!("the direct session exited early: {status}");
+        }
+        std::fs::read_to_string(cluster.dir.path().join("manager.log"))
+            .unwrap_or_default()
+            .contains("Direct exec session opened")
+            && std::fs::read_to_string(cluster.dir.path().join("manager.log"))
+                .unwrap_or_default()
+                .matches("Direct exec session opened")
+                .count()
+                >= 2
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let deleted = cluster.cli_json(&["acl", "token", "delete", &accessor]);
+    assert_eq!(deleted["ok"], true, "{deleted}");
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = session.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the revoked direct session is still running"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let output = session.wait_with_output().expect("output");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!status.success(), "a revoked session fails");
+    assert!(
+        stderr.contains("the token that minted this session was deleted"),
+        "stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }

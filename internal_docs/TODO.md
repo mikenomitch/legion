@@ -44,8 +44,8 @@ How to use it:
         to §6.6, §6.9; calls 20 to 26). Docs:
         [architecture-managers-workers.md](../docs/architecture-managers-workers.md#the-worker-plane),
         [auth-and-acls.md](../docs/auth-and-acls.md#the-worker-plane).
-        The `ticket` class on `ExecTask` ships with sandbox-exec Phase 2
-        below; until then `ExecTask` is manager-only.
+        The `ticket` class on `ExecTask` shipped with sandbox-exec Phase 2
+        (direct exec, below).
   - [x] Phase 2: the host guard in the datapath. Resolve once, judge every
         address, dial what was judged, on the gated egress proxy's three
         paths, external upstreams, and `proxy` handler targets, with the
@@ -1780,19 +1780,16 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] Found during the plan: `docs/multi-raft.md` says instance writes go
         on the control lane, but `instance` is owned by the scheduler lane
         (`src/storage/raft/ownership.rs:222`). Fix the doc.
-- [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (PLANNED) ·
+- [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (IN EXECUTION) ·
       [calls](calls/sandbox-exec-plan_calls.md). Exec into Linux microVM
       sandboxes, and exec sessions that skip the manager. Implemented
       together with
       [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md)
       ([#16](https://github.com/mikenomitch/legion/pull/16)).
-  - [ ] Found during the plan: the worker listener has no authentication
-        and no TLS (`src/worker/server.rs:55`, `:200`,
-        `src/worker/daemon.rs:318`). It binds `127.0.0.1:4848`
-        (`src/worker/daemon.rs:155`), so the gap is local: any process on
-        the worker's host, including an `exec` task or a host-network
-        container, can call `ExecTask` against any allocation on that node.
-        The worker-plane-auth plan (#16) closes it.
+  - [x] Found during the plan: the worker listener had no authentication
+        and no TLS, so any process on the worker's host could call
+        `ExecTask` against any allocation on that node. Closed by
+        worker-plane-auth Phase 1 (the mTLS worker plane, above).
   - [x] Amend the worker-plane-auth plan (exec plan §9): a ticket caller
         class for `ExecTask`, a classification test that allows two classes,
         and the JWKS verifier on every worker that admits tickets. Folded
@@ -1808,9 +1805,39 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         would break memory checkpoints of TAP and `none` sandboxes) and
         worker-plane-auth Phase 1. Gated Phase 1 is built (the override, and
         the `legion-guest` agent crate to extend); Phase 0 is pending.
-  - [ ] Phase 2: direct exec with `MintExecTicket` and a ticket class on the
-        mTLS worker listener, `legion exec --direct`, async audit, revoked
-        accessors on the heartbeat.
+  - [x] Phase 2: direct exec. `MintExecTicket` (no raft write, the same
+        authorization as `ExecAllocation`), the `ticket` class on
+        `ExecTask` behind the worker type's `exec = { direct = true }`,
+        `legion exec --direct`, `legion exec-ticket mint`, the
+        `legion_exec_ticket_mint` MCP tool, `exec.tickets` lifetimes, audit
+        of finished sessions on the heartbeat, and revocation by re-checking
+        open sessions on the heartbeat (calls 6, 9 to 15). `--instance` on
+        `legion exec`, `legion action run`, and the MCP exec tools landed
+        with it (`ExecStart.instance_id`). Docs:
+        [exec-and-actions.md § Direct exec](../docs/exec-and-actions.md#direct-exec).
+        Tests: `tests/worker_plane_e2e.rs` (direct session, exit status,
+        revocation within a heartbeat), `src/worker/direct_exec.rs`,
+        `mint_exec_ticket_admits_exactly_what_exec_allocation_admits_test`.
+  - [ ] Direct exec: bind a ticket to the client's key (a `cnf` claim and a
+        proof over the `jti` in the first frame), so a stolen ticket is
+        useless (plan §13, first open question). Today whoever redeems first
+        wins.
+  - [ ] Direct exec: sessions minted by a JWT auth-method credential have
+        no accessor to re-check on the heartbeat; they end at `max_session`,
+        which the mint clamps to the credential's expiry
+        ([calls entry 12](calls/sandbox-exec-plan_calls.md#12-a-direct-session-never-outlives-the-credential-that-minted-it)).
+  - [ ] Direct exec: the JWKS refresh and clock-skew settings live under
+        the worker's `edgeBoot` block even when only direct exec uses them
+        ([calls entry 11](calls/sandbox-exec-plan_calls.md#11-the-workers-direct-exec-switch-is-a-top-level-exec-block-in-the-worker-type)).
+  - [x] Found while building Phase 2: the pinned JWKS fetch built a runtime
+        inside the server's runtime and panicked the first time a worker
+        verified a boot or exec ticket against a live manager; edge boot's
+        tests used a static JWKS and never hit it. Verification now runs in
+        `spawn_blocking` and the fetch on its own thread
+        ([calls entry 10](calls/sandbox-exec-plan_calls.md#10-exec-tickets-share-the-boot-ticket-jwks-cache-and-verification-runs-off-the-async-runtime)).
+  - [ ] Found while building Phase 2: `legion ledger -j` prints a bare
+        array, not the standard `{ok, data}` envelope AGENTS.md requires
+        (`src/cmd/ledger.rs`).
   - [ ] Phases 3 to 5: delegated minting keys, the gateway tier (shared
         with the scaling plan's wake on request), and exec into unnamed
         sessions after the scaling plan's Phase 6.

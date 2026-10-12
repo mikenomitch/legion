@@ -555,6 +555,41 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Exec and actions (docs/exec-and-actions.md) ---
+        Capability {
+            name: "exec",
+            cli: "legion exec <ALLOC>|--job <JOB>|--instance <ID> [-it] [--direct] -- <CMD>",
+            grpc: Some("Manager/ExecAllocation"),
+            summary: "Run a command inside a running allocation, through the manager or, with \
+                      --direct, against its worker with an exec ticket.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "exec-ticket.mint",
+            cli: "legion exec-ticket mint <ALLOC>|--instance <ID> [--action A] [-- <CMD>]",
+            grpc: Some("Manager/MintExecTicket"),
+            summary: "Mint a short-lived, single-use ticket for one direct exec session on the \
+                      worker running the target (no raft write).",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "action.list",
+            cli: "legion action list <JOB>",
+            grpc: Some("Manager/ListJobActions"),
+            summary: "List the actions declared on a job's tasks, with their parameters.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "action.run",
+            cli: "legion action run <JOB> <ACTION> [--alloc <ID>|--instance <ID>] [--param k=v]",
+            grpc: Some("Manager/ExecAllocation"),
+            summary: "Run a declared action in a running allocation, rendered by the manager.",
+            mutates: true,
+            read_only_safe: false,
+        },
         // --- Edge boot (docs/edge-boot.md) ---
         Capability {
             name: "boot-ticket.create",

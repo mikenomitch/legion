@@ -185,6 +185,9 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("IssueNodeCertificate", Plane::Worker),
         ("GetAllocationLogs", Plane::Protected("job:read")),
         ("ExecAllocation", Plane::Protected("exec:write")),
+        // Direct exec: the same coarse gate as ExecAllocation, then its
+        // precise job scope once the target is resolved.
+        ("MintExecTicket", Plane::Protected("exec:write")),
         ("ListJobActions", Plane::Protected("job:read")),
         ("GetArtifactCredential", Plane::Worker),
         ("GetIngressCertificates", Plane::Worker),
@@ -1123,6 +1126,17 @@ async fn call_endpoint(
             .map(|_| ()),
         "ExecAllocation" => svc
             .exec_allocation(req(empty_exec_stream(), token))
+            .await
+            .map(|_| ()),
+        "MintExecTicket" => svc
+            .mint_exec_ticket(req(
+                MintExecTicketRequest {
+                    allocation_id: 404,
+                    command: vec!["true".into()],
+                    ..Default::default()
+                },
+                token,
+            ))
             .await
             .map(|_| ()),
         "ListJobActions" => svc

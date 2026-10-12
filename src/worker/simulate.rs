@@ -925,8 +925,11 @@ async fn heartbeat_sim_node(
     let acked = node.acked_ids(ready_after);
     fleet.record_reported_allocations(node, acked.len());
     let req = node.credentials.attach(Request::new(HeartbeatRequest {
-        // Simulated nodes have no content store to advertise.
+        // Simulated nodes have no content store to advertise, and run no
+        // direct exec sessions.
         content_locations: None,
+        exec_audit: Vec::new(),
+        exec_sessions: Vec::new(),
         pressure_actions: Vec::new(),
         net_denials: Vec::new(),
         net_status: Vec::new(),

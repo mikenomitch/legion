@@ -245,7 +245,36 @@ impl Authenticator {
             .get_acl_token_by_hash(&hash_secret(secret))
             .map_err(internal_acl_error)?
             .ok_or_else(|| Status::unauthenticated("unknown or revoked ACL token"))?;
+        self.record_identity(record, store)
+    }
 
+    /// The identity of the token with this accessor id, as a request
+    /// carrying its secret would authenticate: `Ok(None)` once the token is
+    /// deleted, `Unauthenticated` once it has expired. How a direct exec
+    /// session, which holds only the minting token's accessor, is re-checked
+    /// (docs/exec-and-actions.md, "Direct exec").
+    pub fn identity_for_accessor(
+        &self,
+        accessor_id: &str,
+        store: &Store,
+    ) -> Result<Option<AclIdentity>, Status> {
+        if !self.enabled {
+            return Ok(Some(AclIdentity::acl_disabled()));
+        }
+        match store
+            .get_acl_token_by_accessor(accessor_id)
+            .map_err(internal_acl_error)?
+        {
+            Some(record) => self.record_identity(record, store).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn record_identity(
+        &self,
+        record: AclTokenRecord,
+        store: &Store,
+    ) -> Result<AclIdentity, Status> {
         if record.is_expired(OffsetDateTime::now_utc()) {
             return Err(Status::unauthenticated(format!(
                 "ACL token `{}` has expired; log in again or create a new token",

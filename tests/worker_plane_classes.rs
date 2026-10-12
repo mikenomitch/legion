@@ -58,7 +58,9 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         ("PostWork", &[Caller::Manager]),
         ("RestartWorker", &[Caller::Manager]),
         ("GetTaskLogs", &[Caller::Manager]),
-        ("ExecTask", &[Caller::Manager]),
+        // A manager certificate, or (direct exec, `exec.direct`) an exec
+        // ticket in the first frame.
+        ("ExecTask", &[Caller::Manager, Caller::Ticket]),
         ("StartClaim", &[Caller::Ticket]),
         ("Probe", &[Caller::Manager]),
     ]
@@ -134,6 +136,7 @@ async fn serve_worker(dir: &tempfile::TempDir) -> R<Cluster> {
         ))),
         identity: None,
         edge_boot: None,
+        direct_exec: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = format!("https://127.0.0.1:{}", listener.local_addr()?.port());
@@ -192,6 +195,9 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
                 frame: Some(exec_client_frame::Frame::Start(ExecStart {
                     allocation_id: 404,
                     command: vec!["true".into()],
+                    // Ignored on the manager leg; on the ticket leg it gets
+                    // the request past the class check to ticket handling.
+                    exec_ticket: "not-a-ticket".into(),
                     ..Default::default()
                 })),
             };
@@ -311,6 +317,31 @@ async fn manager_only_refusal_names_the_rule() -> R<()> {
         status
             .message()
             .contains("ExecTask admits a manager certificate or an exec ticket"),
+        "{}",
+        status.message()
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_on_a_worker_without_direct_exec_names_the_setting() -> R<()> {
+    let dir = tempfile::tempdir()?;
+    let cluster = serve_worker(&dir).await?;
+    let mut anonymous = client(&cluster, None)?;
+    let frame = ExecClientFrame {
+        frame: Some(exec_client_frame::Frame::Start(ExecStart {
+            command: vec!["sh".into()],
+            exec_ticket: "eyJ.not.verified".into(),
+            ..Default::default()
+        })),
+    };
+    let status = anonymous
+        .exec_task(tokio_stream::iter(vec![frame]))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        status.message().contains("exec = { direct = true }"),
         "{}",
         status.message()
     );

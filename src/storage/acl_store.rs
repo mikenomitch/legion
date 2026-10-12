@@ -362,6 +362,21 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn get_acl_token_by_accessor(&self, accessor_id: &str) -> R<Option<AclTokenRecord>> {
+        let conn = self.read_connection()?;
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM acl_token WHERE accessor_id = ?;",
+                Self::ACL_TOKEN_COLUMNS
+            ),
+            [accessor_id],
+            Self::acl_token_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    #[instrument(err, skip_all)]
     pub fn list_acl_tokens(&self) -> R<Vec<AclTokenRecord>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(&format!(

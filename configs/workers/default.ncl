@@ -166,4 +166,10 @@
     #     # Extra destinations to refuse like metadata: IPs or CIDRs.
     #     deny = ["10.0.0.2/32"],
     # },
+    # Direct exec (docs/exec-and-actions.md, "Direct exec"): admit exec
+    # tickets on this node's worker plane, so `legion exec --direct` and
+    # platform clients run sessions here with no manager on the data path.
+    # Off by default: with it on, any client that can reach port 4848 and
+    # holds a ticket for this node can open the session the ticket names.
+    # exec = { direct = true },
 }

@@ -95,7 +95,7 @@ reports `aclEnabled: false`.
 | `state` | raw state store, saved queries | SQL reads, schema | SQL writes, saved queries |
 | `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
 | `acl` | tokens, policies, users | list/get | create/update/delete |
-| `exec` | exec into a running allocation | n/a | open a session (`host = true` for host-level runtimes) |
+| `exec` | exec into a running allocation | n/a | open a session, or mint an exec ticket for one (`host = true` for host-level runtimes) |
 | `action` | run declared actions on an allocation | n/a | run an action (scope with `action_names`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
 | `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. |
@@ -293,7 +293,11 @@ Long-lived streams (`StreamEvents` and exec sessions, including the UI's exec
 WebSocket) re-check their credential every 30 seconds. Revoking or expiring a
 token, or removing the policy that granted the stream, closes the stream
 within that interval with the same `Unauthenticated` or `PermissionDenied`
-error a new request would get.
+error a new request would get. A [direct exec](exec-and-actions.md#direct-exec)
+session never touches a manager after its ticket is minted, so its worker
+reports it on every heartbeat instead: the manager re-checks the minting
+token there, and the session ends within one heartbeat interval of the token
+being deleted, expiring, or losing the grant.
 
 For infrastructure-as-code, `acl.bootstrapSecretFile` pre-seeds the initial
 management token's secret (see [Pre-seeding the
@@ -440,7 +444,9 @@ manager's private key never leaves the managers:
   cluster CA.
 - `PostWork`, `GetTaskLogs`, and `RestartWorker` admit only a caller that
   presents a manager certificate (`legion://manager/<id>`). `ExecTask` admits
-  a manager. `StartClaim` admits a holder of a valid boot ticket.
+  a manager, or a holder of an exec ticket on a worker that opts in to
+  [direct exec](exec-and-actions.md#direct-exec). `StartClaim` admits a holder
+  of a valid boot ticket.
 - Managers verify the worker they dial against `<node>.node.legion`.
 - Join tokens pin the cluster CA (`caHash`), and a joining worker refuses a
   manager whose CA does not match.

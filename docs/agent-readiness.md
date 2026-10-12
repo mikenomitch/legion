@@ -117,6 +117,9 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_snapshot_alias_set` | **yes** | Point a snapshot name at a local or published manual snapshot of the job, creating or moving the name, so `legion_instance_create` with `from_snapshot` = the name picks up the new snapshot. Supports `idempotency_key`. |
 | `legion_snapshot_warm` | **yes** | Pre-fetch a `published` snapshot's parts onto available nodes matching `constraints` (`key=value` node attributes) that could restore it, so a later resume there starts from local bytes. Best effort and idempotent. Only needs `snapshot:read`, but it starts downloads, so it is gated behind `--allow-write`. The reply lists the nodes asked, the ones already warm, and the incompatible ones with the reason. Supports `idempotency_key`. |
 | `legion_boot_ticket_create` | **yes** | Mint a boot ticket: a short-lived capability that lets one edge node start one workload without a manager call ([edge-boot.md](edge-boot.md)). It can only be revoked by expiry, so prefer short TTLs. Supports `idempotency_key`. |
+| `legion_exec_run` | **yes** | Run a one-shot command in a running allocation and return stdout, stderr, and the exit code ([exec-and-actions.md](exec-and-actions.md)). Takes `instance_id` in place of `allocation_id` to reach an instance's current allocation. Needs `exec:write` (with `host` for host-level runtimes). |
+| `legion_action_run` | **yes** | Run a declared action one-shot; the manager renders its argv. Takes `instance_id` like `legion_exec_run`. Needs `action:write` (or `exec:write`). |
+| `legion_exec_ticket_mint` | **yes** | Mint an exec ticket for [direct exec](exec-and-actions.md#direct-exec): one session, on the worker running the target, with no manager on the data path. Authorized like `legion_exec_run` (or `legion_action_run` for an action ticket); writes nothing to the cluster. Returns the ticket, the worker address, the node name to verify, and the cluster CA. Single use, 60s to redeem by default. |
 
 Tool errors come back in-band (`result.isError = true` with a text payload),
 following MCP convention. Transport and protocol errors use JSON-RPC `error`.
@@ -569,6 +572,26 @@ then `ratified` or `refused`). Two properties matter to an agent:
 `legion instance get` reports a sandbox as `provisional` until it is ratified.
 `legion node claims <NODE>` lists everything a node has started but not yet
 had confirmed.
+
+### Direct exec: a session without a manager in the middle
+
+An agent platform that runs many sessions can take the manager off their data
+path ([Direct exec](exec-and-actions.md#direct-exec)). It mints one exec ticket
+per session, then talks to the worker directly:
+
+```bash
+# Authorized like `legion exec`; writes nothing to the cluster.
+legion exec-ticket mint --instance user-42 --ttl 30s -j -- python3 -c 'print(42)'
+
+# Or in one step:
+legion exec --instance user-42 --direct -- python3 -c 'print(42)'
+```
+
+Over MCP, `legion_exec_ticket_mint` returns the same fields. The ticket is a
+credential: single use, one node, one allocation, one command. Its holder
+reaches the worker on the mutual-TLS worker plane, trusting only the `caPem`
+the reply carries and the name `<node>.node.legion`. The worker must opt in
+with `exec = { direct = true }`, and the manager must run workload identity.
 
 ## 7. State store introspection + saved query library
 

@@ -399,27 +399,55 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 crate::structs::WorkerEdgeBootConfigFull::default()
             })
         };
-    let edge_boot = if edge_boot_config.accept_claims {
-        Some(Arc::new(build_edge_boot_runtime(
+    // Direct exec: this node admits exec tickets on `Worker.ExecTask` only
+    // when its worker config says `exec = { direct = true }`.
+    let exec_direct = worker_exec_config(&config.security).direct;
+    // One JWKS cache serves every ticket this node verifies (boot and
+    // exec), fetched over TLS pinned to the cluster CA.
+    let jwks = if edge_boot_config.accept_claims || exec_direct {
+        Some(Arc::new(build_jwks_verifier(
             &edge_boot_config,
             &manager_addr,
-            &name,
             &config.pool,
-            client.clone(),
-            credentials.clone(),
         )?))
     } else {
         None
     };
+    let edge_boot = match (&jwks, edge_boot_config.accept_claims) {
+        (Some(jwks), true) => Some(Arc::new(crate::worker::server::EdgeBootRuntime {
+            verifier: jwks.clone(),
+            spec_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            node_id: name.clone(),
+            ratifier: Arc::new(ManagerClaimRatifier {
+                client: client.clone(),
+                credentials: credentials.clone(),
+            }),
+        })),
+        _ => None,
+    };
     if edge_boot.is_some() {
         info!(worker = %name, pool = %config.pool, "Edge boot enabled: this node accepts boot tickets");
     }
+    let direct_exec = match (&jwks, exec_direct) {
+        (Some(jwks), true) => {
+            info!(worker = %name, "Direct exec enabled: this node accepts exec tickets");
+            Some(Arc::new(
+                crate::worker::direct_exec::ExecTicketVerifier::new(
+                    jwks.clone(),
+                    name.clone(),
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                ),
+            ))
+        }
+        _ => None,
+    };
 
     let worker_node = WorkerDaemonService {
         node_id: name.clone(),
         task_manager: task_manager.clone(),
         identity: Some(identity_manager.clone()),
         edge_boot: edge_boot.clone(),
+        direct_exec,
     };
     let worker_router = Server::builder().add_service(WorkerServer::new(worker_node));
 
@@ -642,16 +670,25 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     Ok(())
 }
 
-/// Assemble this node's edge-boot runtime: the JWKS-backed ticket verifier,
-/// the spec cache, and the ratifier that calls the manager.
-fn build_edge_boot_runtime(
+/// The worker type's `exec` block, from the security payload.
+fn worker_exec_config(security: &str) -> crate::structs::WorkerExecConfig {
+    if security.trim().is_empty() {
+        return Default::default();
+    }
+    serde_json::from_str::<crate::structs::WorkerSecurityConfig>(security)
+        .ok()
+        .and_then(|config| config.exec)
+        .unwrap_or_default()
+}
+
+/// This node's ticket verifier: the cluster JWKS, cached, with the
+/// edge-boot block's refresh and clock-skew settings. Boot tickets and exec
+/// tickets share it.
+fn build_jwks_verifier(
     config: &crate::structs::WorkerEdgeBootConfigFull,
     manager_addr: &str,
-    node_id: &str,
     pool: &str,
-    client: ManagerClient<Channel>,
-    credentials: Arc<WorkerCredentials>,
-) -> R<crate::worker::server::EdgeBootRuntime> {
+) -> R<crate::worker::boot_ticket::BootTicketVerifier> {
     let refresh = humantime::parse_duration(&config.jwks_refresh)
         .unwrap_or(crate::worker::boot_ticket::DEFAULT_JWKS_REFRESH);
     let skew = humantime::parse_duration(&config.clock_skew)
@@ -663,23 +700,15 @@ fn build_edge_boot_runtime(
     // The JWKS rides the same pinned TLS as every other manager call: keys
     // an on-path attacker could swap would let it forge tickets.
     let verifier = crate::worker::plane::manager_verifier(manager_addr)
-        .context("edge boot needs the manager's CA pin to fetch the JWKS over TLS")?;
+        .context("ticket verification needs the manager's CA pin to fetch the JWKS over TLS")?;
     let source = Box::new(crate::worker::boot_ticket::PinnedJwksSource::new(
         manager_addr,
         verifier,
         Duration::from_secs(5),
     )?);
-    Ok(crate::worker::server::EdgeBootRuntime {
-        verifier: Arc::new(crate::worker::boot_ticket::BootTicketVerifier::new(
-            source, issuer, pool, refresh, skew,
-        )),
-        spec_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        node_id: node_id.to_string(),
-        ratifier: Arc::new(ManagerClaimRatifier {
-            client,
-            credentials,
-        }),
-    })
+    Ok(crate::worker::boot_ticket::BootTicketVerifier::new(
+        source, issuer, pool, refresh, skew,
+    ))
 }
 
 /// Ratifies claims by calling the manager's `RatifyClaim`, authenticated with
@@ -1593,6 +1622,7 @@ async fn heartbeat_tick(
                 }
             }
         };
+        let exec_audit = crate::worker::direct_exec::take_audit();
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             content_locations: content_report
                 .as_ref()
@@ -1619,6 +1649,8 @@ async fn heartbeat_tick(
                     message: report.message,
                 })
                 .collect(),
+            exec_audit: exec_audit.clone(),
+            exec_sessions: crate::worker::direct_exec::open_sessions(),
         }));
 
         let response = match client_clone.heartbeat(req).await {
@@ -1641,6 +1673,9 @@ async fn heartbeat_tick(
                 // Same for checkpoint outcomes; the manager would re-send the
                 // request anyway, but a capture should not wait a heartbeat.
                 manager.requeue_snapshot_reports(snapshot_reports_for_redrive);
+                // And the direct exec audit, so a dead connection loses no
+                // record of who opened a shell.
+                crate::worker::direct_exec::restore_audit(exec_audit);
                 if let Some(denials) = forwarder.context().denials() {
                     denials.restore(net_denials_for_redrive);
                 }
@@ -1660,6 +1695,7 @@ async fn heartbeat_tick(
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let reply = response.into_inner();
         served_interval = reply.next_interval_seconds;
+        crate::worker::direct_exec::apply_revocations(&reply.revoked_exec_sessions);
         if let Some(pending) = content_report {
             CONTENT_ADVERTISER
                 .lock()
@@ -4033,6 +4069,7 @@ mod tests {
         let reply = HeartbeatReply {
             content_resync: false,
             cluster_ca_pin: String::new(),
+            revoked_exec_sessions: Vec::new(),
             net_policies: Vec::new(),
             claim_verdicts: Vec::new(),
             next_interval_seconds: None,

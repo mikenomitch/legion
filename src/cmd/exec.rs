@@ -3,6 +3,11 @@
 //! One-shot (`legion exec 42 -- cat /etc/hostname`) or interactive
 //! (`legion exec 42 -it -- /bin/sh`). Streams stdin/stdout/stderr over the
 //! manager's `ExecAllocation` bidi RPC and exits with the remote exit code.
+//!
+//! With `--direct` (docs/exec-and-actions.md, "Direct exec") it mints an
+//! exec ticket from the manager instead, and runs the session against the
+//! worker's own `ExecTask`, verifying the worker by the cluster CA and its
+//! node name.
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use tokio::sync::mpsc;
@@ -10,10 +15,12 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::cmd::helpers::{connect_manager_client, friendly_status};
 use crate::prelude::*;
+use crate::structs::worker_client::WorkerClient;
 use crate::structs::{
     exec_client_frame, exec_server_frame, ExecClientFrame, ExecInput, ExecResize, ExecStart,
-    ExecWinsize, GetLedgerRequest,
+    ExecWinsize, GetLedgerRequest, MintExecTicketRequest,
 };
+use tonic::transport::Channel;
 
 pub fn config() -> Command {
     Command::new("exec")
@@ -30,10 +37,27 @@ pub fn config() -> Command {
                 .required(false),
         )
         .arg(
+            Arg::new("instance")
+                .long("instance")
+                .value_name("ID")
+                .conflicts_with_all(["allocation", "job"])
+                .help("Target an instance: its current allocation, across reschedules and resumes")
+                .required(false),
+        )
+        .arg(
             Arg::new("task")
                 .long("task")
                 .help("Task name within the allocation (for multi-task allocations)")
                 .required(false),
+        )
+        .arg(
+            Arg::new("direct")
+                .long("direct")
+                .help(
+                    "Mint an exec ticket and run the session against the worker directly, \
+                     with no manager on the data path (the worker must set exec.direct)",
+                )
+                .action(ArgAction::SetTrue),
         )
         .arg(
             Arg::new("stdin")
@@ -75,9 +99,44 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 
     let mut client = connect_manager_client().await?;
 
-    let allocation_id = resolve_allocation(&mut client, matches).await?;
+    let instance_id = matches
+        .get_one::<String>("instance")
+        .cloned()
+        .unwrap_or_default();
+    let allocation_id = if instance_id.is_empty() {
+        resolve_allocation(&mut client, matches).await?
+    } else {
+        0
+    };
 
     let winsize = if tty { current_winsize() } else { None };
+
+    if matches.get_flag("direct") {
+        let reply = crate::cmd::exec_ticket::mint(
+            &mut client,
+            MintExecTicketRequest {
+                allocation_id,
+                instance_id,
+                task_name: task.clone(),
+                command: command.clone(),
+                tty,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| friendly_status("exec", e))?;
+        let worker = crate::cmd::exec_ticket::worker_client(&reply).await?;
+        let start = ExecStart {
+            allocation_id: reply.allocation_id,
+            task_name: task,
+            command,
+            tty,
+            winsize,
+            exec_ticket: reply.ticket,
+            ..Default::default()
+        };
+        return run_session(ExecTarget::Worker(worker), start, want_stdin, tty).await;
+    }
 
     let start = ExecStart {
         allocation_id,
@@ -88,9 +147,18 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         tty,
         winsize,
         bearer_token: String::new(),
+        instance_id,
+        exec_ticket: String::new(),
     };
 
-    run_session(&mut client, start, want_stdin, tty).await
+    run_session(ExecTarget::Manager(&mut client), start, want_stdin, tty).await
+}
+
+/// Where a session's stream goes: the manager's proxy, or a worker
+/// directly with an exec ticket.
+pub(crate) enum ExecTarget<'a> {
+    Manager(&'a mut crate::cmd::helpers::AuthedManagerClient),
+    Worker(WorkerClient<Channel>),
 }
 
 /// Resolve which allocation to target: an explicit id, or the newest running
@@ -138,13 +206,13 @@ pub(crate) async fn run_action_session(
     want_stdin: bool,
     tty: bool,
 ) -> R<()> {
-    run_session(client, start, want_stdin, tty).await
+    run_session(ExecTarget::Manager(client), start, want_stdin, tty).await
 }
 
 /// Drive the bidi exec stream: pump local stdin/resize up, remote output down,
 /// and exit with the remote code.
 async fn run_session(
-    client: &mut crate::cmd::helpers::AuthedManagerClient,
+    target: ExecTarget<'_>,
     start: ExecStart,
     want_stdin: bool,
     tty: bool,
@@ -183,11 +251,23 @@ async fn run_session(
         spawn_resize_watcher(tx.clone());
     }
 
-    let mut inbound = client
-        .exec_allocation(ReceiverStream::new(rx))
-        .await
-        .map_err(|e| friendly_status("exec", e))?
-        .into_inner();
+    // The worker client lives as long as the session: dropping the last
+    // handle to its channel cancels the stream.
+    let mut worker_client = None;
+    let opened = match target {
+        ExecTarget::Manager(client) => client.exec_allocation(ReceiverStream::new(rx)).await,
+        ExecTarget::Worker(worker) => {
+            let worker = worker_client.insert(worker);
+            worker.exec_task(ReceiverStream::new(rx)).await
+        }
+    };
+    let mut inbound = match opened {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            drop(_raw_guard);
+            return Err(friendly_status("exec", status));
+        }
+    };
 
     let mut exit_code = 0;
     use std::io::Write;

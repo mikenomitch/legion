@@ -107,6 +107,11 @@ pub async fn run_manager_with(
 ) -> R<()> {
     info!("Starting manager node");
 
+    // `exec.tickets` resolves leniently in `with_defaults`; a typo there
+    // should stop the manager instead.
+    if let Some(tickets) = config.exec.as_ref().and_then(|exec| exec.tickets.as_ref()) {
+        tickets.with_defaults()?;
+    }
     let full_config = config.with_defaults();
     // Fail fast on malformed artifact/auth/node-identity config: a bad
     // matcher or unknown nodeIdentity reference should stop the manager at
@@ -3393,6 +3398,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         // the manager at startup, not the worker at its first connection.
         let security_payload = crate::structs::WorkerSecurityConfig {
             host_guard: wcp.host_guard.clone(),
+            exec: wcp.exec.clone().filter(|exec| exec.direct),
         };
         if let Some(host_guard) = &security_payload.host_guard {
             crate::structs::host_guard::HostGuard::new(host_guard)

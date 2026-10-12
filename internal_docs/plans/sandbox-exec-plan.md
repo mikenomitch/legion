@@ -2,7 +2,9 @@
 
 > **Judgement calls:** [`calls/sandbox-exec-plan_calls.md`](../calls/sandbox-exec-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-11). Nothing here is built. This plan
+**Status: IN EXECUTION** (written 2026-10-11). Phase 2 (direct exec)
+shipped on 2026-10-12 with worker-plane-auth Phases 0 to 8; its deviations
+are calls 6 and 9 to 15. The rest is below. This plan
 is the brief for implementing exec into microVM sandboxes together with
 [worker-plane-auth-plan.md](worker-plane-auth-plan.md) (PR
 [#16](https://github.com/mikenomitch/legion/pull/16)). Deliberately

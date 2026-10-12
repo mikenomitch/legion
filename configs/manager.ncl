@@ -20,6 +20,10 @@
   # still per-caller default-deny once ACLs are on. Set `enabled = false` to turn
   # off ExecAllocation and the exec WebSocket bridge entirely.
   # exec = { enabled = true },
+  # Direct exec tickets (`legion exec --direct`, `MintExecTicket`): how long a
+  # ticket can be redeemed and how long its session may run. Signed with the
+  # workload-identity key, so `workloadIdentity.enabled` must be true to mint.
+  # exec = { tickets = { defaultTtl = "60s", maxTtl = "10m", maxSession = "1h" } },
   # Telemetry: Prometheus /metrics plus /healthz + /readyz probes
   # (docs/metrics.md). Enabled by default; binds server.port + 2 (4749 here)
   # unless `port` is set. Set `enabled = false` to turn the listener off.

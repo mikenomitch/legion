@@ -969,6 +969,7 @@ fn tool_defs() -> Vec<ToolDef> {
                     "job": { "type": "string", "description": "Job name (used to pick the newest running allocation when allocation_id is omitted)." },
                     "action": { "type": "string", "description": "Action name." },
                     "allocation_id": { "type": "integer", "description": "Target allocation id; defaults to the newest running allocation of the job." },
+                    "instance_id": { "type": "string", "description": "Target an instance instead: the manager resolves it to its current allocation, across reschedules and resumes." },
                     "params": { "type": "object", "description": "Action parameters as a string->string map.", "additionalProperties": { "type": "string" } }
                 },
                 "required": ["job", "action"],
@@ -982,11 +983,32 @@ fn tool_defs() -> Vec<ToolDef> {
             input_schema: || json!({
                 "type": "object",
                 "properties": {
-                    "allocation_id": { "type": "integer", "description": "Target allocation id." },
+                    "allocation_id": { "type": "integer", "description": "Target allocation id. Use this or instance_id." },
+                    "instance_id": { "type": "string", "description": "Target an instance: the manager resolves it to its current allocation, across reschedules and resumes." },
                     "command": { "type": "array", "items": { "type": "string" }, "description": "Command argv; first element is the program." },
                     "task": { "type": "string", "description": "Task name, for multi-task allocations." }
                 },
-                "required": ["allocation_id", "command"],
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_exec_ticket_mint",
+            description: "Mint an exec ticket for direct exec (docs/exec-and-actions.md, \"Direct exec\"): a short-lived, single-use credential that lets a client open ONE session on the worker running the target, with no manager on the data path. Authorized exactly like legion_exec_run (exec:write on the job, host for host-level runtimes) or legion_action_run (action:write) for an action ticket. Returns the ticket, the worker address, the node name its certificate carries, the cluster CA to verify it with, and when the ticket stops being redeemable. The ticket opens a shell, so treat it as a secret. Mutating (it grants a session); writes nothing to the cluster.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "allocation_id": { "type": "integer", "description": "Target allocation id. Use this or instance_id." },
+                    "instance_id": { "type": "string", "description": "Target instance, resolved to its current allocation." },
+                    "task": { "type": "string", "description": "Task name, for multi-task allocations." },
+                    "command": { "type": "array", "items": { "type": "string" }, "description": "The argv the ticket allows. Omit (with no action) to allow any command." },
+                    "action": { "type": "string", "description": "Mint for a declared action instead; the manager renders its argv." },
+                    "params": { "type": "object", "description": "Action parameters as a string->string map.", "additionalProperties": { "type": "string" } },
+                    "tty": { "type": "boolean", "description": "Whether the session is interactive." },
+                    "ttl": { "type": "string", "description": "Redeem window, e.g. 30s. Default 60s, at most exec.tickets.maxTtl (10m)." },
+                    "max_session": { "type": "string", "description": "How long the session may run, e.g. 15m. Default and ceiling exec.tickets.maxSession (1h)." }
+                },
                 "additionalProperties": false
             }),
             mutates: true,
@@ -1316,8 +1338,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 })
                 .unwrap_or_default();
             let mut client = connect().await?;
+            let instance_id = opt_str_arg(&args, "instance_id").unwrap_or_default();
             let allocation_id = match args.get("allocation_id").and_then(Value::as_i64) {
                 Some(id) => id,
+                None if !instance_id.is_empty() => 0,
                 None => newest_alloc_for_job(&mut client, &job).await?,
             };
             let start = ExecStart {
@@ -1329,14 +1353,61 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 tty: false,
                 winsize: None,
                 bearer_token: String::new(),
+                instance_id,
+                exec_ticket: String::new(),
             };
             run_exec_oneshot(&mut client, start).await
         }
-        "legion_exec_run" => {
+        "legion_exec_ticket_mint" => {
+            let params: std::collections::HashMap<String, String> = args
+                .get("params")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let command: Vec<String> = args
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let instance_id = opt_str_arg(&args, "instance_id").unwrap_or_default();
             let allocation_id = args
                 .get("allocation_id")
                 .and_then(Value::as_i64)
-                .ok_or_else(|| "missing integer argument: allocation_id".to_string())?;
+                .unwrap_or_default();
+            if allocation_id == 0 && instance_id.is_empty() {
+                return Err("name the target: allocation_id or instance_id".to_string());
+            }
+            let mut client = connect().await?;
+            grpc(
+                client.mint_exec_ticket(crate::structs::MintExecTicketRequest {
+                    allocation_id,
+                    instance_id,
+                    task_name: opt_str_arg(&args, "task").unwrap_or_default(),
+                    command,
+                    action: opt_str_arg(&args, "action").unwrap_or_default(),
+                    action_params: params,
+                    tty: args.get("tty").and_then(Value::as_bool).unwrap_or(false),
+                    ttl: opt_str_arg(&args, "ttl").unwrap_or_default(),
+                    max_session: opt_str_arg(&args, "max_session").unwrap_or_default(),
+                }),
+            )
+            .await
+        }
+        "legion_exec_run" => {
+            let instance_id = opt_str_arg(&args, "instance_id").unwrap_or_default();
+            let allocation_id = match args.get("allocation_id").and_then(Value::as_i64) {
+                Some(id) => id,
+                None if !instance_id.is_empty() => 0,
+                None => return Err("missing argument: allocation_id or instance_id".to_string()),
+            };
             let command: Vec<String> = args
                 .get("command")
                 .and_then(Value::as_array)
@@ -1358,6 +1429,8 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 tty: false,
                 winsize: None,
                 bearer_token: String::new(),
+                instance_id,
+                exec_ticket: String::new(),
             };
             let mut client = connect().await?;
             run_exec_oneshot(&mut client, start).await

@@ -63,23 +63,24 @@ use crate::structs::{
     ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
     ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
     ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest,
-    ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node,
-    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
-    PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent,
-    RaftStatus, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest,
-    RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest,
-    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
-    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
-    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RotateMeshCaReply,
-    RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest,
-    SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, ServiceEdge,
-    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
-    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
-    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
-    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
-    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest,
+    MintExecTicketReply, MintExecTicketRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
+    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
+    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
+    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
+    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
+    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
+    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
+    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
+    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
+    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
+    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
+    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
+    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
@@ -1478,6 +1479,8 @@ pub struct ManagerDaemonService {
     /// Whether `ExecAllocation` is enabled (config `exec.enabled`, default
     /// true). When false the endpoint rejects with FailedPrecondition.
     exec_enabled: bool,
+    /// Direct-exec ticket lifetimes (`exec.tickets`).
+    exec_tickets: crate::structs::ExecTicketsConfigFull,
     /// Edge boot settings (`edgeBoot`, docs/edge-boot.md). Disabled by
     /// default: with `enabled: false` no ticket can be minted and no claim
     /// ratified, so a cluster that upgrades and changes nothing grows no new
@@ -1564,6 +1567,7 @@ impl ManagerDaemonService {
                 crate::artifacts::FetcherRegistry::with_builtins(),
             )),
             exec_enabled: true,
+            exec_tickets: crate::structs::ExecTicketsConfigFull::default(),
             edge_boot: crate::structs::EdgeBootConfigFull::default(),
             provisional_claims: Arc::new(Mutex::new(HashMap::new())),
             ca_pin_cache: Arc::new(Mutex::new(None)),
@@ -2296,6 +2300,7 @@ impl ManagerDaemonService {
             .map(|identity| identity.name.clone())
             .collect();
         service.exec_enabled = config.exec.enabled;
+        service.exec_tickets = config.exec.tickets.clone();
         service.heartbeat = config.heartbeat.clone();
         service.eval_threads = config.eval_threads.max(1);
         service
@@ -4160,6 +4165,58 @@ impl Manager for ManagerDaemonService {
         Ok(Response::new(ReceiverStream::new(out_rx)))
     }
 
+    /// Mint a direct-exec ticket (docs/exec-and-actions.md, "Direct exec").
+    /// ACL: the coarse `exec`/`action` gate here, before anything is
+    /// looked up; the precise scope inside `mint_exec_ticket`, which runs
+    /// `ExecAllocation`'s own resolution.
+    #[instrument(skip_all, fields(allocation_id, instance_id))]
+    async fn mint_exec_ticket(
+        &self,
+        request: Request<MintExecTicketRequest>,
+    ) -> Result<Response<MintExecTicketReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
+        if !identity.would_allow(AclResource::Exec, AclAction::Write, &AclScope::any())
+            && !identity.would_allow(AclResource::Action, AclAction::Write, &AclScope::any())
+        {
+            acl::enforce(
+                &identity,
+                AclResource::Exec,
+                AclAction::Write,
+                &AclScope::any(),
+            )?;
+        }
+        let req = request.into_inner();
+        tracing::Span::current().record("allocation_id", req.allocation_id);
+        tracing::Span::current().record("instance_id", req.instance_id.as_str());
+        if !self.exec_enabled {
+            return Err(Status::failed_precondition(
+                "exec is disabled on this manager (exec.enabled=false)",
+            ));
+        }
+        let Some(state) = self.workload_identity.as_ref() else {
+            return Err(Status::failed_precondition(
+                "exec tickets are signed by the workload-identity issuer, which is not enabled \
+                 on this manager\nHint: set workloadIdentity.enabled: true in the manager \
+                 config, or exec through the manager (drop --direct)",
+            ));
+        };
+        let store = self.store.clone();
+        let state = state.clone();
+        let limits = self.exec_tickets.clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            crate::manager::exec::mint_exec_ticket(
+                &store,
+                &identity,
+                &state,
+                &limits,
+                &req,
+                std::time::SystemTime::now(),
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("mint task failed: {e}")))??;
+        Ok(Response::new(reply))
+    }
     #[instrument(skip_all)]
     async fn list_job_actions(
         &self,
@@ -6716,6 +6773,42 @@ impl Manager for ManagerDaemonService {
             .served_interval()
             .map(|interval| interval.as_secs() as u32);
 
+        // Direct exec (docs/exec-and-actions.md, "Direct exec"): finished
+        // sessions join the `exec_audit` log the proxied path writes, and
+        // open ones are re-checked against their minting token, as the
+        // proxied path re-checks every 30 seconds.
+        for record in &req.exec_audit {
+            // The same `subject` shape the proxied path logs. An action's
+            // rendered argv can hold sensitive parameter values, so workers
+            // never report it: the action's name stands in.
+            let session = if record.action.is_empty() {
+                format!("exec:{}", record.command.join(" "))
+            } else {
+                format!("action:{}", record.action)
+            };
+            info!(
+                target: "exec_audit",
+                node_id = %id,
+                jti = %record.jti,
+                minted_by = %record.subject,
+                allocation_id = record.allocation_id,
+                job_id = %record.job,
+                task = %record.task,
+                subject = %session,
+                tty = record.tty,
+                exit_code = record.exit_code,
+                started_at = record.started_at,
+                ended_at = record.ended_at,
+                ended_by = %record.ended_by,
+                "direct exec session ended"
+            );
+        }
+        let revoked_exec_sessions = if req.exec_sessions.is_empty() {
+            Vec::new()
+        } else {
+            crate::manager::exec::revoked_exec_sessions(&self.store, &self.auth, &req.exec_sessions)
+        };
+
         let reply = HeartbeatReply {
             net_policies,
             message: "ack".into(),
@@ -6728,6 +6821,7 @@ impl Manager for ManagerDaemonService {
             checkpoint_requests,
             content_resync,
             cluster_ca_pin: self.cluster_ca_pin(),
+            revoked_exec_sessions,
         };
 
         Ok(Response::new(reply))
@@ -15923,6 +16017,203 @@ mod tests {
             })))
             .expect_err("unknown instance");
         assert_eq!(status.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    /// Direct exec (docs/exec-and-actions.md, "Direct exec"): a ticket is
+    /// minted for exactly the callers `ExecAllocation` would admit for the
+    /// same target, and the ticket names what was authorized.
+    #[tokio::test]
+    async fn mint_exec_ticket_admits_exactly_what_exec_allocation_admits_test() -> R<()> {
+        use crate::structs::acl::{AclIdentity, AclRule, AclSource};
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        run_jobspec(
+            &manager,
+            json!({
+                "name": "shell",
+                "task": {
+                    "name": "main",
+                    "runtime": "exec",
+                    "config": { "command": ["sleep", "600"] },
+                    "actions": [{ "name": "flush", "command": ["echo", "flushed"] }]
+                }
+            }),
+        )
+        .await?;
+        store.insert_node(NodeMsg {
+            id: "node-1".into(),
+            pool: "default".into(),
+            status: "active".into(),
+            availability: "available".into(),
+            config_attrs: json!({ "workerAddress": "https://10.0.3.17:4848" }).to_string(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: json!({
+                "protocolVersion": crate::manager::worker_plane::MIN_WORKER_PLANE_PROTOCOL
+            })
+            .to_string(),
+            health_checks: "{}".into(),
+            last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
+        })?;
+        let config = store.get_job_config("shell")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&config)?
+            .into_iter()
+            .next()
+            .context("task config")?;
+        let alloc = store.place_alloc("node-1", task_id)?;
+
+        let issuer = crate::manager::workload_identity::WorkloadIdentityState::initialize(
+            &store,
+            &crate::structs::WorkloadIdentityConfigFull {
+                enabled: true,
+                ..Default::default()
+            },
+            "http://127.0.0.1:4747",
+            std::time::SystemTime::now(),
+        )?;
+        let limits = crate::structs::ExecTicketsConfigFull::default();
+
+        let identity = |rules: Value| AclIdentity {
+            principal: "tester".into(),
+            accessor_id: Some("acc-1".into()),
+            is_management: false,
+            is_worker: false,
+            policies: vec!["p".into()],
+            rules: serde_json::from_value::<Vec<AclRule>>(rules).expect("rules"),
+            source: AclSource::Token,
+            expires_at: None,
+            audit_only: false,
+        };
+        let exec_host = identity(json!([
+            { "resources": ["exec"], "actions": ["write"], "names": ["shell"], "host": true }
+        ]));
+        let exec_no_host = identity(json!([
+            { "resources": ["exec"], "actions": ["write"], "names": ["shell"] }
+        ]));
+        let action_only = identity(json!([
+            { "resources": ["action"], "actions": ["write"], "names": ["shell"], "actionNames": ["flush"] }
+        ]));
+        let other_job = identity(json!([
+            { "resources": ["exec"], "actions": ["write"], "names": ["other"], "host": true }
+        ]));
+        let reader = identity(json!([{ "resources": ["job"], "actions": ["read"] }]));
+
+        let command = MintExecTicketRequest {
+            allocation_id: alloc.id,
+            command: vec!["/bin/sh".into()],
+            tty: true,
+            ..Default::default()
+        };
+        let action = MintExecTicketRequest {
+            allocation_id: alloc.id,
+            action: "flush".into(),
+            ..Default::default()
+        };
+        for (name, who) in [
+            ("exec with host", &exec_host),
+            ("exec without host", &exec_no_host),
+            ("action only", &action_only),
+            ("another job", &other_job),
+            ("reader", &reader),
+        ] {
+            for request in [&command, &action] {
+                let start = crate::structs::ExecStart {
+                    allocation_id: request.allocation_id,
+                    command: request.command.clone(),
+                    action: request.action.clone(),
+                    tty: request.tty,
+                    ..Default::default()
+                };
+                let proxied = crate::manager::exec::resolve_for_test(&store, who, &start);
+                let minted = crate::manager::exec::mint_exec_ticket(
+                    &store,
+                    who,
+                    &issuer,
+                    &limits,
+                    request,
+                    std::time::SystemTime::now(),
+                );
+                assert_eq!(
+                    proxied.is_ok(),
+                    minted.is_ok(),
+                    "{name} / {:?}: proxied {:?}, minted {:?}",
+                    request.action,
+                    proxied.err(),
+                    minted.err()
+                );
+                if let Err(status) = minted {
+                    assert_eq!(status.code(), tonic::Code::PermissionDenied, "{name}");
+                }
+            }
+        }
+
+        // The ticket names what was authorized, on the allocation's node.
+        let reply = crate::manager::exec::mint_exec_ticket(
+            &store,
+            &action_only,
+            &issuer,
+            &limits,
+            &action,
+            std::time::SystemTime::now(),
+        )?;
+        assert_eq!(reply.node, "node-1");
+        assert_eq!(reply.worker_address, "https://10.0.3.17:4848");
+        let claims = crate::structs::exec_ticket::ExecTicketClaims::from_claims(&issuer.verify(
+            &reply.ticket,
+            crate::structs::exec_ticket::EXEC_TICKET_AUDIENCE,
+        )?)?;
+        assert_eq!(claims.allocation_id, alloc.id);
+        assert_eq!(claims.action.as_deref(), Some("flush"));
+        assert_eq!(
+            claims.argv,
+            Some(vec!["echo".to_string(), "flushed".to_string()])
+        );
+        assert_eq!(claims.sub, "accessor:acc-1");
+        assert_eq!(claims.max_session, 3600);
+
+        // A redeem window above the manager's ceiling is refused by name.
+        let status = crate::manager::exec::mint_exec_ticket(
+            &store,
+            &exec_host,
+            &issuer,
+            &limits,
+            &MintExecTicketRequest {
+                ttl: "1h".into(),
+                ..command.clone()
+            },
+            std::time::SystemTime::now(),
+        )
+        .expect_err("above the ceiling");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("exec.tickets"),
+            "{}",
+            status.message()
+        );
+
+        // A session never outlives the credential that minted it.
+        let expiring = AclIdentity {
+            expires_at: Some(
+                (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+                    .format(&time::format_description::well_known::Rfc3339)?,
+            ),
+            ..exec_host.clone()
+        };
+        let reply = crate::manager::exec::mint_exec_ticket(
+            &store,
+            &expiring,
+            &issuer,
+            &limits,
+            &command,
+            std::time::SystemTime::now(),
+        )?;
+        assert!(
+            reply.max_session_seconds <= 300,
+            "{}",
+            reply.max_session_seconds
+        );
         Ok(())
     }
 }

@@ -9972,6 +9972,32 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   contentLocations?: ContentLocationReport;
 
+  /**
+   * Direct exec sessions this worker has finished since its last heartbeat
+   * (docs/exec-and-actions.md, "Direct exec"): one record per redeemed exec
+   * ticket, so the manager's `exec_audit` log holds direct sessions as it
+   * holds proxied ones. Restored and re-sent on a failed heartbeat; a
+   * worker keeps at most 1,024 records and drops the oldest past that, with
+   * a warning.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated legion.ExecAuditRecord exec_audit = 15;
+   */
+  execAudit: ExecAuditRecord[] = [];
+
+  /**
+   * Direct exec sessions open on this worker right now. The manager checks
+   * each one's minting credential again, as the proxied path does every 30
+   * seconds, and names the sessions that no longer hold in
+   * `HeartbeatReply.revoked_exec_sessions`.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated legion.ExecSessionRef exec_sessions = 16;
+   */
+  execSessions: ExecSessionRef[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9994,6 +10020,8 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 12, name: "pressure_actions", kind: "message", T: PressureAction, repeated: true },
     { no: 13, name: "snapshot_reports", kind: "message", T: SnapshotReport, repeated: true },
     { no: 14, name: "content_locations", kind: "message", T: ContentLocationReport, opt: true },
+    { no: 15, name: "exec_audit", kind: "message", T: ExecAuditRecord, repeated: true },
+    { no: 16, name: "exec_sessions", kind: "message", T: ExecSessionRef, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -10010,6 +10038,244 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
 
   static equals(a: HeartbeatRequest | PlainMessage<HeartbeatRequest> | undefined, b: HeartbeatRequest | PlainMessage<HeartbeatRequest> | undefined): boolean {
     return proto3.util.equals(HeartbeatRequest, a, b);
+  }
+}
+
+/**
+ * One finished (or refused-after-verification) direct exec session.
+ *
+ * @generated from message legion.ExecAuditRecord
+ */
+export class ExecAuditRecord extends Message<ExecAuditRecord> {
+  /**
+   * The ticket's `jti`.
+   *
+   * @generated from field: string jti = 1;
+   */
+  jti = "";
+
+  /**
+   * The ticket's `sub`: `accessor:<id>` of the minting token, or
+   * `principal:<name>` for a credential without an accessor.
+   *
+   * @generated from field: string subject = 2;
+   */
+  subject = "";
+
+  /**
+   * @generated from field: int64 allocation_id = 3;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * @generated from field: string job = 4;
+   */
+  job = "";
+
+  /**
+   * @generated from field: string task = 5;
+   */
+  task = "";
+
+  /**
+   * The argv that ran. Empty for an action session: a rendered action argv
+   * can carry sensitive parameter values, so only `action` is reported.
+   *
+   * @generated from field: repeated string command = 6;
+   */
+  command: string[] = [];
+
+  /**
+   * Set when the ticket was minted for an action.
+   *
+   * @generated from field: string action = 7;
+   */
+  action = "";
+
+  /**
+   * @generated from field: bool tty = 8;
+   */
+  tty = false;
+
+  /**
+   * The process's exit code; -1 when it was killed or never reported one.
+   *
+   * @generated from field: int32 exit_code = 9;
+   */
+  exitCode = 0;
+
+  /**
+   * Unix seconds.
+   *
+   * @generated from field: int64 started_at = 10;
+   */
+  startedAt = protoInt64.zero;
+
+  /**
+   * @generated from field: int64 ended_at = 11;
+   */
+  endedAt = protoInt64.zero;
+
+  /**
+   * Why the session ended when the process did not end it:
+   * `"max_session"`, `"revoked: <reason>"`, `"client disconnected"`.
+   *
+   * @generated from field: string ended_by = 12;
+   */
+  endedBy = "";
+
+  constructor(data?: PartialMessage<ExecAuditRecord>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecAuditRecord";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "jti", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "subject", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "command", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "action", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "tty", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 9, name: "exit_code", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 10, name: "started_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 11, name: "ended_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 12, name: "ended_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecAuditRecord {
+    return new ExecAuditRecord().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecAuditRecord {
+    return new ExecAuditRecord().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecAuditRecord {
+    return new ExecAuditRecord().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecAuditRecord | PlainMessage<ExecAuditRecord> | undefined, b: ExecAuditRecord | PlainMessage<ExecAuditRecord> | undefined): boolean {
+    return proto3.util.equals(ExecAuditRecord, a, b);
+  }
+}
+
+/**
+ * A direct exec session open on a worker, for the manager's re-check.
+ *
+ * @generated from message legion.ExecSessionRef
+ */
+export class ExecSessionRef extends Message<ExecSessionRef> {
+  /**
+   * @generated from field: string jti = 1;
+   */
+  jti = "";
+
+  /**
+   * The ticket's `sub`.
+   *
+   * @generated from field: string subject = 2;
+   */
+  subject = "";
+
+  /**
+   * @generated from field: string job = 3;
+   */
+  job = "";
+
+  /**
+   * Set for an action ticket: re-checked as `action:write` on the (job,
+   * action), or `exec:write` on the job.
+   *
+   * @generated from field: string action = 4;
+   */
+  action = "";
+
+  /**
+   * @generated from field: int64 allocation_id = 5;
+   */
+  allocationId = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ExecSessionRef>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecSessionRef";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "jti", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "subject", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "action", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecSessionRef {
+    return new ExecSessionRef().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecSessionRef {
+    return new ExecSessionRef().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecSessionRef {
+    return new ExecSessionRef().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecSessionRef | PlainMessage<ExecSessionRef> | undefined, b: ExecSessionRef | PlainMessage<ExecSessionRef> | undefined): boolean {
+    return proto3.util.equals(ExecSessionRef, a, b);
+  }
+}
+
+/**
+ * A direct exec session the worker must end.
+ *
+ * @generated from message legion.RevokedExecSession
+ */
+export class RevokedExecSession extends Message<RevokedExecSession> {
+  /**
+   * @generated from field: string jti = 1;
+   */
+  jti = "";
+
+  /**
+   * Ends the session's stream with this message, e.g. "the token that
+   * minted this session was deleted".
+   *
+   * @generated from field: string reason = 2;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<RevokedExecSession>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RevokedExecSession";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "jti", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RevokedExecSession {
+    return new RevokedExecSession().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RevokedExecSession {
+    return new RevokedExecSession().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RevokedExecSession {
+    return new RevokedExecSession().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RevokedExecSession | PlainMessage<RevokedExecSession> | undefined, b: RevokedExecSession | PlainMessage<RevokedExecSession> | undefined): boolean {
+    return proto3.util.equals(RevokedExecSession, a, b);
   }
 }
 
@@ -11027,6 +11293,20 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   clusterCaPin = "";
 
+  /**
+   * The direct exec sessions from `HeartbeatRequest.exec_sessions` whose
+   * minting credential no longer holds: the token was deleted or expired,
+   * or its policies no longer grant the session. The worker kills each
+   * session's process and ends its stream with `PermissionDenied` and the
+   * reason. This bounds revocation of a direct session to one heartbeat
+   * interval.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated legion.RevokedExecSession revoked_exec_sessions = 12;
+   */
+  revokedExecSessions: RevokedExecSession[] = [];
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11046,6 +11326,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 9, name: "checkpoint_requests", kind: "message", T: CheckpointRequest, repeated: true },
     { no: 10, name: "content_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 11, name: "cluster_ca_pin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "revoked_exec_sessions", kind: "message", T: RevokedExecSession, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -20161,6 +20442,33 @@ export class ExecStart extends Message<ExecStart> {
    */
   bearerToken = "";
 
+  /**
+   * Target an instance instead of an allocation: the manager resolves it to
+   * the instance's current allocation after the coarse ACL gate, so a
+   * caller holding a stable instance id reaches it across reschedules and
+   * resumes (each of which is a new allocation). Takes precedence over
+   * `allocation_id` when set. Manager legs only; a worker ignores it.
+   *
+   * Errors: NotFound for an unknown instance; FailedPrecondition when the
+   * instance has no running allocation (suspended, stopped, or between
+   * placements).
+   *
+   * @generated from field: string instance_id = 9;
+   */
+  instanceId = "";
+
+  /**
+   * An exec ticket from `Manager.MintExecTicket`, presented to
+   * `Worker.ExecTask` by a direct-exec client with no client certificate.
+   * `allocation_id` may be 0 (the ticket names the allocation) and
+   * `command` may be empty (the ticket's argv runs); when set they must
+   * match the ticket. `action` and `action_params` are ignored: an action
+   * ticket carries its rendered argv. Ignored on manager legs.
+   *
+   * @generated from field: string exec_ticket = 10;
+   */
+  execTicket = "";
+
   constructor(data?: PartialMessage<ExecStart>) {
     super();
     proto3.util.initPartial(data, this);
@@ -20177,6 +20485,8 @@ export class ExecStart extends Message<ExecStart> {
     { no: 6, name: "tty", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 7, name: "winsize", kind: "message", T: ExecWinsize },
     { no: 8, name: "bearer_token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "exec_ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecStart {
@@ -20553,6 +20863,222 @@ export class ExecStarted extends Message<ExecStarted> {
 
   static equals(a: ExecStarted | PlainMessage<ExecStarted> | undefined, b: ExecStarted | PlainMessage<ExecStarted> | undefined): boolean {
     return proto3.util.equals(ExecStarted, a, b);
+  }
+}
+
+/**
+ * Request payload for MintExecTicket. The target and command fields mean
+ * what they mean on `ExecStart`.
+ *
+ * @generated from message legion.MintExecTicketRequest
+ */
+export class MintExecTicketRequest extends Message<MintExecTicketRequest> {
+  /**
+   * Target allocation. Ignored when `instance_id` is set.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Target instance, resolved to its current allocation.
+   *
+   * @generated from field: string instance_id = 2;
+   */
+  instanceId = "";
+
+  /**
+   * Task within the allocation. Optional when the allocation runs one task.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Raw argv the ticket allows (`exec:write`). Empty with an empty
+   * `action` mints a ticket that allows any command in the target, which
+   * needs the same `exec:write` grant.
+   *
+   * @generated from field: repeated string command = 4;
+   */
+  command: string[] = [];
+
+  /**
+   * Action to run (`action:write`, or `exec:write`). Its argv is rendered
+   * here from the stored job spec and written into the ticket.
+   *
+   * @generated from field: string action = 5;
+   */
+  action = "";
+
+  /**
+   * Action parameter values, validated and substituted as for
+   * `ExecAllocation`. Sensitive values never appear in the audit log.
+   *
+   * @generated from field: map<string, string> action_params = 6;
+   */
+  actionParams: { [key: string]: string } = {};
+
+  /**
+   * Whether the session is interactive. For an action, the action's own
+   * `tty` wins.
+   *
+   * @generated from field: bool tty = 7;
+   */
+  tty = false;
+
+  /**
+   * How long the ticket can be redeemed, e.g. `"30s"`. Default:
+   * `exec.tickets.defaultTtl` (60s); at most `exec.tickets.maxTtl` (10m).
+   *
+   * @generated from field: string ttl = 8;
+   */
+  ttl = "";
+
+  /**
+   * How long the session may run once opened, e.g. `"15m"`. Default and
+   * ceiling: `exec.tickets.maxSession` (1h). Clamped to the minting
+   * credential's own expiry.
+   *
+   * @generated from field: string max_session = 9;
+   */
+  maxSession = "";
+
+  constructor(data?: PartialMessage<MintExecTicketRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.MintExecTicketRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "command", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "action", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "action_params", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 7, name: "tty", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "ttl", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "max_session", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): MintExecTicketRequest {
+    return new MintExecTicketRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): MintExecTicketRequest {
+    return new MintExecTicketRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): MintExecTicketRequest {
+    return new MintExecTicketRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: MintExecTicketRequest | PlainMessage<MintExecTicketRequest> | undefined, b: MintExecTicketRequest | PlainMessage<MintExecTicketRequest> | undefined): boolean {
+    return proto3.util.equals(MintExecTicketRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for MintExecTicket.
+ *
+ * @generated from message legion.MintExecTicketReply
+ */
+export class MintExecTicketReply extends Message<MintExecTicketReply> {
+  /**
+   * The ticket (a JWT). A credential: pass it to the worker in
+   * `ExecStart.exec_ticket` and nowhere else.
+   *
+   * @generated from field: string ticket = 1;
+   */
+  ticket = "";
+
+  /**
+   * The worker's advertised worker-plane address,
+   * e.g. `"https://10.0.3.17:4848"`.
+   *
+   * @generated from field: string worker_address = 2;
+   */
+  workerAddress = "";
+
+  /**
+   * The node the ticket is redeemable on. The worker's certificate names
+   * `<node>.node.legion`; a client verifies that name, not the address.
+   *
+   * @generated from field: string node = 3;
+   */
+  node = "";
+
+  /**
+   * When the ticket stops being redeemable, RFC 3339 UTC.
+   *
+   * @generated from field: string expires_at = 4;
+   */
+  expiresAt = "";
+
+  /**
+   * The cluster CA bundle, PEM: the only roots a client should trust for
+   * the worker connection.
+   *
+   * @generated from field: string ca_pem = 5;
+   */
+  caPem = "";
+
+  /**
+   * The allocation the ticket opens a session in (resolved from
+   * `instance_id` when the request named one).
+   *
+   * @generated from field: int64 allocation_id = 6;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The ticket's id, as the audit log and the worker's report name it.
+   *
+   * @generated from field: string jti = 7;
+   */
+  jti = "";
+
+  /**
+   * Seconds the session may run once opened.
+   *
+   * @generated from field: uint64 max_session_seconds = 8;
+   */
+  maxSessionSeconds = protoInt64.zero;
+
+  constructor(data?: PartialMessage<MintExecTicketReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.MintExecTicketReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "worker_address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "node", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "ca_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 7, name: "jti", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "max_session_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): MintExecTicketReply {
+    return new MintExecTicketReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): MintExecTicketReply {
+    return new MintExecTicketReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): MintExecTicketReply {
+    return new MintExecTicketReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: MintExecTicketReply | PlainMessage<MintExecTicketReply> | undefined, b: MintExecTicketReply | PlainMessage<MintExecTicketReply> | undefined): boolean {
+    return proto3.util.equals(MintExecTicketReply, a, b);
   }
 }
 

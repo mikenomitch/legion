@@ -172,7 +172,8 @@ how to measure), see
   set.
 - `GetTaskLogs`: `legion job logs`.
 - `ExecTask`: `legion exec`, actions, the UI terminal, and the MCP exec tools,
-  proxied by the manager.
+  proxied by the manager. Direct-exec clients call it too, with an exec
+  ticket ([Direct exec](exec-and-actions.md#direct-exec)).
 - `RestartWorker`: `legion node restart`. The worker refuses a request naming
   another node, so a stale address can't restart the wrong machine.
 - `StartClaim`: not called by managers. Edge routers call it with a boot
@@ -196,7 +197,7 @@ listener and no setting that turns one on.
   | RPC | Admits | Check |
   | --- | --- | --- |
   | `PostWork`, `GetTaskLogs`, `RestartWorker` | manager | a client certificate from the cluster CA carrying `legion://manager/<id>` |
-  | `ExecTask` | manager | as above |
+  | `ExecTask` | manager, ticket | a manager certificate as above, or (where the worker sets `exec = { direct = true }`) an exec ticket in the first frame, verified offline against the cluster JWKS |
   | `StartClaim` | ticket | the boot ticket in the request; a client certificate is ignored |
 
   A node's certificate is signed by the same CA, but it is not a manager

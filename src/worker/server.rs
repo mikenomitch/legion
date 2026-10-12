@@ -7,7 +7,7 @@ use crate::structs::{
 };
 use crate::worker::boot_ticket::BootTicketVerifier;
 use crate::worker::edge;
-use crate::worker::exec::{handle_exec_task, ExecTaskStream};
+use crate::worker::exec::{handle_exec_task, Admission, ExecTaskStream};
 use crate::worker::identity::WorkerIdentityManager;
 use crate::worker::task_manager::{launch_task_allocation, WorkerTaskManager};
 use std::pin::Pin;
@@ -50,6 +50,9 @@ pub struct WorkerDaemonService {
     pub identity: Option<Arc<WorkerIdentityManager>>,
     /// Edge boot support; `None` unless `edgeBoot.acceptClaims` is true.
     pub edge_boot: Option<Arc<EdgeBootRuntime>>,
+    /// Direct exec: the exec ticket verifier, `None` unless the worker
+    /// config sets `exec = { direct = true }`.
+    pub direct_exec: Option<Arc<crate::worker::direct_exec::ExecTicketVerifier>>,
 }
 #[tonic::async_trait]
 impl Worker for WorkerDaemonService {
@@ -211,16 +214,12 @@ impl Worker for WorkerDaemonService {
         // `exec.direct`) an exec ticket in the first frame. A certificate
         // that is not a manager's is refused, never downgraded to the ticket
         // path.
-        match crate::worker::plane::caller_of(&request, "ExecTask")? {
-            crate::worker::plane::Caller::Manager(_) => {}
-            crate::worker::plane::Caller::Ticket => {
-                return Err(Status::unauthenticated(
-                    "ExecTask admits a manager certificate or an exec ticket; this request \
-                     carried neither",
-                ));
-            }
-        }
-        let stream = handle_exec_task(self.task_manager.clone(), request.into_inner()).await?;
+        let admission = match crate::worker::plane::caller_of(&request, "ExecTask")? {
+            crate::worker::plane::Caller::Manager(_) => Admission::Manager,
+            crate::worker::plane::Caller::Ticket => Admission::Ticket(self.direct_exec.clone()),
+        };
+        let stream =
+            handle_exec_task(self.task_manager.clone(), request.into_inner(), admission).await?;
         Ok(Response::new(stream))
     }
 
@@ -253,11 +252,20 @@ impl Worker for WorkerDaemonService {
         // Every check below is local. A node cut off from every manager can
         // still get all the way to `booted`; only the ratification needs the
         // control plane, and it runs in parallel with the boot.
+        // Off the async runtime: a verification can refresh the JWKS, which
+        // blocks.
         let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-        let claims = edge_boot
-            .verifier
-            .verify(&req.ticket, &req.instance_id, now_unix)
-            .map_err(|err| Status::permission_denied(format!("boot ticket rejected: {err:#}")))?;
+        let claims = {
+            let verifier = edge_boot.verifier.clone();
+            let ticket = req.ticket.clone();
+            let instance_id = req.instance_id.clone();
+            tokio::task::spawn_blocking(move || verifier.verify(&ticket, &instance_id, now_unix))
+                .await
+                .map_err(|e| Status::internal(format!("ticket verification panicked: {e}")))?
+                .map_err(|err| {
+                    Status::permission_denied(format!("boot ticket rejected: {err:#}"))
+                })?
+        };
 
         let task = {
             let cache = edge_boot.spec_cache.lock().expect("spec cache");
