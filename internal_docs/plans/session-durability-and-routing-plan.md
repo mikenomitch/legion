@@ -2,7 +2,10 @@
 
 > **Judgement calls:** [`calls/session-durability-and-routing-plan_calls.md`](../calls/session-durability-and-routing-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-12). Builds on session mode from
+**Status: IN EXECUTION** in [#36](https://github.com/mikenomitch/legion/pull/36):
+Phases 1–4 are built and tested; Phase 5 is in progress; Phase 6 stays
+conditional. Deviations are recorded in the calls doc (entries from 15
+on). Written 2026-10-12. Builds on session mode from
 [sandbox-scaling-plan.md](sandbox-scaling-plan.md) Phase 6, shipped in
 [#30](https://github.com/mikenomitch/legion/pull/30); `src/` citations
 are at `main` after that merge (`4a2fee3`). This

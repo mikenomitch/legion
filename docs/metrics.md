@@ -797,6 +797,17 @@ that has never taken a provisional start.
   It makes started-but-unconfirmed capacity visible. A value that does not
   return to zero means claims are leaking.
 
+Session starts on the node ([session-mode.md](session-mode.md)) add two:
+
+- **`legion_worker_launch_refusals_total`** (counter): provisional starts
+  (sessions and claims) refused because no launch slot freed within
+  `edgeBoot.queueTimeout`. Each one answered `RESOURCE_EXHAUSTED` and the
+  caller tried another node. A steady rise means starts arrive faster than
+  `edgeBoot.launchConcurrency` launches finish.
+- **`legion_worker_edge_session_starts_total`** (counter): sessions this
+  node started from a session ticket (`Worker.StartSession`), not counting
+  deduplicated retries.
+
 #### Simulated fleets
 
 `legion start worker --simulate N`

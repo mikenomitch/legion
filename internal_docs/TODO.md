@@ -333,7 +333,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#35](https://github.com/mikenomitch/legion/pull/35) | Session durability, routing, and edge starts plan (docs only): concurrent node starts, worker-restart survival, node tag in session ids, manager-free edge starts, sleeping on the node; raft directory deferred | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
+| [#36](https://github.com/mikenomitch/legion/pull/36) | Session durability, routing, and edge starts, Phases 1–4 (concurrent node starts, `sessions.db` re-adopt, node tag in session ids and tag routing, session tickets, `Worker.StartSession`, `ListSessionNodes`, `legion session`), the session UI pass, and the sandbox spot-check and bottleneck-measurement plans. Phase 5 in progress | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
@@ -1844,14 +1844,16 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `identities`. Needs the signed lease of plan §6.3 in place of the
         start-time lease, and the envelope-scoped token check of §6.8
         ([calls](calls/sandbox-scaling-plan_calls.md) #18, #33, #34).
-  - [ ] **The node session log, its shipper, and per-session events.**
-        Sessions are counted (`legion_session_starts_total`,
-        `legion_session_stops_total`), not recorded; a worker restart ends
-        its unpromoted sessions because nothing is on disk (plan §6.4,
+  - [ ] **The session log's shipper and per-session events.** Sessions
+        are counted (`legion_session_starts_total`,
+        `legion_session_stops_total`), not journaled. The node log itself
+        (`sessions.db`) shipped in #36 for worker restarts, but nothing
+        ships it off the node (plan §6.4,
         [calls](calls/sandbox-scaling-plan_calls.md) #19, #32, #37).
-  - [ ] **Edge-started sessions.** Prefix boot tickets do not start
-        sessions; every session starts through a manager's router (plan
-        §6.3, [calls](calls/sandbox-scaling-plan_calls.md) #30).
+  - [x] **Edge-started sessions.** Session tickets and
+        `Worker.StartSession` (#36,
+        [session-durability plan](plans/session-durability-and-routing-plan.md)
+        §6.4, [docs](../docs/session-mode.md#starting-at-the-edge)).
   - [ ] **More ways to promote.** `promote.onVolume` and promotion by
         `snapshot create --name` (plan §6.6) are not built; only a caller id
         at create and `legion instance promote` promote
@@ -2837,24 +2839,30 @@ Plan: [artifact-system-plan.md](plans/artifact-system-plan.md) · docs: [artifac
 
 Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.md), [volume-plugin-system](plans/volume-plugin-system-plan.md) · docs: [volumes.md](../docs/volumes.md), [stateful-workloads.md](../docs/stateful-workloads.md)
 
-- [ ] **Session durability and routing back** (builds on session mode; plan in
-      [#35](https://github.com/mikenomitch/legion/pull/35)). A worker
+- [ ] **Session durability and routing back** (builds on session mode; plan
+      merged in [#35](https://github.com/mikenomitch/legion/pull/35),
+      implementation in [#36](https://github.com/mikenomitch/legion/pull/36)). A worker
       restart ends every unpromoted session, a session cannot sleep,
       finding one fans out to every manager, and every start goes through
       a manager. Plan:
       [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md)
-      (PLANNED) · calls:
+      (IN EXECUTION) · calls:
       [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md).
-  - [ ] Phase 1: the node starts sessions concurrently (launch out from
+  - [x] Phase 1: the node starts sessions concurrently (launch out from
         under the task-manager lock, no state-file fsync per session start,
         bounded launch pool).
-  - [ ] Phase 2: node-local `sessions.db`, adopt sessions on worker restart.
-  - [ ] Phase 3: the start node's tag in the minted session id, tag-first
+  - [x] Phase 2: node-local `sessions.db`, adopt sessions on worker restart.
+        Full reports are not yet chunked past the message limit; the
+        manager's decode limit was raised to 64 MiB instead.
+  - [x] Phase 3: the start node's tag in the minted session id, tag-first
         routing with fan-out as the fallback.
-  - [ ] Phase 4: edge starts with no manager on the path
+  - [x] Phase 4: edge starts with no manager on the path
         (`ListSessionNodes` for an outside consistent-hash picker, session
-        tickets, `Worker.StartSession`), and the manager-routed path
-        measured across three managers.
+        tickets, `Worker.StartSession`).
+  - [ ] Measure the manager-routed path across three managers, and remove
+        its derived-id fan-out (plan §8 item 4). Needs the loadgen session
+        mode in the bottleneck plan's gaps
+        (`benchmarks/aws/README.md`, "Bottleneck measurements").
   - [ ] Phase 5: session suspend on the node (`durability = "local"` or
         `"store"`), `suspend.keepFor`, `evicted` answers, resume by tag with
         manifest fallback, edge resume on any node, and moves fenced by a

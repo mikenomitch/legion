@@ -93,6 +93,24 @@ it. A node whose envelope turned out to be full refuses, and the router
 tries the next one, up to three nodes. There is no raft entry, no
 evaluation, and no plan.
 
+**The node is in the id.** An unnamed session's id carries an 8-character
+tag naming the node it was started on:
+`workspace-q4n7c2rd.7k2qd9x4m1b8c3rj5t0v6wye2h`. The tag is the first 40
+bits of a SHA-256 of the node id, so a tag never spells a node's name, and
+any manager or picker can map it back to the node from the node list
+(`legion session nodes` prints each node's tag). An id derived from an
+idempotency key carries no tag, because a retry must derive the same id
+whichever node it lands on.
+
+**Nodes start sessions concurrently.** A node admits a session against its
+envelope under a short lock and launches the runtime with the lock
+released, so one node's starts overlap. At most `edgeBoot.launchConcurrency`
+launches run at once (default twice the node's cores); a start that waits
+longer than `edgeBoot.queueTimeout` (default `1s`) for a launch slot is
+refused with `RESOURCE_EXHAUSTED`, which is retryable, and the router or
+picker tries the next node. A session start never rewrites the worker's
+state file.
+
 **Nodes report what they run.** Each worker reports its sessions on its
 heartbeats, as deltas against an epoch, with a full report every 30
 heartbeats and whenever the manager asks for one. Each manager keeps an
@@ -131,8 +149,9 @@ it.
 | --- | --- | --- |
 | Durable record | A raft row from create on; a named id keeps a tombstone after destroy | None while running: the node holds it, and the managers' index lists it |
 | Node loss while running | Rescheduled elsewhere, bound to its storage | Lost. A running session is not rescheduled |
-| Worker restart | The allocation is re-adopted | The node's sessions end (a promoted session is an allocation, and is re-adopted) |
+| Worker restart | The allocation is re-adopted | Re-adopted too: the node records running sessions on its own disk ([Worker restarts](#worker-restarts)) |
 | At most one live copy | Exact | Converges to one: a retried idempotent create can briefly run on two nodes ([Duplicates](#duplicates)) |
+| Who starts it | A manager, through raft | A manager's router, or the node itself on a session ticket ([Starting at the edge](#starting-at-the-edge)) |
 | Ids never recycled | Exact for the job's life | Probabilistic: 130 random bits, no tombstone |
 | `instance list` | An exact read | From the session index, with `complete` and `asOf` ([Listing](#listing-sessions)) |
 | Idempotent create | A replicated record | A derived id: a retry gets the same id, with no record |
@@ -266,6 +285,136 @@ Sessions also end when:
   version it started with.
 - **The node is lost or the worker restarts.**
 
+## Worker restarts
+
+A node records each running session in `sessions.db`, a SQLite file beside
+the worker's state file (`<state dir>/sessions.db`), when it starts and
+removes it when it ends. Writes are batched every 50 ms on a background
+thread, so a start never waits on a disk sync.
+
+A worker that restarts reads the file before it serves anything: each
+session whose process is still alive is re-adopted under its old id and
+claim, with its share of the envelope, and reported on the first
+heartbeat; each whose process died is forgotten. Session processes are not
+children the worker kills on exit, so a worker restart or upgrade (a
+crash, `systemctl restart`, a new binary) keeps them running.
+
+- **What is lost.** A session started in the last 50 ms before a crash may
+  not be in the file. Its process keeps running, but the restarted worker
+  does not know it and does not report it, until it exits.
+- **A machine reboot** kills the processes, so the sessions are gone.
+- **The envelope** comes back from the manager's next desired set; until it
+  does, re-adopted sessions keep running and count against it once it
+  arrives.
+
+## Routing by id
+
+`legion instance get`, `stop`, and `destroy` on a tagged session id go to
+the node the tag names (`Worker.GetSession`), one call instead of asking
+every manager. The node's answer is final when it holds the session or
+says it never did. The manager falls back to the merged view of every
+manager's session index when:
+
+- no live node has the tag (the node was removed),
+- the node does not answer (the session may still be running; the index
+  answers from the node's last report),
+- the node answers `wrong_node` (another node shares the tag, 1 in 2^40
+  per pair), or
+- the id carries no tag (it was derived from an idempotency key).
+
+A node asked for a session it does not hold answers `NOT_FOUND` with a
+reason the caller can act on: `wrong_node:` (the id carries another node's
+tag: route by the id, not by a hash of the user's key) or `not_found:`.
+
+## Starting at the edge
+
+A manager's router handles every start by default. A platform that starts
+sessions faster than a few managers can route them can start them at the
+nodes instead, with no manager on the path and nothing written anywhere:
+
+1. Mint a **session ticket** once, with `boot:write` on the job:
+
+   ```console
+   $ legion boot-ticket create agents --task workspace --pool agents \
+       --scope session --ttl 1h -j
+   ```
+
+   It names the job, the task, and the pool, and no instance or job
+   config. Its uses are unlimited (the envelopes bound it), it is never
+   spent, and, like every boot ticket, it is revocable only by expiry
+   ([edge boot](edge-boot.md#session-tickets)).
+
+2. Keep the node list, refreshed every few seconds:
+
+   ```console
+   $ legion session nodes agents -j
+   {"ok":true,"data":{"job":"agents","task":"workspace","asOf":"2026-11-02T18:04:11.204Z",
+    "nodes":[
+     {"node":"w-17","address":"https://10.0.1.7:4848","tag":"q4n7c2rd",
+      "accepting":true,"room":{"cpu":21500,"memory":44032},"weight":43,"sessions":17},
+     {"node":"w-18","address":"https://10.0.1.8:4848","tag":"h2m5x9pe",
+      "accepting":false,"reason":"draining","room":{"cpu":30000,"memory":61440},
+      "weight":60,"sessions":0}]}}
+   ```
+
+   Every node holding an envelope is listed. `accepting` is false for a
+   node that is `lost`, `down`, `draining`, `ineligible`, has `no-address`,
+   is `full`, or does not serve edge starts (`no-edge-sessions`: its
+   worker config does not set `edgeBoot.acceptClaims`). `weight` is the
+   room left in sessions of this task's size. The list is read from the
+   manager's own state and is advisory: a stale entry costs a refusal and
+   a hop, never a wrong start.
+
+   `--format envoy-eds` prints an Envoy `ClusterLoadAssignment` (nodes not
+   accepting are `DRAINING`) and `--format haproxy` prints `server` lines
+   (nodes not accepting are `disabled`).
+
+3. Pick a node per start (a consistent-hash ring over the accepting nodes,
+   keyed by user or request, is the common choice) and call
+   `Worker.StartSession` on its worker-plane port with the ticket. The
+   worker plane is TLS: verify the node against the cluster CA
+   (`legion net ca show`). The CLI form, for testing and scripts:
+
+   ```console
+   $ legion session start agents --task workspace \
+       --node https://10.0.1.7:4848 --ticket "$T" -j
+   {"ok":true,"data":{"sessionId":"workspace-q4n7c2rd.01jbx...","node":"w-17",
+    "state":"running","deduplicated":false}}
+   ```
+
+   The node verifies the ticket offline (its signature against the cached
+   JWKS, its expiry, and its pool), builds the start from the session
+   task's spec, which its envelope carries, admits it against the
+   envelope, and launches. By default the reply waits up to 30 seconds
+   for the session to be running; `--no-wait` (`wait = false`) answers
+   once admitted. A refusal (`RESOURCE_EXHAUSTED`: the envelope is full or
+   every launch slot is busy) is retryable on the next node.
+
+4. Route every later request for the session by its id, never by hashing
+   the user's key again: map the id's tag to an address from the node
+   list (keep every listed node in that map, accepting or not). `legion
+   session get <ID>` and `legion session stop <ID>` (`Worker.GetSession`,
+   `Worker.StopSession`) take the same ticket. Managers learn about the
+   session from the node's next heartbeat, so `legion instance get`,
+   `list`, `stop`, and `promote` work on it as on any session.
+
+**Idempotency at the edge is per node.** `--idempotency-key` derives the
+id from the job, the task, and the key, so a retry to the same node finds
+the running session (`deduplicated = true`). A retry that lands on another
+node starts a second copy, which the managers stop as a
+[duplicate](#duplicates). Keep a retry on the node the first attempt
+went to.
+
+| Error | Meaning |
+| --- | --- |
+| `UNAUTHENTICATED` | No ticket on the request |
+| `PERMISSION_DENIED` "session ticket refused" | The ticket's signature, expiry, or pool does not hold on this node, or it is not a session ticket |
+| `PERMISSION_DENIED` "does not cover" | The ticket names another job or task |
+| `FAILED_PRECONDITION` "does not accept edge starts" | The node's worker config does not set `edgeBoot.acceptClaims` |
+| `FAILED_PRECONDITION` "no envelope" | This node holds no envelope for the task (yet) |
+| `RESOURCE_EXHAUSTED` | The envelope is full, or no launch slot freed within `edgeBoot.queueTimeout`. Retry on the next node |
+| `NOT_FOUND` `wrong_node:` | `get`/`stop` reached a node the id's tag does not name |
+
 ## Promotion
 
 `legion instance promote <SESSION> [--id NAME]` (`PromoteInstance`) turns a
@@ -311,9 +460,10 @@ The commands that need a row (`suspend`, `fork`, `snapshot create`,
 ## Duplicates
 
 Two nodes can briefly run one session id: an idempotent create retried
-through two managers before either node reported the first start. The
-copy with the earlier start (`leaseIssuedAt`, ties broken by node id) is
-kept, and the other node is asked to end its copy:
+through two managers before either node reported the first start, or an
+idempotent edge start retried on another node. The copy with the higher
+`generation` is kept, then the earlier start (`leaseIssuedAt`), then the
+lower node id, and the other node is asked to end its copy:
 
 - by the manager whose index holds both copies, in that node's heartbeat
   reply (`HeartbeatReply.stop_sessions`), until the node stops listing it;
@@ -335,6 +485,9 @@ copy at every instant should be promoted (or created with `--id`).
   envelope.
 - Watch `legion_session_starts_total{outcome}`: a rising `no_room` or
   `refused` count means the envelopes are too small for the arrival rate.
+- Watch `legion_worker_launch_refusals_total` on the nodes: a rising count
+  means starts arrive faster than `edgeBoot.launchConcurrency` launches
+  finish. Raise it if the runtime's boot is I/O-bound, or add nodes.
 
 ## In the UI
 
@@ -354,7 +507,9 @@ fetch at all, until asked, when the job's envelopes could hold more than
 
 Sessions use the same surfaces as keyed instances: `legion_instance_create`
 (omit `instance_id`), `legion_instance_list`, `legion_instance_get`,
-`legion_instance_stop`, and `legion_instance_promote` over MCP, and the
+`legion_instance_stop`, and `legion_instance_promote` over MCP, plus
+`legion_session_nodes` for the edge node list and
+`legion_boot_ticket_create` with `scope = "session"`, and the
 `--json` envelope on the CLI. An agent should always pass an idempotency
 key on create, read `durable` before relying on a unit surviving a node,
 and treat `complete = false` on a listing as "some sessions may be
@@ -376,11 +531,12 @@ on it and no session is sent to it. See [upgrades](upgrades.md).
 - **No per-session events or audit log.** Starts and stops are counted
   (`legion_session_starts_total`, `legion_session_stops_total`), not
   journaled, and no node-side session log is kept or shipped.
-- **Sessions start only through a manager.** Edge boot tickets do not
-  start sessions.
+- **Edge starts need `edgeBoot.acceptClaims`** on the node, and a session
+  ticket is revocable only by expiry. Idempotency at the edge is per node.
 - **Simulated workers** (`legion start worker --simulate`) do not run
   sessions.
 - **Ending a session is remembered per manager,** so a retried stop that
   lands on another manager answers `NOT_FOUND`.
-- **A worker restart ends its unpromoted sessions.** They are not recorded
-  on the node's disk.
+- **A crash can lose the last 50 ms of starts from `sessions.db`.** Those
+  sessions keep running unreported until they exit. A machine reboot ends
+  the node's sessions.

@@ -329,15 +329,129 @@ existing converge-to-one rule covers the rare cross-node retry.
 
 ## 14. Phase 2 group-commits the session log instead of fsyncing each start
 
-**Call.** `sessions.db` flushes every 50 ms, and a restarted worker also
-adopts live session processes the log missed.
+**Call.** `sessions.db` flushes every 50 ms on a writer thread
+(`src/worker/session_log.rs`, `GROUP_COMMIT`).
 
 **Alternative.** Fsync every start before acknowledging it.
 
-**Trade-off.** A session started in the last 50 ms before a host crash
-(not a worker restart) is not on disk; on a host crash its process is gone
-anyway.
+**Trade-off.** A session started in the last 50 ms before a host crash is
+not on disk; on a host crash its process is gone anyway. *Deviation in
+#36:* the plan also had a restarted worker adopt live session processes
+the log missed. That is not built: such a process (a worker crash, not a
+host crash, inside the 50 ms window) keeps running unreported until it
+exits. Finding it would mean scanning the host's processes for Legion's
+environment markers, and the window is small. The public doc states it
+(`docs/session-mode.md`, "Worker restarts").
 
 **Why (performance).** The start path is the feature's whole point
 (about 2.5 ms p50 in sandbox-scaling §16.3); a per-start fsync would
 roughly double it on ordinary disks for no durability gain.
+
+## 15. A tagged id whose node does not answer falls back to the index, not `UNAVAILABLE`
+
+**Call.** `sessions::find` asks the tagged node (`Worker.GetSession`)
+first; when that node does not answer, it falls back to the merged
+session index, which answers from the node's last report.
+
+**Alternative.** Answer `UNAVAILABLE` naming the node, as plan §8 item 3
+describes.
+
+**Trade-off.** For up to 120 s after a node goes silent, `legion instance
+get` on its sessions answers from a stale report rather than saying the
+node is unreachable; after that the index drops the node and the answer is
+`NOT_FOUND`, never `UNAVAILABLE`.
+
+**Why (simplicity).** `find` is shared by get, stop, promote, and the
+duplicate check, and returns an option; turning a silent node into an
+error in each needs a richer result type through every caller. The stale
+answer is no worse than before Phase 3. Revisit with Phase 5's resume,
+where a lost node changes what the caller should do.
+
+## 16. A session ticket is a boot ticket row with gate `session`
+
+**Call.** Session tickets reuse the boot-ticket store: the row's gate
+column holds `"session"` to mark the scope (`SESSION_TICKET_GATE` in
+`src/manager/edge_boot.rs`), and `ListBootTickets` reports `scope`
+from it.
+
+**Alternative.** A new `scope` column (a store migration) or a separate
+table.
+
+**Trade-off.** The gate column means two things. A future third scope
+needs the column after all.
+
+**Why (simplicity).** No migration and no new listing; the gate column
+was unused for a ticket that has no gate.
+
+## 17. Full session reports are not chunked; the manager's decode limit is raised instead
+
+**Call.** The manager accepts messages up to 64 MiB
+(`MANAGER_MAX_DECODE_BYTES`), which holds a full report of about 200,000
+sessions per node.
+
+**Alternative.** Chunk full reports across heartbeats (plan §8 item 2).
+
+**Trade-off.** One node with more sessions than that cannot report them
+all. No envelope realistically holds that many.
+
+**Why (simplicity).** Chunking needs a multi-part epoch protocol on both
+sides; the raised limit covers every envelope size we can imagine for
+now. It is open in TODO.md.
+
+## 18. Envelope payloads carry the session task's spec
+
+**Call.** `TaskAllocation.session_task_spec` (the session task's config
+as JSON) and `session_task_config_id` ride on every envelope payload, so a
+node builds an edge start without a manager.
+
+**Alternative.** A separate spec fetch by the node on its first edge start
+(a manager call), or the edge-boot spec cache keyed by job config.
+
+**Trade-off.** Every envelope payload grows by one task config.
+
+**Why (simplicity, performance).** The spec is always current with the
+envelope the start lands in, and the first edge start is as fast as the
+hundredth.
+
+## 19. The node tag is an unkeyed hash of the node id
+
+**Call.** `node_tag` is the first 40 bits of SHA-256 over a fixed prefix
+and the node id, in base32.
+
+**Alternative.** A keyed hash (a cluster secret), or a random tag stored
+on the node row.
+
+**Trade-off.** Anyone who can guess node names can match a session id to
+its node. The tag is not a secret, and the worker plane authorizes every
+call anyway.
+
+**Why (simplicity).** Every manager and every picker computes it from the
+node list with no shared secret and no store write.
+
+## 20. `ListSessionNodes` reads fresh usage on each call
+
+**Call.** Each call reads the session index's usage across managers
+(`QuerySessions` with `usage_only`), not the router's one-second cache.
+
+**Alternative.** Serve from the router's cached room view.
+
+**Trade-off.** One peer query per call; a picker polling every few
+seconds per manager is cheap, a picker polling per start is not (the doc
+says to poll).
+
+**Why (simplicity).** The list is advisory and polled; a separate cache
+with its own staleness rules buys nothing at that rate.
+
+## 21. Balancer weights are clamped
+
+**Call.** `--format envoy-eds` clamps a node's weight to 1..128 and
+`--format haproxy` to 1..256, and a node not accepting keeps weight 1 and
+is marked `DRAINING` or `disabled`.
+
+**Alternative.** Scale weights proportionally across the list.
+
+**Trade-off.** Two big nodes that both fit more than 128 sessions look
+equal to Envoy.
+
+**Why (simplicity).** Each balancer's own range, and a node with room for
+over 128 sessions is not the one to steer away from.
