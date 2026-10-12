@@ -34,10 +34,6 @@
                 # On-demand instances with never-recycled ids. A destroyed
                 # sandbox's identity and state can never leak into a new one.
                 mode = "keyed",
-                # Default id source: "uuid" (server mints when --id is
-                # omitted) or "caller" (--id is required). An explicit
-                # --id is always honored either way.
-                idSource = "uuid",
                 storage = {
                     # Contract only in v1: each instance gets an opaque
                     # storage handle bound to this path, reattached on every

@@ -51,6 +51,20 @@ pub enum StopCause {
     ///
     /// Reserved for Phase 3 of the preemption plan; nothing emits it yet.
     Preempted,
+    /// The node ran short of memory and its memory pressure response stopped
+    /// this allocation (`evict-bursting` or `evict-reserved`, see
+    /// docs/resource-enforcement.md, "Memory pressure"). The worker acts
+    /// first, writing this cause into the task's stop notice itself, and the
+    /// manager records it when the heartbeat reports the eviction.
+    NodePressure,
+    /// The allocation's instance is being rolled back to a snapshot
+    /// (`legion snapshot restore`, docs/suspend-and-resume.md). A replacement
+    /// allocation restores from the snapshot on the same node.
+    Restore,
+    /// The allocation's instance was suspended (`legion instance suspend`,
+    /// docs/suspend-and-resume.md): the worker captured it and stopped it
+    /// first, and the manager removed the row when the capture reported.
+    Suspended,
     /// No cause was recorded for this stop.
     ///
     /// This is a legitimate steady-state value, not only a bug: stop causes
@@ -74,6 +88,9 @@ impl StopCause {
             StopCause::NodeLost => "node_lost",
             StopCause::ScaleIn => "scale_in",
             StopCause::Preempted => "preempted",
+            StopCause::NodePressure => "node_pressure",
+            StopCause::Restore => "restore",
+            StopCause::Suspended => "suspended",
             StopCause::Unknown => "unknown",
         }
     }
@@ -92,6 +109,9 @@ impl StopCause {
             "node_lost" => StopCause::NodeLost,
             "scale_in" => StopCause::ScaleIn,
             "preempted" => StopCause::Preempted,
+            "node_pressure" => StopCause::NodePressure,
+            "restore" => StopCause::Restore,
+            "suspended" => StopCause::Suspended,
             _ => StopCause::Unknown,
         }
     }
@@ -212,6 +232,7 @@ mod stop_cause_test {
             StopCause::NodeLost,
             StopCause::ScaleIn,
             StopCause::Preempted,
+            StopCause::NodePressure,
             StopCause::Unknown,
         ] {
             assert_eq!(StopCause::from_wire(cause.as_str()), cause);

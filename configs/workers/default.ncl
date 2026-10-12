@@ -24,17 +24,102 @@
             maxArtifactSize = "50GiB",
         },
     },
-    # Turn a task's declared `resources` into real kernel limits for `exec`
-    # tasks (docs/task-supervision.md). Off by default: a declaration that was
-    # only ever a scheduling estimate should not start OOM-killing workloads
-    # because the cluster upgraded. Linux + cgroup v2 only; a node that cannot
-    # enforce logs a warning and runs the task unconfined.
+    # The node content store (docs/artifacts.md, "The node content store"):
+    # a content-addressed cache under <worker state dir>/content/. Artifacts
+    # with a `checksum` are served from it on every allocation after the
+    # first. Each class has its own budget, so checkpoint parts cannot evict
+    # cached artifacts. The values below are the defaults, except the
+    # budgets, which are left unset so the clamped default shares apply.
+    content = {
+        # false stages every artifact straight from origin.
+        enabled = true,
+        # Each budget is a fixed size ("50GiB") or a share of the filesystem
+        # holding <worker state dir>/content/ ("20%"), sized once at worker
+        # start. An unset budget takes a default share clamped to a range.
+        # A share you set is not clamped, so writing "20%" here is not the
+        # same as leaving it unset. Shares, defaults included, must add up
+        # to at most 100%.
+        budgets = {
+            # Unset: 10% of the disk, clamped to 1GiB..20GiB.
+            # artifacts = "20GiB",
+            # Unset: 20% of the disk, clamped to 2GiB..200GiB. Holds memory
+            # checkpoints: local ones pinned until resumed or deleted,
+            # published ones (suspend.durability = "store") as evictable
+            # cache entries.
+            # snapshots = "40%",
+        },
+        # Unpinned content unused this long is removed. "0s" disables expiry.
+        ttl = "72h",
+        # Evict unpinned content, then refuse new content, before the disk
+        # drops below this. The scheduler counts it too: a node whose free
+        # disk (plus evictable content) less this floor cannot hold one more
+        # memory checkpoint takes no new memory-suspend instances.
+        minFreeDisk = "5GiB",
+    },
+    # Where this worker publishes content (docs/artifacts.md, "Publishing
+    # content"). Absent by default: the node publishes nothing. Every part
+    # is sealed (AES-256-GCM) with a key the manager sends, and lands at
+    # <url>/sealed/<name>, so the bucket never holds plaintext and
+    # publishing is idempotent. Any worker that can read the URL and is sent
+    # the key fetches it back through the ordinary s3:// or file:// artifact
+    # fetcher, opened and verified by digest. Point each
+    # region's workers at their own bucket for region locality. A worker
+    # with a contentStore publishes durable checkpoints
+    # (suspend.durability = "store", `legion snapshot create --publish`) and
+    # advertises the `content-publish` capability. Without one, a store
+    # suspend on this node is refused (docs/suspend-and-resume.md).
+    # contentStore = {
+    #     url = "s3://legion-content-usw2/",
+    #     # Omit auth to use the node's ambient AWS credentials (environment
+    #     # variables, then the instance profile). Or read an AWS credential
+    #     # object from KV, the same shape artifact auth.kv takes:
+    #     # auth = { kv = "legion/content-store" },
+    # },
+    # Turn a task's declared `resources` into real kernel limits
+    # (docs/resource-enforcement.md). On by default: memory pressure,
+    # oversubscription, memoryMax, usage reports, and sandbox confinement
+    # need it. Set false to treat `resources` as scheduling estimates only.
+    # Linux + cgroup v2 with a root worker; a node that cannot enforce logs a
+    # warning at startup and runs tasks unconfined.
     resourceEnforcement = {
-        enabled = false,
-        # Path under /sys/fs/cgroup. Must exist, with `+memory` and `+cpu` in
-        # its cgroup.subtree_control; Legion creates one subtree per
-        # allocation beneath it.
+        enabled = true,
+        # Path under /sys/fs/cgroup. The worker creates it and one subtree
+        # per allocation beneath it.
         cgroupParent = "legion",
+        # Pack this node past its physical capacity: schedulable memory is
+        # (physical - reservedResources.memory) x memory. Above 1.0 a task
+        # within its reservation can be stopped under memory pressure (the
+        # `evict-reserved` step), so use it where workloads are idle-heavy.
+        # CPU only changes how much the scheduler places, and `cores` is
+        # never oversubscribed. Needs `enabled = true`. Default 1.0 (off).
+        # oversubscribe = { memory = 1.0, cpu = 1.0 },
+        # What the node does when it runs short of memory
+        # (docs/resource-enforcement.md#memory-pressure). On whenever
+        # `enabled` is. Every field is optional. Values below are the
+        # defaults except minFree, which scales with the node.
+        # memoryPressure = {
+        #     enabled = true,
+        #     # MemAvailable below this triggers the response. Default 5% of
+        #     # node memory, at least 256MiB and at most 4GiB.
+        #     minFree = "2GiB",
+        #     # ...or memory PSI "some" (10s average) above this.
+        #     maxStall = "10%",
+        #     # Wait this long after each action before taking another.
+        #     settle = "5s",
+        #     # Always run in this order. Remove one to forbid it.
+        #     # `reclaim` gives back memory above reservations (a sandbox's
+        #     # balloon, `memory.reclaim` for the rest), `suspend` checkpoints
+        #     # tasks that set suspend.onPressure = true (most idle first),
+        #     # and `evict-reserved` runs only when oversubscribe.memory > 1.
+        #     steps = ["reclaim", "suspend", "evict-bursting", "evict-reserved"],
+        # },
+    },
+    # `sandbox` runtime settings. Only used with resourceEnforcement.enabled
+    # (docs/resource-enforcement.md#sandbox-tasks).
+    sandbox = {
+        # MiB a sandbox allocation's cgroup allows on top of its guest
+        # memory, for the VMM process itself. Default 64.
+        vmmOverheadMiB = 64,
     },
     # Whether this node serves `Worker.StartClaim` — that is, whether it will
     # start work on a boot ticket at all (docs/edge-boot.md). Off by default

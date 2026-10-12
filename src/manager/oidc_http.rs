@@ -273,6 +273,7 @@ mod tests {
             alloc_id: "7".into(),
             instance: None,
             slot: None,
+            epoch: None,
         };
         let identity = WorkloadIdentity {
             name: "aws".into(),

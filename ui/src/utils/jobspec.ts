@@ -9,7 +9,7 @@ export type JobTaskDependency = {
 // Parsed `stateful` block from a task spec (see docs/stateful-workloads.md).
 export type JobTaskStateful = {
   mode: string
-  idSource?: string
+  requireId?: boolean
   storagePath?: string
 }
 
@@ -76,6 +76,24 @@ export type JobTaskCount = {
   per?: string
 }
 
+// The task's `resources` block, in the units the jobspec uses: `cpus` in
+// cores, `memory` and `memoryMax` in MiB (docs/resource-enforcement.md).
+// Every field is optional because the manager fills defaults at submit.
+export type JobTaskResources = {
+  cpus?: number
+  memory?: number
+  memoryMax?: number
+}
+
+// The task's `snapshots` block (docs/suspend-and-resume.md). Its presence is
+// what opts a sandbox into memory snapshots, so the block itself matters, not
+// only its fields.
+export type JobTaskSnapshots = {
+  ttl?: string
+  keep?: number
+  memory: boolean
+}
+
 export type JobTask = {
   name: string
   count?: JobTaskCount
@@ -90,6 +108,8 @@ export type JobTask = {
   networkMode?: string
   ports: JobTaskPort[]
   service?: JobTaskService
+  resources?: JobTaskResources
+  snapshots?: JobTaskSnapshots
   actions: JobTaskAction[]
 }
 
@@ -138,9 +158,50 @@ const normalizeStateful = (value: unknown): JobTaskStateful | undefined => {
   const storage = raw.storage && typeof raw.storage === 'object' ? (raw.storage as Record<string, unknown>) : undefined
   return {
     mode,
-    idSource: readTaskString(raw.idSource) || undefined,
+    requireId: raw.requireId === true || undefined,
     storagePath: storage ? readTaskString(storage.path) || undefined : undefined,
   }
+}
+
+const readNumber = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) ? value : undefined
+
+const normalizeResources = (value: unknown): JobTaskResources | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  const resources = {
+    cpus: readNumber(raw.cpus),
+    memory: readNumber(raw.memory),
+    memoryMax: readNumber(raw.memoryMax),
+  }
+  return Object.values(resources).some((entry) => entry !== undefined) ? resources : undefined
+}
+
+const normalizeSnapshots = (value: unknown): JobTaskSnapshots | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  return {
+    ttl: readTaskString(raw.ttl) || undefined,
+    keep: readNumber(raw.keep),
+    // `memory` defaults to true once the block is declared.
+    memory: raw.memory !== false,
+  }
+}
+
+/**
+ * Whether the spec lets this task take a memory snapshot: a `sandbox` with a
+ * `snapshots` block that does not turn memory off, and no gated networking.
+ * Returns the reason when it cannot. The manager is the authority (a stored
+ * network policy can gate a task the spec does not), so this only decides
+ * what the UI offers.
+ */
+export const memorySnapshotBlocker = (task: JobTask | undefined): string | undefined => {
+  if (!task) return 'The task is not in the current job spec'
+  if (task.runtime !== 'sandbox') return `Memory snapshots need runtime "sandbox"; this task runs "${task.runtime}"`
+  if (!task.snapshots) return 'Memory snapshots need a `snapshots` block on the task'
+  if (!task.snapshots.memory) return 'The task sets snapshots.memory = false'
+  if (task.networkMode === 'gated') return 'Memory snapshots do not support gated networking yet'
+  return undefined
 }
 
 // Derives a display label for an artifact's auth: the KV path or identity
@@ -349,6 +410,8 @@ const normalizeTask = (value: unknown): JobTask | null => {
     networkMode: network ? readTaskString(network.mode) || undefined : undefined,
     ports,
     service: normalizeService(raw.service),
+    resources: normalizeResources(raw.resources),
+    snapshots: normalizeSnapshots(raw.snapshots),
     actions: (Array.isArray(raw.actions) ? raw.actions : [])
       .map((action) => normalizeAction(action))
       .filter((action): action is JobTaskAction => Boolean(action)),

@@ -1713,6 +1713,151 @@ fn migration_list() -> Vec<M<'static>> {
             "DROP INDEX IF EXISTS idx_job_update_to_job_config_id;
         DROP INDEX IF EXISTS idx_job_config_name_version;",
         ),
+        // Snapshots (suspend plan §7, docs/suspend-and-resume.md). A
+        // `snapshot` row is the manager's record of a capture whose bytes
+        // live on `node_id`: its state machine (capturing -> local | failed,
+        // -> deleting -> removed, -> lost) drives the heartbeat checkpoint
+        // channel, which re-sends work for `capturing` and `deleting` rows
+        // until the node reports. `snapshot_alias` holds operator names
+        // (`--name`), unique per job. `instance.restore_from` names the
+        // snapshot an instance is restoring from until its node reports the
+        // outcome. `task_config.snapshots` is the task's `snapshots` block.
+        // Scheduler lane, with `instance` and `volume`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS snapshot (
+            snapshot_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            task_name TEXT NOT NULL,
+            origin_instance_id TEXT,
+            name TEXT,
+            kind TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            state TEXT NOT NULL,
+            node_id TEXT,
+            allocation_id INTEGER,
+            manifest_json TEXT NOT NULL DEFAULT '',
+            total_bytes INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS snapshot_node_state ON snapshot (node_id, state);
+        CREATE INDEX IF NOT EXISTS snapshot_job ON snapshot (job_id, created_at);
+        CREATE TABLE IF NOT EXISTS snapshot_alias (
+            job_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (job_id, name)
+        );
+        ALTER TABLE instance ADD COLUMN restore_from TEXT;
+        ALTER TABLE task_config ADD COLUMN snapshots TEXT;",
+        )
+        .down(
+            "DROP TABLE IF EXISTS snapshot; DROP TABLE IF EXISTS snapshot_alias;",
+        ),
+        // Suspended instances (suspend plan §7, docs/suspend-and-resume.md).
+        // `suspended` is a new value of `instance.state`. `checkpoint_id`
+        // names the suspend snapshot a resume restores from; `pending_op` is
+        // `suspend` while a capture is outstanding and `resume` while a
+        // restore has not reported yet. The rest is what `instance get`
+        // shows about the last suspend and restore. `task_config.suspend` is
+        // the task's `suspend` block. Scheduler lane, like `instance`.
+        M::up(
+            "ALTER TABLE instance ADD COLUMN checkpoint_id TEXT;
+        ALTER TABLE instance ADD COLUMN suspend_reason TEXT;
+        ALTER TABLE instance ADD COLUMN suspended_at INTEGER;
+        ALTER TABLE instance ADD COLUMN pending_op TEXT;
+        ALTER TABLE instance ADD COLUMN restored_from_snapshot_id TEXT;
+        ALTER TABLE instance ADD COLUMN last_suspend_ms INTEGER;
+        ALTER TABLE instance ADD COLUMN last_restore_ms INTEGER;
+        ALTER TABLE instance ADD COLUMN resume_requested_at INTEGER;
+        ALTER TABLE instance ADD COLUMN lifecycle_error TEXT;
+        ALTER TABLE task_config ADD COLUMN suspend TEXT;",
+        )
+        .down(""),
+        // Allocation ids are never reused. `INTEGER PRIMARY KEY` alone hands
+        // the next insert `MAX(id) + 1`, so deleting the newest allocation
+        // and placing another (a suspend then a resume, a restore, any stop
+        // then start) gave the new allocation the old one's id. A restored
+        // guest's workload-identity token must name the NEW allocation, and
+        // a worker must never mistake a replacement for the task it already
+        // runs, so the table is rebuilt with AUTOINCREMENT. The copy keeps
+        // every id and seeds sqlite_sequence to the current maximum (an id
+        // deleted before this migration can still be reused once, the same
+        // acceptance the earlier rebuilds made). No foreign keys point at
+        // `allocation` any more (the ownerlane rebuild removed them).
+        M::up(
+            "CREATE TABLE allocation__monotonic (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status STRING NOT NULL,
+            resources TEXT NOT NULL,
+            node_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            task_config_id INTEGER NOT NULL,
+            network TEXT,
+            instance_id STRING,
+            created_at_unix INTEGER
+        );
+        INSERT INTO allocation__monotonic (id, status, resources, node_id, job_config_id, task_config_id, network, instance_id, created_at_unix) SELECT id, status, resources, node_id, job_config_id, task_config_id, network, instance_id, created_at_unix FROM allocation;
+        DROP TABLE allocation;
+        ALTER TABLE allocation__monotonic RENAME TO allocation;
+        CREATE INDEX idx_allocation_task_config_id ON allocation(task_config_id);
+        CREATE INDEX idx_allocation_job_config_id ON allocation(job_config_id);
+        CREATE INDEX idx_allocation_node_id ON allocation(node_id);
+        CREATE INDEX idx_allocation_instance_id ON allocation(instance_id);",
+        )
+        .down(""),
+        // Phase 6 (fork, docs/suspend-and-resume.md): how long a live capture
+        // paused the workload, which ForkInstance reports as `pause_ms`. A
+        // fork waiting for its checkpoint is `instance.pending_op = 'fork'`,
+        // an existing column, so the instance table does not change.
+        M::up("ALTER TABLE snapshot ADD COLUMN pause_ms INTEGER;").down(""),
+        // Published snapshots (suspend plan §6.8, Phase 7b;
+        // docs/suspend-and-resume.md). `durability` is `local` or `store`: a
+        // `store` row is published to its node's contentStore once captured,
+        // and moves `local -> published` when the upload reports
+        // (`published_at`). The manifest then records each part's URL.
+        // Scheduler lane, like the rest of `snapshot`.
+        M::up(
+            "ALTER TABLE snapshot ADD COLUMN durability TEXT NOT NULL DEFAULT 'local';
+        ALTER TABLE snapshot ADD COLUMN published_at INTEGER;",
+        )
+        .down(""),
+        // A failed publish is retried by the manager (docs/suspend-and-resume.md,
+        // "Durability"): `publish_attempts` counts the reported failures, and
+        // `publish_retry_at` (unix seconds) is when the next `op = publish`
+        // goes out. NULL once the snapshot is published or out of attempts.
+        M::up(
+            "ALTER TABLE snapshot ADD COLUMN publish_attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE snapshot ADD COLUMN publish_retry_at INTEGER;",
+        )
+        .down(""),
+        // Suspend/resume UI plan §7.3. `last_stop` is JSON
+        // ([`crate::structs::instance::InstanceLastStop`]): why the
+        // instance's last allocation stopped, written in the transaction that
+        // removes it. `forked_from` names a fork's origin instance, so lineage
+        // outlives the fork checkpoint. Scheduler lane, like `instance`.
+        M::up(
+            "ALTER TABLE instance ADD COLUMN last_stop TEXT;
+        ALTER TABLE instance ADD COLUMN forked_from TEXT;",
+        )
+        .down(""),
+        // A resume or restore that booted cold in place of a failed restore
+        // (`onRestoreFailure = "cold"`), as JSON
+        // ([`crate::structs::suspend::InstanceColdBoot`]). Kept until the
+        // next resume or restore starts, so `instance get`, `instance list`,
+        // and the UI can say the running state was lost. Scheduler lane,
+        // like `instance`.
+        M::up("ALTER TABLE instance ADD COLUMN cold_boot TEXT;").down(""),
+        // The instance's workload-identity epoch (docs/workload-identity.md,
+        // "Forks and snapshots"): stamped into its tokens as
+        // `legion.io/epoch` and raised when a fork or snapshot of it is
+        // captured, so Legion refuses the tokens copied into the
+        // checkpoint. Scheduler lane, like `instance`.
+        M::up("ALTER TABLE instance ADD COLUMN identity_epoch INTEGER NOT NULL DEFAULT 0;")
+            .down(""),
     ]
 }
 
@@ -1966,11 +2111,14 @@ mod migrations_test {
         // JSON column.
         assert_eq!(jsonb_count(&conn)?, 0, "a live table still declares JSONB");
 
-        // Positional layout and index sets are exactly what they were.
+        // Positional layout and index sets are exactly what they were. Later
+        // migrations may append columns (`ADD COLUMN` keeps every existing
+        // position), so the pre-rebuild columns must be an exact prefix.
         for (i, table) in rebuilt.iter().enumerate() {
+            let columns = column_names(&conn, table)?;
             assert_eq!(
-                column_names(&conn, table)?,
-                pre_columns[i],
+                columns[..pre_columns[i].len().min(columns.len())],
+                pre_columns[i][..],
                 "column order changed on {table} — raft changesets bind by position"
             );
             assert_eq!(

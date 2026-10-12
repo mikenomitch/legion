@@ -79,10 +79,46 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
   storage handle are kept, so `legion instance start <id>` brings back the
   same identity with its data. A job stop puts keyed instances here. Stopped
   instances aren't scheduled until you start them.
+- `suspended`: checkpointed and stopped (keyed only, by `legion instance
+  suspend`, the task's `suspend.idle` policy, or the node's memory pressure
+  response with `suspend.onPressure`). Like `stopped` it holds no allocation and isn't scheduled, but
+  `checkpoint_id` names a checkpoint, and `legion instance start <id>`
+  restores from it instead of booting cold. A job stop leaves suspended
+  instances suspended. See [Suspend and Resume](suspend-and-resume.md).
 - `terminated`: no longer desired (slot scale-in, keyed destroy, or job stop
   for slot rows). **Rows are kept.** Slot rows are kept so a later scale-out
   brings back the same id. Keyed tombstones are kept so a destroyed id is
   never recycled for the lifetime of the job.
+
+### Snapshots and restore
+
+`legion snapshot create <instance>` captures a running instance: its
+`stateful.storage` volume (`--disk`), or for a `sandbox` task its guest memory
+too (`--memory`). `legion snapshot restore <instance> <snapshot>` rolls a keyed
+instance back to one of its own snapshots in place. The current allocation is
+stopped with cause `restore`, the instance goes back to `pending` with the
+snapshot recorded as its restore source (`restore_snapshot_id` in `legion
+instance get -j`), and the replacement starts from the snapshot on the node
+that holds it. The instance keeps its id and storage handle throughout.
+Stopping or destroying an instance cancels a pending restore. The replacement
+is a new allocation with a new id: allocation ids are never reused.
+
+### Fork and create from a snapshot
+
+`legion instance fork <instance> --count N` copies a running keyed instance
+into N new instances (`<instance>-f1`, `-f2`, ...) while it keeps running.
+`legion instance create <job> --from-snapshot <name|id>` starts new instances
+from a snapshot of the job. Either way each new instance is a full keyed
+instance of its own: a new never-recycled id, its own copy of the volume (the
+driver's `clone` op), and its own workload identity, so the
+at-most-one-live-allocation rule holds untouched. The new instances run on
+the node holding the checkpoint. See [Fork](suspend-and-resume.md#fork).
+
+The task's `snapshots { ttl, keep, memory }` block sets expiry and opts a
+sandbox into memory snapshots. Its `suspend` block sets how `legion instance
+suspend` checkpoints the task and what a resume does when it cannot restore. See
+[Suspend and Resume](suspend-and-resume.md) for the full surface, what a
+restore checks, and its failure modes.
 
 ## Job Spec Reference
 
@@ -95,7 +131,7 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
     count = 3,                    # slot cardinality: slots 0, 1, 2
     stateful = {
       mode = "slot",              # 'slot' (default) | 'keyed'
-      # idSource = "caller",     # keyed only: "caller" | "uuid"
+      # requireId = true,        # keyed only: refuse creates without --id
       # initialInstances = ["user-1", "user-2"],  # keyed only: seed list
       onLost = {                  # optional; node-loss fencing policy — see
                                  # "Node loss and fencing (at-most-one)"
@@ -126,7 +162,7 @@ Validation rules (enforced at `job validate` and submit time):
 
 - `mode` defaults to `'slot'`. Set `'keyed'` explicitly to use the
   instance-management model.
-- `idSource` is only valid in keyed mode (`'caller'` or `'uuid'`).
+- `requireId` is only valid in keyed mode.
 - Slot mode requires `count.num >= 1` and can't be combined with `count.per`
   (per-attribute pools would collide on slot ids).
 - Keyed mode **can't define `count` at all**. The spec is rejected at parse
@@ -533,6 +569,19 @@ CreateInstance ──> pending ──placed──> active ──alloc dies──
 - **Start** (`StartInstance` or `legion instance start`) reverses a stop. The
   instance moves from `stopped` to `pending` and is placed again with the
   same id and kept handle.
+- **Suspend** (`SuspendInstance` or `legion instance suspend`) checkpoints an
+  `active` instance, stops it, and moves it to `suspended`. **Start** on a
+  suspended instance resumes it from that checkpoint, as a new allocation on
+  the node holding the checkpoint (or, for a published checkpoint with
+  `suspend.durability = "store"`, on any compatible node). A suspended
+  instance isn't in the desired set either. `durability = "store"` needs
+  instance data that can move, so it is refused with a node-local
+  `stateful.storage` driver. See
+  [Suspend and Resume](suspend-and-resume.md#durability-surviving-the-node).
+- **Fork** (`ForkInstance` or `legion instance fork`) creates new keyed
+  instances from a live checkpoint of an `active` one. Each fork waits in
+  `pending` (`pending_op = forking`) until the checkpoint lands, and is not in
+  the desired set until then. See [Fork](suspend-and-resume.md#fork).
 - **Destroy** stops the instance's allocation through the normal
   allocation-stop path, **drops the storage handle**, and keeps the row as a
   `terminated` tombstone for the lifetime of the job. Destroying the job
@@ -547,8 +596,8 @@ contract. They're available as `legion instance ...` commands and as MCP
 tools (`legion_instance_create/stop/start/destroy/replace/list/get`):
 
 ```bash
-# create with an explicit key (idSource 'caller' requires one; with 'uuid'
-# or unset the server mints an id when --id is omitted)
+# create with an explicit key (requireId = true requires one; otherwise the
+# server mints an id when --id is omitted)
 legion instance create sandbox-demo --id user-42 -j
 # => { "ok": true, "data": { "instanceId": "user-42", "deduplicated": false } }
 
@@ -632,9 +681,10 @@ Resubmitting a stopped job (`job run`) clears the job's stopped status, but it
 
 - Allowed characters are `[A-Za-z0-9._-]`, and length is 1–128 (ids end up in
   env vars, workload identity subjects, and CLI args).
-- `stateful.idSource` sets the default source. `'caller'` makes the id
-  required on create. `'uuid'` (or unset) lets the server create one. A valid
-  caller-supplied id is always used regardless of `idSource`.
+- `stateful.requireId = true` makes the id required on create, and a batch
+  create can't ask the server to mint ids (`--count`). Without it (the
+  default), the server creates an id when the request omits one. A valid
+  caller-supplied id is always used either way.
 - Ids are unique across the whole cluster and **never recycled for the
   lifetime of the job that owns them**. Creating an id that matches any
   existing instance row, in this job or another one, is rejected

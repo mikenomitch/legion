@@ -37,7 +37,10 @@ A workload identity token is an ES256-signed JWT. Standard claims:
 The token also carries separate Legion claims, so providers that can match
 any claim don't have to parse `sub`: `legion.io/region`, `legion.io/job`,
 `legion.io/group`, `legion.io/task`, `legion.io/node`, `legion.io/alloc` (and
-`legion.io/instance` / `legion.io/slot` for stateful workloads).
+`legion.io/instance` / `legion.io/slot` for stateful workloads). A stateful
+workload's token also carries `legion.io/epoch`, the instance's identity
+epoch, which Legion uses to retire tokens copied into a fork or snapshot (see
+[Forks and snapshots](#forks-and-snapshots)).
 
 ### The `sub` claim is a security boundary
 
@@ -113,8 +116,10 @@ A full runnable example is at
 - `extraClaims` are static literals. Keys can't be a reserved JWT claim
   (`iss`/`sub`/`aud`/…) or use the `legion.io/*` namespace.
 - **Change mode and delivery must be compatible.** `env` with
-  `changeMode = "noop"` is rejected, because env can't refresh in place.
-  `signal` requires `changeSignal`.
+  `changeMode = "noop"` is rejected, because env can't refresh in place. The
+  exception is a memory-checkpointable sandbox, which keeps the token fresh
+  in `/legion/identity/<ENV>` (see [Sandboxes](#sandboxes)). `signal`
+  requires `changeSignal`.
 - The task runtime must support the requested delivery (see capability gating
   below).
 
@@ -135,7 +140,7 @@ When a token is re-issued before expiry, `changeMode` controls what happens:
 | --- | --- | --- | --- |
 | `exec` | ✅ | ✅ | ✅ |
 | `container` | ✅ | ✅ (paths under `/legion/task`) | ✅ |
-| `sandbox` | ✅ | ❌ | ❌ |
+| `sandbox` | ✅ | ✅ (paths under `/legion/identity`) | ❌ |
 | `noop` | ❌ | ❌ | ❌ |
 
 Specs that ask for an unsupported delivery are rejected at admission with an
@@ -312,6 +317,168 @@ is a single manager, and it is always primary.
    `FailedPrecondition`. The worker logs one warning, and the task starts
    without tokens. Job specs still validate, so you can declare identities
    before the cluster enables the feature.
+
+### Sandboxes
+
+A sandbox guest can't read the worker's files, and it can't take a signal,
+so neither the host token file nor `changeMode = "signal"` reaches it. Before
+file delivery, the only way to refresh a sandbox's token was `changeMode =
+"restart"`, which reboots the guest at about half the TTL and loses
+everything it had in memory. That defeats a sandbox kept for its running
+state.
+
+So a sandbox gets its tokens through its identity disk, the small raw disk
+the guest's resume handler (`legion guest-resume`) already polls for
+restores. On every refresh the worker rewrites that disk in place with the
+new tokens, and the handler rewrites the token files in the guest. Nothing
+restarts. Declare file delivery under `/legion/identity` (a relative path
+resolves there):
+
+```nickel
+identities = [{
+  name = "vault",
+  audience = ["vault.example.com"],
+  ttl = "15m",
+  file = { path = "/legion/identity/vault", mode = "0400" },
+  # changeMode defaults to "noop": the guest's file is rewritten in place.
+}],
+```
+
+On a memory-checkpointable sandbox (one with a `suspend` block that
+checkpoints memory, or `snapshots` with `memory` on, and no gated
+networking), env delivery works the same way. The env holds the token the
+guest booted with, and `/legion/identity/<ENV>` always holds the current one.
+There, env with the default `changeMode = "noop"` is accepted:
+
+```nickel
+identities = [{
+  name = "platform",
+  audience = ["api.acme.dev"],
+  env = "PLATFORM_TOKEN",   # boot value in env, current value in /legion/identity/PLATFORM_TOKEN
+}],
+```
+
+A long-lived process re-reads the file rather than its env, as it already
+must after a restore.
+
+A memory-checkpointable sandbox that asks for `changeMode = "restart"` is
+accepted with a warning on `job run` and `job validate`, since every refresh
+would reboot the guest:
+
+```text
+warning: task workspace: identity "platform" sets changeMode = "restart", which reboots this
+sandbox's guest on every token refresh (about every half TTL) and loses its running state. ...
+```
+
+How it works:
+
+- The worker writes a file-delivered token to `<task dir>/identity/<path>` on
+  the host, owner-only, and copies it onto the identity disk with its guest
+  path and mode. Env tokens ride the same disk by key.
+- On a refresh it rewrites the disk *in place*, so the running VMM sees the
+  new bytes. The disk keeps the same allocation id and host time, which is
+  how the handler tells a token refresh from a restore: it rewrites
+  `/legion/identity/`, `/legion/resume.env`, and each file token, and skips
+  the reseed, clock step, and `onResume`.
+- At boot the handler writes the disk's tokens right away, so the files exist
+  from the start.
+- A sandbox that is not launched for checkpoints still gets an identity disk
+  when it declares a file-delivered identity.
+- In dev mode (Apple `container` on macOS) the host's `<task dir>/identity`
+  is bind-mounted read-only at `/legion/identity`, so file tokens refresh the
+  same way. Env tokens there keep their boot value.
+
+Limits:
+
+- The handler polls the disk every 200 ms, so the guest's file trails the
+  worker's refresh by a fraction of a second. A token is refreshed at about
+  half its TTL, so that never leaves the guest an expired token.
+- A sandbox whose gating comes from a stored network policy launches without
+  checkpoint support, so its env tokens are not mirrored. Use file delivery.
+- The handler is the worker's own binary, so a guest whose libc cannot run it
+  never sees refreshed tokens (init says so on the console). Use `restart`
+  there, and accept the reboot.
+
+### Suspended and restored instances
+
+A [suspended](suspend-and-resume.md) sandbox resumes, and a snapshot restores,
+as a **new allocation with a new id**: allocation ids are never reused. The
+worker issues that allocation's tokens before the restore exactly as it does
+before any start, so their `legion.io/alloc` claim names the new allocation.
+It writes them to the guest's identity disk, and the guest's resume handler
+publishes them under `/legion/identity/<ENV>` and in `/legion/resume.env`
+before `suspend.onResume` runs (see [Identity after a
+resume](suspend-and-resume.md#identity-after-a-resume)). Processes already
+running in the guest keep the env they started with, so re-read the file or
+restart them from `onResume`.
+
+A suspend checkpoint holds whatever token the guest had in memory at
+capture, and that token stays valid until it expires: up to one TTL (`ttl`,
+15 minutes by default) after the capture. A suspend does not retire it,
+because only one copy of the instance ever runs, and the resumed guest is the
+same instance. Forks and snapshots are different, since they can start a
+second instance with the first one's tokens (next section). Keep TTLs short on
+tasks you suspend or snapshot, and treat `snapshot:write` on a job as access
+to its in-memory secrets.
+
+### Forks and snapshots
+
+A [fork](suspend-and-resume.md#fork) starts every fork from the origin's
+memory, so each fork holds the token the origin had at capture, next to the
+token issued for the fork itself. A memory snapshot does the same for every
+instance created from it (`instance create --from-snapshot`). Without more,
+a fork could present the origin's token, with the origin's
+`legion.io/instance` and `legion.io/alloc`, for up to one TTL.
+
+Legion closes that window for the verifiers it runs itself:
+
+- Each stateful instance has an **identity epoch**, stamped into its tokens
+  as `legion.io/epoch` (a string, like `legion.io/slot`). It starts at `0`.
+- When a fork or a manual snapshot of the instance is captured, the manager
+  raises the epoch in the same transaction that marks the checkpoint
+  `local` (and, for a fork, releases the forks for placement). From then on
+  it refuses that instance's tokens from earlier epochs. Every token in the
+  checkpoint is one of those.
+- The new epoch reaches the instance's node in the heartbeat that reported
+  the capture (`TaskAllocation.identity_epoch`), and the worker re-issues
+  the allocation's tokens at once instead of at its next half-TTL refresh.
+  The running instance holds a current token again within about a heartbeat
+  (2 seconds). A sandbox guest's file follows within the resume handler's
+  200 ms poll. A refresh triggered this way applies the identity's
+  `changeMode` like any other, so `restart` restarts the origin.
+- A fork's own tokens name the fork's instance, at the fork's epoch, so they
+  are unaffected.
+
+A refused token fails with a message that says why:
+
+```text
+control-plane token refused: token was issued to instance user-42 at identity epoch 0,
+before a fork or snapshot of it was captured (now epoch 1), so it may be a copy a fork
+holds. The instance itself holds a newer token
+```
+
+What this covers, and what it does not:
+
+- **Covered:** the [control-plane identity](#control-plane-identity), both as
+  an `Authorization: Bearer` credential and for `legion login --method
+  legion`. A token naming an instance that no longer exists is refused too.
+- **Not covered: relying parties that verify offline.** AWS STS, GCP, Vault,
+  and any service that checks the JWT against the published JWKS see a
+  validly signed, unexpired token. They cannot know the instance's current
+  epoch, so the origin's pre-capture token still works there until it
+  expires. Keep `ttl` short on tasks you fork or snapshot, and bind
+  per-instance access to `legion.io/instance` only when one TTL of overlap
+  is acceptable.
+- **Not covered: ACL tokens minted from an identity token.** An ACL token
+  the origin got with `legion login --method legion` before the capture is an
+  ordinary ACL token. It is copied into every fork and stays valid for
+  `acl.loginTtl` (24 hours by default). Present the identity token as a
+  bearer credential instead of logging in, or delete the ACL token after a
+  fork.
+- **The window before the refresh.** Between the capture and the origin's
+  re-issue (about a heartbeat), the origin's own current token is already
+  refused. A process that cached its token in memory gets one failed call,
+  then must re-read the token file, as it already must after a restore.
 
 ### What each change mode does on refresh
 

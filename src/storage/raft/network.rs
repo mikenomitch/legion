@@ -370,6 +370,47 @@ impl std::fmt::Display for InvalidSecretMetadata {
 
 impl std::error::Error for InvalidSecretMetadata {}
 
+impl RaftNetwork<TypeConfig> for RaftTransportNetwork {
+    async fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        self.call("AppendEntries", &rpc, option, async |client, req| {
+            client.append_entries(req).await
+        })
+        .await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        rpc: InstallSnapshotRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<
+        InstallSnapshotResponse<NodeId>,
+        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
+    > {
+        // Encoded through the base64 mirror: a 4 MiB chunk would otherwise
+        // render as ~16 MiB of JSON number array.
+        let wire = WireInstallSnapshotRequest::from(rpc);
+        self.call("InstallSnapshot", &wire, option, async |client, req| {
+            client.install_snapshot(req).await
+        })
+        .await
+    }
+
+    async fn vote(
+        &mut self,
+        rpc: VoteRequest<NodeId>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        self.call("Vote", &rpc, option, async |client, req| {
+            client.vote(req).await
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,7 +435,7 @@ mod tests {
         );
         // And the ceiling itself must be far above tonic's 4 MiB default,
         // which is what silently capped snapshots before.
-        assert!(RAFT_MAX_MESSAGE_BYTES > 4 * 1024 * 1024);
+        const { assert!(RAFT_MAX_MESSAGE_BYTES > 4 * 1024 * 1024) };
     }
 
     /// The install-snapshot mirror must round-trip field-for-field AND keep
@@ -435,46 +476,5 @@ mod tests {
         assert!(decoded.done);
         assert_eq!(decoded.meta.snapshot_id, "snap-1");
         assert_eq!(decoded.vote, Vote::new(3, 7));
-    }
-}
-
-impl RaftNetwork<TypeConfig> for RaftTransportNetwork {
-    async fn append_entries(
-        &mut self,
-        rpc: AppendEntriesRequest<TypeConfig>,
-        option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.call("AppendEntries", &rpc, option, async |client, req| {
-            client.append_entries(req).await
-        })
-        .await
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        rpc: InstallSnapshotRequest<TypeConfig>,
-        option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
-    > {
-        // Encoded through the base64 mirror: a 4 MiB chunk would otherwise
-        // render as ~16 MiB of JSON number array.
-        let wire = WireInstallSnapshotRequest::from(rpc);
-        self.call("InstallSnapshot", &wire, option, async |client, req| {
-            client.install_snapshot(req).await
-        })
-        .await
-    }
-
-    async fn vote(
-        &mut self,
-        rpc: VoteRequest<NodeId>,
-        option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.call("Vote", &rpc, option, async |client, req| {
-            client.vote(req).await
-        })
-        .await
     }
 }

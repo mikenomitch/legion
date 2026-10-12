@@ -160,6 +160,44 @@ It is then weighted by the scheduler setting `automatic_anti_affinity`
 As a result, the scheduler prefers not to stack allocations of the same task
 or group on one node. This is a soft preference, so it can still happen.
 
+## Content Locality
+
+A task whose artifacts declare a `checksum` has a *content set*: the digests
+its allocation will need on its node. The scheduler prefers nodes whose
+content store already holds them, scored as the fraction of the set's bytes
+the node holds (`0.0` to `1.0`). A node that has not reported its content
+scores `0`. A task without digest-pinned artifacts skips the term. See
+[artifacts.md](artifacts.md#content-locality) for how nodes report.
+
+## Score Weights
+
+Every candidate node's score is a weighted sum. Set the weights under
+`schedulerSettings.weights` in the manager config:
+
+```nickel
+{
+  schedulerSettings = {
+    weights = {
+      affinities = 1.0,              # affinity rules and same_node_as
+      automatic_anti_affinity = 0.2, # subtracted per stacked allocation
+      locality = 1.0,                # content locality; 0 disables
+      # spread / bin_pack default to 1.0 for the matching policy, else 0.
+    },
+  },
+}
+```
+
+```
+score = affinities * affinity
+      + spread * (emptiness relative to the other candidates)
+      + bin_pack * (fullness relative to the other candidates)
+      - automatic_anti_affinity * stacked allocations
+      + locality * content locality
+```
+
+Weights must be non-negative numbers. Unknown keys are ignored. The highest
+score wins, with exact ties broken at random.
+
 ## count.per Behavior
 
 When `count.per` is set:

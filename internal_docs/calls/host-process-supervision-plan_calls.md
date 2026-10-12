@@ -86,6 +86,26 @@ signal, and every extra enum value is a thing an operator has to look up at 3am.
 
 ## 4. Resource enforcement is opt-in per worker, not on by default
 
+> **Superseded (suspend-resume PR #15).** Enforcement is now **on by
+> default**: `enabled` defaults to `true`, an absent `resourceEnforcement`
+> block means the defaults, and `enabled = false` is the opt-out.
+>
+> - **Why it flipped (ease).** Memory pressure, oversubscription,
+>   `memoryMax`, usage reports, idle suspend, and sandbox confinement all
+>   hang off this switch. Off by default meant none of them worked until an
+>   operator found a flag. Legion has no installed base to protect yet, so
+>   the upgrade-day OOM risk below is not a reason to hold a worse default
+>   (AGENTS.md, "Upgrades and Breaking Changes").
+> - **Trade-off.** A task that under-declares `resources.memory` is now
+>   OOM-killed instead of running over. The fix is to declare what it uses,
+>   or turn enforcement off for that pool.
+> - **What came with it.** The worker checks once at start that it can
+>   create `cgroupParent`. A Linux node that can't (non-root, read-only
+>   `/sys/fs/cgroup`) warns once and runs unconfined, per entry 5, instead
+>   of failing each allocation at its first cgroup write.
+>
+> The original call follows.
+
 `resourceEnforcement: { enabled: false, cgroupParent: "legion" }` in the worker
 config; a task's `resources` stay advisory for `exec` until an operator turns it
 on.

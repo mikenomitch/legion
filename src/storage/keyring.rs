@@ -60,6 +60,7 @@ const NONCE_BYTES: usize = 12;
 const TAG_BYTES: usize = 16;
 const ROOT_KEY_ID_PREFIX: &str = "rk_";
 const DATA_KEY_ID_PREFIX: &str = "dk_";
+const CHECKPOINT_KEY_ID_PREFIX: &str = "ck_";
 /// Header written into a freshly minted root key file, so the file explains
 /// itself to whoever finds it in a backup rotation or a config repo.
 const ROOT_KEY_FILE_HEADER: &str = "# Legion KV root key (docs/kv-encryption.md).\n\
@@ -99,9 +100,13 @@ pub fn root_key_id(key: &[u8]) -> String {
 
 /// A fresh data key id (`dk_` + 16 hex chars of randomness).
 pub fn new_data_key_id() -> R<String> {
+    new_key_id(DATA_KEY_ID_PREFIX)
+}
+
+fn new_key_id(prefix: &str) -> R<String> {
     let bytes = random_bytes(8)?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!("{DATA_KEY_ID_PREFIX}{hex}"))
+    Ok(format!("{prefix}{hex}"))
 }
 
 /// One new root key line, ready to be placed FIRST in a root key file or in
@@ -657,7 +662,8 @@ pub struct KeyringRow {
     pub wrapped_key: Vec<u8>,
     pub root_key_id: String,
     pub root_provider: String,
-    /// `active` | `retired`
+    /// `active` | `retired` for a data key, `checkpoint` for a checkpoint
+    /// key.
     pub state: String,
     pub created_at: i64,
     pub retired_at: Option<i64>,
@@ -665,6 +671,11 @@ pub struct KeyringRow {
 
 pub const KEY_STATE_ACTIVE: &str = "active";
 pub const KEY_STATE_RETIRED: &str = "retired";
+/// A checkpoint key (`ck_…`): the key published checkpoint parts are sealed
+/// under (docs/suspend-and-resume.md, "Security"). It is wrapped by the root
+/// key like a data key, so a root-key rewrap covers it, but it never seals
+/// a KV value, never rotates with the data keys, and is never collected.
+pub const KEY_STATE_CHECKPOINT: &str = "checkpoint";
 
 struct LoadedKey {
     key: Zeroizing<Vec<u8>>,
@@ -855,7 +866,12 @@ impl Keyring {
                 keys.insert(row.key_id.clone(), existing);
                 continue;
             }
-            if row.algorithm != DATA_KEY_ALGORITHM {
+            let algorithm_ok = if row.state == KEY_STATE_CHECKPOINT {
+                row.algorithm == crate::checkpoint_seal::CHECKPOINT_KEY_ALGORITHM
+            } else {
+                row.algorithm == DATA_KEY_ALGORITHM
+            };
+            if !algorithm_ok {
                 locked.push(LockedKey {
                     key_id: row.key_id.clone(),
                     root_key_id: row.root_key_id.clone(),
@@ -936,6 +952,93 @@ impl Keyring {
             retired_at: None,
         };
         Ok((row, key))
+    }
+
+    /// Generate a checkpoint key wrapped by the provider's current root
+    /// key. The caller persists the row (replicated) and then calls
+    /// [`Keyring::install_generated`].
+    pub fn generate_checkpoint_key(&self, now_unix: i64) -> R<(KeyringRow, Zeroizing<Vec<u8>>)> {
+        let key = Zeroizing::new(random_bytes(KEY_BYTES)?);
+        let key_id = new_key_id(CHECKPOINT_KEY_ID_PREFIX)?;
+        let wrapped = self.inner.provider.wrap(&key_id, &key);
+        count_provider_call("wrap", wrapped.is_ok());
+        let (wrapped_key, root_key_id) = wrapped?;
+        let row = KeyringRow {
+            key_id,
+            algorithm: crate::checkpoint_seal::CHECKPOINT_KEY_ALGORITHM.to_string(),
+            wrapped_key,
+            root_key_id,
+            root_provider: self.inner.provider.kind().to_string(),
+            state: KEY_STATE_CHECKPOINT.to_string(),
+            created_at: now_unix,
+            retired_at: None,
+        };
+        Ok((row, key))
+    }
+
+    /// Whether the keyring has a checkpoint key row (loaded or not).
+    pub fn has_checkpoint_key(&self) -> bool {
+        self.read()
+            .rows
+            .iter()
+            .any(|row| row.state == KEY_STATE_CHECKPOINT)
+    }
+
+    /// The key a published checkpoint part with plaintext `digest` is sealed
+    /// under. `key_id` is the part's recorded `keyId`; `None` asks for the
+    /// current checkpoint key, for a new publish. Never logs key material.
+    pub fn checkpoint_part_key(
+        &self,
+        key_id: Option<&str>,
+        digest: &crate::content_store::ContentDigest,
+    ) -> R<crate::checkpoint_seal::PartKey> {
+        let state = self.read();
+        let row = match key_id {
+            Some(id) => state
+                .rows
+                .iter()
+                .find(|row| row.key_id == id && row.state == KEY_STATE_CHECKPOINT)
+                .with_context(|| {
+                    format!(
+                        "checkpoint key {id} is not in this cluster's keyring (a `legion keyring                          reset` dropped it, or the snapshot was published by another cluster),                          so parts sealed under it cannot be read"
+                    )
+                })?,
+            None => state
+                .rows
+                .iter()
+                .filter(|row| row.state == KEY_STATE_CHECKPOINT)
+                .max_by_key(|row| (row.created_at, row.key_id.clone()))
+                .with_context(|| {
+                    if self.inner.enabled {
+                        "this cluster has no checkpoint key yet; the keyring leader mints one                          within seconds of initializing (check `legion keyring status`)"
+                            .to_string()
+                    } else {
+                        "this cluster has no checkpoint key, because the keyring is off                          (encryption.enabled = false on the manager); published checkpoints are                          always sealed, so publishing needs the keyring (docs/kv-encryption.md)"
+                            .to_string()
+                    }
+                })?,
+        };
+        let Some(loaded) = state.keys.get(&row.key_id) else {
+            let reason = state
+                .locked
+                .iter()
+                .find(|locked| locked.key_id == row.key_id)
+                .map(|locked| locked.reason.clone())
+                .unwrap_or_else(|| "checkpoint key not loaded yet".to_string());
+            let provider = &self.inner.provider;
+            return Err(anyhow::Error::new(StorageError::KeyringLocked {
+                key_id: row.key_id.clone(),
+                message: format!(
+                    "keyring locked: checkpoint key {} cannot be unwrapped — {reason}. Root key \
+                     provider `{}` at {}. Copy the root key from a manager that has it (or set \
+                     {DEF_ROOT_KEY_ENV}), then check `legion keyring status`",
+                    row.key_id,
+                    provider.kind(),
+                    provider.location()
+                ),
+            }));
+        };
+        crate::checkpoint_seal::PartKey::derive(&loaded.key, &row.key_id, digest)
     }
 
     /// Re-wrap every loaded data key under the provider's CURRENT root key

@@ -561,6 +561,7 @@ For each task, the planner builds:
 - `AffinitySet` (soft scoring)
 - `DistinctTracker` (for `distinct` constraints)
 - Resource request from normalized task resources
+- Content locality scores, when the task has a content set (below)
 
 Selection policy:
 
@@ -614,6 +615,23 @@ policies always receive the full eligible list. When both
 first (it is a hard cap). Combining them is not recommended. This setting
 is off unless configured, and exact scoring is the default at every fleet
 size.
+
+### Content locality
+
+When a task declares digest-pinned artifacts, the planner looks its content
+set up once per task in the manager's in-memory content location index and
+gets back the fraction of the set each node already holds
+([artifacts.md](artifacts.md#content-locality)). The lookup is one hash probe
+per digest plus one map write per node holding it. It never walks the
+candidate list. Each candidate's score then reads its fraction from the
+per-candidate state, so the per-placement cost does not change. The term is
+weighted by `schedulerSettings.weights.locality` (default `1.0`) in both the
+built-in policies and the context handed to scheduler plugins. A task with
+no content set, or a weight of `0`, skips the lookup entirely.
+
+The index is soft state on the manager that receives a node's heartbeats,
+rebuilt from full reports after a restart or failover. Nodes it has not
+heard from score `0`, which costs placement quality and never correctness.
 
 ## Dependency-Aware Task Readiness
 

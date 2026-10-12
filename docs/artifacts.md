@@ -18,9 +18,10 @@ This page is the user-facing reference.
 > dynamic fetcher plugins, and `nodeIdentity` auth. Two pieces are not
 > finished. **Task `identity` auth** (and `assumeRole`) is validated at
 > admission but fails at fetch time (see
-> [Auth](#workload-identity-auth-pending)). There is also **no artifact cache
-> yet**, so staging fetches from origin unless the same allocation is
-> restaging unchanged artifacts on the same node (see
+> [Auth](#workload-identity-auth-pending)). The
+> [node content store](#the-node-content-store) caches only artifacts that
+> declare a `checksum` on an `http(s)`, `s3`, or `file` source. Everything
+> else fetches from origin for each new allocation (see
 > [Limitations](#limitations)).
 
 ## Declaring artifacts
@@ -459,7 +460,269 @@ worker does a full fresh fetch when:
 
 Reuse applies only on the same node, per allocation. Allocations moved to
 another node always fetch fresh, and explicit stops and removals delete the
-task directory. There is no caching across allocations or nodes.
+task directory. Reuse *across* allocations on one node is the job of the
+node content store, below.
+
+### The node content store
+
+Each worker keeps one content-addressed store at
+`<worker state dir>/content/`. Blobs live at `sha256/<hex>`, named by the
+sha256 of their bytes, with a small sqlite index beside them. It is on by
+default.
+
+When an artifact declares a `checksum` and comes from an `http(s)`, `s3`, or
+`file` source, staging goes through the store:
+
+- **Hit.** The worker copies the blob into the task directory and applies
+  `dest`, `mode`, and `unpack` exactly as a fresh fetch would. Nothing is
+  fetched. The copy is a clone on filesystems that support it (APFS, btrfs,
+  XFS), and the copy is verified against the digest before it is used.
+- **Miss.** The worker fetches from origin as usual. After the checksum
+  verifies, it copies the bytes into the store, so the next allocation on
+  this node is a hit.
+- **Concurrent misses share one download.** Two allocations staging the same
+  digest at the same moment wait for each other, and the second is a hit.
+
+So a second allocation of a digest-pinned artifact on the same node does not
+touch the origin. That includes scale-outs, restarts after a reschedule back
+to the node, and new versions of a job that kept the same artifact.
+
+Tasks always get their own copy. A task that writes to its staged file cannot
+change what the next allocation receives. A blob that fails digest
+verification (disk damage, someone editing files under the state dir) is
+dropped from the store, and the artifact is fetched from origin instead.
+Storing is best effort: if the store is full of pinned content or the disk is
+low, the allocation still stages from its fetched bytes and the worker logs
+`Could not cache artifact in node content store`.
+
+The store keeps a separate byte budget for each **class** of content:
+
+- `artifacts`: cached artifacts.
+- `snapshots`: memory snapshot parts (VMM memory and device state, and the
+  guest root disk). A local snapshot's parts are pinned to it until it is
+  deleted. A published snapshot's parts are unpinned on every node once the
+  upload finishes, so they are evicted like any cached entry (see
+  [suspend and resume](suspend-and-resume.md#durability)).
+
+A class over budget evicts its own least-recently-used entries and never
+touches the other class, so a large memory snapshot cannot push every cached
+artifact off the node. Content can also be **pinned** by an owner, such as a
+snapshot. Pinned content is never evicted, expired, or removed, and it still
+counts toward its class budget. A class whose budget is entirely pinned
+refuses new content with an error naming the budget to raise.
+
+Configure the store per worker type:
+
+```nickel
+# configs/workers/default.ncl
+{
+  workerType = "default",
+  content = {
+    enabled = true,          # false stages every artifact straight from origin
+    budgets = {
+      artifacts = "10%",     # cached artifacts: a share of the disk or a size
+      snapshots = "50GiB",   # checkpoint parts
+    },
+    ttl = "72h",             # unpinned content unused this long is removed. "0s" disables
+    minFreeDisk = "5GiB",    # evict, then refuse, rather than drop below this
+  },
+}
+```
+
+Each budget is either a fixed size (`"50GiB"`) or a share of the filesystem
+that holds `<worker state dir>/content/` (`"20%"`, above 0 and at most
+100). The worker sizes a share once, when it starts, against that
+filesystem's total size, and logs the result (`Sized node content store
+budgets`). A disk that grows or shrinks takes effect at the next worker
+start.
+
+Without a `budgets` entry, a class takes its default share, clamped so that
+very small and very large disks still get a sensible budget:
+
+| Class | Default | Clamp | 8 GiB disk | 100 GiB disk | 1 TiB disk |
+| --- | --- | --- | --- | --- | --- |
+| `artifacts` | 10% | 1 GiB to 20 GiB | 1 GiB | 10 GiB | 20 GiB |
+| `snapshots` | 20% | 2 GiB to 200 GiB | 2 GiB | 20 GiB | 200 GiB |
+
+The artifact cache caps at 20 GiB because a miss costs one refetch, so a
+bigger cache buys little. The snapshot budget caps at 200 GiB so a node with
+a multi-terabyte data disk keeps most of it for volumes unless you ask for
+more. A share you set yourself (`snapshots = "40%"`) is not clamped. On a
+small disk the floors can add up to more than 30% of it, and then
+`minFreeDisk` is what protects the node: the store evicts unpinned content,
+then refuses new content, before free space drops below it, and the
+scheduler counts it when it checks a node's
+[checkpoint room](suspend-and-resume.md#the-checkpoint-disk-budget).
+
+Every field is optional. A malformed size, percentage, or duration fails
+manager startup, not the worker. So do shares that add up past the disk:
+`artifacts = "90%"` beside the default 20% for snapshots fails with
+`content.budgets.artifacts (90%) and content.budgets.snapshots (20%, the
+default) together claim 110% of the disk`. If a worker cannot read the size
+of its content filesystem, it cannot size a share, so it logs `Cannot size
+the node content store` and runs without a store. Set fixed sizes on such a
+platform. The worker runs garbage collection every 10 minutes (TTL
+expiry, plus trimming a class whose budget was lowered across a restart).
+Puts evict on demand, so the store never grows past a budget between passes.
+Deleting `<worker state dir>/content/` while the worker is stopped is always
+safe for artifacts. Everything refetches.
+
+Each artifact's status row reports the outcome in `cache`: `"hit"` when it
+came from the store, `"miss"` when it was fetched and stored. The field is
+absent for artifacts the store cannot serve.
+
+### Content locality
+
+A store only helps when work lands on the node that holds the bytes. So
+workers tell the manager what their store holds, and the scheduler prefers
+nodes that already hold what a placement needs.
+
+**What workers advertise.** Every heartbeat carries the store's changes
+since the last one the manager acknowledged: digests added and removed,
+with sizes. Only entries of at least 1 MiB are advertised. Smaller content
+downloads in well under a heartbeat, so it is not worth steering placement
+for. A worker process sends its full set on its first heartbeat, then
+deltas. An unchanged store sends an empty report.
+
+**What the manager keeps.** The manager folds the reports into an index of
+`digest -> {node: bytes}`. The index lives in memory, like node liveness,
+and is never written to the state store or replicated. Each report carries
+an epoch. When a manager cannot apply a report, because it just started, it
+just became leader, or a heartbeat reply was lost and the epochs disagree,
+it asks the worker for a full report, which arrives on the next heartbeat.
+Until a node's report lands, that node scores 0 on locality. Losing the
+index costs placement quality for a heartbeat or two, never correctness. A
+node silent for two minutes is dropped from the index.
+
+**How placement uses it.** A placement's *content set* is the digests it
+needs on its node: the task's artifacts that declare a `checksum`, plus the
+memory parts of a snapshot the instance restores from (a resume, a restore,
+or a fork). For each candidate node:
+
+```
+locality = bytes of the content set the node holds / total bytes of the set
+```
+
+The total counts the content the index can size: content no node holds and
+no caller sized cannot tell nodes apart, so it is left out. The score joins
+the placement score with weight `schedulerSettings.weights.locality`
+(default `1.0`, the same scale as `affinities`). A placement whose task has
+no digest-pinned artifacts skips the term, and pays nothing for it. Set the
+weight to `0` to turn locality off:
+
+```nickel
+# manager.ncl
+{
+  schedulerSettings = {
+    weights = { locality = 0.5 },   # default 1.0; 0 disables
+  },
+}
+```
+
+Locality is a preference. It never excludes a node, and it competes with
+the other score terms: a node that holds every byte can still lose to a node
+that satisfies an affinity, or to an emptier node under `spread`. To see how
+often placements land warm, watch
+`legion_scheduler_locality_placements_total` (see
+[metrics.md](metrics.md#scheduler--eval-loop)).
+
+**Seeing what a node holds.** `legion node content <node>` (the
+`GetNodeContent` RPC, the `legion_node_content` MCP tool, and the worker
+page's "Content and locality" card) reads the same index the score reads:
+
+```console
+$ legion node content w-04
+Node w-04  publish: yes  checkpoint: yes
+Advertises 3 entries, 574 MiB (epoch 42)
+
+ DIGEST               MiB  SNAPSHOT               ROLE      HOLDERS
+ sha256:3f9a0c21d4e5  480  snap-90d1e90d1e90d1e9  memory    3
+ sha256:aa00aa00aa00  64   -                      -         5
+ sha256:bb11bb11bb11  30   snap-90d1e90d1e90d1e9  vm-state  2
+
+ SNAPSHOT                       JOB         KIND    STATE      CAPTURED HERE  PARTS HERE
+ golden (snap-90d1e90d1e90d1e9)  workspaces  memory  published  no             3/3
+```
+
+Each entry names the snapshot and part role it belongs to when the manager
+knows one, and how many nodes advertise the same digest. The snapshot list
+covers what the node captured and every published snapshot it holds parts
+of (fetched for a resume or fork, or warmed). It needs `node:read` on the
+node's pool, and snapshot rows also need `snapshot:read` on their job.
+Because the index is soft state, the reply says `index_reported: false`
+when this manager holds no report from the node (it just started, the node
+has no store or an older worker, or the node reports to another manager).
+It lists entries of 1 MiB and up only, and carries no per-class budgets:
+the index records digests and sizes, not classes.
+
+### Publishing content
+
+A worker can also publish content from its store to a shared store. Every
+published part is sealed (encrypted) first. Configure it per worker type with
+`contentStore`:
+
+```nickel
+# configs/workers/default.ncl
+{
+  workerType = "default",
+  contentStore = {
+    # s3://bucket/optional/prefix, or file:///shared/dir for a shared mount.
+    # Takes the same ?region= and ?endpoint= query parameters as s3 artifacts.
+    url = "s3://legion-content-usw2/",
+    # Optional. Omit it to use the node's ambient AWS credentials (the AWS_*
+    # environment variables, then the instance profile). Or read an AWS
+    # credential object from KV, the same shape artifact `auth.kv` takes:
+    auth = { kv = "legion/content-store" },
+  },
+}
+```
+
+Published content lands at `<url>/sealed/<name>`, encrypted with
+AES-256-GCM under a key the manager derives for that part from the cluster's
+checkpoint key (see
+[published checkpoint encryption](suspend-and-resume.md#published-checkpoint-encryption)).
+The key and the name are both a keyed function of the content's digest, so
+publishing is idempotent: publishing bytes the destination already holds
+uploads nothing. The worker hashes the bytes as it seals them, so corrupt
+bytes are never published, and it records the published URL per digest in
+its store's index. Sealing and S3 uploads both stream (1 MiB chunks, 16 MiB
+upload parts), so a multi-gigabyte file never sits in memory. There is no
+plaintext mode.
+
+Reads never use the publisher. Any worker fetches published content with the
+ordinary `s3://` or `file://` fetcher, opens it in place with the key the
+manager sent along with the work, and checks the plaintext against the
+digest before it lands in that worker's own store. Pointing each region's
+workers at their own bucket is how region locality works: Legion does not
+replicate between buckets.
+
+A malformed `contentStore` (an unsupported scheme, a bucket-less URL, `auth`
+on a `file://` store) fails manager startup. A worker whose content store is
+disabled logs that it cannot publish and carries on.
+
+**What publishes today: durable checkpoints.** A suspend with
+`suspend.durability = "store"`, and `legion snapshot create --publish`, have
+the capturing worker publish each memory part of the checkpoint here once it
+is captured. Another node then restores it by fetching the parts through its
+ordinary fetchers, verified by digest, into its own content store (see
+[suspend and resume](suspend-and-resume.md#durability-surviving-the-node)).
+A worker with a usable `contentStore` advertises the `content-publish`
+capability when it registers, and `instance suspend` with `durability =
+"store"` refuses a node without it. Publishing reads only from the node
+content store, so `content.enabled = false` turns publishing off too.
+
+Published parts hold guest memory, secrets included, so they are only ever
+stored sealed. Restricting the bucket to your workers is still good practice,
+since object sizes are visible to anyone who can list it. Legion never
+deletes from the store, because one object can belong to more than one
+snapshot. Expire objects with bucket lifecycle rules.
+
+**Warming.** `legion snapshot warm <snapshot> --constraint key=value` asks
+matching nodes to fetch a published snapshot's parts into their stores ahead
+of time, so the location index (and `locality`) prefers them. It is best
+effort and never blocks placement (see
+[Warming nodes](suspend-and-resume.md#warming-nodes)). Artifacts have no warm
+command yet.
 
 ## Status surfaces
 
@@ -472,7 +735,8 @@ already appears:
 ```nickel
 [
   { "name" = "tool",  "source" = "https://releases.acme.io/embed/v1.4.tar.gz",
-    "state" = "staged", "digest" = "sha256:9f86…", "attempts" = 1, "durationMs" = 412 },
+    "state" = "staged", "digest" = "sha256:9f86…", "attempts" = 1, "durationMs" = 412,
+    "cache" = "miss" },
   { "name" = "model", "source" = "oci://registry.acme.io/models/embedder@sha256:abc…",
     "state" = "fetching", "attempts" = 1, "bytesFetched" = 1610612736, "bytesTotal" = 4294967296 },
   { "name" = "cfg",   "source" = "s3://acme-builds/cfg.tar.gz",
@@ -541,8 +805,10 @@ staged OCI layout into the local runtime:
   with `<runtime> run --bundle`. See
   [task-runtime-container.md](task-runtime-container.md#linux-image--bundle).
 
-The flag defaults to **off** until the artifact cache ships. Without a cache,
-Legion-managed pulls download the image again for every allocation. That
+The flag defaults to **off** until the
+[node content store](#the-node-content-store) caches images. It caches only
+single files today, so Legion-managed pulls download the image again for
+every allocation. That
 would be a step backward for runtimes that cache images themselves. With the
 flag off, container behavior is unchanged.
 
@@ -608,14 +874,26 @@ Remember the allowlists. Add a custom scheme to the cluster's
 
 ## Limitations
 
-- **No cache, no pre-warming.** Staging fetches from origin, except when the
-  same allocation restages an unchanged artifact list on the same node (see
-  [Restart reuse](#restart-reuse--no-refetch-when-nothing-changed)). A new
-  allocation fetches fresh, even on a node that already staged the same
-  artifact. There is no content-addressed cache, disk budget, pre-pull, or
-  scheduler locality scoring yet. The
-  `ArtifactSink` write interface exists so a cache can be added without
-  changing specs, fetchers, or plugins.
+- **The node content store caches only digest-pinned single files.** An
+  artifact needs a `checksum` and an `http(s)`, `s3`, or `file` source. Git
+  trees, `file://` directories, OCI images, ORAS layers, and artifacts
+  without a `checksum` fetch from origin for every new allocation. There is
+  no TTL-based revalidation of mutable URLs, so a plain URL without a
+  checksum is never served from the store. Add a `checksum` to opt in.
+- **No pre-warming for artifacts.** The store fills only when an allocation
+  stages, or when `snapshot warm` pulls a published snapshot's parts. There
+  is no artifact pre-pull and no way to list or clear the store from the CLI.
+  Each node's store is its own: a new node always fetches from origin.
+- **Locality covers digest-pinned artifacts only.** Container image layers
+  are not in the content store, so images do not count toward a placement's
+  content set.
+- **The location index is per manager.** Each manager indexes the nodes
+  whose heartbeats it serves. In a multi-manager cluster, nodes that
+  heartbeat a manager other than the one scheduling score 0 on locality.
+  Placement stays correct and only loses the preference.
+- **`contentStore.auth.nodeIdentity` is rejected.** S3 uploads need an AWS
+  credential, and node identity tokens are not exchanged for one. Use
+  `auth.kv` or the node's ambient credentials.
 - **Checksums verify single-file payloads** (and, for OCI, the manifest
   digest). Declaring a `checksum` on a source that produces a tree (git,
   `file://` directories) is a staging error, not a silent skip.

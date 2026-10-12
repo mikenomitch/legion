@@ -17,7 +17,7 @@ let service = fun task_name task_group task_deps => {
   group = task_group,
   dependsOn = task_deps,
   config = { command = ["sleep", "3600"] },
-  resources = { cpus = 0.1, memory = 128 },
+  resources = { cpu = 100, memory = 128 },
 }
 in
 
@@ -28,7 +28,7 @@ let batch = fun task_name task_group seconds task_deps => {
   group = task_group,
   dependsOn = task_deps,
   config = { command = ["sleep", std.string.from_number seconds] },
-  resources = { cpus = 0.1, memory = 128 },
+  resources = { cpu = 100, memory = 128 },
 }
 in
 
@@ -39,7 +39,7 @@ let sidecar = fun task_name task_group task_deps => {
   group = task_group,
   dependsOn = task_deps,
   config = { command = ["sleep", "3600"] },
-  resources = { cpus = 0.1, memory = 64 },
+  resources = { cpu = 100, memory = 64 },
 }
 in
 

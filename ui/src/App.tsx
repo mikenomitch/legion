@@ -51,7 +51,6 @@ import Rollouts from './pages/Rollouts'
 import Services from './pages/Services'
 import Network from './pages/Network'
 import Volumes from './pages/Volumes'
-import TestingUtils from './pages/TestingUtils'
 import Raft from './pages/Raft'
 import Templates from './pages/Templates'
 import TemplateDetail from './pages/details/TemplateDetail'
@@ -62,6 +61,8 @@ import TemplateDetail from './pages/details/TemplateDetail'
 const ApiExplorer = lazyPage(() => import('./pages/ApiExplorer'))
 const StateExplorer = lazyPage(() => import('./pages/StateExplorer'))
 const Observability = lazyPage(() => import('./pages/Observability'))
+// Component fixtures: unlisted, and kept out of the main bundle.
+const TestingUtils = lazyPage(() => import('./pages/TestingUtils'))
 
 type SidebarItem = {
   kind: 'item'
@@ -768,6 +769,10 @@ const Layout = (props: RouteSectionProps) => {
     return !isKnownSection(segments[0])
   }
 
+  // Unlisted pages that render their own PageHeader (the /testing fixtures);
+  // the generic header would name the first nav item instead.
+  const isUnlistedPage = () => location.pathname.replace(/\/+$/, '') === '/testing'
+
   const NavLink = (itemProps: { item: SidebarItem }) => (
     <A
       href={itemProps.item.path}
@@ -1109,7 +1114,7 @@ const Layout = (props: RouteSectionProps) => {
             </div>
           </Show>
           <main class="flex-1 min-w-0 px-4 py-6 md:px-8">
-            <Show when={!isDetailRoute() && !isUnknownRoute()}>
+            <Show when={!isDetailRoute() && !isUnknownRoute() && !isUnlistedPage()}>
               <PageHeader title={pageMeta().title} subtitle={pageMeta().subtitle} />
             </Show>
             <ConnectionGate>

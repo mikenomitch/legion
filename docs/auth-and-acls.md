@@ -50,6 +50,7 @@ legion acl whoami
 | `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. |
 | `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name). Separate from `job:write` for the same reason as `scale`: a platform's ticket minter can authorize individual starts without the right to redeploy the fleet. |
 | `net` | network policy objects ([Network Handlers](network-handlers.md)) | list policies, show or test a job's effective policy (scope by job name) | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. |
+| `snapshot` | instance snapshots ([Suspend and Resume](suspend-and-resume.md)) | list, inspect, warm a published one onto nodes, restore an instance from one, and create instances from one (restore and create also need `job:write`) | create (including `--publish`), delete, and name snapshots, suspend with a memory checkpoint, and fork (fork also needs `job:write`) (scope by job name and namespace) |
 
 Actions are `read` and `write`. `write` does not imply `read`, so grant both.
 Grant `state:read` sparingly, since it can read every table in the state
@@ -71,6 +72,27 @@ store, including ACL metadata. What it cannot read:
 `state:write` is still equivalent to full control of the cluster: it can
 rewrite any row, including ACL tokens and policies. State backups
 (`GetStateBackup`, `operator:write`) are the whole database, keys included.
+
+Grant `snapshot:write` as carefully as read access to a job's secrets. A memory
+snapshot captures everything the workload had in memory, including secrets,
+tokens, and decrypted KV values, so `snapshot:write` on a job is equivalent to
+reading every secret that job has held in memory. That is why snapshots are a
+resource of their own rather than part of `job:write`.
+
+Suspend follows the same line. `legion instance suspend` (`SuspendInstance`)
+needs `job:write` on the instance's job, like `instance stop`, plus
+`snapshot:write` when the checkpoint is `memory`, because a memory checkpoint
+holds the workload's memory. An explicit `--checkpoint memory` is checked
+before the instance is looked up. Resuming (`instance start`) needs
+`job:write` only: it restores the instance's own checkpoint and widens nothing.
+
+Fork (`legion instance fork`, `ForkInstance`) needs `job:write` and
+`snapshot:write` on the origin's job, whatever the checkpoint kind: every
+fork starts with what the origin had in memory or on disk. Creating instances
+from a snapshot (`instance create --from-snapshot`) needs `job:write` and
+`snapshot:read`, since it reads the snapshot. Both grants are checked before
+anything is looked up. Naming a snapshot (`legion snapshot alias`) needs
+`snapshot:write`.
 
 ### Policies
 

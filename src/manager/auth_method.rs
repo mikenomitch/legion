@@ -516,6 +516,10 @@ pub struct ControlPlaneIdentityMethod {
     state: std::sync::Arc<crate::manager::workload_identity::WorkloadIdentityState>,
     binding_rules: Vec<AclBindingRule>,
     token_ttl: Duration,
+    /// Read for the instance's current identity epoch, so a token copied
+    /// into a fork or snapshot is refused
+    /// ([`crate::manager::workload_identity::check_identity_epoch`]).
+    store: Store,
 }
 
 impl ControlPlaneIdentityMethod {
@@ -523,11 +527,13 @@ impl ControlPlaneIdentityMethod {
         state: std::sync::Arc<crate::manager::workload_identity::WorkloadIdentityState>,
         binding_rules: Vec<AclBindingRule>,
         token_ttl: Duration,
+        store: Store,
     ) -> Self {
         Self {
             state,
             binding_rules,
             token_ttl,
+            store,
         }
     }
 
@@ -535,6 +541,11 @@ impl ControlPlaneIdentityMethod {
         let claims = self.state.verify_control_plane(token).map_err(|e| {
             AuthError::InvalidCredentials(format!("control-plane token verification failed: {e:#}"))
         })?;
+        // One indexed instance read, and only for a token that names an
+        // instance: the rest of this path is signature checks.
+        crate::manager::workload_identity::check_identity_epoch(&self.store, &claims).map_err(
+            |e| AuthError::InvalidCredentials(format!("control-plane token refused: {e:#}")),
+        )?;
         let claims = Value::Object(claims);
         let sub = claims
             .get("sub")
@@ -1184,6 +1195,7 @@ mod auth_method_test {
             alloc_id: "7".into(),
             instance: None,
             slot: None,
+            epoch: None,
         };
         let legion = WorkloadIdentity {
             name: CONTROL_PLANE_IDENTITY_NAME.into(),
@@ -1204,6 +1216,7 @@ mod auth_method_test {
                 policies: vec!["kv-reader".into()],
             }],
             Duration::from_secs(60),
+            store.clone(),
         );
         let verified = method
             .validate_bearer(&token)

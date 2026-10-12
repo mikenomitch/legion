@@ -994,7 +994,44 @@ pub fn claims_for_allocation(
         alloc_id: allocation.id.to_string(),
         instance: instance.as_ref().map(|i| i.instance_id.clone()),
         slot: instance.as_ref().and_then(|i| i.slot_index),
+        epoch: instance.as_ref().map(|i| i.identity_epoch),
     })
+}
+
+/// Refuse a verified token whose instance has moved past the epoch it was
+/// issued at (docs/workload-identity.md, "Forks and snapshots").
+///
+/// A fork or snapshot capture copies the instance's tokens into the
+/// checkpoint, and every fork (or `from_snapshot` instance) starts with them
+/// in memory. The capture raises the instance's `identity_epoch`, so here,
+/// in Legion's own verifiers, those copies stop working while the instance
+/// itself gets a fresh token. Signature, issuer, audience, and expiry are
+/// the caller's to check first. A token naming no instance (a stateless
+/// task) has nothing to compare. A token naming an instance that no longer
+/// exists is refused, since nothing should still hold it. A token with no
+/// epoch claim was issued before epochs existed and counts as epoch 0.
+pub fn check_identity_epoch(store: &Store, claims: &Map<String, Value>) -> R<()> {
+    use crate::structs::workload_identity::{EPOCH_CLAIM, INSTANCE_CLAIM};
+    let Some(instance_id) = claims.get(INSTANCE_CLAIM).and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let token_epoch = claims
+        .get(EPOCH_CLAIM)
+        .and_then(Value::as_str)
+        .and_then(|epoch| epoch.parse::<u64>().ok())
+        .unwrap_or(0);
+    let Some(instance) = store.get_instance(instance_id)? else {
+        bail!("token was issued to instance {instance_id}, which no longer exists");
+    };
+    if token_epoch < instance.identity_epoch {
+        bail!(
+            "token was issued to instance {instance_id} at identity epoch {token_epoch}, before \
+             a fork or snapshot of it was captured (now epoch {}), so it may be a copy a fork \
+             holds. The instance itself holds a newer token",
+            instance.identity_epoch
+        );
+    }
+    Ok(())
 }
 
 /// Seconds since the Unix epoch.
@@ -1068,6 +1105,7 @@ mod tests {
             alloc_id: "alloc-42".into(),
             instance: None,
             slot: None,
+            epoch: None,
         }
     }
 
@@ -1455,7 +1493,7 @@ mod tests {
         let task = TaskConfig {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
-                id_source: None,
+                require_id: false,
                 initial_instances: None,
                 on_lost: None,
                 storage: None,

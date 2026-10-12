@@ -13,7 +13,7 @@
         os = "macos",
       },
       resources = {
-        cpus = 0.2,
+        cpu = 200,
         memory = 256,
       },
     },
@@ -59,7 +59,7 @@
         os = "macos",
       },
       resources = {
-        cpus = 0.2,
+        cpu = 200,
         memory = 256,
       },
     },
@@ -134,7 +134,7 @@
         os = "macos",
       },
       resources = {
-        cpus = 0.2,
+        cpu = 200,
         memory = 256,
       },
     },
@@ -201,7 +201,7 @@
         os = "macos",
       },
       resources = {
-        cpus = 0.3,
+        cpu = 300,
         memory = 512,
       },
     },
@@ -331,7 +331,7 @@
         os = "macos",
       },
       resources = {
-        cpus = 0.4,
+        cpu = 400,
         memory = 512,
       },
     },
@@ -377,7 +377,7 @@
         os = "macos",
       },
       resources = {
-        cpus = 0.2,
+        cpu = 200,
         memory = 256,
       },
     },
@@ -444,7 +444,7 @@
         os = "macos",
       },
       resources = {
-        cpus = 0.1,
+        cpu = 100,
         memory = 128,
       },
     },

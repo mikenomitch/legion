@@ -506,7 +506,14 @@ fn resource_limits(assignment: &crate::task_plugins::ResourceAssignment) -> Valu
         // of memory+swap combined — i.e. swap cannot be used to escape it
         // (the K8s semantic). Docker's default of 2x-limit-in-swap makes
         // limits soft in practice, which defeats scheduling against them.
-        resources.insert("memory".into(), json!({ "limit": bytes, "swap": bytes }));
+        let mut memory = json!({ "limit": bytes, "swap": bytes });
+        // `reservation` is cgroup v2 `memory.low` in runc and crun: the
+        // reservation the kernel protects from reclaim while a bursting
+        // neighbour gives memory back first.
+        if let Some(low) = assignment.memory_low_bytes {
+            memory["reservation"] = json!(low);
+        }
+        resources.insert("memory".into(), memory);
     }
     let mut cpu = serde_json::Map::new();
     if let Some(cores) = assignment.cores.as_ref().filter(|cores| !cores.is_empty()) {
@@ -983,6 +990,7 @@ mod tests {
             cores: Some(vec![3, 7]),
             cpu_weight: None,
             memory_limit_bytes: Some(268_435_456),
+            memory_low_bytes: None,
         }));
 
         assert_eq!(spec["linux"]["cgroupsPath"], "legion/reserve/legion-42");
@@ -1011,6 +1019,7 @@ mod tests {
             cores: None,
             cpu_weight: Some(500),
             memory_limit_bytes: Some(134_217_728),
+            memory_low_bytes: None,
         }));
 
         assert_eq!(spec["linux"]["cgroupsPath"], "legion/share/legion-42");
@@ -1033,6 +1042,7 @@ mod tests {
             cores: None,
             cpu_weight: None,
             memory_limit_bytes: None,
+            memory_low_bytes: None,
         }));
         assert!(governed_but_empty["linux"]["resources"]["memory"].is_null());
         assert!(governed_but_empty["linux"]["resources"]["cpu"].is_null());

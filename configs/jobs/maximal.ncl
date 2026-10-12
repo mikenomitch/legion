@@ -386,7 +386,10 @@
                 },
             ],
             resources = {
-                cpus = 1.5,
+                # MHz. `cpus` is an older alias for `cpu`, also in MHz (not
+                # a CPU count): `cpus = 1` reserves 1 MHz, and submit warns
+                # about any value under 10. Use `cores` for whole CPUs.
+                cpu = 1500,
                 memory = 512,
                 disk = 1024,
             },
@@ -573,7 +576,7 @@
                 },
             },
             resources = {
-                cpus = 0.5,
+                cpu = 500,
                 memory = 256,
             },
             constraints = [
@@ -641,7 +644,7 @@
                 },
             },
             resources = {
-                cpus = 0.1,
+                cpu = 100,
                 memory = 128,
             },
             constraints = {
@@ -667,9 +670,10 @@
             # LEGION_ALLOC_ID in its env (no LEGION_INSTANCE_SLOT).
             stateful = {
                 mode = "keyed",
-                # "uuid" = server mints ids when --id is omitted;
-                # "caller" = --id is required. Explicit ids always honored.
-                idSource = "uuid",
+                # Reject `instance create` without --id. Default false: the
+                # server mints an id when --id is omitted. Explicit ids are
+                # always honored.
+                requireId = true,
                 storage = {
                     # Opaque per-instance handle, reattached across
                     # reschedules and dropped on destroy.
@@ -679,8 +683,76 @@
             config = {
                 command = ["sleep", "600"],
             },
+            # How `legion instance suspend` checkpoints this keyed task and
+            # how `legion instance start` resumes it
+            # (docs/suspend-and-resume.md). Keyed stateful tasks only.
+            suspend = {
+                # "memory" | "disk". Unset: memory for a sandbox, disk for
+                # every other runtime. An `exec` task suspends to disk: the
+                # task stops, the volume stays in place, and a resume boots
+                # it fresh on that volume.
+                checkpoint = "disk",
+                # How much of the reservation stays charged to the node while
+                # suspended, so the resume finds room (docs/
+                # suspend-and-resume.md, "Capacity for resumes"). false
+                # (default, the density win), true (everything, exclusive
+                # cores included), a ratio of memory and cpu MHz between 0
+                # and 1, or fixed amounts { memory = "1GiB", cpu = 100 } no
+                # larger than `resources`.
+                reserve = 0.25,
+                # When a resume cannot restore (checkpoint lost with its
+                # node, compat drift, a failed restore): "cold" (default)
+                # boots fresh on the retained storage, "fail" leaves the
+                # instance suspended with the error in its detail.
+                onRestoreFailure = "cold",
+                # How long a resume waits to be placed on its checkpoint's
+                # node before onRestoreFailure = "cold" boots it fresh.
+                resumeTimeout = "30s",
+                # Where the checkpoint lives. "local" (default): only on the
+                # node that took it, and a resume is pinned there. "store":
+                # the node also publishes it to its worker `contentStore`, so
+                # the instance resumes on any compatible node and survives
+                # losing the node. "store" needs instance data that can
+                # move: no stateful.storage, or a network driver such as
+                # nfs. This task's local-dir volume keeps it at "local"
+                # (job validation refuses "store" here).
+                durability = "local",
+                # argv a sandbox guest runs after every memory restore, once
+                # its identity is refreshed. Sandbox memory checkpoints only,
+                # so this exec task leaves it out (job validation refuses it
+                # here):
+                # onResume = ["/usr/local/bin/reconnect"],
+                # Suspend automatically when quiet. The worker tracks the
+                # listed signals and the manager suspends the instance once
+                # none has fired for `after` (needs resourceEnforcement on
+                # the worker, which is what measures activity).
+                idle = {
+                    # Quiet this long, then suspend. Default "3m", at least
+                    # "30s".
+                    after = "3m",
+                    # What counts as activity. Default
+                    # ["network", "cpu", "exec"]. "connections" also counts
+                    # an open ingress connection through the node datapath
+                    # that sends nothing (a client waiting on a slow
+                    # response). A sandbox that is not gated has no datapath
+                    # ingress, so "connections" is refused there, as is
+                    # "exec" on a sandbox pinned to a VMM (a microVM takes no
+                    # exec sessions). On a sandbox, "network" also counts
+                    # bytes the guest sends on its TAP or Apple container
+                    # NIC. "hint" (the workload's own signal) is not
+                    # available yet and is refused.
+                    signals = ["network", "cpu", "exec", "connections"],
+                    # The cpu signal's threshold, as a fraction of this
+                    # task's cpu. Default 0.02.
+                    cpuBelow = 0.02,
+                },
+                # Let the node's memory pressure response suspend this
+                # instance (the `suspend` step) before it evicts anything.
+                # Default false.
+                onPressure = true,
+            },
             resources = {
-                cpus = 0.25,
+                cpu = 250,
                 memory = 128,
             },
             constraints = {
@@ -718,9 +790,11 @@
                 },
                 # Guest working directory (defaults to the image's).
                 cwd = "/workspace",
-                # Guest sizing; defaults are 1 vCPU / 512 MiB.
+                # Guest vCPUs (default 1), independent of resources.cpus.
+                # Guest RAM is not set here: it follows `resources` below
+                # (memoryMax, else memory). An explicit `memory_mib` still
+                # wins this release, with a submit warning when it disagrees.
                 vcpus = 1,
-                memory_mib = 512,
                 # Writable scratch in the ephemeral root disk, on top of the
                 # image contents (default 256). Anything written outside the
                 # volume mount lives here and dies with the allocation.
@@ -735,10 +809,22 @@
                 kernel = "/var/lib/legion/kernels/vmlinux",
                 kernel_args = "quiet",
                 network = {
-                    # "none" (default, loopback only) or "tap" with a
-                    # pre-created host TAP device. Not used when the task's
-                    # own `network.mode` below is "gated".
+                    # "none" (default, loopback only) or "tap". Not used
+                    # when the task's own `network.mode` below is "gated".
                     mode = "none",
+                    # With mode = "tap": a pre-created host TAP device (one
+                    # guest per node, so refused on a keyed task, with
+                    # count above one, or with a createFirst rollout), or
+                    # "auto" for a TAP Legion creates per instance (`lgf` +
+                    # a hash of the instance id), attaches to `bridge`,
+                    # recreates on resume, and deletes with the allocation:
+                    # tap = "auto",
+                    # The host bridge an auto TAP joins. Required with
+                    # tap = "auto", refused with a fixed tap.
+                    # bridge = "br0",
+                    # Guest MAC. An auto TAP defaults to one derived from
+                    # the allocation id.
+                    # mac = "02:00:00:00:00:01",
                 },
             },
             # The task-level network block applies to sandboxes too: "gated"
@@ -750,10 +836,47 @@
                 mode = "gated",
                 egress = { allow = ["pypi.org", "files.pythonhosted.org"] },
             },
-            resources = {
-                cpus = 1,
-                memory = 512,
+            # Opt into snapshots (`legion snapshot`, docs/suspend-and-resume.md).
+            # `ttl` deletes a snapshot this long after it was taken (unset:
+            # never), `keep` caps snapshots per instance (default 5, the
+            # oldest goes first). `memory` (default true) launches a sandbox
+            # on a real VMM ready for memory snapshots. This task is gated,
+            # and memory snapshots do not support gated networking yet, so
+            # it takes disk snapshots only; `memory = true` here would fail
+            # job validation with that reason.
+            snapshots = {
+                ttl = "7d",
+                keep = 5,
+                memory = false,
             },
+            resources = {
+                cpu = 1000,
+                # Reserved: what the scheduler packs on, and the cgroup's
+                # memory.low.
+                memory = 512,
+                # Burst ceiling (MiB, at least `memory`): the guest boots
+                # with this much RAM, and with resource enforcement the
+                # cgroup's memory.max is this plus the worker's
+                # sandbox.vmmOverheadMiB. Above `memory` the task is
+                # "bursting", which is what a node's memory pressure
+                # response gives back first (docs/resource-enforcement.md).
+                memoryMax = 1024,
+            },
+            # A sandbox takes file-delivered identities under
+            # /legion/identity (a relative path resolves there). The worker
+            # copies each refreshed token onto the guest's identity disk and
+            # the guest rewrites the file, with no restart (changeMode
+            # defaults to "noop"). On a memory-checkpointable sandbox, env
+            # delivery with "noop" works too: the current token is kept at
+            # /legion/identity/<ENV> (docs/workload-identity.md, "Sandboxes").
+            identities = [
+                {
+                    name = "pypi",
+                    audience = ["pypi.org"],
+                    ttl = "15m",
+                    file = { path = "/legion/identity/pypi", mode = "0400" },
+                },
+            ],
             constraints = {
                 # A microVM needs KVM, so keep these on a Linux pool. On macOS
                 # the kind falls back to Apple `container` dev mode.

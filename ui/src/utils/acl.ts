@@ -28,6 +28,9 @@ export type AclResource =
   | 'template'
   | 'scale'
   | 'net'
+  // Snapshots of instances, scoped by job like `job`. `snapshot:write` on a
+  // job is as strong as reading its memory (docs/auth-and-acls.md).
+  | 'snapshot'
 
 export type AclActionKind = 'read' | 'write'
 

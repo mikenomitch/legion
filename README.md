@@ -1,21 +1,22 @@
 # Legion
 
-**A workload orchestrator that is simple to start, fast at scale, and built to be extended.**
+**A workload orchestrator that is simple, performant, scalable, and exetensible.**
 
 > [!NOTE]
 > Legion is an experimental personal project, built largely by AI agents.
-> Expect bugs and breaking changes. See [Status](#status) before you use it.
+> Expect bugs, breaking changes, and known security issues. See
+> [Status](#status) before you use it.
 
-Legion runs your containers, binaries, and microVMs across a fleet of machines.
+Legion runs your containers, binaries, and microVM sandboxes across a fleet of machines.
 You describe a job, and Legion decides where it runs, starts it, keeps it
 healthy, and rolls out new versions. It does the same job as
 [Kubernetes](https://kubernetes.io) or [Nomad](https://www.nomadproject.io),
 with far fewer moving parts.
 
 Legion ships as **one ~26 MB binary** that is the manager, the worker, the CLI,
-and an MCP server for AI agents. State lives in SQLite by default, so a
-single-node cluster needs no etcd, no Consul, and no Raft. Turn on
-replication when you need high availability.
+and an MCP server for AI agents. State lives in SQLite by default, and can be
+run on a single machine, streamed to object-storage, or persisted using raft
+depending on your needs.
 
 ```
                 ┌──────────────────────┐
@@ -38,12 +39,6 @@ Install from [crates.io](https://crates.io/crates/legion-rs). You need
 cargo install legion-rs
 ```
 
-The crate is named `legion-rs` because `legion` on crates.io is an unrelated
-library. It installs a binary called `legion`.
-
-To build from a clone instead, run `cargo build --release` and add
-`target/release` to your `PATH`.
-
 Start a manager with a worker running in the same process. The defaults work
 without a config file.
 
@@ -52,7 +47,7 @@ legion start manager --run-worker
 ```
 
 In another terminal, write a job. Job specs use [Nickel](https://nickel-lang.org),
-a small typed configuration language. Plain JSON works too.
+a small typed configuration language, but plain JSON works too.
 
 ```nickel
 # hello.ncl
@@ -92,32 +87,27 @@ legion service resolve web
 curl "http://$(legion service resolve web --one)"
 ```
 
-Change the spec and run it again to roll out a new version. Scale without a
-new version using `legion job scale hello --count 5`.
+Change the spec and run it again to roll out a new version. Scale using
+`legion job scale hello --count 5`.
 
 ### Add more machines
 
 Adding a worker is two commands. Mint a join token on the manager, then paste
-it on the new machine. The token carries the manager's address, so the worker
-needs no other config.
+it on the new machine.
 
 ```bash
-# on the manager
+# on the manager, mint a join token
 legion join-token create --ttl 24h
 
-# on the new machine
+# on the new machine, use the returned token
 legion join lgnjoin_...
 ```
-
-Every command takes `--json` for scripting. See
-[Auth & ACLs](docs/auth-and-acls.md) to lock the cluster down before you expose
-it to a network.
 
 ### Example job specs
 
 A few from [`configs/jobs/`](configs/jobs/), roughly simplest first:
 
-- [`min.ncl`](configs/jobs/min.ncl): the smallest valid job, one container.
+- [`min.ncl`](configs/jobs/min.ncl): a small valid job with one container.
 - [`container-service.ncl`](configs/jobs/container-service.ncl): nginx in a
   container on a dynamic port, with an HTTP health check.
 - [`exec-service.ncl`](configs/jobs/exec-service.ncl): a host process run
@@ -162,10 +152,9 @@ still be happy with at ten thousand nodes.
 
 - **One binary, one command per node.** `legion start manager` and
   `legion join <token>` are the whole install.
-- **Raft is optional.** A single manager runs on local SQLite. Switch to
-  [quorum-replicated state](docs/multi-raft.md) or
-  [WAL streaming with lease-fenced failover](docs/persistence-streaming.md)
-  when you need HA.
+- **Raft is optional.** A single manager runs on local SQLite. When you
+  need HA, you can [stream to object storage](docs/persistence-streaming.md)
+  or use [Raft](docs/multi-raft.md) depending on which suits your needs.
 - **Batteries included.** [Service discovery](docs/service-discovery.md), a
   [service mesh with mTLS](docs/network-handlers.md), a
   [versioned KV store](docs/kv-store.md) with
@@ -175,24 +164,14 @@ still be happy with at ten thousand nodes.
 - **Readable job specs.** [Nickel](docs/configuration-language.md) gives you
   types, imports, and functions for DRY specs, and
   [job templates](docs/job-templates.md) let teams submit vetted jobs with a
-  few typed variables. No YAML sprawl, and no Helm templates.
-- **See a change before you make it.** `legion job validate` and
-  `legion job plan` check a spec against the same rules the manager applies
-  and show exactly what would change. Errors come back with a hint for
-  fixing them.
+  few typed variables. This means no YAML or Helm charts.
 - **State you can query.** Cluster state is plain SQLite, so
   `legion state query "<SQL>"` answers questions the CLI never anticipated.
-- **OpenTelemetry everywhere.** Managers and workers export
-  [traces over OTLP](docs/observability.md) to any OpenTelemetry backend,
-  covering RPCs, evals, scheduling, and plan apply.
-  [Prometheus metrics](docs/metrics.md) and the
-  [event stream](docs/event-stream.md) cover the rest, so you can see every
-  state change as it happens.
 
 ### Fast
 
-On the same AWS hardware at 5,000 nodes, Legion outpaced Kubernetes by a
-wide margin ([benchmarks](docs/benchmarks.md)):
+Legion is fast. For instance, on the same AWS hardware at 5,000 nodes, Legion outpaced Kubernetes
+by a wide margin ([benchmarks](docs/benchmarks.md)):
 
 - **17x** the services placed per second
 - **28x** the batch allocations placed per second
@@ -224,15 +203,11 @@ How it gets there:
   so a busy control plane doesn't mistake healthy nodes for dead ones. A
   circuit breaker refuses to mark half the fleet lost in one tick.
 - **Start work before consensus.** [Edge boot](docs/edge-boot.md) lets a
-  worker boot a workload before its placement is durable, or authorize the
-  start on its own from a short-lived ticket. The durable commit still
-  decides which instance wins.
-- **Small enough for the edge.** The shipping binary is ~26 MB, against
-  ~82 MB for k3s and ~150 MB for Nomad.
-- **Measured, not guessed.** Micro-benchmarks gate scheduler changes, and a
-  [worker simulator](docs/worker-simulation.md) drives thousands of
-  wire-real fake nodes from one process. See
-  [Testing and Benchmarks](docs/testing-and-benchmarks.md).
+  worker boot a workload before its placement is durable. This allows work
+  to start ASAP, but then still be durably committed for future self-healing
+  and consistency.
+
+See [Testing and Benchmarks](docs/testing-and-benchmarks.md) for more details.
 
 ### Flexible
 
@@ -243,7 +218,9 @@ How it gets there:
   no extra round trips.
 - **Any kind of workload.** Long-running services, batch jobs, sidecars, and
   [stateful workloads](docs/stateful-workloads.md) with stable identity,
-  [volumes](docs/volumes.md), and fencing.
+  [volumes](docs/volumes.md), fencing, and
+  [suspend and resume](docs/suspend-and-resume.md) (by hand, when idle, or
+  under memory pressure) with snapshots you can roll an instance back to.
 - **A built-in DAG system.** Tasks declare `dependsOn` to form a
   [dependency graph](docs/jobs-tasks-and-scheduling.md), gated on another
   task starting, completing, or succeeding. Dependencies can span groups
@@ -255,6 +232,8 @@ How it gets there:
   crate that implements one trait, and the
   [`noop` example](plugins/tasks/noop/src/lib.rs) is under 100 lines.
 - **Runs on macOS and Linux**, with Windows support in progress.
+- **Small enough for the edge.** The shipping binary is ~26 MB, against
+  ~82 MB for k3s and ~150 MB for Nomad.
 
 ### Built to run agents
 
@@ -267,9 +246,17 @@ they should. Legion handles all three.
 - **Boot at the edge, ahead of the scheduler.** [Edge boot](docs/edge-boot.md)
   lets a worker start a sandbox before its placement is durable. You can hold
   its network shut until the manager confirms it is the only instance.
-- **Per-job egress control.** [Network handlers](docs/network-handlers.md)
-  give each task its own egress allowlist and proxy middleware, so a sandbox
-  reaches `pypi.org` and nothing else.
+- **Simple egress control.** [Network handlers](docs/network-handlers.md)
+  give each task its own egress allowlist and proxy middleware, so you
+  can customize what traffic is allowed or inject secrets safely.
+- **Agent sandboxes that park when idle.** A sandbox
+  [suspends](docs/suspend-and-resume.md) to a memory checkpoint after a few
+  quiet minutes, frees its reservation (or keeps a share, so the resume
+  finds room), and resumes in place with its processes intact. `memoryMax` and an
+  [oversubscription ratio](docs/resource-enforcement.md#oversubscription)
+  pack the active ones tighter, and fork copies a running sandbox for an
+  agent to explore from. See the
+  [agent sandboxes guide](docs/guides/agent-sandboxes.md).
 
 ### DevEx for humans and agents
 
@@ -281,21 +268,58 @@ they should. Legion handles all three.
   and `legion job schema` emits the job spec as JSON Schema.
 - **Safe to retry.** Mutating RPCs accept idempotency keys, and
   `legion job plan` previews a change before anything runs.
+- **OpenTelemetry everywhere.** Managers and workers export
+  [traces over OTLP](docs/observability.md) to any OpenTelemetry backend,
+  covering RPCs, evals, scheduling, and plan apply.
+  [Prometheus metrics](docs/metrics.md) and the
+  [event stream](docs/event-stream.md) cover the rest, so you can see every
+  state change as it happens.
+
 
 See [Agent Readiness](docs/agent-readiness.md) for the full picture.
 
 ## Status
 
-Legion is a personal project made for fun and largely an experiment in
-agent-driven development. Agents wrote most of the code. Most testing has been
-done by agents, with human spot checking. Expect bugs. Don't run it in
-production.
+Legion is a personal project made for fun is largely an experiment with
+agent-driven development. Most testing has been done by agents, with human
+spot checking. Expect bugs. Don't run it in production.
 
 Don't expect stability either. APIs and the job spec may change without
 notice.
 
-The [docs](docs/README.md) state plainly what is and is not implemented for
+Traditionally, something like this should have been built carefully, 
+layer-by-layer, where you have a ton of confidence in architectural decisions
+before adding another layer. With recent LLM progress, I've taken a different
+approach and just "gone for it" in terms of merging things and building on them,
+with the expectation that I can rip out and adjust foundation after the fact.
+This is part of the experimentation with new workflows in the agent era.
+
+The core scheduler has gotten a decent amount of testing, bug fixes, and optimization,
+but the networking stack/mesh, various runtimes, and sandboxing primitives have not.
+
+The [docs](docs/README.md) should state what is and is not implemented for
 each feature.
+
+### Known security issues
+
+Don't run Legion where untrusted workloads share a host with other work, or
+on a network you don't trust. Known gaps:
+
+- **The worker API authenticates no one.** It listens only on loopback, but
+  any process on the same host, including an `exec` task or a host-network
+  container, can run commands in other allocations on that node. The
+  [worker-plane auth plan](internal_docs/plans/worker-plane-auth-plan.md)
+  fixes this.
+- **Linux containers and `exec` tasks share the host's network by default**,
+  so they can reach the worker and manager ports, the cloud metadata service,
+  and anything else on the host. With ACLs off (the default), the manager's
+  port is full control of the cluster. `gated` mode doesn't help yet, because
+  its egress proxy still dials loopback and link-local addresses for the
+  task. Don't run untrusted code in them yet. The
+  [same plan](internal_docs/plans/worker-plane-auth-plan.md) covers it.
+- **The worker-to-manager channel is plaintext.**
+- **Workers on other hosts can't serve exec, logs, or the service mesh yet**,
+  because they advertise a loopback address. Covered by the same plan.
 
 ### What's next
 
@@ -303,18 +327,23 @@ Open work lives in the [to-do list](internal_docs/TODO.md), with design plans
 in [`internal_docs/plans/`](internal_docs/plans/). A few things I'd like to
 add:
 
-- **Sandbox snapshots and fast start**, with forking support and
-  snapshot-aware scheduling.
-- **An artifact cache with pre-warming**, so images and binaries are on a node
-  before the task that needs them.
-- **Gang scheduling**, to place a group of tasks all at once or not at all.
-- **Sharded scheduler**, so placement throughput scales past a single
-  Raft cluster.
+- **Faster sandbox wake-ups**: wake on connect, lazy memory restore, and diff
+  snapshots on top of [suspend and resume](docs/suspend-and-resume.md).
+- **Sandbox scaling to very large session counts**: ephemeral sessions,
+  node-reported state, idle sessions in object storage that wake on
+  request, and sequenced delivery of work, so raft holds only what must be
+  durable ([plan](internal_docs/plans/sandbox-scaling-plan.md)).
+- **Exec into microVM sandboxes**, and exec sessions that skip the manager
+  ([plan](internal_docs/plans/sandbox-exec-plan.md)).
 - **Built-in ingress gateway, autoscaler, cert-manager, and GitOps tools**, or
   a more omakase starting experience.
+- **Resource registry for sharing and pulling jobs, templates, and plugins.**
+- **Sharded scheduler**, so placement throughput scales past a single
+  Raft cluster.
+- **Submission middleware**, so you can modify or gate job submissions.
 - **Something akin to Kubernetes controllers**, so you can extend Legion with
   your own reconcile loops.
-- **Resource registry for sharing and pulling jobs, templates, and plugins.**
+- **Gang scheduling**, to place a group of tasks all at once or not at all.
 - **More runtimes**, such as WASM or remote serverless workloads.
 - **Namespaces, multi-cluster federation, and Windows support.**
 
@@ -331,10 +360,12 @@ start:
   [Artifacts](docs/artifacts.md) · [Rollouts](docs/rollouts.md) ·
   [Scaling Jobs](docs/autoscaling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
-  [Resource Enforcement](docs/resource-enforcement.md)
+  [Resource Enforcement](docs/resource-enforcement.md) ·
+  [Suspend and Resume](docs/suspend-and-resume.md)
 - **Guides:** [Running Postgres](docs/guides/postgres.md) ·
   [Running Redis](docs/guides/redis.md) ·
-  [Serving TLS Certificates from KV](docs/guides/tls-certificates.md)
+  [Serving TLS Certificates from KV](docs/guides/tls-certificates.md) ·
+  [Running Agent Sandboxes](docs/guides/agent-sandboxes.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md)

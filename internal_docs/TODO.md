@@ -15,6 +15,98 @@ How to use it:
 
 ---
 
+- [ ] **Launch blocker: workers on another host lose exec, logs, and the
+      mesh, and any task can take over the cluster.** The worker binds
+      `127.0.0.1:4848` and always advertises `http://127.0.0.1:4848`
+      (`src/worker/daemon.rs:155`, `:376-379`). Opening the port is not the
+      fix, because `PostWork`, `ExecTask`, `GetTaskLogs`, and `RestartWorker`
+      authenticate nobody. Separately, Linux containers and `exec` tasks share
+      the host network, so they reach the manager (ACLs off by default), the
+      worker port, the cloud metadata service, and other allocations'
+      datapath listeners. Found while preparing the pre-launch AWS spot
+      check, which is paused until Phase 1 lands. Its host-guard rows need
+      Phases 2 and 3. Plan:
+      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (PLANNED)
+      · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
+      Phases in ship order, most dangerous gap first:
+  - [ ] Phase 0: ACLs on by default. The first management token is minted at
+        first start into `<dataDir>/bootstrap-token` and `~/.legion/token`
+        (`0600`), and the open `BootstrapAcl` RPC and `legion acl bootstrap`
+        are removed (plan §6.10).
+  - [ ] Phase 1: the mTLS worker plane with per-RPC caller classes,
+        including the sandbox-exec plan's `ticket` class on `ExecTask`, CSR
+        issuance, the CA pin in join tokens, reachable bind and advertise,
+        and two-step CA rotation (plan §6.1 to §6.6, §6.9).
+  - [ ] Phase 2: the host guard in the datapath. The gated egress proxy
+        dials loopback, link-local, and node-local addresses from the host
+        namespace today, and CIDR rules never see hostnames
+        (`src/worker/netd/proxy.rs:512`, `:621`, `:879`), so the documented
+        metadata deny rule is bypassed by a name. Resolve, judge, then dial
+        (plan §6.11).
+  - [ ] Phase 3: Linux containers gated by default with `gated-default`
+        deny, ingress twins and a resolver for every gated allocation, and a
+        validate warning (plan §6.12).
+  - [ ] Phase 4: the encrypted worker-to-manager channel, with the ticket
+        JWKS fetched over it (plan §6.8).
+  - [ ] Phase 5: the host guard in the kernel: an `nftables` table matched by
+        allocation cgroup, and a cgroup leaf for every task (plan §6.13).
+  - [ ] Phase 6: the container privilege floor: per-allocation user
+        namespaces, Docker's default seccomp profile, a cgroup namespace
+        (plan §6.14).
+  - [ ] Phase 7: `exec` trust. Gated `exec` refuses root, the user switch
+        drops supplementary groups (it never calls `setgroups` today,
+        `src/task_plugins/exec.rs:679-687`), and host-level jobs need `host`
+        on `job:write` (plan §6.15, §6.16).
+  - [ ] Phase 8: reachability diagnostics: `Worker/Probe`,
+        `WORKER_UNREACHABLE` (plan §6.7).
+  - [ ] Fix the public docs now, ahead of Phase 2: `docs/network-handlers.md:556`
+        says gated "cannot be bypassed" for `container` and `exec`, but the
+        proxy reaches the host, and a root `exec` task can `setns` back out.
+
+- [ ] **Pre-launch spot check findings (2026-10-11), from reading the code
+      while preparing the AWS run.** None of these block the worker-plane
+      work. Each is verified in source unless marked otherwise.
+  - [ ] **README says `legion start manager` works without a config file.**
+        It does not. With no `-c`, it evaluates `./configs/manager.ncl`
+        (`src/constants.rs:55`) and fails outside a repo checkout, so the
+        `cargo install legion-rs` quickstart breaks on its second command.
+  - [ ] **`configs/jobs/redis.ncl` cannot work.** The `exec` runtime does not
+        run argv through a shell, so redis-server receives the literal string
+        `$LEGION_STORAGE_DIR`. Its `kind = "exec"` health check has the same
+        problem. Wrap in `sh -c` and use a TCP check.
+  - [ ] **`legion action run -p` does not exist.** The flag is `--param`
+        (`src/cmd/action.rs:37-41`), but `configs/jobs/redis.ncl`,
+        `docs/guides/redis.md`, and `docs/volumes.md` all show `-p`.
+  - [ ] **Nothing says where to get a guest kernel for microVM sandboxes.**
+        `docs/task-runtime-sandbox.md` names the path and env var but no
+        source. cloud-hypervisor's [linux releases](https://github.com/cloud-hypervisor/linux/releases)
+        publish `vmlinux-x86_64`. Also document that AWS now offers
+        [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html)
+        on C7i/M7i/R7i and 8i types, so microVMs need no bare metal.
+  - [ ] **No exec into microVM sandboxes.** Documented
+        (`docs/task-runtime-sandbox.md`, "Current Scope and Limitations"), but
+        it is the headline agent-sandbox use case. macOS dev mode can exec, so
+        a demo that works locally fails on Linux.
+  - [ ] **No way to reach a microVM sandbox over HTTP** without a hand-built
+        TAP device, guest IP config, and host DNAT. Gated mode has no
+        host-to-guest ingress relay (`src/worker/daemon.rs:1934-1936`, gated
+        sandboxes never get a netns).
+  - [ ] **A worker whose join token names a raft follower likely cannot
+        register.** `WorkerRegister` is not in the follower-forwarding list
+        (`src/storage/raft/forward.rs`), so it returns `FAILED_PRECONDITION`.
+        Workers also learn only the one manager in their token. Inferred from
+        code, not yet reproduced.
+  - [ ] **The worker never uses TLS to reach the manager**, even when
+        `server.tls` is on (`src/worker/daemon.rs:799-811`), and raft peers
+        dial `http://` only. `docs/auth-and-acls.md` claims listener TLS
+        "already covers transport encryption." Phase 4 of the worker-plane
+        plan covers the worker half. Fix the doc claim now.
+  - [ ] **`configs/jobs/tls-edge.ncl` listens on the wrong port on Linux.** It
+        declares `static = 9443, to = 443`, but `to` only applies on macOS, so
+        nginx binds host :443 while the comment curls :9443.
+  - [ ] **`internal_docs/development.md` still points workers at :4748**, which
+        is now the exec WebSocket. `scripts/dev/join.sh` uses 4747.
+
 - [ ] **Architecture audit (2026-10-09).** Design-level findings across the
       store, scheduler, manager API, worker, and lifecycle, each with an ID and
       a status line: [architecture-audit-2026-10-09.md](architecture-audit-2026-10-09.md),
@@ -131,7 +223,9 @@ How to use it:
 - [ ] **Heartbeats rebuild the node's whole desired set every beat.** Add a
       desired-state version to the heartbeat so an unchanged node gets a
       cheap "unchanged" reply (proto + worker change). Adaptive cadence
-      already caps the beat rate (calls #16).
+      already caps the beat rate (calls #16). Planned more broadly as
+      sequenced delivery, Phase 2 of
+      [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md).
 - [ ] **Job stop/destroy at scale drains at ~4 evals/s** (AWS 10k cleanup,
       2026-10-10). Profile with `legion_eval_phase_seconds{kind="job_stop"}`.
 - [x] **Re-ran `web_fleet` on AWS with Phase 4 and adaptive cadence**
@@ -609,7 +703,10 @@ How to use it:
       in `failed`. Blocked-and-retried capacity waits are the gang-scheduling
       plan's blocked-eval machinery
       ([plan](plans/gang-scheduling-plan.md)) — when that lands, consider
-      routing plain single-task capacity failures through it too.
+      routing plain single-task capacity failures through it too. Now
+      planned as Phase 3 of
+      [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md), a generic
+      blocked-work queue the gang plan can reuse.
 - [ ] Edge boot follow-ups — the feature shipped (phases 1–4;
       [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
       [calls](calls/edge-boot-plan_calls.md)); these are what it left open.
@@ -1450,16 +1547,14 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       [calls](calls/host-convergence-plan_calls.md) (PLANNED: file-shaped
       resources → system resources → node-config jobs → why-run/drift →
       `host` ACL resource). Phase 1 depends on the exit-status work above.
-- [ ] **`sandbox` adopts `resource_enforcement()`** as a `RuntimeApplied`
-      consumer — pin the VMM's vCPU threads to the assignment's cores, size the
-      guest from its memory limit. Surfaced by the container-runtime plan
-      ([plan Q4](plans/container-runtime-exec-and-signals-plan.md#11-open-questions),
-      [docs](../docs/resource-enforcement.md)) as the honest test of whether
-      the three modes are the right cut: a microVM's "memory limit" is guest
-      size, not a cgroup ceiling, so the assignment may need to say which it
-      means. Until it lands, `sandbox` tasks are ungoverned — their `resources`
-      size the guest and are otherwise scheduling-only, and they can land on
-      cores another task reserved.
+- [ ] **Make a sandbox `memory_mib` that disagrees with `resources` a submit
+      error.** Phase 2 of the
+      [suspend plan](plans/suspend-resume-and-oversubscription-plan.md#10-rollout-and-backward-compatibility)
+      derives guest size from `resources` and ships one release where an
+      explicit, disagreeing `memory_mib` is only a warning and still sizes the
+      guest (calls entry 16). Flip it to an error in the next release, and drop
+      `memory_mib` from the schema after that
+      ([docs](../docs/task-runtime-sandbox.md#guest-size)).
 - [ ] **Linux container port mapping / private network namespaces.** Containers
       keep host networking; assigned ports reach them without mapping, but
       there is no isolation. Named non-goal of the container-runtime plan —
@@ -1469,10 +1564,15 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       affinity, no SMT-sibling avoidance. Nomad gates this behind Enterprise;
       revisit with a workload that measurably needs it
       ([docs](../docs/resource-enforcement.md#not-implemented)).
+- [x] **Resource enforcement on by default** (PR #15). `enabled` defaults to
+      `true` and an absent block means the defaults. A Linux worker that
+      can't create `cgroupParent` warns once at start and runs unconfined
+      ([docs](../docs/resource-enforcement.md#defaults-and-turning-it-off),
+      [call 4](calls/host-process-supervision-plan_calls.md)).
 - [ ] **A delegated (non-root) cgroup hierarchy root.** Enforcement assumes a
       root worker creating `legion/` at the cgroup root; a configurable root
       for delegated setups is unbuilt
-      ([docs](../docs/resource-enforcement.md#turning-it-on)).
+      ([docs](../docs/resource-enforcement.md#defaults-and-turning-it-off)).
 - [ ] **`legion alloc signal`** — an on-demand signal verb. The plumbing now
       exists (`TaskPlugin::signal`, routed through the registry); today signals
       are only delivered by declared policy (`changeSignal` on identity
@@ -1481,34 +1581,741 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 - [ ] **The `sandbox` runtime still cannot exec, signal, or deliver identity
       files** — all three need the guest agent the sandbox plan owns. The
       container runtime's `TaskPlugin::signal` override is the seam its
-      guest-agent path would implement.
+      guest-agent path would implement. Exec is now planned as Phase 1 of
+      [sandbox-exec-plan.md](plans/sandbox-exec-plan.md).
+- [ ] **Sandbox scaling to very large session counts**:
+      [plan](plans/sandbox-scaling-plan.md) (PLANNED) ·
+      [calls](calls/sandbox-scaling-plan_calls.md). Every keyed sandbox is a
+      raft row, about 22 raft entries across create, place, suspend, resume,
+      and destroy (26 with idempotency keys, counted from code, plan §5.1),
+      and a tombstone forever. Raft should hold only envelopes and named
+      instances.
+  - [ ] Phase 0 (gate): an op-count test per lifecycle stage on the
+        `raft_apply_roundtrip` harness, a `legion-loadgen` instance mode,
+        simulated allocation health, bytes per instance row, heartbeat bytes
+        at 1,000 and 10,000 allocations per node, and the latency SLOs at p50
+        and p99 (plan §7.2). Numbers in `benchmarks/scheduler/README.md`.
+  - [ ] Phase 1: group commit and write trimming with no new semantics
+        (target ≤ 8 entries per lifecycle, ≥ 5× the Phase 0 rate).
+  - [ ] Phase 2: sequenced delivery. A per-node delta log in leader memory,
+        `Manager.StreamWork` with acks, full resync on failover or gaps, and
+        delta heartbeats (plan §6.13). Targets: dispatch within a round trip
+        of the commit, steady heartbeats under 1 KiB at 10,000 allocations.
+        Supersedes the "Heartbeats rebuild the node's whole desired set every
+        beat" item under Scheduling & placement.
+  - [ ] Phase 3: blocked work keyed by what blocked it, woken by matching
+        node joins, uncordons, freed capacity, attribute changes, and budget
+        reports (plan §6.15). Covers the "Capacity exhaustion still fails
+        evals terminally" item under Scheduling & placement, and the gang
+        plan builds on it.
+  - [ ] Phase 4: server-minted ids grow to 130 bits and leave no tombstone.
+        Caller ids may not take that shape.
+  - [ ] Phase 5: archive suspended keyed instances to content-store
+        manifests (`suspend.archive`).
+  - [ ] Phase 6: `stateful.mode = "session"`: envelopes, the session
+        router, leases, node session logs, the leader index, and
+        `PromoteInstance`.
+  - [ ] Phase 7: wake on request through `legion start gateway` and
+        `suspend.wake` (plan §6.14). The suspend plan's Phase 8 keeps
+        node-local wake on connect.
+  - [ ] Phases 8 to 10: snapshot-clone density (with suspend plan Phase 8),
+        a sub-VM tier seam, and cells only past the plan §6.11 trigger.
+  - [ ] Found during the plan: allocation health is a status-lane raft
+        write per node per beat, because the manager upserts every
+        allocation with `updated_at = now` and nothing skips unchanged rows
+        (`src/manager/server.rs:6311`, `src/storage/store.rs:13291`). It
+        grows with sandboxes per node, and simulated workers never send it,
+        so the AWS rig has not seen it. Phase 1 fixes it.
+  - [ ] Found during the plan: edge ratification only binds an existing
+        unbound keyed instance (`src/storage/store.rs:12560-12580`), so an
+        edge start still needs `CreateInstance` first, and that create's
+        placement eval can bind the row before the edge claim does. Phase 1
+        makes ratification create the row.
+  - [ ] Found during the plan: the `node_join` capacity pass compares
+        allocations to `count` (`src/storage/store.rs:14557-14607`), and
+        keyed tasks define no count, so a keyed instance left `pending` for
+        lack of room appears never to be retried. Phase 0 confirms with a
+        test, and Phase 3 fixes it.
+  - [ ] Found during the plan: `docs/multi-raft.md` says instance writes go
+        on the control lane, but `instance` is owned by the scheduler lane
+        (`src/storage/raft/ownership.rs:222`). Fix the doc.
+- [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (PLANNED) ·
+      [calls](calls/sandbox-exec-plan_calls.md). Exec into Linux microVM
+      sandboxes, and exec sessions that skip the manager. Implemented
+      together with
+      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md)
+      ([#16](https://github.com/mikenomitch/legion/pull/16)).
+  - [ ] Found during the plan: the worker listener has no authentication
+        and no TLS (`src/worker/server.rs:55`, `:200`,
+        `src/worker/daemon.rs:318`). It binds `127.0.0.1:4848`
+        (`src/worker/daemon.rs:155`), so the gap is local: any process on
+        the worker's host, including an `exec` task or a host-network
+        container, can call `ExecTask` against any allocation on that node.
+        The worker-plane-auth plan (#16) closes it.
+  - [x] Amend the worker-plane-auth plan (exec plan §9): a ticket caller
+        class for `ExecTask`, a classification test that allows two classes,
+        and the JWKS verifier on every worker that admits tickets. Folded
+        into [worker-plane-auth §6.1](plans/worker-plane-auth-plan.md#61-the-worker-listener-is-mutual-tls-always)
+        (2026-10-11), which added one dependency: ticket verifiers need the
+        JWKS over TLS, so direct exec also waits on worker-plane-auth Phase 4.
+  - [ ] Phase 0: exec open latency and manager cost per proxied session at
+        100, 1,000, and 10,000 concurrent sessions.
+  - [ ] Phase 1: exec into Linux microVMs over vsock. Every microVM gets a
+        vsock device and the guest agent, and `legion exec`, actions, MCP,
+        and the UI terminal work unchanged. After gated plan Phases 0 and 1
+        (without the vsock restore override, a vsock device on every microVM
+        would break memory checkpoints of TAP and `none` sandboxes) and
+        worker-plane-auth Phase 1.
+  - [ ] Phase 2: direct exec with `MintExecTicket` and a ticket class on the
+        mTLS worker listener, `legion exec --direct`, async audit, revoked
+        accessors on the heartbeat.
+  - [ ] Phases 3 to 5: delegated minting keys, the gateway tier (shared
+        with the scaling plan's wake on request), and exec into unnamed
+        sessions after the scaling plan's Phase 6.
+- [ ] **Gated sandboxes by default, with memory checkpoints**:
+      [plan](plans/gated-sandbox-checkpoints-plan.md) (PLANNED) ·
+      [calls](calls/gated-sandbox-checkpoints-plan_calls.md). Agent sandboxes
+      get Legion's egress policy and memory suspend, snapshots, and fork
+      together, and TAP stops being a footgun.
+  - [ ] Phase 0: boot a gated sandbox on a real VMM for the first time,
+        measure proxy throughput against a TAP, and prove Firecracker
+        `vsock_override` (1.16.1+) and the cloud-hypervisor `config.json`
+        rewrite. Gate for the rest.
+  - [ ] Phase 1: memory checkpoints of gated sandboxes (vsock retarget on
+        every restore, constant CID, agent drops relays on restore, the
+        Firecracker floor), and remove the submit refusal and every doc
+        that states it.
+  - [ ] Phase 2: `auto` resolves to `gated` for sandboxes on microVM nodes,
+        gated with no policy denies (`gated-default`, every runtime), a
+        resolver for every gated sandbox, lower-case proxy vars and
+        `NODE_USE_ENV_PROXY`, the static `legion-guest` agent.
+  - [ ] Phase 3: live egress bytes and open egress connections for the idle
+        policy.
+  - [ ] Phase 4: Legion addresses TAP guests from a per-bridge pool and
+        re-addresses on every restore and fork. Removes `tap` and `mac`, and
+        the "use DHCP in the guest" docs.
+  - [ ] Phase 5: ingress into gated sandboxes over host-initiated vsock.
+  - [ ] Found during the plan: gated `container` and `exec` tasks without
+        upstreams get no VIP block and so no resolver
+        ([plan §6.5](plans/gated-sandbox-checkpoints-plan.md#65-gated-is-the-sandbox-default-and-it-denies-by-default)).
+  - [ ] Found during the plan: the egress proxy records bytes only when a
+        splice ends, so the service graph and idle policy miss long streams
+        until they close (`src/worker/netd/proxy.rs` `splice`). Phase 3
+        fixes the idle half.
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Suspend, resume, fork, and oversubscription** (generic primitives
       for dense sandboxes, also useful to ordinary services):
-      [plan](plans/suspend-resume-and-oversubscription-plan.md) (PLANNED).
+      [plan](plans/suspend-resume-and-oversubscription-plan.md) (IN EXECUTION,
+      Phases 1-7 and the Track 2 resume guards shipped and integrated, their
+      Linux and KVM checks pending, Phase 8 deferred).
       Supersedes the phasing of the
       [sandbox snapshots plan](plans/sandbox-snapshots-and-fast-start-plan.md),
       whose mechanics remain the reference (its §0 storage convergence shipped).
-  - [ ] Phase 1: measure and govern (sandbox VMMs in the allocation cgroup,
-        per-allocation usage in the heartbeat, `legion node usage`)
-  - [ ] Phase 2: burst and oversubscribe (`resources.memoryMax`, worker
-        `oversubscription` ratios, worker pressure ladder, `node_pressure` cause)
-  - [ ] Phase 3: local checkpoints (`TaskPlugin::checkpoint/restore`,
+  - [x] Phase 1: measure and govern (sandbox VMMs in the allocation cgroup,
+        per-allocation usage in the heartbeat, `legion node usage`, usage in
+        `instance list`, per-node gauges, `legion_node_usage` MCP tool)
+        ([docs](../docs/resource-enforcement.md#measuring-usage)).
+        Follow-ups it left:
+    - [ ] Run the Linux verification for Phase 1:
+          [suspend-resume-linux-verification.md § Phase 1](suspend-resume-linux-verification.md#phase-1)
+          (VMM in its allocation cgroup, `memory.max` = guest + overhead, the
+          ~300 MiB `exec` usage check, the PSI and meminfo readers, teardown,
+          metrics). Built and unit-tested with fixtures on macOS only.
+    - [ ] Usage lives on the manager that received the heartbeat. With
+          several managers, `GetNodeUsage` on another one reports
+          `usage_reported: false`. Forward or replicate it beside liveness
+          digests if that proves confusing.
+    - [x] `last_activity_unix` counts CPU and datapath traffic but not exec
+          sessions (plan §6.2). Phase 5 added exec sessions and ingress
+          bytes ([docs](../docs/suspend-and-resume.md#idle-policy)).
+    - [ ] No reserved-memory or node PSI Prometheus gauge (only physical,
+          available, used, CPU).
+  - [x] Phase 2: burst and oversubscribe: `resources.memoryMax`
+        (`memory.max`/`memory.low`), sandbox guest size from `resources`,
+        worker `resourceEnforcement.oversubscribe` ratios, the memory pressure
+        response (`reclaim`, `evict-bursting`, `evict-reserved`), the "who goes
+        first" preview in `legion node usage`, `node.pressure` events, and
+        `cause = node_pressure`
+        ([docs](../docs/resource-enforcement.md#memory-pressure),
+        [calls 26, 29, 56, 57, 58, 66, 67, 93, 100](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+        Follow-ups it left:
+    - [ ] Run the Linux verification for Phase 2:
+          [suspend-resume-linux-verification.md § Phase 2](suspend-resume-linux-verification.md#phase-2)
+          (`memory.low`/`memory.max` on real cgroups, the ratio on a live
+          node, the two-bursting-tasks eviction, `memory.reclaim`, sandbox
+          guest size). Built and tested against fakes on macOS only.
+    - [ ] A pressure-evicted allocation's replacement can be placed back on
+          the node that evicted it. A short-lived anti-affinity for the
+          evicting node would stop the bounce (calls entry 58).
+    - [ ] `reclaim` needs Linux 5.19 (`memory.reclaim`). On an older kernel
+          it frees nothing from host-process tasks and the response moves on
+          to eviction.
+    - [x] `reclaim` frees almost nothing from a sandbox (guest RAM is
+          anonymous). Phase 5 added the balloon (both VMMs) and free page
+          reporting (cloud-hypervisor)
+          ([docs](../docs/resource-enforcement.md#sandboxes-and-the-balloon)).
+    - [x] The `suspend` pressure step is accepted and does nothing until
+          Phase 5. It acts since Phase 5.
+    - [ ] Rerun `scheduler_speed` and `candidate_construction` before/after
+          on a quiet host for the PR. The numbers in the
+          [plan §9](plans/suspend-resume-and-oversubscription-plan.md#9-testing-plan)
+          were taken on a shared, loaded machine and are noise-dominated.
+  - [x] Phase 3: local checkpoints (`TaskPlugin::checkpoint/restore`,
         Firecracker `--api-sock`, node content store, `snapshot` table/CLI/ACL,
         `compat` constraints, `local-dir` `snapshot` op)
-  - [ ] Phase 4: suspend and resume (`suspended` instance state,
-        `SuspendInstance`, resume via `StartInstance`, guest-agent identity
-        refresh, disk-mode suspend for `exec`/`container`)
-  - [ ] Phase 5: automatic suspend (idle policy, pressure-ladder suspend rung,
-        sandbox free page reporting)
-  - [ ] Phase 6: fork (`ForkInstance`, `create --from-snapshot --count`,
-        `local-dir` `clone`)
-  - [ ] Phase 7: content locality (publishing, location index, `locality`
+    - [x] Phase 3a: node content store (`src/content_store.rs`): one
+          content-addressed store per worker at `<state>/content/sha256/<hex>`,
+          per-class budgets (`content.budgets { artifacts, snapshots }`), LRU,
+          idle TTL, owner pins, `minFreeDisk`, digest verification. Digest-pinned
+          artifacts are served from it on the second allocation.
+          [docs](../docs/artifacts.md#the-node-content-store) ·
+          [calls 38, 72, 106, 107, 117](calls/suspend-resume-and-oversubscription-plan_calls.md#72-the-node-content-store-caches-only-digest-pinned-single-files)
+    - [ ] Run the Phase 3a Linux checks
+          ([§ Phase 3a](suspend-resume-linux-verification.md#phase-3a)): a
+          cache hit on a Linux worker, and `minFreeDisk` against a real
+          filesystem's `statvfs`.
+    - [x] Phase 3b and later: write snapshot parts into the store with
+          `PutOptions::pin(PinOwner::snapshot(id))` and release them with
+          `ContentStore::release_owner` when a snapshot is deleted (3c).
+    - [x] 3b: runtime checkpoint and restore (worker and runtime only).
+          `TaskPlugin::checkpoint_support/checkpoint/restore` (task-plugin ABI
+          3), `SnapshotManifest` + `compat_matches` in
+          `src/structs/checkpoint.rs`, Firecracker `--api-sock` behind
+          `TaskInstance.checkpoint_launch`, Firecracker and cloud-hypervisor
+          API clients, device links and the identity disk, `cpu.*` /
+          `sandbox.vmm*` fingerprint attributes, `local-dir`
+          `snapshot`/`restore`/`clone`/`snapshot-delete` in both modes, the
+          conformance suite's snapshot checks. Docs:
+          [task-runtime-sandbox.md](../docs/task-runtime-sandbox.md#checkpoints),
+          [volumes.md](../docs/volumes.md#snapshot-restore-and-clone).
+    - [x] Wire 3b into the worker and manager (3c): `checkpoint_launch` from
+          the `snapshots` block, capture (`checkpoint` → volume `snapshot` →
+          manifest with `SnapshotCompat::with_cpu_from_attrs`), parts
+          materialized into a `CheckpointDir` before `restore`, and
+          `compat_matches` as a placement check with a named reason.
+    - [x] Ingest checkpoint parts into the node content store (3a) by digest,
+          and hardlink them back (after verifying) for restore (3c).
+    - [x] 3c: the manager side. `snapshot` and `snapshot_alias` tables and
+          `instance.restore_from` (scheduler lane), `CreateSnapshot`,
+          `ListSnapshots`, `GetSnapshot`, `DeleteSnapshot`, `RestoreInstance`
+          (idempotent, full proto comments), the heartbeat checkpoint channel
+          (`checkpoint_requests` / `snapshot_reports`, re-sent until applied,
+          forwarded to the lane leader), the worker `checkpoint` capability,
+          the `snapshot` ACL resource, `legion snapshot
+          create|list|get|delete|restore` with `--wait`, `legion_snapshot_*`
+          MCP tools, `snapshot.*` events, `snapshots { ttl, keep, memory }`
+          with expiry, restore pinned to the snapshot's node with `compat`
+          checked at placement, submit-time and call-time refusal of memory
+          checkpoints on gated sandboxes, TAP recreation on restore, and the
+          `exec` disk round trip test.
+          [docs](../docs/suspend-and-resume.md) ·
+          [Linux verification](suspend-resume-linux-verification.md#phase-3c)
+    - [ ] Run the Phase 3c Linux checks
+          ([§ Phase 3c](suspend-resume-linux-verification.md#phase-3c)): the
+          acceptance check (`snapshot create --memory` then `snapshot restore`
+          brings back a RAM-only counter on both VMMs), content-store pins,
+          the paused volume snapshot, TAP recreation and `TUNSETIFF` busy
+          detection, and the restored VMM's cgroup.
+    - [ ] The worker holds its task-manager lock while the VMM writes guest
+          memory, so a multi-GiB capture on slow disk delays that node's
+          heartbeats. Run the runtime's `checkpoint` without the lock (the
+          volume half and content-store ingest already do).
+    - [ ] Memory snapshots copy only the instance volume. A sandbox that also
+          attaches a block `volumes = [...]` claim resumes with that claim's
+          current contents under a page cache from capture time. Refuse such
+          a memory snapshot, or snapshot claims too.
+    - [x] Restoring into another instance shipped in Phase 6 as new
+          instances (`instance fork`, `instance create --from-snapshot`).
+    - [ ] Restore is keyed-only. Slot instances can be snapshotted but not
+          restored or forked.
+    - [x] Allocation ids are never reused: the `allocation` table was rebuilt
+          with `AUTOINCREMENT` in Phase 4, so a restore's or resume's
+          replacement always has a new id
+          ([call 28](calls/suspend-resume-and-oversubscription-plan_calls.md#28-allocation-ids-are-never-reused-phase-4)).
+    - [ ] `snapshot.restored` does not carry the restore's duration, although
+          the worker reports it. `instance get` shows it now (`last_restore_ms`,
+          Phase 4) and `instance.resumed` carries it for resumes. Add it to the
+          snapshot event too (plan §6.13).
+    - [ ] A restore waiting for placement explains itself only through the
+          placement error (eval events, `job info`). Add a `restore-pending`
+          detail to `instance get`, like `volume-pinned`.
+    - [ ] Snapshot metrics: Phase 4 added `legion_checkpoint_bytes{kind}` (every
+          capture) and suspend/resume latency histograms. Still missing: manual
+          snapshot capture and restore latency, and content-store bytes by
+          class (plan §6.13).
+    - [ ] Scheduler benchmarks for 3c were run with the stateless bench jobs,
+          which never reach the new restore-pin lookup (keyed tasks only).
+          Add a keyed-instance group to `scheduler_bench` that covers it.
+    - [ ] Run the KVM checks in the
+          [Linux verification plan](suspend-resume-linux-verification.md#phase-3b)
+          (`sandbox_memory_checkpoint_round_trip_*` are `#[ignore]`d), and
+          record restore latency per VMM.
+    - [ ] Memory checkpoints of gated sandboxes
+          ([call 55](calls/suspend-resume-and-oversubscription-plan_calls.md#55-gated-sandboxes-are-not-memory-checkpointable-yet)).
+          Now planned in [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md)
+          (Phase 1). The device-link dir is the wrong home for the socket,
+          since forks share it ([calls entry 3](calls/gated-sandbox-checkpoints-plan_calls.md#3-a-restore-retargets-the-vsock-socket-to-its-own-allocation-through-vmm-overrides-not-a-stable-path)).
+    - [ ] Hashing a multi-GiB memory part adds seconds to a checkpoint (after
+          the guest resumes, so not paused time). Let the content store hash
+          on ingest instead of hashing twice.
+  - [x] Phase 4: suspend and resume. The `suspended` instance state and the
+        §7 instance columns, `SuspendInstance` (`idempotency_key`,
+        `--checkpoint memory|disk`, `job:write` plus `snapshot:write` for
+        memory), resume through `StartInstance` with `cold`, the task
+        `suspend` block (`checkpoint`, `reserve`, `onRestoreFailure`,
+        `resumeTimeout`, `onResume`, `durability = "local"`), the suspend
+        transaction on the capture report, `onRestoreFailure` on a failed
+        restore, a lost checkpoint, and `resumeTimeout` (manager sweep),
+        `reserve` as a held `suspended` allocation row, disk suspend for
+        `exec`/`container`, the guest resume handler (`legion guest-resume`:
+        RNG reseed, clock, hostname, MAC, identity files, `onResume`), fresh
+        allocation ids and tokens on every restore, `instance.*` events,
+        `allocation.removed` `cause = suspended`, the CHECKPOINT column and
+        last suspend/restore in `instance get`, suspend/resume/bytes metrics,
+        `legion_instance_suspend` MCP tool, mixed-version
+        `FailedPrecondition`.
+        [docs](../docs/suspend-and-resume.md) ·
+        [calls 28, 32, 33, 35, 45, 51, 61, 79, 82, 123](calls/suspend-resume-and-oversubscription-plan_calls.md) ·
+        [Linux verification](suspend-resume-linux-verification.md#phase-4).
+        Follow-ups it left:
+    - [ ] Run the Phase 4 Linux checks
+          ([§ Phase 4](suspend-resume-linux-verification.md#phase-4)): the
+          acceptance numbers (suspend under 1.5 s, resume under 300 ms for a
+          1 GiB guest on both VMMs), identity refresh inside a real guest,
+          RNG divergence, and a disk suspend of a `container` task. Publish
+          the latencies in `docs/testing-and-benchmarks.md`. The Linux-only
+          resume handler code (`RNDADDENTROPY`, `clock_settime`,
+          `sethostname`, `BLKFLSBUF`) was never compiled on Linux by this
+          phase: let CI catch it first.
+    - [ ] The resume handler is the worker's binary, so a guest whose libc
+          cannot run it (musl images with a glibc worker) restores without the
+          refresh. Ship a static (musl) build of the handler, or a separate
+          small static binary.
+    - [ ] A memory suspend keeps the guest paused while its parts are hashed
+          into the content store, so it may miss the 1.5 s target on slow
+          disk. Hash once, on ingest (same follow-up as 3c's double hash).
+    - [ ] Running processes in a restored guest keep the env they started
+          with; only `/legion/resume.env`, `/legion/identity/<ENV>`, and
+          `onResume` see the new token. File-delivered identities are not
+          refreshed in the guest at all (sandboxes cannot deliver identity
+          files yet).
+    - [ ] `reserve = true` holds are released by a job update or job stop (the
+          instance stays suspended, holding nothing). Carry holds across a
+          rollout if a platform needs it.
+    - [ ] A checkpoint is marked `lost` only when its node is removed. A node
+          that is merely down leaves the resume waiting (`resumeTimeout`
+          applies under `onRestoreFailure = "cold"` only).
+    - [x] Add a keyed-instance group to `scheduler_bench` covering
+          `count_keyed_allocations_desired` and the restore-pin lookup. The
+          `restore` group plans keyed restores and the `snapshot_budget` group
+          (Track 2) plans new keyed instances of a memory-suspend task.
+    - [x] Phase 5 seams: `suspend_reason` takes `idle` and `pressure`;
+          `PressureStep::Suspend` in `src/worker/pressure.rs` is still a no-op.
+          The worker-initiated suspend must reuse `capture_for_suspend` and
+          report through the existing channel. Done in Phase 5.
+  - [x] Phase 5: automatic suspend. The task `suspend.idle { after, signals,
+        cpuBelow }` policy (signals `network`, `connections`, `cpu`, `exec`;
+        `hint` refused until Phase 8), worker idle detection reported as
+        `AllocationUsage.idle_since_unix` / `idle_after_seconds` (ingress
+        connections and bytes from the datapath, exec sessions, cgroup CPU),
+        the manager idle sweep (`suspend.idleSweep`, default 15s, in memory,
+        `begin_suspend` forwardable to the lane leader), `suspend_reason`
+        (`manual | idle | pressure`) threaded through `NewSnapshot` and
+        `begin_suspend`, `InstanceInfo.idle_since` / `idle_after_seconds`,
+        the `suspend` pressure step for `suspend.onPressure = true` (most idle
+        first, before `evict-bursting`, worker-minted ids, local suspensions
+        applied by the manager and acknowledged by the desired set, moved-on
+        instances reclaimed), the `reclaim, then suspend` preview, the sandbox
+        balloon (Firecracker and cloud-hypervisor API calls, `deflate_on_oom`,
+        free page reporting on cloud-hypervisor), `instance.suspended`
+        `reason`, `node.pressure` step `suspend`, and the
+        `legion_instance_suspends_total` / `legion_idle_sweep_suspends_total`
+        metrics. No scheduler change, so no benchmarks.
+        [docs](../docs/suspend-and-resume.md#automatic-suspend) ·
+        [calls 19, 20, 31, 51, 59, 75, 90, 102, 124](calls/suspend-resume-and-oversubscription-plan_calls.md) ·
+        [Linux verification](suspend-resume-linux-verification.md#phase-5).
+        Follow-ups it left:
+    - [ ] Run the Phase 5 Linux checks
+          ([§ Phase 5](suspend-resume-linux-verification.md#phase-5)): the
+          acceptance checks (an idle sandbox suspends within `after` + 30s, a
+          busy one never does, and a pressured node suspends opted-in
+          instances before `evict-bursting`), the quiet-connection check, a
+          local suspension across a lost heartbeat, and the balloon on both
+          VMMs. A real `exec` idle suspend was not feasible on macOS: there
+          are no cgroups, so no usage reports and no idle tracking.
+    - [ ] A pressure suspend's report is held in worker memory until the
+          manager applies it. A worker restart in that window loses the
+          record: the checkpoint stays pinned with no row and the allocation
+          relaunches cold. Persist pending local suspensions in the worker
+          state store
+          ([call 19](calls/suspend-resume-and-oversubscription-plan_calls.md#19-the-suspend-step-acts-first-reports-a-local-suspension-and-the-desired-set-is-its-acknowledgment-phase-5)).
+    - [ ] Turn on `free_page_reporting` for Firecracker guests once the pinned
+          release is confirmed to accept it (verification item 5.5). Off
+          today because older supported releases reject the field.
+    - [ ] The idle policy cannot act on a node without resource enforcement,
+          and a raw host port (no ingress chain) is invisible to `network` and
+          `connections`. Both are in the public limitations
+          ([calls 20, 59](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+    - [ ] Revisit the 3-minute `idle.after` default with data from real agent
+          fleets (plan §12, open question 5).
+    - [ ] The idle sweep tries each idle allocation at most once a minute and
+          logs skips at debug. Surface a persistent skip (a node that cannot
+          checkpoint) on the instance as a `detail`.
+  - [x] Phase 6: fork. `ForkInstance` (`count` up to 64, `checkpoint`,
+        `spread` refused with a hint while checkpoints were local, made to
+        work at integration,
+        `idempotency_key`, `job:write` plus `snapshot:write`), forks named
+        `<origin>-f<n>` waiting as `pending_op = fork` until the live
+        capture lands, then pinned to the origin's node; `CreateInstance(s)`
+        `from_snapshot` (`snapshot:read`); named snapshots with `legion
+        snapshot alias set|delete` (`SetSnapshotAlias`,
+        `DeleteSnapshotAlias`); per-fork volume through the `local-dir`
+        `clone` op; per-fork MAC, TAP (`lgf...` on the origin TAP's
+        bridge, Firecracker `network_overrides`, cloud-hypervisor
+        `config.json`), hostname, token, and entropy; `onRestoreFailure` for
+        forks (`fail` stops); fork checkpoints spent once restored;
+        `pause_ms` on snapshots; `instance.forked`, `instance.fork_failed`;
+        `legion_instance_fork` and `legion_snapshot_alias_set` MCP tools.
+        [docs](../docs/suspend-and-resume.md#fork) ·
+        [calls 22, 23, 24, 46, 64, 76, 77, 83, 86, 91, 114, 116, 125](calls/suspend-resume-and-oversubscription-plan_calls.md) ·
+        [Linux verification](suspend-resume-linux-verification.md#phase-6).
+        Follow-ups it left:
+    - [ ] Run the Phase 6 Linux checks
+          ([§ Phase 6](suspend-resume-linux-verification.md#phase-6)): three
+          real memory forks diverge in hostname, RNG, MAC, and token; TAP
+          creation and bridging on Firecracker 1.12+ and cloud-hypervisor;
+          page sharing between Firecracker forks; a `container` disk fork.
+          Run `sandbox_fork_divergence_*` (`#[ignore]`d, KVM). The
+          Linux-only `TapHost::master` and `set_master` were never compiled
+          on Linux by this phase.
+    - [ ] cloud-hypervisor forks get their TAP through a rewritten
+          `config.json`. If a cloud-hypervisor version restores net devices
+          from `state.json` instead, switch to `net_fds` on restore.
+    - [ ] cloud-hypervisor forks share no memory pages (it copies memory on
+          restore). Try `memory_restore_mode=ondemand` once lazy memory
+          (Phase 8) lands.
+    - [ ] Guest addresses are copied into forks: a static IP collides on the
+          bridge. Now stated up front in the fork docs and the agent
+          sandboxes guide. Reassign addresses in the resume handler (DHCP
+          renew, or an address from the identity disk) if platforms need it.
+    - [x] A disk fork or a cold-booted fork of a fixed-TAP task reused the
+          origin's TAP. A disk fork of a TAP-wired sandbox is now refused at
+          the API, and a fresh boot on a held TAP fails with a named reason
+          ([call 87](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+          A per-instance TAP for fresh boots is still open, so a fixed-TAP
+          task runs one instance per node.
+    - [x] A fixed TAP is refused at submit (and `job scale`) wherever two
+          guests could share a node: a keyed task, `count` above one, or a
+          `createFirst` rollout. Disk forks of auto-TAP sandboxes are now
+          allowed, and the fixed-TAP disk-fork refusal remains only for jobs
+          stored before the rule
+          ([calls 135, 136](calls/suspend-resume-and-oversubscription-plan_calls.md#135-a-fixed-tap-is-refused-wherever-two-guests-could-share-a-node-not-removed),
+          [docs](../docs/task-runtime-sandbox.md#networking)). Removing fixed
+          TAPs altogether is the gated plan's Phase 4.
+    - [x] A fork held the origin's pre-capture workload-identity token, good
+          for one TTL. Fork and manual snapshot captures now raise the
+          instance's identity epoch (`legion.io/epoch`), the `legion` auth
+          method refuses earlier tokens, and the origin's node re-issues at
+          once from `TaskAllocation.identity_epoch`. A suspend does not move
+          the epoch
+          ([calls 137, 138](calls/suspend-resume-and-oversubscription-plan_calls.md#137-fork-and-snapshot-captures-retire-the-origins-earlier-tokens-with-a-per-instance-identity-epoch),
+          [docs](../docs/workload-identity.md#forks-and-snapshots)).
+    - [ ] ACL tokens minted with `legion login --method legion` before a fork
+          are copied into every fork and stay valid for `acl.loginTtl` (24h).
+          Record the instance and epoch on such tokens, or clamp them to the
+          identity token's expiry
+          ([call 139](calls/suspend-resume-and-oversubscription-plan_calls.md#139-acl-tokens-minted-from-an-identity-token-survive-a-fork)).
+    - [x] A resume, fork, or rollback whose restore failed under
+          `onRestoreFailure = "cold"` was visible only as an event and a
+          `detail` string. It is now `InstanceInfo.cold_boot`, persisted on
+          the instance until the next resume or restore starts: `active
+          (resumed cold)` in `instance list`, a `resumed cold at ...` line in
+          `instance get` and `start --wait`, `-j` and MCP output, and a UI
+          badge ([call 140](calls/suspend-resume-and-oversubscription-plan_calls.md#140-a-cold-boot-in-place-of-a-restore-is-a-persisted-record-on-the-instance),
+          [docs](../docs/suspend-and-resume.md#when-a-resume-cannot-restore)).
+    - [x] A fork stopped while it waited for its checkpoint booted on an
+          empty volume when started. A new instance now keeps its restore
+          source across a stop and restores when started
+          ([call 84](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+    - [x] Fork ids under `requireId = true`: verified derived
+          `<origin>-f<n>` ids work, and an origin id too long to suffix is
+          refused there instead of given a minted id
+          ([call 77](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+    - [ ] Caller-supplied fork ids (`ForkInstanceRequest.instance_ids`),
+          for platforms whose `requireId = true` naming must choose
+          fork ids themselves.
+    - [x] Cross-node fork and `--spread`: done at the Phase 6 and 7b
+          integration. `--spread` publishes the memory checkpoint and places
+          each fork on a node no sibling runs on
+          ([call 24](calls/suspend-resume-and-oversubscription-plan_calls.md),
+          [docs](../docs/suspend-and-resume.md#spreading-forks-across-nodes)).
+    - [ ] Spread is enforced on a fork's first placement only. A spread
+          fork rescheduled later (node lost, stop and start) can land next
+          to a sibling. Persist the spread group on the instance if that
+          matters.
+    - [ ] A spread fork placement can run preemption, then find every
+          candidate taken by siblings and skip, wasting the eviction. Skip
+          preemption for a spread restore whose siblings cover the
+          preemptable nodes.
+    - [ ] A spread fork of a TAP-wired sandbox on another node joins the
+          bridge of the task's configured TAP there, and fails by name
+          without one. Verify on Linux with two bridged nodes (verification
+          item 6.7).
+  - [x] Phase 7: content locality (publishing, location index, `locality`
         score, `durability = "store"`, `snapshot warm`). Executes the artifact
         cache plan's Phases 1 and 3.
+    - [x] Phase 7a: the parts that need no snapshots.
+          [docs](../docs/artifacts.md#content-locality) ·
+          [calls 39, 92, 94, 103, 104, 105, 121, 122](calls/suspend-resume-and-oversubscription-plan_calls.md#39-weightslocality-defaults-to-10-the-day-phase-7a-ships)
+      - [x] `ContentPublisher` trait with `s3` and `file` backends
+            (`src/content_publish.rs`), worker `contentStore { url, auth }`,
+            idempotent publish by digest, published URL recorded per digest
+            in the content store index, reads through the ordinary fetchers
+            (`published_artifact`). `ContentPublishing::publish` is the seam
+            7b calls.
+      - [x] Location index: `content_locations` deltas with an epoch on the
+            heartbeat, full set on a worker's first heartbeat and on
+            `content_resync`, entries of at least 1 MiB, held in memory on
+            the manager (`src/storage/content_index.rs`)
+      - [x] `locality` score term, `schedulerSettings.weights.locality`
+            (default 1.0), wired into the cached-batch path and
+            `score_node_for_context`. Content set is pinned artifact digests
+            plus the `Scheduler::restore_content` hook (empty today).
+      - [x] `legion_scheduler_locality_placements_total{outcome}` metric
+      - [x] `scheduler_bench` `locality` group (content present / absent)
+    - [x] Phase 7b: durable checkpoints and cross-node resume.
+          [docs](../docs/suspend-and-resume.md#durability-surviving-the-node) ·
+          [calls 8, 15, 36, 42, 49, 62, 69, 73, 78, 88, 96, 108, 126](calls/suspend-resume-and-oversubscription-plan_calls.md#8-a-published-checkpoint-needs-instance-data-that-can-move-so-node-local-volumes-are-refused-rather-than-copied-phase-7b) ·
+          [Linux verification](suspend-resume-linux-verification.md#phase-7b)
+      - [x] `suspend.durability = "store"` and `snapshot create --publish`:
+            the snapshot is `local` once captured (the instance is
+            `suspended` at once), the node publishes each part through
+            `ContentPublishing::publish` on the checkpoint channel
+            (`op = publish`), and the row moves to `published` with each
+            part's URL in the manifest. `snapshot.published`,
+            `snapshot.publish_failed`, `legion_checkpoint_publish_*` metrics.
+      - [x] Refused loudly: a node-local instance volume at submit (built-in
+            drivers) and admission (plugin drivers advertising `nodeLocal`),
+            and a node without the `content-publish` capability at
+            `instance suspend`. A failed upload stays `local` with the
+            reason.
+      - [x] Cross-node restore fetch: missing parts are fetched on the
+            staging thread through `ArtifactStager::fetch_into_store`
+            (`published_artifact`), verified by digest, stored in the node
+            content store, pinned to the allocation until it starts.
+      - [x] Node loss: `published` snapshots survive node removal, and a
+            published resume does not wait for a lost node.
+      - [x] Placement: no hard pin for a published restore, `compat` checked
+            on every candidate, `locality` over the manifest parts. Keyed on
+            `restore_from`, so fork and `create --from-snapshot` (Phase 6)
+            get cross-node placement once their snapshot is published.
+      - [x] `legion snapshot warm <id|name> --constraint k=v` (`WarmSnapshot`,
+            `snapshot:read`, MCP `legion_snapshot_warm`, capabilities
+            catalog, `acl_endpoints`), `op = warm`, `snapshot.warmed` and
+            `snapshot.warm_failed`.
+      - [x] Fixed: index candidate truncation dropped the pinned node of a
+            stateful task (a `local` restore, a node-local volume) on fleets
+            large enough to arm the index. Stateful tasks no longer truncate
+            (call 88, `tests/restore_placement_indexed.rs`).
+      - [x] `scheduler_bench` `restore` group (`local_pinned`,
+            `published_floating`), run once on a loaded host
+            ([plan §9](plans/suspend-resume-and-oversubscription-plan.md#9-testing-plan)).
+    - [ ] Run the Phase 7b Linux checks
+          ([§ Phase 7b](suspend-resume-linux-verification.md#phase-7b)): a
+          real MinIO publish of a memory checkpoint, and a resume on a second
+          KVM node after the first is destroyed (the §13 Phase 7 acceptance
+          check). Record publish and fetch times.
+    - [ ] Volume migration: a `local-dir` instance volume cannot follow a
+          published checkpoint, so `durability = "store"` is refused with
+          one (call 8). A driver op that publishes and recreates a volume
+          would lift this.
+    - [x] Encrypt published checkpoint parts (plan open question 4, call
+          36): every part is sealed under a per-part key derived from the
+          keyring's checkpoint key, with no plaintext mode
+          ([plan](plans/checkpoint-encryption-plan.md) ·
+          [calls](calls/checkpoint-encryption-plan_calls.md) ·
+          [docs](../docs/suspend-and-resume.md#published-checkpoint-encryption)).
+          Done entry under KV & secrets.
+    - [ ] Rotate the checkpoint key by hand (`legion keyring checkpoint-key
+          rotate`): mint a new current key and keep old ones while a
+          manifest's `keyId` names them. Shares its reference count with
+          published-part GC below
+          ([calls 8](calls/checkpoint-encryption-plan_calls.md#8-manual-checkpoint-key-rotation-is-deferred-with-keyid-in-the-manifest-now)).
+    - [ ] Seal chunks of one large part in parallel. Sealing is one core per
+          part today, which is faster than any S3 upload but would matter on
+          a fast `file://` mount
+          ([calls 6](calls/checkpoint-encryption-plan_calls.md#6-publishing-hashes-while-it-seals-with-ring-replacing-the-separate-verify-pass)).
+    - [ ] Decrypt published parts as they stream in, instead of downloading
+          the ciphertext and opening it in place, to save a disk pass on
+          large fetches
+          ([calls 7](calls/checkpoint-encryption-plan_calls.md#7-fetch-opens-the-object-in-place-instead-of-streaming-through-the-fetcher)).
+    - [ ] Measure sealed publish and fetch against a real MinIO in the Phase
+          7b Linux checks (above), next to the plaintext numbers.
+    - [ ] Hash the node content store with `ring` (imports, `verify`,
+          `copy_out`). The `sha2` crate runs several times slower than the
+          CPU's SHA instructions on Apple silicon, and switching the sealer's
+          hash alone took a 2 GiB publish from 4.6 s to 1.35 s
+          ([calls 6](calls/checkpoint-encryption-plan_calls.md#6-publishing-hashes-while-it-seals-with-ring-replacing-the-separate-verify-pass)).
+    - [ ] Garbage-collect published parts: Legion never deletes from the
+          content store (call 62). A reference-counted sweep, or document a
+          lifecycle-rule recipe per provider. Spent spread-fork checkpoints
+          add to this: their node copy is reclaimed
+          ([call 83](calls/suspend-resume-and-oversubscription-plan_calls.md)),
+          their published parts are not.
+    - [x] Retry a failed publish: the manager re-sends `op = publish` after
+          one minute, then five, three attempts in all
+          ([call 42](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+    - [ ] A manual `snapshot publish <id>` for a snapshot whose attempts are
+          spent.
+    - [x] Published checkpoints are unpinned on their node once the upload
+          succeeds, so the content store evicts them like any cache entry,
+          and a resume there pins what is present or fetches what was
+          evicted. `node usage` counts only `local` checkpoints as suspended
+          on a node
+          ([call 131](calls/suspend-resume-and-oversubscription-plan_calls.md#131-published-checkpoints-are-unpinned-on-their-node-content-store-follow-up),
+          [docs](../docs/suspend-and-resume.md#what-happens)).
+    - [ ] Check a published resume for room to fetch its parts. The
+          checkpoint-room filter covers fresh placements only, so a resume
+          onto a node without its parts and without room fails in the fetch
+          ([call 134](calls/suspend-resume-and-oversubscription-plan_calls.md#134-a-resume-is-still-not-checked-for-room-for-its-parts-content-store-follow-up)).
+    - [x] Placement did not know which workers can fetch published parts.
+          Workers advertise `checkpoint-fetch`, and published restores and
+          warms only go to them
+          ([call 50](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+    - [ ] A pressure suspend stays `local` even with `durability =
+          "store"`, and an idle suspend that cannot publish is skipped
+          ([call 44](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+          Publish pressure checkpoints once the node has recovered, and
+          surface the idle skip on the instance.
+    - [ ] Warms are leader-local and lost on manager restart (call 96).
+          Show queued and finished warms (`snapshot get` or a status RPC).
+    - [x] The binder paired restoring instances with allocations in its
+          own order, so restores with different `compat` placed in one plan
+          could be crossed. Placements now carry the planned instance id
+          ([call 16](calls/suspend-resume-and-oversubscription-plan_calls.md)).
+    - [ ] With `plan_candidates.count = 0` (format-1 plans) placements carry
+          no instance id, so restores bind in the binder's order again.
+          Carry the id in format 1 too, or drop the kill switch.
+    - [x] Fill `Scheduler::restore_content` with a restore manifest's sized
+          memory parts (`RestorePin.manifest_json`), so a restoring
+          instance's checkpoint counts toward its placement's content set.
+    - [ ] Rerun the `locality` bench group, `scheduler_speed`, and
+          `candidate_construction` before/after on a quiet host. The 7a
+          numbers in the
+          [plan §9](plans/suspend-resume-and-oversubscription-plan.md#9-testing-plan)
+          came from a shared, loaded machine.
+    - [ ] Multi-manager clusters: the location index lives on whichever
+          manager serves a node's heartbeats, so the scheduling manager
+          scores nodes that heartbeat a peer as cold. Forward content
+          reports to the scheduler-lane leader (as liveness digests do) or
+          index on every manager.
+    - [ ] `contentStore.auth.nodeIdentity`: exchange a node identity token
+          for AWS credentials (STS `AssumeRoleWithWebIdentity`). Rejected
+          with a hint today.
+    - [ ] Image layers in the content set, once the content store holds OCI
+          blobs by digest (cache plan Phase 1 per-blob storage).
+  - [x] Integration of Phases 5, 6, and 7b: proto fields renumbered per
+        message, migrations ordered (`pause_ms`, then `durability` and
+        `published_at`, then the publish retry columns), one ranked calls
+        list, and the cross-phase fixes: `--spread` forks, the restore binder,
+        `checkpoint-fetch`, the publish retry, published snapshots as named
+        seeds, TAP and stopped-fork fail-loudly fixes, and the `cpus` (MHz)
+        correction. [docs](../docs/suspend-and-resume.md#spreading-forks-across-nodes)
+    - [ ] `resources.cpus` reads as a CPU count but is an alias for `cpu` in
+          MHz, so `cpus = 1` reserves 1 MHz. Submit warns under 10 today.
+          Deprecate the alias (a warning on any use, then a refusal in a
+          later release).
+    - [ ] Run the integration's Linux checks
+          ([§ Phase 6](suspend-resume-linux-verification.md#phase-6) items
+          6.7 and 6.8): a spread fork across two KVM nodes, and the named
+          TAP failures.
+  - [x] Resume guards (Track 2): `suspend.reserve` as `false`/`true`, a
+        ratio, or `{ memory, cpu }` (a partial hold is the suspended
+        allocation row with its resources cut to the share), make-room suspends for a
+        resume pinned to a full node (manager `suspend.makeRoom`, reason
+        `make_room`, `instance.make_room`, `legion_make_room_suspends_total`),
+        the `snapshots` content budget reported on the heartbeat and enforced
+        as a placement filter for new memory-suspend instances, held share in
+        `instance get`, and the `suspended:` and `checkpoints:` lines in
+        `node usage`.
+        [docs](../docs/suspend-and-resume.md#capacity-for-resumes) ·
+        [calls 5, 6, 10, 37, 47, 60, 109, 111, 128](calls/suspend-resume-and-oversubscription-plan_calls.md#5-a-resume-on-a-full-node-makes-room-by-suspending-idle-suspendable-work-there-resume-guards) ·
+        [Linux verification](suspend-resume-linux-verification.md#track-2).
+    - [ ] Run the Track 2 Linux checks
+          ([§ Track 2](suspend-resume-linux-verification.md#track-2)): a
+          make-room round with real sandbox memory captures, and a `snapshots`
+          budget filled by real checkpoints. Tested with the heartbeat
+          standing in for the worker on macOS only.
+    - [x] `scheduler_bench` A/B against main, two rounds in opposite order
+          ([PR #15](https://github.com/mikenomitch/legion/pull/15)).
+          Candidate construction and plan-only are flat within noise.
+    - [ ] Plan-and-apply is about 8% slower than main (`plan_under_fill`
+          plan_and_apply +6 to +11%, `scheduler_speed` 1k×1k +7 to +13%, both
+          rounds), while plan-only is flat, so the cost is in the apply
+          transaction. Profile it: likely the extra allocation columns and
+          the oversubscription and held-share bookkeeping per placement.
+    - [ ] The budget filter checks one checkpoint per placement against the
+          last report, so a plan placing many memory-suspend instances can
+          still overfill one node's budget. Count checkpoints the plan itself
+          places if that shows up
+          ([call 47](calls/suspend-resume-and-oversubscription-plan_calls.md#47-the-checkpoint-budget-is-a-placement-filter-on-soft-state-for-fresh-placements-of-memory-suspend-tasks-only-resume-guards)).
+    - [ ] A held share is fixed when the suspend lands: a changed
+          `suspend.reserve` does not re-charge instances already suspended
+          ([call 37](calls/suspend-resume-and-oversubscription-plan_calls.md#37-the-suspendedreserve-floor-lives-under-resourceenforcement-needs-no-cgroups-and-applies-when-a-suspend-lands-resume-guards)).
+    - [ ] Make-room only knows an instance is quiet from nodes that send usage
+          reports. Without `resourceEnforcement.enabled`, only
+          `onPressure = true` makes an instance eligible. Its cooldown
+          (2 minutes) is a constant.
+    - [x] `ListNodeUsage` fills the suspended summary too: both RPCs build
+          their reply through one `node_usage_reply`, which calls
+          `fill_suspended_capacity`.
+  - [x] Track 1, the agent-sandbox use case
+        ([guide](../docs/guides/agent-sandboxes.md) ·
+        [calls 14, 17, 30, 43, 52, 53, 54, 81](calls/suspend-resume-and-oversubscription-plan_calls.md#14-suspend-and-snapshots-ride-the-allocation-payload-and-the-worker-knows-its-instance) ·
+        [Linux verification](suspend-resume-linux-verification.md#track-1)).
+    - [x] Auto TAPs: `config.network = { mode = "tap", tap = "auto", bridge
+          }` creates a TAP per instance with the fork naming, attaches it to
+          the bridge, recreates it on restore, and deletes it on destroy.
+          Many memory-checkpointable sandboxes with real networking per node.
+          [docs](../docs/task-runtime-sandbox.md#networking)
+    - [x] Idle detection on microVMs: bytes the guest sends on its TAP count
+          for `network`. `connections` is refused on sandboxes that are not
+          gated, `exec` is refused on a sandbox pinned to a VMM and warned
+          otherwise. [docs](../docs/suspend-and-resume.md#what-each-signal-sees-on-a-sandbox)
+    - [x] Sandbox identity refresh with no reboot: file delivery under
+          `/legion/identity` through the identity disk, env + `noop` on
+          memory-checkpointable sandboxes, a warning for `restart`.
+          [docs](../docs/workload-identity.md#sandboxes)
+    - [x] macOS idle suspend: `container stats` feeds the usage sampler, and
+          an ignored end-to-end test (`apple_container_idle`) suspends an idle
+          Apple-container sandbox and resumes it cold on its volume.
+          [docs](../docs/suspend-and-resume.md#macos-dev-loop)
+    - [x] Fixed on the way: the allocation payload never carried `suspend`
+          or `snapshots`, so no real node reported idle time, honored
+          `onPressure`, or launched a sandbox ready for memory checkpoints
+          (now `TaskAllocation.task_suspend`/`task_snapshots`). Apple dev
+          sandboxes could not start (`--` before the command) and two local
+          clusters removed each other's containers (names now carry the
+          node).
+    - [ ] Run [§ Track 1](suspend-resume-linux-verification.md#track-1) on a
+          KVM host: auto TAPs on a bridge, TAP counters, an in-place identity
+          disk refresh in a running guest, and forks of an auto-TAP sandbox.
+    - [ ] No signal keeps a TAP sandbox awake through a quiet outbound call
+          (a harness waiting on a model). `connections` is refused there.
+          The `hint` signal (Phase 8) is the real fix.
+    - [ ] Auto-TAP egress is whatever the operator enforces on the bridge.
+          Per-sandbox egress policy needs gated networking, which still
+          cannot take memory checkpoints (call 55).
+    - [ ] Dev mode (Apple `container`) does not mirror env-delivered tokens
+          into `/legion/identity`, so env tokens there keep their boot value.
+    - [ ] The `container stats` call runs synchronously on the heartbeat
+          path every 10s while a dev sandbox runs. Move it off the loop if it
+          ever shows up in heartbeat latency.
+    - [x] Track 1's calls are inserted at their ranks and every citation
+          renumbered.
   - [ ] Phase 8: fast paths, each needing its own review (wake on connect,
-        `hint` idle signal, UFFD lazy memory, diff snapshots)
+        `hint` idle signal, UFFD lazy memory, diff snapshots). Deferred.
 - [ ] Split a task runtime's implementation into parts — isolation vs. runner vs.
       artifact consumption? (idea, needs a plan). The container-runtime plan's
       `resource_enforcement()` interface carves off the first slice of this —
@@ -1522,7 +2329,11 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       W3).** Launches are off it. Still under it, on async threads:
       `reap_terminating`, `record_failure` and the self-fence path (destroy and
       volume unmount), plus `prepare`/`start` for `ratify_claim`,
-      `restart_allocation`, and edge-boot provisional starts. `heartbeat_tick`
+      `restart_allocation`, edge-boot provisional starts, and snapshot
+      restores (a resume, fork, or `RestoreInstance` start; they record their
+      outcome on the checkpoint channel from inside the locked start, see
+      `begin_task_allocation` and `spawn_staging_thread` in
+      `src/worker/task_manager.rs`). `heartbeat_tick`
       also locks a std mutex from async code. Teardown needs a "tearing down"
       state so starts still wait behind stops. [calls #11](calls/architecture-audit-2026-10-09_calls.md).
 - [ ] **The worker boot fence is silent (audit W6).** A task fenced at boot is
@@ -1559,9 +2370,39 @@ Plan: [artifact-system-plan.md](plans/artifact-system-plan.md) · docs: [artifac
       [suspend/resume plan](plans/suspend-resume-and-oversubscription-plan.md)
       (Phases 3 and 7), amended to add a publish path and an off-raft location
       index in place of the `legion.artifact_cache` dynamic attribute.
-  - [ ] Phase 1 — content-addressed cache
+  - [ ] Phase 1 — content-addressed cache. Shipped as the
+        [node content store](../docs/artifacts.md#the-node-content-store) in
+        suspend plan Phase 3a, with per-class budgets.
+    - [x] CAS + sqlite index, sink swap (verified fetches are written into
+          the store), size budget + `minFreeDisk`, LRU GC loop, pinning,
+          single-flight, cache hit/miss in `artifact_states`
+    - [ ] Mutable-source caching: a source-keyed entry with TTL revalidation
+          through `ArtifactFetcher::resolve()`, and the jobspec `ttl` field.
+          Today only artifacts with a `checksum` use the store
+          ([call 65](calls/suspend-resume-and-oversubscription-plan_calls.md#65-the-node-content-store-caches-only-digest-pinned-single-files)).
+    - [ ] Cache trees (git, `file://` directories) and OCI images/ORAS layers;
+          OCI per-blob storage so tags sharing base layers store them once
+    - [ ] `legion artifact ls/gc` CLI (and MCP tool) over the node store
+    - [ ] Show cache hits in the UI's artifact staging rows (the `cache`
+          field is already in `artifact_states`)
+    - [ ] Flip `containerImageDesugar` to on by default (needs image caching)
   - [ ] Phase 2 — warm RPCs and policies
-  - [ ] Phase 3 — cache advertisement + `artifact_locality` scoring
+  - [x] Phase 3 — cache advertisement + `artifact_locality` scoring. Shipped
+        as suspend plan Phases 7a and 7b, with the plan's amendments.
+        [docs](../docs/artifacts.md#content-locality)
+    - [x] Advertisement: heartbeat deltas into an off-raft location index
+          instead of `ReportArtifactCache` and the `legion.artifact_cache`
+          dynamic attribute. Enqueues no evals.
+          [docs](../docs/artifacts.md#content-locality)
+    - [x] Locality scoring as `schedulerSettings.weights.locality` (default
+          1.0, `0` restores baseline placement) instead of
+          `artifact_locality: 0.3`
+    - [x] "Warming one node makes it win placement": `legion snapshot warm`
+          (suspend plan 7b) fetches a published snapshot onto matching nodes,
+          the location index advertises it, and placement prefers them
+          (`a_published_resume_prefers_the_node_holding_its_parts`).
+          Warming artifacts is Phase 2's `WarmArtifacts`, still open.
+  - [ ] Nodes-page cache card in the UI (left over from Phase 3)
   - [ ] Multiple layers of pre-fetching; tag nodes as pre-warmed; pre-fetch as
         part of the deploy process
   - [ ] Unblocks `artifacts.containerImageDesugar` being on by default
@@ -1586,6 +2427,13 @@ All deferred from the volume plan v1:
 - [ ] **Snapshot / restore / clone / expand** — op names are reserved in the
       contract. Overlaps with sandbox snapshot phases 1–2 and 5 above; build them
       together.
+  - [x] `snapshot`, `restore`, `clone`, `snapshot-delete` in the contract,
+        dispatched to exec drivers, implemented by `local-dir` in both modes
+        (reflink or sparse copy), and covered by the conformance suite
+        (suspend plan Phase 3b,
+        [volumes.md](../docs/volumes.md#snapshot-restore-and-clone))
+  - [ ] A `legion volume snapshot` surface, if one is wanted beyond checkpoints
+  - [ ] `expand`
   - [ ] `clone` × node locality: same-node clone native, cross-node fan-out
         snapshot-mediated, `capabilities` reporting `cloneScope: node | cluster`
 - [ ] **Multiple volumes per instance** (`stateful.volumes: [...]`) — the schema is
@@ -2073,7 +2921,9 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
       [src/manager/server.rs](../src/manager/server.rs), the RPC comment in
       `proto/legion.proto`, and the call-out in
       [docs/artifacts.md](../docs/artifacts.md). Accepted for now; close it.
-- [ ] Worker mTLS (deferred from auth phase 3)
+- [ ] **Worker mTLS (deferred from auth phase 3).** Now planned as part of
+      the worker-plane fix at the top of this file:
+      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md).
 - [ ] Dynamic auth-method dylib plugins (deferred from auth phase 2)
 - [ ] Workload-identity API credentials (deferred from auth phase 4)
 - [ ] Token-resolution cache (deferred from auth phase 4)
@@ -2258,6 +3108,59 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
       Chromium's reserved set, but "the page wins `⌘`+digit" is asserted from
       the reserved-key list, not measured
       ([calls entry 1](calls/ui-jump-hints-plan_calls.md))
+
+- [ ] **Suspend, resume, and oversubscription in the UI**
+      ([plan](plans/suspend-resume-ui-plan.md),
+      [calls](calls/suspend-resume-ui-plan_calls.md),
+      [docs](../docs/ui-architecture.md#usage-pressure-and-snapshots)).
+  - [x] UI-1: worker Usage card from `GetNodeUsage` (capacity with ratio,
+        reserved and used bars, pressure status, per-allocation table,
+        pressure order with step chips), workers-index memory column, usage
+        and `memoryMax` on the job's instance and allocation tables and the
+        task page, Memory pressure cards on job and worker pages, structured
+        `node.pressure` and `snapshot.*` summaries on Events, fixtures at
+        `/testing`
+  - [x] UI-2: job Snapshots card with take (disk or memory), restore, and
+        delete, ACL-gated and two-step, row expansion with the manifest, a
+        "restoring from" badge on instances
+  - [x] UI-3: `suspended` badge and state filter, checkpoint column (kind,
+        local or published, size, node, age), Suspend (kind menu when both
+        are possible), Resume, and Resume cold, two-step and ACL-gated, last
+        suspend and restore durations, `last_stop` on the row, and an
+        `instance` events category with summaries. Rows are keyed by id so
+        an armed confirm survives polls
+        ([calls 6](calls/suspend-resume-ui-plan_calls.md#6-instance-rows-are-keyed-by-id-and-cells-read-the-row-through-an-accessor))
+  - [x] UI-4: idle countdown from `idle_since` and `idle_after_seconds`,
+        `suspend_reason` on suspended rows, and the `suspend` step chip
+  - [x] UI-5: Fork with count and spread (spread only when the manager
+        allows it), fork lineage, snapshot names shown, set, and removed
+  - [x] UI-6: durability column, publish on create, Warm, snapshot holders,
+        and the worker page's "Content and locality" card
+  - [x] Server changes the UI needs
+        ([plan §7.3](plans/suspend-resume-ui-plan.md#73-server-changes-the-ui-needs)):
+        `ListNodeUsage` (the workers index makes one call), `InstanceInfo.last_stop`
+        plus `instance_id` in `node.pressure`, `GetNodeContent` and
+        `SnapshotInfo.holders`, `InstanceInfo.checkpoint_support` per
+        operation, `forked_from`, and CPU `cores` and `used_millicores` on
+        node usage (`legion node usage` with no node, `legion node content`,
+        and the `legion_node_usage_list` and `legion_node_content` MCP tools)
+  - [ ] Show the `artifacts` budget on the worker page's "Content and
+        locality" card. The `snapshots` bar ships, with the room left for a
+        new checkpoint and whether the budget or the disk limits it, but
+        GetNodeUsage carries only the `snapshots` class
+        ([calls 8](calls/suspend-resume-ui-plan_calls.md#8-getnodecontent-reads-only-what-the-manager-already-holds))
+  - [ ] The Jobs index still lists a running job as `done`; only the job
+        page derives `running`
+        ([calls 9](calls/suspend-resume-ui-plan_calls.md#9-a-done-job-with-live-work-reads-running-derived-in-the-ui)).
+        A server-side status that reflects live work would fix both
+  - [ ] `create --from-snapshot` from the UI needs an instance-create
+        surface, which the UI does not have
+        ([calls 15](calls/suspend-resume-ui-plan_calls.md#15-creating-instances-from-a-snapshot-stays-in-the-cli))
+  - [ ] Linux visual check: `/nodes/<id>` against `legion node usage <id>`
+        on a worker with enforcement on, and an idle countdown reaching zero
+        within one poll of the idle sweep suspending the instance. macOS
+        only exercises the not-reported shape, so the countdown is checked
+        against fixtures at `/testing` only
 
 Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 
@@ -2789,6 +3692,20 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Rename "task kind" → "task runtime"
       ([plan](plans/task-runtime-rename-plan.md), single-pass, no shim)
 - [x] A **noop** runtime ([docs](../docs/task-runtime-noop.md))
+- [x] **Sandbox guest size follows `resources`** (`memoryMax`, else
+      `memory`), so the scheduler's reservation and the VM's size can no
+      longer drift apart
+      ([plan Phase 2](plans/suspend-resume-and-oversubscription-plan.md#8-implementation-phases),
+      [docs](../docs/task-runtime-sandbox.md#guest-size)). An explicit
+      `memory_mib` still wins for one release, with a warning.
+- [x] **`sandbox` adopts `resource_enforcement()`** as `WorkerCgroup`: the VMM
+      joins the allocation's worker cgroup, `memory.max` = guest +
+      `sandbox.vmmOverheadMiB` (default 64), and its usage is measured
+      ([plan Phase 1](plans/suspend-resume-and-oversubscription-plan.md#8-implementation-phases),
+      [docs](../docs/resource-enforcement.md#sandbox-tasks)). Chose
+      `WorkerCgroup` over the `RuntimeApplied` shape this item first proposed:
+      the VMM is a host process, so the cgroup ceiling is the honest limit and
+      guest size stays the task config's job.
 - [x] An **exec** runtime ([docs](../docs/task-runtime-exec.md)) — runs the given
       command and args, as a specific user, joining an existing cgroup (v2 only),
       with landlock
@@ -2800,6 +3717,14 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([oci_bundle.rs](../src/task_plugins/oci_bundle.rs)).
 - [x] A **sandbox** runtime ([docs](../docs/task-runtime-sandbox.md)) — OCI images
       in microVMs for untrusted code and agent workspaces
+- [x] **Sandbox snapshot, fork, and suspend footguns** (2026-10-11): a fixed
+      TAP is refused at submit wherever two guests could share a node, forks
+      no longer act as their origin in Legion's own token checks, and a cold
+      resume is recorded on the instance as `cold_boot`
+      ([calls 135-140](calls/suspend-resume-and-oversubscription-plan_calls.md#135-a-fixed-tap-is-refused-wherever-two-guests-could-share-a-node-not-removed),
+      [sandbox networking](../docs/task-runtime-sandbox.md#networking),
+      [forks and snapshots](../docs/workload-identity.md#forks-and-snapshots),
+      [when a resume cannot restore](../docs/suspend-and-resume.md#when-a-resume-cannot-restore)).
 - [x] **The `container` runtime's four core gaps, closed** (2026-07-31) —
       [plan](plans/container-runtime-exec-and-signals-plan.md) ·
       [calls](calls/container-runtime-exec-and-signals-plan_calls.md). Six of
@@ -2867,6 +3792,32 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] A plugin system for fetchers (`plugins/artifacts/<scheme>/`)
 - [x] OCI layout → runtime bundle conversion so Legion-managed images work on
       Linux container workloads
+- [x] **Content store budgets that fit the disk, and a disk-aware checkpoint
+      room check.** Content-store follow-up to the
+      [suspend plan](plans/suspend-resume-and-oversubscription-plan.md),
+      [calls 131 to 134](calls/suspend-resume-and-oversubscription-plan_calls.md#131-published-checkpoints-are-unpinned-on-their-node-content-store-follow-up) ·
+      [docs: the node content store](../docs/artifacts.md#the-node-content-store),
+      [the checkpoint disk budget](../docs/suspend-and-resume.md#the-checkpoint-disk-budget)
+  - [x] `content.budgets.*` takes a size or a share of the content
+        filesystem (`"20%"`), sized at worker start. Defaults are 10%
+        clamped to 1..20 GiB (artifacts) and 20% clamped to 2..200 GiB
+        (snapshots). Bad percentages and shares over 100% fail config load.
+  - [x] Workers report `disk_free_bytes`, `min_free_disk_bytes`, and
+        `reclaimable_bytes` on `SnapshotBudget`. A node's checkpoint room is
+        `min(budget - pinned, free + reclaimable - minFreeDisk)`, used by
+        the placement filter (whose error counts each limit), `legion node
+        usage`, and the worker page's content card. `scheduler_bench`
+        `snapshot_budget` reports disk numbers too.
+  - [ ] Rerun `scheduler_bench` `snapshot_budget` and
+        `candidate_construction` on a quiet host. The local before/after
+        (2026-10-11, load average 11 to 22) moved `unreported/nodes_5000`,
+        which never reaches the changed filter, from 11.8 ms to 21.6 ms, so
+        it measured the host, not the change: `half_full/nodes_5000` 14.8 ms
+        before, 23.4 to 29.1 ms after, `half_full/nodes_1000` 4.0 ms before,
+        2.7 to 3.6 ms after. The filter itself is one pass over reported
+        nodes per task, as before, with a `min` added per node.
+  - [x] Published checkpoints are unpinned on their node (see Phase 7b
+        under Scheduling & placement).
 
 ## Rollouts
 
@@ -2933,6 +3884,21 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
   - [x] Phase 4 — a joining manager receives the root key inside the raft join
         reply (sealed under a key derived from the cluster secret), so "join
         the cluster" stays one command
+
+[checkpoint encryption plan](plans/checkpoint-encryption-plan.md) ·
+[calls](calls/checkpoint-encryption-plan_calls.md) ·
+[docs](../docs/suspend-and-resume.md#published-checkpoint-encryption)
+
+- [x] **Published checkpoints are sealed** (2026-10-11): every part a worker
+      publishes (`durability = "store"`, `snapshot create --publish`,
+      `--spread` forks) is AES-256-GCM in 1 MiB STREAM chunks under a part
+      key the manager derives from the keyring's `ck_…` checkpoint key and
+      the part's plaintext digest. Keys ride the publish, warm, and restore
+      work (never a pull RPC), are redacted from Debug, and never serialize.
+      Objects live at `sealed/<keyed name>`, dedupe and stay idempotent, and
+      open in place on fetch. Plaintext leftovers, tampering, wrong keys,
+      and missing or locked keys each fail by name. Open follow-ups are under
+      the suspend item in Task runtimes.
 
 ## Service discovery (v1)
 
@@ -3023,6 +3989,13 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Manager as an OIDC issuer: keys, discovery, JWKS, rotation
 - [x] Token issuance RPC, job-spec API, worker delivery, change mode
 - [x] Node identity tokens and control-plane identity (phase 7)
+- [x] Identity epochs: a fork or snapshot capture retires the instance's
+      earlier tokens in Legion's own verifiers and re-issues the running
+      instance at once
+      ([calls 137-139](calls/suspend-resume-and-oversubscription-plan_calls.md#137-fork-and-snapshot-captures-retire-the-origins-earlier-tokens-with-a-per-instance-identity-epoch),
+      [docs](../docs/workload-identity.md#forks-and-snapshots)). Offline
+      verifiers (AWS, GCP, Vault) cannot see the epoch, and login-minted ACL
+      tokens are still open (Task runtimes, Phase 6 follow-ups).
 
 ## Auth & ACLs
 

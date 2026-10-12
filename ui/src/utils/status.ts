@@ -15,9 +15,20 @@ const OK = ['running', 'complete', 'done', 'healthy', 'ready', 'active', 'pass',
 // Whole words only — substrings would swallow "updating", "broken", "disabled", …
 const OK_WORDS = /\b(up|ok|enabled)\b/
 
+// Whole words the keyword lists would misread: "suspended" contains
+// "pend", but a suspended instance is parked on purpose, not waiting.
+const EXACT = new Map<string, Tone>([
+  ['suspended', 'accent'],
+  ['suspending', 'info'],
+  ['resuming', 'info'],
+  ['forking', 'info'],
+])
+
 export const statusTone = (status?: string | null): Tone => {
   const normalized = (status ?? '').toLowerCase().trim()
   if (!normalized) return 'neutral'
+  const exact = EXACT.get(normalized)
+  if (exact) return exact
   const match = (keywords: string[]) => keywords.some((keyword) => normalized.includes(keyword))
   // Order matters: danger > warn > info > ok, so "update failed" is red and
   // "updating" is blue rather than accidentally green.

@@ -32,8 +32,10 @@ block device and cannot read a host directory.
         image = "alpine:latest",
         command = ["/bin/sh", "-c", "cd /workspace && ./agent.sh"],
         vcpus = 2,
-        memory_mib = 1024,
     },
+    # The guest boots with 1024 MiB (memoryMax) and the scheduler reserves
+    # 512 MiB for it. See "Guest size" below.
+    resources = { memory = 512, memoryMax = 1024 },
 }
 ```
 
@@ -70,8 +72,9 @@ VM (Virtualization.framework). The isolation boundary is still a VM. Apple owns
 the kernel and disks, though, so the Legion-specific machinery does not apply:
 
 - `kernel`, `kernel_args`, `rootfs_headroom_mib`, and `network` are ignored.
-- `vcpus` and `memory_mib` are forwarded only when the jobspec sets them.
-  Otherwise the backend picks.
+- `vcpus` is forwarded only when the jobspec sets it. Otherwise the backend
+  picks. Memory follows the same [guest size](#guest-size) rule as a
+  microVM.
 - Volumes must use filesystem mode (bind-mounted, like the container runtime).
   A block volume fails at start, because Legion has no VMM to attach it to.
 - Exec is available here (`container exec`), unlike the microVM path.
@@ -109,8 +112,11 @@ workload is done. The sandbox runtime supplies that layer.
    before `start` ([volumes](volumes.md)). Each one's device or disk image
    becomes an extra virtio-blk device after the root disk, in declaration
    order: `/dev/vdb`, `/dev/vdc`, ….
-4. **Boot.** cloud-hypervisor gets argv. Firecracker gets a `--no-api
-   --config-file` JSON config. Both are single-process VMMs, so:
+4. **Boot.** cloud-hypervisor gets argv, plus an `--api-socket`. Firecracker
+   gets a `--config-file` JSON config and `--no-api`, unless the allocation is
+   launched for memory checkpoints (see [Checkpoints](#checkpoints)) or boots
+   with a balloon (see [Guest memory under pressure](#guest-memory-under-pressure)),
+   in which case it gets `--api-sock` instead. Both are single-process VMMs, so:
    - The guest serial console is the VMM's stdout. It lands in the
      allocation's `stdout.log` like any other task's output.
    - Killing the child kills the VM. There is no daemon to chase (unlike the
@@ -222,17 +228,64 @@ Optional:
 | `env` | `{}` | Environment exported inside the sandbox (merged over the image's env, task wins). |
 | `cwd` | image's `WorkingDir` | Working directory in the guest. |
 | `vcpus` | `1` | Guest vCPUs. |
-| `memory_mib` | `512` | Guest RAM (minimum 64). |
+| `memory_mib` | derived from `resources` | Guest RAM (minimum 64). Leave it unset: the manager fills it at submit from `resources.memoryMax`, else `resources.memory`, else 512 ([Guest size](#guest-size)). An explicit value still wins in this release, with a submit warning when it disagrees. |
 | `rootfs_headroom_mib` | `256` | Writable space added to the ephemeral root disk beyond the image contents. |
 | `hypervisor` | `auto` | `auto`, `cloud-hypervisor`, `firecracker`, `dev`. |
 | `kernel` | `LEGION_SANDBOX_KERNEL`, then `/var/lib/legion/kernels/vmlinux` | Uncompressed guest kernel. `${artifact.<name>}` works here. |
 | `kernel_args` | none | Appended to Legion's kernel cmdline. |
-| `network` | `{ mode: 'none' }` | `{ mode: 'tap', tap: 'tap0', mac: … }` attaches the guest to a **pre-created** host TAP device. |
+| `network` | `{ mode: 'none' }` | `{ mode: 'tap', tap: 'tap0', mac: … }` attaches the guest to a **pre-created** host TAP device. `{ mode: 'tap', tap: 'auto', bridge: 'br0' }` has Legion create a TAP per instance on that bridge. See [Networking](#networking). |
 
 Persistent state is not part of the runtime config. Declare
 `stateful.storage` (or `volumes[]`) on the task with `mode = "block"`. See
 [Stateful Sandboxes](#stateful-sandboxes). Validation rejects an old
 `config.state` block and tells you how to migrate it.
+
+### Guest size
+
+The guest's RAM follows the task's `resources`, so what the scheduler
+reserves and what the VM boots with can't drift apart:
+
+- **`resources.memoryMax` when set.** The guest can use up to that much, the
+  scheduler reserves `resources.memory`, and on a worker with resource
+  enforcement the cgroup protects the reservation with `memory.low`. A
+  sandbox with `memory = 512, memoryMax = 4096` boots a 4 GiB guest and
+  reserves 512 MiB.
+- **Else `resources.memory`.** A sandbox task that declares no `memory`
+  gets the runtime's own default of 512 MiB, the size sandboxes have always
+  booted with. That default wins over the manager's
+  `taskResourceDefaults.memory`, which is tuned for host processes and would
+  otherwise resize every guest. The scheduler reserves the same 512 MiB the
+  guest boots with.
+
+The size is fixed when the job is submitted: the manager writes it into the
+stored config as `memory_mib`, and the worker boots exactly that. A job
+stored by an older manager (no `memory_mib`) keeps booting at 512 MiB.
+Resubmitting such a job pins the size and its reservation (now 512 MiB
+instead of the old 256 MiB default), so the resubmit shows as a new version.
+
+With enforcement on, the allocation's cgroup ceiling is the guest size plus
+the worker's `sandbox.vmmOverheadMiB` (default 64). See
+[resource-enforcement.md](resource-enforcement.md#sandbox-tasks).
+
+The guest's vCPU count is `config.vcpus` (default 1), independent of
+`resources.cpus`, `cpu`, and `cores`, which only govern the VMM's threads on
+the host.
+
+**Upgrading from `memory_mib`.** Before this rule, `config.memory_mib` sized
+the guest (default 512) and nothing tied it to `resources.memory`. An
+explicit `memory_mib` keeps working in this release. When it disagrees with
+`resources`, `job run` warns:
+
+```console
+warning: task workspace sets config.memory_mib = 1024, but its resources size the guest at
+512 MiB (resources.memoryMax, else resources.memory). This release still boots 1024 MiB, and
+a future release rejects the mismatch. Drop memory_mib and set resources.memoryMax = 1024 to
+burst to it, or resources.memory = 1024 to reserve it. See docs/task-runtime-sandbox.md
+```
+
+A `memory_mib` with no `resources.memory` is compared with the 512 MiB
+default, so `memory_mib = 1024` alone also warns. A derived guest under
+64 MiB fails at submit.
 
 ### Guest kernel
 
@@ -251,13 +304,81 @@ A missing kernel fails at start. The error names all three options: the task's
 
 ## Networking
 
-Guest networking needs a host TAP device. That needs `CAP_NET_ADMIN` and a
-host addressing plan, so Legion does not create one. The default is
-`mode = "none"`, which gives the guest loopback only. That suits compute and
-agent sandboxes. With `mode = "tap"`, the operator (or a future network
-plugin) pre-creates the device and Legion attaches it. `LEGION_PORT_*` and
-`LEGION_ADDR_*` are still exported into the guest, but nothing maps host ports
-into the VM yet.
+Guest networking needs a host TAP device. The default is `mode = "none"`,
+which gives the guest loopback only. That suits compute sandboxes. With
+`mode = "tap"` there are two ways to get the device:
+
+| `config.network` | Device | Instances per node | Memory checkpoints |
+| --- | --- | --- | --- |
+| `{ mode = "tap", tap = "tap0" }` | Pre-created by the operator (or a network plugin). Legion attaches it | One, since every instance names the same device. Refused on a keyed task, with `count` above one, or with a `createFirst` rollout | Yes |
+| `{ mode = "tap", tap = "auto", bridge = "br0" }` | Created by Legion per instance and attached to `bridge` | Any number | Yes |
+
+```nickel
+config = {
+  image = "ghcr.io/acme/agent-base:2026-10",
+  command = ["/usr/local/bin/harness"],
+  network = { mode = "tap", tap = "auto", bridge = "br0" },
+},
+```
+
+**Auto TAPs.** With `tap = "auto"`, the node creates a persistent TAP for
+each instance, enslaves it to `bridge`, brings it up, and deletes it when the
+allocation is destroyed. The device is named `lgf` plus 12 hex characters of
+the instance id's SHA-256 (the allocation id for a task without instances),
+which fits the kernel's 15-character limit. It is the same name a memory fork
+of that instance gets, so one instance always asks for one device:
+
+- A resume recreates the device under the name its checkpoint recorded, on
+  the same bridge (see [Networking](suspend-and-resume.md#networking)).
+- A fork gets its own `lgf` device on the bridge (see
+  [Networking for forks](suspend-and-resume.md#networking-for-forks)).
+- The guest's MAC defaults to a locally administered address derived from
+  the allocation id (`02:4c:...`), so guests on one bridge never collide. Set
+  `mac` to pin one.
+
+The bridge, its addressing, and DHCP on it are yours. Legion only attaches
+TAPs to it. Have the guest image use DHCP, since every instance boots from
+the same image. Creating TAPs needs `CAP_NET_ADMIN` and the `ip` tool on the
+worker. A device of that name that already exists and is free (left by a
+worker crash) is reused and re-attached to `bridge`. One that another process
+holds fails the boot by name: `sandbox needs TAP device lgf... (network.tap =
+"auto"): it exists and another process holds it`.
+
+`bridge` is required with `tap = "auto"` and refused with a fixed `tap`,
+because a fixed device is wired by whoever created it.
+
+**Fixed TAPs.** A device serves one guest, so a task with a fixed `tap` runs
+one guest per node. Submit, `job validate`, and `job plan` refuse every spec
+that could put a second guest on one node, and so does `job scale` above one:
+
+- a keyed task (`stateful.mode = "keyed"`), since any instance, fork, or
+  snapshot seed can land next to another,
+- a `count` above one, slot mode or stateless, since two allocations can
+  share a node,
+- a rollout with `replacement = "createFirst"`, which starts the replacement
+  before the old allocation stops, on its node when it fits.
+
+```text
+Error: jobspec failed validation: task "workspace" attaches its sandbox to the fixed TAP
+device "tap0" (config.network.tap), which serves one guest per node, but it is a keyed
+task (stateful.mode = "keyed"), so a second instance, a fork that boots cold, or a disk
+snapshot seed on the same node fails to boot
+Hint: set config.network = { mode = "tap", tap = "auto", bridge = "<the bridge tap0 is
+on>" }, so Legion creates a TAP per instance
+```
+
+A fixed TAP fits a single long-lived guest, such as one slot instance. A job
+stored before this rule still runs, and a boot on a TAP another VMM holds
+fails with `sandbox needs TAP device tap0 ..., but another process holds it`.
+
+`LEGION_PORT_*` and `LEGION_ADDR_*` are still exported into the guest, but
+nothing maps host ports into the VM yet.
+
+**Idle detection.** A TAP-wired guest's traffic never crosses the node
+datapath, so the idle policy's `network` signal reads the TAP's counters
+instead: bytes the guest sends (`/sys/class/net/<tap>/statistics/rx_bytes`)
+count as activity. See
+[what each signal sees on a sandbox](suspend-and-resume.md#what-each-signal-sees-on-a-sandbox).
 
 **Gated networking.** Set the task's `network.mode = "gated"` (the block next
 to `service` and `connect`, not `config.network`). The guest then boots with
@@ -302,9 +423,10 @@ isolated filesystem cannot see the host task dir at all.
 | --- | --- |
 | KV env injection | ✅ |
 | KV file injection | ❌ (baked in at disk-build time, so a change needs a restart) |
-| Identity env / file delivery | ✅ / ❌ |
+| Identity env / file delivery | ✅ / ✅ (under `/legion/identity`, refreshed with no restart) |
 | Signal delivery | ❌ (needs a guest agent) |
-| Memory / CPU limits, exclusive cores | ❌ The runtime has not adopted the enforcement interface. `resources` size the guest and are otherwise used only for scheduling. See [docs/resource-enforcement.md](resource-enforcement.md). |
+| Memory / CPU limits, exclusive cores | ✅ with `resourceEnforcement.enabled` on Linux. The VMM runs in the allocation's worker cgroup, with `memory.max` = the [guest size](#guest-size) + the worker's `sandbox.vmmOverheadMiB` (default 64) and `memory.low` = `resources.memory`. `cpu` and `cores` govern the VMM's threads. See [resource-enforcement.md](resource-enforcement.md#sandbox-tasks). |
+| Measured usage | ✅ with enforcement on: memory, CPU, and idle time in `legion node usage` and `instance list` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
 | Artifacts | ✅ image, file, tree, layers |
 | Exec / interactive PTY | ❌ on the microVM path (needs a vsock guest agent). ✅ / ✅ in macOS dev mode. |
 | Volumes | ✅ `block` on microVM backends, `filesystem` on dev backends |
@@ -341,10 +463,157 @@ LEGION_SANDBOX_KERNEL=/path/to/vmlinux \
   cargo test --lib sandbox_microvm_boots -- --ignored --nocapture
 ```
 
-## Snapshots, Fast Start, and Forking
+## Checkpoints
 
-The sandbox runtime does not support snapshots, snapshot restore, or forking
-one sandbox into many. Every sandbox boots from scratch.
+A **checkpoint** captures a running allocation so it can be restored later,
+in the same or a new allocation. The sandbox runtime supports two kinds:
+
+| Backend | Checkpoint | What is captured |
+| --- | --- | --- |
+| `cloud-hypervisor`, `firecracker` | `memory` | Guest memory, VMM device state, the root disk, and the volumes |
+| Apple `container`, Linux `dev` | `disk` | The volumes only. Restore boots the task fresh on them. |
+
+The other runtimes (`exec`, `container`) report a `disk` checkpoint when the
+task has a volume whose driver supports the volume `snapshot` op, and none
+otherwise. The volume half of every checkpoint is the volume driver's
+[`snapshot` op](volumes.md#snapshot-restore-and-clone).
+
+`legion instance suspend` and `legion snapshot create --memory` take a memory
+checkpoint, and `legion instance start` and `legion snapshot restore` restore
+one (see [suspend and resume](suspend-and-resume.md)). This section describes what the
+runtime does when the worker asks it to, and the node attributes a memory
+checkpoint is matched against.
+
+### Launching a sandbox for memory checkpoints
+
+A microVM records the host path of every disk in its saved state and reopens
+those exact paths on restore. A restored sandbox is a new allocation with a new
+directory, so a sandbox that may be memory-checkpointed boots differently:
+
+- **Stable device links.** The VMM sees its disks through symlinks under
+  `<worker state>/allocs/.vmdev/<key>/` (`rootfs.img`, `vol0.img`, …,
+  `identity.img`). A restore repoints the links at the new allocation's files
+  before the VMM opens them.
+- **An identity disk.** A 1 MiB raw disk is attached after the volumes as
+  drive `identity`, read-only. Its guest device is on the kernel cmdline as
+  `legion.identity=/dev/vdX`. The host rewrites it on every restore with the
+  new allocation id, instance id, hostname, a fresh workload-identity token
+  when the task has one, and fresh entropy. Between restores it rewrites the
+  same disk in place whenever a workload-identity token is refreshed. A
+  restored Firecracker VM cannot hotplug a disk, but it can repoint one it
+  already has, which is why the slot is reserved at boot. A sandbox that is
+  not launched for checkpoints still gets this disk (attached directly, with
+  no device links) when it declares file-delivered identities.
+- **Firecracker gets an API socket.** It boots from `--config-file` as usual,
+  plus `--api-sock <alloc>/.sandbox/vmm.sock`. A sandbox that is not launched
+  for checkpoints (and has no balloon) keeps `--no-api` and has no control
+  channel at all.
+- **A balloon device**, the memory pressure response's lever for guest RAM
+  (see [Guest memory under pressure](#guest-memory-under-pressure)).
+
+A sandbox launches this way when its task declares a
+[`suspend` block](suspend-and-resume.md#the-suspend-block) (without
+`checkpoint = "disk"`) or a
+[`snapshots` block](suspend-and-resume.md#the-snapshots-block) (without
+`memory = false`), and its backend is a real VMM. Such a sandbox also gets the
+worker's own binary at `/legion/legion`, and its init starts
+`legion guest-resume` in the background (see
+[Identity after a restore](#identity-after-a-restore)). A sandbox launched without
+these cannot be memory-checkpointed. The error says so and names the fix.
+
+### Capture and restore
+
+Capture pauses the VM, has the VMM write its state (Firecracker
+`PUT /snapshot/create`, cloud-hypervisor `vm.snapshot`), copies the root disk
+beside it, and then either resumes the VM or kills the paused VMM. For a live
+snapshot the worker keeps the VM paused while it snapshots the instance
+volume, then resumes it, so memory and disk are one instant. The guest never
+runs past the captured instant. The root disk copy is a reflink on
+btrfs, XFS, and APFS, and a sparse copy elsewhere. When any step fails after
+the pause, the VM is resumed before the error is returned, so a failed
+checkpoint leaves the sandbox running.
+
+Restore launches a fresh VMM, Firecracker with only `--api-sock` (then
+`PUT /snapshot/load`, a `PATCH /drives/identity`, and a resume),
+cloud-hypervisor with `--restore source_url=file://…` (then a resume). The
+restored VMM joins the allocation's cgroup like a booted one. The restored
+guest keeps its memory, open files, and processes.
+
+Each part of a memory checkpoint is recorded with a `sha256` digest and size.
+Restore checks every part's size before launching the VMM.
+
+A suspend (`legion instance suspend`) captures the same way, without copying
+the instance volume: the volume stays in place on the node, which is what the
+resume restores onto. The guest stays paused from the capture until the
+worker has stored its memory in the node content store, and only then is the
+VMM killed. If storing fails, the guest is resumed and keeps running.
+
+### Identity after a restore
+
+The restored guest wakes up mid-instruction as a new allocation. Its init
+started `legion guest-resume` at first boot, which polls the identity disk
+(dropping the guest's block cache first, so it never reads the captured
+copy). When the disk names a new allocation, the handler reseeds the RNG
+from the disk's fresh entropy (`RNDADDENTROPY`), steps the clock to the
+host's time, sets the hostname (and the NIC's MAC when the restore assigns
+one), writes `/legion/identity.json`, `/legion/resume.env`, and one file per
+env-delivered token under `/legion/identity/`, and finally runs
+`suspend.onResume`. Each step is logged to the console, and a failed step
+does not stop the others. VMGenID, where the VMM exposes it, reseeds the
+kernel RNG on its own as well. See [suspend and
+resume](suspend-and-resume.md#identity-after-a-resume).
+
+When the disk names the same allocation with new tokens, that is a token
+refresh rather than a restore: the handler rewrites the token files and
+`/legion/resume.env` only. See
+[workload identity on sandboxes](workload-identity.md#sandboxes).
+
+### Where a memory checkpoint can be restored
+
+A memory checkpoint only resumes on the same VMM at the same version, on the
+same CPU, with the same guest size. Workers report these node attributes,
+which you can also use in constraints:
+
+| Attribute | Example | Meaning |
+| --- | --- | --- |
+| `sandbox.vmm` | `cloud-hypervisor` | The VMM `hypervisor = "auto"` resolves to on this node |
+| `sandbox.vmm.version` | `41.0.0` | Its version |
+| `sandbox.vmm.<name>.version` | `sandbox.vmm.firecracker.version = 1.7.0` | One per installed VMM |
+| `cpu.vendor` | `GenuineIntel` | CPU vendor (an implementer code such as `0x41` on ARM) |
+| `cpu.model` | `6:106:6` | `family:model:stepping` on x86, `implementer:part:variant:revision` on ARM |
+| `cpu.features` | `3f9a0c21d4e5b6a7` | A digest of the sorted CPU flag list |
+
+A checkpoint records the values it was taken under, and a node must match all
+of them exactly. Restoring into a task whose `vcpus` or `memory_mib` changed is
+refused with an error naming both shapes.
+
+A `local` checkpoint restores only on the node that took it. A published one
+(`suspend.durability = "store"`, or `snapshot create --publish`) restores on
+any node whose attributes match, and that node fetches the memory, VMM state,
+and root disk parts from the content store first. The guest's root disk is
+one of those parts, so a sandbox with no `stateful.storage` moves whole. See
+[Durability](suspend-and-resume.md#durability-surviving-the-node).
+
+## Guest memory under pressure
+
+To the host, a guest's RAM is anonymous memory of the VMM process, which the
+kernel cannot reclaim without swap. So a sandbox that can run above its
+reservation boots with a virtio-balloon device: one whose `resources.memoryMax`
+is above `memory`, and every one launched for memory checkpoints.
+
+- **Firecracker** gets `"balloon": { "amount_mib": 0, "deflate_on_oom": true }`
+  in its config file, and an API socket to drive it.
+- **cloud-hypervisor** gets `--balloon size=0,deflate_on_oom=on,free_page_reporting=on`.
+  With free page reporting, a guest kernel built with `CONFIG_PAGE_REPORTING`
+  hands freed pages back to the host as it frees them.
+
+The balloon starts empty, so the guest sees all of its memory. When the node
+runs short, the [`reclaim` pressure step](resource-enforcement.md#sandboxes-and-the-balloon)
+inflates it by the bytes the guest uses above its reservation (never further),
+and deflates it once the pressure clears. `deflate_on_oom` lets the guest take
+memory back before its own OOM killer would act. The balloon's bounds are
+recorded beside the VMM socket at boot (`balloon.json`), and again after a
+memory restore, since the device rides the snapshot.
 
 ## Current Scope and Limitations
 
@@ -365,5 +634,33 @@ one sandbox into many. Every sandbox boots from scratch.
   script. Scratch and distroless images do not work yet.
 - The guest's exit status is reported on the console, not as the VMM's exit
   code. Restart policies see the VMM exit, and health checks work as usual.
+- **Memory checkpoints of gated sandboxes are refused.** The guest's vsock
+  socket path is part of its saved state. A task that declares
+  `network.mode = "gated"` and a `snapshots` block without `memory = false`,
+  or a `suspend` block without `checkpoint = "disk"`, fails job validation
+  with that reason and a hint. When gating comes from a
+  stored policy, the sandbox launches without checkpoint support, and
+  `legion snapshot create --memory` fails with the same reason.
+- **Running processes keep their old environment after a restore.** The
+  resume handler refreshes the hostname, RNG, clock, and the identity files,
+  but a process's env is fixed at exec. Read the new token from
+  `/legion/identity/<ENV>` or `/legion/resume.env`, or restart the process
+  from `suspend.onResume`.
+- **The resume handler is the worker's binary.** A guest whose libc cannot
+  run it (a musl image with a glibc worker build, for example) restores
+  without refreshing its identity, and init says so on the console.
+- **A TAP device is restored by name.** Both VMMs reopen the TAP device
+  name recorded in the saved state. Before a restore the worker checks that
+  the task still names the same device, uses it when it exists and is free,
+  and creates it when it is missing (removing it again on destroy). A busy
+  device, a different one, or a failed create fails the restore with
+  `restore needs TAP device <name>: ...`, never a guest without its network.
+  A [fork](suspend-and-resume.md#networking-for-forks), or an instance
+  created from a snapshot, is the exception: it cannot share the origin's
+  TAP, so it gets its own (`lgf...`), on the origin TAP's bridge. On
+  Firecracker that needs version 1.12 or later.
+- **Restore holds a node-wide lock** for the few milliseconds between
+  repointing device links and the VMM opening them, so concurrent restores
+  that share a checkpoint are serialized.
 - zstd-compressed image layers are rejected. Gzip and uncompressed layers work.
   This comes from the shared layer extraction code.

@@ -206,9 +206,36 @@ fn resource_enforcement(&self) -> ResourceEnforcement {
 - **`WorkerCgroup`**: for a runtime whose task is a host process you spawn.
   Worker core creates the cgroup and writes its limits, and you spawn into it.
 - **`RuntimeApplied`**: for a runtime that confines its own workload. The
-  `container` runtime writes the assignment into the generated OCI spec. A
-  microVM runtime would pin vCPU threads and size the guest. Worker core
-  computes and accounts, but touches no cgroup file for that task.
+  `container` runtime writes the assignment into the generated OCI spec.
+  Worker core computes and accounts, but touches no cgroup file for that task.
+
+The built-in `sandbox` runtime uses `WorkerCgroup`: its VMM is a host process,
+so it joins the cgroup like `exec` does.
+
+If your process holds more than the workload (a VMM holds guest RAM plus its
+own memory), override the ceiling worker core writes:
+
+```rust
+fn enforced_memory_limit_bytes(&self, task: &TaskConfig) -> Option<u64> {
+    None // the default: `resources.memoryMax`, else `resources.memory`, is the ceiling
+}
+```
+
+`sandbox` returns the guest size plus the worker's `sandbox.vmmOverheadMiB`.
+
+If your runtime's own config also sizes the workload, say so at submit:
+
+```rust
+fn check_resources(&self, task: &TaskConfig) -> R<Vec<String>> {
+    Ok(Vec::new()) // the default: nothing to add
+}
+```
+
+An `Err` rejects the job, and each returned string is a warning on the
+`job run` reply. `sandbox` uses it to warn when `config.memory_mib`
+disagrees with the guest size `resources` imply.
+Every governed task, whatever its mode, is also measured and reported as
+usage ([resource-enforcement.md](resource-enforcement.md#measuring-usage)).
 
 To choose between the last two, ask whether your task runs as a host process
 the worker can spawn into a cgroup.
@@ -225,8 +252,10 @@ pub struct ResourceAssignment {
     pub cores: Option<Vec<u32>>,
     /// Proportional weight as an OCI `cpu.shares` value (shares == declared MHz).
     pub cpu_weight: Option<u64>,
-    /// Hard memory ceiling from declared `memory` (MiB).
+    /// Hard memory ceiling: declared `memoryMax`, else `memory` (MiB).
     pub memory_limit_bytes: Option<u64>,
+    /// Protected memory (`memory.low`): the declared `memory` reservation.
+    pub memory_low_bytes: Option<u64>,
 }
 ```
 
