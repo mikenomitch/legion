@@ -462,6 +462,21 @@ listener ([Worker](#worker)):
   node's capture backlog exceeded one interval. Any steady rate means the
   node cannot capture its sessions that often: lengthen the interval or
   run fewer sessions per node.
+- **`legion_session_superseded_total{via}`** (counter): copies of
+  `suspend.durability = "store"` sessions this node ended because a newer
+  generation of the session runs elsewhere, by how it learned: `write` (its
+  own conditional manifest write failed), `fence_list` (a fence marker a
+  move left), `resume` (a resume found the manifest moved on), or
+  `reconnect` (a self-fenced session the content store no longer names
+  this node for). Each is a split brain that converged
+  ([No split brain](session-mode.md#no-split-brain)); a steady rate means
+  sessions are being moved while their old node still runs them, usually
+  forced moves or a partition.
+- **`legion_session_moves_total`** (counter): `store` sessions this node
+  resumed from their manifest after they ran or slept on another node.
+- **`legion_session_self_fenced_total`** (counter): running `store`
+  sessions this node suspended because it reached neither a manager nor
+  its content store for `stateful.fenceAfter`.
 
 ### Heartbeat cadence
 

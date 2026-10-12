@@ -148,14 +148,14 @@ it.
 | Guarantee | `keyed` | `session` |
 | --- | --- | --- |
 | Durable record | A raft row from create on; a named id keeps a tombstone after destroy | None while running: the node holds it, and the managers' index lists it |
-| Node loss while running | Rescheduled elsewhere, bound to its storage | Lost. A running session is not rescheduled |
+| Node loss while running | Rescheduled elsewhere, bound to its storage | Lost, unless its task sets `suspend.durability = "store"`: then `instance start` resumes it on another node from its last published checkpoint ([Moving a session](#moving-a-session)) |
 | Worker restart | The allocation is re-adopted | Running sessions are re-adopted from the node's session log ([Worker restarts](#worker-restarts)); one whose process died meanwhile ends, unless `suspend.onWorkerStop = "checkpoint"` left a checkpoint to restore it from ([Idle sessions](#idle-sessions)) |
 | At most one live copy | Exact | Converges to one: a retried idempotent create can briefly run on two nodes ([Duplicates](#duplicates)) |
 | Who starts it | A manager, through raft | A manager's router, or the node itself on a session ticket ([Starting at the edge](#starting-at-the-edge)) |
 | Ids never recycled | Exact for the job's life | Probabilistic: 130 random bits, no tombstone |
 | `instance list` | An exact read | From the session index, with `complete` and `asOf` ([Listing](#listing-sessions)) |
 | Idempotent create | A replicated record | A derived id: a retry gets the same id, with no record |
-| Suspend and resume | Yes, with a published or local checkpoint | On the same node only, with `suspend.durability = "local"` ([Idle sessions](#idle-sessions)) |
+| Suspend and resume | Yes, with a published or local checkpoint | On its node with `durability = "local"`; on any node with an envelope with `durability = "store"` ([Idle sessions](#idle-sessions)) |
 | Fork, snapshot | Yes | No. Promote first |
 | Events | The replicated journal | None per session. `instance.promoted` is journaled, and counters cover starts and stops |
 | Capacity | Reserved per instance at placement | Reserved per node as envelopes, whether or not sessions fill them |
@@ -187,6 +187,7 @@ resources = { cpu = 500, memory = 512 },
 | `stateful.envelope.resources` | required | What each node keeps for this task's sessions. Must set `cpu` and `memory`, and every amount the session's own `resources` declares. Sessions are admitted against exactly these keys |
 | `stateful.envelope.constraints` | none | Extra placement constraints for the envelopes, added to the task's own `constraints` |
 | `stateful.promote.onName` | `true` | Whether a caller-chosen id is accepted: `instance create --id` (a keyed instance from birth) and `instance promote --id` (a rename). With `false`, a create always starts an unnamed session and a promotion keeps the session's id |
+| `stateful.fenceAfter` | `"2m"` | Session tasks with `suspend.durability = "store"` only. A node that reaches neither a manager nor its content store for this long suspends its running sessions of the task on its own disk, so a copy cut off from the cluster stops serving before a moved copy can start ([No split brain](#no-split-brain)). At least 10 seconds |
 | `resources` | | One session's size, in the envelope's units |
 
 `job validate` refuses, each with a hint:
@@ -203,6 +204,9 @@ resources = { cpu = 500, memory = 512 },
 - `speculativeStart`: a session already starts without a raft write.
 - `suspend` with a `reserve`: a session's room is its envelope share, and
   a suspended session holds none of it.
+- `stateful.fenceAfter` on a task that is not a session task, on a session
+  task without `suspend.durability = "store"`, shorter than 10 seconds, or
+  not a duration.
 - `suspend.keepFor`, `suspend.checkpointEvery`, or `suspend.onWorkerStop`
   on a task that is not a session task, `keepFor` or `checkpointEvery`
   shorter than 60 seconds, and `checkpointEvery` on a task whose
@@ -289,6 +293,11 @@ manager that ended the session within the last ten minutes answers
 `legion instance start <ID>` on a running session answers
 `Instance <id> already running`, as it does for a live keyed instance. On
 a suspended one it resumes it ([Idle sessions](#idle-sessions)).
+
+Ending a `store` session also deletes its manifest from the content store,
+when the manifest still names the ending node at the session's generation.
+A copy that ended because it was stale (superseded, fenced, or a duplicate)
+leaves the manifest to the copy that won.
 
 Sessions also end when:
 
@@ -434,6 +443,20 @@ went to.
 | `FAILED_PRECONDITION` "no envelope" | This node holds no envelope for the task (yet) |
 | `RESOURCE_EXHAUSTED` | The envelope is full, or no launch slot freed within `edgeBoot.queueTimeout`. Retry on the next node |
 | `NOT_FOUND` `wrong_node:` | `get`/`stop` reached a node the id's tag does not name |
+| `ALREADY_EXISTS` "already runs on node N" | An idempotent start of a `store` session that another node created first. The message ends in `[winner node=<id> generation=<g>]`: send the session's requests there |
+
+**`store` sessions at the edge.** For a task with
+`suspend.durability = "store"`, an idempotent edge start creates the
+session's manifest in the node's `contentStore` before the session's gate
+opens, with a conditional create (`If-None-Match: *`). A retry that lands
+on another node therefore does not start a second copy: it answers
+`ALREADY_EXISTS` naming the node that won. A minted id cannot collide, so a
+start without a key writes nothing until the session's first checkpoint.
+
+`legion session start --resume-id <ID>` (`StartSession.resume_id`) resumes
+an existing `store` session on the node it is sent to, from its manifest
+([Moving a session](#moving-a-session)). The reply adds `resumedFrom`,
+`generation`, and `movedFrom`.
 
 ## Promotion
 
@@ -490,7 +513,7 @@ pays a raft row to survive its node).
 
 ```nickel
 suspend = {
-  durability = "local",          # the only durability a session accepts today
+  durability = "local",          # or "store": publish to the contentStore
   idle = { after = "5m" },       # suspend after 5 minutes of no activity
   keepFor = "24h",               # how long the checkpoint is kept
   checkpointEvery = "10m",       # optional; memory checkpoints only
@@ -500,11 +523,15 @@ suspend = {
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `suspend.durability` | `"local"` | Where the checkpoint lives. A session keeps it on its node. `"store"` is accepted by `job validate` but not served for sessions yet: a node refuses to suspend such a session with `FAILED_PRECONDITION` |
+| `suspend.durability` | `"local"` | Where the checkpoint lives. `"local"` keeps it on the session's node. `"store"` also publishes it, sealed, to the node's `contentStore`, so the session can resume on any node with an envelope for the task ([Moving a session](#moving-a-session)). A node without a `contentStore` refuses to suspend a `store` session with `FAILED_PRECONDITION` |
 | `suspend.idle.after` | none | Suspend the session after this long with no activity, measured by the node as for keyed instances ([idle policy](suspend-and-resume.md#idle-policy)) |
 | `suspend.keepFor` | `"24h"` | How long a suspended session's checkpoint is kept before it is evicted. At least 60 seconds |
 | `suspend.checkpointEvery` | off | Take a live checkpoint of a running session this often, replacing the previous one. At least 60 seconds; memory checkpoints only |
 | `suspend.onWorkerStop` | `"keep"` | What the worker does to running sessions when it is stopped: `"keep"` leaves them running untouched, `"checkpoint"` checkpoints each one first (they keep running) |
+
+With `durability = "store"`, every checkpoint of the session (a suspend, a
+`checkpointEvery` checkpoint, an `onWorkerStop` checkpoint) is published and
+recorded in the session's manifest ([Session manifests](#session-manifests)).
 
 **Suspending.** `legion instance suspend <ID>` (`SuspendInstance`) on a
 session routes, by the node tag in the id, to that node
@@ -529,7 +556,9 @@ of the same spec under the same id.
 | `RESOURCE_EXHAUSTED` (retryable) | The envelope has no room for the session right now. It stays suspended with its checkpoint; retry when another session ends or suspends |
 | `NOT_FOUND` "session X was evicted from NODE at TIME (reason); a local-only session cannot be restored" | The checkpoint was evicted. The hint suggests starting a new session, or `durability = "store"` once sessions support it. The node gives this answer for another `keepFor` after the eviction, then forgets the id |
 | `UNAVAILABLE` "node NODE holds session X and ..." | The node the id names does not answer and no manager's index lists the session. A local session lives only on its node: retry when the node is back. The message says what the cluster last knew of the node |
-| `FAILED_PRECONDITION` | The task has no `suspend` block (promote the session first), or sets `durability = "store"` |
+| `FAILED_PRECONDITION` | The task has no `suspend` block (promote the session first), or sets `durability = "store"` on a node with no `contentStore` |
+| `ABORTED` `superseded:` | A `store` session's manifest names a newer generation on another node: this node's copy was stale and has ended. The message names the winner |
+| `UNAVAILABLE` "the content store ... could not be reached" | A `store` session's resume could not claim its generation. Nothing started; retry |
 | `ABORTED` | Another capture or resume of the session is in progress |
 
 `instance get` on an evicted session, or on one whose node is silent, gives
@@ -586,18 +615,160 @@ from that checkpoint, or from its latest periodic one, under the same id.
 A session with no checkpoint, or with `onWorkerStop = "keep"`, ends as
 before. Sessions the timeout did not reach are logged as left.
 
-**What is not covered.** A suspended session lives on one node. Losing the
-node, or its disk, loses the session: there is no copy elsewhere and no
-other node can resume it. Sessions that must survive their node should be
-promoted.
+**What is not covered.** A `local` suspended session lives on one node.
+Losing the node, or its disk, loses the session: there is no copy
+elsewhere and no other node can resume it. Use `durability = "store"` for
+sessions that must survive their node, or promote them.
 
 | Not available for sessions | Instead |
 | --- | --- |
-| `suspend.durability = "store"` (a published checkpoint another node can resume) | Promote the session, then suspend it |
-| Resuming on another node | Promote first |
 | `suspend.reserve` | Size the envelope for the sessions you want running |
 | `checkpointEvery` with a disk checkpoint (`exec`) | `onWorkerStop = "checkpoint"` alone, or the sandbox runtime |
 | Wake on traffic (`suspend.wake`) | `instance start` from the caller |
+
+## Moving a session
+
+A session whose task sets `suspend.durability = "store"` is not tied to its
+node. `legion instance start <ID>` first asks the node the id's tag names.
+When that node no longer holds the session (it dropped its published local
+copy, or was replaced), is full, or does not answer, the manager resumes
+the session from its manifest on another node with room, in the router's
+order:
+
+```console
+$ legion instance start workspace-q4n7c2rd.01jbx... -j
+{"ok":true,"data":{"message":"Instance workspace-q4n7c2rd.01jbx... moved from w-17
+  and resumed on w-18 (generation 3)","nodeId":"w-18","resumingFrom":"store"}}
+```
+
+The new node admits the session into its envelope, claims the next
+generation in the manifest, leaves a fence marker for the old node, and
+restores the session from the published checkpoint (fetching any part it
+does not have, and opening it with the job's session sealing key). The id
+keeps its original node tag, so a later request asks that node first, gets
+`not_found`, and is answered from the manifest and the managers' index.
+
+**Moving is cautious for running sessions.** When the manifest says the
+session is *running* on another node, the receiving node refuses with
+`running_elsewhere`, and the manager probes that node itself
+(`Worker.GetSession`, 2 seconds):
+
+- it runs the session there: the answer is `Instance <id> already running
+  on <node>`;
+- it answers without the session: the move goes ahead;
+- it does not answer: the move goes ahead only when the managers have
+  marked that node `down` or `lost`. Otherwise the answer is `UNAVAILABLE`
+  `running_elsewhere`, naming the node. Pass `--force-move`
+  (`StartInstance.force_move`) to move anyway once you know the node is
+  gone; until it is fenced the old copy may still run.
+
+A suspended session moves at once. A move writes nothing to raft.
+
+**At the edge.** `legion session start <JOB> --task T --node <ADDR>
+--ticket "$T" --resume-id <ID>` (`StartSession.resume_id`) moves a session
+to the node the request is sent to. The node probes the node the manifest
+names with the same ticket (`GetSession`, 2 seconds): when the session
+runs there, it claims the next generation, asks that node to stop its copy
+(`StopSession`), and launches. When that node does not answer, it refuses
+`UNAVAILABLE` unless the request sets `--force-move`; a picker sets it when
+`legion session nodes` lists the old node as `down` or `lost`. A
+`StartSession` that resumes answers with `resumedFrom = "store"` (or
+`"cold"`), the `generation` it claimed, and `movedFrom`.
+
+## Session manifests
+
+A `store` session's record lives beside its checkpoints in the worker's
+`contentStore`, one JSON object per session:
+
+```
+<contentStore.url>/sessions/<job>/<id-prefix>/<id>.json
+```
+
+`<id-prefix>` is the first two characters of the id's random part, so a
+job's manifests spread over many prefixes. A manifest holds the session's
+job, job config, task, `generation`, the `node` and node address that hold
+it, its `state` (`running` or `suspended`), its first lease, its resources,
+and its latest published checkpoint (the snapshot manifest, every part with
+its `url` and sealing `keyId`).
+
+- **Sealing.** Every published part is sealed (AES-256-GCM). A store
+  session's envelope payload carries the job's session sealing key, derived
+  by the manager from the cluster's checkpoint key for that job, and the
+  node derives each part's key from it. Any node with an envelope of the
+  job can open the job's session checkpoints, and no other job's. The key
+  is never written to disk or logged.
+- **Status.** `SessionStatus.checkpoint` (in `instance get`) reports the
+  session's checkpoint: its `durability`, snapshot id, kind, size, when it
+  was taken, and, once published, `publishedUrl`, the manifest's URL.
+- **After publishing,** the node's local copy of the parts is an ordinary
+  cache entry: content-store pressure can evict it, and a suspended
+  session whose local copy is evicted is dropped from the node quietly (no
+  `evicted` answer), so the next start resumes it from the manifest.
+- **When the content store is unreachable,** a suspend still suspends the
+  session on its node; the publish is retried every few seconds, and
+  `publishedUrl` stays empty until it lands. A resume needs the store (it
+  must claim its generation) and answers `UNAVAILABLE` until it is back.
+- **Ending** the session deletes the manifest (see [Ending
+  sessions](#ending-sessions)). A manifest of a session that is suspended
+  forever stays until the job's sessions are ended; use a bucket lifecycle
+  rule for anything older than you care to keep.
+
+Writes are conditional: a manifest is created with `If-None-Match: *` and
+updated with `If-Match` on the ETag it was read at. On `s3://` this needs a
+store that supports conditional writes (AWS S3, MinIO, R2); on `file://`
+the node takes a lock file beside the manifest and compares a content hash.
+
+## No split brain
+
+A `store` session can run on one node at a time even across partitions:
+every resume claims a new **generation** before its gate opens, and four
+mechanisms stop an older copy.
+
+1. **Superseded on write.** Every manifest write a copy makes (a periodic
+   checkpoint, a suspend, an `onWorkerStop` checkpoint) checks that the
+   manifest still names its node at its generation. A copy that finds a
+   newer generation ends itself with reason `superseded`.
+2. **Fence list.** A move leaves `sessions/fence/<old-node>/<id>` in the
+   content store. Every node lists its own fence prefix every
+   `sessions.fenceListEvery` (worker config, default `30s`), stops each
+   session at or below the fenced generation, and deletes the marker.
+3. **Probe before move.** A running session moves only after its old node
+   answered that it stopped (or does not have it), or after that node is
+   marked down or lost, or with `force_move` ([Moving a
+   session](#moving-a-session)).
+4. **Self-fencing.** A node that has reached neither a manager nor its
+   content store for `stateful.fenceAfter` (default `2m`) suspends its
+   running `store` sessions on its own disk, without publishing. When the
+   content store answers again it resumes, claiming the next generation,
+   only the ones whose manifest still names it, and ends the rest (they
+   moved meanwhile). Set `stateful.fenceAfter` shorter than the time after
+   which you would force a move.
+
+Every claim is a conditional write, so of two racing resumes exactly one
+wins; the other answers `ABORTED` naming the winner:
+`superseded: another resume claimed the session first; generation 3 runs
+on node w-18 [winner node=w-18 generation=3]`. The bracketed tail is
+stable for programs to parse.
+
+The worker config's `sessions` block:
+
+```nickel
+sessions = {
+  fenceListEvery = "30s",   # one LIST of this node's fence prefix per interval
+},
+```
+
+Counters: `legion_session_superseded_total{via}` (copies ended because a
+newer generation runs elsewhere; `via` is `write`, `fence_list`, `resume`,
+or `reconnect`), `legion_session_moves_total`, and
+`legion_session_self_fenced_total` ([metrics](metrics.md#sessions)).
+
+**What this does not cover.** Between a forced move and the old node's
+next manifest write or fence listing, two copies can run; mechanism 4
+bounds that for a node that is cut off. A periodic checkpoint is the
+newest state a move restores: work since then is lost. A session on the
+`exec` runtime has a disk checkpoint, which holds only its spec, so it
+moves as a fresh start under the same id.
 
 ## Duplicates
 
@@ -670,12 +841,20 @@ on it and no session is sent to it. See [upgrades](upgrades.md).
 
 ## Limitations
 
-- **Unnamed sessions cannot be forked or snapshotted,** and suspend only
-  to their own node's disk ([Idle sessions](#idle-sessions)). Promote one
-  for the rest. Idle sessions kept only as bucket manifests are not
-  available.
-- **A suspended session dies with its node.** Its checkpoint is on that
-  node only, until `keepFor` or disk pressure evicts it.
+- **Unnamed sessions cannot be forked or snapshotted.** Promote one for
+  that.
+- **A `local` suspended session dies with its node.** Its checkpoint is on
+  that node only, until `keepFor` or disk pressure evicts it. A `store`
+  session survives it, from its last published checkpoint.
+- **Moving needs a content store with conditional writes** (`If-Match`,
+  `If-None-Match`) on every node of the job, all pointing at the same
+  bucket. A node with another `contentStore` cannot see the session.
+- **A forced move can briefly leave two copies** until the old node's next
+  manifest write, fence listing (`sessions.fenceListEvery`), or self-fence
+  (`stateful.fenceAfter`) stops it.
+- **Manifests of sessions that never end stay in the bucket.** A suspended
+  `store` session past `keepFor` is dropped from its node but its manifest
+  is kept, so it can still resume; clean up with a bucket lifecycle rule.
 - **Idle detection needs resource enforcement** (cgroups) on the node, as
   for keyed instances. Without it, `idle.after` never fires; `instance
   suspend` still works.

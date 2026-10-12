@@ -75,6 +75,17 @@
     #     # object from KV, the same shape artifact auth.kv takes:
     #     # auth = { kv = "legion/content-store" },
     # },
+    # Sessions (docs/session-mode.md, "No split brain"). Only acts on
+    # sessions whose task sets suspend.durability = "store", which need a
+    # contentStore: their manifests live at
+    # <contentStore.url>/sessions/<job>/<id-prefix>/<id>.json.
+    sessions = {
+        # How often this node lists <contentStore.url>/sessions/fence/<node>/
+        # for markers a move left (a session that moved away from this node
+        # while it could not be told) and stops those copies. One LIST per
+        # interval. At least 1s.
+        fenceListEvery = "30s",
+    },
     # Turn a task's declared `resources` into real kernel limits
     # (docs/resource-enforcement.md). On by default: memory pressure,
     # oversubscription, memoryMax, usage reports, and sandbox confinement

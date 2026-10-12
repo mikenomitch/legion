@@ -387,6 +387,18 @@ $ legion boot-ticket create agents --task workspace --pool agents \
   what the platform's own picker can already do. Keep TTLs to what a
   picker needs between refreshes, and mint a ticket per picker.
 - `legion boot-ticket list` shows `scope = session` for these tickets.
+- For a session task with `suspend.durability = "store"`, the same ticket
+  moves a session: `StartSession` with `resume_id` (`legion session start
+  --resume-id <ID>`) resumes it on the node it is sent to from its
+  manifest in the content store. When the manifest says the session runs
+  on another node, the receiving node probes that node with the ticket
+  (`GetSession`, 2 seconds), asks it to stop its copy (`StopSession`), and
+  refuses `UNAVAILABLE` if it does not answer, unless `force_move` is set.
+  The ticket must cover the session's job and task. See
+  [Moving a session](session-mode.md#moving-a-session).
+- An idempotent edge start of a `store` session creates its manifest
+  before its gate opens; a second node that derived the same id answers
+  `ALREADY_EXISTS` naming the first, instead of starting a duplicate.
 
 ### The spec cache
 
