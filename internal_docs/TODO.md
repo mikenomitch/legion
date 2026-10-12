@@ -326,6 +326,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#35](https://github.com/mikenomitch/legion/pull/35) | Session durability and routing plan (docs only): worker-restart survival, node tag in session ids, sleeping on the node; raft directory deferred | Needs #30; [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#25](https://github.com/mikenomitch/legion/pull/25) | Scheduler sharding strategies proposal, revision 3 (docs only) | Ready for review; [plan](plans/scheduler-sharding-strategies-proposal.md) · [calls](calls/scheduler-sharding-strategies-proposal_calls.md) |
 | [#31](https://github.com/mikenomitch/legion/pull/31) | Wake on request (`legion start gateway`, `suspend.wake`), credential injection on egress (`connect.upstreams[].credentials`, KV and identity providers), ingress into gated and TAP sandboxes, and upstreams in gated sandboxes | [wake plan](plans/wake-on-request-plan.md) · [credential plan](plans/egress-credential-injection-plan.md) · [gated plan](plans/gated-sandbox-checkpoints-plan.md) Phase 5; KVM checks G5.1 and G5.2 pending |
 | [#28](https://github.com/mikenomitch/legion/pull/28) | Streaming persistence: one credential path for replica, takeover restore and lease (platform identity by default, keys in `persistence.streaming.credentials`), boot checks, and the object-storage lease that could never be acquired on real S3 | Breaking: lease keys and `LITESTREAM_*` key vars removed; [plan](plans/manager-workload-identity-plan.md) · [calls](calls/manager-workload-identity-plan_calls.md) |
@@ -2775,7 +2776,8 @@ Plan: [artifact-system-plan.md](plans/artifact-system-plan.md) · docs: [artifac
 Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.md), [volume-plugin-system](plans/volume-plugin-system-plan.md) · docs: [volumes.md](../docs/volumes.md), [stateful-workloads.md](../docs/stateful-workloads.md)
 
 - [ ] **Session durability and routing back** (needs session mode from
-      [#30](https://github.com/mikenomitch/legion/pull/30)). A worker
+      [#30](https://github.com/mikenomitch/legion/pull/30); plan in
+      [#35](https://github.com/mikenomitch/legion/pull/35)). A worker
       restart ends every unpromoted session, a session cannot sleep, and
       finding one fans out to every manager. Plan:
       [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md)
