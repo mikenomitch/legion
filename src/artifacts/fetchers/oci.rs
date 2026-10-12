@@ -162,6 +162,14 @@ async fn pull_blob_to_file(
         .pull_blob(reference, descriptor, &mut file)
         .await
         .with_context(|| format!("pull blob {}", descriptor.digest))?;
+    // A tokio file hands its last write to the blocking pool and returns;
+    // dropping it unflushed lets the caller read the path before the bytes
+    // land. The caller hard-links the blob into the node content store at
+    // once, which then hashed an empty or partial file, refused it, and the
+    // next start downloaded the layer again.
+    tokio::io::AsyncWriteExt::flush(&mut file)
+        .await
+        .with_context(|| format!("write blob file {}", path.display()))?;
     Ok(())
 }
 
