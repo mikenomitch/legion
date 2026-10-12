@@ -911,14 +911,14 @@ the publish is reported failed and retried like any failed upload, and the
 instance stays an ordinary suspended instance with a `local` checkpoint.
 
 An archived instance is still `suspended`. `instance get` says so, with
-`archived: true` and the `manifest_url`. `instance list` shows the checkpoint
+`archived: true` and the `manifestUrl`. `instance list` shows the checkpoint
 as `(archived)`:
 
 ```console
 $ legion instance get user-42 -j
-{"ok":true,"data":{"instance":{"instance_id":"user-42","state":"suspended",
- "checkpoint_id":"snap-5b10e2c7a9d04f31","archived":true,
- "manifest_url":"s3://legion-content-usw2/manifests/workspaces/main/workspace/user-42.json", ...}}}
+{"ok":true,"data":{"instance":{"instanceId":"user-42","state":"suspended",
+ "checkpointId":"snap-5b10e2c7a9d04f31","archived":true,
+ "manifestUrl":"s3://legion-content-usw2/manifests/workspaces/main/workspace/user-42.json", ...}}}
 ```
 
 #### Resuming an archived instance

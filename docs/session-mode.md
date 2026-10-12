@@ -44,7 +44,7 @@ $ legion instance create agents --idempotency-key req-81 -j
 
 $ legion instance list agents -j
 {"ok":true,"data":{"instances":[...],"complete":true,
- "asOf":"2026-11-02T18:04:11.204Z","nextIdlePageToken":""}}
+ "asOf":"2026-11-02T18:04:11Z","nextIdlePageToken":""}}
 
 $ legion instance promote workspace-7k2qd9x4m1b8c3rj5t0v6wye2h --id user-42 -j
 {"ok":true,"data":{"instanceId":"user-42",
