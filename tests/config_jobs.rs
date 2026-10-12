@@ -275,7 +275,13 @@ fn maximal_job_spec_parse() {
         injected.on_delete,
         Some(legion::structs::KvInjectionAction::Fail)
     );
-    for task in &config.tasks {
+    // Every task the author wrote sets every field; the envelope task Legion
+    // generates for a session task is not written by anyone.
+    for task in config
+        .tasks
+        .iter()
+        .filter(|task| legion::structs::session::envelope_serves(task).is_none())
+    {
         assert!(!task.name.is_empty(), "task name should be set");
         assert!(
             value_is_non_empty(&task.config),

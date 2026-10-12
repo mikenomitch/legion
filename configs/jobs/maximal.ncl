@@ -817,8 +817,14 @@
                 cpu = 250,
                 memory = 256,
             },
+            # The task's constraints and affinities place its envelopes
+            # (the generated `scratch-envelope` task inherits both, plus
+            # envelope.constraints above).
             constraints = {
                 os = "linux",
+            },
+            affinities = {
+                node_class = "sandbox",
             },
         },
         {
