@@ -339,28 +339,34 @@ management registration still mints and rotates.
   the caller already proved possession, and an attacker holding the token can
   rotate it too.
 
-## 10. Job status is derived at read time; the stored column is untouched
+## 10. Job status: main's derivation replaces this branch's at merge
 
-*Workstream: Scheduler.*
+*Workstream: Scheduler. Revised when main was merged in.*
 
-`GetJobInfo`/`ListJobs` replace the stored `done` with `running` / `pending` /
-`complete` / `failed` computed from live allocations and the latest config's
-task statuses (`Store::derived_job_statuses`, `Store::resolve_job_statuses`).
-`stopped` and `failed` pass through. The `job.status` column still holds
-`done`/`stopped`/`failed`.
+This branch first derived `running` / `pending` / `complete` / `failed` from
+live allocations and task statuses at read time
+(`Store::derived_job_statuses`), leaving the stored `done` untouched. While
+the work was in flight, main shipped its own read-time derivation
+([job-status-plan.md](../plans/job-status-plan.md), #21): the stored `done`
+became `active`, and the derived set adds `scheduled`, `suspended`, and
+`idle`. At merge, main's `job_status_ops` won and this branch's derivation
+was deleted. What the branch keeps is the `RunJob` change: an unchanged spec
+starts a stopped, failed, or idle job again.
 
-- **Alternative:** maintain a real status column (write `running`/`pending`/
-  `complete` from every placement, removal, and terminal report), or rename
-  the stored `done` to `active`.
-- **Trade-off:** two meanings of "status": `legion state query` shows the
-  stored flag, the API the derived value. A `ListJobs` call pays a few
-  correlated subqueries per active job.
-- **Why:** simplicity and correctness. The status moves on events from three
-  raft lanes (scheduler: allocations, status: task statuses, control: the job
-  row); a stored column would need a cross-lane write on every allocation
-  change and could drift. Deriving reads one consistent snapshot. Renaming
-  the stored value would have broken every existing comparison (`!= "stopped"`
-  checks, KV recovery tests) for no user-visible gain.
+```console
+$ legion job run nightly.ncl
+Job config unchanged; job was not running, starting it again
+```
+
+- **Alternative:** keep this branch's derivation and drop main's, or run both
+  (one for the API, one for the UI).
+- **Trade-off:** the branch's tests and docs that named the stored `done`
+  were rewritten to main's `active`. Users see no difference beyond what
+  main already shipped: both derivations put the lifecycle flag first, then
+  live allocations, then task outcomes.
+- **Why:** simplicity. One status vocabulary on every surface, and main's
+  covers cron and keyed jobs this branch's did not. Two derivations would
+  disagree on exactly the jobs an on-call responder looks at.
 
 ## 11. A failed exit carries the task's last stderr lines into its status, failure reason and event
 
