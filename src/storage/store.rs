@@ -21,6 +21,8 @@ mod read_model_check;
 mod fork_ops;
 mod snapshot_ops;
 mod suspend_ops;
+// The job status GetJobInfo/ListJobs report, derived from the workload.
+mod job_status_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -28,6 +30,7 @@ use crate::storage::persistence::{
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
+pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
 pub use snapshot_ops::{
     DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
@@ -25197,6 +25200,73 @@ mod tests {
                 .status,
             "failed"
         );
+
+        Ok(())
+    }
+
+    /// The status GetJobInfo/ListJobs report follows the workload: a service
+    /// with a placed allocation is `running`, a batch job reads `pending`
+    /// until placed, `running` while its process runs, and `complete` once
+    /// it exits 0. The stored lifecycle column stays `active` throughout.
+    #[test]
+    fn derived_job_status_follows_the_workload_test() -> R<()> {
+        let store = setup_store()?;
+        let mut node = make_node_msg("node-a", "ready");
+        node.dynamic_attrs = json!({ "protocolVersion": 2 }).to_string();
+        store.insert_node(node)?;
+        let submit = |name: &str, lifecycle: TaskLifecycle| -> R<String> {
+            let job = JobConfig {
+                priority: Default::default(),
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: name.into(),
+                tasks: vec![TaskConfig {
+                    lifecycle,
+                    ..TaskConfig::new("main", "exec")
+                }],
+                version: None,
+            };
+            store.handle_job_submit(
+                &job,
+                &[Submission {
+                    path: "job.ncl".into(),
+                    content: name.into(),
+                    is_primary: true,
+                }],
+            )?;
+            Ok(store.get_job_config(name)?.id())
+        };
+        let status = |name: &str| -> R<String> { Ok(store.get_job_with_status(name)?.status) };
+
+        let web_config = submit("web", TaskLifecycle::Service)?;
+        let batch_config = submit("nightly", TaskLifecycle::Batch)?;
+        assert_eq!(status("web")?, "pending");
+        assert_eq!(status("nightly")?, "pending");
+
+        let scheduler = Scheduler::new(&store)?;
+        let web = scheduler.plan_and_apply(&web_config, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&web.allocations)?;
+        let batch = scheduler.plan_and_apply(&batch_config, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&batch.allocations)?;
+        assert_eq!(status("web")?, "running");
+        assert_eq!(status("nightly")?, "running");
+
+        store.complete_allocation(batch.allocations[0].id, true)?;
+        assert_eq!(status("nightly")?, "complete");
+        assert_eq!(status("web")?, "running");
+        assert_eq!(store.get_job("nightly")?.status, "active");
+
+        // The list read derives the same answer in one pass.
+        let listed: HashMap<String, String> = store
+            .get_jobs_with_status()?
+            .into_iter()
+            .map(|job| (job.name, job.status))
+            .collect();
+        assert_eq!(listed.get("web").map(String::as_str), Some("running"));
+        assert_eq!(listed.get("nightly").map(String::as_str), Some("complete"));
+
+        store.stop_job("web")?;
+        assert_eq!(status("web")?, "stopped");
 
         Ok(())
     }

@@ -3751,7 +3751,7 @@ impl Manager for ManagerDaemonService {
 
         let job = self
             .store
-            .get_job(&name)
+            .get_job_with_status(&name)
             .map_err(|e| map_store_error("Error getting job", e))?;
         let template = self
             .store
@@ -4466,9 +4466,12 @@ impl Manager for ManagerDaemonService {
             .eq_ignore_ascii_case("desc");
         let (page, page_size) = parse_page(request.page, request.page_size);
 
+        // `status` is derived from each job's workload (running, pending,
+        // complete, ...), so the query, filter, counts, and sort below all
+        // see what a reader sees.
         let mut jobs = self
             .store
-            .get_jobs()
+            .get_jobs_with_status()
             .map_err(|e| map_store_error("Error getting jobs", e))?;
         // Provenance feeds the `templates` rule selector so template-scoped
         // identities see the jobs their templates created. One batch query
@@ -11615,6 +11618,9 @@ mod tests {
             .into_inner();
         assert_eq!(all.total_count, 3);
         assert_eq!(all.status_counts.get("stopped"), Some(&1));
+        // The status is derived from the workload: nothing is placed, so the
+        // two live jobs read `pending`, not the stored lifecycle `active`.
+        assert_eq!(all.status_counts.get("pending"), Some(&2));
         assert_eq!(all.status_counts.values().sum::<u32>(), 3);
 
         let stopped = manager

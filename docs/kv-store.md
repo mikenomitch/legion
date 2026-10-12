@@ -309,7 +309,7 @@ Recovery paths:
 
 - Put the missing key back. The put resolves through the edge's `onChange`.
   A `restart` or `rollout` action re-renders the config, clears the
-  `failed:missing_kv_dependency` stamps, flips the job status back to `active`,
+  `failed:missing_kv_dependency` stamps, clears the job's `failed` status,
   and replaces the failed allocations.
 - `onChange = "none"` doesn't recover on its own. A put re-renders and stores
   the desired config but schedules nothing, so the job stays `failed` with its
@@ -396,5 +396,5 @@ Recover by putting the key back:
 
 ```sh
 cargo run -- kv put demo/banner back
-cargo run -- job list -j        # status: active; task restarted with BANNER=back
+cargo run -- job list -j        # status: running; task restarted with BANNER=back
 ```

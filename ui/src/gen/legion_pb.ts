@@ -8620,8 +8620,9 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
   pageSize?: number;
 
   /**
-   * Keep only jobs whose status equals this value (case-insensitive, exact —
-   * `run` does not match `running`; use `query` for substring search).
+   * Keep only jobs whose derived status (see `Job.status`) equals this value
+   * (case-insensitive, exact — `run` does not match `running`; use `query`
+   * for substring search).
    * Applied after `query` and before paging, so `total_count` reflects the
    * filtered set. Omit or leave empty to return every status.
    *
@@ -8683,17 +8684,33 @@ export class Job extends Message<Job> {
   name = "";
 
   /**
-   * Job lifecycle status. Values the manager writes:
+   * Job status, derived from the job's workload each time it is read. First
+   * match wins:
    *
-   * - `active`: the job is submitted and not stopped. The manager keeps its
-   *   tasks scheduled. This says nothing about placement or progress: an
-   *   active job may have live allocations, may have failed to place, or (for
-   *   batch-only jobs) may have finished every task. Read the job's
-   *   allocations for that.
-   * - `stopped`: `StopJob` stopped the job. Resubmitting it with `RunJob`
-   *   sets it back to `active`.
-   * - `failed`: a required KV dependency vanished (`onDelete: fail`). A KV
-   *   put that restarts or rolls out the job sets it back to `active`.
+   * - `stopped`: `StopJob` stopped the job. `RunJob` brings it back.
+   * - `failed`: a required KV dependency vanished (`onDelete: fail`), or
+   *   nothing is live and a task's last run failed (it spent its restart and
+   *   move budgets, or exited unsuccessfully under a policy that does not
+   *   restart it).
+   * - `running`: at least one allocation of any version of the job is live
+   *   (placed and not yet terminal).
+   * - `pending`: nothing is live, and a task that wants an allocation has not
+   *   finished: it is waiting to be placed (no node fits, or no node is up)
+   *   or waiting on a `dependsOn` condition.
+   * - `scheduled`: nothing is live, nothing is pending, and a cron task
+   *   (`schedule`) finished its last run and waits for the next one.
+   * - `complete`: nothing is live, and every task that wants an allocation
+   *   finished successfully. A batch job reads this once it is done.
+   * - `suspended`: no task wants an allocation, and at least one keyed
+   *   instance is suspended.
+   * - `idle`: no task wants an allocation: every task is scaled to zero, or
+   *   a keyed task has no pending, active, or rescheduling instances.
+   *
+   * Task outcomes come from the job's latest spec version; live allocations
+   * count from every version, so a job mid-rollout reads `running`. The
+   * state store's `job.status` column is not this value: it holds the
+   * lifecycle flag (`active`, `stopped`, `failed`) the derivation starts
+   * from.
    *
    * @generated from field: string status = 3;
    */

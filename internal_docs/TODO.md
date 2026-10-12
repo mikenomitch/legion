@@ -2874,6 +2874,15 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
 
 ## Job types
 
+- [ ] **Per-replica job outcomes.** The derived job status takes each task's
+      outcome from its `task_status` row, the last exit any replica reported,
+      so a `count = 3` batch task with one failed replica can read `complete`
+      ([plan §4](plans/job-status-plan.md#4-goals-and-non-goals),
+      [calls 4](calls/job-status-plan_calls.md#4-a-tasks-outcome-is-its-task_status-row-not-a-per-replica-count))
+- [ ] **Job status-change events.** The job status is derived on read, so
+      nothing emits `job.status_changed` when a job goes `running` →
+      `complete`; an agent has to poll `GetJobInfo`
+      ([plan](plans/job-status-plan.md))
 - [ ] **Sysbatch** — run once on every node
 - [ ] **System job** — N per X (1 per metal, 2 per region, …). Is this really a
       job type, or just a richer `count`? (`count: {num: 1, per: "id"}`
@@ -3187,13 +3196,6 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
         new checkpoint and whether the budget or the disk limits it, but
         GetNodeUsage carries only the `snapshots` class
         ([calls 8](calls/suspend-resume-ui-plan_calls.md#8-getnodecontent-reads-only-what-the-manager-already-holds))
-  - [ ] The Jobs index lists the stored lifecycle status (`active`) for a
-        running job; only the job page derives `running`
-        ([calls 9](calls/suspend-resume-ui-plan_calls.md#9-a-done-job-with-live-work-reads-running-derived-in-the-ui)).
-        A server-side status derived from allocations (`running` / `pending`
-        / `complete`) would fix both, and would let a finished batch-only
-        job stop reading `active`
-        ([calls 1](calls/job-status-active_calls.md#1-the-stored-job-status-is-active-not-running))
   - [ ] `create --from-snapshot` from the UI needs an instance-create
         surface, which the UI does not have
         ([calls 15](calls/suspend-resume-ui-plan_calls.md#15-creating-instances-from-a-snapshot-stays-in-the-cli))
@@ -4137,11 +4139,13 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] DAGs: `depends_on` with `start`/`complete`/`success` conditions, topological
       sort, cycle rejection, cross-group dependencies (so DAGs span machines) and
       group-bound sidecars
-- [x] A submitted job's stored status is `active`, not `done`. `done` read as
-      "finished" next to a long-running service. Values are `active`,
-      `stopped`, `failed`
-      ([docs](../docs/jobs-tasks-and-scheduling.md#job-status) ·
-      calls: [job-status-active_calls.md](calls/job-status-active_calls.md))
+- [x] Job status derived from the workload: `GetJobInfo`/`ListJobs` report
+      `running`, `pending`, `failed`, `scheduled`, `complete`, `suspended`,
+      `idle`, or `stopped` instead of the stored flag, which is now `active`
+      (was `done`, which read as "finished" beside a running service)
+      ([plan](plans/job-status-plan.md) ·
+      [docs](../docs/jobs-tasks-and-scheduling.md#job-status) ·
+      calls: [job-status-plan_calls.md](calls/job-status-plan_calls.md))
 
 ## Agent surfaces
 
@@ -4158,6 +4162,10 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 [docs](../docs/ui-architecture.md)
 
+- [x] The Jobs index and the job page show the same derived job status;
+      the page's client-side `running` workaround is gone
+      ([suspend-resume-ui calls 9](calls/suspend-resume-ui-plan_calls.md#9-a-done-job-with-live-work-reads-running-derived-in-the-ui),
+      [job-status plan](plans/job-status-plan.md))
 - [x] Keyboard navigation: ⌘K command palette, `j`/`k`/`o` index selection, `u`
       to go up a level
 - [x] Jump hints — hold ⌘ (Ctrl) to label index rows with digits and sidebar

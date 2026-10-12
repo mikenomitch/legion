@@ -20,6 +20,18 @@ import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/poll
 import { stableList } from '../../utils/instances'
 import { bytesToMiB, fetchAllocationUsageByNode, formatIdle, formatMiB, reservationLabel } from '../../utils/usage'
 
+// What each derived job status means on this page (the badge's tooltip).
+const JOB_STATUS_HINTS: Record<string, string> = {
+  running: 'At least one allocation of this job is live.',
+  pending: 'Nothing is live yet: a task is waiting to be placed or for a dependency. The task cards show which.',
+  complete: 'Every task finished successfully and nothing is live.',
+  scheduled: 'A cron task finished its last run and is waiting for the next one.',
+  failed: 'A task failed, or a required KV key is missing, and nothing is live. The task cards and events show why.',
+  suspended: 'Every wanted instance is suspended. Start an instance to resume it.',
+  idle: 'No task wants an allocation: scaled to zero, or no keyed instances exist.',
+  stopped: 'Stopped. Run the job again to bring it back.',
+}
+
 function JobDetailContent() {
   const params = useParams()
   const navigate = useNavigate()
@@ -182,16 +194,11 @@ function JobDetailContent() {
     }))
   })
 
-  // The manager stores `active` for every submitted, unstopped job, whether
-  // or not anything is placed. A job with live allocations or active
-  // instances reads as running, which says more than `active`.
-  const displayStatus = createMemo(() => {
-    const status = jobData()?.job?.status || 'unknown'
-    if (status.toLowerCase() !== 'active') return status
-    const liveAllocation = (jobData()?.allocations ?? []).some((allocation) => !['complete', 'failed'].includes(allocation.status.toLowerCase()))
-    const liveInstance = (instances() ?? []).some((instance) => ['active', 'pending', 'rescheduling'].includes(instance.state))
-    return liveAllocation || liveInstance ? 'running' : status
-  })
+  // The manager derives the status from the job's workload (see
+  // docs/jobs-tasks-and-scheduling.md#job-status). The hint says what each
+  // word means here, so `pending` and `idle` are not mistaken for faults.
+  const displayStatus = createMemo(() => jobData()?.job?.status || 'unknown')
+  const statusHint = createMemo(() => JOB_STATUS_HINTS[displayStatus().toLowerCase()])
 
   // The instances panel appears for jobs that declare stateful tasks, or that
   // have instance rows anyway (e.g. the spec failed to parse but the manager
@@ -214,10 +221,10 @@ function JobDetailContent() {
   })
 
   const mayWrite = () => allows('job', 'write', jobScope(jobName(), jobData()?.template?.name))
-  // Stop is offered while there is something to stop; destroy needs a
-  // stopped job first, which is why both live here. Note that `done` is the
-  // manager's word for "submission accepted and scheduled", not "finished".
-  const isStoppable = () => !['stopped', 'failed', 'destroyed'].includes((jobData()?.job?.status ?? '').toLowerCase())
+  // Stop is offered until the job is stopped; destroy needs a stopped job
+  // first, which is why both live here. `failed` and `complete` stay
+  // stoppable, because stopping is the step before destroying either.
+  const isStoppable = () => !['stopped', 'destroyed'].includes((jobData()?.job?.status ?? '').toLowerCase())
 
   const stopJob = async () => {
     try {
@@ -263,13 +270,7 @@ function JobDetailContent() {
               <>
                 <StatusBadge
                   status={displayStatus()}
-                  title={
-                    (jobData()!.job?.status ?? '').toLowerCase() === 'active'
-                      ? displayStatus() === 'running'
-                        ? 'Allocations or instances of this job are running.'
-                        : 'Submitted and not stopped, but nothing is live right now — see the task cards and allocations for why.'
-                      : undefined
-                  }
+                  title={statusHint()}
                 />
                 {/* The priority band decides what this job can displace and
                     what can displace it, so it belongs beside the status
