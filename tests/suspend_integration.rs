@@ -229,6 +229,7 @@ impl Cluster {
                 instance_id: ID.into(),
                 idempotency_key: None,
                 cold,
+                force_move: false,
             }))
             .await
             .map(|reply| reply.into_inner())
@@ -294,6 +295,7 @@ fn job(runtime: &str, suspend: Option<SuspendConfig>) -> JobConfig {
             }),
             envelope: None,
             promote: None,
+            fence_after: None,
         }),
         suspend,
         ..TaskConfig::new(TASK, runtime)

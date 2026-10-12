@@ -55,6 +55,10 @@ pub const RECENT_END_TTL: Duration = Duration::from_secs(600);
 /// How often ingest sweeps stale nodes and expired recent starts.
 const SWEEP_EVERY: Duration = Duration::from_secs(15);
 
+/// Bound on the untagged ids waiting for the duplicate sweep. Past it, ids
+/// wait for their node's next full report.
+const SWEEP_IDS_MAX: usize = 200_000;
+
 /// The per-node totals of one job's task: session count and summed
 /// resources.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -89,8 +93,13 @@ impl Usage {
     }
 }
 
-/// A session's reserved amounts, parsed from its `resources` JSON.
+/// A session's reserved amounts, parsed from its `resources` JSON. A
+/// suspended session holds none: its node freed its envelope share when it
+/// checkpointed (it still counts in [`Usage::sessions`]).
 pub fn session_amounts(status: &SessionStatus) -> BTreeMap<String, f64> {
+    if status.state == "suspended" {
+        return BTreeMap::new();
+    }
     serde_json::from_str::<serde_json::Value>(&status.resources)
         .map(|value| crate::structs::session::resource_amounts(&value))
         .unwrap_or_default()
@@ -125,6 +134,10 @@ struct Inner {
     stops: HashMap<String, HashSet<String>>,
     /// Sessions this manager stopped, until [`RECENT_END_TTL`].
     ended: HashMap<String, Instant>,
+    /// Untagged session ids (derived from an idempotency key) reported
+    /// since the duplicate sweep last asked, the only ids two nodes can
+    /// share ([`SessionIndex::take_sweep_ids`]).
+    sweep_ids: HashSet<String>,
     last_sweep: Option<Instant>,
 }
 
@@ -202,15 +215,21 @@ impl Inner {
         if nodes.len() < 2 {
             return;
         }
-        let mut copies: Vec<(i64, String)> = nodes
+        // The higher generation wins, then the earlier lease, then the lower
+        // node id (`crate::manager::sessions::winner`).
+        let mut copies: Vec<(std::cmp::Reverse<u64>, i64, String)> = nodes
             .iter()
             .filter_map(|node_id| {
                 let status = self.nodes.get(node_id)?.sessions.get(session_id)?;
-                Some((status.lease_issued_at_unix_ms, node_id.clone()))
+                Some((
+                    std::cmp::Reverse(status.generation),
+                    status.lease_issued_at_unix_ms,
+                    node_id.clone(),
+                ))
             })
             .collect();
         copies.sort();
-        for (_, node_id) in copies.into_iter().skip(1) {
+        for (_, _, node_id) in copies.into_iter().skip(1) {
             self.stops
                 .entry(node_id)
                 .or_default()
@@ -323,6 +342,11 @@ impl SessionIndex {
         if outcome != IngestOutcome::Resync {
             for status in &report.upserts {
                 inner.converge(&status.session_id);
+                if crate::structs::session_node_tag(&status.session_id).is_none()
+                    && inner.sweep_ids.len() < SWEEP_IDS_MAX
+                {
+                    inner.sweep_ids.insert(status.session_id.clone());
+                }
             }
         }
         // Stops stand until the node stops listing the session.
@@ -345,6 +369,14 @@ impl SessionIndex {
         }
         inner.sweep(now);
         SessionIngest { outcome, stop }
+    }
+
+    /// The untagged session ids reported since the last call, for the
+    /// managers' batched duplicate sweep. A full report re-adds every one
+    /// its node runs.
+    pub fn take_sweep_ids(&self) -> Vec<String> {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut inner.sweep_ids).into_iter().collect()
     }
 
     /// Record a start this manager's router just made, so a read before the
@@ -392,6 +424,26 @@ impl SessionIndex {
         let task_matches = |status: &SessionStatus| {
             request.task_name.is_empty() || status.task_name == request.task_name
         };
+
+        if request.session_id.is_empty() && !request.session_ids.is_empty() {
+            let mut sessions = Vec::new();
+            for session_id in &request.session_ids {
+                for node_id in inner.by_id.get(session_id).into_iter().flatten() {
+                    if let Some(status) = inner
+                        .nodes
+                        .get(node_id)
+                        .and_then(|node| node.sessions.get(session_id))
+                    {
+                        sessions.push(inner.indexed(node_id, status, false));
+                    }
+                }
+            }
+            return QuerySessionsReply {
+                sessions,
+                covered_nodes,
+                node_usage: Vec::new(),
+            };
+        }
 
         if !request.session_id.is_empty() {
             let mut sessions: Vec<IndexedSession> = inner
@@ -469,6 +521,27 @@ impl SessionIndex {
                     sessions.push(inner.indexed(&start.node_id, &start.status, true));
                 }
             }
+            // A page: ids after `after_session_id`, in id order, at most
+            // `limit` of them.
+            if !request.after_session_id.is_empty() {
+                sessions.retain(|entry| {
+                    entry
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.session_id > request.after_session_id)
+                });
+            }
+            if request.limit > 0 {
+                let id = |entry: &IndexedSession| {
+                    entry
+                        .status
+                        .as_ref()
+                        .map(|status| status.session_id.clone())
+                        .unwrap_or_default()
+                };
+                sessions.sort_by_cached_key(|entry| (id(entry), entry.node_id.clone()));
+                sessions.truncate(request.limit as usize);
+            }
         }
         QuerySessionsReply {
             sessions,
@@ -535,6 +608,7 @@ mod session_index_test {
             state: "running".into(),
             lease_issued_at_unix_ms: iat,
             resources: r#"{"cpu":500,"memory":512}"#.into(),
+            ..Default::default()
         }
     }
 

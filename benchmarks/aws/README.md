@@ -342,6 +342,391 @@ latencies are bounded by the heartbeat cadence (checkpoint requests and
 reports still ride heartbeats), so they say more about that protocol than
 about throughput.
 
+## Bottleneck measurements without a big fleet
+
+Planned, not yet run (written 2026-10-12). This section lists the places
+where Legion could run out of headroom as sandbox counts grow, and shows how
+to measure each one without hundreds of real workers. Each entry names what
+to measure, the tool, the exact command, and the signal or pass bar. Where
+no harness exists yet, the entry says **TODO (gap)**. All the gaps are
+collected under [Gaps](#gaps-harnesses-that-do-not-exist-yet).
+
+Three cheap setups cover almost everything:
+
+- **Laptop or one Linux box.** Use `cargo bench` or an ignored measurement
+  test. These are in-process and need no network.
+- **Local cluster plus a simulated fleet.** Run one manager
+  (`cargo run --release -- start manager -c configs/manager.ncl`) and
+  `legion start worker $TOKEN --simulate N --sim-checkpoints` (see
+  [worker-simulation.md](../../docs/worker-simulation.md)). The control
+  plane is real; the nodes are fake.
+- **One real KVM worker.** For runtime costs (cold start, restore, memory per
+  sandbox), use a spot-check worker (`tests/spot-check/`, an m7i.large with
+  nested virtualization) or any Linux box with `/dev/kvm`. Bare metal gives
+  the numbers to quote. Nested virtualization gives a lower bound.
+
+To scrape the manager's metrics, read `http://<manager>:4749/metrics`
+(`server.port + 2`). Workers export metrics only when
+`LEGION_WORKER_TELEMETRY_PORT` is set ([metrics.md](../../docs/metrics.md)).
+Take a before and after scrape around each run and record the deltas, not
+the absolute values.
+
+| # | Bottleneck | Tool | Fleet needed |
+| --- | --- | --- | --- |
+| 1 | Manager eval and plan | `scheduler_bench`, `eval_critical_path_bench`, `plan_contention` | none |
+| 2 | Raft commit and group commit | `raft_perf_smoke`, `raft_lifecycle_ops`, `heartbeat-commit-probe.sh` | none, or the 3-manager rig |
+| 3 | StreamWork delivery | `work_stream` measurement | none |
+| 4 | Heartbeat load | `heartbeat_scale_benchmark`, `--simulate` | none, or one sim host |
+| 5 | ListInstances and session listing | `instance_scale_measure`, the density cell; session listing is a TODO | none, or one sim host |
+| 6 | Session starts per node (launch pool) | `session_start_latency_measure`; a real-node probe is a TODO | none, or one worker |
+| 7 | sessions.db group commit | TODO | one worker |
+| 8 | Session ticket verification cache | TODO | one worker |
+| 9 | Manager routing by node tag | a timed `instance get` loop, tagged vs untagged | two workers |
+| 10 | Checkpoint write and restore | `instance suspend/start --wait -j` on a real worker | one KVM worker |
+| 11 | Content store | the same, with `durability = "store"` | two workers |
+| 12 | cloud-hypervisor cold start | a timed create loop | one KVM worker |
+| 13 | Memory per idle sandbox | a fill loop plus `/proc/meminfo` | one KVM worker |
+| 14 | UI at large session counts | `/testing` fixture, then a sim fleet | none |
+
+### 1. Manager eval and plan
+
+**Measure:** the time for one eval to produce a plan, as the node count
+grows and as concurrent evals contend.
+**Tool and command:**
+
+```bash
+cargo bench --bench scheduler_bench -- candidate_construction
+cargo bench --bench scheduler_bench -- plan_under_fill
+LEGION_BENCH_SCALING_NODES=1000,10000,50000 cargo bench --bench scheduler_bench -- plan_fleet_scaling
+cargo bench --bench eval_critical_path_bench
+cargo test --release --test plan_contention -- --ignored --nocapture
+LEGION_BENCH_BACKENDS=local_disk,raft1,raft3 cargo test --release --test scheduler_scale_benchmark -- --ignored --nocapture
+```
+
+**Signal:** plan time grows no faster than linearly in nodes. Contention
+should show rejected plans being retried, not lost. On a live manager, read
+`legion_eval_phase_seconds`, `legion_scheduler_plan_phase_seconds`, and
+`legion_eval_queue_depth`. A queue depth that keeps growing under steady
+offered load is the failure.
+**Bar:** no regression against the base branch (AGENTS.md requires before
+and after numbers for scheduler changes).
+
+### 2. Raft commit and group commit
+
+**Measure:** the cost of a commit, how many writes the store batches into
+one commit, and how many raft entries each lifecycle step takes.
+**Tool and command:**
+
+```bash
+cargo test --release --test raft_perf_smoke --locked -- --ignored --nocapture
+cargo test --release --test raft_lifecycle_ops -- --nocapture       # entries per keyed lifecycle stage, asserted exactly
+benchmarks/aws/experiments/heartbeat-commit-probe.sh                 # on the 3-manager rig
+```
+
+**Signal:** `legion_store_coalesce_batch_size` should rise with load, while
+`legion_store_coalesce_commit_seconds` stays flat; that shows group commit
+working. Also watch `legion_store_coalesce_wait_seconds`,
+`legion_raft_propose_apply_seconds`, `legion_raft_pipeline_wait_seconds`, and
+`legion_raft_pipeline_depth`. For entries per operation, take
+`legion_raft_applied_index` (summed over lanes) before and after a known
+number of operations.
+**Bar:** the keyed lane holds about 50 lifecycles/s at about 6 ms per entry
+([sandbox-scaling-plan.md](../../internal_docs/plans/sandbox-scaling-plan.md) §5.1).
+Session starts should move the applied index by far less than one entry per
+start.
+
+### 3. StreamWork delivery
+
+**Measure:** the time from committing an allocation to the worker having it,
+with a large desired set per node.
+**Tool and command:**
+
+```bash
+LEGION_MEASURE_STREAM_ALLOCS=10000 cargo test --release --test work_stream -- a_streaming_heartbeat --nocapture
+```
+
+On a live cluster, read `legion_dispatch_send_seconds` with a simulated
+fleet (`--simulate 200`, and again with `--sim-no-work-stream` for the
+fallback path).
+**Bar:** dispatch p50 ≤ network RTT + 5 ms and p99 ≤ 50 ms
+([sandbox-scaling-plan.md](../../internal_docs/plans/sandbox-scaling-plan.md) §7).
+A steady heartbeat with 10,000 allocations should not resend the whole set.
+
+### 4. Heartbeat load
+
+**Measure:** heartbeats per second one manager can serve, and how freshness
+degrades past that.
+**Tool and command:**
+
+```bash
+LEGION_HEARTBEAT_NODES=1000,5000,10000 LEGION_HEARTBEAT_THREADS=8 LEGION_HEARTBEAT_SECONDS=10 \
+  cargo test --release --test heartbeat_scale_benchmark -- --ignored --nocapture
+legion start worker $TOKEN --simulate 2000 --register-rate 200     # a live manager
+```
+
+**Signal:** `legion_heartbeat_freshness_ratio` stays near 1, and
+`legion_heartbeat_served_interval_seconds` tracks the configured cadence.
+`legion_heartbeat_sustainable_nodes` is the manager's own estimate of how
+many nodes it can carry; also record `legion_heartbeats_total`,
+`legion_grpc_in_flight`, and `legion_runtime_spawn_delay_seconds`. A rising
+`legion_heartbeat_lost_window_seconds` means it has fallen behind.
+**Bar:** the sustainable-nodes estimate exceeds the target fleet size with
+headroom. With 1,000 allocations per node (the dense-sandbox case), the
+cost of one steady beat comes from
+`LEGION_MEASURE_HEARTBEAT_ALLOCS=1000,10000 cargo test --release --test instance_scale_measure -- --ignored --nocapture`.
+
+### 5. ListInstances and session listing at large counts
+
+**Measure:** the latency and reply size of `instance list` at 100k and 1M
+instances, and the store cost behind it.
+**Tool and command:** the store side (bytes per instance row, store-only
+creates/s, suspended rows, and churn of unnamed instances) is measured
+in-process:
+
+```bash
+LEGION_MEASURE_INSTANCES=100000,1000000 cargo test --release --test instance_scale_measure -- --ignored --nocapture
+LEGION_MEASURE_SUSPENDED=50000 LEGION_MEASURE_CHURN=1000000 cargo test --release --test instance_scale_measure -- --ignored --nocapture
+```
+
+For list latency, hold instances resident on a simulated fleet with the
+sandbox campaign's density cell (`scripts/run-sandbox-campaign.sh --density
+100000 --density-nodes 100`, or `legion-loadgen --mode instances` against a
+local manager), then time the listing while they are held:
+
+```bash
+time legion instance list <job> -j | jq '.data.instances | length'
+```
+
+**Signal:** list latency grows with the page size, not with the total
+count, and manager RSS per resident instance stays flat. Record
+`legion_grpc_request_duration_seconds` for the list method.
+**TODO (gap):** `instance_scale_measure` does not time `ListInstances`
+itself, and nothing lists *sessions* at large counts. Session listing is a
+separate path: the manager asks each node for its sessions, then merges.
+Simulated workers do not run sessions, so there is nothing to list. The plan
+is to add a session table to `--simulate`, then time `instance list <job>
+-j` at 10k, 100k, and 250k sessions across 10 to 100 sim nodes, checking
+that `.data.complete` stays true and that the fan-out is one call per node
+(`legion_grpc_requests_total{method}` before and after). Also watch reply
+size: a full report is about 200 B per session, which reaches the 4 MiB
+message limit at around 20k sessions per node.
+
+### 6. Session starts per node (launch pool)
+
+**Measure:** sustained starts per second on one node, and where
+`edgeBoot.launchConcurrency` and `edgeBoot.queueTimeout` begin refusing.
+**Tool and command:**
+
+```bash
+cargo test --release --test session_integration -- session_start_latency_measure --ignored --nocapture
+```
+
+That covers the control plane's share: pick a node, send the start, and
+record it, against fake nodes on loopback. Earlier runs in a debug build
+measured 379 starts/s serial and 972/s at 64 in flight.
+
+On one real worker (spot-check rig, `11-sessions.ncl` with a larger
+envelope), run a closed-loop burst:
+
+```bash
+seq 2000 | xargs -P 64 -I{} legion instance create sessions --task shell -j \
+  | jq -r '.error.code // "ok"' | sort | uniq -c
+```
+
+Watch `legion_session_starts_total{outcome}` on the manager, and
+`legion_worker_launch_refusals_total` on the worker (set
+`LEGION_WORKER_TELEMETRY_PORT`). Repeat with `launchConcurrency` at 2, 8,
+and 0 (twice the cores), and `queueTimeout` at 100ms and 1s.
+**Bar:** with a launch that takes a fixed 30 ms, a node sustains at least
+`launchConcurrency / 0.03` starts/s, and refusals appear only once the pool
+stays full for longer than `queueTimeout`. Refusals are
+`RESOURCE_EXHAUSTED` and retryable.
+**TODO (gap):** no fake runtime launches with a fixed delay, so the 30 ms
+bar cannot be isolated from real `exec` launch cost. `legion-loadgen` has no
+session mode either. Until both exist, the real-worker burst above is the
+measurement, and its launch time is whatever `exec` costs on that box.
+
+### 7. sessions.db group commit
+
+**Measure:** the cost of appending a session start or stop to the worker's
+`<state-dir>/sessions.db`, and how many appends share one fsync.
+**Tool and command:** **TODO (gap):** there is no micro-bench and no metric
+for it. Until one exists, run the burst from 6 on one real worker, with and
+without `sessions.db` (on a branch before session durability Phase 2), and
+compare the starts/s. `strace -c -e fsync,fdatasync -p <worker pid>` during
+the burst counts the syncs.
+**Bar:** at the node's peak start rate, fsyncs per second stay well below
+starts per second. A worker restart with 1,000 sessions re-adopts all of
+them within one full-report period
+([session-durability-and-routing-plan.md](../../internal_docs/plans/session-durability-and-routing-plan.md)).
+
+### 8. Session ticket verification cache
+
+**Measure:** the cost of verifying a session ticket on a cache hit versus a
+miss. The worker caches 4,096 verified tickets.
+**Tool and command:** **TODO (gap):** there is no harness and no hit or miss
+metric. The rough measurement is to time 1,000 `legion session get <id>
+--node <addr> --ticket <t>` calls from a manager box (RUNBOOK 12.10) using
+one ticket, then using 1,000 distinct tickets. The difference is the
+verification cost, plus the CLI's own startup and TLS handshake, which
+dominate. A Rust bench calling the verifier
+directly would give a clean number.
+**Bar:** a cache hit costs microseconds. A miss costs one ES256 verify,
+which is well under 1 ms.
+
+### 9. Manager routing by node tag
+
+**Measure:** the latency of `instance get` and `instance stop` on a session
+whose id carries a node tag (the manager sends it to that node first, with
+`Worker.GetSession`), compared with an untagged id, which the manager has
+to look for across nodes. Ids derived from an idempotency key carry no tag,
+so they take the fan-out path.
+**Tool and command:** on the spot-check rig (two real workers) or a local
+manager with real workers:
+
+```bash
+tagged=$(legion instance create sessions --task shell -j | jq -r '.data.instanceIds[0]')
+untagged=$(legion instance create sessions --task shell --idempotency-key bench-1 -j | jq -r '.data.instanceIds[0]')
+for id in $tagged $untagged; do
+  t0=$(date +%s%N); for i in $(seq 200); do legion instance get $id -j >/dev/null; done
+  echo "$id $(( ($(date +%s%N) - t0) / 200000000 )) ms/get"
+done
+```
+
+Take `legion_grpc_requests_total{method}` before and after each loop: a
+tagged get should add one worker `GetSession` call per get, and an untagged
+one should add one call per node. `legion_grpc_request_duration_seconds` for
+the get method gives p50 and p99.
+**Signal:** routed get latency is one manager-to-worker round trip and stays
+flat as nodes are added; fan-out latency is the slowest node's answer and
+its call count grows with the fleet.
+**TODO (gap):** two workers cannot show the fan-out's growth. Simulated
+workers do not run sessions or serve `GetSession`, so the 100- and
+1,000-node comparison waits for sessions in `--simulate` (see 5).
+
+### 10. Checkpoint write and restore throughput
+
+**Measure:** the suspend time and bytes for a memory checkpoint, and the
+restore time, at guest sizes of 256 MiB, 512 MiB, 1 GiB, and 2 GiB.
+**Tool and command:** on one KVM worker (the spot-check `09-sandboxes.ncl`
+`ws` task, with `memory` varied):
+
+```bash
+for i in $(seq 10); do
+  legion instance suspend ws-1 --wait -j | jq -c '.data | {bytes, durationMs}'
+  legion instance start ws-1 --wait -j  | jq -c '.data | {restoreMs, coldBoot}'
+done
+```
+
+Read `legion_instance_suspend_seconds`, `legion_instance_resume_seconds`, and
+`legion_checkpoint_bytes` from the manager as a cross-check.
+**Bar:** restore p50 ≤ 300 ms for a 512 MiB memory checkpoint on local
+durability ([suspend-and-resume.md](../../docs/suspend-and-resume.md)).
+Nested virtualization will miss that; record the miss and rerun on bare
+metal before quoting it. Suspend time should scale with the memory the guest
+has touched, not with its configured size.
+**TODO (gap):** there is no harness for repeated suspend and resume on a
+real runtime. The loop above is it, and the sim fleet fakes this channel.
+
+### 11. Content store
+
+**Measure:** publish time and bytes for a store-durability checkpoint, and
+the fetch and restore time when the resume lands on another node.
+**Tool and command:** the spot-check `10-sandbox-store.ncl` (RUNBOOK 12.6),
+in a loop over cordon, start, and suspend:
+
+```bash
+legion instance suspend sbs-1 --wait -j | jq -c '.data | {bytes, durationMs, durability}'
+legion instance start sbs-1 --wait --timeout 300 -j | jq -c '.data | {node, restoreMs}'
+```
+
+Read `legion_checkpoint_publish_seconds`, `legion_checkpoint_publish_bytes`,
+and `legion_checkpoint_publish_total`. The fetch has no metric of its own;
+`restoreMs` on a cross-node resume includes it.
+**Signal:** publish MB/s (`bytes / durationMs`) against what the node gets
+from a plain `aws s3 cp` of a file the same size, which is the ceiling. Also
+record whether a second suspend of an unchanged guest publishes fewer bytes
+than the first. There is no bar yet; the first run sets the baseline.
+
+### 12. cloud-hypervisor cold start
+
+**Measure:** the time from `instance create` to the first successful exec,
+for a cached image and for a fresh one.
+**Tool and command:** on one KVM worker:
+
+```bash
+for i in $(seq 20); do
+  id=cold-$i; t0=$(date +%s.%N)
+  legion instance create sandboxes --task ws --id $id >/dev/null
+  until legion exec --instance $id -- true >/dev/null 2>&1; do sleep 0.1; done
+  echo "$id $(echo "$(date +%s.%N) - $t0" | bc)"
+done
+```
+
+Subtract the control plane's share (from `legion_provisional_*` or the
+sandbox campaign's create-to-running stage) to get the runtime's share.
+**Bar:** after the first boot, the image and root disk are cached and the
+boot time is flat. Record p50 and p99.
+**TODO (gap):** this measures through exec polling, which adds up to 100 ms.
+A worker-side boot-time metric (VMM start to guest agent ready) would be
+exact.
+
+### 13. Memory per idle sandbox
+
+**Measure:** the node memory each idle microVM really costs, compared with
+its reservation.
+**Tool and command:** on one KVM worker, start idle sandboxes 10 at a time
+(a sleeping `13-band.ncl` VM at `mib=256`, or a session-mode `vm` task) and
+record `MemAvailable` from `/proc/meminfo` and the sum of the
+cloud-hypervisor processes' RSS (`ps -C cloud-hypervisor -o rss=`) after
+each step. Also record `legion_node_memory_used_bytes`.
+**Signal:** the slope of RSS per sandbox. A guest is backed only as it
+touches memory, so an idle Alpine guest should cost far less than its
+reservation. Report RSS per guest and the density this implies on a
+192 GiB host.
+
+### 14. The UI at large session counts
+
+**Measure:** render and scroll time for the session listing.
+**Tool and command:** `cd ui && npm run dev`, then open `/testing`. It
+builds a 250,000-session listing in the browser
+([ui-architecture.md](../../docs/ui-architecture.md)). Record the time to
+first render and the scroll frame rate with the browser's performance panel.
+**TODO (gap):** a live cluster with many sessions needs simulated workers
+that run sessions (see 5). Until then, the fixture is the only large-count
+test.
+**Bar:** first render under 1 s, and scrolling stays smooth (no long tasks
+over 50 ms) at 250k rows.
+
+### Gaps: harnesses that do not exist yet
+
+- `legion-loadgen` has no session mode, no edge-start mode
+  (`Worker.StartSession` on a session ticket), and no real-runtime mode.
+- Simulated workers (`--simulate`) do not run sessions or serve
+  `GetSession`, so session listing, routed get versus fan-out at 100+
+  nodes, and the UI cannot be tested at scale against a live manager.
+- No fake runtime launches with a fixed delay, so the launch pool's bar
+  (starts/s ≥ `launchConcurrency / 0.03` at 30 ms) cannot be isolated.
+- No micro-bench and no metric for `sessions.db` appends and fsync batching.
+- No hit or miss metric and no bench for the session ticket verification
+  cache.
+- No harness repeats cold start, suspend, and restore on a real runtime, and
+  no worker-side boot-time metric.
+- No content-store fetch metric; a cross-node resume's fetch is only visible
+  inside `restoreMs`.
+- No assertion on how many nodes `QuerySessions` asks; only
+  `legion_grpc_requests_total{method}` shows it.
+- `legion_worker_launch_refusals_total` is exported but not listed in
+  `docs/metrics.md`.
+
+### Recording results
+
+Put each run under `results/bottlenecks/<date>/<number>-<name>/`, with the
+exact command, the git SHA, the box type (and whether it was nested
+virtualization), the before and after metric scrapes, and the numbers. Note
+anything that missed its bar in the sandbox-scaling plan's results section,
+not only here.
+
 ## Unattended runs (overnight, or from a cloud shell)
 
 A full campaign is hours of continuous SSH from one address. Driving it

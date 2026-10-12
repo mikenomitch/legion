@@ -4141,6 +4141,11 @@ impl Store {
             .collect())
     }
 
+    /// Every node id the read model holds, without cloning the nodes.
+    pub fn cached_node_ids(&self) -> R<Vec<String>> {
+        Ok(self.read_model_reader()?.nodes.keys().cloned().collect())
+    }
+
     /// One node from the read model, as the shared `Arc`. `None` when the
     /// read model does not hold it (callers fall back to [`Self::get_node`]).
     pub fn cached_node(&self, id: &str) -> R<Option<Arc<Node>>> {
@@ -27377,6 +27382,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -27810,6 +27816,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -27971,6 +27978,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -28052,6 +28060,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("drop-db", "noop")
         };
@@ -28127,6 +28136,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new(name, "noop")
         }

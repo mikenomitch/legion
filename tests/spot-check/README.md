@@ -44,7 +44,7 @@ The rig still opens port 4848 only to the managers' security group.
 | --- | --- |
 | `infra/` | `up.sh`, `install.sh`, `down.sh`, plus `cli-env.sh`, `ssh.sh`, `refresh-ecr.sh`, cloud-init, and config templates |
 | `images/` | `web`, `api`, `frontend`, and `agent` images, and `build-push.sh` (amd64 and arm64, to the rig's ECR) |
-| `jobs/` | One jobspec per area, numbered in runbook order. `jobs/mac/` holds the macOS variants. |
+| `jobs/` | One jobspec per area, numbered in runbook order. `09`-`13` are the sandbox and session jobs for RUNBOOK section 12: `09-sandboxes` (keyed gated microVMs with egress, injection, and suspend), `10-sandbox-store` (store durability), `11-sessions` (session mode), `12-mem-hog` (memory pressure), `13-band` (preemption). `jobs/mac/` holds the macOS variants. |
 | `launcher/` | The agent-sandbox launcher: a stdlib Python server plus one HTML page |
 | `mac/` | Manager and worker config for local development, and `build-local.sh` |
 
@@ -57,6 +57,11 @@ docker run --rm --platform linux/amd64 -v "$PWD":/src:ro -v "$PWD/target-linux-a
   -e CARGO_TARGET_DIR=/target -w /src rust:1.90-bookworm bash -c \
   'apt-get update -qq && apt-get install -y -qq protobuf-compiler clang libclang-dev >/dev/null && cargo build --release --locked --bin legion'
 cargo build --bin legion                         # the laptop CLI
+# the static guest agent, for microVM exec and gated networking on the
+# Alpine agent image (RUNBOOK 12.0); install.sh ships it when present
+docker run --rm --platform linux/amd64 -v "$PWD":/src:ro -v "$PWD/target-linux-amd64":/target \
+  -e CARGO_TARGET_DIR=/target -w /src rust:1.90-bookworm bash -c \
+  'apt-get update -qq && apt-get install -y -qq protobuf-compiler clang libclang-dev musl-tools >/dev/null && rustup target add x86_64-unknown-linux-musl && cargo build -p legion-guest --profile dist --locked --target x86_64-unknown-linux-musl'
 
 # 2. the rig, the images, the cluster
 tests/spot-check/infra/up.sh
@@ -65,7 +70,7 @@ tests/spot-check/infra/install.sh
 
 # 3. test, then tear down
 tests/spot-check/infra/cli-env.sh --fish | source
-tests/spot-check/smoke.sh
+tests/spot-check/smoke.sh                        # or: smoke.sh sandboxes
 tests/spot-check/infra/down.sh
 ```
 

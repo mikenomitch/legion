@@ -351,6 +351,25 @@ impl S3ContentPublisher {
 /// variables, web identity, then the instance profile). Shared by the
 /// worker's publisher and the manager's archive reads.
 pub fn s3_client(url: &Url, credential: Option<Credential>) -> R<object_store::aws::AmazonS3> {
+    s3_builder(url, credential)?
+        .build()
+        .context("build s3 client for contentStore")
+}
+
+/// [`s3_client`] with conditional writes on: `PutMode::Create` sends
+/// `If-None-Match: *` and `PutMode::Update` sends `If-Match`, as the
+/// session manifests' generations need ([`crate::session_manifest`]).
+pub fn s3_client_conditional(
+    url: &Url,
+    credential: Option<Credential>,
+) -> R<object_store::aws::AmazonS3> {
+    s3_builder(url, credential)?
+        .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+        .build()
+        .context("build s3 client for contentStore")
+}
+
+fn s3_builder(url: &Url, credential: Option<Credential>) -> R<AmazonS3Builder> {
     let bucket = url.host_str().context("contentStore.url has no bucket")?;
     let mut region: Option<String> = None;
     let mut endpoint: Option<String> = None;
@@ -397,7 +416,7 @@ pub fn s3_client(url: &Url, credential: Option<Credential>) -> R<object_store::a
         Some(other) => bail!("contentStore needs an aws credential, got {other:?}"),
         None => {}
     }
-    builder.build().context("build s3 client for contentStore")
+    Ok(builder)
 }
 
 /// The object key of `object_name` under an `s3://bucket/prefix` URL's

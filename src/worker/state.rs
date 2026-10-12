@@ -136,6 +136,12 @@ impl WorkerStateStore {
             .unwrap_or_else(|| PathBuf::from("content"))
     }
 
+    /// The node's session log (`<state-dir>/sessions.db`, session
+    /// durability plan §6.2).
+    pub fn sessions_db_path(&self) -> PathBuf {
+        self.path.with_file_name("sessions.db")
+    }
+
     /// Directory holding the captured stdout/stderr files for one allocation.
     pub fn allocation_log_dir(&self, allocation_id: i64) -> PathBuf {
         self.logs_base_dir().join(allocation_id.to_string())

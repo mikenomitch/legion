@@ -39,6 +39,10 @@ use std::collections::BTreeMap;
 /// constraint, so one is never placed on a worker that predates sessions.
 pub const SESSIONS_CAPABILITY: &str = "sessions";
 
+/// A node that starts sessions on a session ticket (`Worker.StartSession`),
+/// advertised when `edgeBoot.acceptClaims` is on.
+pub const EDGE_SESSIONS_CAPABILITY: &str = "edge-sessions";
+
 /// The built-in runtime of a generated envelope task. It starts nothing:
 /// the allocation is a reservation. Reserved, so a jobspec cannot declare a
 /// task on it.
@@ -116,6 +120,32 @@ pub fn is_session_task(task: &TaskConfig) -> bool {
     task.stateful
         .as_ref()
         .is_some_and(|stateful| stateful.mode == InstanceMode::Keyed && stateful.envelope.is_some())
+}
+
+/// Whether a session task's sessions publish their checkpoints to the
+/// content store (`suspend.durability = "store"`, session durability plan
+/// §6.6): such sessions can resume on any node, claim a generation on every
+/// resume, and fence themselves when cut off.
+pub fn publishes_checkpoints(task: &TaskConfig) -> bool {
+    task.suspend
+        .as_ref()
+        .and_then(|suspend| suspend.resolve().ok())
+        .is_some_and(|suspend| {
+            suspend.durability == crate::structs::snapshot::SnapshotDurability::Store
+        })
+}
+
+/// Default `stateful.fenceAfter`.
+pub const DEFAULT_FENCE_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A session task's `stateful.fenceAfter` (default [`DEFAULT_FENCE_AFTER`]).
+pub fn fence_after(task: &TaskConfig) -> std::time::Duration {
+    task.stateful
+        .as_ref()
+        .and_then(|stateful| stateful.fence_after.as_deref())
+        .and_then(|raw| humantime::parse_duration(raw.trim()).ok())
+        .filter(|after| !after.is_zero())
+        .unwrap_or(DEFAULT_FENCE_AFTER)
 }
 
 /// Whether a session task accepts caller-chosen ids (`promote.onName`).
@@ -305,10 +335,42 @@ pub fn validate_session_task(task: &TaskConfig) -> R<()> {
     let Some(stateful) = task.stateful.as_ref() else {
         return Ok(());
     };
+    let name = &task.name;
     let Some(envelope) = stateful.envelope.as_ref() else {
+        if stateful.fence_after.is_some() {
+            bail!(
+                "task {name} sets stateful.fenceAfter, which applies to session tasks only \
+                 (stateful.mode = \"session\" with suspend.durability = \"store\")\nHint: \
+                 remove stateful.fenceAfter; keyed and slot instances fence with \
+                 stateful.onLost.selfTerminateAfter"
+            );
+        }
         return Ok(());
     };
-    let name = &task.name;
+    if let Some(raw) = stateful.fence_after.as_deref() {
+        let after = humantime::parse_duration(raw.trim()).map_err(|err| {
+            anyhow!(
+                "task {name}: stateful.fenceAfter {raw:?} is not a duration ({err})\nHint: use \
+                 a duration such as \"2m\""
+            )
+        })?;
+        if after < std::time::Duration::from_secs(10) {
+            bail!(
+                "task {name}: stateful.fenceAfter {raw:?} is shorter than 10s. A node fences its \
+                 sessions after this long without reaching a manager or its content store, so \
+                 a value this short suspends sessions on every brief network blip\nHint: use \
+                 a duration such as \"2m\" (the default)"
+            );
+        }
+        if !publishes_checkpoints(task) {
+            bail!(
+                "task {name} sets stateful.fenceAfter without suspend.durability = \"store\". \
+                 Only a session that can move (its checkpoint is in the content store) can \
+                 have a newer copy elsewhere, so only those fence themselves\nHint: set \
+                 suspend = {{ durability = \"store\" }}, or remove stateful.fenceAfter"
+            );
+        }
+    }
     if stateful.require_id {
         bail!(
             "task {name} is a session task and sets stateful.requireId\nHint: a session that \
@@ -405,13 +467,10 @@ pub fn validate_session_task(task: &TaskConfig) -> R<()> {
         let resolved = suspend
             .resolve()
             .map_err(|err| anyhow!("task {name}: {err}"))?;
-        if resolved.durability != crate::structs::snapshot::SnapshotDurability::Store {
-            bail!(
-                "task {name} is a session task and sets suspend with durability = \"local\". A \
-                 promoted session's node is wherever its envelope had room, so its checkpoint \
-                 must be published\nHint: set suspend.durability = \"store\""
-            );
-        }
+        // `durability = "local"` is valid (session durability plan §6.6): an
+        // unpromoted session sleeps on its own node, pinned until
+        // `suspend.keepFor`, and a promoted one is a keyed instance whose
+        // local checkpoint resumes on its node like any other.
         if resolved.reserve != crate::structs::suspend::SuspendReserve::NONE {
             bail!(
                 "task {name} is a session task and sets suspend.reserve. The envelope is the \
@@ -442,6 +501,7 @@ mod session_test {
                 constraints: json!([{ "key": "rack", "operator": "=", "value": "r1" }]),
             }),
             promote: None,
+            fence_after: None,
         });
         task
     }
@@ -563,6 +623,27 @@ mod session_test {
         });
         let err = validate_session_task(&task).expect_err("no cpu");
         assert!(err.to_string().contains("does not set cpu"), "{err}");
+        Ok(())
+    }
+
+    /// Session durability plan §6.6: a session may sleep on its own node.
+    #[test]
+    fn a_session_may_suspend_locally_but_not_reserve_test() -> R<()> {
+        let mut config = job(vec![session_task()]);
+        normalize_session_tasks(&mut config)?;
+        let mut task = config.tasks[0].clone();
+        task.suspend = Some(serde_json::from_value(json!({
+            "durability": "local",
+            "idle": { "after": "3m" },
+            "keepFor": "2h",
+            "onWorkerStop": "checkpoint",
+        }))?);
+        validate_session_task(&task)?;
+        crate::structs::suspend::validate_suspend(&task).map_err(|err| anyhow!(err))?;
+
+        task.suspend = Some(serde_json::from_value(json!({ "reserve": 0.5 }))?);
+        let err = validate_session_task(&task).expect_err("reserve");
+        assert!(err.to_string().contains("envelope is the"), "{err}");
         Ok(())
     }
 

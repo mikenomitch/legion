@@ -35,11 +35,6 @@ const ROUTER_ATTEMPTS: usize = 3;
 /// Bound on one start or stop call to a worker.
 const WORKER_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// When an idempotent create checks whether a retry raced its session onto
-/// a second node: two heartbeats at the default cadence, by which time both
-/// copies have reported.
-const DUPLICATE_CHECK_AFTER: Duration = Duration::from_secs(20);
-
 /// A recent start stands in for a node report when the start was issued
 /// after the report, less this allowance for clock skew between managers.
 const RECENT_SKEW_MS: i64 = 1_000;
@@ -146,19 +141,19 @@ pub fn merge(replies: Vec<QuerySessionsReply>, now_ms: i64) -> SessionView {
     }
 }
 
-/// Of the copies of one session id, the one that stays (the earliest lease,
-/// ties broken by node id) and the ones that should stop.
+/// Of the copies of one session id, the one that stays and the ones that
+/// should stop. The higher generation wins (a copy resumed from a newer
+/// checkpoint holds the newer state); then the earliest lease; then the
+/// lower node id, so every manager picks the same copy.
 pub fn winner(mut copies: Vec<IndexedSession>) -> Option<(IndexedSession, Vec<IndexedSession>)> {
     copies.sort_by(|a, b| {
         let key = |entry: &IndexedSession| {
-            (
-                entry
-                    .status
-                    .as_ref()
-                    .map(|status| status.lease_issued_at_unix_ms)
-                    .unwrap_or_default(),
-                entry.node_id.clone(),
-            )
+            let (generation, lease) = entry
+                .status
+                .as_ref()
+                .map(|status| (status.generation, status.lease_issued_at_unix_ms))
+                .unwrap_or_default();
+            (std::cmp::Reverse(generation), lease, entry.node_id.clone())
         };
         key(a).cmp(&key(b))
     });
@@ -170,9 +165,22 @@ pub fn winner(mut copies: Vec<IndexedSession>) -> Option<(IndexedSession, Vec<In
 /// The running session with this id, if any: the surviving copy, with a stop
 /// sent to any later copy. An id without the minted shape is never a session,
 /// so it is answered without asking the peers.
+///
+/// An id that carries a node tag is asked of that node first
+/// (`Worker.GetSession`): one call instead of a fan-out. The node's answer is
+/// final when it has the session or says it never had it; a node that does
+/// not answer, a tag no live node has, or a node that says the tag is not
+/// its own falls back to the merged view.
 pub async fn find(store: &Store, session_id: &str) -> Option<IndexedSession> {
     if !crate::structs::is_minted_instance_id(session_id) {
         return None;
+    }
+    if let Some(tag) = crate::structs::session_node_tag(session_id) {
+        match probe_tagged(store, session_id, tag).await {
+            Probe::Found(entry) => return Some(*entry),
+            Probe::Absent => return None,
+            Probe::Unknown => {}
+        }
     }
     let view = query(
         store,
@@ -185,6 +193,543 @@ pub async fn find(store: &Store, session_id: &str) -> Option<IndexedSession> {
     let (kept, later) = winner(view.sessions)?;
     stop_duplicates(store, later);
     Some(kept)
+}
+
+/// What the node a session id names said about it.
+enum Probe {
+    Found(Box<IndexedSession>),
+    /// The node answered and does not hold the session.
+    Absent,
+    /// No answer worth trusting: fall back to the merged view.
+    Unknown,
+}
+
+/// How long the tag-to-node map is reused before the node list is read again.
+const NODE_TAG_TTL: Duration = Duration::from_secs(5);
+
+struct NodeTags {
+    read_at: Instant,
+    by_tag: HashMap<String, Vec<String>>,
+}
+
+fn node_tag_cache() -> &'static Mutex<HashMap<usize, NodeTags>> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, NodeTags>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The nodes whose tag is `tag` (almost always one). Read from the store's
+/// node list at most every [`NODE_TAG_TTL`]; a miss re-reads once, so a node
+/// that joined since is found.
+pub fn nodes_for_tag(store: &Store, tag: &str) -> Vec<String> {
+    let key = std::sync::Arc::as_ptr(store.sessions()) as usize;
+    let lookup = |fresh: bool| -> Option<Vec<String>> {
+        let mut cache = node_tag_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let stale = cache
+            .get(&key)
+            .is_none_or(|tags| fresh || tags.read_at.elapsed() > NODE_TAG_TTL);
+        if stale {
+            let mut by_tag: HashMap<String, Vec<String>> = HashMap::new();
+            for node_id in store.cached_node_ids().unwrap_or_default() {
+                by_tag
+                    .entry(crate::structs::node_tag(&node_id))
+                    .or_default()
+                    .push(node_id);
+            }
+            cache.insert(
+                key,
+                NodeTags {
+                    read_at: Instant::now(),
+                    by_tag,
+                },
+            );
+        }
+        cache
+            .get(&key)
+            .and_then(|tags| tags.by_tag.get(tag).cloned())
+    };
+    lookup(false).or_else(|| lookup(true)).unwrap_or_default()
+}
+
+async fn probe_tagged(store: &Store, session_id: &str, tag: &str) -> Probe {
+    let nodes = nodes_for_tag(store, tag);
+    if nodes.is_empty() {
+        return Probe::Unknown;
+    }
+    let mut absent = 0;
+    for node_id in &nodes {
+        match get_on_node(store, node_id, session_id).await {
+            Ok(Some(status)) => {
+                return Probe::Found(Box::new(IndexedSession {
+                    node_id: node_id.clone(),
+                    status: Some(status),
+                    recent: false,
+                }))
+            }
+            Ok(None) => absent += 1,
+            Err(err) => {
+                debug!(session_id, node_id = %node_id, error = %err, "Session probe failed");
+            }
+        }
+    }
+    if absent == nodes.len() {
+        Probe::Absent
+    } else {
+        Probe::Unknown
+    }
+}
+
+/// Ask one node for a session (`Worker.GetSession`). `Ok(None)` when the
+/// node answers that it does not hold it (never had it, or evicted it);
+/// a `wrong_node` answer is an error, so the caller looks elsewhere.
+pub async fn get_on_node(
+    store: &Store,
+    node_id: &str,
+    session_id: &str,
+) -> Result<Option<SessionStatus>, Status> {
+    let (mut client, target) = worker_client(store, node_id)?;
+    let mut request = tonic::Request::new(crate::structs::GetSessionRequest {
+        session_id: session_id.to_string(),
+        ticket: String::new(),
+    });
+    request.set_timeout(WORKER_CALL_TIMEOUT);
+    match client.get_session(request).await {
+        Ok(reply) => Ok(reply.into_inner().session),
+        Err(status)
+            if status.code() == tonic::Code::NotFound
+                && !status.message().starts_with("wrong_node:") =>
+        {
+            Ok(None)
+        }
+        Err(status) => Err(crate::manager::worker_plane::worker_call_error(
+            &target.node_id,
+            &target.address,
+            status,
+        )),
+    }
+}
+
+/// How often each manager sweeps the derived ids newly reported to it for
+/// copies on nodes that heartbeat to other managers.
+pub const DUPLICATE_SWEEP_EVERY: Duration = Duration::from_secs(1);
+
+/// Ids per peer query in one sweep.
+const DUPLICATE_SWEEP_BATCH: usize = 2_000;
+
+/// The managers' batched duplicate sweep (session durability plan §6.7,
+/// mechanism 3): ask every peer, in one call per batch, about the untagged
+/// (derived) session ids newly reported here, and stop the losing copy of
+/// any id two nodes run. Only derived ids can be held twice: a minted id
+/// carries its node's tag. Returns how many copies it asked to stop.
+pub async fn sweep_duplicates(store: &Store) -> usize {
+    let ids = store.sessions().take_sweep_ids();
+    let mut stopped = 0;
+    for batch in ids.chunks(DUPLICATE_SWEEP_BATCH) {
+        let view = query(
+            store,
+            QuerySessionsRequest {
+                session_ids: batch.to_vec(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut by_id: HashMap<String, Vec<IndexedSession>> = HashMap::new();
+        for entry in view.sessions {
+            let Some(id) = entry.status.as_ref().map(|s| s.session_id.clone()) else {
+                continue;
+            };
+            by_id.entry(id).or_default().push(entry);
+        }
+        for copies in by_id.into_values().filter(|copies| copies.len() > 1) {
+            if let Some((_, later)) = winner(copies) {
+                stopped += later.len();
+                stop_duplicates(store, later);
+            }
+        }
+    }
+    stopped
+}
+
+/// Bound on a suspend or resume call to a worker: a memory capture or a
+/// restore of a large guest takes longer than a start or a stop.
+const SLEEP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Where a session is, for the verbs that must reach it (suspend, start,
+/// get). Unlike [`find`], it keeps apart the answers a caller words
+/// differently: a node that evicted the session, and a node that holds it
+/// but cannot be reached.
+#[derive(Debug)]
+pub enum Located {
+    Found(Box<IndexedSession>),
+    /// The node evicted the session's checkpoint; the message is the node's
+    /// own (`session X was evicted from NODE at TIME (reason); …`), with
+    /// its `\nHint:` line.
+    Evicted(String),
+    /// The id's tag names a node, the node did not answer, and no manager's
+    /// index has the session either. The status is the UNAVAILABLE answer.
+    Unreachable(Status),
+    NotFound,
+}
+
+/// What one node answered to `Worker.GetSession`.
+enum NodeAnswer {
+    Holds(SessionStatus),
+    Absent,
+    Evicted(String),
+    /// The id's tag is not this node's (a stale tag map): ask elsewhere.
+    WrongNode,
+    Failed(Status),
+}
+
+async fn ask_node(store: &Store, node_id: &str, session_id: &str) -> NodeAnswer {
+    ask_node_within(store, node_id, session_id, WORKER_CALL_TIMEOUT).await
+}
+
+async fn ask_node_within(
+    store: &Store,
+    node_id: &str,
+    session_id: &str,
+    timeout: Duration,
+) -> NodeAnswer {
+    let (mut client, target) = match worker_client(store, node_id) {
+        Ok(found) => found,
+        Err(status) => return NodeAnswer::Failed(status),
+    };
+    let mut request = tonic::Request::new(crate::structs::GetSessionRequest {
+        session_id: session_id.to_string(),
+        ticket: String::new(),
+    });
+    request.set_timeout(timeout);
+    match client.get_session(request).await {
+        Ok(reply) => match reply.into_inner().session {
+            Some(status) => NodeAnswer::Holds(status),
+            None => NodeAnswer::Absent,
+        },
+        Err(status) if status.code() == tonic::Code::NotFound => {
+            let message = status.message();
+            if let Some(rest) = message.strip_prefix("evicted:") {
+                NodeAnswer::Evicted(rest.trim_start().to_string())
+            } else if message.starts_with("wrong_node:") {
+                NodeAnswer::WrongNode
+            } else {
+                NodeAnswer::Absent
+            }
+        }
+        Err(status) => NodeAnswer::Failed(crate::manager::worker_plane::worker_call_error(
+            &target.node_id,
+            &target.address,
+            status,
+        )),
+    }
+}
+
+/// Find a session for a verb that must reach it. The tagged node is asked
+/// first; when it does not answer, the merged index stands in (a node can
+/// be unreachable from this manager and still heartbeat to another), and
+/// only when that has nothing either is the answer [`Located::Unreachable`].
+pub async fn locate(store: &Store, session_id: &str) -> Located {
+    if !crate::structs::is_minted_instance_id(session_id) {
+        return Located::NotFound;
+    }
+    let mut unreachable: Option<(String, Status)> = None;
+    if let Some(tag) = crate::structs::session_node_tag(session_id) {
+        let nodes = nodes_for_tag(store, tag);
+        let mut absent = 0;
+        for node_id in &nodes {
+            match ask_node(store, node_id, session_id).await {
+                NodeAnswer::Holds(status) => {
+                    return Located::Found(Box::new(IndexedSession {
+                        node_id: node_id.clone(),
+                        status: Some(status),
+                        recent: false,
+                    }))
+                }
+                NodeAnswer::Evicted(message) => return Located::Evicted(message),
+                NodeAnswer::Absent => absent += 1,
+                NodeAnswer::WrongNode => {}
+                NodeAnswer::Failed(status) => {
+                    debug!(session_id, node_id = %node_id, error = %status, "Session probe failed");
+                    unreachable.get_or_insert((node_id.clone(), status));
+                }
+            }
+        }
+        if !nodes.is_empty() && absent == nodes.len() {
+            return Located::NotFound;
+        }
+    }
+    let view = query(
+        store,
+        QuerySessionsRequest {
+            session_id: session_id.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    if let Some((kept, later)) = winner(view.sessions) {
+        stop_duplicates(store, later);
+        return Located::Found(Box::new(kept));
+    }
+    match unreachable {
+        Some((node_id, status)) => {
+            Located::Unreachable(unreachable_answer(store, &node_id, session_id, &status))
+        }
+        None => Located::NotFound,
+    }
+}
+
+/// The UNAVAILABLE answer for a session whose node does not answer: which
+/// node, what the cluster last knew of it, and that the session is not
+/// lost — a local session lives only there, so the caller waits for the
+/// node rather than starting over.
+pub fn unreachable_answer(
+    store: &Store,
+    node_id: &str,
+    session_id: &str,
+    cause: &Status,
+) -> Status {
+    let heard = store
+        .get_node(node_id)
+        .ok()
+        .map(|node| {
+            let age = time::OffsetDateTime::parse(
+                &node.last_heartbeat,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()
+            .map(|at| {
+                (time::OffsetDateTime::now_utc() - at)
+                    .whole_seconds()
+                    .max(0)
+            });
+            match age {
+                Some(secs) => format!(
+                    "is {} and has not been heard from for {}",
+                    node.status,
+                    humantime::format_duration(Duration::from_secs(secs as u64))
+                ),
+                None => format!("is {}", node.status),
+            }
+        })
+        .unwrap_or_else(|| "is not in the node list".to_string());
+    let cause = cause
+        .message()
+        .split("\nHint:")
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    Status::unavailable(format!(
+        "node {node_id} holds session {session_id} and {heard} ({cause})\nHint: a session \
+         lives on its node; retry when the node is back (`legion node info {node_id}`)"
+    ))
+}
+
+/// Suspend sessions on one node (`Worker.SuspendSessions`).
+pub async fn suspend_on_node(
+    store: &Store,
+    node_id: &str,
+    session_ids: &[String],
+    reason: &str,
+) -> Result<crate::structs::SuspendSessionsReply, Status> {
+    let (mut client, target) = worker_client(store, node_id)?;
+    let mut request = tonic::Request::new(crate::structs::SuspendSessionsRequest {
+        session_ids: session_ids.to_vec(),
+        reason: reason.to_string(),
+    });
+    request.set_timeout(SLEEP_CALL_TIMEOUT);
+    client
+        .suspend_sessions(request)
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|status| {
+            let status = crate::manager::worker_plane::worker_call_error(
+                &target.node_id,
+                &target.address,
+                status,
+            );
+            if crate::manager::worker_plane::is_unreachable(&status) {
+                unreachable_answer(store, node_id, &session_ids.join(", "), &status)
+            } else {
+                status
+            }
+        })
+}
+
+/// Resume a suspended session on a node (`Worker.ResumeSession`). The
+/// node's own answers pass through: RESOURCE_EXHAUSTED when the envelope is
+/// full (the checkpoint stays), NOT_FOUND `evicted:` when it was evicted
+/// meanwhile. `from_manifest` names the session's job and task: the node
+/// then resumes a `store` session from its manifest even if it never held
+/// it, moving it (only with `force_move` when the manifest says another
+/// node runs it).
+pub async fn resume_on_node(
+    store: &Store,
+    node_id: &str,
+    session_id: &str,
+    cold: bool,
+    from_manifest: Option<(&str, &str)>,
+    force_move: bool,
+) -> Result<crate::structs::ResumeSessionReply, Status> {
+    let (mut client, target) = worker_client(store, node_id)?;
+    let (job_id, task_name) = from_manifest.unwrap_or_default();
+    let mut request = tonic::Request::new(crate::structs::ResumeSessionRequest {
+        session_id: session_id.to_string(),
+        cold,
+        job_id: job_id.to_string(),
+        task_name: task_name.to_string(),
+        force_move,
+    });
+    request.set_timeout(SLEEP_CALL_TIMEOUT);
+    client
+        .resume_session(request)
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|status| {
+            let status = crate::manager::worker_plane::worker_call_error(
+                &target.node_id,
+                &target.address,
+                status,
+            );
+            if crate::manager::worker_plane::is_unreachable(&status) {
+                unreachable_answer(store, node_id, session_id, &status)
+            } else if let Some(rest) = status.message().strip_prefix("evicted:") {
+                Status::not_found(rest.trim_start().to_string())
+            } else {
+                status
+            }
+        })
+}
+
+/// How long the manager waits for the node a `store` session's manifest
+/// names before it calls that node unreachable (session durability plan
+/// §6.7, "Moving is cautious for running sessions").
+pub const MOVE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What [`resume_store_session`] found.
+#[derive(Debug)]
+pub enum StoreResume {
+    /// Resumed on `node_id` from the session's manifest.
+    Resumed {
+        node_id: String,
+        reply: Box<crate::structs::ResumeSessionReply>,
+    },
+    /// It runs on `node_id` already (it moved there earlier, and the node
+    /// its id is tagged with no longer holds it).
+    Running { node_id: String },
+}
+
+/// Whether the node row says the node is gone: `down`, `lost`, or no row.
+fn node_is_down(store: &Store, node_id: &str) -> bool {
+    store
+        .get_node(node_id)
+        .map(|node| node.status == "down" || node.status == "lost")
+        .unwrap_or(true)
+}
+
+/// Resume a `store` session from its manifest on a node with room (session
+/// durability plan §6.6, "Resume"): the node its id is tagged with lost it,
+/// evicted its local copy, is full, or does not answer. Nodes are tried in
+/// the router's order. A node that finds the manifest naming another node
+/// as running the session answers `running_elsewhere`; the manager then
+/// probes that node itself (`GetSession`, [`MOVE_PROBE_TIMEOUT`]): running
+/// there, the answer is that it runs; not there, the move goes ahead; no
+/// answer, it goes ahead only when that node is marked down (or lost) or the
+/// caller passed `force_move`, and otherwise answers UNAVAILABLE.
+pub async fn resume_store_session(
+    store: &Store,
+    job_id: &str,
+    task: &TaskConfig,
+    session_id: &str,
+    cold: bool,
+    force_move: bool,
+) -> Result<StoreResume, Status> {
+    let view = room_view(store, job_id, &task.name).await?;
+    let needs = resource_amounts(&task.resources);
+    let candidates = rank(&view, &needs);
+    if candidates.is_empty() {
+        return Err(Status::resource_exhausted(format!(
+            "no envelope for {job_id}/{} has room to resume session {session_id} ({} nodes); \
+             its checkpoint stays in the content store, retry once sessions end",
+            task.name,
+            view.envelopes.len()
+        )));
+    }
+    let mut refusals = Vec::new();
+    for node_id in candidates.into_iter().take(ROUTER_ATTEMPTS) {
+        let mut force = force_move;
+        for _ in 0..2 {
+            let answer = resume_on_node(
+                store,
+                &node_id,
+                session_id,
+                cold,
+                Some((job_id, &task.name)),
+                force,
+            )
+            .await;
+            let status = match answer {
+                Ok(reply) => {
+                    return Ok(StoreResume::Resumed {
+                        node_id,
+                        reply: Box::new(reply),
+                    })
+                }
+                Err(status) => status,
+            };
+            let elsewhere = status.code() == tonic::Code::FailedPrecondition
+                && status.message().starts_with("running_elsewhere:");
+            if !elsewhere || force {
+                match status.code() {
+                    // The manifest is gone, the claim was lost, or the
+                    // caller cannot see it: the same everywhere.
+                    tonic::Code::NotFound
+                    | tonic::Code::Aborted
+                    | tonic::Code::PermissionDenied => return Err(status),
+                    _ => {
+                        if matches!(
+                            status.code(),
+                            tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
+                        ) {
+                            note_in_view(store, job_id, &task.name, &node_id, NoteUse::Full);
+                        }
+                        refusals.push(format!("{node_id}: {}", status.message()));
+                        break;
+                    }
+                }
+            }
+            let Some((holder, generation)) =
+                crate::session_manifest::winner_from_message(status.message())
+            else {
+                return Err(status);
+            };
+            match ask_node_within(store, &holder, session_id, MOVE_PROBE_TIMEOUT).await {
+                NodeAnswer::Holds(found) if found.state != "suspended" => {
+                    return Ok(StoreResume::Running { node_id: holder });
+                }
+                NodeAnswer::Holds(_)
+                | NodeAnswer::Absent
+                | NodeAnswer::Evicted(_)
+                | NodeAnswer::WrongNode => force = true,
+                NodeAnswer::Failed(cause) => {
+                    if !node_is_down(store, &holder) {
+                        return Err(Status::unavailable(format!(
+                            "running_elsewhere: session {session_id} runs on node {holder} \
+                             (generation {generation}), which did not answer within {}s ({}). \
+                             Its node is not marked down, so the session was not moved\nHint: \
+                             retry when the node is back, or pass --force-move once you know \
+                             it is down [winner node={holder} generation={generation}]",
+                            MOVE_PROBE_TIMEOUT.as_secs(),
+                            cause.message().split("\nHint:").next().unwrap_or_default()
+                        )));
+                    }
+                    force = true;
+                }
+            }
+        }
+    }
+    Err(Status::resource_exhausted(format!(
+        "no node resumed session {session_id} ({}); its checkpoint stays in the content store, \
+         retry once sessions end",
+        refusals.join("; ")
+    )))
 }
 
 /// Stop the later copies of a duplicated session, in the background.
@@ -264,6 +809,7 @@ pub fn instance_info(entry: &IndexedSession, group: &str) -> InstanceInfo {
         mode: crate::structs::InstanceMode::Session.to_string(),
         state: match status.state.as_str() {
             "running" => "active",
+            "suspended" => "suspended",
             _ => "pending",
         }
         .to_string(),
@@ -461,10 +1007,113 @@ fn rank(view: &RoomView, needs: &BTreeMap<String, f64>) -> Vec<String> {
     ranked.into_iter().map(|(_, node_id)| node_id).collect()
 }
 
+/// Every node holding an envelope for a session task, for an edge picker
+/// (`Manager.ListSessionNodes`). Read from the store's envelope rows and
+/// node rows plus the session index's usage; no node is called.
+pub async fn session_nodes(
+    store: &Store,
+    job_id: &str,
+    task: &TaskConfig,
+) -> Result<Vec<crate::structs::SessionNode>, Status> {
+    let envelopes = placed_envelopes(store, job_id, &task.name)
+        .map_err(|err| Status::internal(format!("failed to read envelopes: {err:#}")))?;
+    let usage = query(
+        store,
+        QuerySessionsRequest {
+            job_id: job_id.to_string(),
+            task_name: task.name.clone(),
+            usage_only: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .usage;
+    let needs = resource_amounts(&task.resources);
+    let mut nodes: Vec<crate::structs::SessionNode> = envelopes
+        .into_iter()
+        .map(|envelope| {
+            let node = store.get_node(&envelope.node_id).ok();
+            let used = usage.get(&envelope.node_id);
+            let room: BTreeMap<String, f64> = envelope
+                .room
+                .iter()
+                .map(|(name, amount)| {
+                    let taken = used
+                        .and_then(|used| used.amounts.get(name))
+                        .copied()
+                        .unwrap_or(0.0);
+                    (name.clone(), (amount - taken).max(0.0))
+                })
+                .collect();
+            let weight = fits(&room, &needs);
+            let address = node
+                .as_ref()
+                .and_then(crate::manager::worker_plane::worker_address)
+                .unwrap_or_default();
+            let reason = match &node {
+                None => "lost",
+                Some(node) if node.status == "lost" => "lost",
+                Some(node) if node.status != "ready" => "down",
+                Some(node) if node.availability == "draining" || node.availability == "drained" => {
+                    "draining"
+                }
+                Some(node) if node.availability != "available" => "ineligible",
+                Some(_) if address.is_empty() => "no-address",
+                Some(node)
+                    if !crate::structs::snapshot::node_advertises(
+                        node,
+                        crate::structs::session::EDGE_SESSIONS_CAPABILITY,
+                    ) =>
+                {
+                    "no-edge-sessions"
+                }
+                Some(_) if weight == 0 => "full",
+                Some(_) => "",
+            };
+            crate::structs::SessionNode {
+                tag: crate::structs::node_tag(&envelope.node_id),
+                node_id: envelope.node_id,
+                address,
+                accepting: reason.is_empty(),
+                reason: reason.to_string(),
+                room: serde_json::to_string(&room).unwrap_or_else(|_| "{}".into()),
+                weight,
+                sessions: used.map(|used| used.sessions).unwrap_or(0),
+            }
+        })
+        .collect();
+    nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    Ok(nodes)
+}
+
+/// How many sessions needing `needs` fit in `room`. A resource the session
+/// does not size does not bound it; a session that sizes nothing fits
+/// without bound (reported as `u32::MAX`).
+fn fits(room: &BTreeMap<String, f64>, needs: &BTreeMap<String, f64>) -> u32 {
+    let mut fit = f64::INFINITY;
+    for (name, need) in needs {
+        if *need <= 0.0 {
+            continue;
+        }
+        let Some(left) = room.get(name) else {
+            continue;
+        };
+        fit = fit.min((left / need + 1e-9).floor());
+    }
+    if fit.is_infinite() {
+        u32::MAX
+    } else {
+        fit.clamp(0.0, u32::MAX as f64) as u32
+    }
+}
+
 /// A session the router started (or found running, for a retried
 /// idempotent create).
 #[derive(Debug, Clone)]
 pub struct StartedSession {
+    /// The session's id: the derived id when one was asked for, else the id
+    /// minted for the node that took it (it carries that node's tag).
+    pub session_id: String,
     pub node_id: String,
     pub state: String,
     pub deduplicated: bool,
@@ -472,21 +1121,24 @@ pub struct StartedSession {
 
 /// Start an unnamed session of a session task: pick a node whose envelope
 /// has room, send it the start, and try the next node if it refuses.
-/// `derived` says the id came from an idempotency key, which makes a retry
-/// find the running session instead of starting a second.
+/// `derived_id` is the id an idempotency key derived, which makes a retry
+/// find the running session instead of starting a second. Without one, each
+/// attempt mints an id carrying the tag of the node it is sent to
+/// ([`crate::structs::mint_session_id`]), so a later read goes straight to
+/// that node.
 pub async fn start(
     store: &Store,
     config: &JobConfig,
     task: &TaskConfig,
-    session_id: &str,
-    derived: bool,
+    derived_id: Option<&str>,
 ) -> Result<StartedSession, Status> {
     let metrics = crate::manager::telemetry::metrics();
     let job_id = config.name.as_str();
-    if derived {
+    if let Some(session_id) = derived_id {
         if let Some(existing) = find(store, session_id).await {
             metrics.session_starts_total.inc(&["deduplicated"]);
             return Ok(StartedSession {
+                session_id: session_id.to_string(),
                 node_id: existing.node_id.clone(),
                 state: existing
                     .status
@@ -536,6 +1188,14 @@ pub async fn start(
     let mut refusals = Vec::new();
     for node_id in candidates.into_iter().take(ROUTER_ATTEMPTS) {
         let issued_at = now_unix_ms();
+        let minted;
+        let session_id = match derived_id {
+            Some(id) => id,
+            None => {
+                minted = crate::structs::mint_session_id(&task.name, &node_id);
+                minted.as_str()
+            }
+        };
         match send_start(
             store,
             config,
@@ -558,6 +1218,7 @@ pub async fn start(
                     state: "starting".into(),
                     lease_issued_at_unix_ms: issued_at,
                     resources: task.resources.to_string(),
+                    ..Default::default()
                 };
                 store
                     .sessions()
@@ -570,17 +1231,31 @@ pub async fn start(
                     NoteUse::Started(session_amounts(&status)),
                 );
                 metrics.session_starts_total.inc(&["started"]);
-                if derived {
-                    schedule_duplicate_check(store, session_id);
-                }
                 debug!(session_id, node_id = %node_id, "Session started");
                 return Ok(StartedSession {
+                    session_id: session_id.to_string(),
                     node_id,
                     state: "starting".into(),
                     deduplicated: false,
                 });
             }
             Err(status) => {
+                // An idempotent `store` start that another node created
+                // first (session durability plan §6.7, row 3): the session
+                // exists, on the node the refusal names.
+                if status.code() == tonic::Code::AlreadyExists {
+                    if let Some((winner, _)) =
+                        crate::session_manifest::winner_from_message(status.message())
+                    {
+                        metrics.session_starts_total.inc(&["deduplicated"]);
+                        return Ok(StartedSession {
+                            session_id: session_id.to_string(),
+                            node_id: winner,
+                            state: "running".into(),
+                            deduplicated: true,
+                        });
+                    }
+                }
                 if matches!(
                     status.code(),
                     tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
@@ -704,17 +1379,6 @@ fn worker_client(
     Ok((client, target))
 }
 
-/// After an idempotent start, look for a copy a concurrent retry started on
-/// another node (through another manager), and stop the later one.
-fn schedule_duplicate_check(store: &Store, session_id: &str) {
-    let store = store.clone();
-    let session_id = session_id.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(DUPLICATE_CHECK_AFTER).await;
-        let _ = find(&store, &session_id).await;
-    });
-}
-
 #[cfg(test)]
 mod sessions_test {
     use super::*;
@@ -730,6 +1394,7 @@ mod sessions_test {
             state: "running".into(),
             lease_issued_at_unix_ms: iat,
             resources: r#"{"cpu":500,"memory":512}"#.into(),
+            ..Default::default()
         }
     }
 
@@ -839,5 +1504,15 @@ mod sessions_test {
             rank(&view, &needs),
             vec!["idle".to_string(), "busy".to_string()]
         );
+    }
+
+    #[test]
+    fn the_node_list_weighs_room_in_sessions_of_the_task_size_test() {
+        let room = BTreeMap::from([("cpu".to_string(), 2100.0), ("memory".to_string(), 512.0)]);
+        let needs = BTreeMap::from([("cpu".to_string(), 500.0), ("memory".to_string(), 128.0)]);
+        assert_eq!(fits(&room, &needs), 4);
+        let tight = BTreeMap::from([("cpu".to_string(), 499.0)]);
+        assert_eq!(fits(&tight, &needs), 0);
+        assert_eq!(fits(&room, &BTreeMap::new()), u32::MAX);
     }
 }

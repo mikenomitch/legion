@@ -102,6 +102,11 @@ fn default_plugin_root(exe_dir: Option<&Path>, build_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| build_dir.join("plugins"))
 }
 
+/// Wall-clock now, in unix milliseconds.
+pub fn now_unix_ms() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,10 +1,9 @@
-use crate::prelude::*;
-
 use crate::manager::blocked::PlacementBlocked;
 use crate::manager::concurrency::{is_planning_kind, PlannerPermit};
 use crate::manager::oidc_http::OidcHttpLayer;
 use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
+use crate::prelude::*;
 use crate::storage::events::drafts;
 use crate::storage::persistence::PersistenceRole;
 use crate::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion, Store};
@@ -26,6 +25,9 @@ use tokio::task::JoinSet;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+
+/// Largest request the manager's gRPC service decodes.
+pub const MANAGER_MAX_DECODE_BYTES: usize = 64 * 1024 * 1024;
 
 // Fallback poll interval used only when delay calculation fails.
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -456,6 +458,21 @@ pub async fn run_manager_with(
 
     let store_for_rotation = store.clone();
 
+    // The managers' batched duplicate sweep for sessions
+    // (docs/session-mode.md, "Duplicates").
+    let sweep_store = store.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(crate::manager::sessions::DUPLICATE_SWEEP_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let stopped = crate::manager::sessions::sweep_duplicates(&sweep_store).await;
+            if stopped > 0 {
+                debug!(stopped, "Session duplicate sweep stopped later copies");
+            }
+        }
+    });
+
     // Read-model maintenance on every manager (each holds its own cache):
     // rebuild after an outside commit to the state database, and reload a
     // rotating slice of nodes so drift from any source heals within one
@@ -602,7 +619,11 @@ pub async fn run_manager_with(
     // The idle sweep reads the usage table heartbeats fill, so it shares
     // the service's handle.
     let usage_for_idle_sweep = manager_node.usage_handle();
-    let manager_service = ManagerServer::new(manager_node);
+    // A worker's full session report carries every session it holds (about
+    // 200 bytes each); tonic's 4 MiB default would cap a node near 20,000
+    // sessions. 64 MiB covers about 300,000 (session durability plan §6.5).
+    let manager_service =
+        ManagerServer::new(manager_node).max_decoding_message_size(MANAGER_MAX_DECODE_BYTES);
     // Browser origins (docs/ui-architecture.md): loopback plus
     // `server.allowedOrigins`. The guard refuses everything else before any
     // handler runs; CORS only echoes the allowed origin back.
@@ -3505,18 +3526,27 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 format!("invalid contentStore config in worker config {path_str}")
             })?;
         }
+        if let Some(sessions) = wcp.sessions.as_ref() {
+            sessions
+                .fence_list_every()
+                .with_context(|| format!("invalid sessions config in worker config {path_str}"))?;
+        }
         // The top-level `content` and `contentStore` blocks ride in the
         // artifacts payload (see `WorkerArtifactsPayload`).
-        let artifacts =
-            if wcp.artifacts.is_none() && wcp.content.is_none() && wcp.content_store.is_none() {
-                String::new()
-            } else {
-                serde_json::to_string(&crate::structs::WorkerArtifactsPayload {
-                    artifacts: wcp.artifacts.clone().unwrap_or_default(),
-                    content: wcp.content.clone(),
-                    content_store: wcp.content_store.clone(),
-                })?
-            };
+        let artifacts = if wcp.artifacts.is_none()
+            && wcp.content.is_none()
+            && wcp.content_store.is_none()
+            && wcp.sessions.is_none()
+        {
+            String::new()
+        } else {
+            serde_json::to_string(&crate::structs::WorkerArtifactsPayload {
+                artifacts: wcp.artifacts.clone().unwrap_or_default(),
+                content: wcp.content.clone(),
+                content_store: wcp.content_store.clone(),
+                sessions: wcp.sessions.clone(),
+            })?
+        };
 
         // Host volumes are validated here so a typo (a relative path) fails at
         // manager startup rather than at a task's first mount.

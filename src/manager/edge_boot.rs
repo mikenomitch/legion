@@ -386,6 +386,102 @@ pub fn mint(
     })
 }
 
+/// Value the stored ticket row's `gate` column holds for a session ticket,
+/// which has no gate: the row is the boot ticket table's, unchanged.
+pub const SESSION_TICKET_GATE: &str = "session";
+
+/// What a session ticket mint asks for (session durability plan §6.4).
+#[derive(Debug, Clone)]
+pub struct SessionTicketRequest {
+    pub job: String,
+    pub task: String,
+    pub pool: String,
+    pub ttl: Duration,
+    pub accessor_id: String,
+}
+
+/// Validate a session ticket mint: the task must be a session task, and the
+/// lifetime within `edgeBoot.maxTicketTtl`.
+pub fn validate_session_ticket_request(
+    request: &SessionTicketRequest,
+    task: &TaskConfig,
+    config: &EdgeBootConfigFull,
+) -> R<()> {
+    if request.job.trim().is_empty() || request.task.trim().is_empty() {
+        bail!("a session ticket must name a job and a session task");
+    }
+    if !crate::structs::session::is_session_task(task) {
+        bail!(
+            "task {} is not a session task (stateful.mode = \"session\"); a session ticket \
+             starts sessions, so mint a boot ticket (the default scope) for it instead",
+            request.task
+        );
+    }
+    if request.pool.trim().is_empty() {
+        bail!("a session ticket must name the node pool it may be redeemed in");
+    }
+    let max_ttl = humantime::parse_duration(config.max_ticket_ttl.trim())
+        .context("invalid edgeBoot.maxTicketTtl")?;
+    if request.ttl > max_ttl {
+        bail!(
+            "requested ticket TTL {} exceeds edgeBoot.maxTicketTtl {}",
+            humantime::format_duration(request.ttl),
+            humantime::format_duration(max_ttl)
+        );
+    }
+    if request.ttl.is_zero() {
+        bail!("a session ticket TTL must be greater than zero");
+    }
+    Ok(())
+}
+
+/// Mint and sign a session ticket. The caller records
+/// [`MintedTicket::record`].
+pub fn mint_session_ticket(
+    identity: &WorkloadIdentityState,
+    request: &SessionTicketRequest,
+    job_config_id: &str,
+    jti: &str,
+    now: SystemTime,
+) -> R<MintedTicket> {
+    let iat = now
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the unix epoch")?
+        .as_secs();
+    let exp = iat + request.ttl.as_secs();
+    let mut claims: Map<String, Value> = Map::new();
+    claims.insert(
+        CLAIM_SCOPE.into(),
+        json!(crate::structs::edge_boot::SESSION_TICKET_SCOPE),
+    );
+    claims.insert(CLAIM_JOB.into(), json!(request.job));
+    claims.insert(CLAIM_TASK.into(), json!(request.task));
+    claims.insert(CLAIM_POOL.into(), json!(request.pool));
+    claims.insert(CLAIM_USES.into(), json!(0));
+    let subject = format!("session:{}/{}", request.job, request.task);
+    let issued = identity.issue_boot_ticket(jti, &subject, claims, iat, exp)?;
+    Ok(MintedTicket {
+        token: issued.token,
+        record: BootTicketRecord {
+            jti: jti.to_string(),
+            job: request.job.clone(),
+            task: request.task.clone(),
+            // For audit: the config current at mint. The ticket itself is
+            // not pinned to it; nodes start their envelope's spec.
+            job_config_id: job_config_id.to_string(),
+            instance_id: String::new(),
+            instance_prefix: String::new(),
+            pool: request.pool.clone(),
+            gate: SESSION_TICKET_GATE.to_string(),
+            uses: 0,
+            uses_spent: 0,
+            expires_at_unix: issued.expires_at as i64,
+            accessor_id: request.accessor_id.clone(),
+            created_at: Store::boot_ticket_now()?,
+        },
+    })
+}
+
 /// Re-verify a ticket presented with a ratification: its signature, its
 /// lifetime, and that it authorizes this instance in this node's pool.
 ///

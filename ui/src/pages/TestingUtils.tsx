@@ -1,10 +1,15 @@
-import { For, type JSX } from 'solid-js'
+import { For, Show, createMemo, createSignal, type JSX } from 'solid-js'
 import { CompactNodeUsage, NodeUsageCard } from '../components/NodeUsagePanel'
 import InstancesTable from '../components/InstancesTable'
+import InstancesPanel, { type InstanceListing } from '../components/InstancesPanel'
+import EnvelopeCard from '../components/EnvelopeCard'
+import SessionNodesCard from '../components/SessionNodesCard'
+import { largeSessionListing, listInstancesFrom, sessionIndex, sessionListing, sessionNodesFrom, type SessionIndex } from '../fixtures/sessions'
+import { SESSION_PAGE, countMap, createSessionPager, isSession, promoteBlocker } from '../utils/sessions'
 import { NodeContentCard } from '../components/NodeContentCard'
 import { InstanceEventSummary, PressureExplanation, PressureHistoryCard, SnapshotEventSummary } from '../components/PressureHistory'
 import { SnapshotHolders, SnapshotsTable } from '../components/SnapshotsPanel'
-import { Card, EmptyState, Note, PageHeader, SectionCard } from '../components/ui'
+import { Button, Card, EmptyState, Note, PageHeader, SectionCard } from '../components/ui'
 import {
   emptyNode,
   instanceEvents,
@@ -19,7 +24,7 @@ import {
   unreportedContent,
   unreportedNode,
 } from '../fixtures/suspendResume'
-import { forkPlan, resumeBlocker, suspendPlan } from '../utils/instances'
+import { forkPlan, resumeBlocker, stopBlocker, suspendPlan } from '../utils/instances'
 import { snapshotBudgets } from '../utils/usage'
 import { GetNodeUsageReply, SnapshotBudget, SuspendedCapacity } from '../gen/legion_pb'
 
@@ -42,7 +47,51 @@ function Fixture(props: { title: string; note: string; children: JSX.Element }) 
   )
 }
 
+// The large session listing, built on request: a quarter of a million
+// messages takes the browser a moment to make.
+const LARGE_SESSIONS = 250_000
+const LARGE_NODES = 1200
+// Sessions one envelope admits in the large listing, so its busiest nodes are full.
+const LARGE_PER_ENVELOPE = 600
+
+/**
+ * The job page's paging over a fixture index: the same pager and request
+ * (`session_limit: SESSION_PAGE`), answered by listInstancesFrom instead of
+ * the manager.
+ */
+function PagedSessionsPanel(props: { index: SessionIndex; complete: boolean }) {
+  const pager = createSessionPager(SESSION_PAGE)
+  const reply = createMemo(() => listInstancesFrom(props.index, { sessionLimit: SESSION_PAGE, sessionPageToken: pager.token() }, props.complete))
+  const listing = (): InstanceListing => ({
+    complete: reply().complete,
+    asOf: reply().asOf,
+    paused: false,
+    refreshing: false,
+    onRefresh: () => undefined,
+    sessions: {
+      count: Number(reply().sessionCount),
+      byNode: countMap(reply().sessionsByNode),
+      offset: pager.offset(),
+      onPage: reply().instances.filter(isSession).length,
+      hasPrev: pager.hasPrev(),
+      hasNext: Boolean(reply().nextSessionPageToken),
+      onPrev: pager.prev,
+      onNext: () => pager.next(reply().nextSessionPageToken),
+      onFirst: pager.first,
+    },
+  })
+  return <InstancesPanel jobName="agents" instances={reply().instances} toRow={(instance) => ({ instance })} actions={false} listing={listing()} />
+}
+
 export default function TestingUtils() {
+  const [large, setLarge] = createSignal<SessionIndex>()
+  const [buildMs, setBuildMs] = createSignal<number>()
+  const buildLarge = () => {
+    const started = performance.now()
+    setLarge(sessionIndex(largeSessionListing(LARGE_SESSIONS, LARGE_NODES)))
+    setBuildMs(Math.round(performance.now() - started))
+  }
+  const mixed = sessionIndex(sessionListing)
   return (
     <div class="space-y-8">
       <PageHeader
@@ -139,6 +188,64 @@ export default function TestingUtils() {
             }}
           </For>
         </Card>
+      </Fixture>
+
+      <Fixture
+        title="Sessions: a mixed listing"
+        note="A session job's Instances card: a renamed promotion, a promotion that kept its id, and running and starting sessions in two envelopes on two nodes. Row actions are left off here, since they call the manager; the card under it says what each row would offer."
+      >
+        <PagedSessionsPanel index={mixed} complete />
+        <Card class="space-y-1 text-xs">
+          <For each={sessionListing}>
+            {(instance) => (
+              <p>
+                <span class="mr-2 inline-block w-72 truncate align-bottom font-mono">{instance.instanceId}</span>
+                <span class="text-muted">
+                  promote: {promoteBlocker(instance, instance.jobId) ?? 'yes'} · stop: {stopBlocker(instance, instance.jobId) ?? 'yes'}
+                </span>
+              </p>
+            )}
+          </For>
+        </Card>
+      </Fixture>
+
+      <Fixture
+        title="Sessions: a quarter of a million"
+        note={`${LARGE_SESSIONS.toLocaleString('en-US')} running sessions over ${LARGE_NODES.toLocaleString('en-US')} nodes, from a partial index, served the way ListInstances pages them: ${SESSION_PAGE} sessions a page with the manager's totals, 100 rows rendered at a time, and the Edge nodes card from a ListSessionNodes reply.`}
+      >
+        <Show
+          when={large()}
+          fallback={
+            <Card class="flex flex-wrap items-center gap-3 text-sm text-muted">
+              <Button size="sm" onClick={buildLarge}>
+                Build the listing
+              </Button>
+              <span>Builds {LARGE_SESSIONS.toLocaleString('en-US')} InstanceInfo messages in this tab.</span>
+            </Card>
+          }
+        >
+          {(index) => (
+            <>
+              <p class="text-xs text-faint">Built and indexed in {buildMs()} ms.</p>
+              <PagedSessionsPanel index={index()} complete={false} />
+              <SessionNodesCard jobId="agents" taskName="workspace" perEnvelope={LARGE_PER_ENVELOPE} reply={sessionNodesFrom(index(), LARGE_PER_ENVELOPE)} />
+            </>
+          )}
+        </Show>
+      </Fixture>
+
+      <Fixture title="Session envelope" note="The allocation page's card for an envelope, with its node's ListSessionNodes entry given rather than read, so nothing here calls the manager.">
+        <EnvelopeCard
+          allocationId={4101n}
+          nodeId="w-17"
+          servedTask="workspace"
+          perEnvelope={60}
+          initial={{ sessions: 3, complete: true, asOf: new Date().toISOString(), node: sessionNodesFrom(mixed, 60).nodes.find((node) => node.nodeId === 'w-17') }}
+          reserved={[
+            { key: 'cpu', label: 'CPU', value: '30000 MHz' },
+            { key: 'memory', label: 'Memory', value: '61440 MiB' },
+          ]}
+        />
       </Fixture>
 
       <Fixture title="Snapshots: durability, names, fork and suspend checkpoints" note="Published with two names, a store snapshot whose publish is retrying, a fork checkpoint, a disk suspend checkpoint (size reads in place), and a manual disk snapshot.">

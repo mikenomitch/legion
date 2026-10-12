@@ -170,6 +170,7 @@ impl Cluster {
                 instance_id: id.into(),
                 idempotency_key: None,
                 cold: false,
+                force_move: false,
             }))
             .await
             .map(|reply| reply.into_inner())
@@ -293,6 +294,7 @@ fn job(archive: &str, on_restore_failure: Option<&str>) -> JobConfig {
             storage: None,
             envelope: None,
             promote: None,
+            fence_after: None,
         }),
         suspend: Some(SuspendConfig {
             durability: Some("store".into()),
@@ -518,6 +520,7 @@ async fn a_manifest_only_instance_lives_in_the_bucket_until_started() -> R<()> {
                 include_idle: !token.is_empty() || size > 0,
                 idle_page_token: token.into(),
                 idle_page_size: size,
+                ..Default::default()
             }))
     };
     let plain = list("", 0).await?.into_inner();

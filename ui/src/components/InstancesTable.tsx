@@ -17,6 +17,7 @@ import {
 import type { JobTask } from '../utils/jobspec'
 import { bytesToMiB, formatCores, formatIdle, formatMiB, heldLabel, idleSecondsFromUsage, reservationLabel } from '../utils/usage'
 import { now } from '../utils/polling'
+import { SESSION_COPY, isSession } from '../utils/sessions'
 import { Badge, MonoBadge, RelativeTime, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 
 /*
@@ -26,7 +27,9 @@ import { Badge, MonoBadge, RelativeTime, StatusBadge, TableShell, cx, tableClass
  *
  * Each id links to the instance's own page (pages/details/InstanceDetail),
  * and the allocation to its page. Columns are a list, so the job page adds
- * the actions column without touching the rest. Each cell takes the row as
+ * the actions column without touching the rest. A session
+ * (docs/session-mode.md) reads as one: a `session` badge in Mode, and the
+ * envelope allocation and node it runs in where an allocation would be. Each cell takes the row as
  * an accessor and reads it inside its own JSX, so a poll that changes one
  * number updates that cell only. Rows are keyed by instance id, not object
  * identity: an armed
@@ -264,6 +267,39 @@ export function IdleCell(props: { row: InstanceRow }) {
   )
 }
 
+/**
+ * Where a session runs, in the Allocation column: the envelope allocation it
+ * was admitted into, and its node. `-` for anything else without an
+ * allocation.
+ */
+function SessionPlacement(props: { instance: InstanceInfo }) {
+  return (
+    <Show when={isSession(props.instance)} fallback="-">
+      <div class="space-y-0.5">
+        <Show when={props.instance.envelopeAllocId !== undefined} fallback={<span class="text-faint">no envelope yet</span>}>
+          <A
+            href={`/allocations/${String(props.instance.envelopeAllocId)}`}
+            class="hover:text-brass-strong"
+            title="The envelope allocation this session runs inside. It reserves the room; the session has no allocation of its own."
+          >
+            envelope #{String(props.instance.envelopeAllocId)}
+          </A>
+        </Show>
+        <Show when={props.instance.nodeId}>
+          {(node) => (
+            <div class="text-2xs text-faint">
+              on{' '}
+              <A href={`/nodes/${encodeURIComponent(node())}`} class="hover:text-brass-strong">
+                {node()}
+              </A>
+            </div>
+          )}
+        </Show>
+      </div>
+    </Show>
+  )
+}
+
 export const INSTANCE_COLUMNS: InstanceColumn[] = [
   {
     key: 'instance',
@@ -288,10 +324,28 @@ export const INSTANCE_COLUMNS: InstanceColumn[] = [
             </div>
           )}
         </Show>
+        <Show when={row().instance.promotedFrom}>
+          {(origin) => (
+            <div class="text-2xs text-faint" title="Promoted from a running session (PromoteInstance), in place">
+              {origin() === row().instance.instanceId ? 'promoted session' : `promoted from ${origin()}`}
+            </div>
+          )}
+        </Show>
       </div>
     ),
   },
-  { key: 'mode', header: 'Mode', class: 'text-muted', cell: (row) => row().instance.mode },
+  {
+    key: 'mode',
+    header: 'Mode',
+    class: 'text-muted',
+    cell: (row) => (
+      <Show when={isSession(row().instance)} fallback={row().instance.mode}>
+        <Badge tone="info" title={SESSION_COPY}>
+          session
+        </Badge>
+      </Show>
+    ),
+  },
   { key: 'state', header: 'State', cell: (row) => <InstanceStateCell instance={row().instance} /> },
   {
     key: 'slot',
@@ -304,7 +358,7 @@ export const INSTANCE_COLUMNS: InstanceColumn[] = [
     header: 'Allocation',
     class: 'font-mono text-xs text-muted',
     cell: (row) => (
-      <Show when={row().instance.currentAllocId !== undefined} fallback="-">
+      <Show when={row().instance.currentAllocId !== undefined} fallback={<SessionPlacement instance={row().instance} />}>
         <A
           href={`/allocations/${String(row().instance.currentAllocId)}`}
           class="hover:text-brass-strong"

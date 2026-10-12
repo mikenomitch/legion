@@ -898,15 +898,39 @@ pub struct WorkerEdgeBootConfig {
     /// `30s`.
     #[serde(default)]
     pub clock_skew: Option<String>,
+    /// How many provisional starts (sessions and claims) this node runs
+    /// through its runtime at once. `0`, the default, means twice the
+    /// node's cores. Starts past it wait for a slot (see `queueTimeout`).
+    #[serde(default)]
+    pub launch_concurrency: Option<u32>,
+    /// How long a start waits for a launch slot before the node refuses it
+    /// with `RESOURCE_EXHAUSTED` (retryable), so a picker tries the next
+    /// node instead of piling up behind a busy one. Default `1s`.
+    #[serde(default)]
+    pub queue_timeout: Option<String>,
+    /// How long a gracefully stopping worker spends checkpointing its
+    /// running sessions whose task sets `suspend.onWorkerStop =
+    /// "checkpoint"`. Default `60s`.
+    #[serde(default)]
+    pub stop_checkpoint_timeout: Option<String>,
 }
+
+/// Default `edgeBoot.queueTimeout`.
+pub const DEF_LAUNCH_QUEUE_TIMEOUT: &str = "1s";
+/// Default `edgeBoot.stopCheckpointTimeout`.
+pub const DEF_STOP_CHECKPOINT_TIMEOUT: &str = "60s";
 
 /// Resolved [`WorkerEdgeBootConfig`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct WorkerEdgeBootConfigFull {
     pub accept_claims: bool,
     pub jwks_refresh: String,
     pub clock_skew: String,
+    /// `0` means twice the node's cores, resolved on the node.
+    pub launch_concurrency: u32,
+    pub queue_timeout: String,
+    pub stop_checkpoint_timeout: String,
 }
 
 impl Default for WorkerEdgeBootConfigFull {
@@ -915,7 +939,23 @@ impl Default for WorkerEdgeBootConfigFull {
             accept_claims: false,
             jwks_refresh: "5m".into(),
             clock_skew: "30s".into(),
+            launch_concurrency: 0,
+            queue_timeout: DEF_LAUNCH_QUEUE_TIMEOUT.into(),
+            stop_checkpoint_timeout: DEF_STOP_CHECKPOINT_TIMEOUT.into(),
         }
+    }
+}
+
+impl WorkerEdgeBootConfigFull {
+    /// The launch pool size this node runs with: the configured value, or
+    /// twice its cores.
+    pub fn resolved_launch_concurrency(&self) -> usize {
+        if self.launch_concurrency > 0 {
+            return self.launch_concurrency as usize;
+        }
+        std::thread::available_parallelism()
+            .map(|cores| cores.get() * 2)
+            .unwrap_or(8)
     }
 }
 
@@ -926,6 +966,14 @@ impl WorkerEdgeBootConfig {
             accept_claims: self.accept_claims.unwrap_or(defaults.accept_claims),
             jwks_refresh: self.jwks_refresh.clone().unwrap_or(defaults.jwks_refresh),
             clock_skew: self.clock_skew.clone().unwrap_or(defaults.clock_skew),
+            launch_concurrency: self
+                .launch_concurrency
+                .unwrap_or(defaults.launch_concurrency),
+            queue_timeout: self.queue_timeout.clone().unwrap_or(defaults.queue_timeout),
+            stop_checkpoint_timeout: self
+                .stop_checkpoint_timeout
+                .clone()
+                .unwrap_or(defaults.stop_checkpoint_timeout),
         }
     }
 }
@@ -2397,6 +2445,10 @@ pub struct WorkerConfigAlt {
     /// "Publishing content"). Absent means the node publishes nothing.
     #[serde(default)]
     pub content_store: Option<crate::content_publish::ContentStoreTarget>,
+    /// Session settings on this worker (docs/session-mode.md, "No split
+    /// brain"). Absent means the defaults.
+    #[serde(default)]
+    pub sessions: Option<WorkerSessionsConfig>,
     /// Host paths this worker offers to jobs through the `host` volume driver
     /// (see docs/volumes.md), keyed by the name jobs claim.
     #[serde(default)]
@@ -2891,6 +2943,40 @@ pub struct WorkerArtifactsPayload {
     /// same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_store: Option<crate::content_publish::ContentStoreTarget>,
+    /// The top-level `sessions` block, riding the same payload: its settings
+    /// act on the session manifests the `contentStore` holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<WorkerSessionsConfig>,
+}
+
+/// A worker's `sessions` block (docs/session-mode.md, "No split brain").
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSessionsConfig {
+    /// How often the node lists its fence prefix in the `contentStore`
+    /// (`sessions/fence/<node>/`) and stops the copies of `store` sessions
+    /// that moved away from it (default `30s`, at least `1s`). One `LIST`
+    /// per interval per node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_list_every: Option<String>,
+}
+
+/// The default of `sessions.fenceListEvery`.
+pub const DEFAULT_FENCE_LIST_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl WorkerSessionsConfig {
+    /// `fenceListEvery`, parsed and checked.
+    pub fn fence_list_every(&self) -> R<std::time::Duration> {
+        let Some(raw) = self.fence_list_every.as_deref() else {
+            return Ok(DEFAULT_FENCE_LIST_EVERY);
+        };
+        let every = humantime::parse_duration(raw.trim())
+            .with_context(|| format!("sessions.fenceListEvery {raw:?} is not a duration"))?;
+        if every < std::time::Duration::from_secs(1) {
+            bail!("sessions.fenceListEvery must be at least 1s, got {raw:?}");
+        }
+        Ok(every)
+    }
 }
 
 /// Resolved worker fetch settings with defaults applied.

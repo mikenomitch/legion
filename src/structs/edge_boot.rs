@@ -40,6 +40,12 @@ pub const CLAIM_USES: &str = "legion.io/uses";
 /// Value of `legion.io/scope` on a boot ticket.
 pub const BOOT_TICKET_SCOPE: &str = "boot";
 
+/// Value of `legion.io/scope` on a session ticket (session durability plan
+/// §6.4): it lets its holder start, read, and stop sessions of one session
+/// task on any node of one pool that holds the task's envelope, until it
+/// expires.
+pub const SESSION_TICKET_SCOPE: &str = "session";
+
 /// Default lease: how long an unratified start survives before the node kills
 /// it unconditionally. Long enough to ride out a raft election, short enough
 /// that a partitioned node's wasted microVM is bounded.
@@ -491,10 +497,87 @@ impl BootTicketClaims {
     }
 }
 
+/// The Legion claims of a session ticket, extracted from a verified JWT.
+///
+/// A session ticket names no instance, prefix, or job config: the node mints
+/// the session id and starts the spec of the envelope it holds. It is not
+/// spent per session; the envelopes' room bounds what it can start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTicketClaims {
+    pub jti: String,
+    pub job: String,
+    pub task: String,
+    pub pool: String,
+    pub expires_at_unix: i64,
+}
+
+impl SessionTicketClaims {
+    pub fn from_claims(claims: &serde_json::Map<String, Value>) -> R<Self> {
+        let string = |key: &str| -> R<String> {
+            claims
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.trim().is_empty())
+                .with_context(|| format!("session ticket is missing {key}"))
+        };
+        let scope = string(CLAIM_SCOPE)?;
+        if scope != SESSION_TICKET_SCOPE {
+            bail!(
+                "ticket scope {scope:?} is not a session ticket; mint one with `legion \
+                 boot-ticket create <job> --task <task> --scope session`"
+            );
+        }
+        Ok(SessionTicketClaims {
+            jti: string("jti")?,
+            job: string(CLAIM_JOB)?,
+            task: string(CLAIM_TASK)?,
+            pool: string(CLAIM_POOL)?,
+            expires_at_unix: claims
+                .get("exp")
+                .and_then(Value::as_i64)
+                .context("session ticket is missing exp")?,
+        })
+    }
+
+    /// Whether this ticket covers sessions of `job`/`task`.
+    pub fn covers(&self, job: &str, task: &str) -> R<()> {
+        if self.job != job || self.task != task {
+            bail!(
+                "session ticket {} covers sessions of {}/{}, not {job}/{task}",
+                self.jti,
+                self.job,
+                self.task
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod edge_boot_test {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_session_ticket_needs_its_scope_and_names_one_task_test() -> R<()> {
+        let claims = json!({
+            "jti": "bt_1",
+            "exp": 100,
+            CLAIM_SCOPE: "session",
+            CLAIM_JOB: "agents",
+            CLAIM_TASK: "workspace",
+            CLAIM_POOL: "agents",
+        });
+        let parsed = SessionTicketClaims::from_claims(claims.as_object().unwrap())?;
+        assert!(parsed.covers("agents", "workspace").is_ok());
+        assert!(parsed.covers("agents", "other").is_err());
+        let mut boot = claims.clone();
+        boot[CLAIM_SCOPE] = json!("boot");
+        let refused = SessionTicketClaims::from_claims(boot.as_object().unwrap()).unwrap_err();
+        assert!(refused.to_string().contains("--scope session"), "{refused}");
+        Ok(())
+    }
 
     #[test]
     fn gate_levels_order_from_off_to_serve() {

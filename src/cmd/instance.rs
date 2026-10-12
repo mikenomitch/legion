@@ -245,6 +245,15 @@ pub fn config() -> Command {
                     .action(ArgAction::SetTrue)
                     .help("Suspended instances: discard the checkpoint and boot fresh"),
             )
+            .arg(
+                Arg::new("force-move")
+                    .long("force-move")
+                    .action(ArgAction::SetTrue)
+                    .help(
+                        "Store sessions: move the session to another node even when its old \
+                         node did not answer the probe (only once that node is known to be down)",
+                    ),
+            )
             .arg(idempotency_arg())
             .arg(json_flag()),
         "the instance is running (and a resume has restored)",
@@ -386,6 +395,22 @@ pub fn config() -> Command {
                      (suspend.archive = \"manifestOnly\"), read from the job's archive \
                      manifests in the contentStore, one page at a time",
                 ),
+        )
+        .arg(
+            Arg::new("session-limit")
+                .long("session-limit")
+                .value_name("N")
+                .value_parser(clap::value_parser!(u32))
+                .help(
+                    "The most running sessions to list, in id order (default 5000, at most \
+                     50000). 0 lists none and prints only the session counts",
+                ),
+        )
+        .arg(
+            Arg::new("session-page-token")
+                .long("session-page-token")
+                .value_name("TOKEN")
+                .help("Resume the session listing at this token (from the previous page)"),
         )
         .arg(
             Arg::new("idle-page-token")
@@ -754,6 +779,7 @@ async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
         instance_id: id.clone(),
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
         cold: arg_matches.get_flag("cold"),
+        force_move: arg_matches.get_flag("force-move"),
     });
 
     let mut client = connect_manager_client().await?;
@@ -1066,6 +1092,11 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
             .get_one::<u32>("idle-page-size")
             .copied()
             .unwrap_or_default(),
+        session_limit: arg_matches.get_one::<u32>("session-limit").copied(),
+        session_page_token: arg_matches
+            .get_one::<String>("session-page-token")
+            .cloned()
+            .unwrap_or_default(),
     });
 
     let mut client = connect_manager_client().await?;
@@ -1082,6 +1113,9 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
             "nextIdlePageToken": reply.next_idle_page_token,
             "complete": reply.complete,
             "asOf": (!reply.as_of.is_empty()).then_some(&reply.as_of),
+            "nextSessionPageToken": reply.next_session_page_token,
+            "sessionCount": reply.session_count,
+            "sessionsByNode": reply.sessions_by_node,
         }));
     } else {
         let rows: Vec<InstanceRow> = reply.instances.iter().map(InstanceRow::from).collect();
@@ -1090,6 +1124,19 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
             println!(
                 "\nmore archived instances: --include-idle --idle-page-token {}",
                 reply.next_idle_page_token
+            );
+        }
+        if reply.session_count > 0 {
+            println!(
+                "\n{} running sessions on {} nodes",
+                reply.session_count,
+                reply.sessions_by_node.len()
+            );
+        }
+        if !reply.next_session_page_token.is_empty() {
+            println!(
+                "more sessions: --session-page-token {}",
+                reply.next_session_page_token
             );
         }
         if !reply.complete {

@@ -772,6 +772,65 @@ impl Worker for SimWorkerService {
         crate::worker::plane::require_manager(&request, "StopSessions")?;
         Ok(Response::new(crate::structs::StopSessionsReply::default()))
     }
+
+    async fn suspend_sessions(
+        &self,
+        request: Request<crate::structs::SuspendSessionsRequest>,
+    ) -> Result<Response<crate::structs::SuspendSessionsReply>, Status> {
+        crate::worker::plane::require_manager(&request, "SuspendSessions")?;
+        let failed = request
+            .into_inner()
+            .session_ids
+            .into_iter()
+            .map(|session_id| crate::structs::SessionSleepFailure {
+                session_id,
+                code: "NotFound".into(),
+                message: "not_found: a simulated node runs no sessions".into(),
+            })
+            .collect();
+        Ok(Response::new(crate::structs::SuspendSessionsReply {
+            suspended: Vec::new(),
+            failed,
+        }))
+    }
+
+    async fn resume_session(
+        &self,
+        request: Request<crate::structs::ResumeSessionRequest>,
+    ) -> Result<Response<crate::structs::ResumeSessionReply>, Status> {
+        crate::worker::plane::require_manager(&request, "ResumeSession")?;
+        Err(Status::not_found(
+            "not_found: a simulated node runs no sessions",
+        ))
+    }
+
+    async fn get_session(
+        &self,
+        request: Request<crate::structs::GetSessionRequest>,
+    ) -> Result<Response<crate::structs::GetSessionReply>, Status> {
+        crate::worker::plane::require_manager(&request, "GetSession")?;
+        Err(Status::not_found(
+            "not_found: a simulated node runs no sessions",
+        ))
+    }
+
+    async fn start_session(
+        &self,
+        _request: Request<crate::structs::StartSessionRequest>,
+    ) -> Result<Response<crate::structs::StartSessionReply>, Status> {
+        Err(Status::failed_precondition(
+            "a simulated node does not accept edge starts",
+        ))
+    }
+
+    async fn stop_session(
+        &self,
+        _request: Request<crate::structs::StopSessionRequest>,
+    ) -> Result<Response<crate::structs::StopSessionReply>, Status> {
+        Err(Status::failed_precondition(
+            "a simulated node does not accept edge starts",
+        ))
+    }
 }
 
 /// A launched fleet: observability for tests and drivers, plus the point

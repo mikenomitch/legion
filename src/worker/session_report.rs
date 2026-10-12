@@ -136,6 +136,7 @@ mod session_report_test {
             state: state.into(),
             lease_issued_at_unix_ms: 1,
             resources: "{}".into(),
+            ..Default::default()
         }
     }
 

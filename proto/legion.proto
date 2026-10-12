@@ -400,11 +400,25 @@ service Manager {
   // without an idempotency key.
   //
   // A running session (docs/session-mode.md) is live too, and answers the
-  // same no-op.
+  // same no-op. A suspended session resumes on the node its id is tagged
+  // with. A session whose task sets `suspend.durability = "store"` resumes
+  // from its manifest in the workers' content store on another node with
+  // room when that node lost it, dropped its local copy, is full, or does
+  // not answer; the new node claims the next generation and the reply's
+  // message names the node it moved from. A session the manifest says is
+  // running on a silent node moves only once that node is marked down or
+  // lost, or with `force_move` (docs/session-mode.md, "Moving a session").
+  // Nothing is written to raft.
   //
   // Errors:
   // - NotFound: no instance row, archive manifest, or running session has
   //   this id.
+  // - Unavailable: a session's node does not answer (a `local` session lives
+  //   only there), or a `store` session's manifest says it runs on a node
+  //   that did not answer and is not marked down (`running_elsewhere`;
+  //   retry, or pass `force_move`).
+  // - Aborted: a `store` session's resume lost its generation claim to a
+  //   racing resume (`superseded`, naming the winner).
   // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
   //   by the scheduler via `count.num`, not this API).
   // - FailedPrecondition: the instance is Terminated (destroyed ids are
@@ -658,6 +672,31 @@ service Manager {
   //   `stateful.promote.onName = false` and `new_id` is set.
   // - FailedPrecondition: the session's job config no longer has its task.
   rpc PromoteInstance (PromoteInstanceRequest) returns (PromoteInstanceReply);
+
+  // Lists every node that holds an envelope for a session task, for a
+  // picker (Envoy, HAProxy, or a platform's own code) that starts sessions
+  // at the nodes directly with a session ticket (`Worker.StartSession`,
+  // docs/session-mode.md, "Starting at the edge").
+  //
+  // Answered from this manager's own state: the envelope allocations and
+  // node rows in the replicated store, plus the session index's usage. No
+  // node is called and nothing is written, so a picker can poll it every
+  // few seconds from any manager. It is advisory: a stale entry costs a
+  // refusal or a connect timeout and a hop to the next node, never a wrong
+  // start, because each node admits or refuses on its own.
+  //
+  // Every node with an envelope is listed, accepting or not, so a picker
+  // can keep its `tag -> address` map (for routing an existing session by
+  // its id) apart from its ring (accepting nodes only).
+  //
+  // ACL: `job:read` on the job.
+  //
+  // Errors:
+  // - InvalidArgument: no `job_id`.
+  // - NotFound: no such job.
+  // - FailedPrecondition: `task_name` names no session task of the job, or
+  //   the job has more than one session task and `task_name` is empty.
+  rpc ListSessionNodes (ListSessionNodesRequest) returns (ListSessionNodesReply);
 
   // === SNAPSHOTS (see docs/suspend-and-resume.md) ===
 
@@ -3414,6 +3453,17 @@ message StartInstanceRequest {
   // retained storage instead of restoring. Ignored for a stopped instance,
   // which always boots fresh. Default false.
   bool cold = 3;
+
+  // Sessions with `suspend.durability = "store"` only
+  // (docs/session-mode.md, "Moving a session"): move the session to
+  // another node even though the node holding it has not been marked down
+  // or lost. By default a running session whose node does not answer moves
+  // only once the managers mark that node down or lost; until then the
+  // call answers UNAVAILABLE naming the node, because the session may still
+  // be running there. A suspended session moves without it. A forced move
+  // of a running session leaves two copies until the old one is fenced.
+  // Ignored for keyed instances. Default false.
+  bool force_move = 4;
 }
 
 // Reply payload for StartInstance.
@@ -3928,6 +3978,57 @@ message InstanceColdBoot {
   string at = 3;
 }
 
+// Request for `Manager.ListSessionNodes`.
+message ListSessionNodesRequest {
+  // The job. Required.
+  string job_id = 1;
+  // The session task. Optional when the job has exactly one.
+  string task_name = 2;
+}
+
+// One node holding an envelope for the session task.
+message SessionNode {
+  // The node id.
+  string node_id = 1;
+  // The node's worker-plane address (`https://host:4848`), where
+  // `Worker.StartSession`, `GetSession`, and `StopSession` are served.
+  // Empty when the node has not advertised one.
+  string address = 2;
+  // The node's tag: the 8 characters a session id minted on this node
+  // carries before its final `.` (`workspace-q4n7c2rd.01J...`). A picker
+  // maps a session id's tag to this node to route requests for it.
+  string tag = 3;
+  // Whether a picker should send new edge starts here: the node is ready,
+  // available (not draining or ineligible), has an address, advertises the
+  // `edge-sessions` capability, and its envelope has room for one more
+  // session of this task.
+  bool accepting = 4;
+  // Why `accepting` is false: `lost`, `down`, `draining`, `ineligible`,
+  // `no-address`, `no-edge-sessions` (the node does not serve
+  // `StartSession`: `edgeBoot.acceptClaims` is off), or `full`. Empty when
+  // accepting.
+  string reason = 5;
+  // The envelope's room left, as a JSON object of amounts (`{"cpu":21500,
+  // "memory":44032}`), from the last reports plus this manager's own
+  // recent starts.
+  string room = 6;
+  // How many more sessions of this task's size fit in `room`: a weight for
+  // weighted balancers. 0 when full.
+  uint32 weight = 7;
+  // Sessions the node last reported for this task.
+  uint32 sessions = 8;
+}
+
+// Reply for `Manager.ListSessionNodes`.
+message ListSessionNodesReply {
+  string job_id = 1;
+  string task_name = 2;
+  // One entry per node with an envelope, sorted by node id.
+  repeated SessionNode nodes = 3;
+  // When the list was read, RFC 3339.
+  string as_of = 4;
+}
+
 // Request payload for ListInstances.
 message ListInstancesRequest {
   // Job name whose instances to list.
@@ -3952,6 +4053,16 @@ message ListInstancesRequest {
   // With `include_idle`: the most bucket-listed instances to return.
   // Default 1000, at most 10000.
   uint32 idle_page_size = 5;
+
+  // The most running sessions (`mode = "session"`) to return, in session
+  // id order. Unset: 5000. At most 50000. 0 returns no sessions, only
+  // `session_count` and `sessions_by_node`: what a dashboard needs at any
+  // scale. Rows are always listed in full.
+  optional uint32 session_limit = 6;
+
+  // Where the session listing resumes: the previous reply's
+  // `next_session_page_token`. Empty starts at the lowest id.
+  string session_page_token = 7;
 }
 
 // Reply payload for ListInstances.
@@ -3976,6 +4087,18 @@ message ListInstancesReply {
   // When the session part of the listing was read, RFC 3339. A session's
   // own entry can be up to one heartbeat older than this.
   string as_of = 4;
+
+  // The token for the next page of sessions (`session_page_token`). Empty
+  // when this reply holds the last of them.
+  string next_session_page_token = 5;
+
+  // How many running sessions the job has, from the session index's
+  // per-node totals, whatever `session_limit` returned. Counted like
+  // `complete`: nodes not reported yet are missing from it.
+  uint64 session_count = 6;
+
+  // `session_count` by node id.
+  map<string, uint64> sessions_by_node = 7;
 }
 
 // Request payload for PromoteInstance.
@@ -4484,6 +4607,31 @@ message CheckpointPartKey {
   // 32 bytes. Derives both the AES-256-GCM key the part is sealed under and
   // the name of the sealed object in the content store.
   bytes key = 3;
+}
+
+// A session sealing key (session durability plan §6.6,
+// docs/session-mode.md "Idle sessions"). An unpromoted session with
+// `suspend.durability = "store"` publishes its checkpoint parts with no
+// manager on the path, so the node cannot ask for a part key per digest
+// the way a keyed snapshot's publish does. Instead every envelope payload
+// of a job whose session task sets `durability = "store"` carries one key
+// per checkpoint key in the cluster keyring, derived for that job:
+// HKDF-SHA256 of the checkpoint key with the job name as context. A node
+// derives each part's key from it exactly as the manager derives a keyed
+// part's key from the checkpoint key itself, so parts are still sealed per
+// digest, and any node holding an envelope of the job can open the
+// session checkpoints of that job and no other. Workers never see the
+// checkpoint key. The generated Rust type redacts `key` from Debug output
+// and never serializes it, so it never reaches the worker's state file or
+// session log.
+message SessionSealKey {
+  // `<checkpoint key id>/session/<job>`: recorded as the `keyId` of every
+  // part sealed under it, so a node opening the part finds the key again
+  // after the keyring rotates.
+  string key_id = 1;
+
+  // 32 bytes. Never logged and never written to disk.
+  bytes key = 2;
 }
 
 // The outcome of one piece of checkpoint work, reported by a worker in
@@ -5457,7 +5605,10 @@ message SessionReport {
 
 // One session as its node reports it.
 message SessionStatus {
-  // The session id (`<task>-<26 base32>`).
+  // The session id: `<task>-<node tag>.<26 base32>` when minted by a router
+  // or a node (the tag names the node it started on, session durability
+  // plan §6.3), or `<task>-<26 base32>` when derived from an idempotency
+  // key.
   string session_id = 1;
 
   // Its job, the exact job config it runs, and its task.
@@ -5469,14 +5620,69 @@ message SessionStatus {
   // when a job update replaces the envelope on the node.
   int64 envelope_allocation_id = 5;
 
-  // `starting` (admitted, not running yet) or `running`.
+  // `starting` (admitted, not running yet), `running`, or `suspended`
+  // (checkpointed on its node, nothing running, not using envelope room;
+  // `Worker.ResumeSession` or `legion instance start` brings it back). A
+  // session whose local checkpoint was evicted is not reported at all: for
+  // `suspend.keepFor` after the eviction its node answers a request for it
+  // with NotFound starting `evicted`, naming when and why.
   string state = 6;
 
-  // When the manager that started it issued it, unix milliseconds.
+  // When the session was issued, unix milliseconds: by the manager that
+  // routed it, or by the node itself for an edge start.
   int64 lease_issued_at_unix_ms = 7;
 
   // The session's reserved resources, as a JSON object.
   string resources = 8;
+
+  // The session's generation (session durability plan §6.7): 1 at start,
+  // one more for every resume that claimed its manifest. Of two copies of
+  // one session id, the higher generation survives, then the earlier
+  // lease, then the lower node id.
+  uint64 generation = 9;
+
+  // Who started it: `manager` (a manager's session router) or `edge` (a
+  // session ticket presented to `Worker.StartSession`).
+  string origin = 10;
+
+  // For an edge start, the `jti` of the session ticket it was started
+  // with. Empty otherwise.
+  string ticket_jti = 11;
+
+  // The checkpoint the session holds, when it has one: the one a
+  // suspended session resumes from, or a running session's latest
+  // periodic (`suspend.checkpointEvery`) or worker-stop checkpoint. Absent
+  // for a running session that was never checkpointed.
+  SessionCheckpointInfo checkpoint = 12;
+}
+
+// A session's checkpoint, as its node reports it in `SessionStatus`.
+message SessionCheckpointInfo {
+  // `local` (the checkpoint lives only on this node) or `store` (the task
+  // sets `suspend.durability = "store"`, and the checkpoint is published to
+  // the node's `contentStore`).
+  string durability = 1;
+
+  // The checkpoint's snapshot id (`snap-...`).
+  string snapshot_id = 2;
+
+  // `memory` or `disk` (a disk checkpoint of a session holds only its
+  // spec, so a resume boots it fresh under the same id).
+  string kind = 3;
+
+  // Bytes the checkpoint's memory parts hold.
+  uint64 bytes = 4;
+
+  // When it was taken, RFC 3339.
+  string taken_at = 5;
+
+  // With `durability = "store"`, the URL of the session manifest that
+  // names the published checkpoint
+  // (`<contentStore.url>/sessions/<job>/<id-prefix>/<id>.json`), once the
+  // publish finished. Empty while the publish is pending (the content store
+  // is unreachable, or the node has no sealing key yet; the node retries)
+  // and for a `local` checkpoint.
+  string published_url = 6;
 }
 
 // Where a worker's `StreamWork` delivery stands, as its heartbeat reports
@@ -8897,6 +9103,293 @@ service Worker {
   // carrying `legion://manager/<id>`); anything else is refused with
   // `Unauthenticated`.
   rpc StopSessions (StopSessionsRequest) returns (StopSessionsReply);
+
+  // Answers for one session on this node (session durability plan §6.3,
+  // docs/session-mode.md "Routing"). A manager calls it to route `instance
+  // get|stop|start|promote` on a session id straight to the node its id
+  // names, instead of asking every manager's session index.
+  //
+  // The node's answer is authoritative for itself:
+  // - OK with the session's status when the node holds it, running or
+  //   sleeping.
+  // - NotFound when it does not. The message starts with `wrong_node` when
+  //   the id's node tag is not this node's (the caller routed by something
+  //   other than the id, or the session moved), and with `not_found`
+  //   otherwise. A node that evicted a local-only checkpoint answers
+  //   NotFound starting with `evicted` for `suspend.keepFor` after the
+  //   eviction, naming when and why.
+  //
+  // Caller classes: `manager`, and `ticket` (a session ticket, see
+  // `StartSession`, for the session's job and task).
+  rpc GetSession (GetSessionRequest) returns (GetSessionReply);
+
+  // Starts a session of a session task on this node from a session ticket,
+  // with no manager on the path (session durability plan §6.4,
+  // docs/session-mode.md "Starting at the edge"). The node verifies the
+  // ticket offline, mints the session id with its own node tag, admits the
+  // session into its envelope, launches it, and answers once it is running.
+  // Managers learn about it from the node's next heartbeat; nothing is
+  // written to raft.
+  //
+  // A platform keeps a consistent-hash ring over `ListSessionNodes` and
+  // sends each new session to a node on it. Every later request for the
+  // session is routed by its id's node tag, never by hashing again.
+  //
+  // With `idempotency_key`, the node derives the session id from the key
+  // (the untagged shape) and answers a retry that lands on it from its own
+  // table with `deduplicated = true`. A retry that lands on another node
+  // (a ring change) starts a second copy there; the managers' duplicate
+  // sweep stops one of the two (docs/session-mode.md, "Duplicates"). For a
+  // task with `suspend.durability = "store"` the node first creates the
+  // session's manifest in its `contentStore` with a conditional create
+  // (`If-None-Match: *`), so of two nodes that derived the same id only one
+  // starts it; the other answers ALREADY_EXISTS naming the first.
+  //
+  // With `resume_id`, the call resumes an existing session of a `store`
+  // task on this node from its manifest instead of starting a new one
+  // (docs/session-mode.md, "Moving a session"): the session may have run or
+  // slept on another node. A session the manifest says is suspended moves
+  // at once. One it says is running on another node is probed there first
+  // (`GetSession`, 2 seconds, with this call's ticket): if it runs there,
+  // this node claims the next generation and asks that node to stop its
+  // copy (`StopSession`) before launching; if that node does not answer,
+  // the call answers UNAVAILABLE unless `force_move` is set. The reply's
+  // `resumed_from`, `generation`, and `moved_from` say what happened.
+  //
+  // Caller class: `ticket` (a session ticket: `legion.io/scope = session`,
+  // minted with `IssueBootTicket` and `scope = "session"`). Admitted only on
+  // a worker with `edgeBoot.acceptClaims: true`.
+  //
+  // Errors:
+  // - FailedPrecondition: edge starts are off on this node, or it holds no
+  //   envelope for the task. Not retryable here; try another node.
+  // - ResourceExhausted: the envelope is full, or every launch slot stayed
+  //   busy for `edgeBoot.queueTimeout`. Retryable on another node.
+  // - PermissionDenied: the ticket failed verification (named check).
+  // - InvalidArgument: `resume_id` is not a session id of the ticket's task.
+  // - NotFound: `resume_id` names a session with no manifest (it ended, or
+  //   was never published).
+  // - AlreadyExists: an idempotent start of a `store` session that another
+  //   node created first. The message ends in `[winner node=<id>
+  //   generation=<g>]`; send the session's requests there.
+  // - Aborted: a resume lost its generation claim to a racing resume
+  //   (`superseded`), naming the winner the same way. Not retryable here.
+  // - Unavailable: the content store could not be reached (no generation
+  //   can be claimed, so nothing started), or a move found the session
+  //   running on a node that did not answer the probe
+  //   (`running_elsewhere`). Retry later, or with `force_move` once that
+  //   node is known to be down.
+  // - Internal: the runtime failed to start the session.
+  rpc StartSession (StartSessionRequest) returns (StartSessionReply);
+
+  // Ends one session on this node. Caller class: `ticket` (a session ticket
+  // for the session's job and task). Idempotent: a session the node no
+  // longer runs answers `stopped = false`. NotFound with `wrong_node` when
+  // the id's tag names another node.
+  rpc StopSession (StopSessionRequest) returns (StopSessionReply);
+
+  // Suspends sessions on this node (session durability plan §6.6,
+  // docs/session-mode.md "Idle sessions"). A manager calls it to route
+  // `legion instance suspend <session>` to the node the session id's tag
+  // names. For each id the node captures a checkpoint into its content
+  // store (a memory checkpoint for a sandbox launched for checkpoints, else
+  // a disk checkpoint, which of a session holds only its spec), stops the
+  // process, frees the session's share of its envelope, and records the
+  // session as `suspended` in its session log, so it survives a worker
+  // restart. The checkpoint stays on this node, pinned until the task's
+  // `suspend.keepFor` expires, the job stops, or disk pressure
+  // (`content.minFreeDisk`) evicts it. Nothing is written to raft.
+  //
+  // Each id is answered on its own, in `suspended` or `failed`. A session
+  // that is already suspended counts as suspended (the call is
+  // idempotent). A failed capture leaves the session running. The reply
+  // comes once every capture has finished, which for a memory checkpoint
+  // takes as long as writing the guest's memory.
+  //
+  // Only sessions whose task sets a `suspend` block can be suspended; a
+  // promoted session is suspended through its row
+  // (`Manager.SuspendInstance`). With `durability = "store"` the node then
+  // publishes the checkpoint's memory parts, sealed, to its `contentStore`
+  // and writes the session's manifest (`suspended`, at the session's
+  // generation) with a conditional write; the local copy becomes an
+  // evictable cache entry. Such a session can resume on any node with an
+  // envelope for its task. A `store` session on a node without a
+  // `contentStore` fails FailedPrecondition. A manifest naming a newer
+  // generation fails the suspend with Aborted (`superseded`): this copy was
+  // stale and has ended. An unreachable content store keeps the session
+  // suspended here, unpublished, and the node retries the publish; the
+  // entry's `published_url` is empty until it lands.
+  //
+  // Caller class: `manager` (a client certificate from the cluster CA
+  // carrying `legion://manager/<id>`); anything else is refused with
+  // `Unauthenticated`.
+  rpc SuspendSessions (SuspendSessionsRequest) returns (SuspendSessionsReply);
+
+  // Resumes a suspended session on this node under the same id (session
+  // durability plan §6.6). A manager calls it to route `legion instance
+  // start <session>` to the node the id's tag names. The node admits the
+  // session into its task's envelope again and restores it from its local
+  // memory checkpoint, or boots it fresh when the checkpoint is a disk one
+  // (it holds only the session's spec) or `cold` is set. The answer comes
+  // once the session's runtime returned. A local session never moves, so
+  // its generation stays 1.
+  //
+  // A `store` session (`suspend.durability = "store"`) claims the next
+  // generation in its manifest before it starts, with a conditional write;
+  // a node whose claim loses answers Aborted naming the winner. With
+  // `job_id` and `task_name` set, the node resumes the session from its
+  // manifest even when it never held it (the manager's fallback when the
+  // tagged node lost the session, evicted its local copy, is full, or does
+  // not answer): it admits the session, claims the next generation on the
+  // manifest it read, leaves a fence marker for the old node, and restores
+  // from the published checkpoint. A manifest naming another node as
+  // running the session refuses FailedPrecondition `running_elsewhere`
+  // unless `force_move` is set; the caller probes that node first.
+  //
+  // A session that is already running answers OK with
+  // `already_running = true`.
+  //
+  // Errors:
+  // - NotFound: the node does not hold the session. The message starts
+  //   with `evicted` when the node evicted its local checkpoint (naming
+  //   when and why; reported for `suspend.keepFor` after the eviction, and
+  //   not retryable: the session is gone), with `wrong_node` when the id's
+  //   node tag names another node, and with `not_found` otherwise.
+  // - ResourceExhausted: the envelope has no room for the session right
+  //   now, or every launch slot stayed busy for `edgeBoot.queueTimeout`.
+  //   Retryable; the session stays suspended with its checkpoint.
+  // - FailedPrecondition: the node holds no envelope for the session's
+  //   task any more (the job stopped or was moved).
+  // - FailedPrecondition `running_elsewhere`: the manifest says another
+  //   node runs the session (the message ends in `[winner node=<id>
+  //   generation=<g>]`). Probe that node; retry with `force_move` only if it
+  //   does not run it or is down.
+  // - Aborted: another suspend, checkpoint, or resume of the session is in
+  //   progress (retryable), or the generation claim lost (`superseded`,
+  //   naming the winner; not retryable here).
+  // - Unavailable: the content store holding the session's manifest could
+  //   not be reached; nothing was claimed or started.
+  // - Internal: the restore failed. The session stays suspended with its
+  //   checkpoint (a `store` session's manifest is handed back as
+  //   `suspended`).
+  //
+  // Caller class: `manager`; anything else is refused with
+  // `Unauthenticated`.
+  rpc ResumeSession (ResumeSessionRequest) returns (ResumeSessionReply);
+}
+
+// Request payload for Worker.StartSession.
+message StartSessionRequest {
+  // The session ticket.
+  string ticket = 1;
+
+  // The job and session task to start. Optional: they default to the
+  // ticket's, and must match it when set.
+  string job_id = 2;
+  string task_name = 3;
+
+  // Optional idempotency key. The same key always derives the same session
+  // id, so a retry to the same node is answered from its table.
+  string idempotency_key = 4;
+
+  // Wait until the session is running before answering (default true:
+  // `false` answers once the session is admitted, in state `starting`).
+  optional bool wait = 5;
+
+  // Resume this existing session on the receiving node instead of starting
+  // a new one (session durability plan §6.6, docs/session-mode.md "Moving a
+  // session"). Only a session whose task sets `suspend.durability =
+  // "store"` can resume on a node other than the one holding it: the node
+  // reads its manifest at the path its id and the ticket's job give, claims
+  // the next generation with a conditional write, and restores it under the
+  // same id, fetching its checkpoint parts from the content store. A
+  // session this node holds suspended resumes from its own checkpoint
+  // (claiming the next generation as well); one already running here
+  // answers `deduplicated = true`. `idempotency_key` is ignored.
+  //
+  // The reply's `node_id` is where the session now runs. Its id keeps the
+  // node tag it was minted with, which is stale after a move: a picker
+  // should cache `session id -> node` from this reply and prefer it over
+  // the tag.
+  string resume_id = 6;
+
+  // With `resume_id`, move a session the manifest says is running on
+  // another node without first reaching that node. By default the node
+  // probes the old node (`Worker.GetSession` with the caller's ticket, 2 s)
+  // and, when it answers that the session runs there, asks it to stop its
+  // copy (`Worker.StopSession`) before moving; when the probe fails it
+  // refuses with UNAVAILABLE naming the old node. Set this only when
+  // `ListSessionNodes` shows that node down or lost: a forced move of a
+  // session that is still running leaves two copies until the old one is
+  // fenced (docs/session-mode.md, "No split brain").
+  bool force_move = 7;
+}
+
+// Reply payload for Worker.StartSession.
+message StartSessionReply {
+  // The new session's id: `<task>-<this node's tag>.<26 base32>`, or the
+  // derived id for an idempotent start.
+  string session_id = 1;
+
+  // This node's id.
+  string node_id = 2;
+
+  // `running`, or `starting` when the caller did not wait.
+  string state = 3;
+
+  // True when an idempotent retry found the session already running here,
+  // or a `resume_id` found it running here.
+  bool deduplicated = 4;
+
+  // With `resume_id`: `local` (restored from this node's own copy of the
+  // checkpoint), `store` (its parts fetched from the content store), or
+  // `cold` (a disk checkpoint, which of a session holds only its spec, so
+  // it booted fresh under the same id). Empty for a new session.
+  string resumed_from = 5;
+
+  // The session's generation after this call: 1 for a new session, the
+  // generation the resume claimed otherwise.
+  uint64 generation = 6;
+
+  // With `resume_id`, the node the session ran on before, when it moved
+  // here. Empty otherwise.
+  string moved_from = 7;
+}
+
+// Request payload for Worker.StopSession.
+message StopSessionRequest {
+  // The session ticket.
+  string ticket = 1;
+
+  // The session to end.
+  string session_id = 2;
+}
+
+// Reply payload for Worker.StopSession.
+message StopSessionReply {
+  // True when this call ended the session; false when it was already gone.
+  bool stopped = 1;
+
+  // This node's id.
+  string node_id = 2;
+}
+
+// Request payload for Worker.GetSession.
+message GetSessionRequest {
+  // The session id.
+  string session_id = 1;
+
+  // A session ticket, for the `ticket` caller class. Empty for a manager.
+  string ticket = 2;
+}
+
+// Reply payload for Worker.GetSession.
+message GetSessionReply {
+  // The session, as this node reports it in its heartbeat.
+  SessionStatus session = 1;
+
+  // This node's id.
+  string node_id = 2;
 }
 
 // Request payload for Worker.StopSessions.
@@ -8912,6 +9405,126 @@ message StopSessionsRequest {
 message StopSessionsReply {
   // The ids this node was running and has ended.
   repeated string stopped = 1;
+}
+
+// Request payload for Worker.SuspendSessions.
+message SuspendSessionsRequest {
+  // The sessions to suspend. Ids the node does not hold are answered in
+  // `failed`.
+  repeated string session_ids = 1;
+
+  // Why, for the node's log: `manual` (`legion instance suspend`) or
+  // another short word.
+  string reason = 2;
+}
+
+// Reply payload for Worker.SuspendSessions.
+message SuspendSessionsReply {
+  // The sessions now suspended on this node, including any that already
+  // were.
+  repeated SuspendedSession suspended = 1;
+
+  // The sessions that were not suspended, each with why. A session whose
+  // capture failed keeps running.
+  repeated SessionSleepFailure failed = 2;
+}
+
+// One session a node suspended.
+message SuspendedSession {
+  // The session id.
+  string session_id = 1;
+
+  // The checkpoint's snapshot id (`snap-...`), local to the node: its parts
+  // are pinned in the node content store and never published.
+  string snapshot_id = 2;
+
+  // `memory` (the guest's memory, restored on resume) or `disk` (nothing
+  // but the session's spec: a resume boots it fresh under the same id).
+  string kind = 3;
+
+  // Bytes the checkpoint holds in the node content store.
+  uint64 bytes = 4;
+
+  // True when the session was already suspended before this call.
+  bool already_suspended = 5;
+
+  // `local` or `store` (the task's `suspend.durability`).
+  string durability = 6;
+
+  // With `durability = "store"`: the session manifest's URL once the
+  // checkpoint is published. Empty when the content store could not be
+  // reached: the suspend still succeeded on this node, the parts stay
+  // pinned here, and the node retries the publish until it lands.
+  string published_url = 7;
+}
+
+// Why a node did not suspend one session.
+message SessionSleepFailure {
+  // The session id.
+  string session_id = 1;
+
+  // The gRPC code the failure would carry on its own: `NOT_FOUND`,
+  // `FAILED_PRECONDITION`, `ABORTED`, or `INTERNAL`.
+  string code = 2;
+
+  // What went wrong. A NOT_FOUND message starts with `not_found`,
+  // `evicted`, or `wrong_node`, as `GetSession` answers.
+  string message = 3;
+}
+
+// Request payload for Worker.ResumeSession.
+message ResumeSessionRequest {
+  // The suspended session to resume.
+  string session_id = 1;
+
+  // Discard the checkpoint and boot the session fresh under the same id.
+  bool cold = 2;
+
+  // The session's job and task. Required only to resume a `store` session
+  // this node does not hold (a move): its manifest lives at
+  // `<contentStore.url>/sessions/<job>/<id-prefix>/<id>.json`, and the node
+  // admits it into its envelope for that task. Ignored for a session the
+  // node holds.
+  string job_id = 3;
+  string task_name = 4;
+
+  // Move a session the manifest says is running on another node without
+  // that node's agreement. A manager sets it only after its own probe of
+  // that node failed and the node is marked down or lost (or the caller
+  // passed `StartInstanceRequest.force_move`). Without it, a manifest
+  // naming another node as running answers FAILED_PRECONDITION starting
+  // `running_elsewhere`, naming the node and generation, so the manager can
+  // probe that node first.
+  bool force_move = 5;
+}
+
+// Reply payload for Worker.ResumeSession.
+message ResumeSessionReply {
+  // The session as it stands after the resume: `running`, or `starting`
+  // when its runtime is still coming up.
+  SessionStatus session = 1;
+
+  // This node's id.
+  string node_id = 2;
+
+  // `local` (restored from the node's memory checkpoint), `store` (a
+  // memory checkpoint whose parts were fetched from the content store: a
+  // move, or a local copy the node had evicted), or `cold` (booted fresh: a
+  // disk checkpoint, or `cold` was asked). Empty when the session was
+  // already running.
+  string resumed_from = 3;
+
+  // True when the session was running already and nothing was done.
+  bool already_running = 4;
+
+  // The session's generation after the resume. A `local` session never
+  // moves, so its generation stays 1; every resume of a `store` session
+  // claims one more.
+  uint64 generation = 5;
+
+  // The node the session ran on before this resume, when it moved here.
+  // Empty when it resumed on its own node.
+  string moved_from = 6;
 }
 
 // Request payload for Worker.Probe. Empty: the TLS handshake and the
@@ -9604,6 +10217,26 @@ message TaskAllocation {
   // A node without it starts the allocation normally, which is what a
   // replacement after node loss does. Empty otherwise.
   string promoted_from_session = 28;
+
+  // On an envelope allocation only: the full spec of the session task the
+  // envelope serves, as JSON, and that task's config id
+  // (docs/session-mode.md, "Starting at the edge"). A node holding the
+  // envelope can then start the task's sessions from a session ticket
+  // (`Worker.StartSession`) with no manager on the path: the spec it starts
+  // is exactly the one its envelope was placed for. Empty on every other
+  // allocation.
+  string session_task_spec = 29;
+  int64 session_task_config_id = 30;
+
+  // On an envelope allocation whose session task sets
+  // `suspend.durability = "store"` only: the job's session sealing keys,
+  // the current one first (see `SessionSealKey`). The node seals the
+  // checkpoint parts its sessions publish with the first, and opens parts
+  // sealed under any of them. Empty on every other allocation, and when the
+  // manager's keyring has no checkpoint key (the keyring is off or locked);
+  // a `store` session whose memory checkpoint has parts to seal then stays
+  // suspended on its node unpublished until the keys arrive.
+  repeated SessionSealKey session_seal_keys = 31;
 }
 
 // Request payload for PostWork.
@@ -10275,6 +10908,19 @@ message IssueBootTicketRequest {
   // Optional idempotency key. A repeat with the same key returns the
   // originally minted ticket rather than minting a second capability.
   optional string idempotency_key = 10;
+
+  // What the ticket authorizes: `boot` (the default) or `session`.
+  //
+  // A `session` ticket (session durability plan §6.4) lets its holder start,
+  // read, and stop sessions of one session task, on any node of `pool` that
+  // holds the task's envelope (`Worker.StartSession`, `GetSession`,
+  // `StopSession`), until it expires. It names no instance, prefix, or job
+  // config (the node starts the spec of the envelope it holds), so
+  // `instance_id`, `instance_prefix`, `job_config_id`, and `gate` must be
+  // empty. It is not spent per session: `uses` must be 0 or 1 and is
+  // recorded as 0 (unlimited); the envelopes' room bounds what it can
+  // start. The task must be a session task.
+  string scope = 11;
 }
 
 // Reply payload for IssueBootTicket.
@@ -10332,6 +10978,8 @@ message BootTicket {
   string accessor_id = 11;
   // Mint time, RFC3339.
   string created_at = 12;
+  // `boot` or `session` (see `IssueBootTicketRequest.scope`).
+  string scope = 13;
 }
 
 // Reply payload for ListBootTickets.
@@ -10665,6 +11313,20 @@ message QuerySessionsRequest {
   // With `job_id`: return only per-node totals in `node_usage`, not the
   // sessions themselves. What the session router reads.
   bool usage_only = 4;
+
+  // Every reported entry for each of these session ids, when
+  // `session_id` is empty: the managers' batched duplicate sweep, which
+  // asks its peers about all the derived ids newly reported to it once a
+  // second in one call. Router starts not yet reported are not included.
+  repeated string session_ids = 5;
+
+  // With `job_id` (not `usage_only`): only sessions whose id sorts after
+  // this one. With `limit`, a page of a listing.
+  string after_session_id = 6;
+
+  // With `job_id` (not `usage_only`): at most this many sessions, the
+  // lowest ids first. 0 returns them all.
+  uint32 limit = 7;
 }
 
 // Reply payload for RaftTransport.QuerySessions.

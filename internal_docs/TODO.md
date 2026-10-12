@@ -194,6 +194,13 @@ How to use it:
       [plan](plans/launch-spot-check-fixes-plan.md) §8.7 ·
       [calls](calls/launch-spot-check-fixes-plan_calls.md)). Each was
       deliberately deferred or found along the way.
+  - [ ] **Run the sandbox spot check** (RUNBOOK §12,
+        `tests/spot-check/smoke.sh sandboxes`; added 2026-10-12, never run).
+        Covers microVM exec, egress and the host guard, credential
+        injection, suspend/resume (local and store), idle and gateway wake,
+        memory pressure, preemption, and session mode. Needs `legion-guest`
+        on the workers and the config changes in RUNBOOK §12.0. The steps
+        marked PR #36 need the session-durability work.
   - [ ] **Re-run the AWS spot check without the shims**
         (`tests/spot-check/smoke.sh` and the RUNBOOK human pass on the
         `spot-check/launch` branch). Nothing in #17 ran on the real rig.
@@ -326,7 +333,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#35](https://github.com/mikenomitch/legion/pull/35) | Session durability, routing, and edge starts plan (docs only): concurrent node starts, worker-restart survival, node tag in session ids, manager-free edge starts, sleeping on the node; raft directory deferred | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
+| [#36](https://github.com/mikenomitch/legion/pull/36) | Session durability, routing, and edge starts, Phases 1–4 (concurrent node starts, `sessions.db` re-adopt, node tag in session ids and tag routing, session tickets, `Worker.StartSession`, `ListSessionNodes`, `legion session`), the session UI pass, and the sandbox spot-check and bottleneck-measurement plans. Phase 5 in progress | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
@@ -1793,6 +1800,13 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         labelled projections; record them in plan §14 and
         `benchmarks/scheduler/README.md`
         ([calls](calls/sandbox-scaling-plan_calls.md) #20, #60).
+  - [ ] **Run the bottleneck measurements.** "Bottleneck measurements
+        without a big fleet" in `benchmarks/aws/README.md` (added
+        2026-10-12, never run) covers 14 bottlenecks on a laptop, a sim
+        fleet, or one KVM worker. Its Gaps list names the missing harnesses
+        (loadgen session mode, sessions in `--simulate`, a fixed-delay fake
+        launch, sessions.db and ticket-cache benches, a real-runtime
+        restore loop).
   - [ ] **Suspend and resume still wait on heartbeats.** Checkpoint
         requests and reports ride the heartbeat, so a suspend takes ~3 s and
         a resume ~2 s at p50 on the default 2 s cadence, while placements
@@ -1830,14 +1844,16 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `identities`. Needs the signed lease of plan §6.3 in place of the
         start-time lease, and the envelope-scoped token check of §6.8
         ([calls](calls/sandbox-scaling-plan_calls.md) #18, #33, #34).
-  - [ ] **The node session log, its shipper, and per-session events.**
-        Sessions are counted (`legion_session_starts_total`,
-        `legion_session_stops_total`), not recorded; a worker restart ends
-        its unpromoted sessions because nothing is on disk (plan §6.4,
+  - [ ] **The session log's shipper and per-session events.** Sessions
+        are counted (`legion_session_starts_total`,
+        `legion_session_stops_total`), not journaled. The node log itself
+        (`sessions.db`) shipped in #36 for worker restarts, but nothing
+        ships it off the node (plan §6.4,
         [calls](calls/sandbox-scaling-plan_calls.md) #19, #32, #37).
-  - [ ] **Edge-started sessions.** Prefix boot tickets do not start
-        sessions; every session starts through a manager's router (plan
-        §6.3, [calls](calls/sandbox-scaling-plan_calls.md) #30).
+  - [x] **Edge-started sessions.** Session tickets and
+        `Worker.StartSession` (#36,
+        [session-durability plan](plans/session-durability-and-routing-plan.md)
+        §6.4, [docs](../docs/session-mode.md#starting-at-the-edge)).
   - [ ] **More ways to promote.** `promote.onVolume` and promotion by
         `snapshot create --name` (plan §6.6) are not built; only a caller id
         at create and `legion instance promote` promote
@@ -2823,33 +2839,96 @@ Plan: [artifact-system-plan.md](plans/artifact-system-plan.md) · docs: [artifac
 
 Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.md), [volume-plugin-system](plans/volume-plugin-system-plan.md) · docs: [volumes.md](../docs/volumes.md), [stateful-workloads.md](../docs/stateful-workloads.md)
 
-- [ ] **Session durability and routing back** (builds on session mode; plan in
-      [#35](https://github.com/mikenomitch/legion/pull/35)). A worker
+- [ ] **Session durability and routing back** (builds on session mode; plan
+      merged in [#35](https://github.com/mikenomitch/legion/pull/35),
+      implementation in [#36](https://github.com/mikenomitch/legion/pull/36)). A worker
       restart ends every unpromoted session, a session cannot sleep,
       finding one fans out to every manager, and every start goes through
       a manager. Plan:
       [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md)
-      (PLANNED) · calls:
+      (IN EXECUTION) · calls:
       [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md).
-  - [ ] Phase 1: the node starts sessions concurrently (launch out from
+  - [x] Phase 1: the node starts sessions concurrently (launch out from
         under the task-manager lock, no state-file fsync per session start,
         bounded launch pool).
-  - [ ] Phase 2: node-local `sessions.db`, adopt sessions on worker restart.
-  - [ ] Phase 3: the start node's tag in the minted session id, tag-first
+  - [x] Phase 2: node-local `sessions.db`, adopt sessions on worker restart.
+        Full reports are not yet chunked past the message limit; the
+        manager's decode limit was raised to 64 MiB instead.
+  - [x] Phase 3: the start node's tag in the minted session id, tag-first
         routing with fan-out as the fallback.
-  - [ ] Phase 4: edge starts with no manager on the path
+  - [x] Phase 4: edge starts with no manager on the path
         (`ListSessionNodes` for an outside consistent-hash picker, session
-        tickets, `Worker.StartSession`), and the manager-routed path
-        measured across three managers.
-  - [ ] Phase 5: session suspend on the node (`durability = "local"` or
-        `"store"`), `suspend.keepFor`, `evicted` answers, resume by tag with
-        manifest fallback, edge resume on any node, and moves fenced by a
-        generation claimed with a conditional manifest write (plan §6.7).
-  - [ ] No split brain (plan §6.7): manifest create for idempotent `store`
-        starts, the fence list, the managers' batched duplicate sweep, and
-        self-fencing after `stateful.fenceAfter`.
-  - [ ] Optional `suspend.checkpointEvery` and `suspend.onWorkerStop =
-        "checkpoint"` (plan §6.6).
+        tickets, `Worker.StartSession`).
+  - [ ] Measure the manager-routed path across three managers, and remove
+        its derived-id fan-out (plan §8 item 4). Needs the loadgen session
+        mode in the bottleneck plan's gaps
+        (`benchmarks/aws/README.md`, "Bottleneck measurements").
+  - [x] Phase 5a: sessions sleep on their own node with `durability =
+        "local"`: `suspend.keepFor`, idle suspend, `Worker.SuspendSessions`
+        / `Worker.ResumeSession` routed by tag from `instance suspend` /
+        `instance start`, eviction (keepFor, envelope gone, minFreeDisk)
+        with the `evicted` answer, UNAVAILABLE naming a silent node
+        ([docs](../docs/session-mode.md#idle-sessions)).
+  - [x] Phase 5b: `durability = "store"` for sessions: suspend and live
+        checkpoints publish sealed parts (a per-job session sealing key on
+        the envelope payload) and write the session manifest at
+        `<contentStore.url>/sessions/<job>/<prefix>/<id>.json`; every
+        resume claims the next generation with a conditional write
+        (`file://` and `s3://`); `Worker.ResumeSession` with job/task and
+        `StartSession.resume_id` resume a session the node never held;
+        `instance start` falls back to the manifest when the tagged node
+        lost it, is full, or does not answer, probing a running copy first
+        (calls 28 to 39;
+        [docs](../docs/session-mode.md#moving-a-session)). Not yet run:
+        see the open items below.
+  - [ ] Phase 5b against real S3 (or MinIO): the `s3://` manifest backend
+        (`PutMode::Create` / `Update` with `S3ConditionalPut::ETagMatch`)
+        is unit-tested only against `object_store`'s in-memory store
+        (`src/session_manifest.rs`), not against a bucket.
+  - [ ] Phase 5b with the `sandbox` runtime: publishing and restoring a
+        session's memory parts (sealed with the session key, fetched on
+        another node) is not covered by a test; the unit tests run `exec`
+        sessions, whose disk checkpoint has no parts.
+  - [ ] Phase 5b edge move: `StartSession.resume_id`'s probe and
+        `StopSession` of the old copy over worker-to-worker TLS has no test
+        (it needs two real workers with mesh certificates); the manager
+        fallback is covered in `tests/session_integration.rs` with fake
+        nodes and a fake bucket.
+  - [ ] An edge picker (`legion session nodes`) should set `force_move`
+        itself when the node a session's tag names is listed `down` or
+        `lost`; today the caller passes `--force-move`.
+  - [ ] Manifests of `store` sessions that are never resumed or stopped
+        stay in the bucket (calls entry 33); consider a manager-side sweep
+        of manifests whose job is gone.
+  - [ ] A moved `store` session runs the receiving node's envelope job
+        version, not the one it started with (calls entry 29).
+  - [ ] Finding a moved session's job scans every job's session tasks
+        (calls entry 37); two jobs with a `store` session task of the same
+        name are ambiguous.
+  - [ ] Evicted and unreachable session answers are given before the job's
+        ACL scope is known; have the node return the job id with them so
+        the precise scope is enforced first.
+  - [ ] Memory checkpoints of sessions (`sandbox` runtime) are not covered
+        by a test: the unit tests run `exec` sessions, whose checkpoint is
+        a disk one (`a_session_suspends_and_resumes_on_its_node_test`).
+        Nor are the periodic checkpoint round, checkpoint on SIGTERM, or
+        restore after restart tested end to end; only their decision
+        functions are.
+  - [x] The managers' batched duplicate sweep and the generation-first
+        winner rule (plan §6.7, mechanism 3; #36).
+  - [x] No split brain for `store` sessions (plan §6.7): manifest create
+        for idempotent `store` starts (`ALREADY_EXISTS` naming the winner),
+        superseded-on-write, the fence list (`sessions.fenceListEvery`,
+        default 30s), probe-before-move, and self-fencing after
+        `stateful.fenceAfter` (default 2m) with resume of owned generations
+        on reconnect ([docs](../docs/session-mode.md#no-split-brain)).
+        Unit-tested on the `file://` backend.
+  - [x] Optional `suspend.checkpointEvery` (memory checkpoints only,
+        staggered, skipped past one interval and counted in
+        `legion_session_checkpoints_skipped_total`) and
+        `suspend.onWorkerStop = "checkpoint"` (a SIGTERM/SIGINT handler in
+        the worker, restore on restart) (plan §6.6,
+        [docs](../docs/session-mode.md#idle-sessions)).
   - [ ] Phase 6 (conditional, plan §6.8): batched raft session directory,
         only past its trigger.
 
@@ -3673,6 +3752,40 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
         within one poll of the idle sweep suspending the instance. macOS
         only exercises the not-reported shape, so the countdown is checked
         against fixtures at `/testing` only
+
+- [ ] **Sessions in the UI, at any count**
+      ([plan](plans/session-ui-plan.md),
+      [calls](calls/session-ui-plan_calls.md),
+      [docs](../docs/ui-architecture.md#sessions)).
+  - [x] Sessions labelled on the job's Instances card (mode badge, envelope
+        and node, promoted-from), Promote and End per row and on the
+        instance page, a session summary (count, nodes, `complete`,
+        `asOf`, busiest nodes), URL filters (`mode`, `node`, `envelope`,
+        `task`), envelope cards on the allocation page, envelope badges on
+        the job and worker pages, notes on session and envelope task pages,
+        fixtures at `/testing`
+  - [x] Bounded at scale: sessions read 500 at a time with First/Prev/Next,
+        100 rows rendered at a time, no re-poll past 5,000 instances, job
+        allocations 200 at a time
+  - [x] Server paging and a session limit on `ListInstances`
+        (`session_limit`, `session_page_token`; #36,
+        [calls 1](calls/session-ui-plan_calls.md#1-the-job-page-reads-one-500-session-page-and-pages-with-prevnext-counts-come-from-the-reply))
+  - [x] Session counts without the listing: `session_count` and
+        `sessions_by_node` on every `ListInstances` reply
+        (`session_limit = 0` for counts only), and per-node counts from
+        `ListSessionNodes` (#36,
+        [calls 2](calls/session-ui-plan_calls.md#2-per-task-and-per-envelope-counts-come-from-listsessionnodes-not-the-listing))
+  - [ ] `ListInstances` filters for `node_id`, `envelope_alloc_id`, `mode`,
+        and `task`, so the node page and the envelope card can show their
+        own sessions without the job's listing
+        ([calls 6](calls/session-ui-plan_calls.md#6-node-envelope-task-and-mode-filters-live-in-the-url))
+  - [ ] The runtime (or an envelope flag) on `LedgerAllocation`, so the
+        worker page stops recognizing envelopes by name
+        ([calls 7](calls/session-ui-plan_calls.md#7-an-envelope-is-recognized-by-name-confirmed-by-the-spec-when-there-is-one))
+  - [ ] Browser check against a live session cluster (Promote, End,
+        paging, the envelope card, the edge-nodes card); checked by
+        typecheck, build, `/testing`, and a 250,000-session paging run of
+        the fixtures only
 
 Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 
@@ -4592,6 +4705,14 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       node-local pinning, `legion volume` CLI + MCP tools, UI, and the
       [Postgres](../docs/guides/postgres.md) / [Redis](../docs/guides/redis.md) guides
 - [x] Block-mode volumes, consumed directly by the sandbox runtime
+- [x] **Idle sessions sleep on their node** (session durability plan Phase
+      5a): `suspend.durability = "local"` on session tasks, `keepFor`,
+      `checkpointEvery`, `onWorkerStop`, suspend and resume routed by the
+      id's node tag, eviction with an explicit `evicted` answer, and no raft
+      entry for any of it ([plan](plans/session-durability-and-routing-plan.md)
+      §6.6 · [docs](../docs/session-mode.md#idle-sessions) ·
+      [calls](calls/session-durability-and-routing-plan_calls.md) #13, #14,
+      #17-#21). Store durability for sessions is open above (Phase 5b).
 - [x] **Edge boot: provisional allocations, gate levels, and boot tickets** —
       a node reaches a declared execution stage (`stage`/`boot`/`serve`) before
       the placement is durable, and an edge node authorizes a start itself from

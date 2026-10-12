@@ -506,6 +506,96 @@ Known limitations:
 - A macOS worker reports no usage, so the idle countdown and populated usage
   are only visible on Linux workers with enforcement on, and on `/testing`.
 
+## Sessions
+
+Sessions ([session-mode.md](session-mode.md)) appear wherever instances do,
+labelled as sessions, and every page that touches them is bounded so a job
+with a million of them stays usable. `utils/sessions.ts` holds the
+vocabulary, the limits, and the session pager.
+
+- **Job page, Instances card.** A `session` badge in the Mode column, the
+  envelope allocation and node in the Allocation column, and **Promote**
+  (with an optional new name, hidden when `stateful.promote.onName = false`)
+  and **End** per row, each a two-step confirm that needs `job:write`.
+  Promoted instances say which session they came from. Above the table: how
+  many sessions run on how many nodes and the busiest nodes as filter chips
+  (all from the reply's `session_count` and `sessions_by_node`, not from the
+  page), whether every node has reported to the session index (`complete`),
+  when it was read (`asOf`), and, once there is more than one page,
+  `Sessions 501–1,000 of 250,000, in id order` with **First**, **Prev**, and
+  **Next**. State and mode chips and a text filter (id, node, or task,
+  case-sensitive) narrow the rows and the page loaded; the mode, node,
+  envelope, and task filters are in the URL, so
+  `/jobs/agents?mode=session&node=w-17#instances` opens one node's sessions.
+- **Job page, Edge nodes card.** One per session task, from
+  `ListSessionNodes`: every node holding an envelope for the task, its tag
+  (the 8 characters a session id minted there carries before its final `.`,
+  as in `workspace-q4n7c2rd.01J…`), whether it takes new edge starts and why
+  not (`lost`, `down`, `draining`, `ineligible`, `no-address`,
+  `no-edge-sessions`, `full`), its weight, its sessions (linking to them on
+  the Instances card), and its envelope's room left. 100 nodes at a time.
+- **Job page, elsewhere.** The header counts sessions (`session_count`); a
+  session task's card shows its envelopes' status and how many sessions run
+  (the sum of its `ListSessionNodes` entries); envelope rows in Allocations
+  are badged with their node's session count for the task and link to their
+  sessions.
+- **Instance page.** A session reads as `Session`, `session · not durable`,
+  with its node and envelope, Promote and End in the header, and a note on
+  what it gives up. Promoting under a new name opens the new instance's
+  page. After a session ends, the page says it ended. Snapshots, suspend,
+  and fork say to promote first. Fork lineage lists the job's rows with
+  `session_limit: 0`, so it works in a session job too.
+- **Allocation page, envelopes.** An allocation of `<task>-envelope` gets a
+  **Session envelope** card: what it reserves, how many sessions fit (from
+  the spec), and, read on open from the node's `ListSessionNodes` entry, how
+  many run in it, whether the node takes edge starts, its room left, and its
+  tag. A manager that refuses `ListSessionNodes` falls back to
+  `ListInstances` with `session_limit: 0`, whose per-node total counts every
+  session task the job has on that node; the card says so. A link opens the
+  sessions on the job page. Health, Network, Logs, and Exec are hidden,
+  since an envelope runs nothing.
+- **Worker and task pages.** Envelope allocations on a worker are badged and
+  link to the job's sessions on that worker. A session task's page says its
+  sessions are not allocations; an envelope task's page says it was
+  generated and runs nothing.
+
+### Limits at scale
+
+`ListInstances` returns the job's rows in full and its running sessions a
+page at a time, in session id order, with the totals counted for free. The
+UI never asks for an unbounded list:
+
+| What | Request | What happens |
+| --- | --- | --- |
+| Instances card | `session_limit: 500`, the pager's token | One page re-read every 2 seconds; **Next** passes the reply's `next_session_page_token`, **Prev** and **First** replay earlier tokens the page kept |
+| Rows rendered | | 100 at a time, at most 1,000: "Showing the first N of M", **Show more**, then the filter or `legion instance list <job> -j` |
+| Counts (header, summary, busiest nodes) | from the same reply | `session_count` and `sessions_by_node`, whatever the page holds |
+| Task cards, envelope rows, Edge nodes | `ListSessionNodes` per session task | Read every 5 seconds; one entry per node, never per session |
+| Envelope card | `ListSessionNodes`, else `session_limit: 0` | Read on open and on **Count again** |
+| Fork lineage | `session_limit: 0` | Rows only |
+| Re-polling | listings under 5,000 | Only a job with that many keyed or slot rows reaches it; the card then stops refreshing every 2 seconds and offers **Refresh** |
+| Job allocations | | 200 at a time, **Show more** |
+
+Known limitations:
+
+- `ListInstances` has no node or envelope filter, so the node, envelope,
+  state, and text filters narrow the page loaded, not every session. With a
+  node filter on, the card says how many sessions that node runs in all and
+  to page on for the rest. The Edge nodes card has each node's count.
+- Page offsets are counted by the page: if sessions end between pages, the
+  `501–1,000` range is approximate, and a page past the last session says
+  so and offers **First**.
+- `origin` (`manager` or `edge`), `generation`, and `ticket_jti` are on the
+  worker's `SessionStatus` but not on `InstanceInfo`, so the UI does not
+  show them.
+- On the worker page an envelope is recognized by its task name alone, so a
+  task named `<x>-envelope` in a job without sessions is badged too.
+- Sessions are created from the CLI or the API, not the UI.
+- `/testing` renders a mixed session listing and a 250,000-session listing
+  built in the browser, both answered the way the manager pages them
+  (`session_limit`, the page token, `session_count`, `sessions_by_node`), an
+  Edge nodes card for the large one, and the envelope card.
+
 ## Job Templates
 
 `/templates` lists the cluster's [job templates](job-templates.md).

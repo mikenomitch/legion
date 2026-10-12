@@ -111,6 +111,7 @@ fn submit_sandbox_job(store: &Store) -> R<()> {
             storage: None,
             envelope: None,
             promote: None,
+            fence_after: None,
         }),
         suspend: Some(SuspendConfig {
             checkpoint: Some("memory".into()),

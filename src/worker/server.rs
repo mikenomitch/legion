@@ -45,11 +45,54 @@ pub trait ClaimRatifier: Send + Sync {
 /// for room is RESOURCE_EXHAUSTED, which the manager's session router reads as
 /// "try the next node"; everything else is FAILED_PRECONDITION, as before.
 fn admission_status(err: &anyhow::Error) -> Status {
+    use crate::worker::task_manager::session_sleep::SessionSleepError;
     use crate::worker::task_manager::SessionRefusal;
+    if let Some(sleep) = err.downcast_ref::<SessionSleepError>() {
+        if let Some(status) = store_status(sleep) {
+            return status;
+        }
+    }
     match err.downcast_ref::<SessionRefusal>() {
         Some(SessionRefusal::EnvelopeFull { .. }) => Status::resource_exhausted(format!("{err:#}")),
         _ => Status::failed_precondition(format!("{err:#}")),
     }
+}
+
+/// The status of a `store` session refusal (session durability plan §6.7):
+/// a lost claim or a superseded copy is ABORTED, a session another node
+/// created first is ALREADY_EXISTS, an unreachable content store is
+/// UNAVAILABLE, and a move that found the session running elsewhere is
+/// FAILED_PRECONDITION `running_elsewhere`. Each message ends in `[winner
+/// node=<id> generation=<g>]` when it names a winner.
+fn store_status(
+    sleep: &crate::worker::task_manager::session_sleep::SessionSleepError,
+) -> Option<Status> {
+    use crate::worker::task_manager::session_sleep::SessionSleepError;
+    Some(match sleep {
+        SessionSleepError::Superseded(why) => Status::aborted(why.clone()),
+        SessionSleepError::AlreadyExists(why) => Status::already_exists(why.clone()),
+        SessionSleepError::StoreUnavailable(why) => Status::unavailable(why.clone()),
+        SessionSleepError::RunningElsewhere { .. } => {
+            Status::failed_precondition(sleep.to_string())
+        }
+        _ => return None,
+    })
+}
+
+/// How long a move waits for the node a session's manifest names before it
+/// calls that node unreachable (session durability plan §6.7, "Moving is
+/// cautious for running sessions").
+pub const MOVE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a probe of the node a manifest names found.
+#[derive(Debug)]
+enum PeerProbe {
+    /// The session runs there.
+    Running,
+    /// The node answered and does not run it (suspended or gone).
+    NotRunning,
+    /// No answer within [`MOVE_PROBE_TIMEOUT`].
+    Unreachable(String),
 }
 
 pub struct WorkerDaemonService {
@@ -64,7 +107,25 @@ pub struct WorkerDaemonService {
     /// Direct exec: the exec ticket verifier, `None` unless the worker
     /// config sets `exec = { direct = true }`.
     pub direct_exec: Option<Arc<crate::worker::direct_exec::ExecTicketVerifier>>,
+    /// Bounds the provisional starts (sessions and claims) this node runs
+    /// through its runtime at once (`edgeBoot.launchConcurrency`).
+    pub launch_pool: Arc<crate::worker::launch_pool::LaunchPool>,
+    /// This node's identity, whose cluster CA bundle verifies another
+    /// worker an edge resume probes (`StartSession.resume_id`). `None` in
+    /// tests: such a node cannot probe, so it moves only with `force_move`.
+    pub node_identity: Option<Arc<crate::worker::plane::NodeIdentity>>,
 }
+
+impl WorkerDaemonService {
+    /// Take a launch slot, or refuse the start as retryable on another node.
+    async fn launch_slot(&self) -> Result<crate::worker::launch_pool::LaunchSlot, Status> {
+        self.launch_pool
+            .acquire()
+            .await
+            .map_err(|full| Status::resource_exhausted(full.to_string()))
+    }
+}
+
 #[tonic::async_trait]
 impl Worker for WorkerDaemonService {
     #[instrument(err, skip_all)]
@@ -91,9 +152,27 @@ impl Worker for WorkerDaemonService {
         // by whether the payload yet has an allocation id.
         if let Some(provisional) = allocation.provisional.clone() {
             if allocation.allocation_id == 0 {
-                let admitted =
-                    edge::admit_and_launch(&self.task_manager, &allocation, &provisional)
-                        .map_err(|err| admission_status(&err))?;
+                let slot = self.launch_slot().await?;
+                // An idempotent `store` start creates its manifest first, so
+                // two nodes that derived the same id cannot both run it.
+                let task_manager = self.task_manager.clone();
+                let payload = allocation.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::worker::task_manager::session_store::claim_new_store_session(
+                        &task_manager,
+                        &payload,
+                    )
+                })
+                .await
+                .map_err(|err| Status::internal(format!("session create panicked: {err}")))?
+                .map_err(|err| admission_status(&err))?;
+                let admitted = edge::admit_and_launch(
+                    &self.task_manager,
+                    &allocation,
+                    &provisional,
+                    Some(slot),
+                )
+                .map_err(|err| admission_status(&err))?;
                 return Ok(Response::new(PostWorkReply {
                     message: format!("Provisional start {} admitted", admitted.claim_id),
                 }));
@@ -372,13 +451,17 @@ impl Worker for WorkerDaemonService {
             .provisional
             .clone()
             .expect("provisional block was just set");
+        let slot = self.launch_slot().await.inspect_err(|_| {
+            edge_boot.verifier.unspend(&claims.jti);
+        })?;
         let admitted =
-            edge::admit_and_launch(&self.task_manager, &payload, &provisional).map_err(|err| {
-                // The start never happened, so the ticket was not really
-                // redeemed; let an operator's retry work.
-                edge_boot.verifier.unspend(&claims.jti);
-                Status::resource_exhausted(format!("{err:#}"))
-            })?;
+            edge::admit_and_launch(&self.task_manager, &payload, &provisional, Some(slot))
+                .map_err(|err| {
+                    // The start never happened, so the ticket was not really
+                    // redeemed; let an operator's retry work.
+                    edge_boot.verifier.unspend(&claims.jti);
+                    Status::resource_exhausted(format!("{err:#}"))
+                })?;
         edge_boot.verifier.spend(&claims, now_unix);
 
         let (tx, rx) = tokio::sync::mpsc::channel(8);
@@ -471,6 +554,650 @@ impl Worker for WorkerDaemonService {
             .map_err(|_| Status::internal("Task manager lock poisoned"))?
             .stop_sessions(&request.session_ids, &format!("requested ({reason})"));
         Ok(Response::new(crate::structs::StopSessionsReply { stopped }))
+    }
+
+    /// Suspend sessions on this node (session durability plan §6.6).
+    /// Manager-only, like `StopSessions`.
+    #[instrument(err, skip_all, fields(sessions))]
+    async fn suspend_sessions(
+        &self,
+        request: Request<crate::structs::SuspendSessionsRequest>,
+    ) -> Result<Response<crate::structs::SuspendSessionsReply>, Status> {
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "SuspendSessions")?;
+        let request = request.into_inner();
+        tracing::Span::current().record("sessions", request.session_ids.len());
+        let reason = if request.reason.is_empty() {
+            "manual".to_string()
+        } else {
+            request.reason
+        };
+        let mut reply = crate::structs::SuspendSessionsReply::default();
+        for session_id in request.session_ids {
+            let task_manager = self.task_manager.clone();
+            let id = session_id.clone();
+            let trigger = reason.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::worker::task_manager::session_sleep::suspend_session(
+                    &task_manager,
+                    &id,
+                    &trigger,
+                )
+            })
+            .await
+            .map_err(|err| Status::internal(format!("session suspend panicked: {err}")))?;
+            match outcome {
+                Ok(outcome) => {
+                    use crate::worker::task_manager::session_sleep::SuspendOutcome;
+                    let (checkpoint, already) = match outcome {
+                        SuspendOutcome::Suspended(checkpoint) => (checkpoint, false),
+                        SuspendOutcome::AlreadySuspended(checkpoint) => (checkpoint, true),
+                    };
+                    let (durability, published_url) = {
+                        let guard = self
+                            .task_manager
+                            .lock()
+                            .map_err(|_| Status::internal("Task manager lock poisoned"))?;
+                        let store = guard.idle_row(&session_id).is_some_and(|row| row.store);
+                        (
+                            if store { "store" } else { "local" }.to_string(),
+                            guard.published_url(&session_id),
+                        )
+                    };
+                    reply.suspended.push(crate::structs::SuspendedSession {
+                        session_id,
+                        snapshot_id: checkpoint.snapshot_id,
+                        kind: checkpoint.kind,
+                        bytes: checkpoint.total_bytes,
+                        already_suspended: already,
+                        durability,
+                        published_url,
+                    });
+                }
+                Err(err) => {
+                    let status = self.session_sleep_status(&session_id, &err);
+                    reply.failed.push(crate::structs::SessionSleepFailure {
+                        session_id,
+                        code: format!("{:?}", status.code()),
+                        message: status.message().to_string(),
+                    });
+                }
+            }
+        }
+        Ok(Response::new(reply))
+    }
+
+    /// Resume a suspended session on this node (session durability plan
+    /// §6.6). Manager-only.
+    #[instrument(err, skip_all, fields(session_id))]
+    async fn resume_session(
+        &self,
+        request: Request<crate::structs::ResumeSessionRequest>,
+    ) -> Result<Response<crate::structs::ResumeSessionReply>, Status> {
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "ResumeSession")?;
+        let request = request.into_inner();
+        tracing::Span::current().record("session_id", request.session_id.as_str());
+        let slot = self.launch_slot().await?;
+        let task_manager = self.task_manager.clone();
+        let session_id = request.session_id.clone();
+        let cold = request.cold;
+        if request.job_id.is_empty() {
+            // A session this node holds, by its id alone.
+            let outcome = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                crate::worker::task_manager::session_sleep::resume_session(
+                    &task_manager,
+                    &session_id,
+                    cold,
+                )
+            })
+            .await
+            .map_err(|err| Status::internal(format!("session resume panicked: {err}")))?
+            .map_err(|err| self.session_sleep_status(&request.session_id, &err))?;
+            use crate::worker::task_manager::session_sleep::ResumeOutcome;
+            let (resumed_from, already_running) = match outcome {
+                ResumeOutcome::Resumed { from } => (from.to_string(), false),
+                ResumeOutcome::AlreadyRunning => (String::new(), true),
+            };
+            let session = self
+                .task_manager
+                .lock()
+                .map_err(|_| Status::internal("Task manager lock poisoned"))?
+                .session_status(&request.session_id);
+            return Ok(Response::new(crate::structs::ResumeSessionReply {
+                generation: session.as_ref().map(|s| s.generation).unwrap_or_default(),
+                session,
+                node_id: self.node_id.clone(),
+                resumed_from,
+                already_running,
+                moved_from: String::new(),
+            }));
+        }
+        // With its job and task: a `store` session resumes here from its
+        // manifest even when another node ran it (session durability plan
+        // §6.6, "Resume"). The manager probed the old node, so a session
+        // the manifest says runs elsewhere moves only with `force_move`.
+        let move_request = crate::worker::task_manager::session_store::MoveRequest {
+            session_id: session_id.clone(),
+            job_id: request.job_id.clone(),
+            task_name: request.task_name.clone(),
+            force_move: request.force_move,
+            cold,
+            origin: "manager".into(),
+            ticket_jti: String::new(),
+        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            crate::worker::task_manager::session_store::resume_moved(
+                &task_manager,
+                &move_request,
+                None,
+            )
+        })
+        .await
+        .map_err(|err| Status::internal(format!("session resume panicked: {err}")))?
+        .map_err(|err| self.session_sleep_status(&request.session_id, &err))?;
+        let session = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .session_status(&request.session_id);
+        Ok(Response::new(crate::structs::ResumeSessionReply {
+            session,
+            node_id: self.node_id.clone(),
+            resumed_from: outcome.from.to_string(),
+            already_running: outcome.from.is_empty(),
+            generation: outcome.generation,
+            moved_from: outcome.moved_from,
+        }))
+    }
+
+    /// One session on this node, for tag routing (session durability plan
+    /// §6.3). The node's answer is authoritative for itself.
+    #[instrument(err, skip_all, fields(session_id))]
+    async fn get_session(
+        &self,
+        request: Request<crate::structs::GetSessionRequest>,
+    ) -> Result<Response<crate::structs::GetSessionReply>, Status> {
+        // Caller classes: manager, ticket (a session ticket).
+        let caller = crate::worker::plane::caller_of(&request, "GetSession")?;
+        let request = request.into_inner();
+        tracing::Span::current().record("session_id", request.session_id.as_str());
+        let ticket = match caller {
+            crate::worker::plane::Caller::Manager(_) => None,
+            crate::worker::plane::Caller::Ticket => {
+                Some(self.verify_session_ticket(&request.ticket, "GetSession")?)
+            }
+        };
+        let session = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .session_status(&request.session_id);
+        let Some(session) = session else {
+            return Err(self.session_not_here(&request.session_id));
+        };
+        if let Some(ticket) = ticket {
+            ticket.allows(&session.job_id, &session.task_name)?;
+        }
+        Ok(Response::new(crate::structs::GetSessionReply {
+            session: Some(session),
+            node_id: self.node_id.clone(),
+        }))
+    }
+
+    /// Start a session from a session ticket (session durability plan
+    /// §6.4): no manager on the path, nothing written to raft.
+    #[instrument(err, skip_all, fields(job, task, session_id))]
+    async fn start_session(
+        &self,
+        request: Request<crate::structs::StartSessionRequest>,
+    ) -> Result<Response<crate::structs::StartSessionReply>, Status> {
+        // Caller class: ticket only.
+        let caller = crate::worker::plane::caller_of(&request, "StartSession")?;
+        if let crate::worker::plane::Caller::Manager(_) = caller {
+            return Err(Status::unauthenticated(
+                "StartSession is the edge entry point and admits a session ticket only; \
+                 managers start sessions with PostWork",
+            ));
+        }
+        let request = request.into_inner();
+        let ticket = self.verify_session_ticket(&request.ticket, "StartSession")?;
+        let claims = ticket.0.clone();
+        let job = if request.job_id.is_empty() {
+            claims.job.clone()
+        } else {
+            request.job_id.clone()
+        };
+        let task = if request.task_name.is_empty() {
+            claims.task.clone()
+        } else {
+            request.task_name.clone()
+        };
+        ticket.allows(&job, &task)?;
+        let span = tracing::Span::current();
+        span.record("job", job.as_str());
+        span.record("task", task.as_str());
+
+        if !request.resume_id.trim().is_empty() {
+            return self
+                .resume_from_edge(&request, claims, job, task)
+                .await
+                .map(Response::new);
+        }
+
+        let slot = self.launch_slot().await?;
+        let task_manager = self.task_manager.clone();
+        let node_id = self.node_id.clone();
+        let key = request.idempotency_key.clone();
+        let started = tokio::task::spawn_blocking(move || {
+            edge::start_edge_session(&task_manager, &node_id, &claims, &key, slot)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("session start panicked: {err}")))?
+        .map_err(|err| admission_status(&err))?;
+        span.record("session_id", started.session_id.as_str());
+
+        let state = if started.deduplicated || !request.wait.unwrap_or(true) {
+            self.task_manager
+                .lock()
+                .map_err(|_| Status::internal("Task manager lock poisoned"))?
+                .session_status(&started.session_id)
+                .map(|status| status.state)
+                .unwrap_or_else(|| "starting".to_string())
+        } else {
+            match edge::wait_until_running(&self.task_manager, &started.session_id, EDGE_START_WAIT)
+                .await
+            {
+                Ok(true) => "running".to_string(),
+                Ok(false) => "starting".to_string(),
+                Err(err) => return Err(Status::internal(format!("{err:#}"))),
+            }
+        };
+        let generation = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .session_status(&started.session_id)
+            .map(|status| status.generation)
+            .unwrap_or(1);
+        Ok(Response::new(crate::structs::StartSessionReply {
+            session_id: started.session_id,
+            node_id: self.node_id.clone(),
+            state,
+            deduplicated: started.deduplicated,
+            resumed_from: String::new(),
+            generation,
+            moved_from: String::new(),
+        }))
+    }
+
+    /// End one session from a session ticket.
+    #[instrument(err, skip_all, fields(session_id))]
+    async fn stop_session(
+        &self,
+        request: Request<crate::structs::StopSessionRequest>,
+    ) -> Result<Response<crate::structs::StopSessionReply>, Status> {
+        // Caller class: ticket only.
+        let caller = crate::worker::plane::caller_of(&request, "StopSession")?;
+        if let crate::worker::plane::Caller::Manager(_) = caller {
+            return Err(Status::unauthenticated(
+                "StopSession admits a session ticket only; managers end sessions with \
+                 StopSessions",
+            ));
+        }
+        let request = request.into_inner();
+        tracing::Span::current().record("session_id", request.session_id.as_str());
+        let ticket = self.verify_session_ticket(&request.ticket, "StopSession")?;
+        let mut manager = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?;
+        let Some(session) = manager.session_status(&request.session_id) else {
+            // An evicted session runs nothing and holds nothing: stopping
+            // it forgets the id, once the ticket is checked against it.
+            if let Some((job, task)) = manager.idle_session_owner(&request.session_id) {
+                ticket.allows(&job, &task)?;
+                manager.stop_sessions(
+                    std::slice::from_ref(&request.session_id),
+                    "requested (edge stop)",
+                );
+                return Ok(Response::new(crate::structs::StopSessionReply {
+                    stopped: false,
+                    node_id: self.node_id.clone(),
+                }));
+            }
+            drop(manager);
+            let status = self.session_not_here(&request.session_id);
+            // Already gone from this node: idempotent, unless the caller has
+            // the wrong node.
+            if status.message().starts_with("not_found") {
+                return Ok(Response::new(crate::structs::StopSessionReply {
+                    stopped: false,
+                    node_id: self.node_id.clone(),
+                }));
+            }
+            return Err(status);
+        };
+        ticket.allows(&session.job_id, &session.task_name)?;
+        let stopped = manager.stop_sessions(
+            std::slice::from_ref(&request.session_id),
+            "requested (edge stop)",
+        );
+        Ok(Response::new(crate::structs::StopSessionReply {
+            stopped: !stopped.is_empty(),
+            node_id: self.node_id.clone(),
+        }))
+    }
+}
+
+/// How long `StartSession` waits for a session to be running before it
+/// answers `starting`.
+const EDGE_START_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A verified session ticket.
+pub(crate) struct VerifiedSessionTicket(crate::structs::edge_boot::SessionTicketClaims);
+
+impl VerifiedSessionTicket {
+    /// PermissionDenied unless the ticket covers this job and task.
+    fn allows(&self, job: &str, task: &str) -> Result<(), Status> {
+        self.0
+            .covers(job, task)
+            .map_err(|err| Status::permission_denied(format!("{err:#}")))
+    }
+}
+
+impl WorkerDaemonService {
+    /// Verify a session ticket presented on the worker plane.
+    pub(crate) fn verify_session_ticket(
+        &self,
+        token: &str,
+        rpc: &str,
+    ) -> Result<VerifiedSessionTicket, Status> {
+        if token.trim().is_empty() {
+            return Err(Status::unauthenticated(format!(
+                "{rpc} admits a manager certificate or a session ticket; this request carried \
+                 neither"
+            )));
+        }
+        let Some(edge_boot) = self.edge_boot.as_ref() else {
+            return Err(Status::failed_precondition(format!(
+                "{rpc}: this node does not accept edge starts (set edgeBoot.acceptClaims: true \
+                 in its worker config)"
+            )));
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        edge_boot
+            .verifier
+            .verify_session(token, now)
+            .map(VerifiedSessionTicket)
+            .map_err(|err| Status::permission_denied(format!("session ticket refused: {err:#}")))
+    }
+}
+
+impl WorkerDaemonService {
+    /// The status a failed suspend or resume of a session answers with
+    /// (docs/session-mode.md, "Idle sessions").
+    pub(crate) fn session_sleep_status(&self, session_id: &str, err: &anyhow::Error) -> Status {
+        use crate::worker::task_manager::session_sleep::SessionSleepError;
+        use crate::worker::task_manager::SessionRefusal;
+        if let Some(sleep) = err.downcast_ref::<SessionSleepError>() {
+            return match sleep {
+                SessionSleepError::NotHere | SessionSleepError::Evicted(_) => {
+                    self.session_not_here(session_id)
+                }
+                SessionSleepError::NotSuspendable(why) => Status::failed_precondition(why.clone()),
+                SessionSleepError::Busy => Status::aborted(sleep.to_string()),
+                other => store_status(other).unwrap_or_else(|| Status::internal(other.to_string())),
+            };
+        }
+        match err.downcast_ref::<SessionRefusal>() {
+            Some(SessionRefusal::EnvelopeFull { .. }) => Status::resource_exhausted(format!(
+                "{err:#}; session {session_id} stays suspended with its checkpoint, retry once \
+                 sessions end"
+            )),
+            Some(SessionRefusal::NoEnvelope { .. }) => {
+                Status::failed_precondition(format!("{err:#}"))
+            }
+            None => Status::internal(format!("{err:#}")),
+        }
+    }
+
+    /// `StartSession` with `resume_id` (session durability plan §6.7, "Moving
+    /// is cautious for running sessions"): resume a `store` session on this
+    /// node from its manifest. A session the manifest says runs on another
+    /// node is probed there first (`GetSession`, 2 s, with the caller's
+    /// ticket): running there, the move claims the next generation and asks
+    /// that node to stop its copy (`StopSession`) before it launches;
+    /// unreachable, the move refuses UNAVAILABLE unless `force_move` says
+    /// the caller knows the node is down. A suspended session moves at once.
+    async fn resume_from_edge(
+        &self,
+        request: &crate::structs::StartSessionRequest,
+        claims: crate::structs::edge_boot::SessionTicketClaims,
+        job: String,
+        task: String,
+    ) -> Result<crate::structs::StartSessionReply, Status> {
+        let session_id = request.resume_id.trim().to_string();
+        tracing::Span::current().record("session_id", session_id.as_str());
+        if !crate::structs::is_minted_for_task(&session_id, &task) {
+            return Err(Status::invalid_argument(format!(
+                "resume_id {session_id:?} is not a session id of task {task}"
+            )));
+        }
+        let move_request = crate::worker::task_manager::session_store::MoveRequest {
+            session_id: session_id.clone(),
+            job_id: job.clone(),
+            task_name: task.clone(),
+            force_move: request.force_move,
+            cold: false,
+            origin: "edge".into(),
+            ticket_jti: claims.jti.clone(),
+        };
+        let mut outcome = self.run_move(move_request.clone(), None).await;
+        let elsewhere = outcome.as_ref().err().and_then(running_elsewhere);
+        if let Some(SessionSleepErrorRef::RunningElsewhere {
+            node,
+            address,
+            generation,
+        }) = elsewhere
+        {
+            let probe = self
+                .probe_peer(&node, &address, &session_id, &request.ticket)
+                .await;
+            debug!(session_id = %session_id, old_node = %node, generation, probe = ?probe, "Probed the node a moving session's manifest names");
+            match probe {
+                PeerProbe::Unreachable(why) => {
+                    return Err(Status::unavailable(format!(
+                        "running_elsewhere: session {session_id} runs on node {node} (generation \
+                         {generation}), which did not answer within {}s: {why}. Retry with \
+                         force_move only once that node is known to be down \
+                         (`legion session nodes`) [winner node={node} generation={generation}]",
+                        MOVE_PROBE_TIMEOUT.as_secs()
+                    )));
+                }
+                PeerProbe::NotRunning => {
+                    let mut forced = move_request.clone();
+                    forced.force_move = true;
+                    outcome = self.run_move(forced, None).await;
+                }
+                PeerProbe::Running => {
+                    let mut forced = move_request.clone();
+                    forced.force_move = true;
+                    let stopper = self.peer_stopper(&node, &address, &session_id, &request.ticket);
+                    outcome = self.run_move(forced, Some(stopper)).await;
+                }
+            }
+        }
+        let moved = outcome.map_err(|err| self.session_sleep_status(&session_id, &err))?;
+        let state = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .session_status(&session_id)
+            .map(|status| status.state)
+            .unwrap_or_else(|| "starting".to_string());
+        Ok(crate::structs::StartSessionReply {
+            session_id,
+            node_id: self.node_id.clone(),
+            state,
+            deduplicated: moved.from.is_empty(),
+            resumed_from: moved.from.to_string(),
+            generation: moved.generation,
+            moved_from: moved.moved_from,
+        })
+    }
+
+    /// Run one move attempt on a blocking thread with a launch slot.
+    async fn run_move(
+        &self,
+        request: crate::worker::task_manager::session_store::MoveRequest,
+        after_claim: Option<crate::worker::task_manager::session_store::AfterClaim>,
+    ) -> R<crate::worker::task_manager::session_store::MoveOutcome> {
+        let slot = self
+            .launch_pool
+            .acquire()
+            .await
+            .map_err(|full| anyhow!(full.to_string()))?;
+        let task_manager = self.task_manager.clone();
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            crate::worker::task_manager::session_store::resume_moved(
+                &task_manager,
+                &request,
+                after_claim,
+            )
+        })
+        .await
+        .map_err(|err| anyhow!("session resume panicked: {err}"))?
+    }
+
+    /// A client for another worker, verified against the cluster CA as
+    /// `<node>.node.legion`, presenting no client certificate (the ticket
+    /// is the credential).
+    async fn peer_client(
+        node_identity: Option<Arc<crate::worker::plane::NodeIdentity>>,
+        node: &str,
+        address: &str,
+    ) -> R<crate::structs::worker_client::WorkerClient<tonic::transport::Channel>> {
+        let roots = node_identity
+            .and_then(|identity| identity.roots())
+            .context("this node holds no cluster CA bundle yet")?;
+        let name = crate::manager::mesh_ca::node_dns_name(node);
+        let verifier = crate::cluster_tls::NamedServerVerifier::new(roots, &name)?;
+        let config = crate::cluster_tls::client_config(verifier, None)?;
+        let channel = crate::cluster_tls::tls_connect(address, config, &name).await?;
+        Ok(crate::structs::worker_client::WorkerClient::new(channel))
+    }
+
+    /// Ask the node a manifest names whether it runs the session.
+    async fn probe_peer(
+        &self,
+        node: &str,
+        address: &str,
+        session_id: &str,
+        ticket: &str,
+    ) -> PeerProbe {
+        if address.is_empty() {
+            return PeerProbe::Unreachable("the manifest names no address for it".into());
+        }
+        let identity = self.node_identity.clone();
+        let probe = async {
+            let mut client = Self::peer_client(identity, node, address).await?;
+            Ok::<_, anyhow::Error>(
+                client
+                    .get_session(crate::structs::GetSessionRequest {
+                        session_id: session_id.to_string(),
+                        ticket: ticket.to_string(),
+                    })
+                    .await,
+            )
+        };
+        match tokio::time::timeout(MOVE_PROBE_TIMEOUT, probe).await {
+            Err(_) => PeerProbe::Unreachable("timed out".into()),
+            Ok(Err(err)) => PeerProbe::Unreachable(format!("{err:#}")),
+            Ok(Ok(Ok(reply))) => match reply.into_inner().session {
+                Some(session) if session.state != "suspended" => PeerProbe::Running,
+                _ => PeerProbe::NotRunning,
+            },
+            Ok(Ok(Err(status))) if status.code() == tonic::Code::NotFound => PeerProbe::NotRunning,
+            Ok(Ok(Err(status))) => PeerProbe::Unreachable(status.message().to_string()),
+        }
+    }
+
+    /// The hook a move runs once its claim is won: ask the old node to stop
+    /// its copy (best effort; its next manifest write or the fence marker
+    /// stops it otherwise).
+    fn peer_stopper(
+        &self,
+        node: &str,
+        address: &str,
+        session_id: &str,
+        ticket: &str,
+    ) -> crate::worker::task_manager::session_store::AfterClaim {
+        let identity = self.node_identity.clone();
+        let (node, address, session_id, ticket) = (
+            node.to_string(),
+            address.to_string(),
+            session_id.to_string(),
+            ticket.to_string(),
+        );
+        let handle = tokio::runtime::Handle::current();
+        Box::new(move |_| {
+            let stop = async {
+                let mut client = Self::peer_client(identity, &node, &address).await?;
+                client
+                    .stop_session(crate::structs::StopSessionRequest {
+                        ticket,
+                        session_id: session_id.clone(),
+                    })
+                    .await
+                    .map_err(|status| anyhow!(status.message().to_string()))?;
+                Ok::<_, anyhow::Error>(())
+            };
+            let result = handle.block_on(async {
+                tokio::time::timeout(MOVE_PROBE_TIMEOUT, stop)
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("timed out")))
+            });
+            if let Err(err) = result {
+                warn!(session_id = %session_id, old_node = %node, error = %format!("{err:#}"), "Could not stop a moved session's old copy; its fence marker or next manifest write stops it");
+            }
+        })
+    }
+
+    /// NotFound for a session this node does not hold: `wrong_node` when its
+    /// id carries another node's tag, `evicted` when the node remembers
+    /// evicting it, `not_found` otherwise (session durability plan §6.7, row
+    /// 4).
+    pub(crate) fn session_not_here(&self, session_id: &str) -> Status {
+        if let Some(evicted) = self
+            .task_manager
+            .lock()
+            .ok()
+            .and_then(|manager| manager.evicted_session(session_id))
+        {
+            return Status::not_found(format!(
+                "evicted: session {session_id} was evicted from {} {}; a local-only session \
+                 cannot be restored\nHint: start a new session, or set suspend.durability = \
+                 \"store\" so idle sessions are kept in the content store",
+                self.node_id, evicted
+            ));
+        }
+        let own = crate::structs::node_tag(&self.node_id);
+        match crate::structs::session_node_tag(session_id) {
+            Some(tag) if tag != own => Status::not_found(format!(
+                "wrong_node: session {session_id} carries node tag {tag}, and this node \
+                 ({}) is {own}. Route requests for a session by its id's tag, not by \
+                 re-hashing a key: `legion session nodes` maps tags to node addresses",
+                self.node_id
+            )),
+            _ => Status::not_found(format!(
+                "not_found: node {} holds no session {session_id}",
+                self.node_id
+            )),
+        }
     }
 }
 
@@ -639,5 +1366,32 @@ async fn drive_claim(
                 .send(frame("refused", detail, 0, RefusalReason::Expired))
                 .await;
         }
+    }
+}
+
+/// A borrowed view of a `running_elsewhere` refusal.
+enum SessionSleepErrorRef {
+    RunningElsewhere {
+        node: String,
+        address: String,
+        generation: u64,
+    },
+}
+
+/// The `running_elsewhere` refusal inside a move's error, if that is what
+/// it was.
+fn running_elsewhere(err: &anyhow::Error) -> Option<SessionSleepErrorRef> {
+    use crate::worker::task_manager::session_sleep::SessionSleepError;
+    match err.downcast_ref::<SessionSleepError>()? {
+        SessionSleepError::RunningElsewhere {
+            node,
+            address,
+            generation,
+        } => Some(SessionSleepErrorRef::RunningElsewhere {
+            node: node.clone(),
+            address: address.clone(),
+            generation: *generation,
+        }),
+        _ => None,
     }
 }

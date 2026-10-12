@@ -11,8 +11,10 @@
 # (host 172.30.0.1) and forwards host port 8090 to 172.30.0.2:8080, which Legion
 # does not do. One address means one VM per worker, hence count = 1.
 #
-# Exec into a running microVM is not supported (no guest agent yet), so this
-# job is checked through HTTP and logs only.
+# Exec into the microVM goes through the guest agent (`legion-guest`, over
+# vsock), which needs /opt/legion/bin/legion-guest on the workers for this
+# Alpine image (RUNBOOK 12.0). Without it, exec fails closed and this job can
+# only be checked through HTTP and logs.
 let images = (import "lib/images.ncl") vars in
 {
   name = "hello-vm",

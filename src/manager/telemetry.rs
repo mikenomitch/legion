@@ -2059,6 +2059,31 @@ pub struct WorkerMetrics {
     /// `legion_provisional_active` — unratified claims held right now, so
     /// started-but-unconfirmed capacity is visible rather than invisible.
     pub provisional_active: Arc<Gauge>,
+    /// `legion_worker_launch_refusals_total` — starts refused because every
+    /// launch slot stayed busy for `edgeBoot.queueTimeout`.
+    pub launch_pool_refusals_total: Arc<Counter>,
+    /// `legion_worker_edge_session_starts_total` — sessions started on this
+    /// node from a session ticket (`Worker.StartSession`).
+    pub edge_session_starts_total: Arc<Counter>,
+    /// `legion_session_checkpoints_skipped_total` — periodic session
+    /// checkpoints (`suspend.checkpointEvery`) a node skipped because its
+    /// backlog would not let it capture them within one interval.
+    pub session_checkpoints_skipped_total: Arc<Counter>,
+    /// `legion_session_evictions_total{reason}` — suspended sessions whose
+    /// local checkpoint this node evicted, by reason (keep_for |
+    /// disk_pressure | envelope_gone | other).
+    pub session_evictions_total: Arc<CounterVec>,
+    /// `legion_session_superseded_total{via}` — copies of `store` sessions
+    /// this node ended because a newer generation runs elsewhere, by how it
+    /// learned (write | fence_list | resume | reconnect).
+    pub session_superseded_total: Arc<CounterVec>,
+    /// `legion_session_moves_total` — `store` sessions resumed on this node
+    /// from their manifest after running or sleeping on another node.
+    pub session_moves_total: Arc<Counter>,
+    /// `legion_session_self_fenced_total` — running `store` sessions this
+    /// node suspended because it reached neither a manager nor its content
+    /// store for `stateful.fenceAfter`.
+    pub session_self_fenced_total: Arc<Counter>,
     /// `legion_worker_simulated_nodes` — simulated nodes registered by this
     /// process (`--simulate N`); 0 in a real worker.
     pub simulated_nodes: Arc<Gauge>,
@@ -2163,6 +2188,69 @@ impl WorkerMetrics {
             cell: GaugeCell::default(),
         });
 
+        let launch_pool_refusals_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_worker_launch_refusals_total",
+                help: "Session and claim starts refused because every launch slot (edgeBoot.launchConcurrency) stayed busy for edgeBoot.queueTimeout. Refused starts are retryable on another node.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
+        let edge_session_starts_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_worker_edge_session_starts_total",
+                help: "Sessions started on this node from a session ticket (Worker.StartSession), with no manager on the path.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
+        let session_checkpoints_skipped_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_session_checkpoints_skipped_total",
+                help: "Periodic session checkpoints (suspend.checkpointEvery) skipped because the node's checkpoint backlog would not let it capture them within one interval. A rising rate means checkpointEvery is too short for the node's session count and memory.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
+        let session_evictions_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_session_evictions_total",
+                help: "Suspended sessions whose local-only checkpoint this node evicted, by reason (keep_for, disk_pressure, envelope_gone, other). An evicted session answers `evicted` for another suspend.keepFor and cannot be resumed.",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+
+        let session_superseded_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_session_superseded_total",
+                help: "Copies of store-durability sessions this node ended because a newer generation of the session runs elsewhere, by how the node learned it: write (its own conditional manifest write failed), fence_list (a fence marker), resume (a resume found the manifest moved on), reconnect (a self-fenced session the content store no longer names this node for). Each is a split brain that converged.",
+                labels: &["via"],
+            },
+            series: Series::new(),
+        });
+
+        let session_moves_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_session_moves_total",
+                help: "Store-durability sessions resumed on this node from their session manifest after running or sleeping on another node.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
+        let session_self_fenced_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_session_self_fenced_total",
+                help: "Running store-durability sessions this node suspended locally because it reached neither a manager nor its content store for stateful.fenceAfter.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
         // Simulated-fleet families. A `--simulate N` process is a worker
         // process that happens to carry N nodes, so it reports through this
         // same registry: the families above become fleet-wide aggregates and
@@ -2252,6 +2340,13 @@ impl WorkerMetrics {
             Arc::clone(&net_handler_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&launch_pool_refusals_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&edge_session_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_checkpoints_skipped_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_evictions_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_superseded_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_moves_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_self_fenced_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_active) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_killed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_ratify_seconds) as Arc<dyn RenderMetric>,
@@ -2274,6 +2369,13 @@ impl WorkerMetrics {
             provisional_killed_total,
             provisional_ratify_seconds,
             provisional_active,
+            launch_pool_refusals_total,
+            edge_session_starts_total,
+            session_checkpoints_skipped_total,
+            session_evictions_total,
+            session_superseded_total,
+            session_moves_total,
+            session_self_fenced_total,
             simulated_nodes,
             simulated_nodes_target,
             simulated_registrations_total,

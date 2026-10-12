@@ -6047,17 +6047,18 @@ impl Manager for ManagerDaemonService {
             // An instance archived with `archive = "manifestOnly"` has no
             // row: its archive manifest is the whole record.
             let Some((manifest, url)) = self.find_manifest_only(&inner.instance_id).await? else {
-                // A running session needs no start (docs/session-mode.md).
+                // A running session needs no start; a suspended one resumes
+                // on its own node (docs/session-mode.md).
                 return match self
-                    .find_session(&identity, &inner.instance_id, AclAction::Write)
+                    .start_session_instance(
+                        &identity,
+                        &inner.instance_id,
+                        inner.cold,
+                        inner.force_move,
+                    )
                     .await?
                 {
-                    Some(_) => Ok(Response::new(StartInstanceReply {
-                        message: format!("Instance {} already running", inner.instance_id),
-                        deduplicated: false,
-                        resuming_from: String::new(),
-                        node_id: String::new(),
-                    })),
+                    Some(reply) => Ok(Response::new(reply)),
                     None => Err(Status::not_found(format!(
                         "instance {} not found",
                         inner.instance_id
@@ -6537,16 +6538,28 @@ impl Manager for ManagerDaemonService {
 
         // Running sessions have no row: they come from the session index
         // of this manager and its peers, after the rows.
-        let (sessions, complete, as_of) = self
-            .list_job_sessions(&inner.job_id, group.as_deref())
+        let session_limit = inner
+            .session_limit
+            .unwrap_or(DEFAULT_SESSION_LIST_LIMIT)
+            .min(MAX_SESSION_LIST_LIMIT);
+        let listing = self
+            .list_job_sessions(
+                &inner.job_id,
+                group.as_deref(),
+                session_limit,
+                &inner.session_page_token,
+            )
             .await;
-        instances.extend(sessions);
+        instances.extend(listing.infos);
 
         Ok(Response::new(ListInstancesReply {
             instances,
             next_idle_page_token,
-            complete,
-            as_of,
+            complete: listing.complete,
+            as_of: listing.as_of,
+            next_session_page_token: listing.next_page_token,
+            session_count: listing.count,
+            sessions_by_node: listing.by_node,
         }))
     }
 
@@ -6564,9 +6577,10 @@ impl Manager for ManagerDaemonService {
             .get_instance(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?;
         let Some(instance) = instance else {
-            // A running session has no row: answer from the session index.
+            // A session has no row: ask its node (an evicted session and an
+            // unreachable node get their own answers), or the index.
             if let Some(session) = self
-                .find_session(&identity, &inner.instance_id, AclAction::Read)
+                .locate_session(&identity, &inner.instance_id, AclAction::Read)
                 .await?
             {
                 return Ok(Response::new(GetInstanceReply {
@@ -6646,6 +6660,13 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::PromoteInstanceRequest>,
     ) -> Result<Response<crate::structs::PromoteInstanceReply>, Status> {
         self.promote_instance_rpc(request).await
+    }
+
+    async fn list_session_nodes(
+        &self,
+        request: Request<crate::structs::ListSessionNodesRequest>,
+    ) -> Result<Response<crate::structs::ListSessionNodesReply>, Status> {
+        self.list_session_nodes_rpc(request).await
     }
 
     // === SNAPSHOTS (docs/suspend-and-resume.md) ===
@@ -10815,29 +10836,54 @@ impl Manager for ManagerDaemonService {
         let ttl = humantime::parse_duration(&ttl)
             .map_err(|e| Status::invalid_argument(format!("invalid ttl `{ttl}`: {e}")))?;
 
-        let ticket_request = crate::manager::edge_boot::TicketRequest {
-            job: req.job.clone(),
-            task: req.task.clone(),
-            job_config_id: job_config_id.clone(),
-            instance_id: req.instance_id.clone(),
-            instance_prefix: req.instance_prefix.clone(),
-            pool: req.pool.clone(),
-            gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
-            ttl,
-            uses: if req.uses == 0 { 1 } else { req.uses },
-            accessor_id: identity.accessor_id.clone().unwrap_or_default(),
+        let minted = match req.scope.trim() {
+            "" | "boot" => {
+                self.mint_boot_ticket(state, &identity, &req, &job_config_id, &task, ttl)?
+            }
+            "session" => {
+                if !req.instance_id.trim().is_empty()
+                    || !req.instance_prefix.trim().is_empty()
+                    || !req.job_config_id.trim().is_empty()
+                    || req.gate != 0
+                    || req.uses > 1
+                {
+                    return Err(Status::invalid_argument(
+                        "a session ticket names no instance, instance prefix, job config, gate, \
+                         or use count: the node mints the session id and starts the spec of the \
+                         envelope it holds, and the ticket is good for any number of sessions \
+                         until it expires",
+                    ));
+                }
+                let session_request = crate::manager::edge_boot::SessionTicketRequest {
+                    job: req.job.clone(),
+                    task: req.task.clone(),
+                    pool: req.pool.clone(),
+                    ttl,
+                    accessor_id: identity.accessor_id.clone().unwrap_or_default(),
+                };
+                crate::manager::edge_boot::validate_session_ticket_request(
+                    &session_request,
+                    &task,
+                    &self.edge_boot,
+                )
+                .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+                let jti = crate::structs::edge_boot::new_ticket_id();
+                crate::manager::edge_boot::mint_session_ticket(
+                    state,
+                    &session_request,
+                    &job_config_id,
+                    &jti,
+                    std::time::SystemTime::now(),
+                )
+                .map_err(|e| Status::internal(format!("failed to mint session ticket: {e:#}")))?
+            }
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown ticket scope `{other}` (boot|session)"
+                )))
+            }
         };
-        crate::manager::edge_boot::validate_ticket_request(&ticket_request, &task, &self.edge_boot)
-            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
-
-        let jti = crate::structs::edge_boot::new_ticket_id();
-        let minted = crate::manager::edge_boot::mint(
-            state,
-            &ticket_request,
-            &jti,
-            std::time::SystemTime::now(),
-        )
-        .map_err(|e| Status::internal(format!("failed to mint boot ticket: {e:#}")))?;
+        let jti = minted.record.jti.clone();
         tracing::Span::current().record("jti", jti.as_str());
 
         self.store
@@ -10923,6 +10969,11 @@ impl Manager for ManagerDaemonService {
                 expires_at_unix: record.expires_at_unix,
                 accessor_id: record.accessor_id,
                 created_at: record.created_at,
+                scope: if record.gate == crate::manager::edge_boot::SESSION_TICKET_GATE {
+                    "session".to_string()
+                } else {
+                    "boot".to_string()
+                },
             })
             .collect();
         Ok(Response::new(ListBootTicketsReply { tickets }))
@@ -11995,6 +12046,12 @@ pub(crate) fn desired_payload(
     let volumes =
         store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
     let mut payload = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+    let session_task = crate::manager::dispatcher::attach_session_task_spec(
+        &mut payload,
+        task,
+        tasks.iter().map(|(id, task)| (*id, task)),
+    )?;
+    crate::manager::dispatcher::attach_session_seal_keys(store, &mut payload, session_task);
     // The band orders the worker's memory pressure response. Read from the
     // read model, so building a payload pays no store read for it.
     payload.priority_band = store
@@ -13145,6 +13202,43 @@ fn volume_info(volume: crate::structs::Volume) -> crate::structs::VolumeInfo {
     }
 }
 
+/// Sessions a ListInstances reply carries when the caller does not say.
+const DEFAULT_SESSION_LIST_LIMIT: u32 = 5_000;
+
+/// The most sessions one ListInstances reply carries.
+const MAX_SESSION_LIST_LIMIT: u32 = 50_000;
+
+impl ManagerDaemonService {
+    /// Mint a boot ticket (`IssueBootTicketRequest.scope = "boot"`).
+    fn mint_boot_ticket(
+        &self,
+        state: &crate::manager::workload_identity::WorkloadIdentityState,
+        identity: &AclIdentity,
+        req: &IssueBootTicketRequest,
+        job_config_id: &str,
+        task: &TaskConfig,
+        ttl: std::time::Duration,
+    ) -> Result<crate::manager::edge_boot::MintedTicket, Status> {
+        let ticket_request = crate::manager::edge_boot::TicketRequest {
+            job: req.job.clone(),
+            task: req.task.clone(),
+            job_config_id: job_config_id.to_string(),
+            instance_id: req.instance_id.clone(),
+            instance_prefix: req.instance_prefix.clone(),
+            pool: req.pool.clone(),
+            gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
+            ttl,
+            uses: if req.uses == 0 { 1 } else { req.uses },
+            accessor_id: identity.accessor_id.clone().unwrap_or_default(),
+        };
+        crate::manager::edge_boot::validate_ticket_request(&ticket_request, task, &self.edge_boot)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        let jti = crate::structs::edge_boot::new_ticket_id();
+        crate::manager::edge_boot::mint(state, &ticket_request, &jti, std::time::SystemTime::now())
+            .map_err(|e| Status::internal(format!("failed to mint boot ticket: {e:#}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13703,6 +13797,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..aws_identity_task("db")
         };
@@ -13971,6 +14066,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -14259,6 +14355,41 @@ mod tests {
             &self,
             _request: Request<crate::structs::StopSessionsRequest>,
         ) -> Result<Response<crate::structs::StopSessionsReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn get_session(
+            &self,
+            _request: Request<crate::structs::GetSessionRequest>,
+        ) -> Result<Response<crate::structs::GetSessionReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn suspend_sessions(
+            &self,
+            _request: Request<crate::structs::SuspendSessionsRequest>,
+        ) -> Result<Response<crate::structs::SuspendSessionsReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn resume_session(
+            &self,
+            _request: Request<crate::structs::ResumeSessionRequest>,
+        ) -> Result<Response<crate::structs::ResumeSessionReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn start_session(
+            &self,
+            _request: Request<crate::structs::StartSessionRequest>,
+        ) -> Result<Response<crate::structs::StartSessionReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn stop_session(
+            &self,
+            _request: Request<crate::structs::StopSessionRequest>,
+        ) -> Result<Response<crate::structs::StopSessionReply>, Status> {
             Err(Status::unimplemented("not used in test"))
         }
 
@@ -17449,6 +17580,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new(name, "noop")
         }

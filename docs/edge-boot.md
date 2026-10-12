@@ -350,6 +350,56 @@ without adding the round trip the ticket exists to avoid. If you need fast
 revocation, set short TTLs and mint new tickets. The manager can always
 refuse ratification, which limits any damage to the gate level.
 
+### Session tickets
+
+`--scope session` mints a different capability: not one start of one
+instance, but any number of [sessions](session-mode.md#starting-at-the-edge)
+of one session task, on any node of one pool, until it expires.
+
+```console
+$ legion boot-ticket create agents --task workspace --pool agents \
+    --scope session --ttl 1h
+```
+
+```jsonc
+{ "aud": "legion:node", "legion.io/scope": "session",
+  "legion.io/job": "agents", "legion.io/task": "workspace",
+  "legion.io/pool": "agents", "legion.io/uses": 0 }   // 0: unlimited
+```
+
+- It names no instance, prefix, or job config. The node mints each
+  session's id and uses the job config of the envelope it holds, whose
+  payload carries the session task's spec.
+- It names no gate: a session always serves at once. `--gate` and
+  `--uses` other than `0` (the default for this scope) are refused, as are
+  `--id`, `--id-prefix`, and `--job-config`. The task must be a session
+  task (`stateful.mode = "session"`).
+- It is presented to `Worker.StartSession`, `Worker.GetSession`, and
+  `Worker.StopSession` (`legion session start|get|stop`), never to
+  `StartClaim`, and a boot ticket is refused on those three.
+- Nothing is spent per session and nothing is ratified: a session has no
+  durable record to ratify into. A node verifies a ticket once (signature,
+  expiry, pool) and caches the result by a hash of the token for its
+  lifetime, so a burst of starts on one ticket costs one signature check
+  per node.
+- The blast radius of a leaked session ticket is "start sessions of this
+  task in this pool until it expires, within the envelopes' room", which is
+  what the platform's own picker can already do. Keep TTLs to what a
+  picker needs between refreshes, and mint a ticket per picker.
+- `legion boot-ticket list` shows `scope = session` for these tickets.
+- For a session task with `suspend.durability = "store"`, the same ticket
+  moves a session: `StartSession` with `resume_id` (`legion session start
+  --resume-id <ID>`) resumes it on the node it is sent to from its
+  manifest in the content store. When the manifest says the session runs
+  on another node, the receiving node probes that node with the ticket
+  (`GetSession`, 2 seconds), asks it to stop its copy (`StopSession`), and
+  refuses `UNAVAILABLE` if it does not answer, unless `force_move` is set.
+  The ticket must cover the session's job and task. See
+  [Moving a session](session-mode.md#moving-a-session).
+- An idempotent edge start of a `store` session creates its manifest
+  before its gate opens; a second node that derived the same id answers
+  `ALREADY_EXISTS` naming the first, instead of starting a duplicate.
+
 ### The spec cache
 
 A ticket names a `job_config_id`, and the node needs the matching task
@@ -442,13 +492,27 @@ not just what it was given.
     acceptClaims = true,   # default false
     jwksRefresh = "5m",
     clockSkew = "30s",
+    launchConcurrency = 0,  # 0: twice the node's cores
+    queueTimeout = "1s",
+    stopCheckpointTimeout = "60s",
   },
 }
 ```
 
 `acceptClaims` is set per node, separately from the manager's switch. An
 operator who turns the feature on cluster-wide still chooses which nodes act
-as edges. A node with it off refuses `StartClaim` with `FailedPrecondition`.
+as edges. A node with it off refuses `StartClaim`, `StartSession`, and a
+session ticket on `GetSession`/`StopSession` with `FailedPrecondition`, and
+does not advertise the `edge-sessions` capability.
+
+`launchConcurrency` bounds how many provisional starts (claims and
+[sessions](session-mode.md), whoever sent them) run through the runtime at
+once; a start that waits `queueTimeout` for a slot is refused with
+`RESOURCE_EXHAUSTED` (retryable) and counted in
+`legion_worker_launch_refusals_total`. These two apply whether or not
+`acceptClaims` is on. `stopCheckpointTimeout` bounds how long a stopping
+worker spends checkpointing sessions whose task sets
+`suspend.onWorkerStop = "checkpoint"`.
 
 ## Observability
 
