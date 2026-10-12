@@ -155,7 +155,44 @@ ticket exists to avoid. Binding to one node makes a local cache strict
 single use, which RFC 9449 notes is otherwise infeasible without shared
 state.
 
-## 6. Platforms mint exec tickets with delegated keys scoped to job globs
+## 6. Revocation re-checks open direct sessions on the heartbeat, instead of pushing revoked accessors
+
+*Implementation (Phase 2), deviating from entry 5 and plan §6.4.*
+
+**Call.** Every heartbeat, a worker reports its open direct sessions
+(`HeartbeatRequest.exec_sessions`: the ticket's `jti`, its minting `sub`,
+the job, the action) and the manager answers with the ones that no longer
+hold (`HeartbeatReply.revoked_exec_sessions`, each with a reason). The
+manager looks the minting token up by accessor and re-runs the session's
+grant against today's policies, the check the proxied path runs every 30
+seconds.
+
+```console
+$ legion exec 1 --direct -- sh -c 'exec sleep 300'
+Error: exec: session ended: the token that minted this session was deleted
+```
+
+**Alternatives.**
+- (a) The plan's shape: the manager pushes `revoked_accessors` to every
+  worker after a token is deleted.
+- (b) Re-check nothing; rely on the TTL and `max_session`.
+
+**Trade-off.** One store read per distinct accessor per heartbeat on a node
+with open direct sessions, and the worker sends a few bytes per open session
+on every beat. A credential with no accessor (a JWT auth method) cannot be
+looked up, so its sessions are bounded by `max_session`, which the mint
+clamps to that credential's expiry (entry 12).
+
+**Why (simplicity and correctness).** (a) needs every manager to know which
+tokens were deleted recently and which workers to tell, which is state that
+does not exist in a multi-manager cluster: a token deleted through one
+manager would reach only workers heartbeating to it, unless the list were
+replicated. It also misses expiry and a policy edit that removes the grant.
+Asking "does this still hold?" is stateless, works on any manager, and
+covers deletion, expiry, and policy changes with one check. The session ends
+with `PermissionDenied` and the reason, as a proxied session does.
+
+## 7. Platforms mint exec tickets with delegated keys scoped to job globs
 
 **Call.** Phase 3 lets a platform register a public key with a job glob and a
 TTL ceiling (`CreateExecKey`, one control-lane write per key). Workers
@@ -174,7 +211,7 @@ shell into it would bring the manager back onto the hottest per-session
 path. The glob and the `host` exclusion keep a key narrower than the
 `exec:write` grant that created it.
 
-## 7. Exec over vsock reuses the existing exec frames, behind a version hello
+## 8. Exec over vsock reuses the existing exec frames, behind a version hello
 
 **Call.** The worker and the guest agent speak the same length-delimited
 `ExecClientFrame` and `ExecServerFrame` protobufs every other exec leg
@@ -192,3 +229,371 @@ bytes instead of translating, and the agent has one codec. The gated plan
 requires any agent protocol beyond raw bytes to negotiate, because a
 restored guest can run an older agent than its worker, and the hello is
 that negotiation.
+
+## 9. `--direct` fails by name when the worker refuses tickets; it does not fall back to the proxy
+
+*Implementation (Phase 2), deviating from plan §12.*
+
+**Call.** `legion exec --direct` against a worker without
+`exec = { direct = true }`, or one the client cannot reach, fails with the
+reason and a hint to drop `--direct`. It never retries through the manager.
+
+```text
+Error: exec: this worker does not admit exec tickets
+Hint: set exec = { direct = true } in its worker config, or exec through the manager (drop --direct)
+```
+
+**Alternative.** The plan's fallback: retry the session through
+`ExecAllocation` with a note.
+
+**Trade-off.** A script that asks for `--direct` on a mixed fleet fails on
+the nodes that have not opted in.
+
+**Why (simplicity).** The plan's fallback existed for version skew with old
+workers, and Legion has no installed base to protect (AGENTS.md). A silent
+fallback would also hide the thing `--direct` exists to guarantee: that the
+session's bytes do not cross a manager. The failure names the setting.
+
+## 10. Exec tickets share the boot-ticket JWKS cache, and verification runs off the async runtime
+
+*Implementation (Phase 2).*
+
+**Call.** A worker builds one JWKS cache (`BootTicketVerifier`) when it
+accepts boot tickets or direct exec, and the exec verifier decodes through
+it with its own audience, node check, process-start check, and spent set.
+Both `ExecTask` and `StartClaim` verify inside `spawn_blocking`, and the
+pinned JWKS fetch runs on a thread of its own.
+
+**Alternatives.** A second cache for exec tickets; verifying inline in the
+handler, as `StartClaim` did.
+
+**Trade-off.** A spawn and a thread hop per ticket presented, and one more
+thread per JWKS refresh.
+
+**Why (correctness).** Inline verification blocked a runtime worker thread
+on a refresh, and the pinned fetch built a runtime inside the server's
+runtime, which panics. With `--run-worker` the manager the fetch dials runs
+on the same runtime, so a blocked worker thread could also starve the very
+connection it waited on. Edge boot had the same latent bug: its tests used a
+static JWKS and never fetched. One cache keeps one refresh schedule per
+worker, which plan §9 amendment 3 asked for.
+
+## 11. The worker's direct-exec switch is a top-level `exec` block in the worker type
+
+*Implementation (Phase 2).*
+
+**Call.** `exec = { direct = true }` sits beside `hostGuard` in the worker
+type and rides to the worker in the same security payload
+(`WorkerConfig.security`).
+
+**Alternatives.** A field under `edgeBoot` (it already holds the JWKS
+settings); a worker CLI flag or environment variable.
+
+**Trade-off.** The JWKS refresh and clock-skew settings still live under
+`edgeBoot`, so an operator tuning them for direct exec edits a block named
+for another feature.
+
+**Why (simplicity).** The plan named the surface `exec = { direct = false }`.
+Direct exec widens who can reach the worker plane, which is the security
+payload's job, and a per-type setting (not a per-process flag) is what
+operators audit. Moving the JWKS knobs is a rename for when someone needs to
+tune them.
+
+## 12. A direct session never outlives the credential that minted it
+
+*Implementation (Phase 2).*
+
+**Call.** The mint clamps `max_session` to the minting credential's
+remaining lifetime, and refuses an expired one.
+
+**Alternative.** Only `max_session` (1h by default), with the heartbeat
+re-check catching expiry.
+
+**Trade-off.** A short-lived token mints short sessions.
+
+**Why (correctness).** The re-check (entry 6) finds credentials by accessor,
+and a JWT from an auth method has none. Clamping at mint gives every
+credential the guarantee the proxied path gives: the session ends when the
+credential does.
+
+## 13. `exec-ticket mint` is cataloged and exposed over MCP as mutating
+
+*Implementation (Phase 2), deviating from plan §8.*
+
+**Call.** `exec-ticket.mint` and `legion_exec_ticket_mint` set
+`mutates: true`, so the MCP tool is listed only with `--allow-write`.
+
+**Alternative.** The plan's `mutates: false, read_only_safe: false`.
+
+**Trade-off.** The catalog says "mutates" for a call that writes nothing.
+
+**Why (security).** The plan asked for the tool to be "gated like
+`legion_exec_run`", and MCP's only gate is `mutates`. A ticket opens a
+shell; an agent in read-only mode must not be able to get one.
+
+## 14. The mint reply carries the cluster CA, and `exec-ticket mint` takes its argv after `--`
+
+*Implementation (Phase 2).*
+
+**Call.** `MintExecTicketReply.ca_pem` is the cluster CA bundle, so a client
+can verify the worker from the reply alone. `legion exec-ticket mint` takes
+the ticket's command after `--`, as `legion exec` does, not as `--argv`.
+
+```console
+$ legion exec-ticket mint --instance user-42 --tty -j -- /bin/bash
+```
+
+**Alternatives.** A separate `legion net ca show` call; the plan's `--argv`
+flag.
+
+**Trade-off.** Every reply carries a few KiB of PEM. `-j` must come before
+`--`, or it becomes part of the argv.
+
+**Why (simplicity).** A platform verifying a worker should not need a second
+call (and a second grant) to learn what to trust. `--` is how every exec
+command in Legion takes argv.
+
+## 15. A direct action session reports its action name, never its rendered argv
+
+*Implementation (Phase 2).*
+
+**Call.** `ExecAuditRecord.command` is empty for an action session, and the
+manager logs `action:<name>`, the subject the proxied path logs.
+
+**Alternative.** Report the argv for every session.
+
+**Trade-off.** The audit for a direct action run cannot show the parameter
+values that were used.
+
+**Why (security).** An action's argv is rendered with its parameters, and a
+`sensitive` parameter is redacted on the proxied path. The worker cannot tell
+which words of the argv came from sensitive parameters, so it reports none.
+
+## 16. Workers learn delegated keys by version on the heartbeat, from a one-second cache
+
+*Implementation (Phase 3).*
+
+**Call.** A worker that admits tickets sends the version of the key set it
+holds (`HeartbeatRequest.exec_keys_version`, `"none"` at first). The manager
+answers with the full set only when the version differs, and reads the
+`exec_key` table at most once a second for all heartbeats. Workers that do
+not admit tickets send nothing and cost nothing.
+
+**Alternatives.** Send every key on every heartbeat (the plan's
+`HeartbeatReply.exec_keys`); push keys to workers on change.
+
+**Trade-off.** A key created through one manager reaches workers that
+heartbeat to another manager up to a second later, and the version string is
+one more field to keep in step.
+
+**Why (performance).** Keys change rarely and heartbeats are the hottest RPC
+in the cluster (5,000 a second at 10k workers). A version check makes the
+common beat free, and the cache keeps a direct-exec fleet to one small read a
+second. A push would need managers to track which workers to tell, which
+heartbeats already do.
+
+## 17. A delegated key's sessions end through the same heartbeat re-check as a token's
+
+*Implementation (Phase 3).*
+
+**Call.** A session minted by a key carries `sub = "key:<id>"`. When the
+worker reports it on a heartbeat, the manager checks the key still exists
+and, if not, revokes the session with "the exec key that minted this session
+was deleted". Workers also drop the key from their set, so its tickets stop
+verifying.
+
+**Alternative.** Only stop verifying new tickets, and let open sessions run
+to `max_session`.
+
+**Trade-off.** One store read per key per heartbeat on a node with open
+key-minted sessions.
+
+**Why (security).** Deleting a key is how an operator answers a leaked key,
+and a leaked key's open shells are the thing they most want gone. Reusing
+entry 6's re-check bounds both halves by one heartbeat with no new mechanism.
+
+## 18. The host-level exclusion is enforced on the worker, where the runtime is known
+
+*Implementation (Phase 3).*
+
+**Call.** A key carries no runtime list. The worker refuses a key-signed
+ticket when the target allocation runs a host-level runtime
+(`runtime_is_host_level`), with a message that names the runtime and says to
+mint through a manager.
+
+```text
+exec ticket rejected: a delegated exec key never reaches a host-level runtime, and direct/main runs `exec`; mint through a manager with the host grant instead
+```
+
+**Alternative.** Have the platform declare runtimes on the key, or check at
+`CreateExecKey`.
+
+**Trade-off.** The refusal comes at redemption, not at key creation, so a
+platform finds out on its first ticket for a host-level job.
+
+**Why (security and simplicity).** The plan's rule is "non-host runtimes",
+not a choice the key holder makes. Only the worker knows what the allocation
+it is about to enter runs, and a job's runtime can change on redeploy, so a
+check at key creation could not hold.
+
+## 19. Exec keys are `acl`-resource credentials, validated by their DER prefix
+
+*Implementation (Phase 3).*
+
+**Call.** `CreateExecKey` and `DeleteExecKey` take `acl:write` and
+`ListExecKeys` `acl:read`. A key must be a P-256 SubjectPublicKeyInfo, checked
+against its fixed 26-byte DER prefix before `jsonwebtoken` parses it. The
+store code lives in `acl_store.rs`, beside tokens.
+
+**Alternatives.** An `exec`-scoped grant (`exec:write` on the glob); a new
+crate to parse SPKI.
+
+**Trade-off.** Delegating exec to a platform needs an ACL administrator, not
+just someone with exec on those jobs.
+
+**Why (security and simplicity).** The plan named `acl:write`: a key mints
+shell access for every matching job forever, which is the power to create
+credentials, not to use one. The DER prefix check refuses P-384 and RSA keys
+by name with no new dependency. `tests/raft_seam.rs` scans `store.rs` and
+`acl_store.rs` for replicated writes, so the code sits where the seam test
+sees it.
+
+## 20. `legion exec-ticket sign` signs offline, and is not an MCP tool
+
+*Implementation (Phase 3).*
+
+**Call.** A CLI helper signs a delegated ticket from a PKCS#8 private key
+file, with no manager call. MCP has create, list, and delete for keys, but
+no signing tool.
+
+**Alternative.** No signing helper (platforms write their own); an MCP
+signing tool.
+
+**Trade-off.** One more command whose output is a credential.
+
+**Why (simplicity).** A platform's own code signs in production, but an
+operator needs a way to test a key, and the end-to-end test needs one too.
+An MCP tool would mean handing a private key to the MCP server process,
+which defeats the point of a key that never leaves the platform.
+
+## 21. The vsock exec leg speaks a five-byte frame codec, not protobuf
+
+*Implementation (Phase 1), deviating from plan §6.1 and entry 8.*
+
+**Call.** The agent and the worker exchange `kind (u8) + length (u32 BE) +
+payload` frames (`legion_guest::exec`): hello, start (JSON), stdin, EOF,
+resize, stdout, stderr, exit, error. The worker translates them to and from
+the `ExecClientFrame` / `ExecServerFrame` protobufs at its `ExecSession`
+boundary, so nothing above the runtime changes.
+
+**Alternative.** The plan's length-delimited protobufs end to end.
+
+**Trade-off.** One more wire format, and a translation on the worker.
+
+**Why (simplicity).** `legion-guest` is deliberately tiny: a static musl
+binary with no async runtime that has to run on busybox. Prost and the
+generated types would be its biggest dependency by far, for nine message
+kinds. The hello still negotiates, as the gated plan requires, and the frame
+cap (1 MiB) is enforced before anything is allocated.
+
+## 22. Every microVM runs the agent; only a gated one runs the relays
+
+*Implementation (Phase 1).*
+
+**Call.** Every microVM gets the vsock device, the agent binary in its root
+disk, and `guest-agent` started by init. On a TAP or `none` sandbox it runs
+`--no-relay`: only the exec listener, no loopback proxy or resolver, and the
+node binds nothing the guest could dial. `/etc/resolv.conf` now follows the
+relay, not the agent, so a TAP guest keeps its bridge resolvers. Every
+restore passes the vsock override.
+
+```text
+legion: guest agent started (exec over vsock)
+```
+
+**Alternatives.** Exec only on gated sandboxes; an opt-in per task.
+
+**Trade-off.** The worker binary (or the static `legion-guest`, under 1 MB)
+is copied into every root disk, which costs the worker binary's size on
+nodes without the static build. A checkpoint captured before this change has
+no vsock device, so its restore's override fails; Legion has no installed
+base, so that is a dev-cluster wipe, not a migration.
+
+**Why (simplicity).** Exec that depends on the network mode is the hidden
+coupling entry 2 rejected. Keeping the relays gated-only keeps `none`'s
+promise: the guest initiates nothing to the host.
+
+## 23. A session runs through `/bin/sh` with the task's environment and working directory
+
+*Implementation (Phase 1).*
+
+**Call.** The agent runs `/bin/sh -c '. /legion/env; . /legion/resume.env;
+exec "$@"' argv...` as root, in the directory the worker records in
+`/legion/cwd` (the command's working directory), under a pty for `-t`. A
+closed connection kills the session's process group.
+
+**Alternatives.** `execve` the argv directly with an environment parsed in
+Rust; the user from the identity disk.
+
+**Trade-off.** An image without `/bin/sh` cannot take exec sessions (it
+cannot boot either: init is a shell script).
+
+**Why (simplicity).** The env file's format is shell, sourced by init; the
+same shell sourcing it means a session sees exactly what the command saw,
+including identity tokens refreshed after a restore. Root matches the
+plan's promise and `container exec`.
+
+## 24. A session cut by a suspend ends with a generic reason, not the instance's
+
+*Implementation (Phase 1), deviating from plan §6.1.*
+
+**Call.** A session whose connection closes without an exit frame ends with
+`session ended: the guest closed it without an exit status (a suspend or a
+restore resets open exec sessions)`.
+
+**Alternative.** The plan's `instance user-42 was suspended`.
+
+**Trade-off.** The message names the likely causes, not the one that
+happened.
+
+**Why (correctness).** The worker's session sees a closed vsock stream. It
+cannot tell a suspend from a guest crash or a VMM restart without asking the
+task manager across a lock it must not hold while pumping bytes, and a
+message that names the wrong cause is worse than one that names the
+candidates.
+
+## 25. The `exec` idle-signal refusal and warning are removed, not relaxed
+
+*Implementation (Phase 1).*
+
+**Call.** `suspend.idle.signals = ["exec"]` on a sandbox pinned to a VMM is
+accepted, and the default signal list draws no warning. The example job and
+the guide list `exec`.
+
+**Alternative.** Keep the warning for a guest whose agent might not run.
+
+**Trade-off.** None worth keeping: an agent that cannot run makes exec fail
+by name, and then the signal does not fire, which is what the warning said.
+
+**Why (simplicity).** The plan's Phase 1 says the `exec` signal works with no
+new code, because the worker already counts open sessions per allocation.
+
+## 26. Phase 0 is measured on one host at up to 500 sessions
+
+*Implementation (Phase 0), narrower than plan §10.*
+
+**Call.** `tests/exec_session_benchmark.rs` runs a manager and a separate
+worker on one machine and measures proxied and direct sessions at 1, 10,
+100, and 500, plus mint throughput. The numbers are in
+`benchmarks/scheduler/README.md`.
+
+**Alternative.** The plan's 1,000 and 10,000 concurrent sessions on
+simulated workers, on the AWS rig.
+
+**Trade-off.** No scale cell and no same-AZ latency SLO; those stay open in
+TODO.md.
+
+**Why.** Simulated workers cannot run exec sessions (`ExecTask` is
+unimplemented there), so the plan's matrix needs real workers on the rig,
+which this environment does not have. The harness is the same one the rig
+would run.

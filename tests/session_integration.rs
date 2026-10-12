@@ -18,7 +18,11 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use legion::manager::mesh_ca;
+use legion::cluster_tls::{
+    certified_key, server_config, tls_incoming, ClusterClientVerifier, SwappableIdentity,
+    SwappableRoots,
+};
+use legion::manager::mesh_ca::{generate_csr, sign_csr, CsrSubject};
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;
@@ -26,17 +30,16 @@ use legion::storage::store::Store;
 use legion::structs::config::{ManagerConfigFull, PersistenceType};
 use legion::structs::job::JobConfig;
 use legion::structs::manager_server::Manager;
-use legion::structs::worker_server::Worker;
+use legion::structs::worker_server::{Worker, WorkerServer};
 use legion::structs::{
     CreateInstanceRequest, DestroyInstanceRequest, ExecClientFrame, ExecServerFrame,
     GetInstanceRequest, GetTaskLogsReply, GetTaskLogsRequest, HeartbeatReply, HeartbeatRequest,
     InstanceInfo, ListInstancesReply, ListInstancesRequest, Node, NodeMsg, PostWorkReply,
-    PostWorkRequest, PromoteInstanceReply, PromoteInstanceRequest, RestartWorkerReply,
-    RestartWorkerRequest, SessionReport, SessionStatus, StartClaimReply, StartClaimRequest,
-    StopInstanceRequest, StopSessionsReply, StopSessionsRequest, Submission,
+    PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest,
+    RestartWorkerReply, RestartWorkerRequest, SessionReport, SessionStatus, StartClaimReply,
+    StartClaimRequest, StopInstanceRequest, StopSessionsReply, StopSessionsRequest, Submission,
     SuspendInstanceRequest, TaskAllocation,
 };
-use legion::worker::plane::{serve_on, NodeIdentity, WorkerPlaneTls};
 use tonic::{Code, Request, Response, Status, Streaming};
 
 const TASK: &str = "workspace";
@@ -135,6 +138,10 @@ impl Worker for FakeNode {
         Ok(Response::new(StopSessionsReply { stopped }))
     }
 
+    async fn probe(&self, _request: Request<ProbeRequest>) -> Result<Response<ProbeReply>, Status> {
+        Ok(Response::new(ProbeReply::default()))
+    }
+
     async fn restart_worker(
         &self,
         _request: Request<RestartWorkerRequest>,
@@ -208,17 +215,34 @@ impl Cluster {
             _dir: dir,
         };
         let ca = cluster.store().ensure_mesh_ca()?;
+        let roots = SwappableRoots::from_pem(&ca.cert_pem)?;
         for node_id in nodes {
             let node = FakeNode {
                 state: Arc::new(Mutex::new(NodeState::default())),
             };
-            let (csr, key) = mesh_ca::node_csr(node_id)?;
-            let (cert, _) = mesh_ca::sign_node_csr(&ca.cert_pem, &ca.key_pem, node_id, &csr)?;
-            let tls = WorkerPlaneTls::new();
-            tls.install(NodeIdentity::new(node_id, cert, key, ca.cert_pem.clone())?)?;
+            let (key, csr) = generate_csr(node_id)?;
+            let (cert, _) = sign_csr(
+                &ca.cert_pem,
+                &ca.key_pem,
+                &csr,
+                &CsrSubject::Node(node_id.to_string()),
+            )?;
+            let identity = SwappableIdentity::new();
+            identity.set(certified_key(&cert, &key)?);
+            let config = server_config(
+                identity,
+                Some(ClusterClientVerifier::new(roots.clone())),
+                false,
+            )?;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let address = listener.local_addr()?;
-            tokio::spawn(serve_on(listener, tls, node.clone()));
+            let service = WorkerServer::new(node.clone());
+            tokio::spawn(async move {
+                let _ = tonic::transport::Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming(tls_incoming(listener, config))
+                    .await;
+            });
             cluster.store().insert_node(NodeMsg::from(Node {
                 id: node_id.to_string(),
                 pool: "default".into(),

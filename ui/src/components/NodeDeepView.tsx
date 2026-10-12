@@ -282,7 +282,7 @@ const buildSignalList = (signals: unknown): string[] => {
   return []
 }
 
-const buildHostFacts = (fingerprintData: unknown, configData: unknown): HostFact[] => {
+const buildHostFacts = (fingerprintData: unknown, configData: unknown, dynamicData?: unknown): HostFact[] => {
   const facts: HostFact[] = []
   const os = extractField(fingerprintData, 'os')
   const arch = extractField(fingerprintData, 'arch')
@@ -324,6 +324,26 @@ const buildHostFacts = (fingerprintData: unknown, configData: unknown): HostFact
     facts.push({ label: 'Worker address', value: workerAddress })
   }
 
+  // The manager's reachability probe (worker-plane-auth plan §6.7): exec,
+  // logs, and restart fail when managers can't dial the worker back.
+  const probe = extractField(dynamicData, 'workerPlane')
+  if (isPlainObject(probe)) {
+    const from = typeof probe.from === 'string' ? probe.from : 'a manager'
+    facts.push({
+      label: 'Worker plane',
+      value:
+        probe.reachable === true
+          ? `reachable from ${from}`
+          : `unreachable from ${from}: ${String(probe.error ?? 'no answer')}. Managers dial workers on this address; allow it from the managers, or set LEGION_WORKER_ADVERTISE_ADDR.`,
+    })
+  }
+
+  // Whether host-mode tasks are guarded in the kernel here (§6.13).
+  const hostGuard = extractField(configData, 'hostGuard')
+  if (typeof hostGuard === 'string' && hostGuard) {
+    facts.push({ label: 'Host guard', value: hostGuard })
+  }
+
   return facts
 }
 
@@ -334,6 +354,8 @@ const OMITTED_ATTRIBUTE_KEYS = new Set([
   'reservedResources',
   'reserved_resources',
   'workerAddress',
+  'hostGuard',
+  'workerPlane',
 ])
 
 const buildAttributeRows = (data: unknown): Array<{ key: string; value: string }> => {
@@ -639,7 +661,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
   const hostFacts = createMemo(() => {
     const parsed = parsedNodeData()
     if (!parsed) return [] as HostFact[]
-    return buildHostFacts(parsed.fingerprintData, parsed.configData)
+    return buildHostFacts(parsed.fingerprintData, parsed.configData, parsed.dynamicData)
   })
 
   const staticAttributes = createMemo(() => buildAttributeRows(parsedNodeData()?.configData))

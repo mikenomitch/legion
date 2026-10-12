@@ -220,10 +220,7 @@ pub async fn stop_on_node(
     session_ids: &[String],
     reason: &str,
 ) -> Result<Vec<String>, Status> {
-    // The worker plane's mTLS client for the node (one cached channel per
-    // node and address).
-    let target = crate::manager::worker_plane::target_for_node(store, node_id)?;
-    let mut client = target.client.clone();
+    let (mut client, target) = worker_client(store, node_id)?;
     let mut request = tonic::Request::new(crate::structs::StopSessionsRequest {
         session_ids: session_ids.to_vec(),
         reason: reason.to_string(),
@@ -233,7 +230,11 @@ pub async fn stop_on_node(
         .stop_sessions(request)
         .await
         .map_err(|status| {
-            let status = target.explain(status);
+            let status = crate::manager::worker_plane::worker_call_error(
+                &target.node_id,
+                &target.address,
+                status,
+            );
             Status::unavailable(format!(
                 "node {node_id} could not be reached to stop the session: {}",
                 status.message()
@@ -615,7 +616,7 @@ async fn send_start(
     session_id: &str,
     issued_at: i64,
 ) -> Result<(), Status> {
-    let target = crate::manager::worker_plane::target_for_node(store, node_id)?;
+    let (mut client, target) = worker_client(store, node_id)?;
     // The session's own identity, for the workload's environment
     // (`LEGION_INSTANCE_ID`, `LEGION_INSTANCE_MODE=session`). Never stored.
     let identity = crate::structs::Instance {
@@ -666,7 +667,6 @@ async fn send_start(
     )
     .map_err(|err| Status::internal(format!("failed to build the session payload: {err:#}")))?;
     payload.priority_band = band.to_string();
-    let mut client = target.client.clone();
     let mut request = tonic::Request::new(crate::structs::PostWorkRequest {
         allocation: Some(payload),
     });
@@ -675,7 +675,33 @@ async fn send_start(
         .post_work(request)
         .await
         .map(|_| ())
-        .map_err(|status| target.explain(status))
+        .map_err(|status| {
+            crate::manager::worker_plane::worker_call_error(
+                &target.node_id,
+                &target.address,
+                status,
+            )
+        })
+}
+
+/// The worker plane's mTLS client for a node (one cached channel per
+/// address), and the target its errors name.
+fn worker_client(
+    store: &Store,
+    node_id: &str,
+) -> Result<
+    (
+        crate::structs::worker_client::WorkerClient<tonic::transport::Channel>,
+        crate::manager::worker_plane::WorkerTarget,
+    ),
+    Status,
+> {
+    let node = store
+        .get_node(node_id)
+        .map_err(|_| Status::not_found(format!("node {node_id} not found")))?;
+    let target = crate::manager::worker_plane::WorkerTarget::for_node(&node)?;
+    let client = crate::manager::worker_plane::WorkerPlane::global().client_for(store, &target)?;
+    Ok((client, target))
 }
 
 /// After an idempotent start, look for a copy a concurrent retry started on

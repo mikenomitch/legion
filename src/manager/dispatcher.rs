@@ -80,23 +80,21 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         let node = node_cache
             .get(&allocation.node_id)
             .context("Missing node in cache")?;
-        // The worker plane factory caches one mTLS channel per (node name,
-        // address) for the life of the process, so the handshake amortizes
-        // to nothing (`crate::manager::worker_plane`). A node it cannot dial
-        // (no address, a pre-protocol-3 plaintext address) is skipped: the
-        // heartbeat reply carries the allocation anyway.
-        let target = match crate::manager::worker_plane::target(store, node) {
+        // Dispatch is best-effort: a node the manager can't dial (no address
+        // yet, or a pre-mTLS worker) still gets this allocation on its next
+        // heartbeat reply.
+        let target = match crate::manager::worker_plane::WorkerTarget::for_node(node) {
             Ok(target) => target,
-            Err(err) => {
-                warn!(
+            Err(status) => {
+                debug!(
                     node_id = %allocation.node_id,
-                    error = %err,
-                    "Skipping push dispatch; the next heartbeat delivers the allocation"
+                    reason = %status.message(),
+                    "Skipping allocation push; the heartbeat reply carries it"
                 );
                 continue;
             }
         };
-        let worker_address = target.key.clone();
+        let worker_address = target.address.clone();
 
         let instance = match allocation.instance_id.as_deref() {
             Some(instance_id) => store.get_instance(instance_id)?,
@@ -124,7 +122,19 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         };
 
         if !clients.contains_key(&worker_address) {
-            clients.insert(worker_address.clone(), target.client);
+            match crate::manager::worker_plane::WorkerPlane::global().client_for(store, &target) {
+                Ok(client) => {
+                    clients.insert(worker_address.clone(), client);
+                }
+                Err(status) => {
+                    warn!(
+                        node_id = %allocation.node_id,
+                        error = %status.message(),
+                        "Skipping allocation push; the heartbeat reply carries it"
+                    );
+                    continue;
+                }
+            }
         }
         pending.push((
             worker_address,
@@ -317,7 +327,8 @@ fn speculative_claim_for(
     };
 
     let node = store.get_node(node_id)?;
-    if crate::manager::worker_plane::node_protocol_version(&node) < MIN_PROVISIONAL_PROTOCOL_VERSION
+    if crate::manager::worker_plane::worker_protocol_version(&node)
+        < MIN_PROVISIONAL_PROTOCOL_VERSION
     {
         debug!(
             node_id,
@@ -325,15 +336,9 @@ fn speculative_claim_for(
         );
         return Ok(None);
     }
-    // The worker plane (mTLS, node name verified). A node it cannot dial
-    // falls back to post-commit dispatch, like an old one.
-    let target = match crate::manager::worker_plane::target(store, &node) {
-        Ok(target) => target,
-        Err(err) => {
-            debug!(node_id, error = %err, "Speculative dispatch skipped");
-            return Ok(None);
-        }
-    };
+    if worker_address_for_node(&node).is_none() {
+        return Ok(None);
+    }
 
     let claim_id = crate::structs::edge_boot::new_claim_id();
     let lease_deadline_unix = time::OffsetDateTime::now_utc().unix_timestamp()
@@ -364,13 +369,14 @@ fn speculative_claim_for(
     let payload = build_task_allocation_with(task, &allocation, None, &[], Some(provisional))?;
 
     let sent = run_dispatch_future(async {
-        let mut client = target.client.clone();
+        let mut client = crate::manager::worker_plane::WorkerPlane::global()
+            .client(store, &node)
+            .map_err(|status| anyhow!("{}", status.message()))?;
         client
             .post_work(crate::structs::PostWorkRequest {
                 allocation: Some(payload),
             })
-            .await
-            .map_err(|status| target.explain(status))?;
+            .await?;
         Ok::<(), anyhow::Error>(())
     });
     if let Err(err) = sent {
@@ -442,8 +448,7 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
         .get_task_config_by_id(allocation.task_config_id)?
         .with_context(|| format!("missing task config {}", allocation.task_config_id))?;
     let node = store.get_node(&allocation.node_id)?;
-    let target = crate::manager::worker_plane::target(store, &node)
-        .context("cannot dial the node for ratification")?;
+    worker_address_for_node(&node).context("worker address missing for ratification")?;
     let instance = match allocation.instance_id.as_deref() {
         Some(instance_id) => store.get_instance(instance_id)?,
         None => None,
@@ -467,13 +472,14 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
     payload.provisional = Some(provisional);
 
     run_dispatch_future(async {
-        let mut client = target.client.clone();
+        let mut client = crate::manager::worker_plane::WorkerPlane::global()
+            .client(store, &node)
+            .map_err(|status| anyhow!("{}", status.message()))?;
         client
             .post_work(crate::structs::PostWorkRequest {
                 allocation: Some(payload),
             })
-            .await
-            .map_err(|status| target.explain(status))?;
+            .await?;
         Ok::<(), anyhow::Error>(())
     })
 }
@@ -494,6 +500,10 @@ where
             runtime.block_on(future)
         }
     }
+}
+
+fn worker_address_for_node(node: &crate::structs::Node) -> Option<String> {
+    crate::manager::worker_plane::worker_address(node)
 }
 
 pub fn build_task_allocation(
@@ -1339,7 +1349,7 @@ mod tests {
             dynamic_attrs: json!({}),
             health_checks: json!({}),
         };
-        let version = crate::manager::worker_plane::node_protocol_version;
+        let version = crate::manager::worker_plane::worker_protocol_version;
         assert!(version(&old) < MIN_PROVISIONAL_PROTOCOL_VERSION);
 
         // Registration records the version in the node's dynamic attributes

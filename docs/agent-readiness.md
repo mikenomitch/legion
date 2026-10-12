@@ -76,6 +76,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_keyring_status` | no | KV encryption at rest on the answering manager ([kv-encryption.md](kv-encryption.md)): `state` (`unlocked`, `locked`, `pending_upgrade`, …), the root key provider and location, each data key with how many values it protects, plaintext rows, rewrap progress, and a one-line `hint` with the next step when something needs doing. |
 | `legion_keyring_rotate` | **yes** | Rotate the KV data key now. Values are re-encrypted in the background with no job restarts. Takes an optional `idempotency_key`. |
 | `legion_node_claims` | no | A node's live provisional (unratified) allocations, meaning work that started but is not yet confirmed ([edge-boot.md](edge-boot.md)). Tells "still booting" apart from "already confirmed". |
+| `legion_exec_key_list` | no | Delegated exec minting keys: id, job glob, and ticket ceilings. Needs `acl:read`. |
 | `legion_boot_ticket_list` | no | Outstanding boot tickets (metadata only. Token bytes are never stored or returned). |
 | `legion_service_list` | no | List declared services with healthy/total endpoint counts, which is what a job can connect to. |
 | `legion_service_resolve` | no | Resolve a service to its endpoints (address, port, allocation, node, health). |
@@ -119,8 +120,11 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_snapshot_warm` | **yes** | Pre-fetch a `published` snapshot's parts onto available nodes matching `constraints` (`key=value` node attributes) that could restore it, so a later resume there starts from local bytes. Best effort and idempotent. Only needs `snapshot:read`, but it starts downloads, so it is gated behind `--allow-write`. The reply lists the nodes asked, the ones already warm, and the incompatible ones with the reason. Supports `idempotency_key`. |
 | `legion_boot_ticket_create` | **yes** | Mint a boot ticket: a short-lived capability that lets one edge node start one workload without a manager call ([edge-boot.md](edge-boot.md)). It can only be revoked by expiry, so prefer short TTLs. Supports `idempotency_key`. |
 | `legion_action_list` | no | List the actions declared on a job's tasks, with their parameters. |
-| `legion_exec_run` | **yes** | Run a one-shot command inside a running allocation; returns `exitCode`, `stdout`, `stderr`, `message`. Needs `exec:write`. |
-| `legion_action_run` | **yes** | Run a declared action against a running allocation (the newest of the job when `allocation_id` is omitted); same result shape. |
+| `legion_exec_run` | **yes** | Run a one-shot command in a running allocation; returns `exitCode`, `stdout`, `stderr`, `message` ([exec-and-actions.md](exec-and-actions.md)). Takes `instance_id` in place of `allocation_id` to reach an instance's current allocation. Needs `exec:write` (with `host` for host-level runtimes). |
+| `legion_action_run` | **yes** | Run a declared action one-shot; the manager renders its argv. Targets `allocation_id`, `instance_id`, or the newest running allocation of the job when both are omitted; same result shape as `legion_exec_run`. Needs `action:write` (or `exec:write`). |
+| `legion_exec_key_create` | **yes** | Register a platform's P-256 public key so workers accept exec tickets it signs for jobs matching a glob, never in a host-level runtime ([delegated minting keys](exec-and-actions.md#delegated-minting-keys)). Needs `acl:write`. Supports `idempotency_key`. |
+| `legion_exec_key_delete` | **yes** | Delete a delegated exec key; workers drop it and end its sessions on their next heartbeat. Needs `acl:write`. Supports `idempotency_key`. |
+| `legion_exec_ticket_mint` | **yes** | Mint an exec ticket for [direct exec](exec-and-actions.md#direct-exec): one session, on the worker running the target, with no manager on the data path. Authorized like `legion_exec_run` (or `legion_action_run` for an action ticket); writes nothing to the cluster. Returns the ticket, the worker address, the node name to verify, and the cluster CA. Single use, 60s to redeem by default. |
 
 Tool errors come back in-band (`result.isError = true` with a text payload),
 following MCP convention. Transport and protocol errors use JSON-RPC `error`.
@@ -163,7 +167,11 @@ command lacks the flag (`every_command_accepts_json` in
 ```
 
 An agent checks `ok` once and never has to scrape prose. The error `code`
-mirrors the gRPC status code (`NotFound`, `Unavailable`, `InvalidArgument`, …).
+mirrors the gRPC status code (`NotFound`, `Unavailable`, `InvalidArgument`, …),
+except where the server names a more specific one: `WORKER_UNREACHABLE`
+(retryable) when a manager can't dial the worker running the target of an
+exec, logs, or restart call. Its hint points at `legion node info <node>`,
+which shows the manager's reachability probe for that node.
 `retryable` tells the agent whether retrying the same request may succeed. It is
 true for `Unavailable`, `DeadlineExceeded`, `Aborted`, and `ResourceExhausted`.
 Commands exit non-zero on failure.
@@ -244,6 +252,15 @@ schema. That catches mistakes an agent could not otherwise see, such as an
 unknown capability name in `exec`'s `hardening` block, a non-octal `umask`, or
 both `oom_adj` and `oom_score_adj` set. These come back from `job validate`
 instead of from a task that fails to start on some node ten seconds later.
+
+A valid spec can still carry **warnings**: settings that will not do what the
+author most likely expects. They come back as a `warnings` list in the
+`job validate --json` data, in `job run`'s reply, and in `PlanJobReply.warnings`
+(`legion job plan -j`). One an agent meets often: a `container` on a Linux
+node runs gated by default and denies every outbound connection that nothing
+allows, so a task with no `network.egress` (and no policy object covering it)
+is warned about before its first `403 gated-default`. Each warning line ends
+with a `hint:` naming the fix.
 
 ### Job templates: authoring by parameter instead of by spec
 
@@ -594,7 +611,7 @@ legion net ca show > ca.pem
 
 # On the request path, against the node itself (mTLS; no manager call):
 legion sandbox start agent-sandboxes \
-    --id user-42 --node https://10.0.1.7:4848 --ca-cert ca.pem --ticket "$TICKET" -j
+    --id user-42 --node https://10.0.1.7:4848 --ca ca.pem --ticket "$TICKET" -j
 ```
 
 The command streams one frame per transition (`admitted`, `staged`/`booted`,
@@ -610,6 +627,26 @@ then `ratified` or `refused`). Two properties matter to an agent:
 `legion instance get` reports a sandbox as `provisional` until it is ratified.
 `legion node claims <NODE>` lists everything a node has started but not yet
 had confirmed.
+
+### Direct exec: a session without a manager in the middle
+
+An agent platform that runs many sessions can take the manager off their data
+path ([Direct exec](exec-and-actions.md#direct-exec)). It mints one exec ticket
+per session, then talks to the worker directly:
+
+```bash
+# Authorized like `legion exec`; writes nothing to the cluster.
+legion exec-ticket mint --instance user-42 --ttl 30s -j -- python3 -c 'print(42)'
+
+# Or in one step:
+legion exec --instance user-42 --direct -- python3 -c 'print(42)'
+```
+
+Over MCP, `legion_exec_ticket_mint` returns the same fields. The ticket is a
+credential: single use, one node, one allocation, one command. Its holder
+reaches the worker on the mutual-TLS worker plane, trusting only the `caPem`
+the reply carries and the name `<node>.node.legion`. The worker must opt in
+with `exec = { direct = true }`, and the manager must run workload identity.
 
 ## 7. State store introspection + saved query library
 
@@ -634,10 +671,16 @@ All client commands and the MCP server read:
 
 - `LEGION_ADDR`: manager address (default `http://127.0.0.1:4747`).
 - `LEGION_TLS_CA_CERT`: CA certificate path for `https`/`grpcs` addresses.
-- `LEGION_TOKEN`: ACL token sent as a bearer credential when the cluster has
-  ACLs enabled. Falls back to the `legion login` token file, `~/.legion/token`.
-  On a `PermissionDenied`, call `legion acl whoami` (or the `legion_acl_whoami`
-  MCP tool) to see the caller's policies. See [Auth & ACLs](auth-and-acls.md).
+- `LEGION_TOKEN`: ACL token sent as a bearer credential. ACLs are on by
+  default, so the CLI and the MCP server need a token for every call. Falls
+  back to the token file, `~/.legion/token` (`$LEGION_TOKEN_FILE` overrides
+  the path), which `legion login` writes and which a manager writes at first
+  start for the user running it. An MCP server started on the manager's own
+  machine therefore works with nothing set. Elsewhere, give it a scoped token,
+  not the management token. A call with no token fails with
+  `Unauthenticated` and a hint naming `<dataDir>/bootstrap-token`. On a
+  `PermissionDenied`, call `legion acl whoami` (or the `legion_acl_whoami` MCP
+  tool) to see the caller's policies. See [Auth & ACLs](auth-and-acls.md).
 
 ## Recommended agent workflow
 

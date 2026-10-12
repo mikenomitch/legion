@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -1377,26 +1377,27 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Issue a short-lived **node certificate** for a worker node: the
-     * credential its worker plane serves on 4848 (docs/auth-and-acls.md, "The
-     * worker plane") and the mesh's node certificate behind
-     * `certFrom = "legion"` (docs/network-handlers.md, "mTLS"). The first call
-     * creates the cluster CA (replicated with the control lane).
+     * Sign a worker node's **node certificate** from a CSR. The certificate is
+     * the node's identity on every plane Legion runs between its own
+     * processes: the mTLS worker plane listener (what a manager verifies when
+     * it dials the node, docs/auth-and-acls.md, "The worker plane") and the
+     * mesh (`certFrom = "legion"`, docs/network-handlers.md, "mTLS").
      *
-     * The worker generates its own key pair and sends only a CSR
-     * (`csr_pem`). The manager checks the CSR's self-signature, then signs its
-     * public key with names it chooses — `<node>.node.legion` and
-     * `legion://node/<node id>` as SANs, `ServerAuth` + `ClientAuth`, valid for
-     * 24 hours — and ignores every name the CSR requests, so a node can never
-     * obtain a certificate for another node or a manager. No private key ever
-     * crosses the network.
+     * The worker generates its key pair locally and sends only a CSR; the
+     * private key never crosses the network. The manager signs the CSR's
+     * public key with the cluster CA and SANs it chooses itself,
+     * `<node>.node.legion` and `legion://node/<node id>`, ignoring every name,
+     * extension, and subject the CSR requests. Valid for 24 hours. Workers call
+     * it right after registration (the listener needs it), again after a third
+     * of the lifetime, and at once when a heartbeat reply names a CA their
+     * bundle lacks (a rotation). The first call creates the cluster CA
+     * (replicated with the control lane).
      *
-     * Workers call it right after registration (the worker plane does not
-     * listen until it holds a certificate), again on their heartbeat loop
-     * after a third of the lifetime has passed, and early when a handshake on
-     * the worker plane suggests the cluster CA was rotated. The worker
-     * persists the key and certificate (mode 0600) so a restart can serve
-     * before it reaches a manager.
+     * `fleet` is for the simulator only (`legion start worker --simulate`),
+     * which serves every simulated node from one listener: the certificate
+     * then names the fleet (`<fleet>.fleet.legion`, `legion://fleet/<name>`)
+     * instead of the node, and the caller's node must have registered with the
+     * `workerFleet` config attribute set to the same name.
      *
      * The node's *workload* identities are never certificates: a dialing node
      * names the workload it forwards for in a PROXY protocol v2 TLV inside the
@@ -1408,8 +1409,8 @@ export const Manager = {
      * (`node:<node_id>`) must match the request's `node_id`.
      *
      * Errors:
-     * - InvalidArgument: `csr_pem` is missing, is not a PEM certificate
-     *   request, or its signature does not verify.
+     * - InvalidArgument: `csr_pem` is missing or is not a valid CSR, or
+     *   `fleet` does not match the node's registered `workerFleet`.
      * - NotFound: no node with `node_id` is registered.
      * - PermissionDenied: `node_id` does not match the caller's credential.
      * - Internal: the CA could not be created or signing failed.
@@ -1846,6 +1847,109 @@ export const Manager = {
       name: "ListJobActions",
       I: ListJobActionsRequest,
       O: ListJobActionsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Mints an exec ticket: a short-lived credential for direct exec, where
+     * the client opens `Worker.ExecTask` on the worker itself instead of
+     * streaming every byte through a manager (docs/exec-and-actions.md,
+     * "Direct exec").
+     *
+     * Authorization is exactly `ExecAllocation`'s: a coarse `exec:write` or
+     * `action:write` gate before any lookup, then `exec:write` on the job
+     * (with `host` for host-level runtimes) for a command, or `action:write`
+     * on the (job, action) — or `exec:write` on the job — for an action, whose
+     * argv is rendered here from the stored job spec. The ticket names what
+     * was authorized and nothing else: one node, one allocation, the job and
+     * task, the rendered argv (absent for an `exec` ticket minted without a
+     * command, which allows any command), the tty flag, and how long the
+     * session may run.
+     *
+     * Minting is a signature, not a write: no raft entry, no idempotency
+     * record. The mint is logged under the `exec_audit` target; the worker
+     * reports the redemption and the exit code on its next heartbeat, logged
+     * under `exec_audit` too. A ticket is single use on its node and expires
+     * after `ttl` (default `exec.tickets.defaultTtl`, 60s). The session it
+     * opens ends after `max_session` (default `exec.tickets.maxSession`, 1h),
+     * never later than the minting credential expires, and within one worker
+     * heartbeat of the minting token being deleted or losing the grant.
+     *
+     * The ticket is signed with the workload-identity key, so the manager
+     * must run with `workloadIdentity.enabled: true`.
+     *
+     * Errors:
+     * - PermissionDenied: the caller could not open this session through
+     *   `ExecAllocation`.
+     * - NotFound: no such allocation, instance, task, or action (only after
+     *   the coarse gate, so it reveals nothing to a caller without exec).
+     * - FailedPrecondition: exec or workload identity is disabled on this
+     *   manager; the allocation is not running; the instance has no running
+     *   allocation; the node advertises no authenticated worker address.
+     * - InvalidArgument: neither a command nor an action; a bad `ttl` or
+     *   `max_session`, or one above the manager's ceiling; bad action params.
+     *
+     * @generated from rpc legion.Manager.MintExecTicket
+     */
+    mintExecTicket: {
+      name: "MintExecTicket",
+      I: MintExecTicketRequest,
+      O: MintExecTicketReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Registers a delegated exec minting key (docs/exec-and-actions.md,
+     * "Delegated minting keys"): a platform's ES256 public key whose exec
+     * tickets workers accept for jobs matching `jobs`, with no manager call
+     * per ticket. One control-lane write per key, never per session.
+     *
+     * A key's tickets are narrower than the `exec:write` grant that could mint
+     * them: they never open a session in a host-level runtime (`exec`), their
+     * redeem window is at most `max_ttl`, and their sessions run at most
+     * `max_session`. Workers learn keys on their heartbeat, so a new key works
+     * on a node within one heartbeat interval.
+     *
+     * ACL: `acl:write` (a key is a credential that mints shell access).
+     * Retry-safe with `idempotency_key`.
+     *
+     * Errors:
+     * - PermissionDenied: caller lacks `acl:write`.
+     * - InvalidArgument: `public_key_pem` is not a P-256 public key; `jobs` is
+     *   empty; `max_ttl` or `max_session` is not a duration, is zero, or is
+     *   above the manager's `exec.tickets` ceiling.
+     *
+     * @generated from rpc legion.Manager.CreateExecKey
+     */
+    createExecKey: {
+      name: "CreateExecKey",
+      I: CreateExecKeyRequest,
+      O: CreateExecKeyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists delegated exec minting keys. Public keys are public; there is no
+     * secret to hide. ACL: `acl:read`.
+     *
+     * @generated from rpc legion.Manager.ListExecKeys
+     */
+    listExecKeys: {
+      name: "ListExecKeys",
+      I: ListExecKeysRequest,
+      O: ListExecKeysReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes a delegated exec minting key. Workers stop accepting its tickets
+     * on their next heartbeat, and open sessions it minted end then too, with
+     * `PermissionDenied`. ACL: `acl:write`. Retry-safe with `idempotency_key`.
+     *
+     * Errors: PermissionDenied without `acl:write`; NotFound for an unknown id.
+     *
+     * @generated from rpc legion.Manager.DeleteExecKey
+     */
+    deleteExecKey: {
+      name: "DeleteExecKey",
+      I: DeleteExecKeyRequest,
+      O: DeleteExecKeyReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -2348,10 +2452,13 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * The mesh CA certificate — what an operator hands a non-Legion client
-     * that must reach a mesh-TLS port, or verifies a node certificate against.
-     * Never the key. Empty `cert_pem` when no node has asked for a certificate
-     * yet (the CA is created on first use). ACL: `net:read`.
+     * The cluster CA — what an operator hands a non-Legion client that must
+     * reach a mesh-TLS port or the worker plane (`legion sandbox start --node`,
+     * `legion exec --direct`), or verifies a node certificate against. Returns
+     * the signing CA, the full trust bundle (both CAs during a rotation), the
+     * pin new join tokens carry, and where a rotation stands. Never a key.
+     * Empty `cert_pem` when no CA exists yet (it is created on first use: the
+     * first join token or node certificate). ACL: `net:read`.
      *
      * @generated from rpc legion.Manager.GetMeshCa
      */
@@ -2362,10 +2469,15 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Replace the mesh CA. Every node re-issues its certificate on its next
-     * heartbeat (within one interval); until a node has, its peers on the new
-     * CA refuse it and it refuses them — expect a heartbeat's worth of
-     * refused mesh connections, never plaintext. ACL: `net:write` (unscoped).
+     * Rotate the cluster CA in two steps, without breaking any connection
+     * (worker-plane-auth plan §6.9). The new CA is generated, cross-signed by
+     * the current one, and signs every certificate from now on; the previous
+     * CA stays in every holder's trust bundle for one certificate lifetime (24
+     * hours), and chains carry the cross-signed certificate meanwhile, so a
+     * holder that has not refreshed its bundle yet keeps verifying. Nodes
+     * re-issue their certificates within one heartbeat (the reply names the
+     * new CA). Join tokens minted before the rotation keep working during the
+     * overlap; after it, mint new ones. ACL: `net:write` (unscoped).
      *
      * @generated from rpc legion.Manager.RotateMeshCa
      */
@@ -2541,21 +2653,6 @@ export const Manager = {
       name: "Login",
       I: LoginRequest,
       O: LoginReply,
-      kind: MethodKind.Unary,
-    },
-    /**
-     * One-time creation of the initial management token.
-     *
-     * Succeeds only while no management token exists; afterwards it returns
-     * FAILED_PRECONDITION. Run `legion acl bootstrap` right after enabling ACLs
-     * and store the returned secret safely.
-     *
-     * @generated from rpc legion.Manager.BootstrapAcl
-     */
-    bootstrapAcl: {
-      name: "BootstrapAcl",
-      I: BootstrapAclRequest,
-      O: BootstrapAclReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -2828,18 +2925,34 @@ export const Manager = {
  * ACLs: managers apply ACLs before they dial, and only managers hold
  * manager certificates.
  *
+ * The worker plane (docs/architecture-managers-workers.md, "The worker
+ * plane"). Every worker serves this service over mutual TLS with its node
+ * certificate (`<node>.node.legion`, `legion://node/<id>`), on
+ * `LEGION_WORKER_HOST:LEGION_WORKER_PORT` (default `0.0.0.0:4848`). There
+ * is no plaintext listener. Client certificates are requested, not
+ * required; one that is presented must chain to the cluster CA or the
+ * handshake fails.
+ *
+ * Each RPC admits named caller classes, checked before anything else:
+ * - `manager`: a client certificate from the cluster CA carrying a
+ *   `legion://manager/<id>` URI SAN. A node's certificate is signed by the
+ *   same CA but is not a manager certificate.
+ * - `ticket`: no client certificate; the request carries a ticket the RPC
+ *   verifies offline.
+ * A request that presents a certificate other than a manager's is refused
+ * with Unauthenticated, never treated as a ticket holder.
+ * `tests/worker_plane_classes.rs` fails the build when an RPC here has no
+ * class.
+ *
  * @generated from service legion.Worker
  */
 export const Worker = {
   typeName: "legion.Worker",
   methods: {
     /**
-     * Delivers one allocation payload to the worker for execution or
-     * reconciliation (and edge boot's provisional starts and ratifications).
-     *
-     * Caller class: `manager`. Best-effort from the manager's side: a failed
-     * push is healed by the next heartbeat reply, which carries the full
-     * desired set.
+     * Delivers one allocation payload to worker for execution/reconciliation.
+     * Caller class: manager. Errors: Unauthenticated without a manager
+     * certificate.
      *
      * @generated from rpc legion.Worker.PostWork
      */
@@ -2850,10 +2963,10 @@ export const Worker = {
       kind: MethodKind.Unary,
     },
     /**
-     * Requests the worker process to restart itself (`legion node restart`).
-     *
-     * Caller class: `manager`. The manager enforces `node:write` on the
-     * node's pool before it dials.
+     * Requests the worker process to restart itself. Caller class: manager.
+     * Errors: Unauthenticated without a manager certificate;
+     * FailedPrecondition when `node_id` names a node other than this worker
+     * (a manager holding a stale address never restarts the wrong machine).
      *
      * @generated from rpc legion.Worker.RestartWorker
      */
@@ -2865,9 +2978,8 @@ export const Worker = {
     },
     /**
      * Reads captured stdout/stderr files for one allocation on this node.
-     *
-     * Caller class: `manager`. The manager enforces `job:read` on the
-     * allocation's job before it dials.
+     * Caller class: manager. Errors: Unauthenticated without a manager
+     * certificate.
      *
      * @generated from rpc legion.Worker.GetTaskLogs
      */
@@ -2878,13 +2990,29 @@ export const Worker = {
       kind: MethodKind.Unary,
     },
     /**
-     * Runs an exec session against a local allocation. The manager has
-     * already authorized the caller (`exec:write` or `action:write`) and
-     * rendered any action command into a raw argv on the `ExecStart` frame.
+     * Runs an exec session against a local allocation. Caller classes:
+     * manager, ticket.
      *
-     * Caller class: `manager`. The sandbox-exec plan's `ticket` class (direct
-     * exec with an exec ticket, behind the worker's `exec.direct`) is not
-     * implemented; until it is, every exec goes through a manager.
+     * - manager: the manager has already authorized the caller and rendered
+     *   any action command into a raw argv on the `ExecStart` frame.
+     * - ticket (direct exec, docs/exec-and-actions.md "Direct exec"): no
+     *   client certificate, and `ExecStart.exec_ticket` carries a ticket from
+     *   `Manager.MintExecTicket`. Admitted only on a worker whose config sets
+     *   `exec = { direct = true }`. The worker verifies the ticket offline
+     *   against the cluster JWKS: signature, `aud = legion:exec`, expiry with
+     *   the worker's clock skew, issued after this worker process started,
+     *   `legion.io/node` is this node, the allocation is running here under
+     *   the ticket's job and task, the `ExecStart` argv and tty fit the ticket,
+     *   and the `jti` has not been redeemed on this node. The session ends
+     *   after the ticket's `legion.io/max_session` seconds, or when a manager
+     *   names it in `HeartbeatReply.revoked_exec_sessions`.
+     *
+     * Errors: Unauthenticated when the request carries neither a manager
+     * certificate nor a ticket ("ExecTask admits a manager certificate or an
+     * exec ticket; this request carried neither"), or presents a certificate
+     * that is not a manager's; FailedPrecondition for a ticket on a worker
+     * without `exec.direct`; PermissionDenied for a ticket that fails any
+     * check above, with the check named.
      *
      * @generated from rpc legion.Worker.ExecTask
      */
@@ -2896,7 +3024,7 @@ export const Worker = {
     },
     /**
      * Starts work on this node from a boot ticket, without any call to a
-     * manager on the critical path (docs/edge-boot.md).
+     * manager on the critical path (docs/edge-boot.md). Caller class: ticket.
      *
      * This is the edge entry point: a platform's router hands the node a
      * ticket it minted ahead of time, the node verifies it offline against the
@@ -2924,6 +3052,23 @@ export const Worker = {
       I: StartClaimRequest,
       O: StartClaimReply,
       kind: MethodKind.ServerStreaming,
+    },
+    /**
+     * Answers a manager's reachability check (docs/architecture-managers-
+     * workers.md, "Reachability"). The manager that accepts a registration
+     * probes the worker's advertised address once its worker plane is up, and
+     * records the outcome on the node (`workerPlane` in its dynamic
+     * attributes, shown by `legion node info`). Informational only: it does
+     * not feed node readiness. Caller class: manager. Errors: Unauthenticated
+     * without a manager certificate.
+     *
+     * @generated from rpc legion.Worker.Probe
+     */
+    probe: {
+      name: "Probe",
+      I: ProbeRequest,
+      O: ProbeReply,
+      kind: MethodKind.Unary,
     },
     /**
      * Ends sessions on this node (docs/session-mode.md). Called by a manager

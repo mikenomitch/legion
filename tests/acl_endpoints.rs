@@ -8,7 +8,7 @@
 //!    when an RPC is added without an entry in [`endpoint_table`] — so a new
 //!    endpoint cannot ship without deciding (and testing) its ACL behavior.
 //! 2. The deny/allow matrix calls every endpoint three ways: anonymous with
-//!    ACLs enabled (protected endpoints must return PermissionDenied), with a
+//!    ACLs enabled (protected endpoints must return Unauthenticated), with a
 //!    management token (must never fail with an auth error), and with ACLs
 //!    disabled (must never fail with an auth error).
 //! 3. Scenario tests prove scoped policies behave correctly end-to-end
@@ -189,6 +189,13 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("IssueNodeCertificate", Plane::Worker),
         ("GetAllocationLogs", Plane::Protected("job:read")),
         ("ExecAllocation", Plane::Protected("exec:write")),
+        // Direct exec: the same coarse gate as ExecAllocation, then its
+        // precise job scope once the target is resolved.
+        ("MintExecTicket", Plane::Protected("exec:write")),
+        // Delegated exec minting keys are credentials: the acl resource.
+        ("CreateExecKey", Plane::Protected("acl:write")),
+        ("ListExecKeys", Plane::Protected("acl:read")),
+        ("DeleteExecKey", Plane::Protected("acl:write")),
         ("ListJobActions", Plane::Protected("job:read")),
         ("GetArtifactCredential", Plane::Worker),
         ("GetIngressCertificates", Plane::Worker),
@@ -196,7 +203,6 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("StreamEvents", Plane::Protected("operator:read")),
         ("WhoAmI", Plane::Open),
         ("Login", Plane::Open),
-        ("BootstrapAcl", Plane::Open),
         ("GetAuthMethods", Plane::Open),
         ("CreateJoinToken", Plane::Protected("node:write")),
         ("ListJoinTokens", Plane::Protected("node:read")),
@@ -264,9 +270,9 @@ fn template_source(job_name: &str) -> String {
     name = "{job_name}",
     tasks = [{{
       name = "main",
-      runtime = "exec",
+      runtime = "container",
       count = 1,
-      config = {{ command = ["echo", "ok"] }},
+      config = {{ image = "alpine", command = ["echo", "ok"] }},
       resources = {{}},
       constraints = {{}},
     }}],
@@ -1122,9 +1128,10 @@ async fn call_endpoint(
             .issue_node_certificate(req(
                 IssueNodeCertificateRequest {
                     node_id: NODE_ID.into(),
-                    csr_pem: legion::manager::mesh_ca::node_csr(NODE_ID)
+                    csr_pem: legion::manager::mesh_ca::generate_csr(NODE_ID)
                         .expect("csr")
-                        .0,
+                        .1,
+                    fleet: String::new(),
                 },
                 token,
             ))
@@ -1152,6 +1159,43 @@ async fn call_endpoint(
             .map(|_| ()),
         "ExecAllocation" => svc
             .exec_allocation(req(empty_exec_stream(), token))
+            .await
+            .map(|_| ()),
+        "MintExecTicket" => svc
+            .mint_exec_ticket(req(
+                MintExecTicketRequest {
+                    allocation_id: 404,
+                    command: vec!["true".into()],
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "CreateExecKey" => svc
+            .create_exec_key(req(
+                CreateExecKeyRequest {
+                    name: "acl-fixture".into(),
+                    jobs: "acl-*".into(),
+                    public_key_pem: "not a key".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListExecKeys" => svc
+            .list_exec_keys(req(ListExecKeysRequest {}, token))
+            .await
+            .map(|_| ()),
+        "DeleteExecKey" => svc
+            .delete_exec_key(req(
+                DeleteExecKeyRequest {
+                    id: "xk_missing".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
             .await
             .map(|_| ()),
         "ListJobActions" => svc
@@ -1203,10 +1247,6 @@ async fn call_endpoint(
                 },
                 token,
             ))
-            .await
-            .map(|_| ()),
-        "BootstrapAcl" => svc
-            .bootstrap_acl(req(BootstrapAclRequest { secret: None }, token))
             .await
             .map(|_| ()),
         "GetAuthMethods" => svc
@@ -1495,8 +1535,9 @@ fn setup_enabled() -> R<(ManagerDaemonService, Fixtures, String)> {
     let authenticator = enabled_authenticator();
 
     let (_, management_secret) = authenticator
-        .bootstrap(&store, None)
-        .map_err(|s| anyhow!(s.to_string()))?;
+        .mint_initial_management_token(&store, None)
+        .map_err(|s| anyhow!(s.to_string()))?
+        .expect("a fresh store has no management token");
     let (deletable, _) = authenticator
         .mint_token(
             &store,
@@ -1559,9 +1600,9 @@ fn every_manager_rpc_is_classified() -> R<()> {
     Ok(())
 }
 
-/// With ACLs enabled, anonymous callers are denied on every protected
-/// endpoint, rejected as unauthenticated on the worker plane, and never
-/// blocked on open endpoints.
+/// With ACLs enabled, anonymous callers are rejected as unauthenticated on
+/// every protected endpoint and on the worker plane, and never blocked on
+/// open endpoints.
 #[tokio::test]
 async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
     let (svc, fixtures, _) = setup_enabled()?;
@@ -1575,8 +1616,8 @@ async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
                 ));
                 assert_eq!(
                     status.code(),
-                    Code::PermissionDenied,
-                    "{method} (requires {capability}) returned `{}` instead of PermissionDenied: {}",
+                    Code::Unauthenticated,
+                    "{method} (requires {capability}) returned `{}` instead of Unauthenticated: {}",
                     status.code(),
                     status.message(),
                 );
@@ -2216,6 +2257,113 @@ async fn template_scoped_policy_gates_submission_channel() -> R<()> {
     Ok(())
 }
 
+/// Worker-plane-auth plan §6.16: a job with a host-level task (`exec`, a
+/// host-network or floor-less container) needs a `job:write` rule with
+/// `host = true`. Same reason as the band test for living here: the check is
+/// conditional logic inside an endpoint that already has an ACL check.
+#[tokio::test]
+async fn host_level_jobs_need_the_host_grant_test() -> R<()> {
+    let (svc, _fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    svc.store.upsert_acl_policy(
+        "deployer",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+    )?;
+    svc.store.upsert_acl_policy(
+        "platform",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"], "host": true}]"#,
+    )?;
+    let mint = |policy: &str| {
+        authenticator
+            .mint_token(&svc.store, policy, "client", &[policy.into()], None)
+            .map(|(_, secret)| secret)
+            .map_err(|s| anyhow!(s.to_string()))
+    };
+    let deployer = mint("deployer")?;
+    let platform = mint("platform")?;
+    let spec = |name: &str, task: serde_json::Value| {
+        serde_json::json!({ "name": name, "tasks": [task] }).to_string()
+    };
+    let exec_task = serde_json::json!({
+        "name": "dump", "runtime": "exec", "count": 1,
+        "config": { "command": ["echo", "ok"] }, "resources": {}, "constraints": {},
+    });
+    let container = |extra: serde_json::Value| {
+        let mut task = serde_json::json!({
+            "name": "web", "runtime": "container", "count": 1,
+            "config": { "image": "alpine", "command": ["echo", "ok"] },
+            "resources": {}, "constraints": {},
+        });
+        if let Some(object) = extra.as_object() {
+            for (key, value) in object {
+                task[key] = value.clone();
+            }
+        }
+        task
+    };
+    let run = |spec: String, secret: String| {
+        let svc = &svc;
+        async move {
+            svc.run_job(req(
+                RunJobRequest {
+                    parsed_jobspec: spec,
+                    submissions: vec![],
+                    priority: None,
+                    force_reschedule: false,
+                    idempotency_key: None,
+                },
+                Some(&secret),
+            ))
+            .await
+        }
+    };
+
+    // A container with the floor and gated (default) networking is not
+    // host-level: any job:write may submit it.
+    run(
+        spec("web", container(serde_json::json!({}))),
+        deployer.clone(),
+    )
+    .await
+    .expect("an ordinary container needs no host grant");
+
+    // An exec task, a host-network container, and a floor-less container
+    // are host-level: refused without the grant, naming the task and why.
+    for (name, task, why) in [
+        ("backup", exec_task.clone(), "uses runtime \"exec\""),
+        (
+            "hostnet",
+            container(serde_json::json!({ "network": { "mode": "host" } })),
+            "network.mode = \"host\"",
+        ),
+        (
+            "rootful",
+            container(serde_json::json!({
+                "config": { "image": "alpine", "command": ["true"],
+                            "security": { "userNamespace": false } }
+            })),
+            "security.userNamespace = false",
+        ),
+    ] {
+        let status = run(spec(name, task.clone()), deployer.clone())
+            .await
+            .expect_err("a host-level job needs the host grant");
+        assert_eq!(status.code(), Code::PermissionDenied, "{name}");
+        assert!(
+            status.message().contains("host-level") && status.message().contains(why),
+            "{name}: {}",
+            status.message()
+        );
+        // The host grant admits it.
+        run(spec(name, task), platform.clone())
+            .await
+            .unwrap_or_else(|status| panic!("{name} with the host grant: {status}"));
+    }
+    Ok(())
+}
+
 /// Priority-band scoping: the `bands` selector on `job` rules is what makes
 /// `critical` a privilege instead of a label anyone can claim.
 ///
@@ -2250,9 +2398,9 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
             "name": name,
             "tasks": [{
                 "name": "main",
-                "runtime": "exec",
+                "runtime": "container",
                 "count": 1,
-                "config": { "command": ["echo", "ok"] },
+                "config": { "image": "alpine", "command": ["echo", "ok"] },
                 "resources": {},
                 "constraints": {},
             }],
@@ -2484,8 +2632,8 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
         let jobspec = serde_json::json!({
             "name": "edge",
             "task": {
-                "runtime": "exec",
-                "config": { "command": ["sleep", "30"] },
+                "runtime": "container",
+                "config": { "image": "alpine", "command": ["sleep", "30"] },
                 "network": {
                     "ports": [{ "name": "https", "static": 8443 }],
                     "ingress": { "tls": { "mode": "server", "certFrom": { "kv": "certs/edge" } } },
@@ -2842,7 +2990,9 @@ async fn anonymous_policy_grants_tokenless_access() -> R<()> {
     let status = call_endpoint(&svc, &fixtures, "StopJob", None)
         .await
         .expect_err("anonymous policy must not allow job writes");
-    assert_eq!(status.code(), Code::PermissionDenied);
+    // Beyond what the anonymous policy grants, a credential-less caller is
+    // told to authenticate, not that its (nonexistent) policies fall short.
+    assert_eq!(status.code(), Code::Unauthenticated);
     Ok(())
 }
 

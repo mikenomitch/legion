@@ -46,6 +46,11 @@ without a config file, from any directory.
 legion start manager --run-worker
 ```
 
+ACLs are on from the first start. The manager mints a management token and
+writes it to `~/.legion/token` (and `.legion/bootstrap-token`), which the CLI
+on this machine reads, so there is nothing to set up. From another machine,
+export the same secret as `LEGION_TOKEN` (see [Auth & ACLs](docs/auth-and-acls.md)).
+
 In another terminal, write a job. Job specs use [Nickel](https://nickel-lang.org),
 a small typed configuration language, but plain JSON works too.
 
@@ -103,14 +108,15 @@ legion join-token create --ttl 24h
 legion join lgnjoin_...
 ```
 
-Managers dial workers back on port 4848 for `legion exec`, `legion job logs`,
-and dispatch, so allow TCP 4848 from the managers to the new machine (and
-4747 from it to the managers). That port is mutual TLS: only a manager's
-certificate can drive a worker through it. The worker advertises the address
-it uses to reach the manager. If managers must dial it somewhere else (NAT, a
-second interface), pass `--advertise-addr 10.0.1.7` or set
-`LEGION_WORKER_ADVERTISE_ADDR`. See
-[docs/architecture-managers-workers.md](docs/architecture-managers-workers.md#ports-and-who-dials-whom).
+The token pins your cluster's CA, so the new worker refuses anything that
+answers at the manager's address but isn't your manager. Managers reach
+workers over mutual TLS on port 4848 for `legion exec`, `legion job logs`,
+and dispatch, so allow TCP 4848 from the managers to the workers (and 4747
+from the workers to the managers). The worker advertises its address on the
+route to the manager; if managers must dial it somewhere else (NAT, a second
+interface), pass `--advertise-addr 10.0.1.7` or set
+`LEGION_WORKER_ADVERTISE_ADDR` (see
+[Managers and Workers](docs/architecture-managers-workers.md#ports-and-who-dials-whom)).
 
 ### Example job specs
 
@@ -255,6 +261,12 @@ they should. Legion handles all three.
 - **Boot at the edge, ahead of the scheduler.** [Edge boot](docs/edge-boot.md)
   lets a worker start a sandbox before its placement is durable. You can hold
   its network shut until the manager confirms it is the only instance.
+- **A shell in any sandbox, with or without the manager in the path.**
+  `legion exec` reaches into Linux microVM sandboxes through the guest
+  agent. For high session counts, a platform mints single-use
+  [exec tickets](docs/exec-and-actions.md#direct-exec) (or signs its own
+  with a [delegated key](docs/exec-and-actions.md#delegated-minting-keys)),
+  and the session runs client to worker with no manager on the data path.
 - **Simple egress control.** [Network handlers](docs/network-handlers.md)
   give each task its own egress allowlist and proxy middleware, so you
   can customize what traffic is allowed or inject secrets safely.
@@ -350,21 +362,21 @@ each feature.
 Don't run Legion where untrusted workloads share a host with other work, or
 on a network you don't trust. Known gaps:
 
-- **The worker API authenticates no one.** It listens only on loopback, but
-  any process on the same host, including an `exec` task or a host-network
-  container, can run commands in other allocations on that node. The
-  [worker-plane auth plan](internal_docs/plans/worker-plane-auth-plan.md)
-  fixes this.
-- **Linux containers and `exec` tasks share the host's network by default**,
-  so they can reach the worker and manager ports, the cloud metadata service,
-  and anything else on the host. With ACLs off (the default), the manager's
-  port is full control of the cluster. `gated` mode doesn't help yet, because
-  its egress proxy still dials loopback and link-local addresses for the
-  task. Don't run untrusted code in them yet. The
-  [same plan](internal_docs/plans/worker-plane-auth-plan.md) covers it.
-- **The worker-to-manager channel is plaintext.**
-- **Workers on other hosts can't serve exec, logs, or the service mesh yet**,
-  because they advertise a loopback address. Covered by the same plan.
+- **`exec` tasks run on the host, and as root unless they set a `user`.**
+  They share the host's network. On Linux nodes with cgroup v2 and `nft`,
+  the [kernel host guard](docs/network-handlers.md#the-host-guard-in-the-kernel)
+  keeps them off Legion's ports, the cloud metadata service, and other
+  allocations' listeners, but a root task can remove it. Run untrusted code
+  in `container` (gated by default on Linux) or `sandbox`, never `exec`.
+- **Raft traffic between managers is plaintext.** Workers reach managers over
+  TLS pinned to the cluster CA, and managers reach workers over mutual TLS,
+  but peer managers talk to each other in the clear. Keep managers on a
+  network you trust.
+- **Revoking access ends a direct exec session within a heartbeat, not at
+  once.** Deleting the token behind a [direct exec](docs/exec-and-actions.md#direct-exec)
+  session, or the delegated key that signed its ticket, closes the session
+  on the worker's next heartbeat: 2 seconds up to 2,500 nodes, longer on
+  larger fleets, where the heartbeat interval grows.
 
 ### What's next
 
@@ -378,8 +390,6 @@ add:
   object storage that wake on request, workload identity for sessions, and
   denser sandboxes per node
   ([plan](internal_docs/plans/sandbox-scaling-plan.md)).
-- **Exec into microVM sandboxes**, and exec sessions that skip the manager
-  ([plan](internal_docs/plans/sandbox-exec-plan.md)).
 - **Built-in ingress gateway, autoscaler, cert-manager, and GitOps tools**, or
   a more omakase starting experience.
 - **Resource registry for sharing and pulling jobs, templates, and plugins.**

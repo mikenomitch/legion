@@ -63,6 +63,11 @@ pub fn hash_secret(secret: &str) -> String {
     format!("{:x}", Sha256::digest(secret.as_bytes()))
 }
 
+/// A fresh random ACL token secret (`lgn_` plus 32 random bytes in hex).
+pub fn generate_token_secret() -> String {
+    format!("{TOKEN_PREFIX}{}", random_hex(32))
+}
+
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::thread_rng().fill_bytes(&mut buf);
@@ -240,7 +245,36 @@ impl Authenticator {
             .get_acl_token_by_hash(&hash_secret(secret))
             .map_err(internal_acl_error)?
             .ok_or_else(|| Status::unauthenticated("unknown or revoked ACL token"))?;
+        self.record_identity(record, store)
+    }
 
+    /// The identity of the token with this accessor id, as a request
+    /// carrying its secret would authenticate: `Ok(None)` once the token is
+    /// deleted, `Unauthenticated` once it has expired. How a direct exec
+    /// session, which holds only the minting token's accessor, is re-checked
+    /// (docs/exec-and-actions.md, "Direct exec").
+    pub fn identity_for_accessor(
+        &self,
+        accessor_id: &str,
+        store: &Store,
+    ) -> Result<Option<AclIdentity>, Status> {
+        if !self.enabled {
+            return Ok(Some(AclIdentity::acl_disabled()));
+        }
+        match store
+            .get_acl_token_by_accessor(accessor_id)
+            .map_err(internal_acl_error)?
+        {
+            Some(record) => self.record_identity(record, store).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn record_identity(
+        &self,
+        record: AclTokenRecord,
+        store: &Store,
+    ) -> Result<AclIdentity, Status> {
         if record.is_expired(OffsetDateTime::now_utc()) {
             return Err(Status::unauthenticated(format!(
                 "ACL token `{}` has expired; log in again or create a new token",
@@ -401,20 +435,25 @@ impl Authenticator {
         })
     }
 
-    /// One-shot creation of the initial management token.
+    /// Mints the initial management token when no management token exists.
     ///
-    /// `provided_secret` supports infrastructure-as-code pre-seeding: when
-    /// given (and at least 24 characters), it becomes the token secret
-    /// instead of a random one.
-    pub fn bootstrap(
+    /// Called by the manager at startup (and on raft control-lane leadership
+    /// acquisition), never by an RPC: there is no open bootstrap endpoint, so
+    /// no local workload can race the operator to it
+    /// (docs/auth-and-acls.md, "Quick start"). `provided_secret` comes from
+    /// `acl.bootstrapSecretFile` for infrastructure-as-code pre-seeding and
+    /// must be at least 24 characters. Returns `None` (minting nothing) when a
+    /// management token already exists; the existence check and the insert
+    /// share one replicated transaction, so two managers cannot both mint.
+    pub fn mint_initial_management_token(
         &self,
         store: &Store,
         provided_secret: Option<&str>,
-    ) -> Result<(AclTokenInfo, String), Status> {
+    ) -> Result<Option<(AclTokenInfo, String)>, Status> {
         if let Some(secret) = provided_secret {
             if secret.len() < 24 {
                 return Err(Status::invalid_argument(
-                    "provided bootstrap secret must be at least 24 characters",
+                    "acl.bootstrapSecretFile must hold a secret of at least 24 characters",
                 ));
             }
         }
@@ -430,12 +469,9 @@ impl Authenticator {
             .bootstrap_acl_token(&record)
             .map_err(internal_acl_error)?;
         if !inserted {
-            return Err(Status::failed_precondition(
-                "ACL system is already bootstrapped (a management token exists); \
-                 delete all management tokens to re-bootstrap",
-            ));
+            return Ok(None);
         }
-        Ok((record.to_info(), secret))
+        Ok(Some((record.to_info(), secret)))
     }
 
     /// Mints (or rotates) the per-node worker credential returned by
@@ -488,10 +524,22 @@ impl Authenticator {
                 .format(&Rfc3339)
                 .map_err(|e| Status::internal(format!("clock error: {e}")))?,
         };
+        // The token pins the CA the managers sign with, so a joining worker
+        // can tell its manager from whoever answers at `addr` (plan §6.5).
+        // Created here on a cluster's first token.
+        let ca_hash = store
+            .ensure_mesh_ca()
+            .and_then(|ca| ca.pin())
+            .map_err(|e| {
+                error!(error = ?e, "Failed to read or create the cluster CA for a join token");
+                Status::unavailable(format!(
+                    "the cluster CA is unavailable, so a join token can't pin it: {e:#}"
+                ))
+            })?;
         store
             .insert_join_token(&record)
             .map_err(internal_acl_error)?;
-        let composite = JoinToken::new(advertise_addr, secret, worker_type)
+        let composite = JoinToken::new(advertise_addr, secret, worker_type, ca_hash)
             .encode()
             .map_err(|e| Status::internal(format!("failed to encode join token: {e:#}")))?;
         Ok((record.to_info(), composite))
@@ -729,13 +777,21 @@ pub fn enforce(
         return Ok(());
     }
 
-    let hint = if identity.source == AclSource::Anonymous {
-        "; no token was provided (set LEGION_TOKEN or run `legion login`)"
-    } else {
-        ""
-    };
+    // A caller with no credential is unauthenticated, not unauthorized: it
+    // has not said who it is. The hint names where the token lives on the
+    // manager's own machine, since that is where a fresh cluster's operator
+    // is most often standing.
+    if identity.source == AclSource::Anonymous {
+        return Err(Status::unauthenticated(format!(
+            "{}:{} requires a token, and no token was provided\n\
+             Hint: set LEGION_TOKEN or run `legion login`. On the manager's machine, the \
+             initial management token is in <dataDir>/bootstrap-token and ~/.legion/token",
+            resource.as_str(),
+            action.as_str(),
+        )));
+    }
     Err(Status::permission_denied(format!(
-        "permission denied: {}:{} requires a policy granting it{hint}",
+        "permission denied: {}:{} requires a policy granting it",
         resource.as_str(),
         action.as_str(),
     )))
@@ -875,31 +931,35 @@ mod authenticator_test {
         let store = setup_store()?;
         let auth = enabled_authenticator();
         let (_, secret) = auth
-            .bootstrap(&store, None)
-            .map_err(|s| anyhow!(s.to_string()))?;
+            .mint_initial_management_token(&store, None)
+            .map_err(|s| anyhow!(s.to_string()))?
+            .expect("first mint creates the token");
         let identity = auth.authenticate(&metadata_with_token(&secret), &store)?;
         assert!(identity.is_management);
         assert!(identity.allows(AclResource::Acl, AclAction::Write, &AclScope::none()));
 
-        // Second bootstrap is refused.
-        let again = auth.bootstrap(&store, None);
-        assert_eq!(again.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        // A second mint creates nothing while a management token exists.
+        let again = auth
+            .mint_initial_management_token(&store, None)
+            .map_err(|s| anyhow!(s.to_string()))?;
+        assert!(again.is_none());
         Ok(())
     }
 
     #[test]
-    fn bootstrap_accepts_a_preseeded_secret() -> R<()> {
+    fn initial_token_accepts_a_preseeded_secret() -> R<()> {
         let store = setup_store()?;
         let auth = enabled_authenticator();
 
         // Too-short secrets are rejected before any state changes.
-        let short = auth.bootstrap(&store, Some("short"));
+        let short = auth.mint_initial_management_token(&store, Some("short"));
         assert_eq!(short.unwrap_err().code(), tonic::Code::InvalidArgument);
 
         let provided = "lgn_preseeded_for_iac_0123456789";
         let (_, secret) = auth
-            .bootstrap(&store, Some(provided))
-            .map_err(|s| anyhow!(s.to_string()))?;
+            .mint_initial_management_token(&store, Some(provided))
+            .map_err(|s| anyhow!(s.to_string()))?
+            .expect("first mint creates the token");
         assert_eq!(secret, provided);
 
         let identity = auth.authenticate(&metadata_with_token(provided), &store)?;
@@ -1392,9 +1452,10 @@ mod authenticator_test {
             &AclScope::any(),
         )
         .expect_err("anonymous must be denied");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
         assert!(err.message().contains("job:write"));
         assert!(err.message().contains("legion login"));
+        assert!(err.message().contains("bootstrap-token"));
         Ok(())
     }
 

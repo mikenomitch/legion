@@ -64,13 +64,16 @@ pub struct InstancesOptions {
     pub simulate: usize,
     pub worker_type: String,
     pub join_secret: Option<String>,
+    /// The cluster CA pin from `--join-token`. The embedded fleet dials the
+    /// manager over TLS verified against it, so a fleet without it fails.
+    pub ca_pin: Option<String>,
     pub hold: Duration,
     pub ready_after: Duration,
     pub stage_timeout: Duration,
     pub submit_job: bool,
     pub quiet: bool,
-    /// Address (`host` or `host:port`) the manager dials for `PostWork` to
-    /// the embedded fleet; `None` auto-detects it. Only a worker off the
+    /// Host the manager dials for `PostWork` to the embedded fleet; `None`
+    /// auto-detects it. Only a worker off the
     /// work stream is pushed to, so this matters only while a stream is
     /// down; on the AWS rig it is the loadgen box's private IP.
     pub advertise_addr: Option<String>,
@@ -317,13 +320,14 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
             opts.manager.clone(),
             opts.worker_type.clone(),
             opts.join_secret.clone(),
+            opts.ca_pin.clone(),
             SimulateOptions {
                 count: opts.simulate,
                 profiles_path: opts.sim_profiles.clone(),
                 name_prefix: opts.sim_name_prefix.clone(),
                 ready_after: opts.ready_after,
                 register_rate: 1000.0,
-                advertise_addr: opts.advertise_addr.clone(),
+                advertise_host: opts.advertise_addr.clone(),
                 checkpoints: true,
                 observer: Some(observer),
                 ..Default::default()

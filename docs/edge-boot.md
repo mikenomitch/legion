@@ -280,23 +280,25 @@ accessor. The token itself is never written anywhere.
 
 ```console
 $ legion sandbox start agent-sandboxes \
-    --id user-42 --node https://10.0.1.7:4848 --ca-cert ca.pem --ticket "$TICKET"
+    --id user-42 --node https://10.0.1.7:4848 --node-name w-17 --ticket "$TICKET"
 admitted
 booted
 ratified
 ```
 
 `--node` is the node's `workerAddress` (`legion node info` shows it), always
-`https://`: the worker plane is mutual TLS
-([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). `StartClaim` is the
-one worker RPC that needs no client certificate, because the boot ticket is
-the authorization. The caller still verifies the node: `legion sandbox start`
-checks that the node presents a node certificate from the cluster CA before
-it sends the ticket. It reads the CA from `--ca-cert <file>` (save it once
-with `legion net ca show > ca.pem`), or fetches it from the manager with your
-token when the flag is absent. A router with its own gRPC client does the
-same: trust `ca.pem`, and expect the server name `<node>.node.legion`.
-Routers must be able to reach 4848 on edge nodes.
+`https://`. The worker plane is always mutual TLS
+([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). The CLI verifies the
+worker's node certificate against the cluster CA bundle before it sends the
+ticket. It fetches the bundle from the manager with your token (`legion net
+ca show`, `net:read`) or reads it from `--ca <file>` (save it once with
+`legion net ca show > ca.pem`). With `--node-name`, the certificate must name
+that node (`w-17.node.legion`); without it, any node certificate of the
+cluster is accepted. The router presents no certificate: the ticket is its
+credential, and the worker ignores a client certificate on `StartClaim`. A
+router of your own must do the same: trust the bundle from `legion net ca
+show`, and verify `<node>.node.legion`. Routers must be able to reach 4848
+on edge nodes.
 
 The stream reports each transition. A router may start routing at `booted`,
 but must handle `refused` at any point until `ratified`. `--dry-run` verifies
@@ -307,7 +309,10 @@ holding or booting anything.
 
 1. signature against a cached JWKS (fetched on first use, refreshed on a `kid`
    miss and on `edgeBoot.jwksRefresh`. **A fetch failure never invalidates
-   cached keys**)
+   cached keys**). The JWKS is fetched over TLS that verifies the manager's
+   cluster certificate (`manager.legion`) against the cluster CA, so an
+   on-path attacker cannot swap the keys
+   ([auth-and-acls.md](auth-and-acls.md#workers-reach-managers-over-tls))
 2. `iss`, `aud == legion:node`, `exp`/`nbf` with bounded clock skew
 3. `legion.io/pool` against this node's own pool
 4. `legion.io/gate` intersected with the task's `speculativeStart.mode` (the

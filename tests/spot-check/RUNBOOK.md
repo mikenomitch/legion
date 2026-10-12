@@ -79,7 +79,7 @@ curl http://$w1:8090/ ; curl http://$w2:8090/   # microVM: one of the two answer
 the host kernel. The microVM answers "from a Legion microVM" on whichever
 worker it landed on, and its log shows a different, guest kernel.
 **Look at:** `legion service resolve web` returns private IPs, not
-`127.0.0.1` (the shim at work).
+`127.0.0.1` (the advertised worker address at work).
 **Known:** Legion creates the microVM's TAP on `br0` and leases it
 `172.30.0.2` (the guest's `LEGION_GUEST_ADDR` shows it), but the bridge and the host port forward are the rig's
 (`infra/cloud-init/worker.sh`). Legion does not map ports into a guest.

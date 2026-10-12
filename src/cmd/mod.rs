@@ -7,6 +7,8 @@ pub mod capabilities;
 pub mod docs;
 pub mod events;
 pub mod exec;
+pub mod exec_key;
+pub mod exec_ticket;
 pub mod guest_agent;
 pub mod guest_resume;
 pub mod helpers;
@@ -73,6 +75,8 @@ pub fn cli() -> Command {
         .subcommand(scheduler::config())
         .subcommand(acl::config())
         .subcommand(exec::config())
+        .subcommand(exec_ticket::config())
+        .subcommand(exec_key::config())
         .subcommand(action::config())
         .subcommand(login::login_config())
         .subcommand(login::logout_config())

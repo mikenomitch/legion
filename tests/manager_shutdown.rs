@@ -31,9 +31,13 @@ fn manager_exits_cleanly_on_sigterm_test() {
     });
     std::fs::write(&config_path, config.to_string()).expect("write config");
 
+    // ACLs are on by default, so the manager mints a management token at
+    // first start: keep it (and the CLI token file) inside the temp dir.
     let mut child = Command::new(env!("CARGO_BIN_EXE_legion"))
         .args(["start", "manager", "-c"])
         .arg(&config_path)
+        .env("LEGION_DATA_DIR", dir.path().join("data"))
+        .env("LEGION_TOKEN_FILE", dir.path().join("cli-token"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

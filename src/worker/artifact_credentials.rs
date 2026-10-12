@@ -56,9 +56,7 @@ impl CredentialSource for ManagerCredentialSource {
                 source: redacted_source.to_string(),
             }));
         let credential_json = runtime.block_on(async move {
-            let channel = tonic::transport::Channel::from_shared(manager_addr)
-                .context("manager address")?
-                .connect()
+            let channel = crate::worker::plane::manager_channel(&manager_addr)
                 .await
                 .context("connect to manager for artifact credential")?;
             let mut client = ManagerClient::new(channel);
@@ -94,9 +92,7 @@ impl CredentialSource for ManagerCredentialSource {
         // Fetched fresh per artifact fetch; the token is used immediately for a
         // single provider exchange and never persisted (never logged).
         let token = runtime.block_on(async move {
-            let channel = tonic::transport::Channel::from_shared(manager_addr)
-                .context("manager address")?
-                .connect()
+            let channel = crate::worker::plane::manager_channel(&manager_addr)
                 .await
                 .context("connect to manager for node identity token")?;
             let mut client = ManagerClient::new(channel);

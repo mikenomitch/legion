@@ -2,9 +2,9 @@ use crate::prelude::*;
 
 use crate::structs::token::JoinToken;
 use crate::structs::{
-    manager_client::ManagerClient, AllocNetwork, AllocationHealth, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints, WorkerConfig,
-    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterRequest,
+    manager_client::ManagerClient, worker_server::WorkerServer, AllocNetwork, AllocationHealth,
+    HealthCheckRequest, HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterRequest,
 };
 use crate::util::random_string;
 use crate::worker::{
@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::time::Duration;
-use tonic::{transport::Channel, Response};
+use tonic::{transport::Channel, transport::Server, Response};
 
 /// The worker's manager-issued credentials: the join secret it was started
 /// with and the node token returned by registration (attached to every
@@ -68,6 +68,14 @@ impl WorkerCredentials {
         request
     }
 
+    /// True once registration returned a node token.
+    pub(crate) fn has_node_token(&self) -> bool {
+        self.node_token
+            .read()
+            .map(|token| token.is_some())
+            .unwrap_or(false)
+    }
+
     /// Adopt the node token a registration reply carried. `None` keeps the
     /// current token: a manager answers a node-token re-registration without
     /// minting a new one ("keep the one you presented"), and a cluster
@@ -89,11 +97,6 @@ impl WorkerCredentials {
         if let Ok(mut current) = self.node_token.write() {
             *current = Some(token);
         }
-    }
-
-    /// Whether a node token is held (persisted or freshly issued).
-    pub(crate) fn has_node_token(&self) -> bool {
-        self.node_token.read().map(|t| t.is_some()).unwrap_or(false)
     }
 
     /// Drop the node token, in memory and on disk: the manager refused it.
@@ -136,6 +139,18 @@ impl WorkerCredentials {
     pub(crate) fn join_secret(&self) -> Option<&String> {
         self.join_secret.as_ref()
     }
+}
+
+/// Port the worker's own gRPC server listens on, and the port it advertises to
+/// the manager as its `workerAddress`. Overridable via `LEGION_WORKER_PORT` so
+/// several workers can run on one host (local multi-node testing); the manager
+/// dispatches to the advertised address, so both uses must agree.
+fn worker_server_port() -> u64 {
+    std::env::var("LEGION_WORKER_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEF_WORKER_SERVER_PORT)
 }
 
 /// Address clients outside the cluster's private network reach this node at,
@@ -195,27 +210,43 @@ fn worker_capabilities(publishing: bool) -> Vec<String> {
     capabilities
 }
 
+/// How a worker reaches its cluster and what it advertises.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerJoin {
+    pub manager_addr: String,
+    pub worker_type: String,
+    pub join_secret: Option<String>,
+    /// The cluster CA pin from the join token. `None` only for the
+    /// in-process worker, which shares the manager's process.
+    pub ca_pin: Option<String>,
+    /// `--advertise-addr`: the host (or `host:port`) managers dial.
+    pub advertise_addr: Option<String>,
+}
+
 #[instrument(err, skip_all)]
-pub async fn run_worker(token: &str, name_override: Option<&str>) -> R<()> {
+pub async fn run_worker(
+    token: &str,
+    name_override: Option<&str>,
+    advertise_addr: Option<&str>,
+) -> R<()> {
     let join_token = JoinToken::decode(token)?;
     info!(worker_type = %join_token.worker_type, "Decoded join token");
     run_worker_with_manager(
-        join_token.addr,
-        join_token.worker_type,
+        WorkerJoin {
+            manager_addr: join_token.addr,
+            worker_type: join_token.worker_type,
+            join_secret: Some(join_token.secret),
+            ca_pin: Some(join_token.ca_hash),
+            advertise_addr: advertise_addr.map(str::to_string),
+        },
         name_override,
-        Some(join_token.secret),
     )
     .await
 }
 
 #[instrument(err, skip_all)]
-pub async fn run_worker_local(
-    manager_addr: String,
-    worker_type: String,
-    name_override: Option<&str>,
-    join_secret: Option<String>,
-) -> R<()> {
-    run_worker_with_manager(manager_addr, worker_type, name_override, join_secret).await
+pub async fn run_worker_local(join: WorkerJoin, name_override: Option<&str>) -> R<()> {
+    run_worker_with_manager(join, name_override).await
 }
 
 /// The worker config's `hostVolumes` map. A malformed value is logged and
@@ -233,17 +264,21 @@ fn parse_host_volumes(raw: &str) -> HashMap<String, crate::volumes::HostVolumeCo
 }
 
 #[instrument(err, skip_all)]
-async fn run_worker_with_manager(
-    manager_addr: String,
-    worker_type: String,
-    name_override: Option<&str>,
-    join_secret: Option<String>,
-) -> R<()> {
-    // Where the worker plane binds and what it advertises: LEGION_WORKER_HOST
-    // (0.0.0.0), LEGION_WORKER_PORT (4848), and --advertise-addr /
-    // LEGION_WORKER_ADVERTISE_ADDR or the route to the manager
-    // (docs/architecture-managers-workers.md, "Ports and who dials whom").
-    let plane_addrs = crate::worker::plane::PlaneAddrs::resolve(&manager_addr).await?;
+async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) -> R<()> {
+    let WorkerJoin {
+        manager_addr,
+        worker_type,
+        join_secret,
+        ca_pin,
+        advertise_addr,
+    } = join;
+    let server_port = worker_server_port();
+    let bind = crate::worker::plane::bind_address(server_port)?;
+    let advertised = crate::worker::plane::advertise_address(
+        &manager_addr,
+        server_port,
+        advertise_addr.as_deref(),
+    )?;
 
     info!(%manager_addr, %worker_type, "Worker connecting to manager");
 
@@ -257,6 +292,20 @@ async fn run_worker_with_manager(
         .clone()
         .map(|store| tokio::spawn(run_boot_fence(store)));
 
+    // Every connection to a manager is TLS verified against the join
+    // token's CA pin, from the first byte of the first one, before the join
+    // secret is sent (worker-plane-auth plan §6.8). The pin (and later the
+    // cluster bundle) covers every manager the worker learns: they share
+    // the cluster CA.
+    match ca_pin.as_deref().filter(|pin| !pin.is_empty()) {
+        Some(pin) => {
+            crate::worker::plane::trust_manager(&manager_addr, pin)?;
+        }
+        None => bail!(
+            "no cluster CA pin for the manager at {manager_addr}; join with a token from \
+             `legion join-token create`"
+        ),
+    }
     // Every manager this worker knows, not just the token's: a restarted
     // worker starts from the set it persisted, so it comes up even when the
     // manager its token names is down (spot-check P0-5).
@@ -300,9 +349,19 @@ async fn run_worker_with_manager(
     );
     credentials.persist_to(WorkerStateStore::new(state_path.clone()));
     managers.persist_to(WorkerStateStore::new(state_path.clone()));
-    // The node certificate the worker plane serves, reloaded from
-    // `<state-dir>/identity/` so a restart can serve before a manager answers.
-    let node_plane = crate::worker::plane::NodePlane::start(&name, &state_path);
+    // The node's key is generated (or loaded) here and never leaves this
+    // host; the manager signs a CSR for it after registration.
+    let node_identity = crate::worker::plane::NodeIdentity::load(
+        &crate::worker::plane::identity_dir(&state_path),
+        &name,
+        None,
+        ca_pin.clone(),
+    )?;
+    // A persisted bundle was pin-checked when it was first accepted; from
+    // here on it, not the token's pin, is what the manager must chain to.
+    if let Some(roots) = node_identity.roots() {
+        crate::worker::plane::trust_manager_bundle(&manager_addr, roots);
+    }
     // The datapath's persisted inputs, replayed before the first heartbeat
     // (docs/network-handlers.md, "The datapath across worker restarts").
     let _ = NETD_STATE.set(crate::worker::netd::state::NetdStateStore::beside(
@@ -346,6 +405,31 @@ async fn run_worker_with_manager(
     let enforcement_config =
         usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
     apply_resource_enforcement_env(&enforcement_config);
+    // The host guard in the kernel (worker-plane-auth plan §6.13). It
+    // matches sockets by cgroup leaf, so where it runs every task gets one,
+    // enforcement or not.
+    let kernel_guard = crate::worker::netd::kernel_guard::probe();
+    match &kernel_guard {
+        crate::worker::netd::kernel_guard::Availability::Active => {
+            std::env::set_var(crate::constants::ENV_HOST_GUARD_KERNEL, "1");
+            std::env::set_var(
+                crate::constants::ENV_CGROUP_PARENT,
+                &enforcement_config.cgroup_parent,
+            );
+            info!(
+                "Host guard active in the kernel (nftables): host-mode tasks cannot reach this \
+                 node's Legion ports, cloud metadata, or other allocations' listeners"
+            );
+        }
+        crate::worker::netd::kernel_guard::Availability::Unavailable(reason) => {
+            std::env::remove_var(crate::constants::ENV_HOST_GUARD_KERNEL);
+            warn!(
+                %reason,
+                "Host guard unavailable in the kernel: host-mode tasks can reach this node's \
+                 Legion ports and cloud metadata (gated tasks are still guarded by the datapath)"
+            );
+        }
+    }
     apply_container_env(&config.container);
     let sandbox_bridges = apply_sandbox_bridges_env(enforcement_config.sandbox.as_ref());
     crate::task_plugins::warn_if_no_static_guest_binary();
@@ -425,30 +509,58 @@ async fn run_worker_with_manager(
                 crate::structs::WorkerEdgeBootConfigFull::default()
             })
         };
-    let edge_boot = if edge_boot_config.accept_claims {
-        Some(Arc::new(build_edge_boot_runtime(
+    // Direct exec: this node admits exec tickets on `Worker.ExecTask` only
+    // when its worker config says `exec = { direct = true }`.
+    let exec_direct = worker_exec_config(&config.security).direct;
+    // One JWKS cache serves every ticket this node verifies (boot and
+    // exec), fetched over TLS pinned to the cluster CA.
+    let jwks = if edge_boot_config.accept_claims || exec_direct {
+        Some(Arc::new(build_jwks_verifier(
             &edge_boot_config,
             &manager_addr,
-            &name,
             &config.pool,
-            client.clone(),
-            credentials.clone(),
-        )))
+        )?))
     } else {
         None
+    };
+    let edge_boot = match (&jwks, edge_boot_config.accept_claims) {
+        (Some(jwks), true) => Some(Arc::new(crate::worker::server::EdgeBootRuntime {
+            verifier: jwks.clone(),
+            spec_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            node_id: name.clone(),
+            ratifier: Arc::new(ManagerClaimRatifier {
+                client: client.clone(),
+                credentials: credentials.clone(),
+            }),
+        })),
+        _ => None,
     };
     if edge_boot.is_some() {
         info!(worker = %name, pool = %config.pool, "Edge boot enabled: this node accepts boot tickets");
     }
+    let direct_exec = match (&jwks, exec_direct) {
+        (Some(jwks), true) => {
+            info!(worker = %name, "Direct exec enabled: this node accepts exec tickets");
+            let verifier = Arc::new(crate::worker::direct_exec::ExecTicketVerifier::new(
+                jwks.clone(),
+                name.clone(),
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            ));
+            // The heartbeat keeps its delegated keys current.
+            crate::worker::direct_exec::register_verifier(verifier.clone());
+            Some(verifier)
+        }
+        _ => None,
+    };
 
     let worker_node = WorkerDaemonService {
+        node_id: name.clone(),
         task_manager: task_manager.clone(),
         identity: Some(identity_manager.clone()),
         edge_boot: edge_boot.clone(),
+        direct_exec: direct_exec.clone(),
     };
-    // mTLS only; it starts listening once the node holds a certificate.
-    let worker_server_fut =
-        crate::worker::plane::serve(plane_addrs.clone(), node_plane.tls.clone(), worker_node);
+    let worker_router = Server::builder().add_service(WorkerServer::new(worker_node));
 
     let mut fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
     // The manager loads no storage drivers of its own, so this is its only
@@ -513,9 +625,14 @@ async fn run_worker_with_manager(
             json!(sandbox_bridges),
         );
     }
+    // What managers (and edge routers) dial: the route's source address
+    // toward the manager unless overridden (docs/architecture-managers-
+    // workers.md, "Ports"). Always `https://`: the worker plane is mTLS.
+    config_attrs.insert("workerAddress".into(), Value::String(advertised.clone()));
+    // `legion node info` shows whether host-mode tasks are guarded here.
     config_attrs.insert(
-        "workerAddress".into(),
-        Value::String(plane_addrs.worker_address()),
+        crate::worker::netd::kernel_guard::NODE_ATTR.into(),
+        Value::String(kernel_guard.attribute()),
     );
     if let Some(public_address) = worker_public_address() {
         config_attrs.insert("publicAddress".into(), Value::String(public_address));
@@ -548,11 +665,22 @@ async fn run_worker_with_manager(
     let reported_managers = register_self(client.clone(), &registration, &credentials).await?;
     managers.learn(&reported_managers);
     info!(worker_name = %name, "Worker registered with manager");
-    // Eager node certificate: the worker plane listens only once it holds
-    // one. A failure here is retried on every heartbeat.
-    node_plane
-        .issue_after_registration(&mut client.clone(), &credentials)
-        .await;
+    // Eager issuance: the listener needs the certificate. A CA that does
+    // not match the join token's pin stops the join here; any other failure
+    // (a manager outage) keeps a persisted certificate, or retries on the
+    // heartbeat loop while the listener waits.
+    if let Err(err) = node_identity
+        .issue(&mut client.clone(), &credentials, &manager_addr)
+        .await
+    {
+        if err
+            .downcast_ref::<crate::worker::plane::PinMismatch>()
+            .is_some()
+        {
+            return Err(err);
+        }
+        warn!(error = %format!("{err:#}"), "Node certificate not issued yet; retrying on the heartbeat loop");
+    }
     record_manager_contact(task_manager.lock().expect("task manager").state_store());
     // Easter egg, mirrored by the manager's log line for the same join.
     info!(worker_name = %name, "We are Legion. {name} has joined");
@@ -576,7 +704,18 @@ async fn run_worker_with_manager(
             Arc::new(crate::worker::netd::NetPolicyCache::new()),
             Arc::new(crate::worker::netd::Denials::new()),
         )
-        .with_logs_base_dir(logs_base_dir.clone()),
+        .with_logs_base_dir(logs_base_dir.clone())
+        .with_host_guard(Arc::new(host_guard_for(&config.security)))
+        .with_kernel_guard_if(
+            (kernel_guard == crate::worker::netd::kernel_guard::Availability::Active).then(|| {
+                kernel_guard_base(
+                    &config.security,
+                    u16::try_from(server_port).unwrap_or_default(),
+                    &manager_addr,
+                    &enforcement_config.cgroup_parent,
+                )
+            }),
+        ),
     );
     let net_dns = Arc::new(crate::worker::netd::dns::NetDns::new(
         net_context.clone(),
@@ -594,11 +733,17 @@ async fn run_worker_with_manager(
             .with_proxies(net_proxies)
             .with_ingress(net_ingress),
     );
-    // The mesh's node certificate is the worker plane's.
-    node_plane.share_with_mesh(forwarder.context());
+    // The mesh shares the node identity.
+    if let Some(mesh) = node_identity.mesh_identity() {
+        if let Err(err) = forwarder.context().set_mesh_identity(mesh) {
+            warn!(error = ?err, "Rejected the node certificate for the mesh");
+        }
+    }
     // Restored tasks are still running: give them their network back now,
     // not on the first successful heartbeat.
     restore_datapath(&forwarder, &task_manager).await;
+    let worker_server_fut =
+        serve_worker_plane(bind, advertised, node_identity.clone(), worker_router);
     // Work arrives over `Manager.StreamWork`: one long-lived stream, its
     // deltas patching the mirror the heartbeat reconciles from. A new
     // allocation starts as soon as its delta lands, through the same path a
@@ -607,9 +752,11 @@ async fn run_worker_with_manager(
     {
         let credentials = credentials.clone();
         let launcher = Arc::new(WorkerDaemonService {
+            node_id: name.clone(),
             task_manager: task_manager.clone(),
             identity: Some(identity_manager.clone()),
             edge_boot: edge_boot.clone(),
+            direct_exec: direct_exec.clone(),
         });
         tokio::spawn(crate::worker::work_stream::run_work_stream(
             client.clone(),
@@ -621,6 +768,8 @@ async fn run_worker_with_manager(
     }
     let heartbeat_fut = start_heartbeats(
         name.clone(),
+        manager_addr.clone(),
+        node_identity.clone(),
         client.clone(),
         task_manager.clone(),
         identity_manager.clone(),
@@ -656,16 +805,25 @@ async fn run_worker_with_manager(
     Ok(())
 }
 
-/// Assemble this node's edge-boot runtime: the JWKS-backed ticket verifier,
-/// the spec cache, and the ratifier that calls the manager.
-fn build_edge_boot_runtime(
+/// The worker type's `exec` block, from the security payload.
+fn worker_exec_config(security: &str) -> crate::structs::WorkerExecConfig {
+    if security.trim().is_empty() {
+        return Default::default();
+    }
+    serde_json::from_str::<crate::structs::WorkerSecurityConfig>(security)
+        .ok()
+        .and_then(|config| config.exec)
+        .unwrap_or_default()
+}
+
+/// This node's ticket verifier: the cluster JWKS, cached, with the
+/// edge-boot block's refresh and clock-skew settings. Boot tickets and exec
+/// tickets share it.
+fn build_jwks_verifier(
     config: &crate::structs::WorkerEdgeBootConfigFull,
     manager_addr: &str,
-    node_id: &str,
     pool: &str,
-    client: ManagerClient<Channel>,
-    credentials: Arc<WorkerCredentials>,
-) -> crate::worker::server::EdgeBootRuntime {
+) -> R<crate::worker::boot_ticket::BootTicketVerifier> {
     let refresh = humantime::parse_duration(&config.jwks_refresh)
         .unwrap_or(crate::worker::boot_ticket::DEFAULT_JWKS_REFRESH);
     let skew = humantime::parse_duration(&config.clock_skew)
@@ -674,22 +832,18 @@ fn build_edge_boot_runtime(
     // what its join token pointed at), and the JWKS lives at the well-known
     // path the manager serves alongside gRPC.
     let issuer = manager_addr.trim_end_matches('/').to_string();
-    let jwks_url = format!("{issuer}/.well-known/jwks.json");
-    let source = Box::new(crate::worker::boot_ticket::HttpJwksSource::new(
-        jwks_url,
+    // The JWKS rides the same pinned TLS as every other manager call: keys
+    // an on-path attacker could swap would let it forge tickets.
+    let verifier = crate::worker::plane::manager_verifier(manager_addr)
+        .context("ticket verification needs the manager's CA pin to fetch the JWKS over TLS")?;
+    let source = Box::new(crate::worker::boot_ticket::PinnedJwksSource::new(
+        manager_addr,
+        verifier,
         Duration::from_secs(5),
-    ));
-    crate::worker::server::EdgeBootRuntime {
-        verifier: Arc::new(crate::worker::boot_ticket::BootTicketVerifier::new(
-            source, issuer, pool, refresh, skew,
-        )),
-        spec_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        node_id: node_id.to_string(),
-        ratifier: Arc::new(ManagerClaimRatifier {
-            client,
-            credentials,
-        }),
-    }
+    )?);
+    Ok(crate::worker::boot_ticket::BootTicketVerifier::new(
+        source, issuer, pool, refresh, skew,
+    ))
 }
 
 /// Ratifies claims by calling the manager's `RatifyClaim`, authenticated with
@@ -711,14 +865,172 @@ impl crate::worker::server::ClaimRatifier for ManagerClaimRatifier {
     }
 }
 
+/// The host guard this worker type's `hostGuard` block describes. A block
+/// the manager validated can't fail here; if it somehow does, the worker
+/// keeps the default guard (no overrides), which refuses more, never less.
+/// The kernel host guard's table without its allocations: Legion's ports on
+/// this node and the operator's `hostGuard` entries (plan §6.13). The
+/// manager's ports count when it shares the node (its address is local).
+fn kernel_guard_base(
+    security: &str,
+    worker_port: u16,
+    manager_addr: &str,
+    cgroup_parent: &str,
+) -> crate::worker::netd::kernel_guard::GuardTable {
+    let mut table = crate::worker::netd::kernel_guard::GuardTable {
+        cgroup_parent: cgroup_parent.to_string(),
+        ..Default::default()
+    };
+    table.control_ports.insert(worker_port);
+    if let Ok(uri) = manager_addr.parse::<http::Uri>() {
+        let host = uri.host().unwrap_or_default().trim_matches(['[', ']']);
+        let local = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => {
+                ip.is_loopback() || crate::structs::host_guard::interface_addresses().contains(&ip)
+            }
+            Err(_) => host == "localhost",
+        };
+        if let (true, Some(port)) = (local, uri.port_u16()) {
+            // The API, the exec WebSocket, and telemetry.
+            for offset in 0..=2 {
+                if let Some(port) = port.checked_add(offset) {
+                    table.control_ports.insert(port);
+                }
+            }
+        }
+    }
+    let config: crate::structs::WorkerSecurityConfig =
+        serde_json::from_str(security).unwrap_or_default();
+    if let Some(host_guard) = config.host_guard {
+        for entry in host_guard.deny {
+            let entry = entry.trim().to_string();
+            if entry.contains(':') {
+                table.deny_v6.push(entry);
+            } else {
+                table.deny_v4.push(entry);
+            }
+        }
+        for entry in host_guard.allow {
+            if crate::structs::host_guard::parse_allow(&entry).is_err() {
+                continue;
+            }
+            let entry = entry.trim();
+            let split = match entry.strip_prefix('[') {
+                Some(rest) => rest
+                    .split_once("]:")
+                    .map(|(addr, port)| (addr.to_string(), port)),
+                None => entry
+                    .rsplit_once(':')
+                    .map(|(addr, port)| (addr.to_string(), port)),
+            };
+            if let Some((addr, port)) = split {
+                if let Ok(port) = port.parse() {
+                    table.allow.push((addr, port));
+                }
+            }
+        }
+    }
+    table
+}
+
+/// The allocations the kernel host guard matches this beat: every desired
+/// allocation whose cgroup leaf exists, with its own VIP block and upstream
+/// loopback ports, which it may still reach.
+fn kernel_guarded_allocations(
+    desired: &[TaskAllocation],
+) -> Vec<crate::worker::netd::kernel_guard::GuardedAllocation> {
+    let parent = crate::task_plugins::exec_isolation::cgroup_parent();
+    desired
+        .iter()
+        .filter_map(|allocation| {
+            let cgroup = crate::worker::netd::kernel_guard::existing_leaf(
+                &parent,
+                allocation.allocation_id,
+            )?;
+            let network: Option<AllocNetwork> = serde_json::from_str(&allocation.network).ok();
+            Some(crate::worker::netd::kernel_guard::GuardedAllocation {
+                allocation_id: allocation.allocation_id,
+                cgroup,
+                vip_block: network
+                    .as_ref()
+                    .and_then(|network| network.vip_block.clone()),
+                loopback_ports: network
+                    .map(|network| {
+                        network
+                            .upstreams
+                            .iter()
+                            .map(|upstream| upstream.local_port)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn host_guard_for(security: &str) -> crate::structs::host_guard::HostGuard {
+    let config = if security.trim().is_empty() {
+        crate::structs::WorkerSecurityConfig::default()
+    } else {
+        serde_json::from_str(security).unwrap_or_else(|err| {
+            warn!(error = ?err, "Invalid worker security config; using the default host guard");
+            crate::structs::WorkerSecurityConfig::default()
+        })
+    };
+    let guard = match config.host_guard.as_ref() {
+        Some(host_guard) => {
+            crate::structs::host_guard::HostGuard::new(host_guard).unwrap_or_else(|err| {
+                warn!(error = ?err, "Invalid hostGuard; using the default host guard");
+                crate::structs::host_guard::HostGuard::default()
+            })
+        }
+        None => crate::structs::host_guard::HostGuard::default(),
+    };
+    guard.set_node_addrs(crate::structs::host_guard::interface_addresses());
+    guard
+}
+
+/// Waits for the node certificate (issued at registration, or on a later
+/// heartbeat if the manager was unreachable), then serves the worker plane.
+async fn serve_worker_plane(
+    bind: std::net::SocketAddr,
+    advertised: String,
+    node_identity: Arc<crate::worker::plane::NodeIdentity>,
+    router: tonic::transport::server::Router,
+) -> R<()> {
+    while !node_identity.has_certificate() {
+        tokio::time::sleep(crate::worker::plane::ISSUE_RETRY).await;
+    }
+    info!("Worker plane listening on {bind} (mTLS); advertised as {advertised}");
+    let result = crate::worker::plane::serve(bind, node_identity, router).await;
+    if let Err(err) = &result {
+        error!(error = ?err, "Worker plane listener exited");
+    }
+    result
+}
+
 #[instrument(err, skip_all)]
 pub(crate) async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Channel>> {
     let mut backoff = Duration::from_millis(200);
     let max_backoff = Duration::from_secs(5);
 
     loop {
-        match create_manager_client(manager_addr.to_string(), String::new()).await {
-            Ok(client) => return Ok(client),
+        match crate::worker::plane::manager_channel(manager_addr).await {
+            Ok(channel) => return Ok(ManagerClient::new(channel)),
+            Err(err) if format!("{err:?}").contains("CA pin mismatch") => {
+                // Not a transient failure: whatever answers at this address
+                // is not the cluster this worker's token names.
+                let presented: Vec<String> = Vec::new();
+                let pin = match crate::worker::plane::manager_verifier(manager_addr)
+                    .map(|verifier| verifier.trust())
+                {
+                    Some(crate::cluster_tls::ManagerTrust::Pin(pin)) => pin,
+                    _ => String::new(),
+                };
+                return Err(anyhow::Error::new(crate::worker::plane::PinMismatch(
+                    crate::cluster_tls::pin_mismatch_message(manager_addr, &presented, &pin),
+                )));
+            }
             Err(err) => {
                 warn!(
                     error = ?err,
@@ -1021,22 +1333,6 @@ fn ensure_dir(path: &Path) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
-async fn create_manager_client(
-    manager_addr: String,
-    _ca_cert: String,
-) -> R<ManagerClient<Channel>> {
-    // let ca_cert = Certificate::from_pem(ca_cert);
-    // let tls: ClientTlsConfig = ClientTlsConfig::new().ca_certificate(ca_cert);
-    let channel = Channel::from_shared(manager_addr)?
-        // .tls_config(tls)? TODO: Temporarily doesn' do any TLS
-        .connect()
-        .await?;
-    let client = ManagerClient::new(channel);
-
-    Ok(client)
-}
-
 // Failed heartbeats retry forever with exponential backoff in this range. The
 // cap stays low (vs the usual 30s) so a reconnecting worker is detected
 // promptly — the self-fence clock keeps running regardless.
@@ -1164,6 +1460,8 @@ const SELF_FENCE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 #[instrument(err, skip_all)]
 async fn start_heartbeats(
     name: String,
+    manager_addr: String,
+    node_identity: Arc<crate::worker::plane::NodeIdentity>,
     client: ManagerClient<Channel>,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
     identity_manager: Arc<WorkerIdentityManager>,
@@ -1201,6 +1499,8 @@ async fn start_heartbeats(
             .set_drain_window(heartbeat_interval);
         let tick_result = heartbeat_tick(
             &name,
+            &manager_addr,
+            &node_identity,
             &client,
             &task_manager,
             &identity_manager,
@@ -1311,6 +1611,8 @@ async fn start_heartbeats(
 #[allow(clippy::too_many_arguments)]
 async fn heartbeat_tick(
     name: &str,
+    manager_addr: &str,
+    node_identity: &Arc<crate::worker::plane::NodeIdentity>,
     client: &ManagerClient<Channel>,
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
     identity_manager: &Arc<WorkerIdentityManager>,
@@ -1531,6 +1833,7 @@ async fn heartbeat_tick(
                 .unwrap_or_else(|p| p.into_inner())
                 .prepare(current)
         };
+        let exec_audit = crate::worker::direct_exec::take_audit();
         // On the stream, the heartbeat stops listing what the node runs: it
         // reports its stream position and a digest of its desired set, and
         // only the allocation health that changed since the manager last
@@ -1579,6 +1882,9 @@ async fn heartbeat_tick(
                     message: report.message,
                 })
                 .collect(),
+            exec_audit: exec_audit.clone(),
+            exec_sessions: crate::worker::direct_exec::open_sessions(),
+            exec_keys_version: crate::worker::direct_exec::keys_version(),
         }));
 
         let response = match client_clone.heartbeat(req).await {
@@ -1601,6 +1907,9 @@ async fn heartbeat_tick(
                 // Same for checkpoint outcomes; the manager would re-send the
                 // request anyway, but a capture should not wait a heartbeat.
                 manager.requeue_snapshot_reports(snapshot_reports_for_redrive);
+                // And the direct exec audit, so a dead connection loses no
+                // record of who opened a shell.
+                crate::worker::direct_exec::restore_audit(exec_audit);
                 if let Some(denials) = forwarder.context().denials() {
                     denials.restore(net_denials_for_redrive);
                 }
@@ -1620,6 +1929,8 @@ async fn heartbeat_tick(
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let mut reply = response.into_inner();
         served_interval = reply.next_interval_seconds;
+        crate::worker::direct_exec::apply_revocations(&reply.revoked_exec_sessions);
+        crate::worker::direct_exec::apply_exec_keys(&reply.exec_keys_version, &reply.exec_keys);
         // The cluster's manager set, refreshed every beat and persisted when
         // it changes, so failover (and a restart) can reach any manager.
         if let Some(managers) = managers {
@@ -1711,6 +2022,16 @@ async fn heartbeat_tick(
         // heartbeat tick because that is the one loop guaranteed to keep
         // running while everything else is stuck.
         crate::worker::edge::sweep_leases(task_manager);
+        // The host guard's node-address class follows the interfaces.
+        forwarder.context().refresh_node_addresses();
+        // The kernel host guard follows the desired set: one rule chain per
+        // allocation leaf, and the drops since the last beat as denials.
+        if forwarder.context().kernel_guard_active() {
+            let guarded = kernel_guarded_allocations(&reply.desired_allocations);
+            let context = forwarder.context().clone();
+            let _ =
+                tokio::task::spawn_blocking(move || context.reconcile_kernel_guard(guarded)).await;
+        }
         // The manager acknowledged us, so this reply is authoritative for the
         // connect datapath (see `apply_upstreams` on fail-static semantics).
         let alloc_root = task_manager
@@ -1728,7 +2049,15 @@ async fn heartbeat_tick(
         // Same authority for network policy: assignments from this reply,
         // bodies fetched by hash, last known good kept on any failure.
         apply_net_policies(forwarder, &mut client_clone, credentials, name, &reply).await;
-        apply_mesh_identity(forwarder, &mut client_clone, credentials, name).await;
+        refresh_node_identity(
+            node_identity,
+            forwarder,
+            &mut client_clone,
+            credentials,
+            manager_addr,
+            &reply.cluster_ca_pin,
+        )
+        .await;
         apply_ingress_certificates(forwarder, &mut client_clone, credentials, name, &reply).await;
         *LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner()) = reply.desired_allocations.clone();
         persist_datapath(forwarder, &reply);
@@ -2302,27 +2631,36 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
     }
 }
 
-/// Keep the node certificate current (docs/auth-and-acls.md, "The worker
-/// plane"). It serves the worker plane and is the mesh's node certificate
-/// (docs/network-handlers.md, "mTLS"). Issued eagerly at registration,
-/// re-issued after a third of its lifetime, and early when a worker-plane
-/// handshake suggests the cluster CA was rotated. Fail-static: an issuance
-/// that fails keeps the certificate the node has, and a node without one
+/// Keep the node certificate current: re-issued after a third of its
+/// lifetime, or at once when the manager names a signing CA the node's
+/// bundle lacks (a CA rotation). The same identity serves the worker plane
+/// listener (hot-swapped, no restart) and the mesh. Fail-static: a failed
+/// issuance keeps the certificate the node has, and a node without one
 /// refuses mesh flows rather than sending them in the clear.
-async fn apply_mesh_identity(
+async fn refresh_node_identity(
+    node_identity: &crate::worker::plane::NodeIdentity,
     forwarder: &UpstreamForwarder,
     client: &mut ManagerClient<Channel>,
     credentials: &Arc<WorkerCredentials>,
-    node_id: &str,
+    manager_addr: &str,
+    manager_ca_pin: &str,
 ) {
-    let Some(plane) = crate::worker::plane::NodePlane::current() else {
-        return;
-    };
-    if plane.node_id != node_id {
+    if !node_identity.needs_refresh(Some(manager_ca_pin)) {
         return;
     }
-    plane.refresh_if_needed(client, credentials).await;
-    plane.share_with_mesh(forwarder.context());
+    match node_identity.issue(client, credentials, manager_addr).await {
+        Ok(()) => {
+            if let Some(mesh) = node_identity.mesh_identity() {
+                if let Err(err) = forwarder.context().set_mesh_identity(mesh) {
+                    warn!(error = ?err, "Rejected the node certificate for the mesh");
+                }
+            }
+        }
+        Err(err) => warn!(
+            error = %format!("{err:#}"),
+            "Failed to refresh the node certificate; keeping the current one"
+        ),
+    }
 }
 
 /// Keep `certFrom = { kv }` ingress certificates current
@@ -3710,8 +4048,16 @@ mod tests {
         })));
         let clock = Arc::new(Mutex::new(std::time::Instant::now()));
 
+        let node_identity = crate::worker::plane::NodeIdentity::load(
+            &temp_dir.path().join("identity"),
+            "test-worker",
+            None,
+            None,
+        )?;
         let heartbeats = tokio::spawn(start_heartbeats(
             "test-worker".into(),
+            "http://127.0.0.1:1".into(),
+            node_identity,
             client,
             task_manager,
             identity_manager,
@@ -3944,8 +4290,13 @@ mod tests {
             credentials: credentials.clone(),
         })));
 
+        let identity_dir = tempfile::tempdir()?;
+        let node_identity =
+            crate::worker::plane::NodeIdentity::load(identity_dir.path(), node_id, None, None)?;
         heartbeat_tick(
             node_id,
+            "http://127.0.0.1:1",
+            &node_identity,
             &client,
             &task_manager,
             &identity_manager,
@@ -4279,6 +4630,10 @@ mod tests {
         let forwarder = UpstreamForwarder::new();
         let reply = HeartbeatReply {
             content_resync: false,
+            cluster_ca_pin: String::new(),
+            revoked_exec_sessions: Vec::new(),
+            exec_keys: Vec::new(),
+            exec_keys_version: String::new(),
             desired_via_stream: false,
             work_resync: false,
             session_resync: false,

@@ -995,26 +995,27 @@ service Manager {
   rpc IssueNodeIdentityToken (IssueNodeIdentityTokenRequest)
       returns (IssueNodeIdentityTokenReply);
 
-  // Issue a short-lived **node certificate** for a worker node: the
-  // credential its worker plane serves on 4848 (docs/auth-and-acls.md, "The
-  // worker plane") and the mesh's node certificate behind
-  // `certFrom = "legion"` (docs/network-handlers.md, "mTLS"). The first call
-  // creates the cluster CA (replicated with the control lane).
+  // Sign a worker node's **node certificate** from a CSR. The certificate is
+  // the node's identity on every plane Legion runs between its own
+  // processes: the mTLS worker plane listener (what a manager verifies when
+  // it dials the node, docs/auth-and-acls.md, "The worker plane") and the
+  // mesh (`certFrom = "legion"`, docs/network-handlers.md, "mTLS").
   //
-  // The worker generates its own key pair and sends only a CSR
-  // (`csr_pem`). The manager checks the CSR's self-signature, then signs its
-  // public key with names it chooses — `<node>.node.legion` and
-  // `legion://node/<node id>` as SANs, `ServerAuth` + `ClientAuth`, valid for
-  // 24 hours — and ignores every name the CSR requests, so a node can never
-  // obtain a certificate for another node or a manager. No private key ever
-  // crosses the network.
+  // The worker generates its key pair locally and sends only a CSR; the
+  // private key never crosses the network. The manager signs the CSR's
+  // public key with the cluster CA and SANs it chooses itself,
+  // `<node>.node.legion` and `legion://node/<node id>`, ignoring every name,
+  // extension, and subject the CSR requests. Valid for 24 hours. Workers call
+  // it right after registration (the listener needs it), again after a third
+  // of the lifetime, and at once when a heartbeat reply names a CA their
+  // bundle lacks (a rotation). The first call creates the cluster CA
+  // (replicated with the control lane).
   //
-  // Workers call it right after registration (the worker plane does not
-  // listen until it holds a certificate), again on their heartbeat loop
-  // after a third of the lifetime has passed, and early when a handshake on
-  // the worker plane suggests the cluster CA was rotated. The worker
-  // persists the key and certificate (mode 0600) so a restart can serve
-  // before it reaches a manager.
+  // `fleet` is for the simulator only (`legion start worker --simulate`),
+  // which serves every simulated node from one listener: the certificate
+  // then names the fleet (`<fleet>.fleet.legion`, `legion://fleet/<name>`)
+  // instead of the node, and the caller's node must have registered with the
+  // `workerFleet` config attribute set to the same name.
   //
   // The node's *workload* identities are never certificates: a dialing node
   // names the workload it forwards for in a PROXY protocol v2 TLV inside the
@@ -1026,8 +1027,8 @@ service Manager {
   // (`node:<node_id>`) must match the request's `node_id`.
   //
   // Errors:
-  // - InvalidArgument: `csr_pem` is missing, is not a PEM certificate
-  //   request, or its signature does not verify.
+  // - InvalidArgument: `csr_pem` is missing or is not a valid CSR, or
+  //   `fleet` does not match the node's registered `workerFleet`.
   // - NotFound: no node with `node_id` is registered.
   // - PermissionDenied: `node_id` does not match the caller's credential.
   // - Internal: the CA could not be created or signing failed.
@@ -1344,6 +1345,77 @@ service Manager {
   // Lists the actions declared on a job's tasks (for CLI + UI discovery).
   rpc ListJobActions (ListJobActionsRequest) returns (ListJobActionsReply);
 
+  // Mints an exec ticket: a short-lived credential for direct exec, where
+  // the client opens `Worker.ExecTask` on the worker itself instead of
+  // streaming every byte through a manager (docs/exec-and-actions.md,
+  // "Direct exec").
+  //
+  // Authorization is exactly `ExecAllocation`'s: a coarse `exec:write` or
+  // `action:write` gate before any lookup, then `exec:write` on the job
+  // (with `host` for host-level runtimes) for a command, or `action:write`
+  // on the (job, action) — or `exec:write` on the job — for an action, whose
+  // argv is rendered here from the stored job spec. The ticket names what
+  // was authorized and nothing else: one node, one allocation, the job and
+  // task, the rendered argv (absent for an `exec` ticket minted without a
+  // command, which allows any command), the tty flag, and how long the
+  // session may run.
+  //
+  // Minting is a signature, not a write: no raft entry, no idempotency
+  // record. The mint is logged under the `exec_audit` target; the worker
+  // reports the redemption and the exit code on its next heartbeat, logged
+  // under `exec_audit` too. A ticket is single use on its node and expires
+  // after `ttl` (default `exec.tickets.defaultTtl`, 60s). The session it
+  // opens ends after `max_session` (default `exec.tickets.maxSession`, 1h),
+  // never later than the minting credential expires, and within one worker
+  // heartbeat of the minting token being deleted or losing the grant.
+  //
+  // The ticket is signed with the workload-identity key, so the manager
+  // must run with `workloadIdentity.enabled: true`.
+  //
+  // Errors:
+  // - PermissionDenied: the caller could not open this session through
+  //   `ExecAllocation`.
+  // - NotFound: no such allocation, instance, task, or action (only after
+  //   the coarse gate, so it reveals nothing to a caller without exec).
+  // - FailedPrecondition: exec or workload identity is disabled on this
+  //   manager; the allocation is not running; the instance has no running
+  //   allocation; the node advertises no authenticated worker address.
+  // - InvalidArgument: neither a command nor an action; a bad `ttl` or
+  //   `max_session`, or one above the manager's ceiling; bad action params.
+  rpc MintExecTicket (MintExecTicketRequest) returns (MintExecTicketReply);
+
+  // Registers a delegated exec minting key (docs/exec-and-actions.md,
+  // "Delegated minting keys"): a platform's ES256 public key whose exec
+  // tickets workers accept for jobs matching `jobs`, with no manager call
+  // per ticket. One control-lane write per key, never per session.
+  //
+  // A key's tickets are narrower than the `exec:write` grant that could mint
+  // them: they never open a session in a host-level runtime (`exec`), their
+  // redeem window is at most `max_ttl`, and their sessions run at most
+  // `max_session`. Workers learn keys on their heartbeat, so a new key works
+  // on a node within one heartbeat interval.
+  //
+  // ACL: `acl:write` (a key is a credential that mints shell access).
+  // Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - PermissionDenied: caller lacks `acl:write`.
+  // - InvalidArgument: `public_key_pem` is not a P-256 public key; `jobs` is
+  //   empty; `max_ttl` or `max_session` is not a duration, is zero, or is
+  //   above the manager's `exec.tickets` ceiling.
+  rpc CreateExecKey (CreateExecKeyRequest) returns (CreateExecKeyReply);
+
+  // Lists delegated exec minting keys. Public keys are public; there is no
+  // secret to hide. ACL: `acl:read`.
+  rpc ListExecKeys (ListExecKeysRequest) returns (ListExecKeysReply);
+
+  // Deletes a delegated exec minting key. Workers stop accepting its tickets
+  // on their next heartbeat, and open sessions it minted end then too, with
+  // `PermissionDenied`. ACL: `acl:write`. Retry-safe with `idempotency_key`.
+  //
+  // Errors: PermissionDenied without `acl:write`; NotFound for an unknown id.
+  rpc DeleteExecKey (DeleteExecKeyRequest) returns (DeleteExecKeyReply);
+
   // Returns node + allocation view of cluster state (the "ledger").
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
 
@@ -1583,16 +1655,24 @@ service Manager {
   // reported as `defer`. ACL: `net:read` on the job.
   rpc TestNetPolicy (TestNetPolicyRequest) returns (TestNetPolicyReply);
 
-  // The mesh CA certificate — what an operator hands a non-Legion client
-  // that must reach a mesh-TLS port, or verifies a node certificate against.
-  // Never the key. Empty `cert_pem` when no node has asked for a certificate
-  // yet (the CA is created on first use). ACL: `net:read`.
+  // The cluster CA — what an operator hands a non-Legion client that must
+  // reach a mesh-TLS port or the worker plane (`legion sandbox start --node`,
+  // `legion exec --direct`), or verifies a node certificate against. Returns
+  // the signing CA, the full trust bundle (both CAs during a rotation), the
+  // pin new join tokens carry, and where a rotation stands. Never a key.
+  // Empty `cert_pem` when no CA exists yet (it is created on first use: the
+  // first join token or node certificate). ACL: `net:read`.
   rpc GetMeshCa (GetMeshCaRequest) returns (GetMeshCaReply);
 
-  // Replace the mesh CA. Every node re-issues its certificate on its next
-  // heartbeat (within one interval); until a node has, its peers on the new
-  // CA refuse it and it refuses them — expect a heartbeat's worth of
-  // refused mesh connections, never plaintext. ACL: `net:write` (unscoped).
+  // Rotate the cluster CA in two steps, without breaking any connection
+  // (worker-plane-auth plan §6.9). The new CA is generated, cross-signed by
+  // the current one, and signs every certificate from now on; the previous
+  // CA stays in every holder's trust bundle for one certificate lifetime (24
+  // hours), and chains carry the cross-signed certificate meanwhile, so a
+  // holder that has not refreshed its bundle yet keeps verifying. Nodes
+  // re-issue their certificates within one heartbeat (the reply names the
+  // new CA). Join tokens minted before the rotation keep working during the
+  // overlap; after it, mint new ones. ACL: `net:write` (unscoped).
   rpc RotateMeshCa (RotateMeshCaRequest) returns (RotateMeshCaReply);
 
   // Worker plane: fetches the merged policy body for a hash the heartbeat
@@ -1668,14 +1748,24 @@ service Manager {
   //
   // Legion's ACL system is token-based: callers present a bearer credential in
   // the `authorization` metadata header (`Bearer <secret>`). Credentials are
-  // either opaque Legion ACL tokens (minted by BootstrapAcl, CreateAclToken,
-  // or Login) or externally issued JWTs validated against a configured auth
-  // method. Each request resolves to a set of named policies; policies contain
-  // scoped allow/deny rules over resources (`job`, `node`, `kv`, `state`,
+  // either opaque Legion ACL tokens (minted by CreateAclToken or Login, or the
+  // initial management token the manager mints itself at first start) or
+  // externally issued JWTs validated against a configured auth method. Each
+  // request resolves to a set of named policies; policies contain scoped
+  // allow/deny rules over resources (`job`, `node`, `kv`, `state`,
   // `operator`, `acl`) and actions (`read`, `write`).
   //
-  // When ACLs are disabled (the default) every endpoint behaves as if the
-  // caller held a management token.
+  // ACLs are on by default (`acl.enabled = true`). When a manager starts with
+  // ACLs on and no management token exists, it mints one itself, as a
+  // replicated write on the control-lane leader, and writes the secret to
+  // `<dataDir>/bootstrap-token` (and to `~/.legion/token` when that file does
+  // not exist), both mode 0600. There is no open bootstrap endpoint: the
+  // secret never crosses the network. `acl.bootstrapSecretFile` pre-seeds the
+  // secret for infrastructure-as-code. Recovery is "delete the management
+  // tokens, then restart the manager".
+  //
+  // When ACLs are explicitly disabled (`acl.enabled = false`) every endpoint
+  // behaves as if the caller held a management token.
 
   // Reports how the manager authenticated the caller and what access applies.
   //
@@ -1692,13 +1782,6 @@ service Manager {
   // externally issued token). The reply contains the token secret exactly
   // once; the manager stores only a hash of it.
   rpc Login (LoginRequest) returns (LoginReply);
-
-  // One-time creation of the initial management token.
-  //
-  // Succeeds only while no management token exists; afterwards it returns
-  // FAILED_PRECONDITION. Run `legion acl bootstrap` right after enabling ACLs
-  // and store the returned secret safely.
-  rpc BootstrapAcl (BootstrapAclRequest) returns (BootstrapAclReply);
 
   // Creates or replaces a named ACL policy. Requires `acl:write`.
   rpc UpsertAclPolicy (UpsertAclPolicyRequest) returns (UpsertAclPolicyReply);
@@ -1956,6 +2039,18 @@ message WorkerConfig {
   // Default: empty string (the default set: Docker's default capabilities
   // less `CAP_NET_RAW`, so jobs may drop capabilities but add none).
   string container = 14;
+  // JSON-encoded security settings for workers of this type, folded by the
+  // manager from the worker config's top-level blocks
+  // (docs/network-handlers.md, "The host guard"):
+  //
+  // - `hostGuard`: `{"allow": ["10.0.1.7:9100"], "deny": ["192.0.2.10/32"]}`.
+  //   Destinations no allocation may reach through the datapath are fixed
+  //   (loopback, the node's own addresses, link-local, cloud metadata);
+  //   `allow` opens one `ip:port` (or `cidr:port`) each, `deny` adds
+  //   destinations. Job policy can't widen the guard; only this can.
+  //
+  // Default: empty string (the default guard, no overrides).
+  string security = 15;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -2829,6 +2924,15 @@ message PlanJobReply {
   // otherwise, which is exactly the discoverability failure this field
   // exists to prevent.
   string preemption_mode = 7;
+
+  // Valid settings that will not do what the author most likely expects,
+  // one human-readable line each (the same lines `RunJob` returns). Today: a
+  // task that would run gated (a `container` on a Linux node by default, or
+  // any task with `network.mode = "gated"`) with no `network.egress` and no
+  // stored policy object covering it, whose outbound connections would all
+  // be refused with `gated-default`. Each line ends with a `hint:` naming the
+  // fix. Empty when there is nothing to say.
+  repeated string warnings = 8;
 }
 
 // One allocation a plan would displace.
@@ -4825,11 +4929,32 @@ message GetMeshCaRequest {}
 
 // Reply payload for GetMeshCa.
 message GetMeshCaReply {
-  // The CA certificate, PEM; empty when none exists yet.
+  // The signing CA certificate, PEM; empty when none exists yet.
   string cert_pem = 1;
 
-  // When the current CA was created (RFC 3339); empty when none exists.
+  // When the signing CA was created (RFC 3339); empty when none exists.
   string created_at = 2;
+
+  // Every CA a holder should trust, PEM: the signing CA, then the previous
+  // CA while a rotation's overlap lasts. Clients that verify node or
+  // manager certificates (`legion sandbox start --node`, direct exec) use
+  // this, not `cert_pem`.
+  string bundle_pem = 3;
+
+  // The signing CA's pin (`sha256:<hex of its DER>`), as join tokens carry
+  // it in `caHash`.
+  string pin = 4;
+
+  // Where a rotation stands: `stable` (one CA) or `overlap` (the new CA
+  // signs and the previous one is still trusted until `overlap_until`).
+  string phase = 5;
+
+  // When the previous CA leaves the bundle (RFC 3339); empty when `stable`.
+  string overlap_until = 6;
+
+  // The previous CA certificate, PEM, while it is still trusted; empty
+  // otherwise.
+  string previous_cert_pem = 7;
 }
 
 // Request payload for RotateMeshCa.
@@ -4842,6 +4967,14 @@ message RotateMeshCaReply {
 
   // When it was created (RFC 3339).
   string created_at = 2;
+
+  // The new CA's pin (`sha256:<hex>`), which join tokens minted from now on
+  // carry.
+  string pin = 3;
+
+  // When the previous CA leaves the trust bundle (RFC 3339): one node
+  // certificate lifetime from now.
+  string overlap_until = 4;
 }
 
 // Request payload for IssueNodeCertificate.
@@ -4850,30 +4983,33 @@ message IssueNodeCertificateRequest {
   // authenticated per-node credential.
   string node_id = 1;
 
-  // Required. A PKCS#10 certificate signing request, PEM
-  // (`-----BEGIN CERTIFICATE REQUEST-----`), for a key pair the worker
-  // generated and keeps. Only its public key is used; its subject and any
-  // requested SANs or extensions are ignored. Requests without one are
-  // refused with InvalidArgument: the manager never generates a node's key.
+  // Required. A PEM certificate signing request for a key the worker
+  // generated and keeps. Only its public key is used; the manager chooses
+  // the certificate's names.
   string csr_pem = 2;
+
+  // Simulator only: sign a fleet certificate (`<fleet>.fleet.legion`,
+  // `legion://fleet/<fleet>`) instead of a node certificate. The node must
+  // have registered with config attribute `workerFleet` equal to this name.
+  // Empty for every real worker.
+  string fleet = 3;
 }
 
 // Reply payload for IssueNodeCertificate.
 message IssueNodeCertificateReply {
-  // The node certificate, PEM, for the CSR's public key. SANs:
-  // `<node>.node.legion` (what a manager or peer node verifies when it
-  // dials this node) and `legion://node/<node id>` (the role the worker
-  // plane and the mesh read back). Extended key usages: ServerAuth and
-  // ClientAuth.
+  // The node certificate chain, PEM, leaf first. SANs: `<node>.node.legion`
+  // and `legion://node/<node id>` (or the fleet names for a fleet
+  // certificate). During a CA rotation's overlap the chain also carries the
+  // new CA cross-signed by the previous one.
   string cert_pem = 1;
 
-  // Field 2 carried a manager-generated private key before the worker
-  // plane moved to CSRs (protocol 3). Never reuse it.
   reserved 2;
   reserved "key_pem";
 
-  // The cluster CA certificate, PEM: the only trust root a node uses to
-  // verify managers dialing its worker plane and peers on the mesh.
+  // The cluster CA trust bundle, PEM: the signing CA, plus the previous CA
+  // while a rotation's overlap lasts. What a node verifies managers and
+  // peers against. A worker joining with a token checks that this bundle
+  // contains the token's pinned CA before trusting it.
   string ca_pem = 3;
 
   // Certificate expiry as Unix seconds.
@@ -5088,6 +5224,32 @@ message HeartbeatRequest {
   // set in every reply.
   optional WorkStreamState work_stream = 15;
 
+  // Direct exec sessions this worker has finished since its last heartbeat
+  // (docs/exec-and-actions.md, "Direct exec"): one record per redeemed exec
+  // ticket, so the manager's `exec_audit` log holds direct sessions as it
+  // holds proxied ones. Restored and re-sent on a failed heartbeat; a
+  // worker keeps at most 1,024 records and drops the oldest past that, with
+  // a warning.
+  //
+  // Default: empty list.
+  repeated ExecAuditRecord exec_audit = 16;
+
+  // Direct exec sessions open on this worker right now. The manager checks
+  // each one's minting credential again, as the proxied path does every 30
+  // seconds, and names the sessions that no longer hold in
+  // `HeartbeatReply.revoked_exec_sessions`.
+  //
+  // Default: empty list.
+  repeated ExecSessionRef exec_sessions = 17;
+
+  // The version of the delegated exec keys this worker holds
+  // (`HeartbeatReply.exec_keys_version`). A worker that admits exec tickets
+  // sends `"none"` until it has received a set; a worker that does not
+  // sends nothing, and the manager skips the lookup.
+  //
+  // Default: empty (the worker does not admit exec tickets).
+  string exec_keys_version = 18;
+
   // The sessions this node runs (docs/session-mode.md), for the manager's
   // in-memory session index. Same epoch protocol as `content_locations`: a
   // worker process opens with a full report, then sends deltas against the
@@ -5095,7 +5257,7 @@ message HeartbeatRequest {
   // sets `HeartbeatReply.session_resync`, and the next report is full. A
   // worker also sends a full report every 30 beats, as a backstop. Absent
   // from workers without the `sessions` capability.
-  optional SessionReport session_report = 16;
+  optional SessionReport session_report = 19;
 }
 
 // One heartbeat's session report. See `HeartbeatRequest.session_report`.
@@ -5225,6 +5387,52 @@ message StreamWorkReply {
   // The digest of the worker's desired set after applying this message, in
   // the `WorkStreamState.digest` form.
   string digest = 6;
+}
+
+// One finished (or refused-after-verification) direct exec session.
+message ExecAuditRecord {
+  // The ticket's `jti`.
+  string jti = 1;
+  // The ticket's `sub`: `accessor:<id>` of the minting token, or
+  // `principal:<name>` for a credential without an accessor.
+  string subject = 2;
+  int64 allocation_id = 3;
+  string job = 4;
+  string task = 5;
+  // The argv that ran. Empty for an action session: a rendered action argv
+  // can carry sensitive parameter values, so only `action` is reported.
+  repeated string command = 6;
+  // Set when the ticket was minted for an action.
+  string action = 7;
+  bool tty = 8;
+  // The process's exit code; -1 when it was killed or never reported one.
+  int32 exit_code = 9;
+  // Unix seconds.
+  int64 started_at = 10;
+  int64 ended_at = 11;
+  // Why the session ended when the process did not end it:
+  // `"max_session"`, `"revoked: <reason>"`, `"client disconnected"`.
+  string ended_by = 12;
+}
+
+// A direct exec session open on a worker, for the manager's re-check.
+message ExecSessionRef {
+  string jti = 1;
+  // The ticket's `sub`.
+  string subject = 2;
+  string job = 3;
+  // Set for an action ticket: re-checked as `action:write` on the (job,
+  // action), or `exec:write` on the job.
+  string action = 4;
+  int64 allocation_id = 5;
+}
+
+// A direct exec session the worker must end.
+message RevokedExecSession {
+  string jti = 1;
+  // Ends the session's stream with this message, e.g. "the token that
+  // minted this session was deleted".
+  string reason = 2;
 }
 
 // Content locality. One heartbeat's content advertisement. See
@@ -5693,17 +5901,44 @@ message HeartbeatReply {
   // field; an empty list leaves the worker's known set unchanged.
   // See docs/architecture-managers-workers.md.
   repeated string manager_addresses = 13;
+  // The pin (`sha256:<hex>`) of the cluster CA the managers sign with now.
+  // A worker whose CA bundle does not contain it re-issues its node
+  // certificate at once instead of waiting for its refresh timer: that is
+  // how a `legion net ca rotate` reaches every node within one heartbeat.
+  // Empty when no cluster CA exists yet.
+  string cluster_ca_pin = 14;
+
+  // The direct exec sessions from `HeartbeatRequest.exec_sessions` whose
+  // minting credential no longer holds: the token was deleted or expired,
+  // or its policies no longer grant the session. The worker kills each
+  // session's process and ends its stream with `PermissionDenied` and the
+  // reason. This bounds revocation of a direct session to one heartbeat
+  // interval.
+  //
+  // Default: empty list.
+  repeated RevokedExecSession revoked_exec_sessions = 15;
+
+  // The current set of delegated exec keys, sent only when
+  // `HeartbeatRequest.exec_keys_version` was non-empty and differs from
+  // `exec_keys_version` below. The worker replaces its set with this one,
+  // so a deleted key stops working on its next heartbeat. Empty with a
+  // changed version means no keys.
+  repeated ExecKey exec_keys = 16;
+
+  // The version `exec_keys` describes. Empty when the request carried no
+  // version.
+  string exec_keys_version = 17;
 
   // The manager could not apply the request's `session_report` (it holds
   // no state for the node, or the epochs disagree): the worker sends a full
   // report next.
-  bool session_resync = 14;
+  bool session_resync = 18;
 
   // Sessions this node should end now (docs/session-mode.md): the later of
   // two copies of one session id the manager found on two nodes. Re-sent on
   // every beat until the node's report no longer lists them. Sessions the
   // node does not run are ignored.
-  repeated string stop_sessions = 15;
+  repeated string stop_sessions = 19;
 }
 
 // Why one allocation is being stopped.
@@ -8390,37 +8625,68 @@ message Eval {
 // ACLs: managers apply ACLs before they dial, and only managers hold
 // manager certificates.
 service Worker {
-  // Delivers one allocation payload to the worker for execution or
-  // reconciliation (and edge boot's provisional starts and ratifications).
+  // The worker plane (docs/architecture-managers-workers.md, "The worker
+  // plane"). Every worker serves this service over mutual TLS with its node
+  // certificate (`<node>.node.legion`, `legion://node/<id>`), on
+  // `LEGION_WORKER_HOST:LEGION_WORKER_PORT` (default `0.0.0.0:4848`). There
+  // is no plaintext listener. Client certificates are requested, not
+  // required; one that is presented must chain to the cluster CA or the
+  // handshake fails.
   //
-  // Caller class: `manager`. Best-effort from the manager's side: a failed
-  // push is healed by the next heartbeat reply, which carries the full
-  // desired set.
+  // Each RPC admits named caller classes, checked before anything else:
+  // - `manager`: a client certificate from the cluster CA carrying a
+  //   `legion://manager/<id>` URI SAN. A node's certificate is signed by the
+  //   same CA but is not a manager certificate.
+  // - `ticket`: no client certificate; the request carries a ticket the RPC
+  //   verifies offline.
+  // A request that presents a certificate other than a manager's is refused
+  // with Unauthenticated, never treated as a ticket holder.
+  // `tests/worker_plane_classes.rs` fails the build when an RPC here has no
+  // class.
+
+  // Delivers one allocation payload to worker for execution/reconciliation.
+  // Caller class: manager. Errors: Unauthenticated without a manager
+  // certificate.
   rpc PostWork (PostWorkRequest) returns (PostWorkReply);
 
-  // Requests the worker process to restart itself (`legion node restart`).
-  //
-  // Caller class: `manager`. The manager enforces `node:write` on the
-  // node's pool before it dials.
+  // Requests the worker process to restart itself. Caller class: manager.
+  // Errors: Unauthenticated without a manager certificate;
+  // FailedPrecondition when `node_id` names a node other than this worker
+  // (a manager holding a stale address never restarts the wrong machine).
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 
   // Reads captured stdout/stderr files for one allocation on this node.
-  //
-  // Caller class: `manager`. The manager enforces `job:read` on the
-  // allocation's job before it dials.
+  // Caller class: manager. Errors: Unauthenticated without a manager
+  // certificate.
   rpc GetTaskLogs (GetTaskLogsRequest) returns (GetTaskLogsReply);
 
-  // Runs an exec session against a local allocation. The manager has
-  // already authorized the caller (`exec:write` or `action:write`) and
-  // rendered any action command into a raw argv on the `ExecStart` frame.
+  // Runs an exec session against a local allocation. Caller classes:
+  // manager, ticket.
   //
-  // Caller class: `manager`. The sandbox-exec plan's `ticket` class (direct
-  // exec with an exec ticket, behind the worker's `exec.direct`) is not
-  // implemented; until it is, every exec goes through a manager.
+  // - manager: the manager has already authorized the caller and rendered
+  //   any action command into a raw argv on the `ExecStart` frame.
+  // - ticket (direct exec, docs/exec-and-actions.md "Direct exec"): no
+  //   client certificate, and `ExecStart.exec_ticket` carries a ticket from
+  //   `Manager.MintExecTicket`. Admitted only on a worker whose config sets
+  //   `exec = { direct = true }`. The worker verifies the ticket offline
+  //   against the cluster JWKS: signature, `aud = legion:exec`, expiry with
+  //   the worker's clock skew, issued after this worker process started,
+  //   `legion.io/node` is this node, the allocation is running here under
+  //   the ticket's job and task, the `ExecStart` argv and tty fit the ticket,
+  //   and the `jti` has not been redeemed on this node. The session ends
+  //   after the ticket's `legion.io/max_session` seconds, or when a manager
+  //   names it in `HeartbeatReply.revoked_exec_sessions`.
+  //
+  // Errors: Unauthenticated when the request carries neither a manager
+  // certificate nor a ticket ("ExecTask admits a manager certificate or an
+  // exec ticket; this request carried neither"), or presents a certificate
+  // that is not a manager's; FailedPrecondition for a ticket on a worker
+  // without `exec.direct`; PermissionDenied for a ticket that fails any
+  // check above, with the check named.
   rpc ExecTask (stream ExecClientFrame) returns (stream ExecServerFrame);
 
   // Starts work on this node from a boot ticket, without any call to a
-  // manager on the critical path (docs/edge-boot.md).
+  // manager on the critical path (docs/edge-boot.md). Caller class: ticket.
   //
   // This is the edge entry point: a platform's router hands the node a
   // ticket it minted ahead of time, the node verifies it offline against the
@@ -8441,6 +8707,15 @@ service Worker {
   // against the cluster CA (`legion net ca show`), as `legion sandbox
   // start` does.
   rpc StartClaim (StartClaimRequest) returns (stream StartClaimReply);
+
+  // Answers a manager's reachability check (docs/architecture-managers-
+  // workers.md, "Reachability"). The manager that accepts a registration
+  // probes the worker's advertised address once its worker plane is up, and
+  // records the outcome on the node (`workerPlane` in its dynamic
+  // attributes, shown by `legion node info`). Informational only: it does
+  // not feed node readiness. Caller class: manager. Errors: Unauthenticated
+  // without a manager certificate.
+  rpc Probe (ProbeRequest) returns (ProbeReply);
 
   // Ends sessions on this node (docs/session-mode.md). Called by a manager
   // for `instance stop` or `instance destroy` on a session, and to stop the
@@ -8466,6 +8741,21 @@ message StopSessionsRequest {
 message StopSessionsReply {
   // The ids this node was running and has ended.
   repeated string stopped = 1;
+}
+
+// Request payload for Worker.Probe. Empty: the TLS handshake and the
+// manager-class check are the probe.
+message ProbeRequest {}
+
+// Reply payload for Worker.Probe.
+message ProbeReply {
+  // The node id this worker serves, so a manager that dialed a stale or
+  // reused address learns it reached a different node. A simulated fleet
+  // answers with its fleet name.
+  string node_id = 1;
+
+  // The worker's protocol version (`PROTOCOL_VERSION`, docs/upgrades.md).
+  uint64 protocol_version = 2;
 }
 
 // === EXEC / ACTIONS ===
@@ -8509,6 +8799,25 @@ message ExecStart {
   // cannot set request headers. Ignored on native gRPC legs, where the
   // `authorization` metadata is used instead.
   string bearer_token = 8;
+
+  // Target an instance instead of an allocation: the manager resolves it to
+  // the instance's current allocation after the coarse ACL gate, so a
+  // caller holding a stable instance id reaches it across reschedules and
+  // resumes (each of which is a new allocation). Takes precedence over
+  // `allocation_id` when set. Manager legs only; a worker ignores it.
+  //
+  // Errors: NotFound for an unknown instance; FailedPrecondition when the
+  // instance has no running allocation (suspended, stopped, or between
+  // placements).
+  string instance_id = 9;
+
+  // An exec ticket from `Manager.MintExecTicket`, presented to
+  // `Worker.ExecTask` by a direct-exec client with no client certificate.
+  // `allocation_id` may be 0 (the ticket names the allocation) and
+  // `command` may be empty (the ticket's argv runs); when set they must
+  // match the ticket. `action` and `action_params` are ignored: an action
+  // ticket carries its rendered argv. Ignored on manager legs.
+  string exec_ticket = 10;
 }
 
 // Standard-input chunk. `eof` half-closes stdin (the k8s v5 lesson) so piped
@@ -8558,6 +8867,144 @@ message ExecExit {
 // receipt. `session_id` identifies the session in audit events.
 message ExecStarted {
   string session_id = 1;
+}
+
+// Request payload for MintExecTicket. The target and command fields mean
+// what they mean on `ExecStart`.
+message MintExecTicketRequest {
+  // Target allocation. Ignored when `instance_id` is set.
+  int64 allocation_id = 1;
+
+  // Target instance, resolved to its current allocation.
+  string instance_id = 2;
+
+  // Task within the allocation. Optional when the allocation runs one task.
+  string task_name = 3;
+
+  // Raw argv the ticket allows (`exec:write`). Empty with an empty
+  // `action` mints a ticket that allows any command in the target, which
+  // needs the same `exec:write` grant.
+  repeated string command = 4;
+
+  // Action to run (`action:write`, or `exec:write`). Its argv is rendered
+  // here from the stored job spec and written into the ticket.
+  string action = 5;
+
+  // Action parameter values, validated and substituted as for
+  // `ExecAllocation`. Sensitive values never appear in the audit log.
+  map<string, string> action_params = 6;
+
+  // Whether the session is interactive. For an action, the action's own
+  // `tty` wins.
+  bool tty = 7;
+
+  // How long the ticket can be redeemed, e.g. `"30s"`. Default:
+  // `exec.tickets.defaultTtl` (60s); at most `exec.tickets.maxTtl` (10m).
+  string ttl = 8;
+
+  // How long the session may run once opened, e.g. `"15m"`. Default and
+  // ceiling: `exec.tickets.maxSession` (1h). Clamped to the minting
+  // credential's own expiry.
+  string max_session = 9;
+}
+
+// Reply payload for MintExecTicket.
+message MintExecTicketReply {
+  // The ticket (a JWT). A credential: pass it to the worker in
+  // `ExecStart.exec_ticket` and nowhere else.
+  string ticket = 1;
+
+  // The worker's advertised worker-plane address,
+  // e.g. `"https://10.0.3.17:4848"`.
+  string worker_address = 2;
+
+  // The node the ticket is redeemable on. The worker's certificate names
+  // `<node>.node.legion`; a client verifies that name, not the address.
+  string node = 3;
+
+  // When the ticket stops being redeemable, RFC 3339 UTC.
+  string expires_at = 4;
+
+  // The cluster CA bundle, PEM: the only roots a client should trust for
+  // the worker connection.
+  string ca_pem = 5;
+
+  // The allocation the ticket opens a session in (resolved from
+  // `instance_id` when the request named one).
+  int64 allocation_id = 6;
+
+  // The ticket's id, as the audit log and the worker's report name it.
+  string jti = 7;
+
+  // Seconds the session may run once opened.
+  uint64 max_session_seconds = 8;
+}
+
+// A delegated exec minting key.
+message ExecKey {
+  // `xk_` and random characters. A ticket signed with this key carries it as
+  // its JWT `kid` header and `sub = "key:<id>"`.
+  string id = 1;
+  // A label for people, e.g. `"agents-platform"`.
+  string name = 2;
+  // Glob over job names the key's tickets may open sessions in,
+  // e.g. `"agents-*"`.
+  string jobs = 3;
+  // The ES256 (P-256) public key, SPKI PEM.
+  string public_key_pem = 4;
+  // The longest redeem window (`exp - iat`) a ticket may have.
+  uint64 max_ttl_seconds = 5;
+  // The longest `legion.io/max_session` a ticket may name.
+  uint64 max_session_seconds = 6;
+  // Who created it: `accessor:<id>` or `principal:<name>`.
+  string created_by = 7;
+  // RFC 3339 UTC.
+  string created_at = 8;
+}
+
+// Request payload for CreateExecKey.
+message CreateExecKeyRequest {
+  // A label for people. Optional.
+  string name = 1;
+  // Glob over job names, e.g. `"agents-*"`. Required.
+  string jobs = 2;
+  // The ES256 (P-256) public key, SPKI PEM (`openssl ec -pubout`). Required.
+  string public_key_pem = 3;
+  // Ceiling on a ticket's redeem window, e.g. `"5m"`. Default and ceiling:
+  // the manager's `exec.tickets.maxTtl` (10m).
+  string max_ttl = 4;
+  // Ceiling on a ticket's session length, e.g. `"30m"`. Default and ceiling:
+  // the manager's `exec.tickets.maxSession` (1h).
+  string max_session = 5;
+  // Retry-safe create: a repeat with the same key returns the same key.
+  optional string idempotency_key = 6;
+}
+
+// Reply payload for CreateExecKey.
+message CreateExecKeyReply {
+  ExecKey key = 1;
+  // True when this answered a retry of an earlier create.
+  bool deduplicated = 2;
+}
+
+// Request payload for ListExecKeys.
+message ListExecKeysRequest {}
+
+// Reply payload for ListExecKeys, newest first.
+message ListExecKeysReply {
+  repeated ExecKey keys = 1;
+}
+
+// Request payload for DeleteExecKey.
+message DeleteExecKeyRequest {
+  string id = 1;
+  // Retry-safe delete: a repeat with the same key reports `deduplicated`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for DeleteExecKey.
+message DeleteExecKeyReply {
+  bool deduplicated = 1;
 }
 
 // Request payload for ListJobActions.
@@ -9086,24 +9533,6 @@ message LoginReply {
   AclTokenInfo token = 1;
 
   // The token secret. Returned exactly once; the manager stores only a hash.
-  string secret = 2;
-}
-
-// Request payload for BootstrapAcl.
-message BootstrapAclRequest {
-  // Optional operator-provided secret for the initial management token
-  // (infrastructure-as-code pre-seeding). Must be at least 24 characters.
-  //
-  // Default when omitted: the manager generates a random secret.
-  optional string secret = 1;
-}
-
-// Reply payload for BootstrapAcl.
-message BootstrapAclReply {
-  // Metadata for the initial management token.
-  AclTokenInfo token = 1;
-
-  // The management token secret. Returned exactly once.
   string secret = 2;
 }
 
@@ -10425,7 +10854,11 @@ message TestNetPolicyReply {
   // The rule that decided (`policy/<name>#<index>`, `task#<index>`, or
   // `fallthrough`); empty on allow-by-absence. `gated-default` when the task
   // runs gated and no task block or policy object covers its egress at all:
-  // gated denies everything nothing allows.
+  // gated denies everything nothing allows. `host-guard` for an egress
+  // target the host guard refuses, which is answered before any policy: the
+  // manager resolves the name and judges the built-in classes (loopback,
+  // link-local, cloud metadata). A node's own addresses and its `hostGuard`
+  // overrides are judged on the worker only.
   string source = 2;
 
   // The rule's `reason`, if any.
@@ -10440,7 +10873,9 @@ message TestNetPolicyReply {
 
   // How to change the verdict, when there is an obvious fix. Set for a
   // `gated-default` denial: allow the destination in the task's
-  // `network.egress.allow`, or apply a policy object. Empty otherwise.
+  // `network.egress.allow`, or apply a policy object. Set for a `host-guard`
+  // denial: the guard is changed on the worker (`hostGuard.allow`), not in
+  // job policy. Empty otherwise.
   string hint = 7;
 }
 
@@ -10480,11 +10915,17 @@ message NetDenial {
   // `host:port` (egress destination or ingress peer).
   string destination = 5;
 
-  // The rule that denied: `policy/<name>#<index>`, `task#<index>`, or
-  // `fallthrough`.
+  // What denied. A rule: `policy/<name>#<index>`, `task#<index>`, or
+  // `fallthrough`. Or a layer below policy: `host-guard` (the destination,
+  // or every address its name resolved to, is loopback, this node, link-local
+  // / cloud metadata, or in the worker's `hostGuard.deny`; no policy can
+  // allow it), `gate` (the edge-boot gate is shut), or `policy-pending` (a
+  // gated allocation whose policy has not arrived).
   string source = 6;
 
-  // The rule's reason, if any.
+  // The rule's reason, if any. For `host-guard`, the address and its class,
+  // e.g. `169.254.169.254 is link-local (cloud metadata); allocations may not
+  // reach it`, or `<name> resolves to <ip> (<class>); ...` for a hostname.
   string reason = 7;
 
   // `tcp`, `http`, or `dns`.

@@ -18,7 +18,7 @@
 #   # On the request path, at the edge — no manager call (ca.pem from
 #   # `legion net ca show`, saved once):
 #   legion sandbox start edge-sandboxes \
-#       --id user-42 --node https://10.0.1.7:4848 --ca-cert ca.pem --ticket "$TICKET"
+#       --id user-42 --node https://10.0.1.7:4848 --ca ca.pem --ticket "$TICKET"
 #
 # Requires `edgeBoot.enabled = true` on the manager (plus
 # `workloadIdentity.enabled`, which signs the tickets) and
