@@ -331,6 +331,14 @@ fast with a name error rather than a timeout.
 behind `--allow-write`. `--dry-run` / `dry_run` validates the object and lists
 the running allocations whose effective policy would change, without writing.
 
+**A TAP sandbox's address is something Legion reports**, not something an
+agent discovers by probing. A sandbox on `config.network = { mode = "tap",
+bridge = "br0" }` gets its address leased from the bridge's pool at boot and
+on every restore and fork. A platform agent reads it from `legion instance
+get <id> -j` (`guest_address`, `guest_bridge`), and the harness inside the
+guest reads `LEGION_GUEST_ADDR`. A fork never shares its origin's address. See
+[Addressing](task-runtime-sandbox.md#addressing).
+
 ## 5. Idempotency keys
 
 Mutating job, instance, volume, and snapshot operations accept an optional

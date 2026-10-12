@@ -1150,12 +1150,22 @@ node makes sure that TAP device is there:
 - If the device exists and nothing holds it, the restore uses it.
 - If another process holds it (most likely another VM), the restore fails:
   `restore needs TAP device tap7: it exists and another process holds it`.
-- If it does not exist, the node creates it (a persistent TAP, brought up)
-  and removes it again when the allocation is destroyed. A failure to create
-  it fails the restore: `restore needs TAP device tap7: creating it failed:
-  ...`. An auto TAP (`tap = "auto"`) is recreated under the same `lgf` name
-  and attached to the task's `bridge` again, so a resume lands back on the
-  same network segment.
+- If it does not exist, the node creates it under the same `lgf` name,
+  attaches it to the task's `bridge`, brings it up, and removes it again
+  when the allocation is destroyed, so a resume lands back on the same
+  network segment. A failure to create it fails the restore: `restore needs
+  TAP device lgf...: creating it failed: ...`.
+- A checkpoint wired to a TAP that is not the instance's own (one taken on a
+  hand-named `tap = "tap0"` before every TAP was per instance) is moved onto
+  the instance's own device, the way a fork's is.
+
+The restored guest also gets an address leased from the bridge's pool on the
+restoring node, asking for the one its checkpoint recorded first, and its
+resume handler re-addresses `eth0` before `onResume` runs (see
+[Addressing](task-runtime-sandbox.md#addressing)). A resume on the same node
+normally keeps its address. A resume elsewhere, or one whose old address was
+taken meanwhile, gets a new one, which `LEGION_GUEST_ADDR` and `instance get`
+show.
 
 A restore never comes up without the network its guest was captured with.
 
@@ -1316,13 +1326,6 @@ $ legion instance fork run-17 --count 3 --wait -j
  "checkpoint_state":"local","deduplicated":false}}
 ```
 
-> **A static IP inside the guest is copied to every fork.** A memory fork
-> resumes the origin's guest exactly, network configuration included. Legion
-> gives each fork its own MAC and TAP device, but an address configured
-> inside the guest comes along, so every fork answers on the origin's IP on
-> the same bridge. Use DHCP in the guest, or renew the address in
-> `suspend.onResume`. See [Networking for forks](#networking-for-forks).
-
 A fork is three things Legion already does, plus one rule:
 
 1. **A live checkpoint of the origin.** A memory checkpoint pauses the guest
@@ -1356,7 +1359,8 @@ everything the origin held in memory.
 | Allocation | Unchanged, keeps running | A new allocation id |
 | Volume | Untouched | Its own copy, made with the volume driver's `clone` op |
 | Workload identity | A new [identity epoch](workload-identity.md#forks-and-snapshots): its earlier tokens are refused by Legion and re-issued within a heartbeat | A token issued for the fork's own allocation |
-| TAP device (disk fork with `tap = "auto"`) | Unchanged | Its own `lgf` device on the task's `bridge` |
+| TAP device (disk fork) | Unchanged | Its own `lgf` device on the task's `bridge` |
+| Guest address (TAP sandbox) | Unchanged | Its own lease from the bridge's pool, never the origin's |
 | Hostname | Unchanged | `legion-sbx-<allocation>` |
 | RNG | Unchanged | Reseeded from fresh entropy |
 | MAC (memory fork) | Unchanged | `02:4c:...`, derived from the allocation id |
@@ -1494,61 +1498,34 @@ file into each guest at restore, so its forks share nothing.
 
 ### Networking for forks
 
-> **Addresses inside the guest are copied.** A guest with a static IP comes
-> up in every fork with the origin's IP, on the same bridge, and the
-> addresses collide. Legion only changes what it owns (MAC, TAP device,
-> hostname). Use DHCP in the guest, or renew the address in
-> `suspend.onResume`.
-
-A sandbox's saved state names the TAP device its NIC was attached to. A fork
-cannot use the origin's TAP, which the origin holds. So a memory fork of a
-TAP-wired sandbox gets a TAP device of its own:
+A fork of a TAP sandbox never shares its origin's device or address. A
+sandbox's saved state names the TAP device its NIC was attached to, and a
+fork cannot use the origin's, which the origin holds. So a memory fork of a
+TAP sandbox gets a TAP device and an address of its own:
 
 - The device is named `lgf` plus 12 hex characters derived from the fork's
-  instance id, and the node creates it at restore, brings it up, and removes
-  it when the fork's allocation is destroyed. An operator can pre-create it
-  to wire it differently, and a free existing device is used as is.
-- When the origin's TAP is enslaved to a bridge, the fork's TAP joins the
-  same bridge, so the fork lands on the origin's network segment. A spread
-  fork on another node joins the bridge of the task's configured TAP on that
-  node instead. When neither device is on that node's bridge, the restore
-  fails with `restore needs TAP device lgf...: ... the fork would have no
-  network`, and `onRestoreFailure` decides what happens next.
+  instance id, the name the fork's instance would boot on, and the node
+  creates it at restore on the task's `bridge`, brings it up, and removes it
+  when the fork's allocation is destroyed. An operator can pre-create it to
+  wire it differently, and a free existing device is used as is. A fork that
+  later boots cold, or is suspended and resumed, keeps that device.
 - Firecracker moves the restored NIC with `network_overrides` on snapshot
   load, which needs Firecracker 1.12 or later. On an older Firecracker the
   fork is refused at the API with a hint (`upgrade Firecracker on the node,
   or use --checkpoint disk`). cloud-hypervisor gets the fork's device through
   the checkpoint's `config.json`, rewritten in the fork's own copy.
-- The guest's resume handler gives the NIC the fork's MAC.
+- The fork gets a fresh lease from the bridge's pool on its node, never the
+  origin's address (see [Addressing](task-runtime-sandbox.md#addressing)).
+  The guest's resume handler gives the NIC the fork's MAC, then flushes the
+  origin's addresses and applies the lease and its default route, before
+  `onResume` runs. So every fork answers on its own address, with no
+  network configuration in the image.
 
-A fork's later checkpoints record its own TAP, so suspending and resuming a
-fork keeps it.
+A fork's later checkpoints record its own TAP and address, so suspending and
+resuming a fork keeps them.
 
-A fork of an auto-TAP sandbox (`tap = "auto"`) gets the same `lgf` device
-name its instance would boot on, attached to the task's `bridge`. So a fork
-that later boots cold, or is suspended and resumed, keeps that device.
-
-A fresh boot of a fixed-TAP task (`tap = "tap0"`) always uses the task's
-configured TAP, so only one guest of it fits on a node. A fork, a disk
-snapshot seed, or a fork that falls back to a cold boot would boot next to
-the origin on that device. So submit, `job validate`, and `job plan` refuse a
-fixed TAP on a keyed task, the only kind that forks:
-
-```text
-Error: jobspec failed validation: task "workspace" attaches its sandbox to the fixed TAP
-device "tap0" (config.network.tap), which serves one guest per node, but it is a keyed
-task (stateful.mode = "keyed"), so a second instance, a fork that boots cold, or a disk
-snapshot seed on the same node fails to boot
-Hint: set config.network = { mode = "tap", tap = "auto", bridge = "<the bridge tap0 is
-on>" }, so Legion creates a TAP per instance
-```
-
-Every fork of an auto-TAP sandbox gets its own device, so both kinds of fork
-work there, including a disk fork, which boots each fork on its own `lgf`
-device. A job stored before this rule still runs. A disk fork of it is
-refused at the API with the hint to use `--checkpoint memory`, and any second
-guest on its TAP fails to start with `sandbox needs TAP device tap0 ..., but
-another process holds it`, rather than an opaque VMM error.
+A disk fork boots each fork fresh on its own `lgf` device with its own
+lease, so both kinds of fork work on a TAP sandbox.
 
 ### Refusals
 
@@ -1891,18 +1868,19 @@ See [metrics](metrics.md#suspend-and-resume).
 | Submit: `"connections" counts open connections through the node datapath, and this sandbox's traffic never crosses it` | A sandbox that is not gated has no datapath connections | Remove `connections`, or run the sandbox gated. Otherwise raise `after` or suspend from your platform |
 | Submit: `lists "exec", but this sandbox always runs as a microVM` | A microVM takes no exec sessions | Remove `exec` |
 | Warning: `suspend.idle counts "exec", which never fires while the sandbox runs as a microVM` | The default signals on a sandbox that may run as a microVM | List signals explicitly, or ignore it for a dev-mode-only job |
-| A TAP-wired sandbox never suspends | The guest keeps sending on its TAP (DHCP, NTP, a chatty agent) | Compare `node usage`'s IDLE column with the guest's traffic, or drop `network` from `signals` |
-| Allocation fails: `sandbox needs TAP device lgf... (network.tap = "auto"): it exists and another process holds it` | The instance already runs a guest on this node | Stop the other allocation first |
+| A TAP-wired sandbox never suspends | The guest keeps sending on its TAP (NTP, ARP, a chatty agent) | Compare `node usage`'s IDLE column with the guest's traffic, or drop `network` from `signals` |
+| Allocation fails: `sandbox needs TAP device lgf... on bridge br0: it exists and another process holds it` | The instance already runs a guest on this node | Stop the other allocation first |
+| Allocation fails: `bridge br0's sandbox range ... is full (N addresses leased on node w-03)` | Every address in the node's `sandbox.bridges.br0.range` is leased | Widen `range` in the worker config, or stop sandboxes on that node. See [Addressing](task-runtime-sandbox.md#addressing) |
+| A TAP sandbox stays `pending` with `no available nodes matching constraints` | No node declares its bridge in `sandbox.bridges` (the implicit `sandbox.bridges contains` constraint) | Add `sandbox.bridges.<bridge>` to the worker type that should run it |
+| A TAP guest boots with no address | The guest kernel lacks `CONFIG_IP_PNP`, so it ignores `ip=` | Use a kernel built with `CONFIG_IP_PNP=y` |
 | Submit: `suspend.idle.after "5s" is shorter than 30s` | Reports every 10s and a 15s sweep cannot honor it | Use `30s` or longer |
 | `instance fork` refused | See [Refusals](#refusals) | Follow the hint in the message |
 | Forks stuck `pending (forking)` | The origin's node has not reported the capture yet (it is down, or busy writing memory) | Wait, or watch the checkpoint with `legion snapshot get <snapshot>` |
 | Forks `terminated` with `fork of ... failed` | The capture failed. The origin kept running | Read the forks' `detail` or `instance.fork_failed`, fix the cause, and fork again |
 | Forks stuck `pending` after `instance.forked` | The origin's node is full, or (spread) every node that can take one already runs a sibling | Free capacity on the node, add nodes, or fork fewer |
 | A spread fork stays `pending (forking)` after its capture | Its checkpoint is still being published, or a publish retry is pending | `legion snapshot get <snapshot>` shows the publish error and when it retries |
-| A fork has no network | Its own TAP was created but the origin's TAP has no bridge, or the guest uses a static IP | Pre-create the fork's TAP, put the origin's TAP on a bridge, or use DHCP in the guest |
-| Fork `restore needs TAP device lgf...: ... would have no network` | A spread fork landed on a node where neither the origin's TAP nor the task's TAP is on a bridge | Create the task's TAP on a bridge on every node a spread fork can land on |
-| Submit: `attaches its sandbox to the fixed TAP device "tap0" ... which serves one guest per node` | A keyed task, a `count` above one, or a `createFirst` rollout on a fixed `tap` | Use `tap = "auto"` with the `bridge` the device was on |
-| Allocation fails: `sandbox needs TAP device tap0 ..., but another process holds it` | A second guest of a fixed-TAP task on one node. Submit refuses every spec that can cause it, so the job was stored before that rule | Resubmit the job with `tap = "auto"` and a `bridge` |
+| A restored or forked TAP guest answers on its old address, or none | The resume handler's `address` step failed, and the guest console logs why (for one, a workload that renamed `eth0`) | Read the allocation's console log. Legion's init never renames the NIC, so leave it `eth0` |
+| Submit: `config.network.tap is gone` or `config.network.mac is gone` | The job names a TAP device or MAC by hand, which Legion now owns | Set `bridge` to the bridge the device was on, drop `tap` and `mac`, and declare `sandbox.bridges.<bridge>` on the worker type |
 | `instance create --from-snapshot`: `is a fork checkpoint` or `suspend checkpoint` | Only manual snapshots seed instances | Take one with `legion snapshot create` |
 | Submit fails: `sets suspend.durability = "store", but its stateful.storage uses volume driver ...` | The instance volume cannot leave its node | Use a network driver, drop `stateful.storage`, or keep `durability = "local"` |
 | `instance suspend`: `whose worker has no contentStore to publish to` | `durability = "store"` on a node without a `contentStore` block | Add `contentStore { url }` to that worker's config |
@@ -1947,10 +1925,9 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Spreading applies to a fork's first placement.** A spread fork that is
   later rescheduled (its node lost, or stopped and started) is placed like
   any instance and can land next to a sibling.
-- **Forks copy the guest's addresses and in-memory secrets.** Legion gives
-  each fork its own MAC, TAP, hostname, token, and entropy, but a static IP
-  configured inside the guest is copied to every fork, as are open
-  connections and anything the origin had in memory. `onResume` is where a
+- **Forks copy the guest's in-memory secrets.** Legion gives each fork its
+  own MAC, TAP, address, hostname, token, and entropy, but open connections
+  and anything the origin had in memory come along. `onResume` is where a
   workload resets them.
 - **Each fork is charged its full reservation**, even though forks of one
   memory checkpoint share pages on Firecracker. cloud-hypervisor forks share
