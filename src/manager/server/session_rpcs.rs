@@ -11,6 +11,7 @@ use super::*;
 use crate::manager::sessions;
 use crate::structs::{
     IndexedSession, PromoteInstanceReply, PromoteInstanceRequest, QuerySessionsRequest,
+    SuspendInstanceReply,
 };
 use serde::{Deserialize, Serialize};
 
@@ -150,6 +151,171 @@ impl ManagerDaemonService {
             .unwrap_or_default();
         acl::enforce(identity, AclResource::Job, action, &AclScope::job(&job_id))?;
         Ok(Some(found))
+    }
+
+    /// A session for a verb that must reach it (suspend, start, get), once
+    /// `action` on its job is enforced. Unlike [`Self::find_session`], an
+    /// evicted session answers NOT_FOUND with its node's account of the
+    /// eviction, and a session whose node does not answer answers
+    /// UNAVAILABLE naming the node. `None` when no session has the id.
+    ///
+    /// Those two answers come before the job scope is known (the session's
+    /// job is on the node that evicted it or cannot be reached); the
+    /// handler's coarse check has already run, and neither answer carries
+    /// more than the id the caller sent and the node it names.
+    pub(super) async fn locate_session(
+        &self,
+        identity: &AclIdentity,
+        session_id: &str,
+        action: AclAction,
+    ) -> Result<Option<IndexedSession>, Status> {
+        match sessions::locate(&self.store, session_id).await {
+            sessions::Located::Found(found) => {
+                let job_id = found
+                    .status
+                    .as_ref()
+                    .map(|status| status.job_id.clone())
+                    .unwrap_or_default();
+                acl::enforce(identity, AclResource::Job, action, &AclScope::job(&job_id))?;
+                Ok(Some(*found))
+            }
+            sessions::Located::Evicted(message) => Err(Status::not_found(message)),
+            sessions::Located::Unreachable(status) => Err(status),
+            sessions::Located::NotFound => Ok(None),
+        }
+    }
+
+    /// Whether a session's task carries a `suspend` block: only those
+    /// sessions sleep on their node. Without one, suspend keeps answering
+    /// that a session must be promoted first.
+    fn session_can_sleep(&self, entry: &IndexedSession) -> bool {
+        let Some(status) = entry.status.as_ref() else {
+            return false;
+        };
+        self.store
+            .get_job_config(&status.job_id)
+            .ok()
+            .and_then(|config| {
+                config
+                    .tasks
+                    .iter()
+                    .find(|task| task.name == status.task_name)
+                    .map(|task| task.suspend.is_some())
+            })
+            .unwrap_or(false)
+    }
+
+    /// SuspendInstance on a session whose task has a suspend block: the
+    /// node checkpoints it into its own content store and frees its
+    /// envelope share (`Worker.SuspendSessions`). `None` when the id is no
+    /// such session, so the caller answers as for any missing row.
+    pub(super) async fn suspend_session_instance(
+        &self,
+        identity: &AclIdentity,
+        session_id: &str,
+    ) -> Result<Option<SuspendInstanceReply>, Status> {
+        let Some(found) = self
+            .locate_session(identity, session_id, AclAction::Write)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !self.session_can_sleep(&found) {
+            return Ok(None);
+        }
+        let reply = sessions::suspend_on_node(
+            &self.store,
+            &found.node_id,
+            &[session_id.to_string()],
+            "requested",
+        )
+        .await?;
+        if let Some(failed) = reply.failed.into_iter().next() {
+            let message = failed
+                .message
+                .strip_prefix("evicted:")
+                .map(|rest| rest.trim_start().to_string())
+                .unwrap_or(failed.message);
+            return Err(Status::new(code_from_name(&failed.code), message));
+        }
+        let Some(done) = reply.suspended.into_iter().next() else {
+            return Err(Status::internal(format!(
+                "node {} answered without suspending session {session_id}",
+                found.node_id
+            )));
+        };
+        let message = if done.already_suspended {
+            format!(
+                "Instance {session_id} already suspended ({})",
+                done.snapshot_id
+            )
+        } else {
+            format!(
+                "Instance {session_id} suspended on {} ({} checkpoint {}, {} bytes)",
+                found.node_id, done.kind, done.snapshot_id, done.bytes
+            )
+        };
+        Ok(Some(SuspendInstanceReply {
+            message,
+            snapshot_id: done.snapshot_id,
+            kind: done.kind,
+            node_id: found.node_id,
+            deduplicated: false,
+            durability: "local".to_string(),
+        }))
+    }
+
+    /// StartInstance on a session: running answers that it already runs;
+    /// suspended resumes it on its node (`Worker.ResumeSession`) under the
+    /// same id. `None` when no session has the id.
+    pub(super) async fn start_session_instance(
+        &self,
+        identity: &AclIdentity,
+        session_id: &str,
+    ) -> Result<Option<StartInstanceReply>, Status> {
+        let Some(found) = self
+            .locate_session(identity, session_id, AclAction::Write)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let state = found
+            .status
+            .as_ref()
+            .map(|status| status.state.clone())
+            .unwrap_or_default();
+        if state != "suspended" {
+            return Ok(Some(StartInstanceReply {
+                message: format!("Instance {session_id} already running"),
+                node_id: found.node_id,
+                ..Default::default()
+            }));
+        }
+        let reply = sessions::resume_on_node(&self.store, &found.node_id, session_id, false)
+            .await
+            .map_err(|status| {
+                if status.code() == tonic::Code::ResourceExhausted {
+                    Status::resource_exhausted(format!(
+                        "{}\nHint: the session stays suspended with its checkpoint; retry \
+                         when another session on {} ends or suspends",
+                        status.message().split("\nHint:").next().unwrap_or_default(),
+                        found.node_id
+                    ))
+                } else {
+                    status
+                }
+            })?;
+        let message = if reply.already_running {
+            format!("Instance {session_id} already running")
+        } else {
+            format!("Instance {session_id} resumed on {}", found.node_id)
+        };
+        Ok(Some(StartInstanceReply {
+            message,
+            resuming_from: reply.resumed_from,
+            node_id: found.node_id,
+            ..Default::default()
+        }))
     }
 
     /// A running session's `InstanceInfo`, its group read from the job.
@@ -456,5 +622,19 @@ impl ManagerDaemonService {
             "Promoted session"
         );
         Ok(Response::new(recorded.into_reply(false)))
+    }
+}
+
+/// A gRPC code from its name as a node reports it in a
+/// `SessionSleepFailure` (`NotFound`, `FailedPrecondition`, …).
+fn code_from_name(name: &str) -> tonic::Code {
+    match name {
+        "NotFound" | "not_found" => tonic::Code::NotFound,
+        "FailedPrecondition" | "failed_precondition" => tonic::Code::FailedPrecondition,
+        "Aborted" | "aborted" => tonic::Code::Aborted,
+        "ResourceExhausted" | "resource_exhausted" => tonic::Code::ResourceExhausted,
+        "Unavailable" | "unavailable" => tonic::Code::Unavailable,
+        "InvalidArgument" | "invalid_argument" => tonic::Code::InvalidArgument,
+        _ => tonic::Code::Internal,
     }
 }

@@ -844,8 +844,8 @@ impl WorkerDaemonService {
         {
             return Status::not_found(format!(
                 "evicted: session {session_id} was evicted from {} {}; a local-only session \
-                 cannot be restored. Start a new session, or set suspend.durability = \"store\" \
-                 to keep idle sessions in the content store",
+                 cannot be restored\nHint: start a new session, or set suspend.durability = \
+                 \"store\" so idle sessions are kept in the content store",
                 self.node_id, evicted
             ));
         }

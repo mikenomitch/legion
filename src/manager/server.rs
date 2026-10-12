@@ -6047,17 +6047,13 @@ impl Manager for ManagerDaemonService {
             // An instance archived with `archive = "manifestOnly"` has no
             // row: its archive manifest is the whole record.
             let Some((manifest, url)) = self.find_manifest_only(&inner.instance_id).await? else {
-                // A running session needs no start (docs/session-mode.md).
+                // A running session needs no start; a suspended one resumes
+                // on its own node (docs/session-mode.md).
                 return match self
-                    .find_session(&identity, &inner.instance_id, AclAction::Write)
+                    .start_session_instance(&identity, &inner.instance_id)
                     .await?
                 {
-                    Some(_) => Ok(Response::new(StartInstanceReply {
-                        message: format!("Instance {} already running", inner.instance_id),
-                        deduplicated: false,
-                        resuming_from: String::new(),
-                        node_id: String::new(),
-                    })),
+                    Some(reply) => Ok(Response::new(reply)),
                     None => Err(Status::not_found(format!(
                         "instance {} not found",
                         inner.instance_id
@@ -6564,9 +6560,10 @@ impl Manager for ManagerDaemonService {
             .get_instance(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?;
         let Some(instance) = instance else {
-            // A running session has no row: answer from the session index.
+            // A session has no row: ask its node (an evicted session and an
+            // unreachable node get their own answers), or the index.
             if let Some(session) = self
-                .find_session(&identity, &inner.instance_id, AclAction::Read)
+                .locate_session(&identity, &inner.instance_id, AclAction::Read)
                 .await?
             {
                 return Ok(Response::new(GetInstanceReply {

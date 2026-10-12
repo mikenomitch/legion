@@ -89,8 +89,13 @@ impl Usage {
     }
 }
 
-/// A session's reserved amounts, parsed from its `resources` JSON.
+/// A session's reserved amounts, parsed from its `resources` JSON. A
+/// suspended session holds none: its node freed its envelope share when it
+/// checkpointed (it still counts in [`Usage::sessions`]).
 pub fn session_amounts(status: &SessionStatus) -> BTreeMap<String, f64> {
+    if status.state == "suspended" {
+        return BTreeMap::new();
+    }
     serde_json::from_str::<serde_json::Value>(&status.resources)
         .map(|value| crate::structs::session::resource_amounts(&value))
         .unwrap_or_default()

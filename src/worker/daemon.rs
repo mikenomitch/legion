@@ -807,16 +807,196 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // Notices task processes exiting, reaps them, and applies each task's
     // `restart` policy (see docs/task-supervision.md).
     let supervisor_fut = start_task_supervisor(task_manager.clone());
-    let _res = join!(
-        heartbeat_fut,
-        self_fence_fut,
-        checks_fut,
-        log_maintenance_fut,
-        supervisor_fut,
-        worker_server_fut
-    );
+    // Idle sessions: expiry, eviction, periodic checkpoints, and the
+    // restores a restart left (docs/session-mode.md#idle-sessions).
+    let session_fut = start_session_maintenance(task_manager.clone(), launch_pool.clone());
+    let stop_checkpoint_timeout =
+        humantime::parse_duration(&edge_boot_config.stop_checkpoint_timeout)
+            .unwrap_or(Duration::from_secs(60));
+    let shutdown_task_manager = task_manager.clone();
+    tokio::select! {
+        _ = async {
+            join!(
+                heartbeat_fut,
+                self_fence_fut,
+                checks_fut,
+                log_maintenance_fut,
+                supervisor_fut,
+                worker_server_fut,
+                session_fut
+            )
+        } => {}
+        signal = worker_shutdown_signal() => {
+            stop_worker_daemon(shutdown_task_manager, signal, stop_checkpoint_timeout).await;
+        }
+    }
 
     Ok(())
+}
+
+/// How often the session maintenance loop runs: the keepFor sweep, disk
+/// pressure eviction, and the periodic checkpoint round.
+const SESSION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Idle-session upkeep on this node. First resumes the sessions a restart
+/// found dead with an `onWorkerStop` checkpoint, then every
+/// [`SESSION_MAINTENANCE_INTERVAL`] sweeps expired and orphaned checkpoints
+/// (and evicts the oldest under `content.minFreeDisk` pressure), and runs a
+/// `suspend.checkpointEvery` round.
+async fn start_session_maintenance(
+    task_manager: Arc<Mutex<WorkerTaskManager>>,
+    launch_pool: Arc<crate::worker::launch_pool::LaunchPool>,
+) -> R<()> {
+    use crate::worker::task_manager::session_sleep;
+    let restores = task_manager
+        .lock()
+        .expect("task manager")
+        .take_pending_session_restores();
+    for session_id in restores {
+        let slot = match launch_pool.acquire().await {
+            Ok(slot) => slot,
+            Err(err) => {
+                warn!(session_id = %session_id, error = %err, "No launch slot to restore a session; it stays suspended");
+                continue;
+            }
+        };
+        let manager = task_manager.clone();
+        let id = session_id.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            session_sleep::resume_session(&manager, &id, false)
+        })
+        .await;
+        drop(slot);
+        match outcome {
+            Ok(Ok(_)) => info!(session_id = %session_id, "Restored session after worker restart"),
+            Ok(Err(err)) => {
+                warn!(session_id = %session_id, error = %err, "Session restore after restart failed; it stays suspended")
+            }
+            Err(err) => {
+                warn!(session_id = %session_id, error = %err, "Session restore task failed")
+            }
+        }
+    }
+    let mut per_capture = Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(SESSION_MAINTENANCE_INTERVAL).await;
+        let manager = task_manager.clone();
+        let mut estimate = per_capture;
+        let round = tokio::task::spawn_blocking(move || {
+            manager
+                .lock()
+                .expect("task manager")
+                .sweep_idle_sessions(std::time::Instant::now(), crate::util::now_unix_ms());
+            let counts = session_sleep::run_checkpoint_round(&manager, &mut estimate);
+            (counts, estimate)
+        })
+        .await;
+        match round {
+            Ok(((ran, skipped), estimate)) => {
+                per_capture = estimate;
+                if ran > 0 || skipped > 0 {
+                    debug!(ran, skipped, "Session checkpoint round");
+                }
+            }
+            Err(err) => warn!(error = %err, "Session maintenance round failed"),
+        }
+    }
+}
+
+/// Suspend the sessions the idle policy found quiet past `idle.after`, each
+/// on the blocking pool. A session already capturing answers busy and is
+/// tried again at the next usage report.
+fn suspend_idle_sessions(task_manager: &Arc<Mutex<WorkerTaskManager>>, local_keys: Vec<i64>) {
+    for local_key in local_keys {
+        let Some(session_id) = task_manager
+            .lock()
+            .expect("task manager")
+            .session_id_for_local_key(local_key)
+        else {
+            continue;
+        };
+        let manager = task_manager.clone();
+        tokio::task::spawn_blocking(move || {
+            match crate::worker::task_manager::session_sleep::suspend_session(
+                &manager,
+                &session_id,
+                "idle",
+            ) {
+                Ok(_) => info!(session_id = %session_id, "Suspended idle session"),
+                Err(err) => {
+                    debug!(session_id = %session_id, error = %err, "Idle session not suspended")
+                }
+            }
+        });
+    }
+}
+
+/// Resolves with the signal's name on SIGTERM or SIGINT (Ctrl-C).
+async fn worker_shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(error = ?err, "Failed installing the SIGINT handler");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = ctrl_c => "SIGINT",
+            },
+            Err(err) => {
+                warn!(error = ?err, "Failed installing the SIGTERM handler");
+                ctrl_c.await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+        "SIGINT"
+    }
+}
+
+/// The worker's orderly stop: checkpoint the sessions whose task sets
+/// `suspend.onWorkerStop = "checkpoint"` (least recently checkpointed
+/// first, within `edgeBoot.stopCheckpointTimeout`), flush the session log,
+/// and exit. Workloads keep running, as on any worker stop: a restarted
+/// worker re-adopts them, and restores from these checkpoints only the
+/// sessions whose process died meanwhile.
+async fn stop_worker_daemon(
+    task_manager: Arc<Mutex<WorkerTaskManager>>,
+    signal: &'static str,
+    timeout: Duration,
+) {
+    info!(signal, "Worker stopping");
+    let deadline = std::time::Instant::now() + timeout;
+    let manager = task_manager.clone();
+    let checkpointed = tokio::task::spawn_blocking(move || {
+        let counts = crate::worker::task_manager::session_sleep::checkpoint_sessions_on_stop(
+            &manager, deadline,
+        );
+        manager
+            .lock()
+            .expect("task manager")
+            .sync_session_log(Duration::from_secs(5));
+        counts
+    });
+    match tokio::time::timeout(timeout + Duration::from_secs(10), checkpointed).await {
+        Ok(Ok((done, 0))) if done > 0 => info!(done, "Checkpointed sessions before stopping"),
+        Ok(Ok((done, left))) if left > 0 => {
+            warn!(
+                done,
+                left, "Stop checkpoint timeout reached; some sessions were not checkpointed"
+            )
+        }
+        Ok(_) => {}
+        Err(_) => warn!("Stop checkpoints did not finish in time; exiting anyway"),
+    }
+    std::process::exit(0);
 }
 
 /// The worker type's `exec` block, from the security payload.
@@ -1718,7 +1898,15 @@ async fn heartbeat_tick(
             sampler.note_network_activity(net_edges.iter().map(|edge| edge.allocation_id));
             let now = std::time::Instant::now();
             sampler.due(now).then(|| {
-                let targets = task_manager.lock().expect("task manager").usage_targets();
+                // Sessions ride along under their negative local keys, for
+                // the idle policy only (docs/session-mode.md#idle-sessions):
+                // their entries come back out before the report is sent.
+                let targets = {
+                    let manager = task_manager.lock().expect("task manager");
+                    let mut targets = manager.usage_targets();
+                    targets.extend(manager.session_idle_targets());
+                    targets
+                };
                 // What the datapath and exec server saw, for activity and
                 // the idle policy (docs/suspend-and-resume.md, "Idle policy").
                 let activity = forwarder.context().activity();
@@ -1753,10 +1941,23 @@ async fn heartbeat_tick(
                     crate::worker::usage::read_node_memory(),
                     &inputs,
                 );
+                let (session_usage, allocations): (Vec<_>, Vec<_>) =
+                    std::mem::take(&mut report.allocations)
+                        .into_iter()
+                        .partition(|usage| usage.allocation_id < 0);
+                report.allocations = allocations;
+                suspend_idle_sessions(
+                    task_manager,
+                    crate::worker::task_manager::session_sleep::idle_sessions_to_suspend(
+                        &session_usage,
+                        chrono::Utc::now().timestamp(),
+                    ),
+                );
                 // "Who goes first", from the same ordering the responder
                 // acts with, so `legion node usage` previews it.
                 let metas = targets
                     .iter()
+                    .filter(|target| target.allocation_id >= 0)
                     .map(|target| (target.allocation_id, target.pressure.clone()))
                     .collect();
                 let view = PRESSURE_SETTINGS

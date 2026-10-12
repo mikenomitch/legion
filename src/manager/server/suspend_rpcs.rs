@@ -288,6 +288,15 @@ impl ManagerDaemonService {
             .get_instance(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?
         else {
+            // A session whose task has a suspend block sleeps on its own
+            // node (docs/session-mode.md#idle-sessions); any other session
+            // must be promoted first.
+            if let Some(reply) = self
+                .suspend_session_instance(&identity, &inner.instance_id)
+                .await?
+            {
+                return Ok(Response::new(reply));
+            }
             return Err(self
                 .missing_instance(&identity, &inner.instance_id, "suspended")
                 .await);
