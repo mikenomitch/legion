@@ -262,8 +262,16 @@ impl ManagerDaemonService {
             )
         } else {
             format!(
-                "Instance {session_id} suspended on {} ({} checkpoint {}, {} bytes)",
-                found.node_id, done.kind, done.snapshot_id, done.bytes
+                "Instance {session_id} suspended on {} ({} checkpoint {}, {} bytes{})",
+                found.node_id,
+                done.kind,
+                done.snapshot_id,
+                done.bytes,
+                if done.published_url.is_empty() {
+                    String::new()
+                } else {
+                    format!(", published to {}", done.published_url)
+                }
             )
         };
         Ok(Some(SuspendInstanceReply {
@@ -272,24 +280,144 @@ impl ManagerDaemonService {
             kind: done.kind,
             node_id: found.node_id,
             deduplicated: false,
-            durability: "local".to_string(),
+            durability: if done.durability.is_empty() {
+                "local".to_string()
+            } else {
+                done.durability
+            },
         }))
+    }
+
+    /// The job and task of a `store` session id: the session task whose
+    /// sessions publish checkpoints (`suspend.durability = "store"`) and
+    /// whose id shape the id has, once `Write` on the job is enforced. The
+    /// manager keeps no record of sessions, so this scans the jobs.
+    fn store_session_task(
+        &self,
+        identity: &AclIdentity,
+        session_id: &str,
+    ) -> Result<Option<(String, TaskConfig)>, Status> {
+        let jobs = self
+            .store
+            .get_jobs()
+            .map_err(|e| map_store_error("Error loading jobs", e))?;
+        for job in jobs {
+            let Ok(config) = self.store.get_job_config(&job.name) else {
+                continue;
+            };
+            let found = config.tasks.iter().find(|task| {
+                crate::structs::session::is_session_task(task)
+                    && crate::structs::session::publishes_checkpoints(task)
+                    && crate::structs::is_minted_for_task(session_id, &task.name)
+            });
+            if let Some(task) = found {
+                acl::enforce(
+                    identity,
+                    AclResource::Job,
+                    AclAction::Write,
+                    &AclScope::job(&job.name),
+                )?;
+                return Ok(Some((job.name.clone(), task.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resume a `store` session from its manifest on any node with room
+    /// (docs/session-mode.md, "Moving a session"). `None` when the id is no
+    /// `store` session's.
+    async fn resume_store_instance(
+        &self,
+        identity: &AclIdentity,
+        session_id: &str,
+        cold: bool,
+        force_move: bool,
+    ) -> Result<Option<StartInstanceReply>, Status> {
+        let Some((job_id, task)) = self.store_session_task(identity, session_id)? else {
+            return Ok(None);
+        };
+        match sessions::resume_store_session(
+            &self.store,
+            &job_id,
+            &task,
+            session_id,
+            cold,
+            force_move,
+        )
+        .await?
+        {
+            sessions::StoreResume::Running { node_id } => Ok(Some(StartInstanceReply {
+                message: format!("Instance {session_id} already running on {node_id}"),
+                node_id,
+                ..Default::default()
+            })),
+            sessions::StoreResume::Resumed { node_id, reply } => {
+                let message = if reply.already_running {
+                    format!("Instance {session_id} already running on {node_id}")
+                } else if reply.moved_from.is_empty() {
+                    format!(
+                        "Instance {session_id} resumed on {node_id} from the content store \
+                         (generation {})",
+                        reply.generation
+                    )
+                } else {
+                    format!(
+                        "Instance {session_id} moved from {} and resumed on {node_id} \
+                         (generation {})",
+                        reply.moved_from, reply.generation
+                    )
+                };
+                Ok(Some(StartInstanceReply {
+                    message,
+                    resuming_from: reply.resumed_from,
+                    node_id,
+                    ..Default::default()
+                }))
+            }
+        }
     }
 
     /// StartInstance on a session: running answers that it already runs;
     /// suspended resumes it on its node (`Worker.ResumeSession`) under the
-    /// same id, from its checkpoint or, `cold`, booted fresh. `None` when no session has the id.
+    /// same id, from its checkpoint or, `cold`, booted fresh. A `store`
+    /// session whose node lost it, evicted its local copy, is full, or does
+    /// not answer resumes from its manifest on another node instead
+    /// (`force_move` moves it even when its old node did not answer the
+    /// probe and is not marked down). `None` when no session has the id.
     pub(super) async fn start_session_instance(
         &self,
         identity: &AclIdentity,
         session_id: &str,
         cold: bool,
+        force_move: bool,
     ) -> Result<Option<StartInstanceReply>, Status> {
-        let Some(found) = self
+        let located = self
             .locate_session(identity, session_id, AclAction::Write)
-            .await?
-        else {
-            return Ok(None);
+            .await;
+        let found = match located {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                return self
+                    .resume_store_instance(identity, session_id, cold, force_move)
+                    .await
+            }
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::NotFound | tonic::Code::Unavailable
+                ) =>
+            {
+                // Evicted, or its node does not answer: a `store` session
+                // lives on in the content store.
+                return match self
+                    .resume_store_instance(identity, session_id, cold, force_move)
+                    .await?
+                {
+                    Some(reply) => Ok(Some(reply)),
+                    None => Err(status),
+                };
+            }
+            Err(status) => return Err(status),
         };
         let state = found
             .status
@@ -303,20 +431,36 @@ impl ManagerDaemonService {
                 ..Default::default()
             }));
         }
-        let reply = sessions::resume_on_node(&self.store, &found.node_id, session_id, cold)
-            .await
-            .map_err(|status| {
-                if status.code() == tonic::Code::ResourceExhausted {
-                    Status::resource_exhausted(format!(
-                        "{}\nHint: the session stays suspended with its checkpoint; retry \
-                         when another session on {} ends or suspends",
-                        status.message().split("\nHint:").next().unwrap_or_default(),
-                        found.node_id
-                    ))
-                } else {
-                    status
+        let resumed =
+            sessions::resume_on_node(&self.store, &found.node_id, session_id, cold, None, false)
+                .await;
+        if let Err(status) = resumed.as_ref() {
+            // Full, or its local copy went meanwhile: a `store` session
+            // resumes from its manifest elsewhere.
+            if matches!(
+                status.code(),
+                tonic::Code::ResourceExhausted | tonic::Code::NotFound
+            ) {
+                if let Some(reply) = self
+                    .resume_store_instance(identity, session_id, cold, force_move)
+                    .await?
+                {
+                    return Ok(Some(reply));
                 }
-            })?;
+            }
+        }
+        let reply = resumed.map_err(|status| {
+            if status.code() == tonic::Code::ResourceExhausted {
+                Status::resource_exhausted(format!(
+                    "{}\nHint: the session stays suspended with its checkpoint; retry \
+                         when another session on {} ends or suspends",
+                    status.message().split("\nHint:").next().unwrap_or_default(),
+                    found.node_id
+                ))
+            } else {
+                status
+            }
+        })?;
         let message = if reply.already_running {
             format!("Instance {session_id} already running")
         } else {

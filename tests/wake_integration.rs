@@ -164,6 +164,7 @@ fn job() -> JobConfig {
             }),
             envelope: None,
             promote: None,
+            fence_after: None,
         }),
         network: Some(NetworkConfig {
             ports: vec![PortConfig {
@@ -251,6 +252,7 @@ impl Control for InProcess {
                 instance_id: instance_id.into(),
                 idempotency_key: None,
                 cold: false,
+                force_move: false,
             }))
             .await?
             .into_inner();

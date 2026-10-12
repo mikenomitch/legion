@@ -170,6 +170,7 @@ impl Cluster {
                 instance_id: id.into(),
                 idempotency_key: None,
                 cold: false,
+                force_move: false,
             }))
             .await
             .map(|reply| reply.into_inner())
@@ -293,6 +294,7 @@ fn job(archive: &str, on_restore_failure: Option<&str>) -> JobConfig {
             storage: None,
             envelope: None,
             promote: None,
+            fence_after: None,
         }),
         suspend: Some(SuspendConfig {
             durability: Some("store".into()),

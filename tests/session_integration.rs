@@ -60,6 +60,23 @@ struct NodeState {
     /// Sessions this node evicted, with the `evicted:` answer's details.
     evicted: BTreeMap<String, String>,
     epoch: u64,
+    /// This node's id, as `store` session manifests name it.
+    node_id: String,
+    /// The content store's session manifests, shared by every fake node.
+    bucket: Bucket,
+}
+
+/// A stand-in for the session manifests in a shared content store: each
+/// `store` session's holder, generation, and state. The real conditional
+/// writes are covered by the unit tests in `src/session_manifest.rs`; here
+/// one lock makes every claim atomic.
+type Bucket = Arc<Mutex<BTreeMap<String, Manifest>>>;
+
+#[derive(Debug, Clone, PartialEq)]
+struct Manifest {
+    node: String,
+    generation: u64,
+    state: String,
 }
 
 #[derive(Clone)]
@@ -102,6 +119,17 @@ impl Worker for FakeNode {
         if let Some((provisional, session)) = session {
             if state.full {
                 return Err(Status::resource_exhausted("the envelope is full"));
+            }
+            if allocation.task_suspend.contains("\"store\"") {
+                let node = state.node_id.clone();
+                state.bucket.lock().expect("bucket").insert(
+                    provisional.instance_id.clone(),
+                    Manifest {
+                        node,
+                        generation: 1,
+                        state: "running".into(),
+                    },
+                );
             }
             state.sessions.insert(
                 provisional.instance_id.clone(),
@@ -157,12 +185,32 @@ impl Worker for FakeNode {
                 Some(status) => {
                     let already = status.state == "suspended";
                     status.state = "suspended".into();
+                    // A `store` session publishes: its manifest says
+                    // suspended on this node.
+                    let node = state.node_id.clone();
+                    let published = {
+                        let mut bucket = state.bucket.lock().expect("bucket");
+                        match bucket.get_mut(&id) {
+                            Some(manifest) => {
+                                manifest.state = "suspended".into();
+                                manifest.node = node;
+                                true
+                            }
+                            None => false,
+                        }
+                    };
                     reply.suspended.push(SuspendedSession {
-                        session_id: id,
+                        session_id: id.clone(),
                         snapshot_id: "snap-fake".into(),
                         kind: "memory".into(),
                         bytes: 4096,
                         already_suspended: already,
+                        durability: if published { "store" } else { "local" }.into(),
+                        published_url: if published {
+                            format!("file:///bucket/sessions/{id}.json")
+                        } else {
+                            String::new()
+                        },
                     });
                 }
                 None => reply.failed.push(SessionSleepFailure {
@@ -179,7 +227,8 @@ impl Worker for FakeNode {
         &self,
         request: Request<ResumeSessionRequest>,
     ) -> Result<Response<ResumeSessionReply>, Status> {
-        let id = request.into_inner().session_id;
+        let request = request.into_inner();
+        let id = request.session_id.clone();
         let mut state = self.lock();
         if let Some(when) = state.evicted.get(&id) {
             return Err(Status::not_found(format!(
@@ -187,6 +236,54 @@ impl Worker for FakeNode {
             )));
         }
         let full = state.full;
+        if !state.sessions.contains_key(&id) && !request.job_id.is_empty() {
+            // Resume from the manifest, as a node that never held it does.
+            let bucket = state.bucket.clone();
+            let mut bucket = bucket.lock().expect("bucket");
+            let Some(manifest) = bucket.get_mut(&id) else {
+                return Err(Status::not_found(format!(
+                    "not_found: no manifest for {id}"
+                )));
+            };
+            if manifest.state == "running" && manifest.node != state.node_id && !request.force_move
+            {
+                return Err(Status::failed_precondition(format!(
+                    "running_elsewhere: generation {g} runs on node {n} [winner node={n} generation={g}]",
+                    g = manifest.generation,
+                    n = manifest.node
+                )));
+            }
+            if full {
+                return Err(Status::resource_exhausted("envelope full"));
+            }
+            let moved_from = manifest.node.clone();
+            manifest.generation += 1;
+            manifest.node = state.node_id.clone();
+            manifest.state = "running".into();
+            let generation = manifest.generation;
+            let status = SessionStatus {
+                session_id: id.clone(),
+                job_id: request.job_id.clone(),
+                task_name: request.task_name.clone(),
+                envelope_allocation_id: 1,
+                state: "running".into(),
+                generation,
+                ..Default::default()
+            };
+            state.sessions.insert(id.clone(), status.clone());
+            return Ok(Response::new(ResumeSessionReply {
+                session: Some(status),
+                node_id: state.node_id.clone(),
+                resumed_from: "store".into(),
+                generation,
+                moved_from: if moved_from == state.node_id {
+                    String::new()
+                } else {
+                    moved_from
+                },
+                ..Default::default()
+            }));
+        }
         let Some(status) = state.sessions.get_mut(&id) else {
             return Err(Status::not_found(format!("not_found: no session {id}")));
         };
@@ -345,9 +442,14 @@ impl Cluster {
         };
         let ca = cluster.store().ensure_mesh_ca()?;
         let roots = SwappableRoots::from_pem(&ca.cert_pem)?;
+        let bucket = Bucket::default();
         for node_id in nodes {
             let node = FakeNode {
-                state: Arc::new(Mutex::new(NodeState::default())),
+                state: Arc::new(Mutex::new(NodeState {
+                    node_id: node_id.to_string(),
+                    bucket: bucket.clone(),
+                    ..Default::default()
+                })),
             };
             let (key, csr) = generate_csr(node_id)?;
             let (cert, _) = sign_csr(
@@ -1182,5 +1284,155 @@ async fn session_start_latency_measure() -> R<()> {
     );
     println!("raft entries +{}", cluster.raft_entries() - before);
     assert_eq!(cluster.raft_entries(), before);
+    Ok(())
+}
+
+/// A `store` session whose node no longer holds it (its local copy was
+/// dropped once published) and whose node is full resumes on another node
+/// from its manifest: the manager falls back to the manifest, the new node
+/// claims the next generation, and nothing is written to raft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_session_resumes_on_another_node_from_its_manifest_test() -> R<()> {
+    let cluster = Cluster::with_suspend(
+        "agents-store",
+        &["n1", "n2"],
+        json!({ "durability": "store", "idle": { "after": "5m" } }),
+    )
+    .await?;
+    let a = cluster.create(None).await?;
+    let (home, other) = if a.node_id == "n1" {
+        ("n1", "n2")
+    } else {
+        ("n2", "n1")
+    };
+    for node in ["n1", "n2"] {
+        cluster.report(node).await?;
+    }
+    let before = cluster.raft_entries();
+    let slept = cluster
+        .svc
+        .suspend_instance(Request::new(SuspendInstanceRequest {
+            instance_id: a.instance_id.clone(),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(slept.durability, "store", "{slept:?}");
+    assert!(slept.message.contains("published to"), "{slept:?}");
+
+    // Its node dropped the published local copy, and is full.
+    cluster.node(home).lock().sessions.remove(&a.instance_id);
+    cluster.node(home).lock().full = true;
+    let start = |force_move: bool| {
+        cluster
+            .svc
+            .start_instance(Request::new(StartInstanceRequest {
+                instance_id: a.instance_id.clone(),
+                force_move,
+                ..Default::default()
+            }))
+    };
+    let moved = start(false).await?.into_inner();
+    assert_eq!(moved.node_id, other, "{moved:?}");
+    assert_eq!(moved.resuming_from, "store", "{moved:?}");
+    assert!(
+        moved.message.contains(&format!("moved from {home}")),
+        "{moved:?}"
+    );
+    assert!(moved.message.contains("generation 2"), "{moved:?}");
+    assert_eq!(
+        cluster.node(other).lock().sessions[&a.instance_id].state,
+        "running"
+    );
+
+    // Running on the other node now: a second start says so (the node the
+    // id is tagged with does not hold it, the manifest names the holder).
+    cluster.report(other).await?;
+    let again = start(false).await?.into_inner();
+    assert!(again.message.contains("already running"), "{again:?}");
+    assert_eq!(again.node_id, other, "{again:?}");
+    assert_eq!(
+        cluster.raft_entries(),
+        before,
+        "suspending and moving a store session write nothing to raft"
+    );
+    Ok(())
+}
+
+/// A manifest that names another node as running the session is not moved
+/// past while that node answers that it runs it: the start answers that it
+/// runs there. Once that node is marked down and does not answer, the move
+/// goes ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_session_running_elsewhere_moves_only_when_its_node_is_down_test() -> R<()> {
+    let cluster = Cluster::with_suspend(
+        "agents-elsewhere",
+        &["n1", "n2"],
+        json!({ "durability": "store", "idle": { "after": "5m" } }),
+    )
+    .await?;
+    let a = cluster.create(None).await?;
+    let (home, other) = if a.node_id == "n1" {
+        ("n1", "n2")
+    } else {
+        ("n2", "n1")
+    };
+    // The session moved to `other` earlier and runs there; `home` (whose tag
+    // it carries) no longer holds it, and no index has heard of the move.
+    let status = cluster
+        .node(home)
+        .lock()
+        .sessions
+        .remove(&a.instance_id)
+        .expect("started on its home node");
+    cluster
+        .node(other)
+        .lock()
+        .sessions
+        .insert(a.instance_id.clone(), status);
+    {
+        let bucket = cluster.node(home).lock().bucket.clone();
+        let mut bucket = bucket.lock().expect("bucket");
+        let manifest = bucket.get_mut(&a.instance_id).expect("manifest");
+        manifest.node = other.to_string();
+        manifest.generation = 2;
+    }
+    let start = || {
+        cluster
+            .svc
+            .start_instance(Request::new(StartInstanceRequest {
+                instance_id: a.instance_id.clone(),
+                ..Default::default()
+            }))
+    };
+    let running = start().await?.into_inner();
+    assert!(running.message.contains("already running"), "{running:?}");
+    assert_eq!(running.node_id, other, "{running:?}");
+
+    // `other` goes silent but is not marked down: no move, UNAVAILABLE.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let dead = listener.local_addr()?;
+    drop(listener);
+    let mut node = cluster.store().get_node(other)?;
+    node.config_attrs["workerAddress"] = json!(format!("https://{dead}"));
+    cluster.store().insert_node(NodeMsg::from(node.clone()))?;
+    let refused = start().await.expect_err("its node is not known to be down");
+    assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+    assert!(
+        refused.message().contains("running_elsewhere"),
+        "{refused:?}"
+    );
+    assert!(refused.message().contains("--force-move"), "{refused:?}");
+
+    // Marked down: the move goes ahead, to the session's home node.
+    node.status = "down".into();
+    cluster.store().insert_node(NodeMsg::from(node))?;
+    let moved = start().await?.into_inner();
+    assert_eq!(moved.node_id, home, "{moved:?}");
+    assert!(
+        moved.message.contains(&format!("moved from {other}")),
+        "{moved:?}"
+    );
+    assert!(moved.message.contains("generation 3"), "{moved:?}");
     Ok(())
 }

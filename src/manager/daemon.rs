@@ -3526,18 +3526,27 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 format!("invalid contentStore config in worker config {path_str}")
             })?;
         }
+        if let Some(sessions) = wcp.sessions.as_ref() {
+            sessions
+                .fence_list_every()
+                .with_context(|| format!("invalid sessions config in worker config {path_str}"))?;
+        }
         // The top-level `content` and `contentStore` blocks ride in the
         // artifacts payload (see `WorkerArtifactsPayload`).
-        let artifacts =
-            if wcp.artifacts.is_none() && wcp.content.is_none() && wcp.content_store.is_none() {
-                String::new()
-            } else {
-                serde_json::to_string(&crate::structs::WorkerArtifactsPayload {
-                    artifacts: wcp.artifacts.clone().unwrap_or_default(),
-                    content: wcp.content.clone(),
-                    content_store: wcp.content_store.clone(),
-                })?
-            };
+        let artifacts = if wcp.artifacts.is_none()
+            && wcp.content.is_none()
+            && wcp.content_store.is_none()
+            && wcp.sessions.is_none()
+        {
+            String::new()
+        } else {
+            serde_json::to_string(&crate::structs::WorkerArtifactsPayload {
+                artifacts: wcp.artifacts.clone().unwrap_or_default(),
+                content: wcp.content.clone(),
+                content_store: wcp.content_store.clone(),
+                sessions: wcp.sessions.clone(),
+            })?
+        };
 
         // Host volumes are validated here so a typo (a relative path) fails at
         // manager startup rather than at a task's first mount.
