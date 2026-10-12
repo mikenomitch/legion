@@ -136,6 +136,7 @@ After the instance is `active`, the gateway dials its port until it accepts
 - **Trade-off.** An agent does not discover the gateway from `legion
   capabilities`.
 - **Why.** It is a daemon like `start manager` and `start worker`, which are
-  not listed either; it produces no output to structure. The agent-facing
+  not listed either and sit with it in the `NO_ENVELOPE` exemptions of the
+  `every_command_accepts_json` test; it produces no output to structure. The agent-facing
   surface is the HTTP webhook, documented in `docs/agent-readiness.md`, and
   its errors use the standard envelope.
