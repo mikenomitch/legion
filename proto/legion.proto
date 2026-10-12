@@ -887,14 +887,26 @@ service Manager {
   rpc IssueNodeIdentityToken (IssueNodeIdentityTokenRequest)
       returns (IssueNodeIdentityTokenReply);
 
-  // Issue a short-lived **mesh certificate** for a worker node — the
-  // credential behind `certFrom = "legion"` (docs/network-handlers.md,
-  // "mTLS"). The first call creates the cluster's mesh CA (replicated with
-  // the control lane); every call signs a fresh key pair for the node with
-  // `<node>.node.legion` and `legion://node/<node id>` as its SANs, valid for
-  // 24 hours. Workers call it on their heartbeat loop once any allocation on
-  // the node terminates or originates mesh TLS, and again after a third of
-  // the lifetime has passed.
+  // Issue a short-lived **node certificate** for a worker node: the
+  // credential its worker plane serves on 4848 (docs/auth-and-acls.md, "The
+  // worker plane") and the mesh's node certificate behind
+  // `certFrom = "legion"` (docs/network-handlers.md, "mTLS"). The first call
+  // creates the cluster CA (replicated with the control lane).
+  //
+  // The worker generates its own key pair and sends only a CSR
+  // (`csr_pem`). The manager checks the CSR's self-signature, then signs its
+  // public key with names it chooses — `<node>.node.legion` and
+  // `legion://node/<node id>` as SANs, `ServerAuth` + `ClientAuth`, valid for
+  // 24 hours — and ignores every name the CSR requests, so a node can never
+  // obtain a certificate for another node or a manager. No private key ever
+  // crosses the network.
+  //
+  // Workers call it right after registration (the worker plane does not
+  // listen until it holds a certificate), again on their heartbeat loop
+  // after a third of the lifetime has passed, and early when a handshake on
+  // the worker plane suggests the cluster CA was rotated. The worker
+  // persists the key and certificate (mode 0600) so a restart can serve
+  // before it reaches a manager.
   //
   // The node's *workload* identities are never certificates: a dialing node
   // names the workload it forwards for in a PROXY protocol v2 TLV inside the
@@ -906,6 +918,8 @@ service Manager {
   // (`node:<node_id>`) must match the request's `node_id`.
   //
   // Errors:
+  // - InvalidArgument: `csr_pem` is missing, is not a PEM certificate
+  //   request, or its signature does not verify.
   // - NotFound: no node with `node_id` is registered.
   // - PermissionDenied: `node_id` does not match the caller's credential.
   // - Internal: the CA could not be created or signing failed.
@@ -946,8 +960,56 @@ service Manager {
   // Worker heartbeat endpoint.
   //
   // Workers send runtime state, failures, and allocation health snapshots.
-  // The manager returns the desired allocations for that worker node.
+  // The manager returns the desired allocations for that worker node,
+  // unless the worker receives its work over `StreamWork`: then the reply
+  // says so (`desired_via_stream`) and leaves the desired set out, and the
+  // heartbeat carries only a digest of what the worker holds
+  // (`work_stream`), so its size no longer grows with what the node runs.
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
+
+  // Sequenced delivery of work to one worker (docs/
+  // architecture-managers-workers.md, "Delivery"; sandbox-scaling plan,
+  // Phase 2).
+  //
+  // The worker opens this stream once and keeps it open. Its first frame is
+  // `StreamWorkRequest.open`, naming its node and the last position it
+  // applied (`last_epoch`, `last_seq`); every later frame is an `ack` of the
+  // highest `seq` it applied. The manager sends `StreamWorkReply` messages:
+  //
+  // - **Deltas.** Each committed change to an allocation on the node (placed,
+  //   updated, stopped, removed) becomes the next message on the node's
+  //   sequence: `upserts` carries the full `TaskAllocation` payload, exactly
+  //   what the heartbeat's desired set would have carried, and `stops` the
+  //   allocations that left the desired set with why. A placement reaches the
+  //   worker one network round trip after it commits, whatever the heartbeat
+  //   cadence.
+  // - **Full resync.** A message with `resync = true` carries the node's whole
+  //   desired set and replaces what the worker holds. It is the first message
+  //   on a stream that cannot resume: a new `epoch` (this manager process is
+  //   not the one the worker last streamed from, as after a failover or a
+  //   restart), a `last_seq` ahead of the manager's, or a `last_seq` older
+  //   than the messages the manager still keeps. It also follows a heartbeat
+  //   whose digest disagreed with the manager's (`HeartbeatReply.work_resync`).
+  //
+  // A worker that reconnects with the same `epoch` and a `last_seq` the
+  // manager still holds gets the messages after it replayed, then live
+  // deltas: nothing is lost and nothing is applied twice. Acked messages
+  // are pruned. The log is held in the manager's memory only: the
+  // committed allocation rows are the durable record, so a new manager
+  // process resyncs instead of replaying.
+  //
+  // Any manager serves the stream, leader or follower, from its own
+  // replica of the store.
+  //
+  // Called by the worker for its own node: the caller's authenticated
+  // per-node principal (`node:<node_id>`) must match `open.node_id`.
+  // Worker-plane endpoint: workers authenticate with their node token.
+  //
+  // Errors:
+  // - InvalidArgument: the first frame is not `open`, or names no node.
+  // - PermissionDenied: `open.node_id` does not match the caller's
+  //   credential.
+  rpc StreamWork (stream StreamWorkRequest) returns (stream StreamWorkReply);
 
   // Worker node health-check endpoint.
   //
@@ -1061,7 +1123,16 @@ service Manager {
   // - PermissionDenied: the caller lacks node:read on the node's pool.
   rpc GetNodeContent (GetNodeContentRequest) returns (GetNodeContentReply);
 
-  // Proxies a restart request to a worker node.
+  // Proxies a restart request to a worker node, over the mTLS worker plane
+  // (the manager's own certificate; the node's name verified).
+  //
+  // Errors:
+  // - PermissionDenied: caller lacks `node:write` on the node's pool.
+  // - NotFound: no such node.
+  // - FailedPrecondition: the node registered no worker address, or runs
+  //   worker protocol 2 or older (a plaintext address managers never dial).
+  // - Unavailable: the worker could not be reached or failed TLS
+  //   verification; the message names the node, address, and port.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 
   // Sets a node's scheduling availability: cordon, drain, or uncordon.
@@ -1102,6 +1173,32 @@ service Manager {
   //
   // The manager locates the node hosting each allocation and proxies the read
   // to that worker's `Worker.GetTaskLogs` RPC.
+  //
+  // Removed allocations stay reachable for a day: the manager remembers where
+  // every removed allocation ran (job, task, node, why it was removed) for 24
+  // hours, and the worker keeps the files for its log retention (7 days by
+  // default, `LEGION_LOG_RETENTION_DAYS`). So:
+  // - `allocation_id` names a live allocation or one removed within the
+  //   window; either way the reply carries it, with `removed` set for the
+  //   latter.
+  // - `job` returns the job's live allocations. When it has none (it failed,
+  //   finished, was stopped, or was destroyed) the reply holds its most
+  //   recently removed allocations instead, newest first, at most 10.
+  //   `include_removed` appends them even when live ones exist.
+  //
+  // A node that is gone, unreachable, or has pruned the files fills that
+  // allocation's `error` instead of failing the whole request. A worker's
+  // own error is relayed by its message (never as raw transport output). A
+  // worker the manager cannot reach over the mTLS worker plane gets an
+  // `error` that names the node, its address, and the port managers dial
+  // (4848 by default); a worker on protocol 2 or older (plaintext address)
+  // gets one naming its version.
+  //
+  // Errors:
+  // - InvalidArgument: neither `job` nor `allocation_id` is set.
+  // - NotFound: no such allocation, live or removed within the window; or no
+  //   such job and no removed allocations of that name within the window.
+  // - PermissionDenied: caller lacks `job:read` on the allocation's job.
   rpc GetAllocationLogs (GetAllocationLogsRequest)
     returns (GetAllocationLogsReply);
 
@@ -1119,6 +1216,21 @@ service Manager {
   // revoked or expired, or its policies no longer grant the session, the
   // stream ends with that auth error (`UNAUTHENTICATED` or
   // `PERMISSION_DENIED`) and the worker-side process is cancelled.
+  //
+  // The manager dials the worker over the mTLS worker plane
+  // (docs/auth-and-acls.md, "The worker plane"): its own manager certificate,
+  // the cluster CA as the only root, the node's name verified. An error the
+  // worker returns (no such allocation, a refused command) is relayed with
+  // its own code.
+  //
+  // Worker-plane errors:
+  // - Unavailable: the worker could not be reached or failed TLS
+  //   verification. The message names the node, its address, and the port
+  //   managers dial (4848 by default), and how to fix it. Retryable.
+  // - FailedPrecondition: the node registered no worker address, or
+  //   advertises a plaintext `http://` address because it runs worker
+  //   protocol 2 or older (the message names the version); upgrade the
+  //   worker.
   rpc ExecAllocation (stream ExecClientFrame) returns (stream ExecServerFrame);
 
   // Lists the actions declared on a job's tasks (for CLI + UI discovery).
@@ -1604,9 +1716,11 @@ message WorkerPreRegisterRequest {
 
   // Join token secret (the `secret` field of a decoded join token).
   //
-  // Required when ACLs are enforced: the manager validates it against its
-  // stored join tokens before serving worker configuration. Ignored when
-  // ACLs are disabled.
+  // When ACLs are enforced the caller must present either this (validated
+  // against the manager's stored join tokens) or an already-issued node
+  // token as its bearer credential, with this field left unset — the path a
+  // restarted worker takes, so it does not depend on its join token still
+  // being valid. Ignored when ACLs are disabled.
   optional string join_token = 2;
 }
 
@@ -1719,6 +1833,21 @@ message WorkerConfig {
   //
   // Default: empty string (this node accepts no edge starts).
   string edge_boot = 13;
+
+  // JSON-encoded `container` runtime settings for this worker type (see
+  // docs/task-runtime-container.md, "Capabilities"). Shape:
+  // `{"allowCaps":["CAP_CHOWN","CAP_NET_RAW",...]}` or `{"allowCaps":["ALL"]}`.
+  //
+  // `allowCaps` is the set of Linux capabilities a `container` task on this
+  // node may end up with after its `security.capabilities` adjustments (the
+  // default set, less `drop`, plus `add`). A task whose effective set holds
+  // anything outside it fails at start on this node, with a message naming
+  // each refused capability and this field. The manager writes the names
+  // normalized (`CAP_` prefixed, sorted); `["ALL"]` allows every capability.
+  //
+  // Default: empty string (the default set: Docker's default capabilities
+  // less `CAP_NET_RAW`, so jobs may drop capabilities but add none).
+  string container = 14;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -1757,14 +1886,19 @@ message WorkerRegisterRequest {
 
   // Manager-populated defaults on registration (not client-provided):
   // - `status = "active"`
-  // - `availability = "available"` for a new node; re-registration keeps the
-  //   node's existing availability (a drained node stays drained)
+  // - `availability = "available"` for a new node; re-registration keeps an
+  //   operator's `drained` (a cordoned node stays cordoned) and turns the
+  //   `unavailable` that node loss sets back into `available` (a registering
+  //   worker is alive)
   // - `dynamic_attrs = {}`
   // - `last_heartbeat = ""` until first heartbeat
 
   // Join token secret (the `secret` field of a decoded join token).
   //
-  // Required when ACLs are enforced. Ignored when ACLs are disabled.
+  // When ACLs are enforced, a registration must present either this or the
+  // node's own current node token as its bearer credential (with this field
+  // left unset). A node token can re-register only its own node, in its
+  // current pool. Ignored when ACLs are disabled.
   optional string join_token = 6;
 
   // Semantic build version of the worker binary (its Cargo package version,
@@ -1816,9 +1950,22 @@ message WorkerRegisterReply {
   string message = 1;
 
   // Per-node credential for subsequent worker-plane calls (Heartbeat,
-  // HealthCheck). Minted only when ACLs are enforced; re-registering
-  // rotates it (the previous node token is revoked). Workers attach it as
-  // a bearer credential exactly like an ACL token.
+  // HealthCheck, and the identity, certificate, and credential issuers).
+  // Workers attach it as a bearer credential exactly like an ACL token.
+  //
+  // Minted only when ACLs are enforced, and only when the caller registered
+  // with a join token (or a management token): that registration rotates it
+  // (the node's previous node token is revoked). A worker that re-registers
+  // by presenting its CURRENT node token as its bearer credential — what a
+  // restarted worker does, from the token it persisted with mode 0600 in its
+  // state directory — gets no new token here: absent means "keep using the
+  // one you presented". That is what lets a worker restart after its join
+  // token has expired or been revoked, and it removes the window in which a
+  // crash between the manager's rotation and the worker's write would lose
+  // the only valid credential.
+  //
+  // Node tokens do not expire. Removing the node or resetting ACL state
+  // revokes it; the worker then falls back to its join token.
   optional string node_token = 2;
 
   // Semantic build version of the manager binary that handled this
@@ -1835,6 +1982,12 @@ message WorkerRegisterReply {
   // at or below this version are compatible. `0` means the manager predates
   // version reporting.
   uint32 manager_protocol_version = 4;
+
+  // Every manager in the cluster, in the same form and with the same
+  // semantics as `HeartbeatReply.manager_addresses`: delivered at
+  // registration so a worker knows its failover set before its first
+  // heartbeat. Empty outside `persistence.type = "raft"`.
+  repeated string manager_addresses = 5;
 }
 
 // One submission unit that contributed to a rendered jobspec.
@@ -1902,8 +2055,15 @@ message RunJobReply {
   // - `"Job submit success"`
   // - `"Rollout started"`
   // - `"Rollout created; waiting for manual start"`
-  // - `"Job config unchanged; no update needed"`
+  // - `"Job config unchanged; no update needed (the job is running; use
+  //   --force-reschedule to restart it)"`
   // - `"Job config unchanged; forced reschedule queued"`
+  // - `"Job config unchanged; job was stopped, starting it again"`
+  // - `"Job config unchanged; job had failed, starting it again"`
+  // - `"Job config unchanged; job was not running, starting it again"`
+  //
+  // An unchanged spec restarts the job (a `job_update` eval) when the job was
+  // stopped or failed, or when nothing of it is running or queued to run.
   string message = 1;
 
   // True when this reply carries a previously recorded result for the request's
@@ -4212,9 +4372,14 @@ message Job {
   //   restart it).
   // - `running`: at least one allocation of any version of the job is live
   //   (placed and not yet terminal).
+  // - `blocked`: nothing is live, and the job's eval found no room for a
+  //   placement and waits for capacity that could help (docs/
+  //   scheduler-and-eval-loop.md, "Blocked evals"). It places on its own when
+  //   that capacity appears; `blocked` below says what it waits for. Takes
+  //   the place `pending` would have.
   // - `pending`: nothing is live, and a task that wants an allocation has not
-  //   finished: it is waiting to be placed (no node fits, or no node is up)
-  //   or waiting on a `dependsOn` condition.
+  //   finished: it is waiting to be placed or waiting on a `dependsOn`
+  //   condition.
   // - `scheduled`: nothing is live, nothing is pending, and a cron task
   //   (`schedule`) finished its last run and waits for the next one.
   // - `complete`: nothing is live, and every task that wants an allocation
@@ -4254,6 +4419,40 @@ message Job {
   // peer. See docs/preemption-and-eviction.md. Empty only when read from a
   // manager that predates bands.
   string priority = 6;
+
+  // Set while the job has an eval blocked on capacity
+  // (docs/scheduler-and-eval-loop.md, "Blocked evals"), whatever `status`
+  // reads: a job with a live allocation reads `running` and still says here
+  // what its other placements wait for; with nothing live it reads
+  // `blocked`. Unset for a job stopped or failed by its lifecycle.
+  optional JobBlocked blocked = 7;
+}
+
+// What a blocked job waits for.
+message JobBlocked {
+  // The blocking key: `class:pool=<pool>[,<attr>=<value>...]` (any node of
+  // that pool whose attributes match the task's `=` constraints can help),
+  // `node:<id>` (a resume pinned to the node holding its checkpoint or
+  // node-local storage), or `escaped` (the cluster had no schedulable node at
+  // all; any capacity wakes it).
+  string key = 1;
+
+  // The task that could not place.
+  string task = 2;
+
+  // What one placement of `task` asks for that no eligible node had free:
+  // `cpu` (e.g. `500MHz`) and `memory` (e.g. `512MiB`), for the resources the
+  // task declares. Per placement, not the job's total.
+  map<string, string> shortfall = 3;
+
+  // The scheduler's diagnosis, the message the eval used to fail with.
+  string message = 4;
+
+  // Unix timestamp (seconds) when the eval blocked.
+  int64 since = 5;
+
+  // The blocked eval's id.
+  string eval_id = 6;
 }
 
 // Reply payload for ListJobs.
@@ -4363,20 +4562,31 @@ message IssueNodeCertificateRequest {
   // The worker node the certificate is for. Must match the caller's
   // authenticated per-node credential.
   string node_id = 1;
+
+  // Required. A PKCS#10 certificate signing request, PEM
+  // (`-----BEGIN CERTIFICATE REQUEST-----`), for a key pair the worker
+  // generated and keeps. Only its public key is used; its subject and any
+  // requested SANs or extensions are ignored. Requests without one are
+  // refused with InvalidArgument: the manager never generates a node's key.
+  string csr_pem = 2;
 }
 
 // Reply payload for IssueNodeCertificate.
 message IssueNodeCertificateReply {
-  // The node certificate, PEM. SANs: `<node>.node.legion` and
-  // `legion://node/<node id>`.
+  // The node certificate, PEM, for the CSR's public key. SANs:
+  // `<node>.node.legion` (what a manager or peer node verifies when it
+  // dials this node) and `legion://node/<node id>` (the role the worker
+  // plane and the mesh read back). Extended key usages: ServerAuth and
+  // ClientAuth.
   string cert_pem = 1;
 
-  // The certificate's private key, PEM. Treat as a secret: never log it,
-  // never write it to disk — the worker holds it in memory and re-issues
-  // after a restart.
-  string key_pem = 2;
+  // Field 2 carried a manager-generated private key before the worker
+  // plane moved to CSRs (protocol 3). Never reuse it.
+  reserved 2;
+  reserved "key_pem";
 
-  // The mesh CA certificate, PEM. What a node verifies its peers against.
+  // The cluster CA certificate, PEM: the only trust root a node uses to
+  // verify managers dialing its worker plane and peers on the mesh.
   string ca_pem = 3;
 
   // Certificate expiry as Unix seconds.
@@ -4444,7 +4654,10 @@ message HeartbeatRequest {
   // `PERMISSION_DENIED`.
   string id = 1;
 
-  // Allocation IDs currently known/running on worker.
+  // Allocation IDs currently known/running on worker. Informational: the
+  // manager decides the desired set from its own rows, not from this list.
+  // A worker that reports `work_stream` leaves it empty (the digest stands
+  // in for it).
   //
   // Default: empty list.
   repeated int64 allocation_ids = 2;
@@ -4454,7 +4667,12 @@ message HeartbeatRequest {
   // Default: empty list.
   repeated FailedAllocation failed_allocations = 3;
 
-  // Latest per-allocation health snapshots from worker.
+  // Per-allocation health snapshots from worker. A worker without
+  // `work_stream` sends every allocation's health on every beat. A worker
+  // on the stream sends only the snapshots that changed since the last
+  // reply that set `HeartbeatReply.desired_via_stream`, and everything again
+  // after any other reply. Either way the manager writes only the rows whose
+  // values changed, so a steady beat writes nothing.
   //
   // Default: empty list.
   repeated AllocationHealth allocation_health = 4;
@@ -4571,6 +4789,98 @@ message HeartbeatRequest {
   // Absent from workers that predate content locality. The manager treats
   // such a node as holding nothing, so it scores 0 on locality.
   optional ContentLocationReport content_locations = 14;
+
+  // The worker's `StreamWork` position and a digest of the desired set it
+  // holds, sent instead of `allocation_ids` by a worker that receives its
+  // work over the stream (sandbox-scaling plan, Phase 2). The manager
+  // compares the digest with its own for the node once every message up to
+  // `seq` has been applied, and answers `HeartbeatReply.work_resync` when
+  // they differ, so a delta lost to a bug is caught within one beat.
+  //
+  // Absent from workers that do not stream, which get today's full desired
+  // set in every reply.
+  optional WorkStreamState work_stream = 15;
+}
+
+// Where a worker's `StreamWork` delivery stands, as its heartbeat reports
+// it.
+message WorkStreamState {
+  // The `StreamWorkReply.epoch` of the messages the worker applied.
+  uint64 epoch = 1;
+
+  // The highest `StreamWorkReply.seq` the worker applied.
+  uint64 seq = 2;
+
+  // Digest of the allocation ids in the worker's desired set after `seq`:
+  // `<count>:<xor of splitmix64(id)>`, both in lowercase hex. Order
+  // independent, so either side can update it per delta.
+  string digest = 3;
+}
+
+// One frame from the worker on `StreamWork`.
+message StreamWorkRequest {
+  oneof frame {
+    // The first frame, and only the first.
+    StreamWorkOpen open = 1;
+    // Every later frame: the highest message the worker has applied.
+    StreamWorkAck ack = 2;
+  }
+}
+
+// Opens a `StreamWork` stream.
+message StreamWorkOpen {
+  // The worker's node id. Must match the caller's node credential.
+  string node_id = 1;
+
+  // The `epoch` of the last message the worker applied, or 0 when it holds
+  // nothing (a fresh worker process). A value other than the manager's
+  // current epoch gets a full resync.
+  uint64 last_epoch = 2;
+
+  // The `seq` of the last message the worker applied, or 0. The manager
+  // replays everything after it when it still holds those messages, and
+  // resyncs otherwise.
+  uint64 last_seq = 3;
+}
+
+// Acknowledges every `StreamWork` message up to `seq`, so the manager can
+// prune them.
+message StreamWorkAck {
+  uint64 epoch = 1;
+  uint64 seq = 2;
+}
+
+// One message on `StreamWork`.
+message StreamWorkReply {
+  // The manager process's delivery epoch: a random non-zero value chosen
+  // when the manager starts. Positions from another epoch cannot be
+  // resumed.
+  uint64 epoch = 1;
+
+  // This message's position in the node's sequence. Starts at 1 and grows
+  // by one per message.
+  uint64 seq = 2;
+
+  // `true` when `upserts` is the node's whole desired set and replaces
+  // everything the worker holds. `stops` is empty on a resync.
+  bool resync = 3;
+
+  // Allocations added to or changed in the node's desired set, as full
+  // payloads (the same `TaskAllocation` the heartbeat's desired set carries,
+  // restore payload and band included). The worker launches the new ones
+  // at once and replaces its copy of the rest.
+  repeated TaskAllocation upserts = 4;
+
+  // Allocations that left the node's desired set: stopped, removed,
+  // suspended, preempted. `cause` is the stop notice's cause, empty when
+  // the manager recorded none. A message carrying stops (or a resync, or a
+  // changed payload) makes the worker run its reconcile at once, which
+  // stops anything the desired set no longer lists.
+  repeated StopNotice stops = 5;
+
+  // The digest of the worker's desired set after applying this message, in
+  // the `WorkStreamState.digest` form.
+  string digest = 6;
 }
 
 // Content locality. One heartbeat's content advertisement. See
@@ -4997,6 +5307,48 @@ message HeartbeatReply {
   //
   // Default: false. Never set for a heartbeat that carried no report.
   bool content_resync = 10;
+
+  // The desired set was left out of this reply because the worker receives
+  // it over `StreamWork` (sandbox-scaling plan, Phase 2): `desired_allocations`
+  // and `stop_notices` are empty and must not be read as "run nothing". Set
+  // only when the request carried `work_stream` in the epoch of a stream
+  // this manager is serving for the node.
+  bool desired_via_stream = 11;
+
+  // The worker's `work_stream.digest` disagreed with the manager's at the
+  // same `seq`: the manager will send a full resync on the stream. Never set
+  // while messages the worker has not applied are in flight.
+  bool work_resync = 12;
+
+  // Every manager in the cluster, as `scheme://host:port` addresses the
+  // worker can dial, so a worker is not tied to the one manager its join
+  // token names.
+  //
+  // Populated from the replicated raft membership (voters and learners): each
+  // entry is a member's raft `advertiseAddr`, which is the same listener as
+  // its Manager API (the raft transport shares it), prefixed with the scheme
+  // of the answering manager's own API listener (`https` when `server.tls`
+  // is enabled, `http` otherwise). The
+  // worker persists the list beside its state (`managers.json` in the worker
+  // state directory) and, after consecutive transport failures to its
+  // current manager, moves to the next one in the list — and on to the next
+  // after that, wrapping around, so it returns to a recovered manager the
+  // same way. Any manager accepts any worker-plane call: a manager that does
+  // not lead the owning raft lane forwards the write to the leader. A
+  // restarted worker reads the persisted list, so it comes up even when the
+  // manager named in its token is down.
+  //
+  // The list is a snapshot, not a delta: the worker replaces its copy
+  // wholesale whenever it changes, and always keeps the address from its
+  // join token as a last resort. Addresses must be reachable from workers;
+  // when managers advertise a raft address workers cannot reach, the worker
+  // tries each one in turn and keeps the ones that answer.
+  //
+  // Default: empty on a manager that does not run `persistence.type = "raft"`
+  // (there is no other manager to fail over to) or that predates this
+  // field; an empty list leaves the worker's known set unchanged.
+  // See docs/architecture-managers-workers.md.
+  repeated string manager_addresses = 13;
 }
 
 // Why one allocation is being stopped.
@@ -7624,9 +7976,15 @@ message Eval {
   // Eval ID.
   string id = 1;
 
-  // Eval status (for example: pending, in_flight, failed).
+  // Eval status: `pending`, `in_flight`, `blocked`, or `failed`.
   //
-  // Newly enqueued evals start as `pending`.
+  // Newly enqueued evals start as `pending`. `in_flight` is reported only by
+  // the manager whose eval worker has claimed the eval: a claim is that
+  // manager's memory, and every other manager shows the row as `pending`.
+  // `blocked` means the eval's plan found no room and it waits, under a key
+  // (`class:pool=…`, `node:<id>`, `escaped`), for capacity that could help;
+  // it returns to `pending` on its own (docs/scheduler-and-eval-loop.md,
+  // "Blocked evals"). `failed` evals are never retried.
   string status = 2;
 
   // Eval kind (for example: job_submit, node_drop, rollout_tick).
@@ -7656,20 +8014,54 @@ message Eval {
 
 // === WORKER ===
 
-// Worker is the per-node runtime API called by the manager.
+// Worker is the per-node runtime API: the worker plane, served by every
+// worker on `LEGION_WORKER_HOST:LEGION_WORKER_PORT` (default `0.0.0.0:4848`)
+// and advertised as the node's `workerAddress` (`https://<host>:<port>`).
+//
+// It is always mutual TLS (docs/auth-and-acls.md, "The worker plane"). The
+// worker serves its node certificate (IssueNodeCertificate) and requests,
+// but does not require, a client certificate chaining to the cluster CA.
+// Each RPC admits named caller classes, checked before the request is read:
+//
+// - `manager`: a client certificate from the cluster CA carrying a
+//   `legion://manager/<id>` URI SAN. Every manager mints its own. A node
+//   certificate is not a manager certificate.
+// - `ticket`: a signed ticket in the request, verified offline. A client
+//   certificate is not needed and is ignored.
+//
+// A call without an admitted class is refused with Unauthenticated, for
+// example `GetTaskLogs is a manager-only worker RPC: present a Legion
+// manager certificate`. These checks hold whether or not the cluster runs
+// ACLs: managers apply ACLs before they dial, and only managers hold
+// manager certificates.
 service Worker {
-  // Delivers one allocation payload to worker for execution/reconciliation.
+  // Delivers one allocation payload to the worker for execution or
+  // reconciliation (and edge boot's provisional starts and ratifications).
+  //
+  // Caller class: `manager`. Best-effort from the manager's side: a failed
+  // push is healed by the next heartbeat reply, which carries the full
+  // desired set.
   rpc PostWork (PostWorkRequest) returns (PostWorkReply);
 
-  // Requests the worker process to restart itself.
+  // Requests the worker process to restart itself (`legion node restart`).
+  //
+  // Caller class: `manager`. The manager enforces `node:write` on the
+  // node's pool before it dials.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 
   // Reads captured stdout/stderr files for one allocation on this node.
+  //
+  // Caller class: `manager`. The manager enforces `job:read` on the
+  // allocation's job before it dials.
   rpc GetTaskLogs (GetTaskLogsRequest) returns (GetTaskLogsReply);
 
-  // Runs an exec session against a local allocation. Called only by the
-  // manager (worker plane); the manager has already authorized the caller and
+  // Runs an exec session against a local allocation. The manager has
+  // already authorized the caller (`exec:write` or `action:write`) and
   // rendered any action command into a raw argv on the `ExecStart` frame.
+  //
+  // Caller class: `manager`. The sandbox-exec plan's `ticket` class (direct
+  // exec with an exec ticket, behind the worker's `exec.direct`) is not
+  // implemented; until it is, every exec goes through a manager.
   rpc ExecTask (stream ExecClientFrame) returns (stream ExecServerFrame);
 
   // Starts work on this node from a boot ticket, without any call to a
@@ -7686,9 +8078,13 @@ service Worker {
   // `refused` at any point until `ratified`.
   //
   // Rejected with FailedPrecondition unless the worker was configured with
-  // `edgeBoot.acceptClaims: true`. Callers are authorized by the ticket
-  // alone; the worker holds no user credentials and verifies no other
-  // identity.
+  // `edgeBoot.acceptClaims: true`.
+  //
+  // Caller class: `ticket`. Callers are authorized by the boot ticket
+  // alone; no client certificate is needed and one that is presented is
+  // ignored. Callers dial `https://` and verify the node's certificate
+  // against the cluster CA (`legion net ca show`), as `legion sandbox
+  // start` does.
   rpc StartClaim (StartClaimRequest) returns (stream StartClaimReply);
 }
 
@@ -7900,6 +8296,12 @@ message GetAllocationLogsRequest {
   // Byte offset to read forward from (incremental tail / follow). Applied per
   // stream; see `GetTaskLogsRequest.offset`.
   int64 offset = 6;
+
+  // Also return the job's recently removed allocations (newest first, at
+  // most 10, removed within the last 24 hours) after its live ones. Without
+  // it they are returned only when the job has no live allocation. Ignored
+  // when `allocation_id` is set, which reaches a removed allocation anyway.
+  bool include_removed = 7;
 }
 
 // Captured logs for a single allocation, annotated with where they came from.
@@ -7918,6 +8320,24 @@ message AllocationLog {
 
   // Per-allocation error (for example: node unreachable). Empty on success.
   string error = 5;
+
+  // True when the allocation was already removed (stopped, replaced,
+  // rescheduled, its job destroyed) and its logs were read from the node's
+  // retained files. A removed allocation's output is final.
+  bool removed = 6;
+
+  // Why a removed allocation was removed: a stop cause such as `stop`,
+  // `update`, `node_lost`, `preempted`, `destroy`, `scale_in`. Empty for a
+  // live allocation, or when the removal named no cause.
+  string removal_cause = 7;
+
+  // When a removed allocation was removed, in unix seconds. 0 for a live
+  // allocation.
+  int64 removed_at_unix = 8;
+
+  // The allocation's status: `placed`, `complete`, or `failed` for a live
+  // row; for a removed one, its status at removal.
+  string status = 9;
 }
 
 // Reply payload for Manager.GetAllocationLogs.
@@ -8141,6 +8561,43 @@ message TaskAllocation {
   // forked or snapshotted. A worker that predates the field ignores it and
   // refreshes on its normal schedule.
   uint64 identity_epoch = 25;
+
+  // The task's `lifecycle` as declared in the jobspec: `service`, `batch`,
+  // or `sidecar`.
+  //
+  // Carried because the worker never sees a jobspec: it rebuilds the task
+  // from the fields on this message, and the lifecycle decides what a process
+  // exit means there. Together with `task_restart` it selects the restart
+  // policy the worker's task supervisor applies (docs/task-supervision.md):
+  // a `batch` task defaults to `onFailure`, so an exit with a status in
+  // `restart.successExitCodes` (default `[0]`) ends the allocation and is
+  // reported once in `HeartbeatRequest.terminated_allocations` with
+  // `success = true`, which the manager records as allocation status
+  // `complete` and task status `success`. A `batch` task on a runtime that
+  // tracks no process (`noop`) is reported complete at start instead.
+  // `service` and `sidecar` default to `always`: they are relaunched in place
+  // on any exit.
+  //
+  // Always set by the manager. An empty string (a payload built by hand, or
+  // by a manager that predates the field) is read as `service`, which is the
+  // jobspec default.
+  string task_lifecycle = 26;
+
+  // The task's `restart` block as JSON, exactly as declared:
+  // `{"policy":"onFailure","delay":"5s","successExitCodes":[0,2]}`.
+  //
+  // `policy` is `always`, `onFailure`, or `never`; `delay` is the wait before
+  // an in-place relaunch (defaults to `on_unhealthy.restart_delay`);
+  // `successExitCodes` lists the exit statuses that count as success. The
+  // worker's supervisor applies it on every observed exit, sharing one
+  // restart budget (`on_unhealthy.restart_count` within `restart_period`)
+  // with health-check restarts; a wanted restart the budget refuses fails the
+  // allocation, which the manager then reschedules.
+  //
+  // Empty string when the task declares no `restart` block, which is NOT the
+  // same as declaring `always`: the policy then follows `task_lifecycle`
+  // (`onFailure` for `batch`, `always` otherwise).
+  string task_restart = 27;
 }
 
 // Request payload for PostWork.
@@ -9136,6 +9593,46 @@ service RaftTransport {
   // ACL: manager-plane internal, authenticated by cluster secret metadata.
   // It is not a `Manager` RPC, so it takes no ACL row.
   rpc FetchRootKey (FetchRootKeyRequest) returns (FetchRootKeyReply);
+
+  // Asks this manager to campaign for leadership of every raft group it
+  // runs, now. The building block of `legion raft command transfer-leader`
+  // and `step-down`: openraft 0.9 has no leader-transfer API, so the manager
+  // the operator talks to asks the TARGET to start an election (the
+  // equivalent of running `trigger-election` on the target), re-asking no
+  // faster than one election timeout until the target leads the control
+  // group or the command's deadline passes. The answer only says the
+  // campaign started; the caller watches leadership itself.
+  //
+  // A campaign while the current leader is healthy is not free: voters
+  // holding a live leader lease refuse it, and leadership moves once the
+  // incumbent observes the higher term. Expect the term to rise by a few.
+  //
+  // ACL: manager-plane internal, authenticated by cluster secret metadata.
+  // The operator-facing gate is `IssueRaftCommand` (`operator:write`); this
+  // is not a `Manager` RPC, so it takes no ACL row. An older manager answers
+  // `Unimplemented`, and the command reports that the target must be
+  // upgraded.
+  rpc TriggerElection (TriggerElectionRequest) returns (TriggerElectionReply);
+}
+
+// Request payload for RaftTransport.TriggerElection.
+message TriggerElectionRequest {
+  // The requesting manager's raft `nodeId`, recorded in the target's raft
+  // history so the campaign is attributable.
+  string requested_by = 1;
+
+  // The actor the operator command named (`legion raft command --actor`),
+  // for the same history entry. Empty means "api".
+  string actor = 2;
+}
+
+// Reply payload for RaftTransport.TriggerElection.
+message TriggerElectionReply {
+  // The answering manager's raft `nodeId` — the one now campaigning.
+  string node_id = 1;
+
+  // Raft groups (lane wire names) on which the campaign was started.
+  repeated string lanes = 2;
 }
 
 // Request payload for RaftTransport.FetchRootKey.

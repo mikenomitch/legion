@@ -8,7 +8,9 @@
 Run an OCI image inside a microVM instead of a container. The workload gets
 its own kernel, so escaping it means escaping a hypervisor instead of a
 syscall filter. Use it for untrusted code, agent workspaces, CI runners, and
-multi-tenant exec sandboxes.
+multi-tenant exec sandboxes. For running many of them (what each create,
+suspend, and resume costs, and how to measure it), see
+[Sandboxes at scale](sandboxes-at-scale.md).
 
 The job config is close to [`container`](task-runtime-container.md) (`image`,
 `command`, `env`). It adds what a VM needs and a container does not: guest size
@@ -75,6 +77,15 @@ the kernel and disks, though, so the Legion-specific machinery does not apply:
 - `vcpus` is forwarded only when the jobspec sets it. Otherwise the backend
   picks. Memory follows the same [guest size](#guest-size) rule as a
   microVM.
+- Apple `container` refuses a VM under **200 MiB**, a higher floor than a
+  microVM's 64 MiB. A sandbox whose constraints pin it to macOS
+  (`constraints = { os = "macos" }`) and sizes its guest below 200 MiB is
+  rejected at submit. Any other sandbox that lands on a macOS worker that
+  small fails at start with a message naming the floor and the field to
+  raise, instead of the runtime's error appearing only in the task's stderr.
+- The command follows the image directly, with no `--` separator: Apple
+  `container` would run a `--` as the executable ("failed to find target
+  executable --"). `container exec` into the sandbox has none either.
 - Volumes must use filesystem mode (bind-mounted, like the container runtime).
   A block volume fails at start, because Legion has no VMM to attach it to.
 - Exec is available here (`container exec`), unlike the microVM path.
@@ -91,6 +102,13 @@ without nested virtualization) runs the image through an OCI runtime bundle.
 That isolates with namespaces only, with no VM. Legion never selects it
 automatically. It exists so you can exercise the runtime on machines that
 cannot boot a VM. Do not treat it as a security boundary for untrusted code.
+
+The bundle is the one the `container` runtime builds, with its defaults:
+image layers extracted with their owners and modes, Docker's default
+capabilities without `NET_RAW`, `RLIMIT_NOFILE` at 1048576, and the task's log
+files handed to the image's user so it can reopen `/dev/stdout`. A sandbox has
+no `security` or `ulimits` fields; those defaults are fixed. See
+[docs/task-runtime-container.md](task-runtime-container.md#linux-image--bundle).
 
 ## How a microVM Boots
 
@@ -346,6 +364,16 @@ A missing kernel fails at start. The error names all three options: the task's
 `kernel` field, `LEGION_SANDBOX_KERNEL` on the worker, or a kernel installed at
 `/var/lib/legion/kernels/vmlinux`.
 
+cloud-hypervisor publishes guest kernels that work here on its
+[linux releases page](https://github.com/cloud-hypervisor/linux/releases)
+(`vmlinux-x86_64`). [Installing Legion and Its Runtimes](installation.md#3-install-a-guest-kernel)
+has the commands, along with installing cloud-hypervisor and checking
+`/dev/kvm`.
+
+Images reach the root disk through the same node
+[image cache](task-runtime-container.md#image-cache) the `container` runtime
+uses, so a second sandbox of one image on a node downloads nothing.
+
 ## Networking
 
 A sandbox's network is one of three shapes:
@@ -567,6 +595,11 @@ an `exec:write` rule without `host` is enough. See
 [exec-and-actions.md](exec-and-actions.md).
 
 ## Trying It Locally
+
+See [Installing Legion and Its Runtimes](installation.md#linux-the-sandbox-runtime-microvms)
+for the host setup: `/dev/kvm`, cloud-hypervisor, e2fsprogs, and a guest
+kernel. On AWS, the C7i, M7i, and R7i families and the 8i generation support
+nested virtualization, so a microVM worker does not need a `.metal` instance.
 
 ```bash
 # Linux with KVM. Install cloud-hypervisor (or firecracker) and e2fsprogs,

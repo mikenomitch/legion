@@ -146,8 +146,9 @@ concurrent planner. A worker asks the gate before each batch:
   sustained throttling.
 - **Already holding a batch** — the fused settle-and-claim hands each worker
   its next batch. If that batch plans and the gate refuses, the worker waits
-  for a permit rather than run over the limit. The rows are `in_flight` to it
-  either way; parking holds them exactly as the queue would have.
+  for a permit rather than run over the limit. The evals are claimed by it
+  (in its manager's memory) either way; parking holds them exactly as the
+  queue would have.
 
 The permit is a guard that releases itself when dropped, on every path —
 error, requeue, panic. A leaked permit would be a permanently wedged

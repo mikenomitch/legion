@@ -37,6 +37,28 @@ and a 60-second batch pool gets a 10-second window for the first and a
 Under a fixed 10-second window, a 13-second cadence would mean one missed
 beat marks a node dead.
 
+### What a beat carries, and what it no longer gates
+
+The interval decides liveness, not delivery. A worker receives its work over
+`Manager.StreamWork` ([Delivery](architecture-managers-workers.md#delivery)):
+a placement reaches it one round trip after it commits, so stretching the
+interval to relieve the manager no longer delays new work.
+
+The beat's size does not grow with what the node runs either. A worker on
+the stream reports its stream position, a digest of the allocation ids it
+holds, and only the allocation health that changed since the manager last
+acknowledged it; the reply leaves the desired set out. A steady beat from a
+300-allocation node is a 42-byte request and a 7-byte reply, and costs the
+manager 0.5 ms (debug build), where the full desired set was 5,154 bytes,
+102,670 bytes, and 26 ms. Measured before the stream at 1,000 and 10,000
+allocations per node (release build), the full set was 17,761 and 179,762
+request bytes, 439,771 and 4,408,772 reply bytes, and 27 and 344 ms of
+manager time per beat. A beat whose health did not change writes no rows.
+
+A worker whose stream is down reports no position and gets the full desired
+set, as every worker did before the stream; sizing that case is what the
+rest of this page still describes.
+
 ---
 
 ## Sizing a control plane

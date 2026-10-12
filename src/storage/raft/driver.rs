@@ -613,13 +613,19 @@ impl std::fmt::Display for NotRaftLeader {
             None => String::new(),
         };
         match (&self.leader_name, &self.leader_addr) {
+            // `addr` is the leader's raft advertise address — what PEER
+            // managers dial. It is said as such: from a laptop or another
+            // network it may not be reachable, and API callers never need
+            // it, because any manager forwards a rejected write to the
+            // leader (`manager::leader_forward`).
             (Some(name), Some(addr)) => write!(
                 f,
-                "this manager is not the raft leader{scope}; retry against its leader {name} at {addr}"
+                "this manager is not the raft leader{scope}; retry on its leader {name} \
+                 (raft advertise address {addr})"
             ),
             (Some(name), None) => write!(
                 f,
-                "this manager is not the raft leader{scope}; retry against its leader {name}"
+                "this manager is not the raft leader{scope}; retry on its leader {name}"
             ),
             _ => write!(
                 f,
@@ -888,6 +894,178 @@ impl MultiRaftDriver {
     /// Accepts `"name@host:port"` (and `"name=host:port"`, the peers-config
     /// spelling) directly; a bare `"name"` resolves its address from the
     /// configured `raft.peers` entries when possible.
+    /// The voter `target` names in the control group's membership, as
+    /// `(raft id, name, host:port)`. Accepts a bare member name or
+    /// `name@host:port`. A learner, or a name that is not a member, is an
+    /// invalid argument: only voters can lead.
+    fn voter_by_name(&self, engine: &Engine, target: &str) -> R<(NodeId, String, String)> {
+        let wanted = self.resolve_target(target).0;
+        let metrics = Self::control_metrics(engine).context("raft metrics unavailable")?;
+        let membership = metrics.membership_config.membership();
+        for (id, node) in membership.nodes() {
+            let (name, host_port) = split_node_addr(&node.addr);
+            if name == wanted || (name.is_empty() && host_port == wanted) {
+                if !membership.voter_ids().any(|voter| voter == *id) {
+                    return Err(invalid_raft_command(format!(
+                        "{wanted} is a learner, not a voter; only voters can lead \
+                         (promote it with `legion raft command add-voter --target {wanted}`)"
+                    )));
+                }
+                return Ok((*id, wanted, host_port.to_string()));
+            }
+        }
+        let members: Vec<String> = membership
+            .nodes()
+            .map(|(_, node)| split_node_addr(&node.addr).0.to_string())
+            .collect();
+        Err(invalid_raft_command(format!(
+            "{wanted} is not a member of this raft cluster (members: {})",
+            members.join(", ")
+        )))
+    }
+
+    /// `step-down`'s successor: the other voter whose log matches the
+    /// leader's furthest (so it can win without a catch-up). Only the leader
+    /// knows replication progress, so only the leader can step down.
+    fn step_down_target(&self, engine: &Engine) -> R<String> {
+        let metrics = Self::control_metrics(engine).context("raft metrics unavailable")?;
+        if metrics.current_leader != Some(self.raft_id) {
+            // The typed rejection, so the API layer forwards the command to
+            // the leader (`manager::leader_forward`): `step-down` works from
+            // any manager, like every other leader-only operation.
+            return Err(anyhow::Error::new(self.not_leader_error(Lane::Control))
+                .context("step-down runs on the raft leader"));
+        }
+        let membership = metrics.membership_config.membership();
+        let progress = metrics.replication.clone().unwrap_or_default();
+        membership
+            .voter_ids()
+            .filter(|id| *id != self.raft_id)
+            .max_by_key(|id| progress.get(id).cloned().flatten().map(|log| log.index))
+            .map(|id| member_name(&metrics, id))
+            .ok_or_else(|| {
+                invalid_raft_command(
+                    "step-down needs another voter to hand leadership to; this manager is \
+                     the only one",
+                )
+            })
+    }
+
+    /// Move control-group leadership to `target` (the transfer behind
+    /// `transfer-leader` and `step-down`). Returns whether the target leads
+    /// by the deadline, and how many elections were started.
+    ///
+    /// While handing leadership AWAY, this manager stops campaigning itself
+    /// (openraft's `elect` switch), so the incumbent cannot win back the
+    /// race it is trying to lose; the switch is restored before returning.
+    fn transfer_leadership(
+        &self,
+        engine: &Engine,
+        target_id: NodeId,
+        name: &str,
+        addr: &str,
+        actor: &str,
+    ) -> R<(bool, u32)> {
+        let election_max = Duration::from_millis(self.cfg.election_timeout_max_ms.max(100));
+        let deadline = Instant::now() + (election_max * 10).max(Duration::from_secs(10));
+        let retrigger = election_max + Duration::from_millis(250);
+        let control = engine
+            .lanes
+            .get(&Lane::Control)
+            .context("control raft group is not running")?;
+        let leads = || control.metrics().borrow().current_leader == Some(target_id);
+        if leads() {
+            return Ok((true, 0));
+        }
+        let handing_off = target_id != self.raft_id;
+        if handing_off {
+            for raft in engine.lanes.values() {
+                raft.runtime_config().elect(false);
+            }
+        }
+        let result = (|| -> R<(bool, u32)> {
+            let mut attempts = 0u32;
+            let mut last: Option<Instant> = None;
+            loop {
+                if leads() {
+                    return Ok((true, attempts));
+                }
+                if Instant::now() >= deadline {
+                    return Ok((false, attempts));
+                }
+                if last.is_none_or(|at| at.elapsed() >= retrigger) {
+                    last = Some(Instant::now());
+                    attempts += 1;
+                    if handing_off {
+                        if let Err(err) = self.remote_trigger_election(engine, addr, actor) {
+                            // The first ask must land; a later one failing
+                            // is an election in progress, not a dead target.
+                            if attempts == 1 {
+                                return Err(err.context(format!(
+                                    "could not ask {name} at {addr} to start an election"
+                                )));
+                            }
+                            debug!(target = %name, error = %err, "Re-asking the transfer target failed");
+                        }
+                    } else {
+                        for (lane, raft) in lanes_in_order(&engine.lanes) {
+                            Self::block_on_engine(engine, raft.trigger().elect())?.map_err(
+                                |e| {
+                                    anyhow!(
+                                        "failed triggering election on lane {}: {e}",
+                                        lane.wire_name()
+                                    )
+                                },
+                            )?;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })();
+        if handing_off {
+            for raft in engine.lanes.values() {
+                raft.runtime_config().elect(true);
+            }
+        }
+        result
+    }
+
+    /// Ask the manager at `addr` to campaign (`RaftTransport.TriggerElection`).
+    fn remote_trigger_election(&self, engine: &Engine, addr: &str, actor: &str) -> R<()> {
+        let secret: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = engine
+            .cluster_secret
+            .parse()
+            .map_err(|_| anyhow!("cluster secret is not valid ascii metadata"))?;
+        let pool = Arc::clone(&engine.pool);
+        let addr = addr.to_string();
+        let request = crate::structs::TriggerElectionRequest {
+            requested_by: self.node_id.clone(),
+            actor: actor.to_string(),
+        };
+        Self::block_on_engine(engine, async move {
+            // Dial inside the runtime (see `forward_lane_write`).
+            let channel = pool
+                .get(&addr)
+                .map_err(|e| anyhow!("malformed member address {addr}: {e}"))?;
+            let mut client =
+                crate::structs::raft_transport_client::RaftTransportClient::new(channel);
+            let mut request = tonic::Request::new(request);
+            request.set_timeout(Duration::from_secs(5));
+            request
+                .metadata_mut()
+                .insert(RAFT_CLUSTER_SECRET_METADATA_KEY, secret);
+            match client.trigger_election(request).await {
+                Ok(_) => Ok(()),
+                Err(status) if status.code() == tonic::Code::Unimplemented => Err(anyhow!(
+                    "{addr} runs a manager that predates remote elections; upgrade it, or run \
+                     `legion raft command trigger-election` against it directly"
+                )),
+                Err(status) => Err(anyhow!("{status}")),
+            }
+        })?
+    }
+
     fn resolve_target(&self, target: &str) -> (String, Option<String>) {
         for sep in ['@', '='] {
             if let Some((name, addr)) = target.rsplit_once(sep) {
@@ -1051,12 +1229,10 @@ impl MultiRaftDriver {
         let engine = self.engine()?;
         let lane = op.lane();
         // In `single` topology every lane rides the one control group; the
-        // envelope's group_id must name a group ACTIVE on the receiver.
-        let group = if engine.lanes.len() == 1 {
-            Lane::Control
-        } else {
-            lane
-        };
+        // envelope's group_id must name a group ACTIVE on the receiver, and
+        // the receiver checks it in the same (group) space via the same
+        // helper.
+        let group = crate::storage::raft::physical_group(engine.lanes.len(), lane);
         let hint = self.not_leader_error(lane);
         let Some(leader_addr) = hint.leader_addr.clone() else {
             return Err(anyhow::Error::new(hint).context(format!(
@@ -1140,6 +1316,42 @@ impl MultiRaftDriver {
     /// The lane's current leader address, when this node knows one.
     pub(crate) fn lane_leader_addr(&self, lane: Lane) -> Option<String> {
         self.not_leader_error(lane).leader_addr
+    }
+
+    /// A (lazily connected) channel to a peer manager's listener from the
+    /// engine's shared pool. `None` before the engine starts or for a
+    /// malformed address. Call inside a tokio runtime: building the channel
+    /// spawns its connection task (see `forward_lane_write`).
+    pub(crate) fn peer_channel(&self, host_port: &str) -> Option<tonic::transport::Channel> {
+        self.engine.get()?.pool.get(host_port).ok()
+    }
+
+    /// Every raft member's advertised `host:port` (voters and learners of
+    /// the control group, which every lane's membership mirrors), sorted and
+    /// deduplicated. The raft transport shares each manager's API listener,
+    /// so these are also the managers' API addresses — what workers are told
+    /// so they can fail over (spot-check P0-5). One metrics borrow; no I/O.
+    pub(crate) fn member_addresses(&self) -> Vec<String> {
+        let Some(engine) = self.engine.get() else {
+            return Vec::new();
+        };
+        let Some(raft) = engine.lanes.get(&Lane::Control) else {
+            return Vec::new();
+        };
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow();
+        let mut addrs: Vec<String> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(_, node)| {
+                crate::storage::raft::types::node_addr_host_port(&node.addr).to_string()
+            })
+            .filter(|addr| !addr.is_empty())
+            .collect();
+        addrs.sort();
+        addrs.dedup();
+        addrs
     }
 
     /// Send one liveness digest to the status-lane leader (liveness plan
@@ -1476,6 +1688,63 @@ const MEMBERSHIP_CHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// worker heartbeat RPC blocked behind a wedged lane; on expiry the origin
 /// returns its original typed rejection.
 const FORWARD_LANE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a restarted member holds its own elections when no leader
+/// replicates to it (quiet start): long enough for the manager listener to
+/// come up and the leader's replication backoff to reach it, short enough
+/// that a whole-cluster restart still elects promptly. Five election
+/// timeouts, and never under three seconds.
+fn quiet_start_window(election_timeout_max_ms: u64) -> Duration {
+    (Duration::from_millis(election_timeout_max_ms) * 5).max(Duration::from_secs(3))
+}
+
+/// Whether a just-started raft core should start quiet: it is a voter in a
+/// group with other voters (a sole voter must elect itself at once, and a
+/// learner never campaigns).
+fn quiet_start_applies(raft: &Raft, raft_id: NodeId) -> bool {
+    let metrics = raft.metrics();
+    let metrics = metrics.borrow();
+    let membership = metrics.membership_config.membership();
+    membership.voter_ids().any(|id| id == raft_id) && membership.voter_ids().count() > 1
+}
+
+/// Ends a quiet start: re-enables elections once a leader has replicated to
+/// this member (`seen`), or once `window` passes with none — the
+/// whole-cluster-restart case, where somebody has to campaign.
+async fn end_quiet_start(
+    raft: Raft,
+    lane: Lane,
+    seen: Arc<std::sync::atomic::AtomicBool>,
+    window: Duration,
+) {
+    let started = Instant::now();
+    while !seen.load(std::sync::atomic::Ordering::Relaxed) && started.elapsed() < window {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    raft.runtime_config().elect(true);
+    if seen.load(std::sync::atomic::Ordering::Relaxed) {
+        debug!(
+            lane = lane.wire_name(),
+            "Rejoined the raft group as a follower; elections enabled"
+        );
+    } else {
+        info!(
+            lane = lane.wire_name(),
+            quiet_secs = window.as_secs(),
+            "No raft leader replicated to this restarted member within its quiet window; \
+             enabling elections"
+        );
+    }
+}
+
+/// An operator command the caller got wrong (a missing or unknown target,
+/// a leader-only command on a follower). Typed so the RPC layer answers
+/// `INVALID_ARGUMENT` with the message instead of an opaque internal error.
+fn invalid_raft_command(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(crate::storage::errors::StorageError::InvalidInput {
+        message: message.into(),
+    })
+}
 
 /// Operator-meaningful name for a raft member: the `name` half of its
 /// `BasicNode.addr` (`"name@host:port"`), falling back to the bare addr or
@@ -2912,6 +3181,55 @@ fn voter_in_every_config(
 
 #[tonic::async_trait]
 impl RaftJoinHandler for EngineJoinHandler {
+    async fn trigger_election(
+        &self,
+        request: crate::structs::TriggerElectionRequest,
+    ) -> Result<crate::structs::TriggerElectionReply, tonic::Status> {
+        let mut lanes_started = Vec::new();
+        let mut term = 0;
+        let mut leader = None;
+        for (lane, raft) in lanes_in_order(&self.lanes) {
+            if lane == Lane::Control {
+                let metrics = raft.metrics().borrow().clone();
+                term = metrics.current_term;
+                leader = metrics.current_leader.map(|id| member_name(&metrics, id));
+            }
+            raft.trigger().elect().await.map_err(|e| {
+                tonic::Status::internal(format!(
+                    "failed starting an election on lane {}: {e}",
+                    lane.wire_name()
+                ))
+            })?;
+            lanes_started.push(lane.wire_name().to_string());
+        }
+        let actor = if request.actor.is_empty() {
+            "api"
+        } else {
+            request.actor.as_str()
+        };
+        info!(
+            requested_by = %request.requested_by,
+            actor,
+            "Campaigning for raft leadership at a peer's request (transfer-leader)"
+        );
+        MultiRaftDriver::push_history(
+            &self.history,
+            "election",
+            format!(
+                "Election started on {} at {}'s request (transfer-leader by {actor})",
+                self.node_id, request.requested_by
+            ),
+            actor,
+            Some(self.node_id.clone()),
+            term,
+            leader,
+        );
+        Ok(crate::structs::TriggerElectionReply {
+            node_id: self.node_id.clone(),
+            lanes: lanes_started,
+        })
+    }
+
     async fn join(
         &self,
         request: JoinRaftClusterRequest,
@@ -3299,6 +3617,11 @@ impl PersistenceDriver for MultiRaftDriver {
         let self_node = BasicNode::new(encode_node_addr(&self.node_id, &self.advertise_addr));
         let raft_id = self.raft_id;
         let bootstrap = self.cfg.bootstrap;
+        let append_entries_seen: HashMap<Lane, Arc<std::sync::atomic::AtomicBool>> = lanes_list
+            .iter()
+            .map(|lane| (*lane, Arc::new(std::sync::atomic::AtomicBool::new(false))))
+            .collect();
+        let quiet_window = quiet_start_window(self.cfg.election_timeout_max_ms);
 
         // Raft::new / initialize are async; drive them on the (brand-new)
         // engine runtime from a scoped thread so this works whether
@@ -3339,6 +3662,54 @@ impl PersistenceDriver for MultiRaftDriver {
                     )
                 })?;
 
+                // Quiet start (spot-check P2-10): a restarted member of a
+                // multi-voter group holds its own elections until a leader
+                // replicates to it, or its quiet window passes. Without this
+                // it campaigned once one leader lease plus its election
+                // timeout passed with no leader reaching it — and the
+                // manager binds the listener leaders reach it on only after
+                // raft starts, so a slow start used that window up. It kept
+                // campaigning while unreachable, and its higher term then
+                // deposed the healthy leader the moment that leader's
+                // heartbeat arrived: the restart cost an election and several
+                // terms. openraft 0.9 has no pre-vote, which is what prevents
+                // this in other raft implementations.
+                //
+                // Elections go off FIRST, before the membership is known:
+                // `Raft::new` returns before the core has reported the
+                // membership it loaded (the metrics start empty), so deciding
+                // from them straight away would always say "not a
+                // multi-voter group". A sole voter gets its elections back
+                // as soon as the loaded membership shows it is one.
+                let quiet = if had_state {
+                    raft.runtime_config().elect(false);
+                    let _ = raft
+                        .wait(Some(Duration::from_secs(2)))
+                        .metrics(
+                            |m| {
+                                m.membership_config
+                                    .membership()
+                                    .voter_ids()
+                                    .next()
+                                    .is_some()
+                            },
+                            "the loaded membership",
+                        )
+                        .await;
+                    let applies = quiet_start_applies(&raft, raft_id);
+                    if !applies {
+                        raft.runtime_config().elect(true);
+                    }
+                    applies
+                } else {
+                    false
+                };
+                if quiet {
+                    let watched = raft.clone();
+                    let seen = append_entries_seen.get(&lane).cloned().unwrap_or_default();
+                    tokio::spawn(end_quiet_start(watched, lane, seen, quiet_window));
+                }
+
                 if bootstrap {
                     let mut members = BTreeMap::new();
                     members.insert(raft_id, self_node.clone());
@@ -3376,7 +3747,10 @@ impl PersistenceDriver for MultiRaftDriver {
                 // wins its own election) once the listener serves. A blank
                 // non-bootstrap node is awaiting a join and proceeds
                 // leaderless.
-                if bootstrap || had_state {
+                // A quiet-starting member skips the wait: it will not elect
+                // itself, and no leader can reach it before the listener is
+                // up, so waiting could only delay startup.
+                if (bootstrap || had_state) && !quiet {
                     let wait_result = raft
                         .wait(Some(LEADER_WAIT))
                         .metrics(|m| m.current_leader.is_some(), "leader elected")
@@ -3531,6 +3905,7 @@ impl PersistenceDriver for MultiRaftDriver {
                 join_handler: Some(join_handler),
                 forward_store: Some(store.forward_executor_clone()),
                 schema_version: self.advertised_schema_version.clone(),
+                append_entries_seen: append_entries_seen.clone(),
             })
             .map_err(|_| anyhow!("raft transport registry already populated"))?;
 
@@ -3920,15 +4295,48 @@ impl PersistenceDriver for MultiRaftDriver {
                     leader,
                 )
             }
-            // openraft 0.9 has no leader-transfer / step-down API (it lands
-            // in 0.10). The A-2 lifecycle phase implements these as a
-            // remote-elect side RPC on the Join service; until then the gap
-            // is reported honestly instead of simulated.
-            "step-down" | "transfer-leader" => bail!(
-                "raft command `{command}` is not supported by openraft 0.9 (no leader-transfer \
-                 API); trigger-election on the desired leader is the current equivalent — a \
-                 remote-elect operator RPC ships with the membership phase"
-            ),
+            // openraft 0.9 has no leader-transfer / step-down API, so both
+            // are built on a remote elect: the target campaigns (the
+            // `RaftTransport.TriggerElection` RPC when it is another
+            // manager), re-asked no faster than one election timeout until
+            // it leads the control group or the deadline passes.
+            // `step-down` picks the most caught-up other voter.
+            "step-down" | "transfer-leader" => {
+                let target_name = if command == "transfer-leader" {
+                    target.map(str::to_string).ok_or_else(|| {
+                        invalid_raft_command(
+                            "transfer-leader needs --target <manager>: the raft member name \
+                             (see `legion raft status`) that should lead",
+                        )
+                    })?
+                } else {
+                    self.step_down_target(engine)?
+                };
+                let (target_id, name, addr) = self.voter_by_name(engine, &target_name)?;
+                let (moved, attempts) =
+                    self.transfer_leadership(engine, target_id, &name, &addr, actor)?;
+                if !moved {
+                    warning = Some(format!(
+                        "{name} has not taken leadership yet ({attempts} election(s) started); \
+                         an election may still be settling — check `legion raft status` and \
+                         re-run the command if leadership did not move"
+                    ));
+                }
+                let message = if moved {
+                    format!("Leadership transferred to {name} ({command} by {actor})")
+                } else {
+                    format!("Leadership transfer to {name} requested by {actor}; not yet settled")
+                };
+                Self::push_history(
+                    &self.history,
+                    "election",
+                    message,
+                    actor,
+                    Some(name),
+                    term,
+                    leader,
+                )
+            }
             "add-learner" | "add-voter" => {
                 let target =
                     target.with_context(|| format!("{command} command requires a target"))?;

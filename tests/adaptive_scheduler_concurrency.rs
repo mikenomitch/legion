@@ -368,8 +368,16 @@ fn off_mode_leaves_queue_order_exactly_as_it_was() -> R<()> {
             })
             .unwrap_or(false)
     })?;
+    // The stop frees capacity, so it can queue a capacity pass
+    // (`node_join`) behind itself; that eval is not part of the ordering
+    // under test.
+    let enqueued: Vec<&str> = order
+        .iter()
+        .map(String::as_str)
+        .filter(|kind| *kind != "node_join")
+        .collect();
     assert_eq!(
-        order.last().map(String::as_str),
+        enqueued.last().copied(),
         Some("job_stop"),
         "with the controller off, priority order is untouched: {order:?}"
     );

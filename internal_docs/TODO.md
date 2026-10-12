@@ -15,29 +15,34 @@ How to use it:
 
 ---
 
-- [ ] **Launch blocker: workers on another host lose exec, logs, and the
-      mesh, and any task can take over the cluster.** The worker binds
-      `127.0.0.1:4848` and always advertises `http://127.0.0.1:4848`
-      (`src/worker/daemon.rs:155`, `:376-379`). Opening the port is not the
-      fix, because `PostWork`, `ExecTask`, `GetTaskLogs`, and `RestartWorker`
-      authenticate nobody. Separately, Linux containers and `exec` tasks share
+- [ ] **Launch blocker: any task can take over the cluster.** The
+      multi-host half (workers on another host losing exec, logs, and the
+      mesh behind an unauthenticated worker port) shipped as Phase 1 in
+      [#17](https://github.com/mikenomitch/legion/pull/17); see Done,
+      "Pre-launch spot check (2026-10-11)". Linux containers and `exec` tasks share
       the host network, so they reach the manager (ACLs off by default), the
       worker port, the cloud metadata service, and other allocations'
-      datapath listeners. Found while preparing the pre-launch AWS spot
-      check, which runs on a temporary shim
-      (`tests/spot-check/shims.patch`) until Phase 1 lands. Its host-guard
-      rows need Phases 2 and 3. Plan:
-      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (PLANNED)
+      datapath listeners. The spot check's host-guard rows need Phases 2
+      and 3. Plan:
+      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (IN EXECUTION)
       · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
       Phases in ship order, most dangerous gap first:
   - [ ] Phase 0: ACLs on by default. The first management token is minted at
         first start into `<dataDir>/bootstrap-token` and `~/.legion/token`
         (`0600`), and the open `BootstrapAcl` RPC and `legion acl bootstrap`
         are removed (plan §6.10).
-  - [ ] Phase 1: the mTLS worker plane with per-RPC caller classes,
-        including the sandbox-exec plan's `ticket` class on `ExecTask`, CSR
-        issuance, the CA pin in join tokens, reachable bind and advertise,
-        and two-step CA rotation (plan §6.1 to §6.6, §6.9).
+  - [x] Phase 1 core: the mTLS worker plane with per-RPC caller classes,
+        manager certificates and one client factory, CSR issuance, reachable
+        bind and advertise (plan §6.1 to §6.4, §6.6), in
+        [#17](https://github.com/mikenomitch/legion/pull/17).
+  - [ ] Phase 1 remainder: two-step CA rotation (plan §6.9, calls 11).
+        Until then, after `legion net ca rotate` the first exec, logs, or
+        restart against each node can fail, and a node nothing dials keeps
+        its old certificate for up to 8 hours. Cheap first step: carry the
+        CA fingerprint on the heartbeat reply.
+  - [ ] The sandbox-exec plan's `ticket` class on `ExecTask` (plan §6.1,
+        calls 15): `ExecTask` admits only a manager certificate today.
+  - [ ] The CA pin in join tokens (plan §6.5), moved to Phase 4 (calls 10).
   - [ ] Phase 2: the host guard in the datapath. The gated egress proxy
         dials loopback, link-local, and node-local addresses from the host
         namespace today, and CIDR rules never see hostnames
@@ -99,24 +104,15 @@ How to use it:
 
 - [ ] **Pre-launch spot check findings (2026-10-11), from reading the code
       while preparing the AWS run.** Each is verified in source unless marked
-      otherwise.
-  - [ ] **README says `legion start manager` works without a config file.**
-        It does not. With no `-c`, it evaluates `./configs/manager.ncl`
-        (`src/constants.rs:55`) and fails outside a repo checkout, so the
-        `cargo install legion-rs` quickstart breaks on its second command.
-  - [ ] **`configs/jobs/redis.ncl` cannot work.** The `exec` runtime does not
-        run argv through a shell, so redis-server receives the literal string
-        `$LEGION_STORAGE_DIR`. Its `kind = "exec"` health check has the same
-        problem. Wrap in `sh -c` and use a TCP check.
-  - [ ] **`legion action run -p` does not exist.** The flag is `--param`
-        (`src/cmd/action.rs:37-41`), but `configs/jobs/redis.ncl`,
-        `docs/guides/redis.md`, and `docs/volumes.md` all show `-p`.
-  - [ ] **Nothing says where to get a guest kernel for microVM sandboxes.**
-        `docs/task-runtime-sandbox.md` names the path and env var but no
-        source. cloud-hypervisor's [linux releases](https://github.com/cloud-hypervisor/linux/releases)
-        publish `vmlinux-x86_64`. Also document that AWS now offers
-        [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html)
-        on C7i/M7i/R7i and 8i types, so microVMs need no bare metal.
+      otherwise. The fixed ones (README quickstart, `redis.ncl`,
+      `action run -p`, the guest kernel docs, `WorkerRegister` on a
+      follower, `tls-edge.ncl`, and the dev guide's `:4748`) are in Done,
+      "Pre-launch spot check (2026-10-11)".
+  - [ ] **The installation guide's release versions are placeholders.**
+        `docs/installation.md` names youki, cloud-hypervisor, and guest
+        kernel release tags that were not checked against the upstream
+        release pages (GitHub was unreachable when it was written). Confirm
+        the tags and asset names before launch.
   - [ ] **No exec into microVM sandboxes.** Documented
         (`docs/task-runtime-sandbox.md`, "Current Scope and Limitations"), but
         it is the headline agent-sandbox use case. macOS dev mode can exec, so
@@ -125,21 +121,91 @@ How to use it:
         TAP device, guest IP config, and host DNAT. Gated mode has no
         host-to-guest ingress relay (`src/worker/daemon.rs:1934-1936`, gated
         sandboxes never get a netns).
-  - [ ] **A worker whose join token names a raft follower likely cannot
-        register.** `WorkerRegister` is not in the follower-forwarding list
-        (`src/storage/raft/forward.rs`), so it returns `FAILED_PRECONDITION`.
-        Workers also learn only the one manager in their token. Inferred from
-        code, not yet reproduced.
   - [ ] **The worker never uses TLS to reach the manager**, even when
-        `server.tls` is on (`src/worker/daemon.rs:799-811`), and raft peers
-        dial `http://` only. `docs/auth-and-acls.md` claims listener TLS
-        "already covers transport encryption." Phase 4 of the worker-plane
-        plan covers the worker half. Fix the doc claim now.
-  - [ ] **`configs/jobs/tls-edge.ncl` listens on the wrong port on Linux.** It
-        declares `static = 9443, to = 443`, but `to` only applies on macOS, so
-        nginx binds host :443 while the comment curls :9443.
-  - [ ] **`internal_docs/development.md` still points workers at :4748**, which
-        is now the exec WebSocket. `scripts/dev/join.sh` uses 4747.
+        `server.tls` is on, and raft peers dial `http://` only. Phase 4 of
+        the worker-plane plan covers the worker half. (The false "listener
+        TLS already covers transport encryption" claim in
+        `docs/auth-and-acls.md` was corrected in
+        [#17](https://github.com/mikenomitch/legion/pull/17).)
+
+- [ ] **Follow-ups from the 2026-10-11 spot-check fixes**
+      ([#17](https://github.com/mikenomitch/legion/pull/17);
+      [plan](plans/launch-spot-check-fixes-plan.md) §8.7 ·
+      [calls](calls/launch-spot-check-fixes-plan_calls.md)). Each was
+      deliberately deferred or found along the way.
+  - [ ] **Re-run the AWS spot check without the shims**
+        (`tests/spot-check/smoke.sh` and the RUNBOOK human pass on the
+        `spot-check/launch` branch). Nothing in #17 ran on the real rig.
+        Smoke-test edge-boot speculative dispatch in particular: the
+        dispatcher read `protocolVersion` from the wrong attribute map, so
+        it had never fired for a real worker before #17.
+  - [ ] **Capability-aware placement.** A task that adds capabilities places
+        like any other and fails at start on a node whose
+        `container.allowCaps` refuses them; authors pin such tasks by pool
+        (calls 1). Also still open: the per-author ACL `host` grant
+        (worker-plane-auth-plan §6.16), since the allowlist bounds the node,
+        not the author.
+  - [ ] **User namespaces and seccomp matter more now** that containers get
+        Docker's 13 default capabilities instead of 3 (worker-plane-auth-plan
+        §6.14, Phase 6).
+  - [ ] **On Linux `command` replaces the image `ENTRYPOINT`; on macOS it
+        does not**, so one jobspec runs different commands per OS (calls 51).
+        Needs a plan.
+  - [ ] **Pre-vote for partitioned raft members.** A restarted member now
+        starts quiet (calls 17), but a member cut off by a partition still
+        deposes the leader when it heals; openraft 0.9 has no pre-vote.
+  - [ ] **Workers fail over to raft advertise addresses**
+        (`HeartbeatReply.manager_addresses`), which must be reachable from
+        workers. Consider serving each manager's `server.advertiseAddr`
+        instead (calls 7).
+  - [ ] **Fold the partial-placement remainder into blocked evals.** A plan
+        that places nothing blocks on main's blocked evals, but the unplaced
+        remainder of a partial plan still waits for the free-triggered
+        capacity pass (`capacity_waiters`), so there are two retry paths and
+        `job info` shows `blocked` only when nothing placed (calls 21).
+  - [ ] **A `legion_leader_forwards_total` metric** for follower-to-leader
+        write forwarding (calls 3).
+  - [ ] **Terminal batch reports are not persisted.** A worker restarted
+        between a batch exit and the heartbeat that reports it cannot know
+        the exit status, so the completed step is rescheduled and runs again.
+  - [ ] **`TerminatedAllocation.success = false` is never sent**: every
+        unsuccessful terminal exit takes the failure (reschedule) path,
+        including `restart.policy = "never"`. Route `never` through it or
+        drop the field.
+  - [ ] **`legion exec` into a gated `exec` task runs in the host network
+        namespace** (`ExecOptions` has no namespace field), and a pushed
+        gated task's datapath listeners bind only at the next heartbeat.
+  - [ ] **Removed-allocation history and worker log retention disagree**:
+        the manager forgets a removed allocation after 24h, the worker keeps
+        its logs 7 days. Add a `--node` override or a configurable retention.
+        The UI Logs tab never sets `include_removed`.
+  - [ ] **Destructive static-port rollouts race the old process's graceful
+        stop**; the new process may fail to bind once and fall back on its
+        restart policy. A worker can also stop an unwanted allocation and
+        start its static-port replacement in the same tick.
+  - [ ] **No-op `rollout_tick` evals still emit eval events** (backoff caps
+        them at about two every 30s).
+  - [ ] **`batch_task_outcome_tx` compares against the spec `count`**, not a
+        `job scale` override.
+  - [ ] **Image pulls**: the extracted rootfs is not cached (every new
+        allocation re-extracts), ORAS layers are not cached, a hung pull
+        blocks other starts of the same image (oci-client has no read
+        timeout), and oci-client's bundled webpki roots cannot pull through
+        a TLS-intercepting proxy (`rustls-tls-native-roots` would). On
+        macOS the pull happens inside the task process, so a pull failure is
+        reported as an exit with stderr rather than a staging failure.
+  - [ ] **Supplementary groups from the image's `/etc/group` are not
+        applied** in Linux containers.
+  - [ ] **CLI errors print twice**: `#[instrument(err)]` on command handlers
+        logs each human-mode error as ERROR trace lines before `Error:`.
+  - [ ] **Event metadata keys are still mixed case**; the camelCase rule now
+        covers API messages and CLI envelopes, not event metadata.
+  - [ ] **The https CA default (`configs/tls/rootca.pem`) is relative to the
+        working directory**, like the manager config path was.
+  - [ ] **`legion job info` prints only the job row**, not its allocations.
+  - [ ] **Not verified on real hardware**: cgroup v2 resource enforcement
+        turning on (P1-1), and the worker-plane throughput cost of TLS
+        dispatch at 1,000 nodes.
 
 - [ ] **Architecture audit (2026-10-09).** Design-level findings across the
       store, scheduler, manager API, worker, and lifecycle, each with an ID and
@@ -199,10 +265,7 @@ How to use it:
 | PR | What it lands | Notes |
 | --- | --- | --- |
 | [#25](https://github.com/mikenomitch/legion/pull/25) | Scheduler sharding strategies proposal, revision 3 (docs only) | Draft; [plan](plans/scheduler-sharding-strategies-proposal.md) · [calls](calls/scheduler-sharding-strategies-proposal_calls.md) |
-| [#20](https://github.com/mikenomitch/legion/pull/20) | Operator UI gaps: instance and allocation pages, event filters by instance/allocation, KV values hidden until revealed, worker public addresses, stale rollouts cancel themselves | [plan](plans/operator-ui-gaps-plan.md) · [calls](calls/operator-ui-gaps-plan_calls.md) |
-| [#19](https://github.com/mikenomitch/legion/pull/19) | Task page tabs, guided template launch, Actions tab; template-launched jobs list their tasks again | UI only; [plan](plans/ui-task-and-template-redesign-plan.md) · [calls](calls/ui-task-and-template-redesign-plan_calls.md) |
-| [#24](https://github.com/mikenomitch/legion/pull/24) | Gated sandbox checkpoints Phases 1 to 4: gated memory checkpoints, `gated-default` deny, the static `legion-guest` agent, gated idle signals, Legion-addressed TAP guests (`tap`/`mac` removed) | Phase 0 (KVM) pending, so the gated-by-default flip is held; [plan](plans/gated-sandbox-checkpoints-plan.md) · [calls](calls/gated-sandbox-checkpoints-plan_calls.md) |
-| [#14](https://github.com/mikenomitch/legion/pull/14) | Live KV file updates (`onChange = "update"`) and KV-backed ingress certificates (`certFrom = { kv }`) | [plan](plans/kv-cert-delivery-plan.md) · [calls](calls/kv-cert-delivery-plan_calls.md) |
+| [#17](https://github.com/mikenomitch/legion/pull/17) | Fixes for every 2026-10-11 spot-check finding, including Phase 1 of the worker plane | [plan](plans/launch-spot-check-fixes-plan.md) · [calls](calls/launch-spot-check-fixes-plan_calls.md); AWS re-run pending |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
 | [#4](https://github.com/mikenomitch/legion/pull/4) | Rename crate to `legion-rs`, crates.io metadata, `cargo install` docs | Not published yet; follow-ups under Templates, registry & packaging |
@@ -257,12 +320,6 @@ How to use it:
       lost-node replans now retry plan conflicts and hand off to a
       `job_reschedule` eval instead of leaving the job short
       ([calls](calls/plan-path-fleet-scaling-plan_calls.md) #15).
-- [ ] **Heartbeats rebuild the node's whole desired set every beat.** Add a
-      desired-state version to the heartbeat so an unchanged node gets a
-      cheap "unchanged" reply (proto + worker change). Adaptive cadence
-      already caps the beat rate (calls #16). Planned more broadly as
-      sequenced delivery, Phase 2 of
-      [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md).
 - [ ] **Job stop/destroy at scale drains at ~4 evals/s** (AWS 10k cleanup,
       2026-10-10). Profile with `legion_eval_phase_seconds{kind="job_stop"}`.
 - [x] **Re-ran `web_fleet` on AWS with Phase 4 and adaptive cadence**
@@ -766,22 +823,25 @@ How to use it:
       batch the eval lifecycle ops into fewer proposals, or give the
       pipeline more than one thread per lane. Wants measurement of which
       of the ~6 ops are actually separable before any design.
+      **Half done (2026-10-12):** sandbox-scaling Phase 1 made eval claims
+      leader memory and fused the settle into the plan apply, so a placing
+      eval is one entry ([calls](calls/sandbox-scaling-plan_calls.md) #11,
+      #17). What is left is the lane itself, and it now bounds keyed
+      sandbox lifecycles at ~50/s on a 4-vCPU host, against the plan's
+      ≥ 5× target of ~125/s: ~6 ms of serial lane time per entry (capture
+      3.2 ms, propose → apply 2.7 ms), the pipeline thread ~54% busy, the
+      manager at 1.1 of 4 cores, and the same in `single` and `lanes`
+      ([plan §14.3](plans/sandbox-scaling-plan.md#143-phase-1-group-commit-and-write-trimming),
+      [calls](calls/sandbox-scaling-plan_calls.md) #13). Levers: more
+      placements per plan entry (sandbox placements average 1.09 plans per
+      entry, one eval each), a cheaper capture (each write executes twice,
+      once to capture and once to apply), or a pipelined lane.
 - [ ] **Fused top-k candidate scoring.** Ranked candidate lists materialize a
       scored vector per placement; the one-candidate path (`plan_candidates:
       0`) uses the fused argmax loop that does not. A fused top-k loop would
       give the default path the same win — worth doing when the
       candidate-construction benchmark (+2–10% plan-only) says it pays
       ([calls #20](calls/late-binding-plan-apply-plan_calls.md)).
-- [ ] **Capacity exhaustion still fails evals terminally.** The late-binding
-      requeue backstop only covers *conflict* errors; a replan that finds no
-      eligible capacity at all ("no available nodes …") still ends the eval
-      in `failed`. Blocked-and-retried capacity waits are the gang-scheduling
-      plan's blocked-eval machinery
-      ([plan](plans/gang-scheduling-plan.md)) — when that lands, consider
-      routing plain single-task capacity failures through it too. Now
-      planned as Phase 3 of
-      [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md), a generic
-      blocked-work queue the gang plan can reuse.
 - [ ] Edge boot follow-ups — the feature shipped (phases 1–4;
       [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
       [calls](calls/edge-boot-plan_calls.md)); these are what it left open.
@@ -846,18 +906,6 @@ How to use it:
           p50/p99, confirmed vs refused by reason, coalescer batch size and
           commit time on the lanes involved, and the rate where p99 crosses
           `ratifyTimeout`. Numbers go in `benchmarks/scheduler/README.md`.
-    - [ ] **Stop the ticket spend from being its own raft commit.**
-          `verify_and_spend` → `Store::spend_boot_ticket`
-          (`src/storage/boot_ticket_store.rs`) is one unbatched
-          `replicated(Lane::Control, ..)` write per start, and the placement
-          then commits again on the plan path. That is two serial commits per
-          sandbox, and the unbatched one is likely the first ceiling
-          (hundreds to low thousands per second). Prefer folding the
-          conditional `UPDATE boot_ticket` into the ratification's plan-apply
-          transaction: one commit per start, and a refused placement stops
-          burning a ticket use. Fallback: a spend coalescer like
-          `heartbeat_coalescer`. Keep the cross-node double-spend refusal and
-          test it, plus expiry and refused-placement-leaves-`uses_spent`.
     - [ ] **Let ratifications fill commit batches.** Ratifications go through
           `submit_and_apply_plan_for_instance` → the plan coalescer, capped by
           `plan_apply_batch_max` (default 16, clamped 1..=128). Evals fill
@@ -1659,61 +1707,66 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       guest-agent path would implement. Exec is now planned as Phase 1 of
       [sandbox-exec-plan.md](plans/sandbox-exec-plan.md).
 - [ ] **Sandbox scaling to very large session counts**:
-      [plan](plans/sandbox-scaling-plan.md) (PLANNED) ·
-      [calls](calls/sandbox-scaling-plan_calls.md). Every keyed sandbox is a
-      raft row, about 22 raft entries across create, place, suspend, resume,
-      and destroy (26 with idempotency keys, counted from code, plan §5.1),
-      and a tombstone forever. Raft should hold only envelopes and named
-      instances.
-  - [ ] Phase 0 (gate): an op-count test per lifecycle stage on the
-        `raft_apply_roundtrip` harness, a `legion-loadgen` instance mode,
-        simulated allocation health, bytes per instance row, heartbeat bytes
-        at 1,000 and 10,000 allocations per node, and the latency SLOs at p50
-        and p99 (plan §7.2). Numbers in `benchmarks/scheduler/README.md`.
-  - [ ] Phase 1: group commit and write trimming with no new semantics
-        (target ≤ 8 entries per lifecycle, ≥ 5× the Phase 0 rate).
-  - [ ] Phase 2: sequenced delivery. A per-node delta log in leader memory,
-        `Manager.StreamWork` with acks, full resync on failover or gaps, and
-        delta heartbeats (plan §6.13). Targets: dispatch within a round trip
-        of the commit, steady heartbeats under 1 KiB at 10,000 allocations.
-        Supersedes the "Heartbeats rebuild the node's whole desired set every
-        beat" item under Scheduling & placement.
-  - [ ] Phase 3: blocked work keyed by what blocked it, woken by matching
-        node joins, uncordons, freed capacity, attribute changes, and budget
-        reports (plan §6.15). Covers the "Capacity exhaustion still fails
-        evals terminally" item under Scheduling & placement, and the gang
-        plan builds on it.
+      [plan](plans/sandbox-scaling-plan.md) (IN EXECUTION) ·
+      [calls](calls/sandbox-scaling-plan_calls.md) ·
+      [docs](../docs/sandboxes-at-scale.md). Phases 0–3 shipped (Done,
+      below): a keyed sandbox lifecycle is 8 raft entries, work streams to
+      nodes, and a full cluster blocks creates instead of failing them.
+      Every keyed sandbox is still a raft row and a tombstone forever; raft
+      should hold only envelopes and named instances.
+  - [ ] **The lifecycle rate reached ~2× Phase 0, not the ≥ 5× target.**
+        ~50 lifecycles/s against ~25/s on the 4-vCPU reference host; the
+        scheduler lane's serial per-entry cost is the bound. Tracked with
+        its levers in "Cut the raft round trips per eval, or widen the lane
+        pipeline" under Scheduling & placement
+        ([plan §14.3](plans/sandbox-scaling-plan.md#143-phase-1-group-commit-and-write-trimming),
+        [calls](calls/sandbox-scaling-plan_calls.md) #13).
+  - [ ] **Run the sandbox campaign on the AWS rig.** Every Phase 0–3 number
+        is from a single-host substitute. `benchmarks/aws/scripts/run-sandbox-campaign.sh`
+        (3 managers, one load box, ~$1/hour) produces the ceiling,
+        per-lifecycle raft and CPU cost, memory per resident sandbox, and
+        labelled projections; record them in plan §14 and
+        `benchmarks/scheduler/README.md`
+        ([calls](calls/sandbox-scaling-plan_calls.md) #14, #41).
+  - [ ] **Suspend and resume still wait on heartbeats.** Checkpoint
+        requests and reports ride the heartbeat, so a suspend takes ~3 s and
+        a resume ~2 s at p50 on the default 2 s cadence, while placements
+        land in one round trip. Put checkpoint requests on the `StreamWork`
+        stream and reports on a prompt path; Phases 5 and 7's resume and
+        wake targets assume it
+        ([plan §14.6](plans/sandbox-scaling-plan.md#146-what-the-results-change-in-later-phases)).
+  - [ ] **Edge-boot provisional deltas on the stream.** Speculative dispatch
+        still pushes with `PostWork` and the verdict arrives on the
+        `RatifyClaim` reply
+        ([calls](calls/sandbox-scaling-plan_calls.md) #30).
+  - [ ] **Checkpoint budget reports and `snapshot warm` as blocked-eval wake
+        events.** Only registration, node changes, readiness, and freed
+        allocations wake today
+        ([calls](calls/sandbox-scaling-plan_calls.md) #33).
+  - [ ] **Arm the fused settle in more handlers.** Only `job_reschedule`
+        without a batch follow-up settles inside its plan; `job_submit`,
+        `job_update`, and `job_scale` still settle in a separate entry
+        ([calls](calls/sandbox-scaling-plan_calls.md) #17).
+  - [ ] **Rollout ticks and node-scoped passes do not block.** They keep the
+        old terminal outcome when nothing fits
+        ([calls](calls/sandbox-scaling-plan_calls.md) #32).
+  - [ ] **The raft seam test does not read `src/storage/store/*.rs`.**
+        `tests/raft_seam.rs` parses only `store.rs` and `acl_store.rs`, so a
+        replicated write added in a store submodule (`eval_claims.rs`,
+        `blocked_evals.rs`) is not checked for a lane classification
+        ([calls](calls/sandbox-scaling-plan_calls.md) #39).
   - [ ] Phase 4: server-minted ids grow to 130 bits and leave no tombstone.
         Caller ids may not take that shape.
   - [ ] Phase 5: archive suspended keyed instances to content-store
         manifests (`suspend.archive`).
   - [ ] Phase 6: `stateful.mode = "session"`: envelopes, the session
         router, leases, node session logs, the leader index, and
-        `PromoteInstance`.
+        `PromoteInstance`. Its user docs are drafted in plan §15.
   - [ ] Phase 7: wake on request through `legion start gateway` and
         `suspend.wake` (plan §6.14). The suspend plan's Phase 8 keeps
         node-local wake on connect.
   - [ ] Phases 8 to 10: snapshot-clone density (with suspend plan Phase 8),
         a sub-VM tier seam, and cells only past the plan §6.11 trigger.
-  - [ ] Found during the plan: allocation health is a status-lane raft
-        write per node per beat, because the manager upserts every
-        allocation with `updated_at = now` and nothing skips unchanged rows
-        (`src/manager/server.rs:6311`, `src/storage/store.rs:13291`). It
-        grows with sandboxes per node, and simulated workers never send it,
-        so the AWS rig has not seen it. Phase 1 fixes it.
-  - [ ] Found during the plan: edge ratification only binds an existing
-        unbound keyed instance (`src/storage/store.rs:12560-12580`), so an
-        edge start still needs `CreateInstance` first, and that create's
-        placement eval can bind the row before the edge claim does. Phase 1
-        makes ratification create the row.
-  - [ ] Found during the plan: the `node_join` capacity pass compares
-        allocations to `count` (`src/storage/store.rs:14557-14607`), and
-        keyed tasks define no count, so a keyed instance left `pending` for
-        lack of room appears never to be retried. Phase 0 confirms with a
-        test, and Phase 3 fixes it.
-  - [ ] Found during the plan: `docs/multi-raft.md` says instance writes go
-        on the control lane, but `instance` is owned by the scheduler lane
-        (`src/storage/raft/ownership.rs:222`). Fix the doc.
 - [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (PLANNED) ·
       [calls](calls/sandbox-exec-plan_calls.md). Exec into Linux microVM
       sandboxes, and exec sessions that skip the manager. Implemented
@@ -4168,6 +4221,53 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
       [calls](calls/edge-boot-plan_calls.md)). Phase 0's measurement and
       phase 5's backlog are open above.
+- [x] **The ticket spend rides the ratification** (2026-10-12). `boot_ticket`
+      moved to the scheduler lane, and a ratification spends its ticket,
+      creates the keyed instance when the ticket names an id that never
+      existed, and places it in one group-committed entry, so an edge start
+      is one entry and a refused ratification leaves the ticket unspent
+      ([sandbox-scaling calls](calls/sandbox-scaling-plan_calls.md) #23,
+      [docs](../docs/edge-boot.md)).
+- [x] **Sandbox scaling Phases 0–3** (2026-10-12,
+      [#27](https://github.com/mikenomitch/legion/pull/27)):
+      [plan](plans/sandbox-scaling-plan.md) §14 ·
+      [calls](calls/sandbox-scaling-plan_calls.md) ·
+      [docs](../docs/sandboxes-at-scale.md). Open phases and gaps are above,
+      under Task runtimes.
+  - [x] Phase 0: `tests/raft_lifecycle_ops.rs` asserts raft entries per
+        lifecycle stage on `single` and `lanes`; `legion-loadgen --mode
+        instances` drives create → running → suspend → resume → destroy at
+        an open-loop rate (simulated nodes send allocation health and fake
+        checkpoints); row sizes at 10^5 and 10^6 and heartbeat bytes at
+        1,000 and 10,000 allocations (`tests/instance_scale_measure.rs`).
+        Baseline: 22 entries per lifecycle, ~25 lifecycles/s.
+  - [x] Phase 0 found and fixed: a keyed instance left `pending` by a full
+        cluster was never retried by the capacity pass
+        (`tests/capacity_retry.rs`, calls #38).
+  - [x] Phase 1: 8 entries per lifecycle. Allocation health is written only
+        on change; eval claims are leader memory; a placing eval settles
+        inside its plan; stop and destroy queue no eval; concurrent instance
+        operations group-commit (`schedulerSettings.instance_group_commit`,
+        default on); the docs fix for instance writes being on the scheduler
+        lane (`docs/multi-raft.md`). The ≥ 5× rate target was missed (~2×),
+        open above.
+  - [x] Phase 2: `Manager.StreamWork` delivers placements to nodes one round
+        trip after commit, with per-process epochs, per-node sequences,
+        acks, replay, and digest-checked resync; a steady heartbeat carries
+        a position and digest instead of the allocation set
+        ([docs](../docs/architecture-managers-workers.md#delivery)).
+        Replaces the "heartbeats rebuild the node's whole desired set every
+        beat" item.
+  - [x] Phase 3: unplaceable job evals end `blocked` under a key (pool
+        class, pinned node, or `escaped`), one per job, woken only by
+        matching capacity (registration, node change, readiness, freed
+        allocations) with missed-unblock detection; `Job.blocked` and the
+        `blocked` job status
+        ([docs](../docs/scheduler-and-eval-loop.md#blocked-evals)). Replaces
+        the "capacity exhaustion still fails evals terminally" item.
+  - [x] A standalone AWS sandbox campaign
+        (`benchmarks/aws/scripts/run-sandbox-campaign.sh`,
+        `analysis/sandbox_report.py`), not yet run (open above).
 
 ## Persistence
 
@@ -4441,6 +4541,58 @@ now does about them so nobody re-derives it at 02:00.
   6x-470-crate rebuild from every campaign, but it is a cache, not a fix:
   the first build on a fresh box and any change under `plugins/` still pays
   in full, so the shared-target-dir item above stands.
+
+## Pre-launch spot check (2026-10-11)
+
+[findings](launch-spot-check-findings.md) ·
+[plan](plans/launch-spot-check-fixes-plan.md) ·
+[calls](calls/launch-spot-check-fixes-plan_calls.md) · fixed in
+[#17](https://github.com/mikenomitch/legion/pull/17) (open). Per-finding
+outcomes are in the plan's §8; what it deferred is open above under
+"Follow-ups from the 2026-10-11 spot-check fixes".
+
+- [x] **Workers on other hosts** (P0-1): Phase 1 of the worker plane:
+      reachable bind and advertise, mTLS with per-RPC caller classes, CSR
+      issuance ([architecture-managers-workers.md](../docs/architecture-managers-workers.md),
+      [auth-and-acls.md](../docs/auth-and-acls.md)).
+- [x] **Task lifecycle** (P0-2, P0-3, P1-1, P1-4, P1-9, P2-7, P2-8): batch
+      tasks finish and restart policies reach the worker; health checks start
+      for staged tasks; resource enforcement turns on; gated starts create
+      their namespace; failure reasons carry the task's stderr; the plugin
+      dir defaults next to the binary; exec sessions get the task env
+      ([task-supervision.md](../docs/task-supervision.md),
+      [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)).
+- [x] **Scheduler** (P0-4, P1-2, P1-3, P1-8): DAG dependencies wait for
+      reported status; static ports are planned, plans place what fits and
+      freed capacity retries the rest; reschedules fall back to the failed
+      node; job status is derived from live state
+      ([scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md),
+      [rollouts.md](../docs/rollouts.md)).
+- [x] **Manager availability** (P0-5, P0-6, P0-8, P1-5 in part, P2-5, P2-10,
+      `transfer-leader`): forwarded heartbeats in `single`, worker failover
+      across managers, an availability reconcile, re-registration with the
+      node's own token, follower write forwarding (also fixes
+      `WorkerRegister` on a follower), remote-election leadership moves, a
+      quiet restart for raft members
+      ([raft-operations.md](../docs/raft-operations.md),
+      [node-liveness.md](../docs/node-liveness.md)).
+- [x] **Linux containers** (P0-7, P1-6, P2-6, P2-9, P2-11): Docker's default
+      capabilities less `NET_RAW` with `security.capabilities` bounded by
+      `container.allowCaps`, ownership kept on extraction, reopenable stdio,
+      `ulimits`, the macOS 200 MiB floor, a per-blob image cache, a Linux
+      install guide with the guest kernel source and AWS nested
+      virtualization ([task-runtime-container.md](../docs/task-runtime-container.md),
+      [installation.md](../docs/installation.md)). `redis.ncl` runs through
+      `sh -c` with TCP checks and the docs use `--param`.
+- [x] **CLI and diagnostics** (P1-7, P1-9, P2-1 to P2-4, P2-6, P2-7):
+      allocation ids survive lane snapshots, removed allocations' logs stay
+      readable, the quickstart works outside a checkout, precondition errors
+      keep their cause, `kv get` misses exit non-zero, `--json` on every
+      command and camelCase everywhere ([logging.md](../docs/logging.md),
+      [agent-readiness.md](../docs/agent-readiness.md)).
+- [x] **Small fixes from the earlier read-through**: `tls-edge.ncl` listens
+      on its advertised port on Linux, and `internal_docs/development.md`
+      points workers at :4747.
 
 ## Architecture audit (2026-10-09)
 

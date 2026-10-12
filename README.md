@@ -40,7 +40,7 @@ cargo install legion-rs
 ```
 
 Start a manager with a worker running in the same process. The defaults work
-without a config file.
+without a config file, from any directory.
 
 ```bash
 legion start manager --run-worker
@@ -102,6 +102,15 @@ legion join-token create --ttl 24h
 # on the new machine, use the returned token
 legion join lgnjoin_...
 ```
+
+Managers dial workers back on port 4848 for `legion exec`, `legion job logs`,
+and dispatch, so allow TCP 4848 from the managers to the new machine (and
+4747 from it to the managers). That port is mutual TLS: only a manager's
+certificate can drive a worker through it. The worker advertises the address
+it uses to reach the manager. If managers must dial it somewhere else (NAT, a
+second interface), pass `--advertise-addr 10.0.1.7` or set
+`LEGION_WORKER_ADVERTISE_ADDR`. See
+[docs/architecture-managers-workers.md](docs/architecture-managers-workers.md#ports-and-who-dials-whom).
 
 ### Example job specs
 
@@ -257,6 +266,23 @@ they should. Legion handles all three.
   pack the active ones tighter, and fork copies a running sandbox for an
   agent to explore from. See the
   [agent sandboxes guide](docs/guides/agent-sandboxes.md).
+- **Sandboxes that scale.** Every sandbox is a durable, named instance:
+  it survives node loss, suspends and resumes, forks, and its id is never
+  reused. A full lifecycle (create, run, suspend, resume, destroy) costs the
+  control plane 8 replicated writes, down from 22. Concurrent creates and
+  suspends share a single write, so the cost per sandbox falls under load.
+  See [Sandboxes at scale](docs/sandboxes-at-scale.md).
+- **Work lands in one round trip.** Each node holds one stream to its
+  manager, so a placement reaches it as soon as it commits, at any
+  heartbeat interval. A node running 10,000 sandboxes sends a heartbeat of a
+  few dozen bytes, where it used to exchange about 4.6 MB per beat.
+- **Full clusters don't fail creates.** A sandbox that finds no room waits,
+  and places itself the moment a node that can host it joins or frees
+  capacity. `legion job info` shows what it's waiting for.
+- **Measure it yourself.** `legion-loadgen --mode instances` drives
+  sandbox lifecycles against any cluster. A standalone AWS campaign runs a
+  3-manager cluster on four boxes for about $1/hour and reports the
+  ceiling, latencies, cost per million lifecycles, and resident capacity.
 
 ### DevEx for humans and agents
 
@@ -352,6 +378,8 @@ add:
 The full index lives at **[docs/README.md](docs/README.md)**. Good places to
 start:
 
+- **Installing:** [Legion and its runtimes](docs/installation.md) (youki,
+  cloud-hypervisor, a guest kernel, Apple `container`)
 - **Concepts:** [Managers and Workers](docs/architecture-managers-workers.md) ·
   [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md) ·
   [Configuration Language](docs/configuration-language.md) ·
@@ -366,7 +394,8 @@ start:
 - **Guides:** [Running Postgres](docs/guides/postgres.md) ·
   [Running Redis](docs/guides/redis.md) ·
   [Serving TLS Certificates from KV](docs/guides/tls-certificates.md) ·
-  [Running Agent Sandboxes](docs/guides/agent-sandboxes.md)
+  [Running Agent Sandboxes](docs/guides/agent-sandboxes.md) ·
+  [Sandboxes at Scale](docs/sandboxes-at-scale.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md)

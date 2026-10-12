@@ -15,9 +15,10 @@
 #   legion boot-ticket create edge-sandboxes \
 #       --task workspace --id user-42 --pool edge-eu --gate boot --ttl 5m
 #
-#   # On the request path, at the edge — no manager call:
+#   # On the request path, at the edge — no manager call (ca.pem from
+#   # `legion net ca show`, saved once):
 #   legion sandbox start edge-sandboxes \
-#       --id user-42 --node http://10.0.1.7:4848 --ticket "$TICKET"
+#       --id user-42 --node https://10.0.1.7:4848 --ca-cert ca.pem --ticket "$TICKET"
 #
 # Requires `edgeBoot.enabled = true` on the manager (plus
 # `workloadIdentity.enabled`, which signs the tickets) and

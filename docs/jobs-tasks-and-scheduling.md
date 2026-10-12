@@ -82,15 +82,70 @@ Scheduling uses dependency-aware readiness:
 
 - The DAG is topologically sorted.
 - Cycles are rejected.
-- Dependencies evaluate against current task statuses and already-planned tasks.
+- Dependencies evaluate against the task statuses workers report. A task
+  whose dependencies are not met yet is **held**: it is not placed, and it
+  does not count as short of capacity.
 
 Dependency conditions:
 
-- `start`: the dependency has started or is being placed now.
-- `complete`: the dependency is complete or successful (or is a batch task being placed now).
-- `success`: the dependency must not have failed and must be successful (or is a batch task being placed now).
+| Condition | Met when the dependency… | Typical use |
+| --- | --- | --- |
+| `start` | has started, or is being placed in the same pass | a sidecar beside its primary |
+| `complete` | has finished, whether it exited 0 or not | a cleanup step that runs either way |
+| `success` | has finished with a successful exit (`successExitCodes`, default `0`) | the next step of a pipeline |
 
-Only ready tasks enter the current planning pass.
+`complete` and `success` are met only by a reported exit. A batch dependency
+that has merely been placed, or is still running, holds its dependents. A
+batch task with several replicas finishes when every replica has: it is
+`success` once all of them exited successfully, and `failed` as soon as one
+fails for good.
+
+Held tasks move on their own. When a worker reports that a task with
+dependents reached a terminal state, the manager queues an eval for the job:
+a `job_reschedule`, or a `rollout_tick` when the config is being rolled out
+to, so the rollout's step and health gating still apply. That eval places
+whatever the exit made ready. A three-step pipeline therefore runs one step
+at a time:
+
+```nickel
+tasks = [
+  { name = "fetch",    lifecycle = "batch", ... },
+  { name = "validate", lifecycle = "batch",
+    dependsOn = [{ task = "fetch", condition = "success" }], ... },
+  { name = "serve",    lifecycle = "service",
+    dependsOn = [{ task = "validate", condition = "success" }], ... },
+]
+```
+
+`validate` is placed only after `fetch` exits 0, and `serve` only after
+`validate` does. If `validate` fails for good (it exits unsuccessfully under
+`restart = { policy = "never" }`, or its reschedule budget runs out), `serve`
+never starts and the job reads `failed`.
+
+A restart of the whole job (a batch `schedule`'s next run,
+`legion job run --force-reschedule`, a KV `restart`) resets every task to
+`pending` first, so the previous run's results never satisfy the new run's
+conditions.
+
+`legion job plan` is a dry run and shows where every task would eventually
+land: it treats batch dependencies as if they will succeed.
+
+Diagnostics: an eval that leaves tasks held says so in its outcome
+(`legion events list --job <job>`, the `eval.completed` message ends with
+`waiting on dependencies: validate, serve`).
+
+Each step needs room only while it runs. A finished allocation (`complete` or
+`failed`) keeps its row, so its task's slot stays spent, but it releases its
+CPU, memory, disk, allocation count, and static ports the moment its exit is
+reported. On one 8 GiB node, a pipeline whose steps each need 6 GiB runs every
+step, one after another.
+
+Known limitations:
+
+- A runtime that cannot report exits (`noop`, or a third-party plugin that
+  does not supervise a process) reports a batch task complete as soon as it
+  starts, so its dependents follow right away (see
+  [Task Supervision](task-supervision.md)).
 
 Lifecycle rules, enforced at submit and by `legion job validate`:
 
@@ -220,20 +275,31 @@ When a job group contains multiple tasks:
 
 ### Node Added
 
-Two paths exist:
+A plan that finds no capacity does not fail its eval: the eval waits
+**blocked**, keyed by what it needs (the task's pool and pinned attributes,
+the node a resume is pinned to, or `escaped` when there was no node at
+all), and new capacity on a node that could host it returns it to the
+queue. Capacity means a node registering, a node being uncordoned or having
+its pool or attributes change, a node returning to `ready`, or allocations
+leaving a node (a stop, a destroy, a scale-in, a suspend, a preemption). A
+node in another pool wakes nothing. `legion job info` reports such a job as
+`blocked` with what it waits for. The full model, its keys, and its
+limitations are in
+[Blocked evals](scheduler-and-eval-loop.md#blocked-evals).
 
-A plan that finds no capacity fails its eval, and nothing retries it on a
-timer. New capacity is what retries it:
+The capacity pass remains as a backstop for jobs that are short without a
+blocked eval:
 
 - Worker registration (`worker_register`) inserts the node, then queues a
   capacity pass: one `node_join` eval with no node. Uncordoning a node
   (`legion node uncordon`) queues the same pass.
 - The pass re-evaluates, with a `Reschedule` plan, every active job that has
-  no live rollout and nothing already queued, when its config has a
-  `count.per` task or a service or sidecar task with fewer allocations than
-  its effective count. It also tops up rollouts that completed incomplete.
-  After a failed or cancelled rollout it converges what the rollout left
-  running, never the rolled-back version (see
+  no live rollout and nothing already queued or blocked, when its config has
+  a `count.per` task, a service or sidecar task with fewer allocations than
+  its effective count, or a keyed instance waiting for placement. It also
+  tops up rollouts that completed incomplete. After a failed or cancelled
+  rollout it converges what the rollout left running, never the rolled-back
+  version (see
   [rollouts.md](rollouts.md#after-a-rollout-fails-rolls-back-or-is-stopped)).
 - One pass covers any number of joins. While a pass is pending, further
   registrations queue nothing, so a burst of new workers costs one pass.
@@ -242,12 +308,11 @@ timer. New capacity is what retries it:
 
 Known limitations:
 
-- Batch tasks are not re-evaluated, because a batch task that already ran
-  to completion looks the same as one that never placed.
-- Capacity freed by stopping or scaling in another job, or by a lost node
-  heartbeating again, does not queue the pass. The next registration or
-  uncordon does, and so does a manager leadership change, whose
-  reconciliation reschedules every active job.
+- Batch tasks are not re-evaluated by the pass, because a batch task that
+  already ran to completion looks the same as one that never placed. A
+  batch task whose placement blocked is woken like any other.
+- A rollout tick that cannot place still fails its rollout rather than
+  blocking.
 
 ### Node Lost
 
@@ -324,6 +389,27 @@ placement, decides a batch task's `Success`, so
 including the version-skew rule for workers that predate exit reporting, are in
 [Task Supervision](task-supervision.md).
 
+The worker never sees the jobspec, so the manager sends each task's
+`lifecycle` and `restart` block with every dispatch
+(`TaskAllocation.task_lifecycle` / `task_restart`). With no `restart` block,
+or one that leaves out `policy`, the policy follows the lifecycle:
+
+| Lifecycle | Policy | Exit 0 (or another `successExitCodes` entry) | Any other exit |
+| --- | --- | --- | --- |
+| `batch` | `onFailure` | allocation `complete`, task `success`; not restarted | restarted in place while the restart budget lasts, then failed and rescheduled |
+| `service`, `sidecar` | `always` | restarted in place | restarted in place, then failed and rescheduled |
+
+A batch task's terminal exit reaches the manager on the worker's next
+heartbeat (`HeartbeatRequest.terminated_allocations`), which is what moves its
+task status from `running` to `success` (or `failed` for a `never`-policy task
+that exited unsuccessfully), the status `dependsOn` conditions read. The
+completed allocation keeps its row and is never dispatched again, but it no
+longer holds node resources or ports. In
+`legion job events`, a finished batch task appears as `allocation.terminated`;
+a task that failed for good appears as `allocation.failed` with the exit
+status and the last lines the task wrote to stderr (for example `exited with
+status 1; last stderr: Error: ... 429 Too Many Requests`).
+
 ### Worker-side health loop
 
 For each allocation with checks:
@@ -336,6 +422,17 @@ When the unhealthy threshold is reached:
 1. Restart locally if `on_unhealthy.restart_count/restart_period/restart_delay` allows it.
 2. If restarts are exhausted, record an allocation failure.
 
+Health checks start when the task starts, including tasks that stage
+artifacts first (every container image when `containerImageDesugar` is on).
+They never start for a task whose staging failed: that allocation fails with
+`artifact staging failed: ...` and an `artifact.failed` event per artifact.
+
+While the task's process is down (it exited and the supervisor is about to
+restart it, or it has finished), failed checks are not counted. A check
+against a dead process can only fail, and the exit is the real cause, so the
+supervisor's verdict is the one the allocation reports. After the supervisor
+relaunches the task, the checks start over with a fresh boot grace window.
+
 ### Manager-side move logic
 
 The worker reports failed allocations in its heartbeat (from a failed health
@@ -344,14 +441,21 @@ The manager then:
 
 1. removes the failed allocation row
 2. checks move history per `(job_config_id, task_config_id)`
-3. if `move_count` is exceeded within `move_period`, marks the job failed
+3. if `move_count` is exceeded within `move_period`, marks the job failed and
+   the task's status `failed`
 4. otherwise, enqueues a delayed `job_reschedule` after `move_delay`
 
 So failures escalate in order:
 
 - local restarts first,
-- then a reschedule to another node,
+- then a reschedule, preferably to another node,
 - then job failure once the move budget is used up.
+
+The reschedule **avoids** the node the allocation failed on rather than
+excluding it. It first plans without that node; whatever that pass cannot
+place is planned again with the node allowed. On a one-node cluster, or when
+the failed node is the only one with room, the replacement goes back to the
+same node instead of failing with `No nodes available to place allocations`.
 
 ## Batch Scheduling Notes
 
@@ -386,7 +490,8 @@ The first matching row wins:
 | `failed` | A required KV key vanished (`onDelete = "fail"`; see [KV store](kv-store.md#fail-semantics-and-recovery)). |
 | `running` | At least one allocation of the job is live: placed and not yet terminal. |
 | `failed` | Nothing is live, and a task's last run failed: it spent its restart and move budgets, or exited unsuccessfully under a policy that does not restart it ([task supervision](task-supervision.md)). |
-| `pending` | Nothing is live, and a task that wants an allocation hasn't finished. It is waiting to be placed (no node fits, or no node is up) or waiting on a `dependsOn` condition. |
+| `blocked` | Nothing is live, and the job's placement found no room: its eval waits [blocked](scheduler-and-eval-loop.md#blocked-evals) for capacity that could host it, and the job places on its own when that capacity appears. `Job.blocked` says what it waits for. |
+| `pending` | Nothing is live, and a task that wants an allocation hasn't finished. It is waiting to be placed or waiting on a `dependsOn` condition. |
 | `scheduled` | Nothing is live or pending, and a cron task (`schedule`) finished its last run and is waiting for the next. |
 | `complete` | Nothing is live, and every task that wants an allocation finished successfully. |
 | `suspended` | No task wants an allocation, and at least one keyed instance is [suspended](suspend-and-resume.md). |
@@ -405,6 +510,10 @@ How the inputs are read:
 - **A task wants an allocation** when its `count` is above zero, or, for a
   keyed stateful task, when it has at least one pending, active, or
   rescheduling instance.
+- **`blocked` takes the place of `pending`** only. A job with something live
+  reads `running` even while another of its placements waits for room; its
+  `blocked` block (`legion job info -j`, the UI's job page) still says what
+  that placement waits for.
 
 `legion job list --status <value>` and `ListJobsRequest.status` filter on the
 derived status, and `ListJobsReply.status_counts` counts it.
@@ -432,6 +541,23 @@ the flag, so count allocations when you want the workload (see
   `running` indefinitely.
 - **Read cost.** `ListJobs` derives every job's status with three aggregate
   queries per call: over allocations, latest-version tasks, and instances.
+
+### Re-running a job
+
+`legion job run` with a spec identical to the job's latest version normally
+changes nothing. When nothing of the job is running, it starts the job again
+instead (a `job_update` eval runs it from the top) and says why:
+
+```text
+Job config unchanged; job was stopped, starting it again
+Job config unchanged; job had failed, starting it again
+Job config unchanged; job was not running, starting it again
+Job config unchanged; no update needed (the job is running; use --force-reschedule to restart it)
+```
+
+"Not running" means no live allocation and no placing eval queued for the
+job, so a finished batch job runs again and a job that could not be placed
+gets another attempt.
 
 ## Job Timestamps: `created_at` and `updated_at`
 

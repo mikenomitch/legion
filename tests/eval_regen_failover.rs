@@ -923,10 +923,12 @@ fn complete_evals_and_claim_next_settles_the_batch_and_claims_more() -> R<()> {
 ///
 /// Two things must hold, and they are the reason batching is safe at all:
 /// its siblings still settle normally, and the omitted eval is neither
-/// completed nor lost — it stays `in_flight` until
-/// `requeue_in_flight_evals` (the leadership-acquisition hook) returns it to
-/// the queue. Inventing an outcome for it would be the dangerous choice:
-/// failed evals are never retried, so a fabricated failure silently drops
+/// completed nor lost — it stays claimed (shown `in_flight`) until its
+/// claim is released or the leadership-acquisition hook clears every claim,
+/// and its row never stopped being `pending`, so it runs again. Claims are
+/// leader memory (sandbox-scaling plan, Phase 1), so recovery rewrites no
+/// row. Inventing an outcome for it would be the dangerous choice: failed
+/// evals are never retried, so a fabricated failure silently drops
 /// acknowledged work.
 #[test]
 fn an_unobserved_batch_member_stays_in_flight_and_is_recovered() -> R<()> {
@@ -1001,8 +1003,9 @@ fn an_unobserved_batch_member_stays_in_flight_and_is_recovered() -> R<()> {
         "the unobserved eval must be neither completed nor failed"
     );
 
-    // Recovery: the row the batch died holding comes back to the queue.
-    assert_eq!(store.requeue_in_flight_evals()?, 1);
+    // Recovery: the leadership-acquisition hook forgets the claim; the row
+    // was never rewritten, so there is nothing to requeue in the store.
+    assert_eq!(store.requeue_in_flight_evals()?, 0);
     let recovered = store.claim_evals(limits, ClaimScope::Any)?;
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].id, casualty.id);

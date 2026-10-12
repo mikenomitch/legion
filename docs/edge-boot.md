@@ -62,7 +62,7 @@ platform's own API ──(user auth)──► platform control plane
                                         │
                                   signed ticket (JWT, ~minutes)
                                         ▼
-   user request ──► edge router ──► legion sandbox start --node <addr>
+   user request ──► edge router ──► legion sandbox start --node https://<addr>
                                         │ verified offline, admitted locally,
                                         │ booted to the gate level
                                         ▼
@@ -280,11 +280,23 @@ accessor. The token itself is never written anywhere.
 
 ```console
 $ legion sandbox start agent-sandboxes \
-    --id user-42 --node http://10.0.1.7:4848 --ticket "$TICKET"
+    --id user-42 --node https://10.0.1.7:4848 --ca-cert ca.pem --ticket "$TICKET"
 admitted
 booted
 ratified
 ```
+
+`--node` is the node's `workerAddress` (`legion node info` shows it), always
+`https://`: the worker plane is mutual TLS
+([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). `StartClaim` is the
+one worker RPC that needs no client certificate, because the boot ticket is
+the authorization. The caller still verifies the node: `legion sandbox start`
+checks that the node presents a node certificate from the cluster CA before
+it sends the ticket. It reads the CA from `--ca-cert <file>` (save it once
+with `legion net ca show > ca.pem`), or fetches it from the manager with your
+token when the flag is absent. A router with its own gRPC client does the
+same: trust `ca.pem`, and expect the server name `<node>.node.legion`.
+Routers must be able to reach 4848 on edge nodes.
 
 The stream reports each transition. A router may start routing at `booted`,
 but must handle `refused` at any point until `ratified`. `--dry-run` verifies
@@ -313,6 +325,20 @@ use by spending the `jti` in one conditional update, so the second
 ratification is refused even if the first workload has since exited. Nodes
 are expected to behave correctly, but Legion does not trust any node to be
 the only holder of a ticket.
+
+**The ratification is one write.** The ticket spend, the instance bind, the
+allocation, and the `provisional.ratified` event commit in a single
+scheduler-lane entry, all or nothing. A ratification that is refused (the
+node no longer fits, another node won the instance) therefore leaves the
+ticket unspent: a single-use ticket is consumed only by the start that
+actually ratifies.
+
+**The edge start can be the create.** A ticket that names a keyed instance
+id that has never existed creates the instance in that same entry, so a
+platform does not have to call `CreateInstance` first. A destroyed id is a
+tombstone, not "never existed", and is refused (`instance_claimed`): ids
+are never recycled. An id that is not a valid keyed instance id is refused
+with `unknown_target`.
 
 **Revocation is by TTL only.** The fast path cannot check a revocation list
 without adding the round trip the ticket exists to avoid. If you need fast
@@ -469,6 +495,12 @@ Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
 
 ## Known limitations
 
+- **The JWKS is fetched over the plaintext worker-to-manager channel** unless
+  the manager serves `server.tls`. Someone on the path between an edge node
+  and its manager could swap the keys that verify boot tickets. Keep that
+  path on a trusted network until encrypted worker connections ship
+  ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). The router-to-node
+  hop (`StartClaim` on 4848) is TLS, verified against the cluster CA.
 - **No island mode.** An unratified start that cannot reach a manager dies
   when its lease expires. Edge boot does not keep work running through a long
   control-plane outage.

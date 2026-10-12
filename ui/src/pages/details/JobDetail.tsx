@@ -348,6 +348,30 @@ function JobDetailContent() {
 
           <Show when={activeTab() === 'overview'}>
             <div class="space-y-4">
+              {/* A placement found no room: the job waits under a key and
+                  places on its own when capacity that could host it appears
+                  (docs/scheduler-and-eval-loop.md, "Blocked evals"). */}
+              <Show when={jobData()!.job?.blocked}>
+                {(blocked) => (
+                  <Note tone="warn">
+                    <div class="space-y-1">
+                      <div>
+                        <span class="font-semibold">Waiting for capacity</span> · blocked on{' '}
+                        <code class="font-mono">{blocked().key}</code> since <RelativeTime value={blocked().since} />
+                      </div>
+                      <div>
+                        Task <code class="font-mono">{blocked().task}</code> needs{' '}
+                        {Object.entries(blocked().shortfall)
+                          .sort(([a], [b]) => a.localeCompare(b))
+                          .map(([resource, amount]) => `${resource} ${amount}`)
+                          .join(', ') || 'room'}{' '}
+                        per placement. It places on its own when a node it can run on joins or frees room.
+                      </div>
+                      <div class="text-xs opacity-80">{blocked().message}</div>
+                    </div>
+                  </Note>
+                )}
+              </Show>
               <Show when={jobData()!.activeRollout}>
                 <Note tone="info">
                   <div class="flex flex-wrap items-center gap-x-3 gap-y-1">

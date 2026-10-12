@@ -9,6 +9,7 @@ use crate::worker::boot_ticket::BootTicketVerifier;
 use crate::worker::edge;
 use crate::worker::exec::{handle_exec_task, ExecTaskStream};
 use crate::worker::identity::WorkerIdentityManager;
+use crate::worker::plane::authorize;
 use crate::worker::task_manager::{launch_task_allocation, WorkerTaskManager};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -56,7 +57,9 @@ impl Worker for WorkerDaemonService {
         &self,
         request: Request<PostWorkRequest>,
     ) -> Result<Response<PostWorkReply>, Status> {
-        info!("Got a request from {:?}", request.remote_addr());
+        // Caller class `manager` (crate::worker::plane::WORKER_RPC_CALLERS).
+        let caller = authorize(&request, "PostWork")?;
+        debug!(remote = ?request.remote_addr(), %caller, "PostWork");
         let mut allocation = request
             .into_inner()
             .allocation
@@ -162,6 +165,8 @@ impl Worker for WorkerDaemonService {
         &self,
         request: Request<GetTaskLogsRequest>,
     ) -> Result<Response<GetTaskLogsReply>, Status> {
+        // Caller class `manager`.
+        authorize(&request, "GetTaskLogs")?;
         let req = request.into_inner();
         let streams = {
             let manager = self
@@ -201,6 +206,8 @@ impl Worker for WorkerDaemonService {
         &self,
         request: Request<Streaming<ExecClientFrame>>,
     ) -> Result<Response<Self::ExecTaskStream>, Status> {
+        // Caller class `manager`; checked before the first frame is read.
+        authorize(&request, "ExecTask")?;
         let stream = handle_exec_task(self.task_manager.clone(), request.into_inner()).await?;
         Ok(Response::new(stream))
     }
@@ -216,6 +223,9 @@ impl Worker for WorkerDaemonService {
         &self,
         request: Request<StartClaimRequest>,
     ) -> Result<Response<Self::StartClaimStream>, Status> {
+        // Caller class `ticket`: the boot ticket below is the authorization;
+        // a client certificate is neither needed nor consulted.
+        authorize(&request, "StartClaim")?;
         let Some(edge_boot) = self.edge_boot.clone() else {
             return Err(Status::failed_precondition(
                 "this node does not accept edge starts \
@@ -370,8 +380,10 @@ impl Worker for WorkerDaemonService {
         &self,
         request: Request<RestartWorkerRequest>,
     ) -> Result<Response<RestartWorkerReply>, Status> {
+        // Caller class `manager`.
+        let caller = authorize(&request, "RestartWorker")?;
         let node_id = request.into_inner().node_id;
-        info!(node_id = %node_id, "Received worker restart request");
+        info!(node_id = %node_id, %caller, "Received worker restart request");
 
         let reply = RestartWorkerReply {
             message: "Worker restarting".into(),

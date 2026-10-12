@@ -417,24 +417,63 @@ impl ManagerDaemonService {
             }
         }
 
-        let snapshot = self
-            .store
-            .begin_suspend(NewSnapshot {
-                snapshot_id: crate::structs::snapshot::new_snapshot_id(),
-                job_id: instance.job_id.clone(),
-                task_name: task.name.clone(),
-                instance_id: instance.instance_id.clone(),
-                name: None,
-                kind,
-                purpose: SnapshotPurpose::Suspend,
-                node_id: node.id.clone(),
-                allocation_id: allocation.id,
-                // Owned by the instance: never subject to snapshots.ttl.
-                expires_at: None,
-                suspend_reason: Some(crate::structs::suspend::SUSPEND_REASON_MANUAL.to_string()),
-                durability,
-            })
-            .map_err(|e| map_store_error("Error suspending instance", e))?;
+        let new = NewSnapshot {
+            snapshot_id: crate::structs::snapshot::new_snapshot_id(),
+            job_id: instance.job_id.clone(),
+            task_name: task.name.clone(),
+            instance_id: instance.instance_id.clone(),
+            name: None,
+            kind,
+            purpose: SnapshotPurpose::Suspend,
+            node_id: node.id.clone(),
+            allocation_id: allocation.id,
+            // Owned by the instance: never subject to snapshots.ttl.
+            expires_at: None,
+            suspend_reason: Some(crate::structs::suspend::SUSPEND_REASON_MANUAL.to_string()),
+            durability,
+        };
+        let recorded = RecordedSuspend {
+            message: format!(
+                "Suspending instance {} ({} checkpoint {} on {})",
+                instance.instance_id,
+                kind.as_str(),
+                new.snapshot_id,
+                node.id
+            ),
+            snapshot_id: new.snapshot_id.clone(),
+            kind: kind.as_str().to_string(),
+            node_id: node.id.clone(),
+            durability: durability.as_str().to_string(),
+        };
+        let record = serde_json::to_string(&recorded).unwrap_or_default();
+        // One scheduler-lane entry for the suspend and its idempotency
+        // record, group-committed with other instance writes
+        // (sandbox-scaling plan, Phase 1). A manager that does not lead the
+        // scheduler lane falls back to the forwarding pair it always used.
+        let fused = {
+            let new = new.clone();
+            let key = idempotency_key.clone();
+            let record = record.clone();
+            self.store
+                .scheduler_group_commit("suspend_instance", move |s| {
+                    let snapshot = s.begin_suspend_local(new)?;
+                    s.idempotency_record(&key, "suspend_instance", &record)?;
+                    Ok(snapshot)
+                })
+        };
+        let snapshot = match fused {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                let snapshot = self
+                    .store
+                    .begin_suspend(new)
+                    .map_err(|e| map_store_error("Error suspending instance", e))?;
+                self.store
+                    .idempotency_record(&idempotency_key, "suspend_instance", &record)
+                    .map_err(|e| map_store_error("Error recording idempotency", e))?;
+                snapshot
+            }
+            other => other.map_err(|e| map_store_error("Error suspending instance", e))?,
+        };
         info!(
             instance_id = %instance.instance_id,
             snapshot_id = %snapshot.snapshot_id,
@@ -443,26 +482,6 @@ impl ManagerDaemonService {
             durability = durability.as_str(),
             "Suspend requested"
         );
-        let recorded = RecordedSuspend {
-            message: format!(
-                "Suspending instance {} ({} checkpoint {} on {})",
-                instance.instance_id,
-                kind.as_str(),
-                snapshot.snapshot_id,
-                node.id
-            ),
-            snapshot_id: snapshot.snapshot_id,
-            kind: kind.as_str().to_string(),
-            node_id: node.id,
-            durability: durability.as_str().to_string(),
-        };
-        self.store
-            .idempotency_record(
-                &idempotency_key,
-                "suspend_instance",
-                &serde_json::to_string(&recorded).unwrap_or_default(),
-            )
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
         Ok(Response::new(recorded.into_reply(false)))
     }
 
@@ -486,84 +505,101 @@ impl ManagerDaemonService {
     }
 
     /// StartInstance on a `suspended` instance: restore from its checkpoint,
-    /// or boot cold. Returns the reply to record and send.
+    /// or boot cold. Returns the reply it recorded.
+    ///
+    /// One scheduler-lane entry, group-committed with other instance writes
+    /// (sandbox-scaling plan, Phase 1): the resume itself, an
+    /// `instance.restore_failed` event when the checkpoint is discarded, the
+    /// placement eval, and the idempotency record. A resume that cannot
+    /// restore (`RestoreUnavailable`) commits its `lifecycle_error` and
+    /// nothing else, and is refused without a record so a retry can succeed
+    /// once the cause is fixed.
     pub(super) fn resume_instance(
         &self,
         instance: &Instance,
         cold: bool,
+        idempotency_key: &str,
     ) -> Result<RecordedStart, Status> {
-        let outcome = self
-            .store
-            .resume_suspended_instance(&instance.instance_id, cold)
-            .map_err(|e| map_store_error("Error resuming instance", e))?;
-        let recorded = match outcome {
-            ResumeOutcome::RestoreUnavailable { reason } => {
-                return Err(Status::failed_precondition(format!(
-                    "instance {} cannot resume: {reason}\nHint: `legion instance start {} \
-                     --cold` boots it fresh on its retained storage",
-                    instance.instance_id, instance.instance_id
-                )));
-            }
-            ResumeOutcome::Resuming {
-                snapshot_id,
-                node_id,
-            } => RecordedStart {
-                message: match node_id.as_deref() {
-                    Some(node_id) => format!(
-                        "Resuming instance {} from {snapshot_id} on {node_id}",
-                        instance.instance_id
-                    ),
-                    None => format!(
-                        "Resuming instance {} from published {snapshot_id} on any compatible \
-                         node",
-                        instance.instance_id
-                    ),
-                },
-                resuming_from: snapshot_id,
-                node_id: node_id.unwrap_or_default(),
-            },
-            ResumeOutcome::Cold { reason, discarded } => {
-                if let (Some(reason), Some(snapshot_id)) = (reason.as_deref(), discarded.as_deref())
-                {
-                    self.store.events().instance_restore_failed(
-                        snapshot_id,
-                        &instance.job_id,
-                        &instance.instance_id,
-                        None,
-                        None,
-                        reason,
-                        true,
-                    );
-                }
-                RecordedStart {
-                    message: match reason {
-                        Some(reason) => {
-                            format!("Started instance {} cold: {reason}", instance.instance_id)
-                        }
-                        None => format!(
-                            "Started instance {} cold (discarded checkpoint {})",
-                            instance.instance_id,
-                            discarded.as_deref().unwrap_or("-")
-                        ),
-                    },
-                    ..Default::default()
-                }
-            }
-        };
-        let config = self
+        let config_id = self
             .store
             .get_job_config(&instance.job_id)
-            .map_err(|e| map_store_error("Error loading job config", e))?;
-        self.store
-            .enqueue_eval(
-                "job_reschedule",
-                Some(&instance.job_id),
-                Some(&config.id()),
-                None,
-                Some(self.store.default_eval_priority),
-            )
-            .map_err(|e| map_store_error("Error scheduling instance resume", e))?;
-        Ok(recorded)
+            .map_err(|e| map_store_error("Error loading job config", e))?
+            .id();
+        let instance_id = instance.instance_id.clone();
+        let job_id = instance.job_id.clone();
+        let priority = self.store.default_eval_priority;
+        let key = idempotency_key.to_string();
+        let resumed = self
+            .store
+            .scheduler_group_commit("resume_instance", move |s| {
+                let recorded = match s.resume_suspended_instance(&instance_id, cold)? {
+                    ResumeOutcome::RestoreUnavailable { reason } => return Ok(Err(reason)),
+                    ResumeOutcome::Resuming {
+                        snapshot_id,
+                        node_id,
+                    } => RecordedStart {
+                        message: match node_id.as_deref() {
+                            Some(node_id) => format!(
+                                "Resuming instance {instance_id} from {snapshot_id} on {node_id}"
+                            ),
+                            None => format!(
+                                "Resuming instance {instance_id} from published {snapshot_id} on \
+                                 any compatible node"
+                            ),
+                        },
+                        resuming_from: snapshot_id,
+                        node_id: node_id.unwrap_or_default(),
+                    },
+                    ResumeOutcome::Cold { reason, discarded } => {
+                        if let (Some(reason), Some(snapshot_id)) =
+                            (reason.as_deref(), discarded.as_deref())
+                        {
+                            s.events().instance_restore_failed(
+                                snapshot_id,
+                                &job_id,
+                                &instance_id,
+                                None,
+                                None,
+                                reason,
+                                true,
+                            );
+                        }
+                        RecordedStart {
+                            message: match reason {
+                                Some(reason) => {
+                                    format!("Started instance {instance_id} cold: {reason}")
+                                }
+                                None => format!(
+                                    "Started instance {instance_id} cold (discarded checkpoint {})",
+                                    discarded.as_deref().unwrap_or("-")
+                                ),
+                            },
+                            ..Default::default()
+                        }
+                    }
+                };
+                s.enqueue_eval(
+                    "job_reschedule",
+                    Some(&job_id),
+                    Some(&config_id),
+                    None,
+                    Some(priority),
+                )?;
+                s.idempotency_record(
+                    &key,
+                    "start_instance",
+                    &serde_json::to_string(&recorded).unwrap_or_default(),
+                )?;
+                Ok(Ok(recorded))
+            })
+            .map_err(|e| map_store_error("Error resuming instance", e))?;
+        resumed.map_err(|reason| {
+            Status::failed_precondition(format!(
+                "instance {} cannot resume: {reason}\nHint: `legion instance start {} \
+                 --cold` boots it fresh on its retained storage",
+                instance.instance_id, instance.instance_id
+            ))
+        })
     }
 }
 
