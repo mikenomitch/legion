@@ -132,7 +132,7 @@ spreading planning across managers (M3), with or without shards.
    ([`../aws-phase3-findings.md`](../aws-phase3-findings.md)); phase 3 put
    `apply` at 67% of plan time and throughput ~7× below planner capacity.
 2. **One active planner.** Eval workers idle on every manager that does not
-   lead the scheduler lane (`src/manager/daemon.rs:2608`).
+   lead the scheduler lane (`src/manager/daemon.rs:2765`).
 3. **One SQLite writer for every group.** `CAPTURE_MUTEX` is a
    process-global static (`capture.rs:163`) held for the whole of every
    capture (`:230`) and every apply (`:760`), across all lanes, because all
@@ -213,7 +213,7 @@ manager count from fleet size. What still grows with fleet size:
 - **The read model, on every manager.** `SchedulingReadModel` is an
   unconditional full mirror (`src/storage/store.rs:403`, built by
   unfiltered table scans at `store.rs:3203`, kept current on every replica
-  by projecting each applied changeset, `store.rs:11065`, and rebuilt
+  by projecting each applied changeset, `store.rs:11067`, and rebuilt
   after a snapshot install, `state_machine.rs:650`). No in-cluster sharding shrinks
   it — every manager is a voter of every group and must be able to take any
   shard over. At a rough 1–3 KB per node and per allocation in memory, a
@@ -251,7 +251,7 @@ clusters, not more groups.
 - **TiKV / CockroachDB** — true multi-raft over one shared engine, with a
   placement driver for split/merge/rebalance. *Take: many groups over one
   voter set and one transport (Legion's engine already multiplexes by
-  `group_id`, `proto/legion.proto:9709`). Reject: dynamic range management
+  `group_id`, `proto/legion.proto:10138`). Reject: dynamic range management
   in v1. And the lesson in §1.2: their sharing works because RocksDB is
   multi-writer; ours cannot.*
 - **YARN federation / Mesos** — routers over sub-schedulers owning capacity
@@ -348,12 +348,12 @@ clusters, not more groups.
   `ownership.rs:5`: row-changeset replication from two logs into one table
   applies in different orders on different replicas.
 - `verify_changeset_ownership` rejects a cross-lane changeset before
-  proposal, in every topology (`ownership.rs:485`, `:58`;
-  `driver.rs:1947`). Tests pin totality (`:568`) and per-lane snapshot
-  disjointness (`:649`).
+  proposal, in every topology (`ownership.rs:486`, `:58`;
+  `driver.rs:1947`). Tests pin totality (`:569`) and per-lane snapshot
+  disjointness (`:650`).
 - `scheduler_event` and `idempotency_record` are the `Commutative` class —
   insert-only, globally unique keys, writable from any lane's changeset,
-  snapshotted with control (`ownership.rs:91`, `:300`, `:354`).
+  snapshotted with control (`ownership.rs:91`, `:301`, `:355`).
 - Cross-lane **foreign keys exist**: `allocation`, `eval`, `rollout`,
   `rollout_event`, `instance`, and friends carry `REFERENCES job /
   job_config / task_config / node … ON DELETE CASCADE` into control-lane
@@ -363,13 +363,13 @@ clusters, not more groups.
   cascade would be a cross-lane write inside a control changeset and the
   guard would reject it — which is why the composites delete in
   dependency order (destroy: status → scheduler → control,
-  `store.rs:9315`) so cascades find nothing. `foreign_keys = ON` is live
+  `store.rs:9317`) so cascades find nothing. `foreign_keys = ON` is live
   (the JSON-affinity rebuild had to order its table drops around it), so
   the constraints are real but latent: safety nets, not load-bearing.
 
 ### 5.3 The scheduler lane, concretely
 
-- Owned tables (`ownership.rs:199`): `allocation`, `allocation_epoch`,
+- Owned tables (`ownership.rs:200`): `allocation`, `allocation_epoch`,
   `allocation_epoch_partition`, `plan_submission`,
   `allocation_stop_notice`, `allocation_history`, `node_alloc_usage`,
   `instance`, `volume`, `snapshot`, `snapshot_alias`, `boot_ticket`,
@@ -384,7 +384,7 @@ clusters, not more groups.
 - `snapshot` and `snapshot_alias` (sandbox checkpoints, added since
   revision 2) ride the scheduler lane with `instance`, because a restore
   writes `instance.restore_from` and reads the snapshot in one op
-  (`ownership.rs:249`). Both carry a `job_id`, so they are job-scoped rows
+  (`ownership.rs:250`). Both carry a `job_id`, so they are job-scoped rows
   and live in the job's shard. A `local` checkpoint pins its restore to the
   node that took it, and a `published` one restores on any compatible node
   ([docs/suspend-and-resume.md](../../docs/suspend-and-resume.md)). Either
@@ -400,19 +400,19 @@ clusters, not more groups.
   That makes per-shard claiming (rung A) a choice of which shard's queue to
   read, with no extra round.
 - Eval workers gate on per-lane leadership at loop top and mid-batch
-  (`daemon.rs:2608`, `:2751`), with an acquisition hook that recovers the
-  queue (`daemon.rs:2355`); the probe is per lane (`store.rs:2134` →
+  (`daemon.rs:2765`, `:2908`), with an acquisition hook that recovers the
+  queue (`daemon.rs:2512`); the probe is per lane (`store.rs:2134` →
   `driver.rs:1177`).
 
 ### 5.4 The cross-cutting couplings
 
 1. **`CAPTURE_MUTEX` + one file** (§1.1–1.2).
 2. **Composites span lanes** — submit, destroy, register, remove-node,
-   mark-lost (`store.rs:9817`, `:9315`, `:8046`, `:7692`, and
-   `mark_node_lost` at `:7419`) —
+   mark-lost (`store.rs:9819`, `:9317`, `:8047`, `:7693`, and
+   `mark_node_lost` at `:7420`) —
    each half its own entry, completed under divergence by forwarding
    (`ForwardableLaneWrite`, `src/storage/raft/forward.rs:53`, including
-   `enqueue_eval`) and the lane reconcilers (`daemon.rs:1523`–`1654`).
+   `enqueue_eval`) and the lane reconcilers (`daemon.rs:1680`–`1811`).
 3. **Co-location is deliberate.** `ANCHOR_LANE = Lane::Control` and the
    convergence loop gather all leadership on one manager
    (`driver.rs:158`, `:3926`), because composites half-fail elsewhere and
@@ -431,9 +431,9 @@ clusters, not more groups.
   pool-less tasks to `default` (`src/constraints.rs:117`), `pool_binding()`
   resolves a task's pool (`constraints.rs:181`), the scheduling index
   partitions by pool (`src/scheduling_index.rs:156`), preemption and ACLs
-  are pool-scoped (`scheduler.rs:4204`, `src/structs/acl.rs:135`).
+  are pool-scoped (`scheduler.rs:4222`, `src/structs/acl.rs:135`).
 - **Namespaces do not exist yet.** The ACL vocabulary has a `namespaces`
-  selector hardcoded to `DEFAULT_NAMESPACE` (`acl.rs:230`), and
+  selector hardcoded to `DEFAULT_NAMESPACE` (`acl.rs:236`), and
   [`namespaces-plan.md`](namespaces-plan.md) (PLANNED) turns it into a
   tenancy boundary. A namespace is not a shard key: namespaces group
   *jobs*, and two namespaces can place on the same pool, so keying shards
@@ -442,7 +442,7 @@ clusters, not more groups.
   different label.
 - **Store shape:** one `write_conn` and a read pool (`store.rs:1213`), all
   over one file; `ATTACH` is mentioned only as a thing changesets cannot
-  carry (`store.rs:19216`). rusqlite is `bundled` (`Cargo.toml:55`), so
+  carry (`store.rs:19269`). rusqlite is `bundled` (`Cargo.toml:55`), so
   `SQLITE_MAX_ATTACHED` is the default 10 unless the build defines it.
 
 ## 6. The methods
