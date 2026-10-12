@@ -8683,9 +8683,17 @@ export class Job extends Message<Job> {
   name = "";
 
   /**
-   * Job status string.
+   * Job lifecycle status. Values the manager writes:
    *
-   * Current values written by manager include: done, stopped, failed.
+   * - `active`: the job is submitted and not stopped. The manager keeps its
+   *   tasks scheduled. This says nothing about placement or progress: an
+   *   active job may have live allocations, may have failed to place, or (for
+   *   batch-only jobs) may have finished every task. Read the job's
+   *   allocations for that.
+   * - `stopped`: `StopJob` stopped the job. Resubmitting it with `RunJob`
+   *   sets it back to `active`.
+   * - `failed`: a required KV dependency vanished (`onDelete: fail`). A KV
+   *   put that restarts or rolls out the job sets it back to `active`.
    *
    * @generated from field: string status = 3;
    */

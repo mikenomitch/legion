@@ -182,12 +182,12 @@ function JobDetailContent() {
     }))
   })
 
-  // The manager stores `done` for every accepted job, running or not. A job
-  // with live allocations or active instances reads as running, so a keyed
-  // job with active instances never says DONE beside them.
+  // The manager stores `active` for every submitted, unstopped job, whether
+  // or not anything is placed. A job with live allocations or active
+  // instances reads as running, which says more than `active`.
   const displayStatus = createMemo(() => {
     const status = jobData()?.job?.status || 'unknown'
-    if (status.toLowerCase() !== 'done') return status
+    if (status.toLowerCase() !== 'active') return status
     const liveAllocation = (jobData()?.allocations ?? []).some((allocation) => !['complete', 'failed'].includes(allocation.status.toLowerCase()))
     const liveInstance = (instances() ?? []).some((instance) => ['active', 'pending', 'rescheduling'].includes(instance.state))
     return liveAllocation || liveInstance ? 'running' : status
@@ -264,10 +264,10 @@ function JobDetailContent() {
                 <StatusBadge
                   status={displayStatus()}
                   title={
-                    (jobData()!.job?.status ?? '').toLowerCase() === 'done'
+                    (jobData()!.job?.status ?? '').toLowerCase() === 'active'
                       ? displayStatus() === 'running'
-                        ? 'Allocations or instances of this job are running. The manager records the job itself as "done", its word for an accepted job.'
-                        : 'Submitted and scheduled. "done" is the manager\'s word for an accepted job, not a finished one — see the task cards for what is running.'
+                        ? 'Allocations or instances of this job are running.'
+                        : 'Submitted and not stopped, but nothing is live right now — see the task cards and allocations for why.'
                       : undefined
                   }
                 />

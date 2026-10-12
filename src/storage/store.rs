@@ -8841,7 +8841,7 @@ impl Store {
         Ok(status)
     }
 
-    /// Clear a `failed` job status (back to `done`) when a KV-triggered
+    /// Clear a `failed` job status (back to `active`) when a KV-triggered
     /// restart or rollout actively recovers the job. No-op when the job is
     /// not currently failed. Returns whether a row was updated.
     #[instrument(err, skip(self))]
@@ -8855,14 +8855,14 @@ impl Store {
     fn clear_job_failed_status_apply(&self, job_id: &str) -> R<bool> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
-            "UPDATE job SET status = 'done', updated_at = ?2 \
+            "UPDATE job SET status = 'active', updated_at = ?2 \
              WHERE id = ?1 AND status = 'failed';",
             params![job_id, Self::now_unix()],
         )?;
         Ok(updated > 0)
     }
 
-    /// Clear a `stopped` job status (back to `done`) when the job is
+    /// Clear a `stopped` job status (back to `active`) when the job is
     /// resubmitted via RunJob. A resubmit revives the job, so the
     /// instance-management RPCs (CreateInstance/StartInstance), which reject
     /// stopped jobs, must accept it again. Stopped keyed instances
@@ -8880,7 +8880,7 @@ impl Store {
     fn clear_job_stopped_status_apply(&self, job_id: &str) -> R<bool> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
-            "UPDATE job SET status = 'done', updated_at = ?2 \
+            "UPDATE job SET status = 'active', updated_at = ?2 \
              WHERE id = ?1 AND status = 'stopped';",
             params![job_id, Self::now_unix()],
         )?;
@@ -9938,7 +9938,7 @@ impl Store {
                 let job_params = named_params! {
                     ":id": config.name,
                     ":name": config.name,
-                    ":status": "done",
+                    ":status": "active",
                     ":created_at": now,
                     ":updated_at": now,
                 };

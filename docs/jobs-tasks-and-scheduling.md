@@ -362,6 +362,30 @@ Batch tasks can set `schedule` (`every` or cron). After a submit, update, or res
 
 `task.schedule` is rejected for any lifecycle other than `batch`.
 
+## Job Status
+
+`Job.status` (in `legion job list`, `legion job info`, `ListJobs`, and the
+`job` table) is a lifecycle flag. It records what was done to the job, not how
+its workload is doing:
+
+| Status | Meaning | Set by |
+| --- | --- | --- |
+| `active` | Submitted and not stopped. The manager keeps its tasks scheduled. | First submission, `legion job run` on a stopped job, KV recovery from `failed` |
+| `stopped` | Stopped by an operator. | `legion job stop` |
+| `failed` | A required KV dependency vanished (`onDelete = "fail"`). | KV reactive updates ([KV store](kv-store.md#fail-semantics-and-recovery)) |
+
+`active` doesn't tell you anything about placement or progress. A long-running
+service with healthy allocations is `active`. So is a job whose tasks all
+failed to place, and so is a batch-only job whose tasks have all exited
+successfully. To see what is actually running, look at the job's allocations:
+the job page in the UI, or a state-store query (see
+[Diagnosing scheduler performance](diagnosing-scheduler-performance.md)). The
+UI's job page shows `running` in place of `active` while any allocation or
+instance of the job is live.
+
+`legion job list --status <value>` and `ListJobsRequest.status` filter on
+this field exactly.
+
 ## Job Timestamps: `created_at` and `updated_at`
 
 Every job has two timestamps, both unix seconds on the wire (`Job.created_at`,
@@ -388,7 +412,7 @@ The mtime tracks changes to the job record. It does not track the workload runni
 | A byte-identical spec is resubmitted | no (nothing changed) |
 | `legion job stop` (status → `stopped`) | yes |
 | Job marked `failed`, including a failed KV dependency | yes |
-| Job recovered to `done` from `stopped` or `failed` | yes |
+| Job recovered to `active` from `stopped` or `failed` | yes |
 | A restart request is acknowledged | yes |
 | An allocation is placed, replaced, or removed | **no** |
 | Health checks, task-status writes, node heartbeats | **no** |

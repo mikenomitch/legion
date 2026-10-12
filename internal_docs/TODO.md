@@ -3187,10 +3187,13 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
         new checkpoint and whether the budget or the disk limits it, but
         GetNodeUsage carries only the `snapshots` class
         ([calls 8](calls/suspend-resume-ui-plan_calls.md#8-getnodecontent-reads-only-what-the-manager-already-holds))
-  - [ ] The Jobs index still lists a running job as `done`; only the job
-        page derives `running`
+  - [ ] The Jobs index lists the stored lifecycle status (`active`) for a
+        running job; only the job page derives `running`
         ([calls 9](calls/suspend-resume-ui-plan_calls.md#9-a-done-job-with-live-work-reads-running-derived-in-the-ui)).
-        A server-side status that reflects live work would fix both
+        A server-side status derived from allocations (`running` / `pending`
+        / `complete`) would fix both, and would let a finished batch-only
+        job stop reading `active`
+        ([calls 1](calls/job-status-active_calls.md#1-the-stored-job-status-is-active-not-running))
   - [ ] `create --from-snapshot` from the UI needs an instance-create
         surface, which the UI does not have
         ([calls 15](calls/suspend-resume-ui-plan_calls.md#15-creating-instances-from-a-snapshot-stays-in-the-cli))
@@ -4134,6 +4137,11 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] DAGs: `depends_on` with `start`/`complete`/`success` conditions, topological
       sort, cycle rejection, cross-group dependencies (so DAGs span machines) and
       group-bound sidecars
+- [x] A submitted job's stored status is `active`, not `done`. `done` read as
+      "finished" next to a long-running service. Values are `active`,
+      `stopped`, `failed`
+      ([docs](../docs/jobs-tasks-and-scheduling.md#job-status) ·
+      calls: [job-status-active_calls.md](calls/job-status-active_calls.md))
 
 ## Agent surfaces
 

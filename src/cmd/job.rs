@@ -173,7 +173,7 @@ pub fn config() -> Command {
             Arg::new("status")
                 .long("status")
                 .value_name("STATUS")
-                .help("Only jobs with this exact status (e.g. running, stopped, failed)"),
+                .help("Only jobs with this exact status (active, stopped, or failed)"),
         )
         .arg(json_flag());
 

@@ -188,6 +188,7 @@ by project impact. The full template and a worked example:
 - [heartbeat-scale-plan_calls.md](calls/heartbeat-scale-plan_calls.md)
 - [host-convergence-plan_calls.md](calls/host-convergence-plan_calls.md)
 - [host-process-supervision-plan_calls.md](calls/host-process-supervision-plan_calls.md)
+- [job-status-active_calls.md](calls/job-status-active_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
 - [jsonb-text-affinity-plan_calls.md](calls/jsonb-text-affinity-plan_calls.md)
 - [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)

@@ -545,14 +545,15 @@ failure. Count allocations instead.
 
 A run ended with 264 evals in `status: failed` in the eval table, while
 `legion_evals_processed_total{status="error"}` never moved. Jobs where every
-task had failed to place reported `status: done`.
+task had failed to place reported `status: active`.
 
 Two separate gaps caused that:
 
 1. **The job `status` field is a lifecycle flag.** It doesn't tell you whether
-   placement worked. A job row is inserted with `status = "done"` at submit
-   time, and only the KV reactive-update failure path ever writes `failed`. A
-   job whose placements all failed keeps the status it was created with.
+   placement worked. A job row is inserted with `status = "active"` at submit
+   time, and only `legion job stop` (`stopped`) and the KV reactive-update
+   failure path (`failed`) ever change it. A job whose placements all failed
+   keeps the status it was created with.
    `GetJobInfo` returns the job row and nothing about its allocations, so
    `legion job info` can't tell you whether a job placed.
 2. **Terminal eval failures don't reliably reach the counter.**

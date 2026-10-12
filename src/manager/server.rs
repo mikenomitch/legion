@@ -12641,7 +12641,7 @@ mod tests {
             evals_of_kind(&manager.store, "kv-del-none", "rollout_tick")?,
             0
         );
-        assert_eq!(manager.store.get_job("kv-del-none")?.status, "done");
+        assert_eq!(manager.store.get_job("kv-del-none")?.status, "active");
         // The last rendered value is kept in the desired config.
         assert_eq!(
             task_env_value(&manager.store, "kv-del-none", 0, "WATCHED")?,
@@ -12668,7 +12668,7 @@ mod tests {
             evals_of_kind(&manager.store, "kv-del-restart", "job_update")?,
             1
         );
-        assert_eq!(manager.store.get_job("kv-del-restart")?.status, "done");
+        assert_eq!(manager.store.get_job("kv-del-restart")?.status, "active");
         Ok(())
     }
 
@@ -12765,7 +12765,7 @@ mod tests {
         // Recovery path: putting the key back resolves through onChange.
         put_kv_entry(&manager, "recover/key", "v2").await?;
 
-        assert_eq!(store.get_job("kv-recover")?.status, "done");
+        assert_eq!(store.get_job("kv-recover")?.status, "active");
         assert_eq!(evals_of_kind(&store, "kv-recover", "job_update")?, 1);
         assert_eq!(task_env_value(&store, "kv-recover", 0, "WATCHED")?, "v2");
         Ok(())
@@ -12916,9 +12916,9 @@ mod tests {
         assert_eq!(stamped.status, "failed:missing_kv_dependency");
 
         // Put the key back: onChange=restart recovers — job status back to
-        // done and a job_update enqueued to replace the failed allocations.
+        // active and a job_update enqueued to replace the failed allocations.
         put_kv_entry(&manager, "clr/key", "v2").await?;
-        assert_eq!(store.get_job("kv-clr")?.status, "done");
+        assert_eq!(store.get_job("kv-clr")?.status, "active");
         assert_eq!(evals_of_kind(&store, "kv-clr", "job_update")?, 1);
         Ok(())
     }
@@ -12950,7 +12950,7 @@ mod tests {
             watched_env_jobspec("kv-none", "none/key", "none", "fail"),
         )
         .await?;
-        assert_eq!(store.get_job("kv-none")?.status, "done");
+        assert_eq!(store.get_job("kv-none")?.status, "active");
         Ok(())
     }
 
@@ -12989,7 +12989,7 @@ mod tests {
             evals_of_kind(&manager.store, "kv-unwatched", "rollout_tick")?,
             0
         );
-        assert_eq!(manager.store.get_job("kv-unwatched")?.status, "done");
+        assert_eq!(manager.store.get_job("kv-unwatched")?.status, "active");
         // The put still refreshed the desired config (state-only update).
         assert_eq!(
             task_env_value(&manager.store, "kv-unwatched", 0, "WATCHED")?,
@@ -13362,7 +13362,7 @@ mod tests {
 
         // Only a replacement clears the failure stamps, so the put restarts.
         put_kv_entry(&manager, "certs/gone", "pem-2").await?;
-        assert_eq!(store.get_job("kv-live-fail")?.status, "done");
+        assert_eq!(store.get_job("kv-live-fail")?.status, "active");
         assert_eq!(evals_of_kind(&store, "kv-live-fail", "job_update")?, 1);
         Ok(())
     }
