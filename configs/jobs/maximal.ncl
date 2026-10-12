@@ -717,6 +717,18 @@
                 # nfs. This task's local-dir volume keeps it at "local"
                 # (job validation refuses "store" here).
                 durability = "local",
+                # Once a "store" checkpoint is published, move its record
+                # out of the replicated store into the bucket, next to its
+                # parts (docs/suspend-and-resume.md, "Archiving idle
+                # instances"). "slim": the instance row stays, recording the
+                # archive manifest's URL, and the snapshot row is dropped.
+                # "manifestOnly": an unnamed instance without a
+                # stateful.storage volume keeps no row at all (any other
+                # instance keeps a slim row). Unset (default): nothing is
+                # archived. Needs durability = "store", a memory checkpoint,
+                # and no reserve, so this exec task leaves it out (job
+                # validation refuses it here):
+                # archive = "slim",
                 # argv a sandbox guest runs after every memory restore, once
                 # its identity is refreshed. Sandbox memory checkpoints only,
                 # so this exec task leaves it out (job validation refuses it

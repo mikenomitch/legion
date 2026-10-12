@@ -825,6 +825,9 @@ pub struct Metrics {
     /// `legion_checkpoint_publish_total{outcome}` (docs/metrics.md, "Suspend
     /// and resume"; Phase 7b)
     pub checkpoint_publish_total: Arc<CounterVec>,
+    /// `legion_instance_archived_total{mode}` (docs/metrics.md, "Suspend
+    /// and resume"; sandbox-scaling Phase 5)
+    pub instance_archived_total: Arc<CounterVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
     /// `legion_store_write_lock_wait_seconds`
@@ -1265,6 +1268,14 @@ impl Metrics {
                 name: "legion_checkpoint_publish_total",
                 help: "Checkpoint publishes reported by nodes, by outcome (published|retrying|failed). A failed publish leaves the snapshot local to its node; retrying means the manager asks the node again after a backoff.",
                 labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let instance_archived_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_instance_archived_total",
+                help: "Suspended instances archived as their checkpoint was published (suspend.archive), by mode (slim|manifestOnly). An archived instance keeps no snapshot row in the store; manifestOnly keeps no row at all.",
+                labels: &["mode"],
             },
             series: Series::new(),
         });
@@ -1776,6 +1787,7 @@ impl Metrics {
             Arc::clone(&checkpoint_publish_bytes) as Arc<dyn RenderMetric>,
             Arc::clone(&checkpoint_publish_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&checkpoint_publish_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&instance_archived_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
@@ -1878,6 +1890,7 @@ impl Metrics {
             checkpoint_publish_bytes,
             checkpoint_publish_seconds,
             checkpoint_publish_total,
+            instance_archived_total,
             allocations,
             store_write_lock_wait_seconds,
             store_read_lock_wait_seconds,

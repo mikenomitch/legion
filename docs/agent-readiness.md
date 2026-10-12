@@ -60,7 +60,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_job_validate` | no | Validate a rendered jobspec (JSON). |
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
-| `legion_instance_list` | no | List a job's stateful instances (slot + keyed). |
+| `legion_instance_list` | no | List a job's stateful instances (slot + keyed). The reply is `{ instances, next_idle_page_token }`. `include_idle: true` also lists instances [archived](suspend-and-resume.md#archiving-idle-instances) with `manifestOnly`, which have no row, from the bucket a page at a time (`idle_page_token`, `idle_page_size`); page until the token is empty, since a page can come back short. |
 | `legion_instance_get` | no | Inspect one stateful instance, including a live unratified claim when one exists ([edge-boot.md](edge-boot.md)). |
 | `legion_volume_list` | no | List volumes, the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
 | `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |

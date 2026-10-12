@@ -1630,6 +1630,33 @@ pub mod drafts {
         )
     }
 
+    /// `instance.archived` — a suspended instance's checkpoint was
+    /// published and its snapshot row moved to an archive manifest in the
+    /// `contentStore` (`suspend.archive`).
+    pub fn instance_archived(archived: &crate::storage::store::ArchivedInstance) -> EventDraft {
+        EventDraft::info(
+            "instance.archived",
+            format!(
+                "Instance {} archived its checkpoint {} to {}{}",
+                archived.instance_id,
+                archived.snapshot_id,
+                archived.manifest_url,
+                if archived.row_deleted {
+                    " and keeps no row (manifestOnly)"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .job(&archived.job_id)
+        .meta(json!({
+            "instanceId": archived.instance_id,
+            "snapshotId": archived.snapshot_id,
+            "manifestUrl": archived.manifest_url,
+            "manifestOnly": archived.row_deleted,
+        }))
+    }
+
     /// `instance.resumed` — a suspended instance restored from its
     /// checkpoint as a new allocation.
     pub fn instance_resumed(
@@ -2369,6 +2396,10 @@ impl EventRecorder<'_> {
 
     pub fn instance_suspend_failed(self, snapshot: &crate::structs::snapshot::SnapshotRecord) {
         self.emit(drafts::instance_suspend_failed(snapshot));
+    }
+
+    pub fn instance_archived(self, archived: &crate::storage::store::ArchivedInstance) {
+        self.emit(drafts::instance_archived(archived));
     }
 
     pub fn instance_resumed(

@@ -329,6 +329,31 @@ pub fn config() -> Command {
                 .value_name("GROUP")
                 .help("Only show instances in this task group"),
         )
+        .arg(
+            Arg::new("include-idle")
+                .long("include-idle")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Also list archived instances that have no row in the store \
+                     (suspend.archive = \"manifestOnly\"), read from the job's archive \
+                     manifests in the contentStore, one page at a time",
+                ),
+        )
+        .arg(
+            Arg::new("idle-page-token")
+                .long("idle-page-token")
+                .value_name("TOKEN")
+                .requires("include-idle")
+                .help("With --include-idle: resume the bucket listing at this token"),
+        )
+        .arg(
+            Arg::new("idle-page-size")
+                .long("idle-page-size")
+                .value_name("N")
+                .value_parser(clap::value_parser!(u32))
+                .requires("include-idle")
+                .help("With --include-idle: the most archived instances to list (default 1000)"),
+        )
         .arg(json_flag());
 
     let get_cmd = Command::new("get")
@@ -912,9 +937,19 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<String>("job")
         .context("Must provide job")?
         .clone();
+    let include_idle = arg_matches.get_flag("include-idle");
     let request = tonic::Request::new(ListInstancesRequest {
         job_id: job,
         group: arg_matches.get_one::<String>("group").cloned(),
+        include_idle,
+        idle_page_token: arg_matches
+            .get_one::<String>("idle-page-token")
+            .cloned()
+            .unwrap_or_default(),
+        idle_page_size: arg_matches
+            .get_one::<u32>("idle-page-size")
+            .copied()
+            .unwrap_or_default(),
     });
 
     let mut client = connect_manager_client().await?;
@@ -926,10 +961,19 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
     .into_inner();
 
     if format.is_json() {
-        output::print_success(&reply.instances);
+        output::print_success(&json!({
+            "instances": reply.instances,
+            "nextIdlePageToken": reply.next_idle_page_token,
+        }));
     } else {
         let rows: Vec<InstanceRow> = reply.instances.iter().map(InstanceRow::from).collect();
         print_table(rows);
+        if !reply.next_idle_page_token.is_empty() {
+            println!(
+                "\nmore archived instances: --include-idle --idle-page-token {}",
+                reply.next_idle_page_token
+            );
+        }
     }
     Ok(())
 }
@@ -1066,6 +1110,12 @@ impl From<&InstanceInfo> for InstanceRow {
 /// `snap-77e0 (memory, local w-03)`, `snap-5b10 (memory, published)`,
 /// `snap-1a4d (disk)`, or `-`.
 fn checkpoint_column(instance: &InstanceInfo) -> String {
+    if instance.archived {
+        return match instance.checkpoint_id.as_deref() {
+            Some(id) => format!("{id} (archived)"),
+            None => "archived".into(),
+        };
+    }
     let Some(id) = instance.checkpoint_id.as_deref() else {
         return "-".into();
     };
@@ -1098,7 +1148,13 @@ fn address_line(instance: &InstanceInfo) -> Option<String> {
 /// The last suspend and restore, for `instance get`.
 fn suspend_lines(instance: &InstanceInfo) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(checkpoint) = instance.checkpoint_id.as_deref() {
+    if instance.archived {
+        lines.push(format!(
+            "\narchived: {} (the checkpoint's snapshot row lives in this manifest; `instance \
+             start` reads it back)",
+            instance.manifest_url.as_deref().unwrap_or("-")
+        ));
+    } else if let Some(checkpoint) = instance.checkpoint_id.as_deref() {
         lines.push(format!(
             "\ncheckpoint: {checkpoint} ({}, {} on {}, {} bytes, durability {})",
             instance.checkpoint_kind.as_deref().unwrap_or("-"),

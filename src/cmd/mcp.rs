@@ -193,12 +193,15 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_list",
-            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `coldBoot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`coldBoot.reason` says why).",
+            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `coldBoot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`coldBoot.reason` says why). An `archived` instance is suspended with its checkpoint moved to an archive manifest (`manifestUrl`); start it as usual. With `include_idle`, archived instances that have no row (suspend.archive = \"manifestOnly\") are listed from the bucket after the rows, one page at a time: pass `nextIdlePageToken` back as `idle_page_token`.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "string", "description": "Job name." },
-                    "group": { "type": "string", "description": "Optional task-group filter." }
+                    "group": { "type": "string", "description": "Optional task-group filter." },
+                    "include_idle": { "type": "boolean", "description": "Also list archived instances with no row, from the contentStore. Default false." },
+                    "idle_page_token": { "type": "string", "description": "With include_idle: the previous reply's nextIdlePageToken." },
+                    "idle_page_size": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "With include_idle: the most bucket-listed instances to return (default 1000)." }
                 },
                 "required": ["job_id"],
                 "additionalProperties": false
@@ -1366,8 +1369,25 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_instance_list" => {
             let job_id = str_arg(&args, "job_id")?;
             let group = opt_str_arg(&args, "group");
+            let include_idle = args
+                .get("include_idle")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let idle_page_token = opt_str_arg(&args, "idle_page_token").unwrap_or_default();
+            let idle_page_size = args
+                .get("idle_page_size")
+                .and_then(Value::as_u64)
+                .map(|size| size.min(u64::from(u32::MAX)) as u32)
+                .unwrap_or(0);
             let mut client = connect().await?;
-            grpc(client.list_instances(ListInstancesRequest { job_id, group })).await
+            grpc(client.list_instances(ListInstancesRequest {
+                job_id,
+                group,
+                include_idle,
+                idle_page_token,
+                idle_page_size,
+            }))
+            .await
         }
         "legion_instance_get" => {
             let instance_id = str_arg(&args, "instance_id")?;

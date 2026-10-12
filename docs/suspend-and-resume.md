@@ -106,6 +106,7 @@ suspend = {
   resumeTimeout = "30s",          # how long a resume waits for its node
   onResume = ["/usr/local/bin/reconnect"],  # run in the guest after a restore
   durability = "local",           # "local" | "store"
+  archive = "slim",               # "slim" | "manifestOnly": keep the record in the bucket (store only)
   idle = { after = "3m" },        # suspend automatically when quiet
   onPressure = true,              # let a short node suspend it instead of evicting
 },
@@ -119,6 +120,7 @@ suspend = {
 | `resumeTimeout` | `30s` | How long a resume waits to be placed on its checkpoint's node before `onRestoreFailure = "cold"` boots it fresh. At least one second. |
 | `onResume` | none | argv the sandbox guest runs after every memory restore, once its identity is refreshed. |
 | `durability` | `local` | Where the checkpoint lives. `local`: only on the node that took it. `store`: also published to that node's `contentStore`, so the instance can resume on any compatible node and survives losing the node. See [Durability](#durability-surviving-the-node). |
+| `archive` | none | Once a `durability = "store"` checkpoint is published, move its record out of the replicated store and into the bucket: `slim` keeps a small instance row, `manifestOnly` keeps nothing for an unnamed instance. See [Archiving idle instances](#archiving-idle-instances). |
 | `idle` | none | Suspend automatically once the instance has been quiet for `idle.after`. See [Idle policy](#idle-policy). |
 | `onPressure` | `false` | Let the node's memory pressure response suspend this instance (the `suspend` step) before it evicts anything. See [Under memory pressure](#under-memory-pressure). |
 
@@ -859,6 +861,121 @@ nodes heartbeat drops them, and you warm again.
 `snapshot warm` needs `snapshot:read` on the snapshot's job. It is gated like
 a mutating call in the MCP server (`--allow-write`), because it starts
 downloads across the fleet.
+
+### Archiving idle instances
+
+A suspended instance with a published checkpoint still holds two rows in the
+replicated store: the instance row, and its checkpoint's snapshot row, which
+carries the whole manifest (every part's URL, digest, and key). For a fleet
+with millions of idle sandboxes, those rows are most of the store, and every
+manager keeps a copy. `suspend.archive` moves the checkpoint's record into the
+bucket next to its parts once it is published:
+
+```nickel
+suspend = {
+  checkpoint = "memory",
+  durability = "store",
+  archive = "slim",               # "slim" | "manifestOnly"
+  idle = { after = "3m" },
+},
+```
+
+| Mode | What stays in the replicated store |
+| --- | --- |
+| `slim` | The instance row, recording the archive manifest's URL. The snapshot row is dropped. |
+| `manifestOnly` | Nothing, for an unnamed instance (created without `--id`) with no `stateful.storage` volume. Any other instance keeps a slim row, as with `slim`. |
+
+`archive` needs `durability = "store"`, a memory checkpoint, and no
+`suspend.reserve` (an archived instance holds nothing on any node). Submit
+refuses anything else:
+
+```text
+Error: task "workspace" sets suspend.archive = "slim", but its checkpoints stay on the node that took them (durability = "local")
+Hint: set suspend.durability = "store" so the checkpoint is published to the worker's contentStore before it is archived
+```
+
+#### What happens
+
+1. The suspend and the publish run exactly as in [What happens](#what-happens).
+2. Once every part is uploaded, the node writes an **archive manifest** to
+   `<contentStore.url>/manifests/<job>/<group>/<task>/<instance>.json`: the
+   checkpoint's manifest, plus the instance's identity (its id, job, task,
+   when it was created and suspended, the fork it came from, and its identity
+   epoch).
+3. The node's publish report carries the manifest's URL. The manager drops
+   the snapshot row, and with `manifestOnly` the instance row, in the same
+   entry that records the publish, and emits `instance.archived`.
+
+Archiving writes no raft entry of its own. If the manifest cannot be written,
+the publish is reported failed and retried like any failed upload, and the
+instance stays an ordinary suspended instance with a `local` checkpoint.
+
+An archived instance is still `suspended`. `instance get` says so, with
+`archived: true` and the `manifest_url`. `instance list` shows the checkpoint
+as `(archived)`:
+
+```console
+$ legion instance get user-42 -j
+{"ok":true,"data":{"instance":{"instance_id":"user-42","state":"suspended",
+ "checkpoint_id":"snap-5b10e2c7a9d04f31","archived":true,
+ "manifest_url":"s3://legion-content-usw2/manifests/workspaces/main/workspace/user-42.json", ...}}}
+```
+
+#### Resuming an archived instance
+
+`legion instance start <id>` reads the archive manifest, puts the snapshot
+row back in the same entry that starts the resume, and resumes it as a
+`published` checkpoint on any compatible node. Once the instance is back in
+the store, the manager deletes the manifest. `--cold` does not read it.
+
+An instance archived with `manifestOnly` has no row, so `instance start`,
+`get`, and `destroy` look for its manifest in the bucket instead. Its id
+names its task (`workspace-7k2qd9x4m1b8c3rj5t0v6wye2h`), so the manager
+probes one object per job that has a keyed `workspace` task with
+`durability = "store"`, in each `contentStore` the cluster's worker types
+name. A start of an id with neither a row nor a manifest is `NotFound`.
+
+When the manifest cannot be read, the resume follows `onRestoreFailure`
+exactly as for a lost checkpoint: `cold` boots fresh, `fail` leaves the
+instance suspended with the reason in its detail:
+
+```text
+instance user-42 cannot resume: checkpoint snap-5b10e2c7a9d04f31 is archived and its manifest s3://legion-content-usw2/manifests/workspaces/main/workspace/user-42.json could not be read (the manifest does not exist)
+```
+
+#### Listing archived instances
+
+`instance list` reads rows, so it shows slim archived instances like any
+other. `manifestOnly` instances live only in the bucket, and
+`--include-idle` lists them from it, a page at a time:
+
+```console
+$ legion instance list workspaces --include-idle --idle-page-size 500 -j
+{"ok":true,"data":{"instances":[...],"nextIdlePageToken":"0:manifests/workspaces/main/workspace/workspace-7k2q..."}}
+$ legion instance list workspaces --include-idle --idle-page-token '0:manifests/...' -j
+```
+
+The rows come first on the first page. Every page then adds up to
+`--idle-page-size` (default 1,000, at most 10,000) instances from the
+bucket, in object-name order across each `contentStore`, and
+`nextIdlePageToken` is empty after the last. A page can come back shorter
+than its size, because a manifest whose instance also has a row is listed
+once, from the row. A bucket instance's state is `suspended`, with
+`archived: true`.
+
+#### Stopping and destroying
+
+`instance destroy` and `instance stop` on an archived instance delete its
+manifest (destroy of a `manifestOnly` instance deletes only the manifest,
+since there is no row). The checkpoint parts stay where they are, like every
+published part, until the bucket's lifecycle rule removes them. A lifecycle
+rule on `manifests/` is how long an idle `manifestOnly` instance lives: once
+its manifest expires, the instance is gone.
+
+The manager reads, lists, and deletes manifests itself, so it needs read,
+list, and delete access to every `contentStore`. A bucket whose worker type
+sets `contentStore.auth.kv` is reached with that credential, and otherwise
+with the manager's ambient credentials (instance role, environment).
 
 ## Identity after a resume
 
@@ -1807,6 +1924,7 @@ while the manager's keyring is locked.
 | `snapshot.warmed` | info | A node fetched a published snapshot's parts after `snapshot warm`. The metadata carries `fetchedBytes` and `durationMs`. |
 | `snapshot.warm_failed` | warn | A node could not warm a snapshot. The metadata carries `error`. |
 | `instance.suspended` | info | A suspend's capture landed. The instance is `suspended`. The metadata carries `kind`, `totalBytes`, `durationMs`, `reserved` (whether it holds a share of its reservation), and `reason` (`manual`, `idle`, `pressure`, or `make_room`). |
+| `instance.archived` | info | A published suspend checkpoint was archived (`suspend.archive`). The metadata carries `snapshotId`, `manifestUrl`, and `manifestOnly` (whether the instance row was dropped too). |
 | `instance.make_room` | info | A resume did not fit on its checkpoint's node, and the manager started suspends to make room. The metadata carries the resume's `instanceId` and the instances it is `suspending`. |
 | `instance.suspend_failed` | warn | A suspend's capture failed. The instance keeps running. The metadata carries `error`. |
 | `instance.resumed` | info | A resume restored as a new allocation. The metadata carries `restoreMs`. |
@@ -1832,6 +1950,7 @@ A suspend by the node's pressure response also emits `node.pressure` with
 | `legion_idle_sweep_suspends_total` | counter | `outcome` | Suspends the idle sweep tried to start: `started`, or `skipped` (the instance changed, an operation was in flight, or the node cannot checkpoint). |
 | `legion_checkpoint_publish_bytes` | histogram | `kind` | Bytes a node uploaded to publish one checkpoint. 0 when the store already held every part. |
 | `legion_checkpoint_publish_seconds` | histogram | `kind` | How long each successful publish took on its node. |
+| `legion_instance_archived_total` | counter | `mode` | Instances archived after their checkpoint published, by `slim` (a slim row stays) or `manifestOnly` (no row stays). |
 | `legion_checkpoint_publish_total` | counter | `outcome` | Publishes reported, by `published`, `retrying` (failed, the manager asks again), or `failed` (the last attempt failed). |
 
 See [metrics](metrics.md#suspend-and-resume).
@@ -1890,6 +2009,11 @@ See [metrics](metrics.md#suspend-and-resume).
 | `snapshot.restore_failed`: `fetching part ... from its content store` | The new node could not fetch a published part (no access to the bucket, a scheme not in `artifacts.fetch.allowedSchemes`) | Give the node read access to the store |
 | `snapshot.restore_failed` or `snapshot.publish_failed` naming a sealed part, a checkpoint key, or the keyring | The part could not be sealed or opened | See [When a part cannot be opened](#when-a-part-cannot-be-opened) |
 | `snapshot warm`: `is local, not published` | Only published snapshots can be warmed | Publish with `durability = "store"` or `--publish` |
+| Submit: `sets suspend.archive = ... but its checkpoints stay on the node` | `archive` needs a published checkpoint | Set `durability = "store"` |
+| Submit: `sets suspend.archive = ... and suspend.reserve` | An archived instance holds nothing on a node | Remove `reserve`, or remove `archive` |
+| `instance start`: `checkpoint ... is archived and its manifest ... could not be read` | The archive manifest was deleted (a bucket lifecycle rule, by hand) or the manager cannot read the bucket | With `onRestoreFailure = "cold"` it boots fresh. Otherwise give the manager read access, or `instance start --cold` |
+| `instance start` or `get` of a `manifestOnly` instance: `Unavailable ... could not read the archive manifest` | The manager could not reach a `contentStore` to look for it | Give the manager read and list access to every `contentStore` |
+| An archived instance's `snapshot.published` arrives, but no `instance.archived` | The instance changed before the publish landed (it was started, stopped, or suspended again), so it was left as is | Nothing: the checkpoint is still published |
 
 ## Limitations
 
@@ -1909,6 +2033,25 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Published part sizes are visible in the bucket, and identical parts
   share one object.** See
   [Published checkpoint encryption](#published-checkpoint-encryption).
+- **Archive manifests outlive some of their instances.** `instance stop`
+  and `destroy` delete an archived instance's manifest, but `job stop` and
+  `job destroy` do not: a slim instance's manifest is left orphaned in the
+  bucket, and a `manifestOnly` instance stays there, startable again once
+  the job runs (a job destroyed and submitted again under the same name does
+  not resume them, because the job's creation time is checked). Expire
+  `manifests/` with a bucket lifecycle rule.
+- **A `manifestOnly` id is only as unique as its 130 random bits.** There is
+  no row to refuse a duplicate, which is why only unnamed instances drop
+  their row: a caller id needs a row to stay unique.
+- **The manager needs bucket access.** Reading, listing, and deleting archive
+  manifests happen on the manager, with the worker type's
+  `contentStore.auth.kv` credential or the manager's ambient credentials.
+  A manager that cannot reach a bucket can neither resume nor list what is
+  archived in it.
+- **`--include-idle` pages can come back short.** A manifest whose instance
+  also has a row is listed once, from the row, so a page can hold fewer than
+  `--idle-page-size` bucket instances. Page until `nextIdlePageToken` is
+  empty.
 - **Warms and the location index are held by one manager.** In a
   multi-manager cluster, nodes that heartbeat a different manager than the
   one that accepted `snapshot warm`, or that scheduled the placement, are

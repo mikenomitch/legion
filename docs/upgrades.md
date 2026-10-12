@@ -245,6 +245,23 @@ added unnamed instances ([Id rules](stateful-workloads.md#id-rules)):
 - **Downgrading a manager** leaves the `instance.named` column it does not
   read, and an older manager tombstones every destroy again.
 
+## Archived instances
+
+The release that added [archived instances](suspend-and-resume.md#archiving-idle-instances)
+(`suspend.archive`) changed one output shape and added one column:
+
+- **`legion instance list -j` returns an object.** The data was a bare
+  array of instances. It is now `{ "instances": [...], "nextIdlePageToken":
+  "..." }`, so `--include-idle` can page. Scripts that read `.data[]` read
+  `.data.instances[]`.
+- **The `instance.manifest_url` column** is appended by the upgrade.
+  Nothing is archived until a job sets `suspend.archive`.
+- **Downgrading a manager** loses archived instances: an older manager does
+  not read `manifest_url`, so a slim archived instance looks like a
+  suspended instance whose checkpoint is gone (`onRestoreFailure` decides),
+  and a `manifestOnly` instance, which has no row, is not found. Start the
+  archived instances you need before a downgrade.
+
 ## Task-plugin ABI
 
 Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by

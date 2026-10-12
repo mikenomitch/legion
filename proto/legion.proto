@@ -3554,6 +3554,23 @@ message InstanceInfo {
   // re-create it. After that, GetInstance answers NOT_FOUND for the id. See
   // docs/stateful-workloads.md, "Id rules".
   bool named = 39;
+
+  // Whether the suspended instance is archived (its task's
+  // `suspend.archive`): its checkpoint was published and its snapshot row
+  // moved to an archive manifest in the `contentStore`, at
+  // `manifest_url`. The instance stays `suspended`, StartInstance reads the
+  // manifest back and resumes it like any published checkpoint, and
+  // `checkpoint_kind`, `checkpoint_state`, `checkpoint_node_id`, and
+  // `checkpoint_bytes` are unset while it is archived, since the row they
+  // come from is gone. An instance archived with `archive = "manifestOnly"`
+  // has no row at all: GetInstance reads it from its manifest, and
+  // ListInstances shows it only with `include_idle`. See
+  // docs/suspend-and-resume.md, "Archived instances".
+  bool archived = 40;
+
+  // The archive manifest's URL (`s3://…/manifests/<job>/<group>/<task>/<id>.json`
+  // or `file://…`). Set exactly when `archived` is.
+  optional string manifest_url = 41;
 }
 
 // A cold boot that replaced a restore (InstanceInfo.cold_boot).
@@ -3579,13 +3596,35 @@ message ListInstancesRequest {
 
   // Optional exact-match group filter.
   optional string group = 2;
+
+  // Also list archived instances that have no row in the manager's store
+  // (`suspend.archive = "manifestOnly"`), read from the job's archive
+  // manifests in every `contentStore` the cluster's worker types publish
+  // to. They come after the rows, as `suspended` and `archived`, one page
+  // of `idle_page_size` per call: pass `next_idle_page_token` back as
+  // `idle_page_token` for the next. Rows are always listed in full; only
+  // the bucket listing pages. Default false: a list reads the store only.
+  bool include_idle = 3;
+
+  // With `include_idle`: where the bucket listing resumes, from the
+  // previous reply's `next_idle_page_token`. Empty starts at the beginning.
+  string idle_page_token = 4;
+
+  // With `include_idle`: the most bucket-listed instances to return.
+  // Default 1000, at most 10000.
+  uint32 idle_page_size = 5;
 }
 
 // Reply payload for ListInstances.
 message ListInstancesReply {
   // Instances ordered by group, slot index, then instance id. Includes
-  // Terminated rows (tombstones).
+  // Terminated rows (tombstones). With `include_idle`, the bucket-listed
+  // archived instances follow, ordered by group, task, then id.
   repeated InstanceInfo instances = 1;
+
+  // With `include_idle`: the token for the next page of the bucket
+  // listing. Empty when the listing is complete.
+  string next_idle_page_token = 2;
 }
 
 // Request payload for GetInstance.
@@ -4020,6 +4059,23 @@ message CheckpointRequest {
   // the cluster no longer has. The worker fails the work with this message.
   // Empty when every key is present.
   string part_key_error = 9;
+
+  // `publish` of a suspend checkpoint whose task sets `suspend.archive`
+  // (docs/suspend-and-resume.md, "Archived instances"): once every part is
+  // uploaded, the worker also writes an archive manifest to this object
+  // name under its `contentStore` root
+  // (`manifests/<job>/<group>/<task>/<instance>.json`) and reports its URL
+  // in `SnapshotReport.manifest_url`. The publish fails, and is retried
+  // like any failed publish, when that write fails. Empty for every other
+  // piece of work.
+  string manifest_object = 10;
+
+  // With `manifest_object`: the identity envelope the manager needs to
+  // rebuild the instance and its snapshot row on resume, as JSON (instance
+  // id, job, group, task, the snapshot's kind and capture metadata). The
+  // worker writes it verbatim as the archive manifest's `envelope`, beside
+  // the published checkpoint manifest, and does not interpret it.
+  string manifest_envelope = 11;
 }
 
 // The key for one published checkpoint part. A worker receives it with the
@@ -4091,6 +4147,13 @@ message SnapshotReport {
   // `capture`: how long the workload was paused, in milliseconds (a live
   // memory capture only; 0 otherwise). Older workers leave it 0.
   uint64 pause_ms = 10;
+
+  // `publish` with `CheckpointRequest.manifest_object`: the URL of the
+  // archive manifest the worker wrote (`s3://…` or `file://…`). The
+  // manager archives the suspended instance in the same transaction that
+  // marks the snapshot published: it drops the snapshot row and records
+  // this URL on the instance. Empty otherwise.
+  string manifest_url = 11;
 }
 
 // A snapshot an allocation should start from instead of booting, attached

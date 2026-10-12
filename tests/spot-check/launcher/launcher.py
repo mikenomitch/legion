@@ -61,7 +61,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             return self.json(200, {"job": JOB, "manager": ADDR, "wsUrl": ws_url(), "token": os.environ.get("LEGION_TOKEN", "")})
         if path == "/api/sandboxes":
-            return self.result(*legion("instance", "list", JOB))
+            ok, data = legion("instance", "list", JOB)
+            return self.result(ok, (data or {}).get("instances", []) if ok else data)
         parts = path.strip("/").split("/")
         if len(parts) == 3 and parts[:2] == ["api", "sandboxes"]:
             return self.result(*legion("instance", "get", parts[2]))

@@ -423,6 +423,12 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   so alert on a rising `failed` rate, and watch `retrying` for a store going
   bad.
 
+- **`legion_instance_archived_total{mode}`** (counter): suspended instances
+  [archived](suspend-and-resume.md#archiving-idle-instances) once their
+  checkpoint published, by `mode`: `slim` (a slim instance row stays) or
+  `manifestOnly` (no row stays, the bucket holds the instance). Counted on
+  the manager that recorded the publish.
+
 ### Heartbeat cadence
 
 Reported on the status-lane leader (the manager that owns node liveness), and

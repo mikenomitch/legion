@@ -303,6 +303,16 @@ pub fn is_minted_instance_id(id: &str) -> bool {
         && random.bytes().all(|b| MINTED_ID_ALPHABET.contains(&b))
 }
 
+/// Whether `id` is a server-minted id of task `task_name`: the minted shape
+/// with the prefix [`mint_instance_id`] gives that task.
+pub fn is_minted_for_task(id: &str, task_name: &str) -> bool {
+    let max_prefix = KEYED_INSTANCE_ID_MAX_LEN - MINTED_ID_RANDOM_LEN - 1;
+    is_minted_instance_id(id)
+        && id
+            .rsplit_once('-')
+            .is_some_and(|(prefix, _)| prefix.chars().eq(task_name.chars().take(max_prefix)))
+}
+
 /// Validate a keyed instance id: `[A-Za-z0-9._-]{1,128}`.
 ///
 /// The charset is deliberately conservative — keyed ids flow into env vars
@@ -396,6 +406,11 @@ mod tests {
         let long = mint_instance_id(&"t".repeat(200));
         assert_eq!(long.len(), KEYED_INSTANCE_ID_MAX_LEN);
         assert!(is_minted_instance_id(&long));
+        // A minted id names the task that minted it.
+        assert!(is_minted_for_task(&id, "workspace"));
+        assert!(!is_minted_for_task(&id, "work"));
+        assert!(!is_minted_for_task("user-42", "user"));
+        assert!(is_minted_for_task(&long, &"t".repeat(200)));
     }
 
     #[test]

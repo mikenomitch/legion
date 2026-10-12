@@ -1180,6 +1180,7 @@ fn apply_one_snapshot_report(store: &Store, node_id: &str, report: &SnapshotRepo
                 uploaded_bytes,
                 duration_ms,
                 released_forks,
+                archived,
             } => {
                 info!(
                     node_id,
@@ -1199,6 +1200,23 @@ fn apply_one_snapshot_report(store: &Store, node_id: &str, report: &SnapshotRepo
                 store
                     .events()
                     .snapshot_published(&snapshot, uploaded_bytes, duration_ms);
+                if let Some(archived) = archived.as_ref() {
+                    info!(
+                        node_id,
+                        instance_id = %archived.instance_id,
+                        snapshot_id = %archived.snapshot_id,
+                        manifest_only = archived.row_deleted,
+                        "Suspended instance archived"
+                    );
+                    crate::manager::telemetry::metrics()
+                        .instance_archived_total
+                        .inc(&[if archived.row_deleted {
+                            "manifestOnly"
+                        } else {
+                            "slim"
+                        }]);
+                    store.events().instance_archived(archived);
+                }
                 // A spread fork's forks waited for the publish.
                 if !released_forks.is_empty() {
                     let origin = snapshot.instance_id.clone().unwrap_or_default();
@@ -1395,6 +1413,7 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
             manifest_json: warm.manifest_json,
             part_keys,
             part_key_error,
+            ..Default::default()
         }
     });
     work.into_iter()
@@ -1403,6 +1422,8 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
             SnapshotState::Local => {
                 let (part_keys, part_key_error) =
                     checkpoint_part_keys(store, &snapshot.manifest_json, PartKeyUse::Publish);
+                let (manifest_object, manifest_envelope) =
+                    archive_request(store, &snapshot).unwrap_or_default();
                 CheckpointRequest {
                     snapshot_id: snapshot.snapshot_id,
                     op: "publish".into(),
@@ -1413,6 +1434,8 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
                     manifest_json: snapshot.manifest_json,
                     part_keys,
                     part_key_error,
+                    manifest_object,
+                    manifest_envelope,
                 }
             }
             SnapshotState::Capturing => CheckpointRequest {
@@ -1446,6 +1469,58 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
         })
         .chain(warm_requests)
         .collect()
+}
+
+/// The archive manifest a publish should also write
+/// (docs/suspend-and-resume.md, "Archived instances"): `(object name,
+/// envelope JSON)` for a suspend checkpoint whose instance is still
+/// suspended on it and whose task sets `suspend.archive`. `None` for every
+/// other publish. Lookups that fail leave the publish as it was, so the
+/// instance stays suspended with its snapshot row.
+fn archive_request(store: &Store, snapshot: &SnapshotRecord) -> Option<(String, String)> {
+    if snapshot.purpose != SnapshotPurpose::Suspend {
+        return None;
+    }
+    let instance_id = snapshot.instance_id.as_deref()?;
+    let instance = store.get_instance(instance_id).ok()??;
+    if instance.state != InstanceState::Suspended {
+        return None;
+    }
+    store
+        .suspend_settings_for(&instance.job_id, &instance.task_name)
+        .archive?;
+    let suspend = store.instance_suspend_state(instance_id).ok()?;
+    if suspend.checkpoint_id.as_deref() != Some(snapshot.snapshot_id.as_str())
+        || suspend.pending_op.is_some()
+    {
+        return None;
+    }
+    let job = store.get_job(&instance.job_id).ok()?;
+    let history = store.instance_history(instance_id).ok();
+    let mut row = snapshot.clone();
+    row.manifest_json = String::new();
+    let envelope = crate::structs::archive::ArchiveEnvelope {
+        instance_id: instance.instance_id.clone(),
+        job_id: instance.job_id.clone(),
+        job_created_at: job.created_at,
+        group: instance.group.clone(),
+        task: instance.task_name.clone(),
+        named: instance.named,
+        created_at: instance.created_at.clone(),
+        forked_from: history.and_then(|history| history.forked_from),
+        identity_epoch: instance.identity_epoch,
+        suspend_reason: suspend.suspend_reason,
+        suspended_at: suspend.suspended_at,
+        last_suspend_ms: suspend.last_suspend_ms,
+        snapshot: row,
+    };
+    let object = crate::structs::archive::archive_object_name(
+        &instance.job_id,
+        &instance.group,
+        &instance.task_name,
+        &instance.instance_id,
+    );
+    Some((object, serde_json::to_string(&envelope).ok()?))
 }
 
 /// What a set of part keys is for.

@@ -514,25 +514,65 @@ impl ManagerDaemonService {
     /// restore (`RestoreUnavailable`) commits its `lifecycle_error` and
     /// nothing else, and is refused without a record so a retry can succeed
     /// once the cause is fixed.
+    ///
+    /// `archived` is what the handler read back from an archived instance's
+    /// archive manifest (docs/suspend-and-resume.md, "Archived instances").
     pub(super) fn resume_instance(
         &self,
         instance: &Instance,
         cold: bool,
+        archived: Option<crate::storage::store::ArchivedCheckpoint>,
         idempotency_key: &str,
+    ) -> Result<RecordedStart, Status> {
+        let instance_id = instance.instance_id.clone();
+        self.resume_with(
+            &instance.job_id,
+            &instance.instance_id,
+            idempotency_key,
+            move |s| s.resume_archived_instance(&instance_id, cold, archived),
+        )
+    }
+
+    /// StartInstance on an instance archived with `archive =
+    /// "manifestOnly"`, which has no row: the row comes back from
+    /// `manifest`, and the resume runs as for any archived instance, in the
+    /// same one entry.
+    pub(super) fn resume_manifest_only(
+        &self,
+        manifest: crate::structs::archive::ArchiveManifest,
+        manifest_url: &str,
+        cold: bool,
+        idempotency_key: &str,
+    ) -> Result<RecordedStart, Status> {
+        let job_id = manifest.envelope.job_id.clone();
+        let instance_id = manifest.envelope.instance_id.clone();
+        let url = manifest_url.to_string();
+        self.resume_with(&job_id, &instance_id, idempotency_key, move |s| {
+            s.resume_manifest_only_instance(manifest, &url, cold)
+        })
+    }
+
+    fn resume_with(
+        &self,
+        job_id: &str,
+        instance_id: &str,
+        idempotency_key: &str,
+        resume: impl FnOnce(&Store) -> R<ResumeOutcome> + Send + 'static,
     ) -> Result<RecordedStart, Status> {
         let config_id = self
             .store
-            .get_job_config(&instance.job_id)
+            .get_job_config(job_id)
             .map_err(|e| map_store_error("Error loading job config", e))?
             .id();
-        let instance_id = instance.instance_id.clone();
-        let job_id = instance.job_id.clone();
+        let shown_id = instance_id.to_string();
+        let instance_id = instance_id.to_string();
+        let job_id = job_id.to_string();
         let priority = self.store.default_eval_priority;
         let key = idempotency_key.to_string();
         let resumed = self
             .store
             .scheduler_group_commit("resume_instance", move |s| {
-                let recorded = match s.resume_suspended_instance(&instance_id, cold)? {
+                let recorded = match resume(s)? {
                     ResumeOutcome::RestoreUnavailable { reason } => return Ok(Err(reason)),
                     ResumeOutcome::Resuming {
                         snapshot_id,
@@ -595,9 +635,8 @@ impl ManagerDaemonService {
             .map_err(|e| map_store_error("Error resuming instance", e))?;
         resumed.map_err(|reason| {
             Status::failed_precondition(format!(
-                "instance {} cannot resume: {reason}\nHint: `legion instance start {} \
-                 --cold` boots it fresh on its retained storage",
-                instance.instance_id, instance.instance_id
+                "instance {shown_id} cannot resume: {reason}\nHint: `legion instance start \
+                 {shown_id} --cold` boots it fresh on its retained storage"
             ))
         })
     }
