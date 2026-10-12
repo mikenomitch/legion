@@ -108,6 +108,7 @@ suspend = {
   durability = "local",           # "local" | "store"
   idle = { after = "3m" },        # suspend automatically when quiet
   onPressure = true,              # let a short node suspend it instead of evicting
+  wake = { port = "http" },       # resume on a request through `legion start gateway`
 },
 ```
 
@@ -121,6 +122,7 @@ suspend = {
 | `durability` | `local` | Where the checkpoint lives. `local`: only on the node that took it. `store`: also published to that node's `contentStore`, so the instance can resume on any compatible node and survives losing the node. See [Durability](#durability-surviving-the-node). |
 | `idle` | none | Suspend automatically once the instance has been quiet for `idle.after`. See [Idle policy](#idle-policy). |
 | `onPressure` | `false` | Let the node's memory pressure response suspend this instance (the `suspend` step) before it evicts anything. See [Under memory pressure](#under-memory-pressure). |
+| `wake` | none | `{ port, timeout = "30s" }`: requests through `legion start gateway` for this instance go to the `network.ports` label `port`, and a request for a suspended instance resumes it and is held until it serves. Without it, the gateway refuses the instance. See [Waking on a request](#waking-on-a-request). |
 
 Submit refuses anything the block cannot honor, with the fix in the hint:
 
@@ -463,6 +465,27 @@ under 300 ms for a 1 GiB guest on local NVMe. A disk resume is a cold boot.
 
 `--cold` discards the checkpoint and boots fresh on the retained storage. It
 is the escape hatch when a checkpoint cannot be restored.
+
+### Waking on a request
+
+A task with `suspend.wake` resumes when a request for it reaches
+[`legion start gateway`](gateway.md). The gateway calls `StartInstance`,
+holds the request until the instance accepts connections on `wake.port`, and
+then forwards it, so a sleeping sandbox answers its link a moment later:
+
+```nickel
+suspend = {
+  idle = { after = "3m" },
+  wake = { port = "http", timeout = "30s" },
+},
+network = { ports = [{ name = "http" }] },
+```
+
+Concurrent requests share one resume. Past `wake.timeout` the client gets
+`503` with `Retry-After`. A `stopped` instance is never woken this way.
+`instance get` on a task with `wake` shows where each port is served while
+the instance runs. See [gateway.md](gateway.md) for addressing, `CONNECT`,
+the webhook, and errors.
 
 ### When a resume cannot restore
 

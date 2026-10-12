@@ -1090,6 +1090,15 @@ caller class. Exec, proxied or direct, is unaffected
 
 ### 6.14 Wake on request (Phase 7)
 
+> **Update 2026-10-12:** wake for **keyed instances** shipped ahead of this
+> phase as [wake-on-request-plan.md](wake-on-request-plan.md), which now owns
+> the gateway, its addressing, and the jobspec block. Its surface differs
+> from the sketch below: `suspend.wake = { port = "<label>", timeout }` with
+> no `on` field, hosts are `<instance>.<domain>` (a `Legion-Port` header or
+> `CONNECT` picks another port), and the default hold is `30s`. Waking
+> sessions from manifests is that plan's Phase 3; this section stays as the
+> session-specific design.
+
 An idle session that exists only as a manifest in the bucket has no node.
 Something has to hold the inbound request, trigger the resume, and forward
 once the guest is ready. Three plans touch this, and each owns one part:

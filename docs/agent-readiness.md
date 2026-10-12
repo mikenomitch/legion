@@ -602,6 +602,25 @@ then `ratified` or `refused`). Two properties matter to an agent:
 `legion node claims <NODE>` lists everything a node has started but not yet
 had confirmed.
 
+## 6c. Waking a sleeping sandbox (`legion start gateway`)
+
+A keyed instance whose task sets `suspend.wake` can be reached through a
+gateway while it is suspended ([gateway.md](gateway.md)). An agent does not
+need to resume it and poll first: it sends the request, and the gateway
+resumes the instance and holds the request until it serves. To wake an
+instance without sending it anything, one call returns once it accepts
+connections:
+
+```bash
+curl -s -X POST http://gateway:4780/v1/wake/user-42
+# → {"ok":true,"data":{"instance":"user-42","address":"10.0.3.17:24312","port":"http","woke":true,"waitedMs":842}}
+```
+
+Every refusal uses the standard error envelope, with `retryable` and a
+`Retry-After` header when waiting longer would help (`wake_timeout`,
+`manager_unavailable`). `legion instance get -j` shows the task's `wake`
+block and, while the instance runs, its `endpoints`.
+
 ## 7. State store introspection + saved query library
 
 The SQL state store is the agent's main introspection tool. It is read-only by

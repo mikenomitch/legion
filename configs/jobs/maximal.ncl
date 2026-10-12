@@ -683,6 +683,10 @@
             config = {
                 command = ["sleep", "600"],
             },
+            # The port `suspend.wake` routes gateway requests to.
+            network = {
+                ports = [{ name = "http" }],
+            },
             # How `legion instance suspend` checkpoints this keyed task and
             # how `legion instance start` resumes it
             # (docs/suspend-and-resume.md). Keyed stateful tasks only.
@@ -750,6 +754,19 @@
                 # instance (the `suspend` step) before it evicts anything.
                 # Default false.
                 onPressure = true,
+                # Wake on request (docs/gateway.md): `legion start gateway`
+                # routes requests for this instance to `port` (a
+                # network.ports label), and a request for a suspended
+                # instance resumes it and is held until the instance
+                # accepts connections. Without it the gateway refuses the
+                # instance.
+                wake = {
+                    port = "http",
+                    # How long the gateway holds a request while the
+                    # instance resumes, then 503 with Retry-After. Default
+                    # "30s", from "1s" to "5m".
+                    timeout = "30s",
+                },
             },
             resources = {
                 cpu = 250,

@@ -1761,11 +1761,30 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] Phase 6: `stateful.mode = "session"`: envelopes, the session
         router, leases, node session logs, the leader index, and
         `PromoteInstance`. Its user docs are drafted in plan §15.
-  - [ ] Phase 7: wake on request through `legion start gateway` and
-        `suspend.wake` (plan §6.14). The suspend plan's Phase 8 keeps
-        node-local wake on connect.
+  - [ ] Phase 7: wake on request for **sessions**. Shipped early for keyed
+        instances by the [wake-on-request plan](plans/wake-on-request-plan.md)
+        (see below); waking sessions from manifests is that plan's Phase 3,
+        after Phase 6 here.
   - [ ] Phases 8 to 10: snapshot-clone density (with suspend plan Phase 8),
         a sub-VM tier seam, and cells only past the plan §6.11 trigger.
+- [ ] **Wake on request**: [plan](plans/wake-on-request-plan.md) (IN
+      EXECUTION) · [calls](calls/wake-on-request-plan_calls.md) ·
+      [docs](../docs/gateway.md). Phase 1 (the gateway) is done, below.
+  - [ ] Phase 2: gateway metrics (`legion_gateway_requests_total{outcome}`,
+        wake latency, held requests) on a `/metrics` listener. Today the
+        gateway only logs.
+  - [ ] Phase 3: wake `session`-mode sessions from bucket manifests, after
+        sandbox-scaling Phase 6.
+  - [ ] Phase 4: node-local wake on connect (suspend plan §6.10), for
+        clusters without a gateway tier.
+  - [ ] Pass the client address to the instance (`Forwarded`). The gateway
+        splices after the first head, so it cannot add a header to later
+        requests on a kept-alive connection (plan §11).
+  - [ ] Reload the gateway's TLS certificate without a restart (from a file
+        watch or `certFrom = { kv }` like ingress chains).
+  - [ ] A real microVM resume behind the gateway on KVM hardware; CI only
+        runs the gateway against a real manager with a simulated worker
+        (`tests/wake_integration.rs`).
 - [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (PLANNED) ·
       [calls](calls/sandbox-exec-plan_calls.md). Exec into Linux microVM
       sandboxes, and exec sessions that skip the manager. Implemented
@@ -3908,6 +3927,14 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Rename "task kind" → "task runtime"
       ([plan](plans/task-runtime-rename-plan.md), single-pass, no shim)
 - [x] A **noop** runtime ([docs](../docs/task-runtime-noop.md))
+- [x] **Wake on request, Phase 1**: `suspend.wake = { port, timeout }`,
+      `legion start gateway` (host, `Legion-Instance`, `CONNECT`, and
+      `POST /v1/wake/<id>` routing; held requests with one resume per burst;
+      `503` + `Retry-After` past the timeout; optional TLS; running
+      instances reachable through a manager outage), and `InstanceInfo.wake`
+      and `endpoints` on `GetInstance`.
+      [plan](plans/wake-on-request-plan.md) ·
+      [docs](../docs/gateway.md)
 - [x] **Gated sandboxes, Phases 1 to 4** of the
       [gated sandbox checkpoints plan](plans/gated-sandbox-checkpoints-plan.md)
       ([calls](calls/gated-sandbox-checkpoints-plan_calls.md)), built on a

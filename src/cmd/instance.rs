@@ -974,6 +974,9 @@ async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
                 if let Some(address) = address_line(&instance) {
                     println!("\n{address}");
                 }
+                for line in endpoint_lines(&instance) {
+                    println!("{line}");
+                }
                 if let Some(snapshot) = instance.restore_snapshot_id.as_deref() {
                     println!(
                         "\nrestoring: from snapshot {snapshot}, until its node reports the outcome"
@@ -1090,6 +1093,31 @@ fn address_line(instance: &InstanceInfo) -> Option<String> {
         Some(bridge) if !bridge.is_empty() => format!("address: {address} ({bridge})"),
         _ => format!("address: {address}"),
     })
+}
+
+/// Where each port is served, and whether the gateway may wake the
+/// instance (docs/gateway.md), for `instance get`:
+/// `wake: on request to port http (hold up to 30s)` and
+/// `port http: 10.0.3.17:24312`.
+fn endpoint_lines(instance: &InstanceInfo) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(wake) = instance.wake.as_ref() {
+        lines.push(format!(
+            "\nwake: on request to port {} (hold up to {}s)",
+            wake.port,
+            wake.timeout_ms.div_ceil(1000)
+        ));
+    }
+    for endpoint in &instance.endpoints {
+        if endpoint.address.is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            "port {}: {}:{}",
+            endpoint.port, endpoint.address, endpoint.number
+        ));
+    }
+    lines
 }
 
 /// The last suspend and restore, for `instance get`.
@@ -1352,6 +1380,30 @@ mod tests {
             Some("address: 10.88.128.7 (br0)")
         );
         assert_eq!(address_line(&InstanceInfo::default()), None);
+    }
+
+    #[test]
+    fn instance_get_shows_wake_and_served_ports_test() {
+        let info = InstanceInfo {
+            wake: Some(crate::structs::InstanceWake {
+                port: "http".into(),
+                timeout_ms: 30_000,
+            }),
+            endpoints: vec![crate::structs::InstanceEndpoint {
+                port: "http".into(),
+                address: "10.0.3.17".into(),
+                number: 24312,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            endpoint_lines(&info),
+            vec![
+                "\nwake: on request to port http (hold up to 30s)".to_string(),
+                "port http: 10.0.3.17:24312".to_string(),
+            ]
+        );
+        assert!(endpoint_lines(&InstanceInfo::default()).is_empty());
     }
 
     /// `instance get` names why the last suspend happened and, while the

@@ -487,6 +487,34 @@ $ legion instance start user-42 --wait -j
 as a **resumed cold** badge. See
 [when a resume cannot restore](../suspend-and-resume.md#when-a-resume-cannot-restore).
 
+### Resume on the next request
+
+Instead of calling `start` yourself, let the user's next request wake the
+sandbox. Add `wake` to the `suspend` block and declare the port the harness
+serves:
+
+```nickel
+network = { ports = [{ name = "http" }] },
+suspend = {
+  # ...as above...
+  wake = { port = "http", timeout = "30s" },
+},
+```
+
+and run a gateway in front of the fleet:
+
+```console
+$ legion start gateway --listen 0.0.0.0:443 --domain sandboxes.acme.dev \
+    --tls-cert wildcard.pem --tls-key wildcard-key.pem
+```
+
+A request for `https://user-42.sandboxes.acme.dev` reaches the gateway,
+which resumes `user-42`, holds the request until the harness accepts
+connections, and forwards it. Concurrent requests share one resume, and a
+resume that takes longer than `timeout` gets `503` with `Retry-After`.
+`POST /v1/wake/user-42` on the gateway wakes it without sending a request.
+See [the gateway](../gateway.md).
+
 ### Force a cold boot
 
 ```console
