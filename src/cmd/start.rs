@@ -182,6 +182,10 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             crate::gateway::run_gateway(crate::gateway::GatewayConfig {
                 listen,
                 domain: arg_matches.get_one::<String>("domain").cloned(),
+                tls: arg_matches
+                    .get_one::<String>("tls-cert")
+                    .cloned()
+                    .zip(arg_matches.get_one::<String>("tls-key").cloned()),
             })
             .await
         }

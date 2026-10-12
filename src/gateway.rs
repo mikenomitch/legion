@@ -56,6 +56,29 @@ pub struct GatewayConfig {
     /// The wildcard domain: `<instance>.<domain>` names an instance. `None`
     /// routes by the `Legion-Instance` header only.
     pub domain: Option<String>,
+    /// Terminate TLS with this certificate chain and key (PEM file paths).
+    /// `None` serves plain HTTP, for a gateway behind a load balancer that
+    /// terminates TLS itself.
+    pub tls: Option<(String, String)>,
+}
+
+/// A rustls acceptor from a PEM chain and key on disk.
+fn tls_acceptor(cert_path: &str, key_path: &str) -> R<tokio_rustls::TlsAcceptor> {
+    use crate::worker::netd::tls::{certs_from_pem, key_from_pem};
+    let chain =
+        certs_from_pem(&std::fs::read(cert_path).with_context(|| format!("reading {cert_path}"))?)?;
+    if chain.is_empty() {
+        bail!("{cert_path} holds no certificate");
+    }
+    let key =
+        key_from_pem(&std::fs::read(key_path).with_context(|| format!("reading {key_path}"))?)?;
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .map_err(|err| anyhow::anyhow!("{cert_path} and {key_path} do not match: {err}"))?;
+    // The gateway reads one HTTP/1.1 head and splices; it does not speak h2.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
 /// What the gateway reads from `GetInstance`.
@@ -165,6 +188,11 @@ impl Control for ManagerControl {
 
 /// Run the gateway until the process is stopped.
 pub async fn run_gateway(config: GatewayConfig) -> R<()> {
+    let acceptor = config
+        .tls
+        .as_ref()
+        .map(|(cert, key)| tls_acceptor(cert, key))
+        .transpose()?;
     let client = crate::cmd::helpers::connect_manager_client().await?;
     let listener = TcpListener::bind(config.listen)
         .await
@@ -172,11 +200,12 @@ pub async fn run_gateway(config: GatewayConfig) -> R<()> {
     info!(
         listen = %config.listen,
         domain = config.domain.as_deref().unwrap_or(""),
+        tls = acceptor.is_some(),
         "Gateway listening"
     );
     let gateway = Arc::new(Gateway::new(ManagerControl::new(client), config.domain));
     tokio::select! {
-        result = gateway.serve(listener) => result,
+        result = gateway.serve(listener, acceptor) => result,
         _ = tokio::signal::ctrl_c() => {
             info!("Gateway stopping");
             Ok(())
@@ -380,7 +409,11 @@ impl<C: Control> Gateway<C> {
     }
 
     /// Accept connections until the listener fails.
-    pub async fn serve(self: Arc<Self>, listener: TcpListener) -> R<()> {
+    pub async fn serve(
+        self: Arc<Self>,
+        listener: TcpListener,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+    ) -> R<()> {
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(accepted) => accepted,
@@ -392,8 +425,20 @@ impl<C: Control> Gateway<C> {
             };
             let _ = stream.set_nodelay(true);
             let gateway = self.clone();
+            let tls = tls.clone();
             tokio::spawn(async move {
-                gateway.handle(stream, peer).await;
+                match tls {
+                    None => gateway.handle(stream, peer).await,
+                    Some(acceptor) => {
+                        match tokio::time::timeout(HEAD_TIMEOUT, acceptor.accept(stream)).await {
+                            Ok(Ok(stream)) => gateway.handle(stream, peer).await,
+                            Ok(Err(err)) => {
+                                debug!(%peer, error = %err, "Gateway TLS handshake failed")
+                            }
+                            Err(_) => debug!(%peer, "Gateway TLS handshake timed out"),
+                        }
+                    }
+                }
             });
         }
     }
@@ -992,7 +1037,7 @@ mod gateway_test {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let gateway = Arc::new(Gateway::new(control, Some("gw.test".into())));
-        tokio::spawn(gateway.serve(listener));
+        tokio::spawn(gateway.serve(listener, None));
         port
     }
 
@@ -1209,5 +1254,46 @@ mod gateway_test {
         let response = send(port, "CONNECT ws-1:22 HTTP/1.1\r\n\r\n").await;
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
         assert!(response.contains("unknown_port"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn terminates_tls_and_routes_by_the_decrypted_host_test() {
+        let backend = origin().await;
+        let mut view = suspended(Duration::from_secs(5));
+        view.state = "active".into();
+        view.endpoints = vec![("http".into(), "127.0.0.1".into(), backend)];
+        let (control, _) = fake(Some(view), backend, Duration::ZERO);
+
+        let cert = rcgen::generate_simple_self_signed(vec!["*.gw.test".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        let acceptor =
+            tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap();
+        assert!(tls_acceptor(key_path.to_str().unwrap(), key_path.to_str().unwrap()).is_err());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let gateway = Arc::new(Gateway::new(control, Some("gw.test".into())));
+        tokio::spawn(gateway.serve(listener, Some(acceptor)));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let name = rustls_pki_types::ServerName::try_from("ws-1.gw.test").unwrap();
+        let mut tls = connector.connect(name, tcp).await.unwrap();
+        tls.write_all(b"GET /secure HTTP/1.1\r\nHost: ws-1.gw.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let _ = tls.read_to_end(&mut out).await;
+        let out = String::from_utf8_lossy(&out);
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+        assert!(out.ends_with("GET /secure"), "{out}");
     }
 }
