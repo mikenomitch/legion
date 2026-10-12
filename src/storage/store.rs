@@ -36,12 +36,12 @@ pub use snapshot_ops::{
 pub use suspend_ops::{AbandonedResume, ResumeOutcome, WaitingResume};
 
 use crate::storage::queries::{
-    DELETE_SIGNING_KEY, GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB,
-    GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS, GET_INSTANCE, GET_INSTANCES_FOR_JOB,
-    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID, GET_JOB_UPDATE_FOR_CONFIG,
-    GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_SIGNING_KEYS,
-    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
-    INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
+    CLAIM_EVAL, CLAIM_NON_PLANNING_EVAL, DELETE_SIGNING_KEY, GET_ALLOCATION_BY_ID, GET_ALLOCS,
+    GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS, GET_INSTANCE,
+    GET_INSTANCES_FOR_JOB, GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID,
+    GET_JOB_UPDATE_FOR_CONFIG, GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES,
+    GET_SIGNING_KEYS, GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL,
+    INSERT_JOB, INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
     INSERT_SIGNING_KEY, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_JOINED_ATTRS,
     NODE_JOINED_FROM, SEED_NODE_HEALTH, UPDATE_SIGNING_KEY_STATE, UPSERT_INSTANCE,
     UPSERT_MANAGER_CONFIG,
@@ -191,6 +191,22 @@ impl EvalBatchLimits {
         let pending = pending.max(0) as usize;
         (pending / workers).clamp(1, self.max.max(1))
     }
+}
+
+/// Which eval kinds a claim may take.
+///
+/// [`ClaimScope::NonPlanning`] is the adaptive-concurrency gate's escape
+/// hatch (docs/adaptive-scheduler-concurrency.md): an eval worker refused a
+/// planning permit keeps draining the kinds that cannot conflict —
+/// `crate::manager::concurrency::NON_PLANNING_EVAL_KINDS`, today just
+/// `job_stop` — instead of parking with the queue head in reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimScope {
+    /// Any pending eval, strict `priority DESC, id ASC`.
+    #[default]
+    Any,
+    /// Only kinds that never invoke the planner, same order among them.
+    NonPlanning,
 }
 
 /// RFC3339 with the subsecond field pinned to nine digits, so the rendered
@@ -5194,6 +5210,12 @@ impl Store {
             crate::manager::telemetry::metrics()
                 .plan_apply_total
                 .inc(&["rejected"]);
+            // A race that was LOST. The adaptive-concurrency controller's
+            // whole input signal is this counter against the two below
+            // (docs/adaptive-scheduler-concurrency.md); mirroring it into a
+            // relaxed atomic here costs the apply path one add and saves
+            // plumbing outcomes back through the store.
+            crate::manager::concurrency::conflict_window().record_rejected();
             Ok((
                 PlanApplyOutcome::Rejected {
                     reason,
@@ -5708,6 +5730,17 @@ impl Store {
         metrics
             .plan_apply_total
             .inc(&[if fallbacks > 0 { "fallback" } else { "applied" }]);
+        // Both are PROGRESS as far as the concurrency controller is concerned:
+        // a race that cost a rank is a race that was absorbed, and throttling
+        // to avoid absorbed races would be throttling to avoid late binding
+        // working. The split is kept so the diagnostic can show the absorbed
+        // rate separately.
+        let window = crate::manager::concurrency::conflict_window();
+        if fallbacks > 0 {
+            window.record_fallback();
+        } else {
+            window.record_applied();
+        }
         if !preempted.victims.is_empty() {
             let metrics = crate::manager::telemetry::metrics();
             for (pool, band, count) in preempted.metric_rows {
@@ -15958,7 +15991,9 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn claim_eval(&self) -> R<Option<Eval>> {
-        self.replicated(Lane::Scheduler, "claim_eval", move |s| s.claim_eval_apply())
+        self.replicated(Lane::Scheduler, "claim_eval", move |s| {
+            s.claim_eval_apply(ClaimScope::Any)
+        })
     }
 
     /// Claim a whole batch of evals in ONE scheduler-lane op.
@@ -15981,14 +16016,23 @@ impl Store {
     /// so a lower-priority eval is only ever reached after every
     /// higher-priority one — batching changes how many rounds the queue
     /// costs, not which eval runs next.
+    ///
+    /// `scope` narrows the claim to eval kinds that never invoke the
+    /// planner ([`ClaimScope::NonPlanning`]). That is what an eval worker the
+    /// adaptive-concurrency gate has throttled claims instead of blocking
+    /// (docs/adaptive-scheduler-concurrency.md): blocking would starve stops
+    /// outright under sustained throttling, and an operator's `job stop`
+    /// during an incident must not queue behind the storm it is trying to
+    /// end. Everything else — ordering among the rows it can see, the
+    /// superseded-sibling sweep, the queue-depth gauge — is identical.
     #[instrument(err, skip_all)]
-    pub fn claim_evals(&self, limits: EvalBatchLimits) -> R<Vec<Eval>> {
+    pub fn claim_evals(&self, limits: EvalBatchLimits, scope: ClaimScope) -> R<Vec<Eval>> {
         self.replicated(Lane::Scheduler, "claim_evals", move |s| {
-            s.claim_evals_apply(limits)
+            s.claim_evals_apply(limits, scope)
         })
     }
 
-    fn claim_evals_apply(&self, limits: EvalBatchLimits) -> R<Vec<Eval>> {
+    fn claim_evals_apply(&self, limits: EvalBatchLimits, scope: ClaimScope) -> R<Vec<Eval>> {
         let take = {
             // The WRITE connection, not a read one: inside a capture the
             // completions this op already applied live in an uncommitted
@@ -16004,7 +16048,7 @@ impl Store {
             // Reused verbatim so a batched claim can never drift from a
             // single one: same ordering, same superseded-eval sweep, same
             // queue-depth gauge.
-            match self.claim_eval_apply()? {
+            match self.claim_eval_apply(scope)? {
                 Some(eval) => claimed.push(eval),
                 // Dry queue. Return what we have instead of waiting for
                 // the batch to fill — this cluster is idle far more often
@@ -16052,12 +16096,13 @@ impl Store {
         &self,
         completions: Vec<(String, EvalCompletion)>,
         limits: EvalBatchLimits,
+        scope: ClaimScope,
     ) -> R<Vec<Eval>> {
         self.replicated(Lane::Scheduler, "complete_evals_and_claim_next", move |s| {
             for (eval_id, completion) in completions {
                 s.apply_eval_completion(&eval_id, completion)?;
             }
-            s.claim_evals_apply(limits)
+            s.claim_evals_apply(limits, scope)
         })
     }
 
@@ -16098,7 +16143,7 @@ impl Store {
         let eval_id = eval_id.to_owned();
         self.replicated(Lane::Scheduler, "complete_and_claim_next", move |s| {
             s.apply_eval_completion(&eval_id, completion)?;
-            s.claim_eval_apply()
+            s.claim_eval_apply(ClaimScope::Any)
         })
     }
 
@@ -16134,24 +16179,23 @@ impl Store {
         }
     }
 
-    fn claim_eval_apply(&self) -> R<Option<Eval>> {
+    /// Take the head of the queue, marking it `in_flight`.
+    ///
+    /// The one claim primitive: every claim path — single, batched, and the
+    /// fused settle-and-claim — reuses it verbatim, so none can drift from
+    /// the others in ordering, superseded-sibling sweep, or queue-depth
+    /// gauge. `scope` chooses between the two prepared statements; the
+    /// non-planning one differs only by a kind filter on the inner SELECT.
+    fn claim_eval_apply(&self, scope: ClaimScope) -> R<Option<Eval>> {
         let tx_started = Instant::now();
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
 
         let eval = tx
-            .prepare_cached(
-                "UPDATE eval
-                SET status = 'in_flight'
-                WHERE id = (
-                    SELECT id
-                    FROM eval
-                    WHERE status = 'pending' AND ready_at <= :now
-                    ORDER BY priority DESC, id ASC
-                    LIMIT 1
-                )
-                RETURNING id, status, type, job_id, job_config_id, node_id, priority, ready_at;",
-            )?
+            .prepare_cached(match scope {
+                ClaimScope::Any => &CLAIM_EVAL,
+                ClaimScope::NonPlanning => &CLAIM_NON_PLANNING_EVAL,
+            })?
             .query_row(named_params! {":now": Self::sortable_now()?}, |row| {
                 self.eval_from_row(row)
             })
@@ -21902,6 +21946,96 @@ mod tests {
             .filter(|(kind, ..)| kind == "node_lost_reschedule")
             .count();
         assert_eq!(lost, 1, "duplicate node-scoped evals still collapse");
+
+        Ok(())
+    }
+
+    /// The throttled worker's claim (docs/adaptive-scheduler-concurrency.md).
+    ///
+    /// It must skip every kind that can reach the planner — including the
+    /// higher-priority one at the head of the queue, which is the whole point
+    /// — while preserving `ORDER BY priority DESC, id ASC` among the rest, and
+    /// applying the same dedupe sweep and queue-depth gauge as an unscoped
+    /// claim.
+    #[test]
+    fn a_non_planning_claim_skips_planning_kinds_and_keeps_priority_order() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(&store, "job-a", vec![task("api")])?;
+        let cfg = Some(job_config_id.as_str());
+        let other_config_id = submit_job(&store, "job-b", vec![task("api")])?;
+        let other_cfg = Some(other_config_id.as_str());
+        let one_at_a_time = EvalBatchLimits { max: 1, workers: 1 };
+
+        // A high-priority planning eval at the head, a rollout tick (which
+        // also plans, through `handle_rollout_tick`), and two stops.
+        store.enqueue_eval("job_submit", Some("job-a"), cfg, None, Some(90))?;
+        store.enqueue_eval("rollout_tick", Some("job-a"), cfg, None, Some(80))?;
+        store.enqueue_eval("job_stop", Some("job-b"), other_cfg, None, Some(10))?;
+        store.enqueue_eval("job_stop", Some("job-a"), cfg, None, Some(50))?;
+
+        // Priority order among the claimable rows: the 50 before the 10.
+        let claimed = store.claim_evals(one_at_a_time, ClaimScope::NonPlanning)?;
+        let [stop] = claimed.as_slice() else {
+            panic!("expected exactly one stop, got {claimed:?}");
+        };
+        assert_eq!(
+            (stop.kind.as_str(), stop.job_id.as_str()),
+            ("job_stop", "job-a")
+        );
+        assert_eq!(stop.status, "in_flight");
+        store.complete_eval(&stop.id, true)?;
+
+        let claimed = store.claim_evals(one_at_a_time, ClaimScope::NonPlanning)?;
+        assert_eq!(claimed.len(), 1, "the second stop is claimable too");
+        assert_eq!(claimed[0].job_id, "job-b");
+        store.complete_eval(&claimed[0].id, true)?;
+
+        // The planning work is untouched and still in its original order.
+        assert!(
+            store
+                .claim_evals(one_at_a_time, ClaimScope::NonPlanning)?
+                .is_empty(),
+            "planning kinds are never handed to a throttled worker"
+        );
+        let pending: Vec<String> = store
+            .get_evals()?
+            .into_iter()
+            .filter(|eval| eval.status == "pending")
+            .map(|eval| eval.kind)
+            .collect();
+        assert_eq!(
+            pending,
+            vec!["job_submit".to_string(), "rollout_tick".to_string()]
+        );
+        let claimed = store.claim_eval()?.context("unthrottled claims the head")?;
+        assert_eq!(claimed.kind, "job_submit");
+
+        Ok(())
+    }
+
+    /// A throttled worker's claim collapses redundant work exactly as an
+    /// unthrottled one does — the sweep is shared, not duplicated.
+    #[test]
+    fn a_non_planning_claim_applies_the_same_dedupe_sweep() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(&store, "job-a", vec![task("api")])?;
+        let cfg = Some(job_config_id.as_str());
+
+        store.enqueue_eval("job_stop", Some("job-a"), cfg, None, Some(50))?;
+        store.enqueue_eval("job_stop", Some("job-a"), cfg, None, Some(50))?;
+
+        let claimed = store.claim_evals(
+            EvalBatchLimits { max: 1, workers: 1 },
+            ClaimScope::NonPlanning,
+        )?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].kind, "job_stop");
+        let pending = store
+            .get_evals()?
+            .into_iter()
+            .filter(|eval| eval.status == "pending")
+            .count();
+        assert_eq!(pending, 0, "the duplicate stop was collapsed");
 
         Ok(())
     }

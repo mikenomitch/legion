@@ -1126,6 +1126,28 @@ service Manager {
   rpc GetObservability (GetObservabilityRequest)
     returns (GetObservabilityReply);
 
+  // Reports the adaptive scheduler-concurrency controller: how many evals this
+  // manager will PLAN at once right now, why, and whether the cluster's
+  // conflicts are concurrency-driven or capacity-driven.
+  //
+  // The question it answers is one no other endpoint does — "are placements
+  // slow because the scheduler is holding itself back, or because the cluster
+  // is full?" — and the two have opposite remedies ("wait" versus "add
+  // nodes"). Backs `legion scheduler concurrency`.
+  //
+  // Read-only and cheap: every field comes from a snapshot the controller
+  // already publishes each 500ms tick, so calling this costs no extra work on
+  // the plan path.
+  //
+  // Answer with care on a manager that does not lead the scheduler lane: it
+  // does no planning, so it reports zeros rather than a guess. Ask any manager
+  // and check `is_scheduler_lane_leader` in the reply.
+  //
+  // ACL: operator:read, unscoped (the report is cluster-wide).
+  // See docs/adaptive-scheduler-concurrency.md.
+  rpc GetSchedulerConcurrency (GetSchedulerConcurrencyRequest)
+    returns (GetSchedulerConcurrencyReply);
+
   // Returns the local manager's Raft control-plane status.
   //
   // This endpoint is available even before full Raft state replication is enabled,
@@ -5932,6 +5954,118 @@ message GetManagerConfigsReply {
 
   // Page size used to produce this reply.
   uint32 page_size = 4;
+}
+
+// Request payload for GetSchedulerConcurrency. No parameters: the controller
+// is per-manager and global, so there is nothing to scope the question to.
+message GetSchedulerConcurrencyRequest {}
+
+// Reply payload for GetSchedulerConcurrency — one manager's view of how much
+// planning it is admitting, and why.
+//
+// The controller measures its own plan-apply conflict rate and tunes how many
+// evals it will PLAN at once between `floor` and `ceiling` (AIMD: halve on
+// congestion, add one back after calm). The arithmetic behind every field is
+// published in docs/adaptive-scheduler-concurrency.md.
+message GetSchedulerConcurrencyReply {
+  // The controller's mode, as configured in
+  // `schedulerSettings.adaptiveConcurrency.mode`:
+  // - `enforce` — measure and actuate.
+  // - `observe` — measure and publish what it WOULD do, actuate nothing.
+  //   The default.
+  // - `off` — the controller does not run; `evalThreads` is the fixed planner
+  //   count, exactly as before this feature existed. Every numeric field below
+  //   is zero in this mode.
+  string mode = 1;
+
+  // Planners currently admitted. In `observe` mode this is the SHADOW limit —
+  // what the controller would be enforcing — which is what makes observe mode
+  // useful on its own.
+  uint32 limit = 2;
+
+  // Lower bound on `limit` (`adaptiveConcurrency.min`, 1 by default). Never 0:
+  // a floor of 0 is a stuck scheduler, not a throttled one.
+  uint32 floor = 3;
+
+  // Upper bound on `limit`. `adaptiveConcurrency.max` if set, otherwise
+  // `evalThreads`, and never above `evalThreads`.
+  uint32 ceiling = 4;
+
+  // The manager's configured `evalThreads`: the size of the worker pool, and
+  // the ceiling the controller works under. The controller never admits more
+  // planners than this and, in `enforce`, backs off below it on evidence.
+  uint32 eval_threads = 5;
+
+  // Admission permits held right now — eval workers currently inside a
+  // planning eval. 0 when the controller is off, which never consults the gate.
+  uint32 in_flight = 6;
+
+  // What the controller is doing:
+  // - `steady` — running at the ceiling; nothing is held back.
+  // - `throttled` — below the ceiling, and conflicts have not yet subsided.
+  // - `probing` — below the ceiling and accumulating calm ticks toward an
+  //   increase.
+  // - `saturated` — backing off did NOT improve goodput, so the conflicts are
+  //   capacity-driven rather than concurrency-driven. The remedy is nodes, not
+  //   patience, and the controller has stopped applying an actuator that
+  //   cannot help.
+  string state = 7;
+
+  // How long the controller has been in `state`, in seconds.
+  uint32 seconds_in_state = 8;
+
+  // Smoothed plan rejection rate, 0.0 to 1.0:
+  // `rejected / (applied + fallback + rejected)`. Plans that bound but slid
+  // down a candidate list count as PROGRESS, not as conflict — that is the
+  // point of late binding, and throttling to avoid absorbed races would be
+  // throttling to avoid the feature working.
+  double conflict_rate = 9;
+
+  // Smoothed fraction of plans that bound at a lower-ranked candidate: races
+  // ABSORBED by late binding. Reported for diagnosis and never fed into the
+  // controller's decision.
+  double fallback_rate = 10;
+
+  // Smoothed plans that actually placed, per second. This — not the conflict
+  // rate — is the objective; the conflict rate is only its fast leading
+  // indicator, and every decrease is verified against this before it is kept.
+  double goodput = 11;
+
+  // Raw plan outcomes in the most recent 500ms window, so the percentages
+  // above can be checked by hand.
+  uint32 window_applied = 12;
+  uint32 window_fallback = 13;
+  uint32 window_rejected = 14;
+
+  // The last limit change: `increase`, `decrease`, or `revert` (a decrease
+  // undone because it did not improve goodput). Empty if the controller has
+  // not moved the limit yet.
+  string last_adjustment_direction = 15;
+
+  // The limit before and after that change.
+  uint32 last_adjustment_from = 16;
+  uint32 last_adjustment_to = 17;
+
+  // How long ago it happened, in seconds.
+  uint32 last_adjustment_seconds_ago = 18;
+
+  // Relative change in goodput since that adjustment, as a fraction (0.18 =
+  // +18%). This is what says whether backing off actually bought anything.
+  double last_adjustment_goodput_delta = 19;
+
+  // Times a throttled worker claimed a non-planning eval (today: `job_stop`)
+  // instead of the queue head. This counts the one deviation from strict
+  // priority order the admission gate introduces: it is a cross-class
+  // inversion only, never within a class, and it exists so an operator's
+  // `job stop` during an incident does not queue behind the storm it is
+  // trying to end.
+  uint64 admission_skips = 20;
+
+  // Whether the manager that answered leads the scheduler lane, and therefore
+  // does the planning (always true outside raft mode and in `single`
+  // topology). When false, every number above is zero: a manager that does no
+  // planning reports nothing rather than guessing.
+  bool is_scheduler_lane_leader = 21;
 }
 
 // Request payload for GetObservability.

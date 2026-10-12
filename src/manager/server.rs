@@ -45,7 +45,8 @@ use crate::structs::{
     GetNodeUsageRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
     GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
     GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
+    GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest,
+    GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
     GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
     HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IngressCertificate,
     Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
@@ -1474,6 +1475,11 @@ pub struct ManagerDaemonService {
     /// the next report rather than anything wrong. Shared with the idle
     /// sweep (see [`Self::usage_handle`]).
     usage: Arc<Mutex<crate::manager::usage::UsageTable>>,
+    /// The manager's configured `evalThreads`. With adaptive scheduler
+    /// concurrency enabled this is the CEILING on admitted planners rather
+    /// than a target, and `GetSchedulerConcurrency` reports it as such even
+    /// when this manager does not lead the scheduler lane.
+    eval_threads: usize,
 }
 
 /// Distinct merged policy bodies kept in memory.
@@ -1514,6 +1520,7 @@ impl ManagerDaemonService {
             net_edges: Arc::new(Mutex::new(HashMap::new())),
             stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
             usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
+            eval_threads: 1,
         }
     }
 
@@ -1579,6 +1586,13 @@ impl ManagerDaemonService {
     /// does; direct service users get the defaults, which serve no interval).
     pub fn with_heartbeat_config(mut self, heartbeat: crate::structs::HeartbeatConfigFull) -> Self {
         self.heartbeat = heartbeat;
+        self
+    }
+
+    /// Attach the manager's `evalThreads`, the ceiling the adaptive
+    /// concurrency controller works under.
+    pub fn with_eval_threads(mut self, eval_threads: usize) -> Self {
+        self.eval_threads = eval_threads.max(1);
         self
     }
 
@@ -2140,6 +2154,7 @@ impl ManagerDaemonService {
             .collect();
         service.exec_enabled = config.exec.enabled;
         service.heartbeat = config.heartbeat.clone();
+        service.eval_threads = config.eval_threads.max(1);
         service
     }
 
@@ -7260,6 +7275,82 @@ impl Manager for ManagerDaemonService {
             persistence_backend: persistence.backend,
             persistence_role: persistence.role.as_str().to_string(),
             persistence_lease_held: persistence.lease_held,
+        }))
+    }
+
+    /// The adaptive scheduler-concurrency report
+    /// (docs/adaptive-scheduler-concurrency.md).
+    ///
+    /// Modelled line for line on `get_heartbeat_cadence`, including the "this
+    /// manager does not lead the lane, ask the one that does" branch: a
+    /// manager that does no planning has no window to report, and an
+    /// approximate answer is worse than an honest "ask the leader".
+    #[instrument(skip_all)]
+    async fn get_scheduler_concurrency(
+        &self,
+        request: Request<GetSchedulerConcurrencyRequest>,
+    ) -> Result<Response<GetSchedulerConcurrencyReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        let is_leader = self.store.is_raft_leader(crate::storage::Lane::Scheduler);
+        let report = crate::manager::concurrency::latest_report();
+        let Some(report) = report.filter(|_| is_leader) else {
+            // Either this manager does not lead the scheduler lane, or the
+            // controller is off (or has not ticked yet). Both answer with
+            // zeros; `mode` and `is_scheduler_lane_leader` say which.
+            let mode =
+                crate::manager::concurrency::AdaptiveConcurrencySettings::from_scheduler_settings(
+                    self.store.scheduler_settings.as_ref(),
+                )
+                .map(|settings| settings.mode)
+                .unwrap_or_default();
+            return Ok(Response::new(GetSchedulerConcurrencyReply {
+                mode: mode.as_str().to_string(),
+                eval_threads: self.eval_threads as u32,
+                is_scheduler_lane_leader: is_leader,
+                ..Default::default()
+            }));
+        };
+
+        let goodput = report.goodput.unwrap_or(0.0);
+        let last = report.last_adjustment;
+        Ok(Response::new(GetSchedulerConcurrencyReply {
+            mode: report.mode.as_str().to_string(),
+            limit: report.limit as u32,
+            floor: report.floor as u32,
+            ceiling: report.ceiling as u32,
+            eval_threads: report.eval_threads as u32,
+            in_flight: report.in_flight as u32,
+            state: report.state.as_str().to_string(),
+            seconds_in_state: report.seconds_in_state as u32,
+            conflict_rate: report.conflict_rate.unwrap_or(0.0),
+            fallback_rate: report.fallback_rate.unwrap_or(0.0),
+            goodput,
+            window_applied: report.window.applied as u32,
+            window_fallback: report.window.fallback as u32,
+            window_rejected: report.window.rejected as u32,
+            last_adjustment_direction: last
+                .map(|adjustment| adjustment.direction.as_str().to_string())
+                .unwrap_or_default(),
+            last_adjustment_from: last.map(|adjustment| adjustment.from).unwrap_or(0) as u32,
+            last_adjustment_to: last.map(|adjustment| adjustment.to).unwrap_or(0) as u32,
+            last_adjustment_seconds_ago: last
+                .map(|adjustment| {
+                    (u64::from(adjustment.ticks_ago)
+                        * crate::manager::concurrency::TICK_PERIOD.as_millis() as u64)
+                        / 1_000
+                })
+                .unwrap_or(0) as u32,
+            last_adjustment_goodput_delta: last
+                .filter(|adjustment| adjustment.goodput_before > 0.0)
+                .map(|adjustment| (goodput - adjustment.goodput_before) / adjustment.goodput_before)
+                .unwrap_or(0.0),
+            admission_skips: report.admission_skips,
+            is_scheduler_lane_leader: true,
         }))
     }
 

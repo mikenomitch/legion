@@ -675,6 +675,44 @@ How to use it:
       candidate-starved; the plan carries one candidate per task and loses
       it to a concurrent apply. That points straight at striped disjoint
       candidate lists as the highest-value item of the four.
+- [ ] **Adaptive scheduler concurrency, phases 0/4/5.** The controller
+      shipped in `observe` (see Done below); what it left open is everything
+      that needs measurement — and the measurement it was planned against is
+      retracted ([aws-phase4-findings.md](aws-phase4-findings.md)), so the
+      first job is to find out whether a conflict-bound cell exists on the
+      current build at all —
+      [plan](plans/adaptive-scheduler-concurrency-plan.md).
+  - [ ] **Phase 0's matrix was never run**, so every constant in the
+        controller (`HIGH_WATERMARK = 0.20`, `LOW = 0.05`, the 4-tick probe
+        dwell) is a fitted starting value. Run the fixed-limit sweep over
+        `evalThreads ∈ {1,2,4,8,16,32}` at 1,000 and 5,000 nodes on a
+        workload candidate lists cannot absorb (coupled replicas on a tight
+        pool), recording conflict rate, fallback rate, candidate-rank
+        histogram, goodput and per-op lane wait, into
+        `benchmarks/scheduler/README.md` (plan §11, §16). Needs the native
+        submitter first — the current rig cannot outrun the scheduler.
+  - [ ] **Phase 4: flip the default to `enforce`.** Gated on §11's matrix
+        showing `enforce` beating the best static `evalThreads` on that
+        workload without regressing the uncontended one. Also rewrite the
+        `evalThreads` guidance in
+        [docs/scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md)
+        from conditional ("with this on, a ceiling") to unconditional.
+  - [ ] **The `pool` label on `legion_plan_apply_total`** (plan §7.7) is
+        deferred with Phase 0: a cardinality increase whose only consumer is
+        a per-pool controller, and the data that decides whether one gets
+        built ([calls #2](calls/adaptive-scheduler-concurrency-plan_calls.md)).
+  - [ ] **Phase 5 backlog**, each separately justified by Phase 0/2 data:
+        per-pool controllers (gated on §11.3's mixed-pool result — today one
+        saturated pool can throttle planning for every other), feeding the
+        fallback rate in as a secondary pressure signal, coupling the limit
+        to scheduler-lane pipeline wait as a second congestion signal, and
+        live reload of `adaptiveConcurrency` without a manager restart.
+  - [ ] **Only `job_stop` is exempt from throttling.** `rollout_tick` and
+        the four `node_*` kinds all reach the planner in this codebase, so
+        they hold a permit — a node-loss reschedule proceeds at the admitted
+        rate under sustained throttling. If that latency proves to matter,
+        the fix is a priority lane for recovery kinds, not widening the
+        exemption ([calls #1](calls/adaptive-scheduler-concurrency-plan_calls.md)).
 - [ ] **Cut the raft round trips per eval, or widen the lane pipeline.**
       Same run: the scheduler lane took 67,165 raft ops for ~10,700 evals
       (~6 per eval — `claim_eval`, the plan apply, `complete_eval_with_event`,
@@ -3683,6 +3721,30 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       [plan](plans/late-binding-plan-apply-plan.md),
       [docs/late-binding-plan-apply.md](../docs/late-binding-plan-apply.md).
       Phase 4 backlog and the capacity-exhaustion gap are open items above.
+- [x] **Adaptive scheduler concurrency** (phases 1–3) — the manager
+      measures its own plan-apply conflict rate and tunes how many evals it
+      will PLAN at once between a floor and `evalThreads`, so `evalThreads`
+      becomes a ceiling rather than a guess. AIMD on a smoothed conflict
+      rate (halve above 20%, add one back after 2s below 5%, integer limit,
+      dead band + refractory + asymmetric dwell, starts at the ceiling),
+      with a **goodput guard** that reverts a decrease which did not improve
+      placements/sec and says `SATURATED` — the answer there is nodes, not
+      patience. The actuator is an admission gate on planning
+      (`PlannerGate`: one permit per worker per batch, held across the
+      batched loop's fused settle-and-claim), never a resized worker pool; a
+      throttled worker narrows to `ClaimScope::NonPlanning` instead of
+      blocking so `job stop` never queues behind a congestion storm. Ships
+      `legion scheduler concurrency` + `GetSchedulerConcurrency` + the
+      read-only MCP tool, six metrics, and the
+      `scheduler.concurrency_adjusted` / `_saturated` events. **Default is
+      `observe`**: it computes and exports the limit it would enforce and
+      actuates nothing — and the plan's motivating "4 beats 16" measurement
+      was retracted after the feature was built, so `observe` is also the
+      only honest mode until a conflict-bound cell is measured on the
+      current build — [plan](plans/adaptive-scheduler-concurrency-plan.md),
+      [calls](calls/adaptive-scheduler-concurrency-plan_calls.md),
+      [docs/adaptive-scheduler-concurrency.md](../docs/adaptive-scheduler-concurrency.md).
+      Phase 0 (measurement) was skipped and phases 4–5 are open items above.
 
 ## Task runtimes
 

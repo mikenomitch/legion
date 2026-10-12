@@ -596,6 +596,17 @@ pub fn catalog() -> Vec<Capability> {
             mutates: false,
             read_only_safe: true,
         },
+        // --- Scheduler diagnostics ---
+        Capability {
+            name: "scheduler.concurrency",
+            cli: "legion scheduler concurrency",
+            grpc: Some("Manager/GetSchedulerConcurrency"),
+            summary: "Report how many evals the manager will plan at once and why: the current \
+                 limit against evalThreads, the plan-conflict and fallback rates, goodput, and \
+                 whether conflicts are concurrency-driven (wait) or capacity-driven (add nodes).",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- State store (the agent's introspection workhorse) ---
         Capability {
             name: "state.query",
