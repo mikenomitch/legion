@@ -37,6 +37,12 @@ architecture and behavior docs are public.
 
 ## Notes
 
+- [launch-spot-check-findings.md](launch-spot-check-findings.md) — the
+  2026-10-11 pre-launch spot check on a real 3-manager, 2-worker AWS cluster
+  and macOS: what works, eight P0s (batch tasks never finish, DAG ordering,
+  HA strands workers, stock images fail in Linux containers, and more), and
+  the shims the run needed. The rig and runbook are in
+  [`tests/spot-check/`](../tests/spot-check/README.md).
 - [aws-phase1-findings.md](aws-phase1-findings.md) — the first real AWS
   benchmark run (2026-08-02/03): phase 1 passed, and it surfaced a
   manager heartbeat ceiling that was fsync-bound through raft. Start here
