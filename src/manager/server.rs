@@ -772,6 +772,7 @@ fn map_instance_info(
         // attach ([`attach_guest_address`]).
         guest_address: None,
         guest_bridge: None,
+        named: instance.named,
     }
 }
 

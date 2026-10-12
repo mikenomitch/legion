@@ -69,7 +69,7 @@ What each mode guarantees and costs:
 | Identity across reschedules | none (a new allocation id) | the slot's id, reused within the pool | the instance's id, unique and never recycled while the job exists |
 | Survives node loss | replaced elsewhere | the slot is replaced, bound to its storage | the instance is replaced, bound to its storage (`onLost` decides when) |
 | Suspend, resume, fork | no | no | yes ([suspend-and-resume.md](suspend-and-resume.md)) |
-| Durable record | the allocation row | one instance row per slot | one instance row per instance, kept as a tombstone after destroy |
+| Durable record | the allocation row | one instance row per slot | one instance row per instance; a named id keeps a tombstone after destroy, a server-minted one does not ([Id rules](#id-rules)) |
 | Control-plane writes per unit | one placement | one placement | about 8 raft entries for a full create → place → suspend → resume → destroy ([Sandboxes at scale](sandboxes-at-scale.md)) |
 
 Sandboxes are the canonical `keyed` workload, and
@@ -731,6 +731,25 @@ Resubmitting a stopped job (`job run`) clears the job's stopped status, but it
   (see [Scale-In / Scale-Out Retention](#scale-in--scale-out-retention)).
   After that, ids from that job are free again. The never-recycle guarantee
   lasts for the job's lifetime only.
+- **Named and unnamed ids.** An id you choose (`--id`), a fork of one
+  (`user-42-f1`), a seeded `initialInstances` id, and an edge-boot id are
+  *named*: destroy keeps a `terminated` tombstone, which is what refuses the
+  id forever. An id the server mints, `<task>-<26 lowercase base32
+  characters>` (130 random bits, such as
+  `workspace-7k2qd9x4m1b8c3rj5t0v6wye2h`), is *unnamed*: destroy deletes its
+  row outright. It is still never reused, but by randomness rather than by
+  record: at a trillion minted ids the chance of any two colliding is about
+  10^-15, and the shape is reserved, so a caller id that ends in `-` plus
+  26 characters of `[a-z2-7]` is rejected (`InvalidArgument`) and nobody can
+  re-create an unnamed instance by typing its id. A fork of an unnamed
+  instance is unnamed too and gets a minted id of its own rather than
+  `<origin>-f<n>`. `instance get` reports which kind an instance is
+  (`named`). The point is size: a platform that creates and destroys
+  millions of unnamed sandboxes keeps a store the size of its live set,
+  not of its history.
+- After an unnamed destroy the id is gone: `instance get` answers
+  `NotFound`, and so does a second `instance destroy`. Retry destroys with
+  `--idempotency-key` to get the first reply back.
 - Keyed ids can't match the reserved slot-id pattern `{job}-{group}-{slot}`
   of a slot-mode stateful task **in the same job**. Slot and keyed ids are
   kept separate so a keyed id can never take over, or be taken over by, a

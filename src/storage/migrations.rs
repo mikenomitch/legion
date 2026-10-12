@@ -1904,6 +1904,15 @@ fn migration_list() -> Vec<M<'static>> {
         // existing row, which reads as the default allowlist. Control lane,
         // like the rest of `worker_type`.
         M::up("ALTER TABLE worker_type ADD COLUMN container TEXT NOT NULL DEFAULT '';").down(""),
+        // Unnamed instances (sandbox-scaling plan, Phase 4;
+        // docs/stateful-workloads.md, "Id rules"): `named = 0` marks a keyed
+        // instance whose id was server-minted (130 random bits, in a shape
+        // callers may not choose), which is deleted on destroy instead of
+        // kept as a tombstone. Every existing row is named, so nothing
+        // already tombstoned is released. Appended at the end, since raft
+        // changesets bind columns by position. Scheduler lane, like
+        // `instance`.
+        M::up("ALTER TABLE instance ADD COLUMN named INTEGER NOT NULL DEFAULT 1;").down(""),
     ]
 }
 

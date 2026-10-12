@@ -264,6 +264,47 @@ fn instance_and_snapshot_row_bytes() -> R<()> {
     Ok(())
 }
 
+/// Phase 4 acceptance: churn through unnamed (server-minted) instances and
+/// check the instance table holds only the live ones. Default 10^5 creates
+/// and destroys; `LEGION_MEASURE_CHURN=1000000` runs the plan's 10^6.
+#[test]
+#[ignore = "Phase 4 measurement; run with --ignored --nocapture"]
+fn unnamed_churn_keeps_the_table_at_the_live_count() -> R<()> {
+    let churn = env_list("LEGION_MEASURE_CHURN", &[100_000])[0];
+    let live = 1_000;
+    let dir = tempfile::tempdir()?;
+    let store = store_at(dir.path())?;
+    submit_sandbox_job(&store)?;
+    for _ in 0..live {
+        store.create_keyed_instance(JOB, "default", TASK, None)?;
+    }
+    let before = image_bytes(&store, dir.path(), "live")?;
+    let started = Instant::now();
+    for _ in 0..churn {
+        let id = store
+            .create_keyed_instance(JOB, "default", TASK, None)?
+            .instance_id;
+        store.destroy_keyed_instance(&id)?;
+    }
+    let secs = started.elapsed().as_secs_f64();
+    let rows = store.list_instances(JOB)?.len();
+    let after = image_bytes(&store, dir.path(), "churned")?;
+    println!(
+        "instance_scale_measure {}",
+        json!({
+            "measure": "unnamed_churn",
+            "churned": churn,
+            "live": live,
+            "rows_after": rows,
+            "image_bytes_before": before,
+            "image_bytes_after": after,
+            "create_destroy_pairs_per_sec_store_only": churn as f64 / secs,
+        })
+    );
+    assert_eq!(rows, live, "only live unnamed instances keep rows");
+    Ok(())
+}
+
 /// Heartbeat bytes both ways, and the manager's time per beat, for one node
 /// running N allocations, steady state (every allocation already reported
 /// healthy once).

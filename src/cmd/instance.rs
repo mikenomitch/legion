@@ -70,8 +70,10 @@ pub fn config() -> Command {
             otherwise the server mints one) and may repeat; --count N asks the\n\
             server to mint N additional ids. Requests for more than one instance\n\
             are atomic (all-or-nothing): any collision or invalid id creates\n\
-            nothing. Ids are never recycled: a destroyed id can never be created\n\
-            again, and a stopped instance still owns its id.\n\
+            nothing. Ids are never recycled: a destroyed --id can never be created\n\
+            again, and a stopped instance still owns its id. A minted id\n\
+            (<task>-<26 base32>) is unique by randomness and leaves no tombstone;\n\
+            --id may not take that shape.\n\
             \n\
             --from-snapshot restores every new instance from a snapshot of the\n\
             job (an id or a name; see `legion snapshot alias`) instead of booting\n\
@@ -271,8 +273,9 @@ pub fn config() -> Command {
             "\
             Destroy a keyed-mode instance\n\
             \n\
-            Stops its allocation, drops its storage handle, and tombstones the id\n\
-            forever (never recycled). Destroying an already-terminated instance\n\
+            Stops its allocation, drops its storage handle, and tombstones a\n\
+            named id for the life of the job (never recycled). A server-minted\n\
+            id leaves no row at all. Destroying an already-terminated instance\n\
             succeeds as a no-op.\
             ",
         )

@@ -7248,6 +7248,7 @@ impl Store {
             updated_at: row.get(10)?,
             restore_from: row.get(11)?,
             identity_epoch: row.get::<_, i64>(12)?.max(0) as u64,
+            named: row.get::<_, i64>(13)? != 0,
         };
 
         Ok(instance)
@@ -13339,7 +13340,8 @@ impl Store {
                 "SELECT instance.instance_id, instance.job_id, instance.group_name, \
                  instance.task_name, instance.mode, instance.state, instance.slot_index, \
                  instance.current_alloc_id, instance.storage_handle, instance.created_at, \
-                 instance.updated_at, instance.restore_from, instance.identity_epoch \
+                 instance.updated_at, instance.restore_from, instance.identity_epoch, \
+                 instance.named \
                  FROM instance \
                  LEFT JOIN volume ON volume.instance_id = instance.instance_id \
                  AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
@@ -16350,8 +16352,10 @@ impl Store {
     }
 
     /// Insert one pending keyed instance row inside `tx`, enforcing the
-    /// never-recycle collision rule. `requested_id: None` mints
-    /// `{task}-{16 alphanumerics}`. Shared by the single and batch create
+    /// never-recycle collision rule. `requested_id: None` mints an unnamed
+    /// `{task}-{26 base32}` id ([`crate::structs::mint_instance_id`]), whose
+    /// row is deleted on destroy rather than tombstoned; a requested id is
+    /// named and keeps a tombstone. Shared by the single and batch create
     /// paths so both apply identical rules.
     fn insert_keyed_instance_tx(
         &self,
@@ -16384,20 +16388,24 @@ impl Store {
                 id.to_string()
             }
             None => loop {
-                // Collisions on 16 random alphanumerics are practically
-                // impossible; the loop is belt-and-braces.
-                let candidate = format!("{task_name}-{}", random_string(16));
+                // Collisions on 130 random bits are practically impossible;
+                // the loop is belt-and-braces against a live row (the
+                // primary key would refuse it anyway). Ids of destroyed
+                // unnamed instances leave no row to check, and need none:
+                // the shape is reserved, so only a mint can produce one.
+                let candidate = crate::structs::mint_instance_id(task_name);
                 if !Self::instance_id_exists_tx(tx, &candidate)? {
                     break candidate;
                 }
             },
         };
+        let named = requested_id.is_some();
 
         tx.execute(
             "INSERT INTO instance (instance_id, job_id, group_name, task_name, mode, state, \
-             slot_index, current_alloc_id, storage_handle, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, 'keyed', 'pending', NULL, NULL, NULL, ?5, ?5);",
-            params![instance_id, job_id, group, task_name, now],
+             slot_index, current_alloc_id, storage_handle, created_at, updated_at, named) \
+             VALUES (?1, ?2, ?3, ?4, 'keyed', 'pending', NULL, NULL, NULL, ?5, ?5, ?6);",
+            params![instance_id, job_id, group, task_name, now, named],
         )?;
         Ok(instance_id)
     }
@@ -16408,8 +16416,8 @@ impl Store {
     /// When `requested_id` is `Some` it must not collide with ANY existing
     /// instance row — including Stopped rows and Terminated tombstones —
     /// enforcing the never-recycle guarantee; collisions surface as
-    /// [`StorageError::Conflict`]. When `None`, a random id is minted
-    /// (`{task}-{16 alphanumerics}`). The row starts `pending` with no storage
+    /// [`StorageError::Conflict`]. When `None`, an unnamed random id is
+    /// minted (`{task}-{26 base32}`). The row starts `pending` with no storage
     /// handle; the first placement mints one if the task declares storage.
     #[instrument(err, skip_all)]
     pub fn create_keyed_instance(
@@ -16592,8 +16600,12 @@ impl Store {
     /// delete its allocations through the normal allocation-removal path,
     /// transition the row to `terminated`, and drop its storage handle.
     ///
-    /// The row is retained forever as a tombstone so the id can never be
-    /// created again. Destroying a `stopped` instance works the same way
+    /// A named instance's row is retained as a tombstone for the job's life
+    /// so the id can never be created again. An unnamed (server-minted)
+    /// instance's row is deleted instead: its id is unique by 130 random
+    /// bits and its shape is reserved, so nobody can re-create it, and the
+    /// store tracks live instances rather than history (sandbox-scaling
+    /// plan, Phase 4). Destroying a `stopped` instance works the same way
     /// (stopped -> terminated; the retained handle is dropped) — stop is the
     /// reversible pause, destroy is forever. Destroying an
     /// already-terminated instance is a no-op (returns
@@ -16658,6 +16670,15 @@ impl Store {
         )?;
         // A suspend checkpoint is owned by its instance and dies with it.
         Self::clear_suspend_tx(&tx, instance_id)?;
+        // An unnamed instance leaves no tombstone. Its volume is reclaimed by
+        // the orphan reaper exactly as a dropped handle is, and its
+        // snapshots keep `origin_instance_id` as plain lineage.
+        if !instance.named {
+            tx.execute(
+                "DELETE FROM instance WHERE instance_id = ?1;",
+                [instance_id],
+            )?;
+        }
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Destroy)?;
         tx.commit()?;
@@ -16669,6 +16690,7 @@ impl Store {
             instance_id,
             job_id = %instance.job_id,
             removed_allocations = allocations.len(),
+            tombstoned = instance.named,
             "Destroyed keyed instance"
         );
         Ok(DestroyInstanceOutcome::Destroyed {
@@ -28174,13 +28196,113 @@ mod tests {
             Some(StorageError::Conflict { .. })
         ));
 
-        // Server-minted ids are fresh and unique.
+        // Server-minted ids are fresh, unique, unnamed, and in the reserved
+        // shape a caller may not choose.
         let minted = store.create_keyed_instance(job_id, "default", "sandbox", None)?;
         assert_ne!(minted.instance_id, "user-a");
         assert!(minted.instance_id.starts_with("sandbox-"));
-        assert!(crate::structs::validate_keyed_instance_id(&minted.instance_id).is_ok());
+        assert!(crate::structs::is_minted_instance_id(&minted.instance_id));
+        assert!(crate::structs::validate_keyed_instance_id(&minted.instance_id).is_err());
+        assert!(!minted.named);
         let minted_two = store.create_keyed_instance(job_id, "default", "sandbox", None)?;
         assert_ne!(minted.instance_id, minted_two.instance_id);
+        assert!(store.get_instance("user-a")?.context("tombstone")?.named);
+        Ok(())
+    }
+
+    /// Phase 4: an unnamed destroy leaves no row, a named one leaves a
+    /// tombstone, and churn through unnamed instances keeps the table at
+    /// the live count.
+    #[test]
+    fn unnamed_destroy_leaves_no_row_and_named_destroy_leaves_a_tombstone() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-unnamed";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task = task_id_for(&store, "sandbox", job_id)?;
+
+        let unnamed = store.create_keyed_instance(job_id, "default", "sandbox", None)?;
+        let alloc = store.place_alloc("node-a", task)?;
+        assert_eq!(
+            alloc.instance_id.as_deref(),
+            Some(unnamed.instance_id.as_str())
+        );
+        let handle = store
+            .get_instance(&unnamed.instance_id)?
+            .and_then(|instance| instance.storage_handle)
+            .context("the task declares storage, so placement minted a handle")?;
+        assert_eq!(
+            store.destroy_keyed_instance(&unnamed.instance_id)?,
+            DestroyInstanceOutcome::Destroyed {
+                removed_allocations: 1
+            }
+        );
+        assert!(
+            store.get_instance(&unnamed.instance_id)?.is_none(),
+            "an unnamed destroy deletes the row"
+        );
+        assert!(store.get_allocation_by_id(alloc.id)?.is_none());
+        // Its volume is reclaimed by the reaper like any dropped handle.
+        let reaped = store.reap_orphaned_volumes()?;
+        assert!(
+            reaped
+                .iter()
+                .any(|volume| handle.ends_with(&volume.volume_id)),
+            "the unnamed instance's volume is reaped: {reaped:?}"
+        );
+        // A second destroy finds nothing.
+        let err = store
+            .destroy_keyed_instance(&unnamed.instance_id)
+            .expect_err("nothing left to destroy");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::NotFound { .. })
+        ));
+
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-b"))?;
+        store.destroy_keyed_instance("user-b")?;
+        let tombstone = store.get_instance("user-b")?.context("named tombstone")?;
+        assert_eq!(tombstone.state, InstanceState::Terminated);
+
+        // Churn: a thousand unnamed creates and destroys leave only the live
+        // rows (one live unnamed instance, plus the named tombstone).
+        let live = store.create_keyed_instance(job_id, "default", "sandbox", None)?;
+        for _ in 0..1_000 {
+            let id = store
+                .create_keyed_instance(job_id, "default", "sandbox", None)?
+                .instance_id;
+            store.destroy_keyed_instance(&id)?;
+        }
+        let rows = store.list_instances(job_id)?;
+        let ids: Vec<&str> = rows.iter().map(|row| row.instance_id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&live.instance_id.as_str()));
+        assert!(ids.contains(&"user-b"));
+        Ok(())
+    }
+
+    /// Phase 4: existing rows predate the column and stay named, so nothing
+    /// already tombstoned is released by the upgrade.
+    #[test]
+    fn rows_from_before_the_named_column_stay_named() -> R<()> {
+        let migrations = crate::storage::migrations::get_migrations();
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        let latest = crate::storage::migrations::schema_version() as usize;
+        migrations.to_version(&mut conn, latest - 1)?;
+        conn.execute(
+            "INSERT INTO instance (instance_id, job_id, group_name, task_name, mode, state, \
+             slot_index, current_alloc_id, storage_handle, created_at, updated_at) \
+             VALUES ('sandbox-abcdefghijklmnop', 'j', 'default', 'sandbox', 'keyed', \
+             'terminated', NULL, NULL, NULL, 'now', 'now');",
+            [],
+        )?;
+        migrations.to_latest(&mut conn)?;
+        let named: i64 = conn.query_row(
+            "SELECT named FROM instance WHERE instance_id = 'sandbox-abcdefghijklmnop';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(named, 1, "a pre-Phase 4 tombstone stays a tombstone");
         Ok(())
     }
 

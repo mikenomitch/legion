@@ -225,6 +225,26 @@ anything is captured.
   on, so upgrading the whole fleet's VMM leaves it nowhere to run. Upgrade a
   subset first, or resume the instances before the last old node goes.
 
+## Unnamed instance ids
+
+Server-minted keyed ids changed shape and guarantee in the release that
+added unnamed instances ([Id rules](stateful-workloads.md#id-rules)):
+
+- **The never-recycled guarantee for server-minted ids is now
+  probabilistic.** A minted id is `<task>-<26 base32>` (130 random bits) and
+  `instance destroy` deletes its row instead of keeping a tombstone. Ids you
+  choose keep their tombstones exactly as before.
+- **Nothing existing is released.** The upgrade marks every existing
+  instance row named, including tombstones of ids minted by an older
+  release (`<task>-<16 alphanumerics>`), so they keep refusing re-creation.
+  Only instances minted after the upgrade are unnamed.
+- **A caller id may no longer end in `-` plus 26 characters of `[a-z2-7]`.**
+  That shape is reserved for minted ids. Scripts that generate ids of that
+  shape themselves get `InvalidArgument`; drop the id to have one minted,
+  or change the generator.
+- **Downgrading a manager** leaves the `instance.named` column it does not
+  read, and an older manager tombstones every destroy again.
+
 ## Task-plugin ABI
 
 Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by

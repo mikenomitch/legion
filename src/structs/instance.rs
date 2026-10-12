@@ -29,7 +29,10 @@ pub enum InstanceMode {
     #[default]
     Slot,
     /// Instances created on demand via the CreateInstance/DestroyInstance
-    /// management RPCs with never-recycled ids (sandbox / dispatch style).
+    /// management RPCs with never-recycled ids (sandbox / dispatch style):
+    /// a caller id is kept as a tombstone after destroy, and a server-minted
+    /// id is never reused because it is 130 random bits in a shape callers
+    /// may not choose.
     /// `count.num` does not drive keyed tasks: live instances do.
     Keyed,
 }
@@ -86,8 +89,10 @@ pub enum InstanceState {
     Suspended,
     /// No longer desired (scaled in, job stopped, or destroyed). Slot-mode
     /// rows are retained so a later scale-out re-materializes the same id and
-    /// reattaches the retained storage handle; keyed-mode rows are retained
-    /// forever to guarantee ids are never recycled.
+    /// reattaches the retained storage handle; named keyed rows are retained
+    /// for the job's life so their ids are never recycled. An unnamed
+    /// (server-minted) keyed row is deleted on destroy instead: its id is
+    /// unique by randomness and reserved in shape ([`is_minted_instance_id`]).
     Terminated,
 }
 
@@ -168,6 +173,17 @@ pub struct Instance {
     /// the capture ops, never by a generic upsert.
     #[serde(default)]
     pub identity_epoch: u64,
+    /// Whether the id is a name: caller-chosen, a slot ordinal, or derived
+    /// from a named origin. A named keyed instance keeps a `terminated`
+    /// tombstone after destroy so its id is never reused. An unnamed one
+    /// (server-minted, [`mint_instance_id`]) is unique by 130 random bits
+    /// and its row is deleted on destroy (sandbox-scaling plan, Phase 4).
+    #[serde(default = "named_default")]
+    pub named: bool,
+}
+
+fn named_default() -> bool {
+    true
 }
 
 /// Why an instance's last allocation stopped (`instance.last_stop`, JSON).
@@ -247,6 +263,46 @@ pub fn slot_instance_id(job_id: &str, group: &str, slot: u32) -> String {
 /// Maximum length of a keyed instance id.
 pub const KEYED_INSTANCE_ID_MAX_LEN: usize = 128;
 
+/// Length of the random part of a server-minted instance id: 26 base32
+/// characters, 130 bits (sandbox-scaling plan, Phase 4). At a trillion
+/// minted ids the chance that any two collide is about 10^-15, which is what
+/// lets an unnamed instance leave no tombstone on destroy.
+pub const MINTED_ID_RANDOM_LEN: usize = 26;
+
+/// The base32 alphabet minted ids draw from (RFC 4648, lowercase).
+const MINTED_ID_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+/// Mint an unnamed instance id: `{task}-{26 base32 chars}`.
+///
+/// Ids of this shape are reserved: [`validate_keyed_instance_id`] refuses
+/// them as caller ids, so an id of this shape can only ever come from a mint,
+/// and nobody can re-create a destroyed unnamed instance by typing its id.
+/// That is what makes "no tombstone" safe for them. A task name long enough
+/// to push the id past [`KEYED_INSTANCE_ID_MAX_LEN`] is truncated, so the id
+/// stays valid and keeps all 130 random bits.
+pub fn mint_instance_id(task_name: &str) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let random: String = (0..MINTED_ID_RANDOM_LEN)
+        .map(|_| MINTED_ID_ALPHABET[rng.gen_range(0..MINTED_ID_ALPHABET.len())] as char)
+        .collect();
+    let max_prefix = KEYED_INSTANCE_ID_MAX_LEN - MINTED_ID_RANDOM_LEN - 1;
+    let prefix: String = task_name.chars().take(max_prefix).collect();
+    format!("{prefix}-{random}")
+}
+
+/// Whether `id` has the reserved shape of a server-minted id: a non-empty
+/// prefix, a `-`, and exactly [`MINTED_ID_RANDOM_LEN`] characters of the
+/// lowercase base32 alphabet at the end.
+pub fn is_minted_instance_id(id: &str) -> bool {
+    let Some((prefix, random)) = id.rsplit_once('-') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && random.len() == MINTED_ID_RANDOM_LEN
+        && random.bytes().all(|b| MINTED_ID_ALPHABET.contains(&b))
+}
+
 /// Validate a keyed instance id: `[A-Za-z0-9._-]{1,128}`.
 ///
 /// The charset is deliberately conservative — keyed ids flow into env vars
@@ -270,6 +326,15 @@ pub fn validate_keyed_instance_id(id: &str) -> Result<(), String> {
     {
         return Err(format!(
             "keyed instance id contains invalid character {bad:?}; allowed: [A-Za-z0-9._-]"
+        ));
+    }
+    if is_minted_instance_id(id) {
+        return Err(format!(
+            "keyed instance id {id} has the reserved shape of a server-minted id \
+             (`<prefix>-<{MINTED_ID_RANDOM_LEN} lowercase base32 characters>`); minted ids leave \
+             no tombstone, so a caller may not choose one. Pick an id that does not end in \
+             {MINTED_ID_RANDOM_LEN} characters of [a-z2-7] after its last `-`, or omit the id \
+             to have one minted"
         ));
     }
     Ok(())
@@ -304,6 +369,33 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn minted_ids_have_the_reserved_shape_and_callers_cannot_use_it() {
+        let id = mint_instance_id("workspace");
+        assert!(id.starts_with("workspace-"), "{id}");
+        assert_eq!(id.len(), "workspace-".len() + MINTED_ID_RANDOM_LEN);
+        assert!(is_minted_instance_id(&id));
+        assert_ne!(id, mint_instance_id("workspace"), "two mints differ");
+        // A caller may not choose the shape...
+        let err = validate_keyed_instance_id(&id).unwrap_err();
+        assert!(err.contains("reserved shape"), "{err}");
+        // ...but every other id stays valid, including near misses.
+        for ok in [
+            "user-42",
+            "workspace-abcdefghijklmnopqrstuvwxy", // 25 characters
+            "workspace-abcdefghijklmnopqrstuvwxyz2", // 27 characters
+            "workspace-ABCDEFGHIJKLMNOPQRSTUVWXYZ", // uppercase
+            "workspace-abcdefghijklmnopqrstuvwx18", // 1 and 8 are not base32
+            "abcdefghijklmnopqrstuvwxyz",          // no prefix
+        ] {
+            assert!(validate_keyed_instance_id(ok).is_ok(), "{ok:?}");
+        }
+        // A task name too long to fit is truncated, never the random part.
+        let long = mint_instance_id(&"t".repeat(200));
+        assert_eq!(long.len(), KEYED_INSTANCE_ID_MAX_LEN);
+        assert!(is_minted_instance_id(&long));
     }
 
     #[test]

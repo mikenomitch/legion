@@ -176,16 +176,22 @@ service Manager {
   // created through this RPC is the task's desired allocation count (zero
   // instances = zero allocations).
   //
-  // Id assignment: when `instance_id` is absent the server mints an id,
+  // Id assignment: when `instance_id` is absent the server mints an
+  // unnamed id, `<task>-<26 lowercase base32 characters>` (130 random bits),
   // unless the target task sets `stateful.requireId: true`, which rejects
-  // the request instead. A caller-supplied `instance_id` is always accepted
-  // when valid.
+  // the request instead. A caller-supplied `instance_id` is a name and is
+  // always accepted when valid. That shape is reserved for minted ids: a
+  // caller id ending in `-` plus 26 characters of `[a-z2-7]` is refused, so
+  // nobody can re-create an unnamed instance by typing its id. Named and
+  // unnamed instances differ only on destroy (see DestroyInstance and
+  // `InstanceInfo.named`).
   //
   // Errors:
   // - NotFound: the job does not exist.
   // - InvalidArgument: no keyed task matches `group`/`task`, the match is
   //   ambiguous, the id has an invalid charset (must match
-  //   `[A-Za-z0-9._-]{1,128}`), or `requireId: true` and no id was given.
+  //   `[A-Za-z0-9._-]{1,128}`) or the reserved minted-id shape, or
+  //   `requireId: true` and no id was given.
   // - AlreadyExists: the id collides with ANY existing instance row of the
   //   job — including Stopped instances and Terminated tombstones — or
   //   structurally aliases the reserved slot-id pattern
@@ -266,18 +272,24 @@ service Manager {
   // Destroys a keyed-mode instance: stops its current allocation, drops its
   // storage handle, and marks the instance Terminated.
   //
-  // The instance row is retained as a tombstone so its id can never be
-  // re-created — and its workload identity `sub` never re-minted for a
-  // different workload — for the lifetime of the job (the never-recycle
-  // guarantee). Destroying the whole job (DestroyJob) cascades and clears its
-  // instance history, after which the id is free again; a live job never
-  // recycles a destroyed id. The storage handle is always dropped on destroy
-  // — a destroyed sandbox's state must not be reattachable. (This is
+  // A named instance (`InstanceInfo.named`: a caller-chosen id, or a fork of
+  // one) keeps its row as a tombstone so its id can never be re-created —
+  // and its workload identity `sub` never re-minted for a different
+  // workload — for the lifetime of the job (the never-recycle guarantee).
+  // Destroying the whole job (DestroyJob) cascades and clears its instance
+  // history, after which the id is free again; a live job never recycles a
+  // destroyed id. An unnamed instance (a server-minted id) leaves no row at
+  // all: its id is unique by 130 random bits and its shape is reserved, so
+  // it is never reused either, and the store holds live instances rather
+  // than history. The storage handle is always dropped on destroy — a
+  // destroyed sandbox's state must not be reattachable. (This is
   // intentionally stricter than slot-mode scale-in, which retains storage by
   // default for a later scale-out.)
   //
   // Destroying an already-Terminated instance succeeds as a no-op, so the
-  // call is safe to retry even without an idempotency key.
+  // call is safe to retry even without an idempotency key. A retried destroy
+  // of an unnamed instance answers NOT_FOUND, since nothing is left; pass an
+  // `idempotency_key` to get the first call's reply back instead.
   //
   // Destroy also applies to Stopped instances: the row transitions
   // stopped -> terminated and its retained storage handle is dropped. It
@@ -3310,8 +3322,10 @@ message ReplaceInstanceReply {
 // owns the storage binding, and feeds the workload-identity subject.
 message InstanceInfo {
   // Stable id, unique within the cluster. Slot mode: the deterministic
-  // `{job}-{group}-{slot}` ordinal id. Keyed mode: the caller-supplied or
-  // server-minted key, never recycled after destroy.
+  // `{job}-{group}-{slot}` ordinal id. Keyed mode: the caller-supplied key
+  // (never recycled: destroy keeps a tombstone) or a server-minted
+  // `<task>-<26 base32>` id (unique by 130 random bits, with no tombstone;
+  // see `named`).
   string instance_id = 1;
 
   // Owning job name.
@@ -3527,6 +3541,19 @@ message InstanceInfo {
   // The bridge `guest_address` belongs to (`br0`). Set exactly when
   // `guest_address` is.
   optional string guest_bridge = 36;
+
+  // Whether the instance id is a name. True for a caller-chosen keyed id, a
+  // fork of a named instance (`<origin>-f<n>`), a seeded
+  // `initialInstances` id, an edge-boot id, and every slot id. False for a
+  // keyed id the server minted (`<task>-<26 lowercase base32 characters>`,
+  // CreateInstance without `instance_id`, or a fork of an unnamed
+  // instance). DestroyInstance keeps a named instance's row as a
+  // `terminated` tombstone for the life of its job, so the id is never
+  // reused; it deletes an unnamed instance's row, whose id is unique by 130
+  // random bits and has a shape callers may not choose, so no one can
+  // re-create it. After that, GetInstance answers NOT_FOUND for the id. See
+  // docs/stateful-workloads.md, "Id rules".
+  bool named = 39;
 }
 
 // A cold boot that replaced a restore (InstanceInfo.cold_boot).

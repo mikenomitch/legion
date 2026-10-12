@@ -46,7 +46,15 @@ pub struct AliasOutcome {
 
 /// The origin columns [`Store::begin_fork`] checks: mode, state, current
 /// allocation, pending op, group, task.
-type OriginRow = (String, String, Option<i64>, Option<String>, String, String);
+type OriginRow = (
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    String,
+    String,
+    bool,
+);
 
 impl Store {
     /// Start a fork (the ForkInstance RPC's storage half): insert the
@@ -57,7 +65,8 @@ impl Store {
     ///
     /// Fork ids are `<origin>-f<n>` with the lowest `n` whose id has never
     /// existed in any job (ids are never recycled), or a minted id when the
-    /// origin id is too long to suffix. With `derived_ids_only` (a task whose
+    /// origin id is too long to suffix. A fork of an unnamed (server-minted)
+    /// origin always gets a minted, unnamed id of its own. With `derived_ids_only` (a task whose
     /// `stateful.requireId = true`, so every id must stay in the caller's
     /// namespace) a fork that would need a minted id is refused instead.
     #[instrument(err, skip_all, fields(snapshot_id = %new.snapshot_id, count))]
@@ -82,7 +91,7 @@ impl Store {
         let tx = Self::write_tx(&mut conn)?;
         let row: Option<OriginRow> = tx
             .query_row(
-                "SELECT mode, state, current_alloc_id, pending_op, group_name, task_name \
+                "SELECT mode, state, current_alloc_id, pending_op, group_name, task_name, named \
                  FROM instance WHERE instance_id = ?1;",
                 [&new.instance_id],
                 |row| {
@@ -93,11 +102,12 @@ impl Store {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get::<_, i64>(6)? != 0,
                     ))
                 },
             )
             .optional()?;
-        let Some((mode, state, current, pending, group, task_name)) = row else {
+        let Some((mode, state, current, pending, group, task_name, origin_named)) = row else {
             bail!(StorageError::not_found("instance", &new.instance_id));
         };
         if mode != "keyed" || state != "active" || current != Some(new.allocation_id) {
@@ -121,7 +131,15 @@ impl Store {
         let mut instances = Vec::with_capacity(count as usize);
         let mut n = 1u32;
         while instances.len() < count as usize {
-            let id = match fork_instance_id(&new.instance_id, n) {
+            // A fork of an unnamed origin is unnamed too, with an id of its
+            // own: a derived `<origin>-f<n>` would be reused once that fork
+            // was destroyed and left no row.
+            let derived = if origin_named {
+                fork_instance_id(&new.instance_id, n)
+            } else {
+                None
+            };
+            let id = match derived {
                 Some(candidate) => {
                     n += 1;
                     let taken = tx
@@ -143,7 +161,7 @@ impl Store {
                         Some(&candidate),
                     )?
                 }
-                None if derived_ids_only => bail!(StorageError::InvalidInput {
+                None if derived_ids_only && origin_named => bail!(StorageError::InvalidInput {
                     message: format!(
                         "instance {} is too long to fork: a fork id is `<origin>-f<n>`, at most \
                          128 characters, and its task sets stateful.requireId = true, so \
