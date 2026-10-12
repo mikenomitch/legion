@@ -103,7 +103,7 @@ When one is required and what goes in it:
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [edge-boot-plan.md](plans/edge-boot-plan.md) | shipped (phases 1–4); phase 0 measurement not run, phase 5 backlog |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
-| [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | planned (gated sandboxes take memory checkpoints and become the sandbox default with deny-by-default egress, Legion-addressed TAPs as the fallback; Phase 0 is a real-VMM gate) |
+| [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | in execution (Phases 1 to 4 built: gated memory checkpoints, default deny, the static guest agent, gated idle signals, Legion-addressed TAPs; Phase 0, the real-VMM gate, is pending, so the gated-by-default flip is held; Phase 5 ingress not started) |
 | [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
 | [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
 | [job-status-plan.md](plans/job-status-plan.md) | shipped (per-replica outcomes and status-change events deferred) |

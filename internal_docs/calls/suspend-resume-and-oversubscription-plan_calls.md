@@ -1354,7 +1354,7 @@ so `used` would refuse nodes that have room.
 [gated-sandbox-checkpoints-plan.md](../plans/gated-sandbox-checkpoints-plan.md)
 Phase 1: gated sandboxes take memory checkpoints, and the submit refusal is
 gone. What is refused now, at capture, is a gated sandbox on Firecracker
-older than 1.16.1 ([gated calls entry 7](gated-sandbox-checkpoints-plan_calls.md#7-gated-memory-checkpoints-need-firecracker-1161-checked-at-capture)).
+older than 1.16.1 ([gated calls entry 12](gated-sandbox-checkpoints-plan_calls.md#12-gated-memory-checkpoints-need-firecracker-1161-checked-at-capture)).
 
 **Call.** Job validation (`job run`, `job validate`, `job plan`) refuses a
 `sandbox` task that declares gated networking and asks for memory checkpoints.
@@ -1524,7 +1524,7 @@ pinned VMM is certain never to fire it.
 Phase 1. Every restore now moves the vsock onto the restoring allocation's
 own socket through the VMMs' overrides, and the device-link route this entry
 considered was rejected there as a cross-instance policy bypass
-([gated calls entry 3](gated-sandbox-checkpoints-plan_calls.md#3-a-restore-retargets-the-vsock-socket-to-its-own-allocation-through-vmm-overrides-not-a-stable-path)).
+([gated calls entry 5](gated-sandbox-checkpoints-plan_calls.md#5-a-restore-retargets-the-vsock-socket-to-its-own-allocation-through-vmm-overrides-not-a-stable-path)).
 
 **Call.** A sandbox with `network.mode = "gated"` launches without
 checkpoint support even when asked, with a warning, and a checkpoint of one
