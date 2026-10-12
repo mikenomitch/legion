@@ -11597,7 +11597,9 @@ mod tests {
         let status = map_store_error("Error deleting job", err);
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(
-            status.message().contains("must be stopped before it can be destroyed"),
+            status
+                .message()
+                .contains("must be stopped before it can be destroyed"),
             "{}",
             status.message()
         );

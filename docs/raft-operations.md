@@ -306,11 +306,14 @@ backed by the same engine state as the CLI.
 - **Restarting a member is quiet.** A restarted member that belongs to a
   multi-voter cluster does not campaign until a leader replicates to it, or
   until its quiet window passes (five election timeouts, at least 3s), which
-  covers a whole-cluster restart. Before, it campaigned on its first election
-  tick, before its own listener was up, and its higher term then deposed the
-  healthy leader: every restart cost an election and several terms. A term
-  that still climbs on a steady cluster means elections are failing: check
-  the election timings below and whether the hosts stall.
+  covers a whole-cluster restart. Before, a member that no leader reached
+  within one leader lease plus its election timeout of starting raft (the
+  manager binds its listener after starting raft, so a slow start, such as
+  auth-method key fetches or a large state, used up that window) campaigned,
+  kept campaigning while unreachable, and its higher term then deposed the
+  healthy leader: the restart cost an election and several terms. A term that
+  still climbs on a steady cluster means elections are failing: check the
+  election timings in docs/multi-raft.md and whether the hosts stall.
 - **Observability:** `legion raft status` and `history`, the UI Raft page,
   and `/readyz` all report raft state. In raft mode, `/readyz` requires a
   known leader. While the voter count is even, it also includes the

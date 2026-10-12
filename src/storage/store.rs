@@ -26631,7 +26631,10 @@ mod tests {
             vec![second.id, first.id]
         );
         assert_eq!(gone[0].cause, "stop");
-        assert_eq!(store.removed_allocations(Some("logs-web"), None, 1)?.len(), 1);
+        assert_eq!(
+            store.removed_allocations(Some("logs-web"), None, 1)?.len(),
+            1
+        );
 
         // Past the retention they are no longer offered.
         store.write_connection()?.execute(

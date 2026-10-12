@@ -3665,13 +3665,15 @@ impl PersistenceDriver for MultiRaftDriver {
                 // Quiet start (spot-check P2-10): a restarted member of a
                 // multi-voter group holds its own elections until a leader
                 // replicates to it, or its quiet window passes. Without this
-                // it campaigned on its first election tick — before its
-                // listener was even up, so no leader could reach it — and
-                // its higher term then deposed the healthy leader the moment
-                // that leader's heartbeat arrived. Every manager restart cost
-                // an election and several terms. openraft 0.9 has no
-                // pre-vote, which is what prevents this in other raft
-                // implementations.
+                // it campaigned once one leader lease plus its election
+                // timeout passed with no leader reaching it — and the
+                // manager binds the listener leaders reach it on only after
+                // raft starts, so a slow start used that window up. It kept
+                // campaigning while unreachable, and its higher term then
+                // deposed the healthy leader the moment that leader's
+                // heartbeat arrived: the restart cost an election and several
+                // terms. openraft 0.9 has no pre-vote, which is what prevents
+                // this in other raft implementations.
                 let quiet = had_state && quiet_start_applies(&raft, raft_id);
                 if quiet {
                     raft.runtime_config().elect(false);
