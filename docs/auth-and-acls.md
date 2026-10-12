@@ -393,8 +393,53 @@ and the exec WebSocket only answer loopback origins and those listed in
 [UI Architecture](ui-architecture.md#allowed-browser-origins)). With ACLs off
 this is the only thing that stops a web page from driving a local manager.
 
-The worker plane does not support mTLS yet. The listener-level TLS below
-already covers transport encryption.
+### The worker plane
+
+Managers reach workers on the worker plane (port 4848) for dispatch, exec,
+logs, and restart. It is authenticated independently of ACL mode, because a
+manager's private key never leaves the managers:
+
+- The listener is always mutual TLS with the node's certificate from the
+  cluster CA.
+- `PostWork`, `GetTaskLogs`, and `RestartWorker` admit only a caller that
+  presents a manager certificate (`legion://manager/<id>`). `ExecTask` admits
+  a manager. `StartClaim` admits a holder of a valid boot ticket.
+- Managers verify the worker they dial against `<node>.node.legion`.
+- Join tokens pin the cluster CA (`caHash`), and a joining worker refuses a
+  manager whose CA does not match.
+- Node keys are generated on the node. `IssueNodeCertificate` takes a CSR
+  only and never returns a private key.
+
+See [Managers and Workers](architecture-managers-workers.md#the-worker-plane)
+for the caller-class table and the ports, and [Rotating the cluster
+CA](#rotating-the-cluster-ca) below.
+
+The worker's own connection to the manager (registration, heartbeats) is
+still plaintext unless the manager serves TLS: see the TLS section below.
+
+### Rotating the cluster CA
+
+One CA per cluster signs node, manager, and mesh certificates
+(`legion net ca show` prints the trust bundle, its pin, and the rotation
+phase). Rotate it in two steps that break no connection:
+
+```console
+$ legion net ca rotate
+Rotated the cluster CA. The new CA (pin sha256:...) signs every certificate from now on.
+The previous CA stays trusted until 2026-11-03T18:05:11Z, so no worker-plane or mesh connection breaks;
+nodes re-issue their certificates within one heartbeat. Join tokens minted before
+the rotation work until then; mint new ones after.
+```
+
+1. The new CA is generated and cross-signed by the old one, and signs every
+   certificate from then on. Chains carry the cross-signed certificate, so a
+   holder that still trusts only the old CA keeps verifying.
+2. The old CA stays in every trust bundle for one certificate lifetime (24
+   hours). Every node sees the new CA's pin on its next heartbeat reply and
+   re-issues at once.
+3. After the overlap, the old CA leaves the bundle. Join tokens that pin it
+   stop working; mint new ones. A worker that was offline for the whole
+   overlap must re-join.
 
 ### TLS
 

@@ -428,6 +428,23 @@ export class WorkerConfig extends Message<WorkerConfig> {
    */
   edgeBoot = "";
 
+  /**
+   * JSON-encoded security settings for workers of this type, folded by the
+   * manager from the worker config's top-level blocks
+   * (docs/network-handlers.md, "The host guard"):
+   *
+   * - `hostGuard`: `{"allow": ["10.0.1.7:9100"], "deny": ["192.0.2.10/32"]}`.
+   *   Destinations no allocation may reach through the datapath are fixed
+   *   (loopback, the node's own addresses, link-local, cloud metadata);
+   *   `allow` opens one `ip:port` (or `cidr:port`) each, `deny` adds
+   *   destinations. Job policy can't widen the guard; only this can.
+   *
+   * Default: empty string (the default guard, no overrides).
+   *
+   * @generated from field: string security = 14;
+   */
+  security = "";
+
   constructor(data?: PartialMessage<WorkerConfig>) {
     super();
     proto3.util.initPartial(data, this);
@@ -449,6 +466,7 @@ export class WorkerConfig extends Message<WorkerConfig> {
     { no: 11, name: "heartbeat_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 12, name: "resource_enforcement", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "edge_boot", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 14, name: "security", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerConfig {
@@ -9108,18 +9126,59 @@ export class GetMeshCaRequest extends Message<GetMeshCaRequest> {
  */
 export class GetMeshCaReply extends Message<GetMeshCaReply> {
   /**
-   * The CA certificate, PEM; empty when none exists yet.
+   * The signing CA certificate, PEM; empty when none exists yet.
    *
    * @generated from field: string cert_pem = 1;
    */
   certPem = "";
 
   /**
-   * When the current CA was created (RFC 3339); empty when none exists.
+   * When the signing CA was created (RFC 3339); empty when none exists.
    *
    * @generated from field: string created_at = 2;
    */
   createdAt = "";
+
+  /**
+   * Every CA a holder should trust, PEM: the signing CA, then the previous
+   * CA while a rotation's overlap lasts. Clients that verify node or
+   * manager certificates (`legion sandbox start --node`, direct exec) use
+   * this, not `cert_pem`.
+   *
+   * @generated from field: string bundle_pem = 3;
+   */
+  bundlePem = "";
+
+  /**
+   * The signing CA's pin (`sha256:<hex of its DER>`), as join tokens carry
+   * it in `caHash`.
+   *
+   * @generated from field: string pin = 4;
+   */
+  pin = "";
+
+  /**
+   * Where a rotation stands: `stable` (one CA) or `overlap` (the new CA
+   * signs and the previous one is still trusted until `overlap_until`).
+   *
+   * @generated from field: string phase = 5;
+   */
+  phase = "";
+
+  /**
+   * When the previous CA leaves the bundle (RFC 3339); empty when `stable`.
+   *
+   * @generated from field: string overlap_until = 6;
+   */
+  overlapUntil = "";
+
+  /**
+   * The previous CA certificate, PEM, while it is still trusted; empty
+   * otherwise.
+   *
+   * @generated from field: string previous_cert_pem = 7;
+   */
+  previousCertPem = "";
 
   constructor(data?: PartialMessage<GetMeshCaReply>) {
     super();
@@ -9131,6 +9190,11 @@ export class GetMeshCaReply extends Message<GetMeshCaReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "cert_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "bundle_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "pin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "phase", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "overlap_until", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "previous_cert_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetMeshCaReply {
@@ -9203,6 +9267,22 @@ export class RotateMeshCaReply extends Message<RotateMeshCaReply> {
    */
   createdAt = "";
 
+  /**
+   * The new CA's pin (`sha256:<hex>`), which join tokens minted from now on
+   * carry.
+   *
+   * @generated from field: string pin = 3;
+   */
+  pin = "";
+
+  /**
+   * When the previous CA leaves the trust bundle (RFC 3339): one node
+   * certificate lifetime from now.
+   *
+   * @generated from field: string overlap_until = 4;
+   */
+  overlapUntil = "";
+
   constructor(data?: PartialMessage<RotateMeshCaReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9213,6 +9293,8 @@ export class RotateMeshCaReply extends Message<RotateMeshCaReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "cert_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "pin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "overlap_until", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RotateMeshCaReply {
@@ -9246,6 +9328,25 @@ export class IssueNodeCertificateRequest extends Message<IssueNodeCertificateReq
    */
   nodeId = "";
 
+  /**
+   * Required. A PEM certificate signing request for a key the worker
+   * generated and keeps. Only its public key is used; the manager chooses
+   * the certificate's names.
+   *
+   * @generated from field: string csr_pem = 2;
+   */
+  csrPem = "";
+
+  /**
+   * Simulator only: sign a fleet certificate (`<fleet>.fleet.legion`,
+   * `legion://fleet/<fleet>`) instead of a node certificate. The node must
+   * have registered with config attribute `workerFleet` equal to this name.
+   * Empty for every real worker.
+   *
+   * @generated from field: string fleet = 3;
+   */
+  fleet = "";
+
   constructor(data?: PartialMessage<IssueNodeCertificateRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9255,6 +9356,8 @@ export class IssueNodeCertificateRequest extends Message<IssueNodeCertificateReq
   static readonly typeName = "legion.IssueNodeCertificateRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "csr_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "fleet", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueNodeCertificateRequest {
@@ -9281,24 +9384,20 @@ export class IssueNodeCertificateRequest extends Message<IssueNodeCertificateReq
  */
 export class IssueNodeCertificateReply extends Message<IssueNodeCertificateReply> {
   /**
-   * The node certificate, PEM. SANs: `<node>.node.legion` and
-   * `legion://node/<node id>`.
+   * The node certificate chain, PEM, leaf first. SANs: `<node>.node.legion`
+   * and `legion://node/<node id>` (or the fleet names for a fleet
+   * certificate). During a CA rotation's overlap the chain also carries the
+   * new CA cross-signed by the previous one.
    *
    * @generated from field: string cert_pem = 1;
    */
   certPem = "";
 
   /**
-   * The certificate's private key, PEM. Treat as a secret: never log it,
-   * never write it to disk — the worker holds it in memory and re-issues
-   * after a restart.
-   *
-   * @generated from field: string key_pem = 2;
-   */
-  keyPem = "";
-
-  /**
-   * The mesh CA certificate, PEM. What a node verifies its peers against.
+   * The cluster CA trust bundle, PEM: the signing CA, plus the previous CA
+   * while a rotation's overlap lasts. What a node verifies managers and
+   * peers against. A worker joining with a token checks that this bundle
+   * contains the token's pinned CA before trusting it.
    *
    * @generated from field: string ca_pem = 3;
    */
@@ -9320,7 +9419,6 @@ export class IssueNodeCertificateReply extends Message<IssueNodeCertificateReply
   static readonly typeName = "legion.IssueNodeCertificateReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "cert_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "key_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "ca_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "expires_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ]);
@@ -10811,6 +10909,17 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   contentResync = false;
 
+  /**
+   * The pin (`sha256:<hex>`) of the cluster CA the managers sign with now.
+   * A worker whose CA bundle does not contain it re-issues its node
+   * certificate at once instead of waiting for its refresh timer: that is
+   * how a `legion net ca rotate` reaches every node within one heartbeat.
+   * Empty when no cluster CA exists yet.
+   *
+   * @generated from field: string cluster_ca_pin = 11;
+   */
+  clusterCaPin = "";
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10829,6 +10938,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 8, name: "net_policies", kind: "message", T: AllocNetPolicy, repeated: true },
     { no: 9, name: "checkpoint_requests", kind: "message", T: CheckpointRequest, repeated: true },
     { no: 10, name: "content_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 11, name: "cluster_ca_pin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -25374,7 +25484,11 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
 
   /**
    * The rule that decided (`policy/<name>#<index>`, `task#<index>`, or
-   * `fallthrough`); empty on allow-by-absence.
+   * `fallthrough`); empty on allow-by-absence. `host-guard` for an egress
+   * target the host guard refuses, which is answered before any policy: the
+   * manager resolves the name and judges the built-in classes (loopback,
+   * link-local, cloud metadata). A node's own addresses and its `hostGuard`
+   * overrides are judged on the worker only.
    *
    * @generated from field: string source = 2;
    */
@@ -25613,15 +25727,21 @@ export class NetDenial extends Message<NetDenial> {
   destination = "";
 
   /**
-   * The rule that denied: `policy/<name>#<index>`, `task#<index>`, or
-   * `fallthrough`.
+   * What denied. A rule: `policy/<name>#<index>`, `task#<index>`, or
+   * `fallthrough`. Or a layer below policy: `host-guard` (the destination,
+   * or every address its name resolved to, is loopback, this node, link-local
+   * / cloud metadata, or in the worker's `hostGuard.deny`; no policy can
+   * allow it), `gate` (the edge-boot gate is shut), or `policy-pending` (a
+   * gated allocation whose policy has not arrived).
    *
    * @generated from field: string source = 6;
    */
   source = "";
 
   /**
-   * The rule's reason, if any.
+   * The rule's reason, if any. For `host-guard`, the address and its class,
+   * e.g. `169.254.169.254 is link-local (cloud metadata); allocations may not
+   * reach it`, or `<name> resolves to <ip> (<class>); ...` for a hostname.
    *
    * @generated from field: string reason = 7;
    */

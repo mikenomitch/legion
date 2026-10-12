@@ -106,16 +106,7 @@ pub fn config() -> Command {
                 .requires("simulate")
                 .help("Registration ramp in nodes/second (default: 100)"),
         )
-        .arg(
-            Arg::new("advertise-host")
-                .long("advertise-host")
-                .value_name("HOST")
-                .requires("simulate")
-                .help(
-                    "Host the manager should dial for task dispatch to this fleet \
-                     (default: 127.0.0.1)",
-                ),
-        );
+        .arg(crate::cmd::join::advertise_addr_arg());
 
     Command::new("start")
         .about("Start a daemon")
@@ -136,7 +127,10 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 return run_simulated_workers(token, opts).await;
             }
             let name = arg_matches.get_one::<String>("name").map(String::as_str);
-            run_worker(token, name).await
+            let advertise = arg_matches
+                .get_one::<String>("advertise-addr")
+                .map(String::as_str);
+            run_worker(token, name, advertise).await
         }
         Some(("manager", arg_matches)) => {
             let config_path = arg_matches
@@ -206,9 +200,10 @@ fn simulate_options(count: usize, arg_matches: &ArgMatches) -> R<SimulateOptions
             .copied()
             .unwrap_or(defaults.register_rate),
         advertise_host: arg_matches
-            .get_one::<String>("advertise-host")
+            .get_one::<String>("advertise-addr")
             .cloned()
-            .unwrap_or(defaults.advertise_host),
+            .or(defaults.advertise_host),
+        identity_dir: None,
     })
 }
 

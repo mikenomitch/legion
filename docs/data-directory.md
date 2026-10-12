@@ -24,6 +24,8 @@ up, or start over without deleting your existing data.
 | Raft log, snapshots, cluster secret | `<data dir>/raft` | `persistence.raft.dataDir` |
 | Worker state, allocation dirs, task logs | `<data dir>/workers/<worker-id>/` | `LEGION_WORKER_STATE_PATH` (state file only) |
 | Identity token backing files | `<data dir>/identity/<alloc-id>/<name>/token` | none |
+| Worker node key, certificate, and cluster CA bundle (`node.key`, `node.pem`, `ca.pem`, mode `0600`) | `<data dir>/workers/<worker-id>/identity/` (beside the state file) | moves with `LEGION_WORKER_STATE_PATH` |
+| Simulator fleet key and certificate | `<data dir>/sim/<name prefix>/identity/` | none |
 | Initial management token (`bootstrap-token`, mode `0600`), written by the manager that mints it | `<data dir>/bootstrap-token` | none |
 
 `<data dir>` is `$LEGION_DATA_DIR` when it is set and non-empty, and `.legion`
@@ -50,7 +52,7 @@ its own ports as well as its own data dir:
 # Second manager: copy configs/manager.ncl with a different `server.port`.
 LEGION_DATA_DIR=/tmp/legion-b legion start manager -c manager-b.ncl
 
-# Second worker: its own data dir and gRPC port.
+# Second worker: its own data dir and worker-plane port.
 LEGION_DATA_DIR=/tmp/legion-b LEGION_WORKER_PORT=4858 \
   legion start worker "$TOKEN"
 ```

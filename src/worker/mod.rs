@@ -14,6 +14,7 @@ pub mod log_sink;
 pub mod logs;
 pub mod netd;
 pub mod node_check;
+pub mod plane;
 pub mod pressure;
 pub mod resources;
 pub mod server;

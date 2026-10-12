@@ -413,6 +413,25 @@ pub async fn run_manager_with(
 
     // The in-process worker (--run-worker) registers like any external
     // worker; with ACLs enforced the manager self-issues its join token.
+    // Certificates name this manager by its raft node id, or `local`.
+    let manager_cert_id = store
+        .raft_status()
+        .map(|status| status.node_id)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "local".to_string());
+    crate::manager::worker_plane::WorkerPlane::global().set_manager_id(&manager_cert_id);
+    // The in-process worker pins the cluster CA like any joining worker.
+    let local_worker_ca_pin = if run_worker {
+        match store.ensure_mesh_ca().and_then(|ca| ca.pin()) {
+            Ok(pin) => Some(pin),
+            Err(err) => {
+                warn!(error = ?err, "Cluster CA unavailable for the in-process worker's pin");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let local_worker_join_secret = if run_worker && authenticator.enabled {
         let (_, composite) = authenticator
             .mint_join_token(
@@ -633,10 +652,14 @@ pub async fn run_manager_with(
         if run_worker {
             info!(%manager_addr, "Starting in-process worker");
             run_worker_local(
-                manager_addr,
-                "default".to_string(),
+                crate::worker::daemon::WorkerJoin {
+                    manager_addr,
+                    worker_type: "default".to_string(),
+                    join_secret: local_worker_join_secret,
+                    ca_pin: local_worker_ca_pin,
+                    advertise_addr: None,
+                },
                 None,
-                local_worker_join_secret,
             )
             .await?;
         }
@@ -3278,6 +3301,22 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             Some(block) => serde_json::to_string(&block.with_defaults())?,
         };
 
+        // Security blocks (`hostGuard`, ...) ride as one JSON payload. They
+        // are validated here so a bad entry (an `allow` without a port) stops
+        // the manager at startup, not the worker at its first connection.
+        let security_payload = crate::structs::WorkerSecurityConfig {
+            host_guard: wcp.host_guard.clone(),
+        };
+        if let Some(host_guard) = &security_payload.host_guard {
+            crate::structs::host_guard::HostGuard::new(host_guard)
+                .with_context(|| format!("invalid hostGuard in worker config {path_str}"))?;
+        }
+        let security = if security_payload == crate::structs::WorkerSecurityConfig::default() {
+            String::new()
+        } else {
+            serde_json::to_string(&security_payload)?
+        };
+
         if let Some(seconds) = wcp.heartbeat_seconds {
             // The clamp widened from 1..=30 the moment the lost window began
             // moving with the cadence (heartbeat-cadence plan §7). Under the
@@ -3338,6 +3377,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             heartbeat_seconds: wcp.heartbeat_seconds,
             resource_enforcement,
             edge_boot,
+            security,
         };
 
         store.insert_worker_type(&wc)?;

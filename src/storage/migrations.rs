@@ -1858,6 +1858,20 @@ fn migration_list() -> Vec<M<'static>> {
         // checkpoint. Scheduler lane, like `instance`.
         M::up("ALTER TABLE instance ADD COLUMN identity_epoch INTEGER NOT NULL DEFAULT 0;")
             .down(""),
+        // Two-step cluster CA rotation (worker-plane-auth plan §6.9): after
+        // `legion net ca rotate` the new CA signs at once, the previous CA
+        // stays trusted for one node-certificate lifetime, and chains carry
+        // the new CA cross-signed by the previous one so holders that still
+        // trust only the previous CA keep verifying. NULL outside a rotation.
+        // Worker-type security settings (`hostGuard`, ...), folded by the
+        // manager into one JSON column like `edge_boot`.
+        M::up("ALTER TABLE worker_type ADD COLUMN security TEXT NOT NULL DEFAULT '';").down(""),
+        M::up(
+            "ALTER TABLE net_mesh_ca ADD COLUMN previous_cert_pem TEXT;
+             ALTER TABLE net_mesh_ca ADD COLUMN cross_cert_pem TEXT;
+             ALTER TABLE net_mesh_ca ADD COLUMN rotated_at TIMESTAMP;",
+        )
+        .down(""),
     ]
 }
 

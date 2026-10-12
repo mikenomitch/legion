@@ -141,16 +141,16 @@ pub fn config() -> Command {
         )
         .subcommand(
             Command::new("ca")
-                .about("The mesh CA behind certFrom = \"legion\"")
+                .about("The cluster CA: the worker plane, the worker-to-manager channel, and certFrom = \"legion\"")
                 .subcommand_required(true)
                 .subcommand(
                     Command::new("show")
-                        .about("Print the mesh CA certificate (PEM) — what an outside client trusts to reach a mesh port")
+                        .about("Print the cluster CA trust bundle (PEM), its pin, and where a rotation stands")
                         .arg(json_flag()),
                 )
                 .subcommand(
                     Command::new("rotate")
-                        .about("Replace the mesh CA; every node re-issues its certificate on its next heartbeat")
+                        .about("Rotate the cluster CA in two steps: the new CA signs now, the old one stays trusted for 24h")
                         .arg(json_flag()),
                 ),
         )
@@ -425,23 +425,40 @@ async fn ca_show(matches: &ArgMatches) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
         format,
-        "mesh ca",
+        "cluster ca",
         client.get_mesh_ca(GetMeshCaRequest {}).await,
     )?
     .into_inner();
     if format.is_json() {
         output::print_success(&json!({
             "certPem": reply.cert_pem,
+            "bundlePem": reply.bundle_pem,
+            "pin": reply.pin,
+            "phase": reply.phase,
+            "overlapUntil": reply.overlap_until,
+            "previousCertPem": reply.previous_cert_pem,
             "createdAt": reply.created_at,
             "exists": !reply.cert_pem.is_empty(),
         }));
         return Ok(());
     }
     if reply.cert_pem.is_empty() {
-        println!("no mesh CA yet — it is created when the first node asks for a certificate");
+        println!("no cluster CA yet: it is created with the first join token or node certificate");
         return Ok(());
     }
-    print!("{}", reply.cert_pem);
+    // Human output goes to stderr so `legion net ca show > ca.pem` writes a
+    // bundle a client can trust as is.
+    eprintln!("Pin:     {}", reply.pin);
+    if reply.phase == "overlap" {
+        eprintln!(
+            "Phase:   rotating. The new CA signs; the previous CA stays trusted until {}",
+            reply.overlap_until
+        );
+        eprintln!("Bundle:  2 CAs (the signing CA first, then the previous one)");
+    } else {
+        eprintln!("Phase:   stable (one CA)");
+    }
+    print!("{}", reply.bundle_pem);
     Ok(())
 }
 
@@ -450,7 +467,7 @@ async fn ca_rotate(matches: &ArgMatches) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
         format,
-        "rotate mesh ca",
+        "rotate cluster ca",
         client.rotate_mesh_ca(RotateMeshCaRequest {}).await,
     )?
     .into_inner();
@@ -458,12 +475,17 @@ async fn ca_rotate(matches: &ArgMatches) -> R<()> {
         output::print_success(&json!({
             "certPem": reply.cert_pem,
             "createdAt": reply.created_at,
+            "pin": reply.pin,
+            "overlapUntil": reply.overlap_until,
         }));
         return Ok(());
     }
     println!(
-        "rotated the mesh CA at {}; nodes re-issue their certificates on their next heartbeat",
-        reply.created_at
+        "Rotated the cluster CA. The new CA (pin {}) signs every certificate from now on.\n\
+         The previous CA stays trusted until {}, so no worker-plane or mesh connection breaks;\n\
+         nodes re-issue their certificates within one heartbeat. Join tokens minted before\n\
+         the rotation work until then; mint new ones after.",
+        reply.pin, reply.overlap_until
     );
     Ok(())
 }
@@ -1199,6 +1221,16 @@ pub(crate) fn diagnose_network(
                     if hop.last_error.is_empty() { String::new() } else { format!(" — last error: {}", hop.last_error) }
                 ),
                 hint: (!hop.healthy).then(|| "the chain fails closed on this hop unless it says onError = \"allow\"; `legion net handler test <target>` probes it directly".to_string()),
+            });
+        }
+        if status.proxy_ready {
+            steps.push(DoctorStep {
+                layer: "host-guard",
+                status: "info",
+                detail: format!(
+                    "allocation {alloc}: the egress proxy refuses loopback, this node's own addresses, link-local, and cloud metadata, whatever policy says; a refusal reads `Legion-Denied-By: host-guard`"
+                ),
+                hint: Some("only the node's operator can open one service: hostGuard.allow = [\"ip:port\"] in the worker config".into()),
             });
         }
         steps.push(DoctorStep {

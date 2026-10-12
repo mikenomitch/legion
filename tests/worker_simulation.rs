@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use legion::manager::scheduler::{PlanMode, Scheduler};
 use legion::manager::server::ManagerDaemonService;
 use legion::manager::telemetry::{render_worker, worker_metrics};
+use legion::manager::worker_plane::WorkerPlane;
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
 use legion::structs::{
-    config::ManagerConfigFull, manager_server::ManagerServer, worker_client::WorkerClient,
-    GetTaskLogsRequest, JobConfig, PostWorkRequest, Submission, TaskAllocation, TaskConfig,
-    TaskCount, WorkerConfig,
+    config::ManagerConfigFull, manager_server::ManagerServer, GetTaskLogsRequest, JobConfig,
+    PostWorkRequest, Submission, TaskAllocation, TaskConfig, TaskCount, WorkerConfig,
 };
 use legion::worker::simulate::{launch_simulated_fleet, SimFleetRun, SimulateOptions};
 use tempfile::TempDir;
@@ -100,9 +100,10 @@ async fn launch_fleet(dir: &TempDir, manager_addr: String, count: usize) -> R<Si
         name_prefix: "sim-it".into(),
         ready_after: Duration::ZERO,
         register_rate: 1000.0,
-        advertise_host: "127.0.0.1".into(),
+        advertise_host: Some("127.0.0.1".into()),
+        identity_dir: Some(dir.path().join("fleet-identity")),
     };
-    launch_simulated_fleet(manager_addr, "default".into(), None, opts).await
+    launch_simulated_fleet(manager_addr, "default".into(), None, None, opts).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -273,8 +274,24 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
     let fleet = launch_fleet(&dir, manager_addr, 4).await?;
     wait_until("fleet registered", || fleet.registered() == 4).await;
 
-    // Push dispatch (the manager's PostWork path) routes on node_id.
-    let mut worker = WorkerClient::connect(fleet.worker_address().to_string()).await?;
+    // Push dispatch (the manager's PostWork path) routes on node_id. The
+    // manager dials the fleet over mTLS, verifying its fleet certificate.
+    let node = store.get_node("sim-it-web-0")?;
+    let mut worker = WorkerPlane::global()
+        .client(&store, &node)
+        .map_err(|status| anyhow::anyhow!("{status}"))?;
+    let deadline = Instant::now() + DEADLINE;
+    while worker
+        .get_task_logs(GetTaskLogsRequest::default())
+        .await
+        .is_err_and(|status| status.code() != tonic::Code::Unimplemented)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "fleet listener never served mTLS"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     worker
         .post_work(PostWorkRequest {
             allocation: Some(TaskAllocation {

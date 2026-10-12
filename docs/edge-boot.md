@@ -280,11 +280,21 @@ accessor. The token itself is never written anywhere.
 
 ```console
 $ legion sandbox start agent-sandboxes \
-    --id user-42 --node http://10.0.1.7:4848 --ticket "$TICKET"
+    --id user-42 --node https://10.0.1.7:4848 --node-name w-17 --ticket "$TICKET"
 admitted
 booted
 ratified
 ```
+
+The worker plane is always mutual TLS. The CLI verifies the worker's node
+certificate against the cluster CA bundle, which it fetches from the manager
+with your token (`legion net ca show`, `net:read`) or reads from `--ca
+<file>`. With `--node-name`, the certificate must name that node
+(`w-17.node.legion`); without it, any node certificate of the cluster is
+accepted. The router presents no certificate: the ticket is its credential,
+and the worker ignores a client certificate on `StartClaim`. A router of your
+own must do the same: trust the bundle from `legion net ca show`, and verify
+`<node>.node.legion`.
 
 The stream reports each transition. A router may start routing at `booted`,
 but must handle `refused` at any point until `ratified`. `--dry-run` verifies
@@ -469,6 +479,12 @@ Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
 
 ## Known limitations
 
+- **The JWKS travels in plaintext until the worker-to-manager channel is
+  encrypted.** A worker fetches the keys that verify boot tickets from
+  `<manager addr>/.well-known/jwks.json`. Over a plaintext manager address an
+  on-path attacker could swap them and mint tickets this node accepts.
+  Run edge workers on a network you trust, or serve the manager with
+  `server.tls`.
 - **No island mode.** An unratified start that cannot reach a manager dies
   when its lease expires. Edge boot does not keep work running through a long
   control-plane outage.

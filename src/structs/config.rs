@@ -2289,6 +2289,21 @@ pub struct WorkerConfigAlt {
     /// the tickets that authorize them (see docs/edge-boot.md). Absent = off.
     #[serde(default)]
     pub edge_boot: Option<WorkerEdgeBootConfig>,
+    /// Holes in (and additions to) the host guard, the fixed floor of
+    /// destinations no allocation on this node may reach through the
+    /// datapath (docs/network-handlers.md, "The host guard"). Absent = the
+    /// default guard.
+    #[serde(default)]
+    pub host_guard: Option<crate::structs::host_guard::HostGuardConfig>,
+}
+
+/// The worker-type security blocks, carried to the worker as one JSON
+/// payload (`WorkerConfig.security`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSecurityConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_guard: Option<crate::structs::host_guard::HostGuardConfig>,
 }
 
 /// Worker `resourceEnforcement` block: cgroup v2 limits for governed tasks.

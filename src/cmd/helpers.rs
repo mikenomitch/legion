@@ -145,6 +145,58 @@ pub async fn connect_manager_client() -> R<AuthedManagerClient> {
     Ok(ManagerClient::with_interceptor(channel, auth_interceptor()))
 }
 
+/// A client for one worker's plane (port 4848), for the commands that talk
+/// to a worker directly instead of through a manager (`legion sandbox
+/// start`, `legion exec --direct`). The worker plane is always TLS; the
+/// worker's certificate is verified against the cluster CA bundle, read from
+/// `ca_file` or fetched from the manager with the caller's token
+/// (`GetMeshCa`, `net:read`). With `node_name`, the certificate must name
+/// that node (`<node>.node.legion`); without it, any node certificate of the
+/// cluster is accepted. The client presents no certificate: these callers
+/// authenticate with tickets.
+pub async fn worker_plane_client(
+    address: &str,
+    node_name: Option<&str>,
+    ca_file: Option<&str>,
+) -> R<crate::structs::worker_client::WorkerClient<tonic::transport::Channel>> {
+    use crate::cluster_tls::{
+        client_config, tls_channel, AnyNodeVerifier, NamedServerVerifier, SwappableRoots,
+    };
+    let bundle = match ca_file {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read the cluster CA bundle from {path}"))?,
+        None => {
+            let mut manager = connect_manager_client().await?;
+            let reply = manager
+                .get_mesh_ca(tonic::Request::new(crate::structs::GetMeshCaRequest {}))
+                .await
+                .map_err(|status| {
+                    friendly_status(
+                        "failed to fetch the cluster CA to verify the worker (pass --ca to \
+                         skip the manager)",
+                        status,
+                    )
+                })?
+                .into_inner();
+            if reply.bundle_pem.is_empty() {
+                bail!("the cluster has no CA yet, so no worker has a certificate to verify");
+            }
+            reply.bundle_pem
+        }
+    };
+    let roots = SwappableRoots::from_pem(&bundle)?;
+    let (verifier, sni): (Arc<dyn rustls::client::danger::ServerCertVerifier>, String) =
+        match node_name {
+            Some(node) => {
+                let name = crate::manager::mesh_ca::node_dns_name(node);
+                (NamedServerVerifier::new(roots, &name)?, name)
+            }
+            None => (AnyNodeVerifier::new(roots), "node.legion".to_string()),
+        };
+    let channel = tls_channel(address, client_config(verifier, None)?, &sni)?;
+    Ok(crate::structs::worker_client::WorkerClient::new(channel))
+}
+
 pub fn json_flag() -> Arg {
     Arg::new("json")
         .long("json")

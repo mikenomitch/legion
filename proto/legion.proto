@@ -878,14 +878,27 @@ service Manager {
   rpc IssueNodeIdentityToken (IssueNodeIdentityTokenRequest)
       returns (IssueNodeIdentityTokenReply);
 
-  // Issue a short-lived **mesh certificate** for a worker node — the
-  // credential behind `certFrom = "legion"` (docs/network-handlers.md,
-  // "mTLS"). The first call creates the cluster's mesh CA (replicated with
-  // the control lane); every call signs a fresh key pair for the node with
-  // `<node>.node.legion` and `legion://node/<node id>` as its SANs, valid for
-  // 24 hours. Workers call it on their heartbeat loop once any allocation on
-  // the node terminates or originates mesh TLS, and again after a third of
-  // the lifetime has passed.
+  // Sign a worker node's **node certificate** from a CSR. The certificate is
+  // the node's identity on every plane Legion runs between its own
+  // processes: the mTLS worker plane listener (what a manager verifies when
+  // it dials the node, docs/auth-and-acls.md, "The worker plane") and the
+  // mesh (`certFrom = "legion"`, docs/network-handlers.md, "mTLS").
+  //
+  // The worker generates its key pair locally and sends only a CSR; the
+  // private key never crosses the network. The manager signs the CSR's
+  // public key with the cluster CA and SANs it chooses itself,
+  // `<node>.node.legion` and `legion://node/<node id>`, ignoring every name,
+  // extension, and subject the CSR requests. Valid for 24 hours. Workers call
+  // it right after registration (the listener needs it), again after a third
+  // of the lifetime, and at once when a heartbeat reply names a CA their
+  // bundle lacks (a rotation). The first call creates the cluster CA
+  // (replicated with the control lane).
+  //
+  // `fleet` is for the simulator only (`legion start worker --simulate`),
+  // which serves every simulated node from one listener: the certificate
+  // then names the fleet (`<fleet>.fleet.legion`, `legion://fleet/<name>`)
+  // instead of the node, and the caller's node must have registered with the
+  // `workerFleet` config attribute set to the same name.
   //
   // The node's *workload* identities are never certificates: a dialing node
   // names the workload it forwards for in a PROXY protocol v2 TLV inside the
@@ -897,6 +910,8 @@ service Manager {
   // (`node:<node_id>`) must match the request's `node_id`.
   //
   // Errors:
+  // - InvalidArgument: `csr_pem` is missing or is not a valid CSR, or
+  //   `fleet` does not match the node's registered `workerFleet`.
   // - NotFound: no node with `node_id` is registered.
   // - PermissionDenied: `node_id` does not match the caller's credential.
   // - Internal: the CA could not be created or signing failed.
@@ -1354,16 +1369,24 @@ service Manager {
   // reported as `defer`. ACL: `net:read` on the job.
   rpc TestNetPolicy (TestNetPolicyRequest) returns (TestNetPolicyReply);
 
-  // The mesh CA certificate — what an operator hands a non-Legion client
-  // that must reach a mesh-TLS port, or verifies a node certificate against.
-  // Never the key. Empty `cert_pem` when no node has asked for a certificate
-  // yet (the CA is created on first use). ACL: `net:read`.
+  // The cluster CA — what an operator hands a non-Legion client that must
+  // reach a mesh-TLS port or the worker plane (`legion sandbox start --node`,
+  // `legion exec --direct`), or verifies a node certificate against. Returns
+  // the signing CA, the full trust bundle (both CAs during a rotation), the
+  // pin new join tokens carry, and where a rotation stands. Never a key.
+  // Empty `cert_pem` when no CA exists yet (it is created on first use: the
+  // first join token or node certificate). ACL: `net:read`.
   rpc GetMeshCa (GetMeshCaRequest) returns (GetMeshCaReply);
 
-  // Replace the mesh CA. Every node re-issues its certificate on its next
-  // heartbeat (within one interval); until a node has, its peers on the new
-  // CA refuse it and it refuses them — expect a heartbeat's worth of
-  // refused mesh connections, never plaintext. ACL: `net:write` (unscoped).
+  // Rotate the cluster CA in two steps, without breaking any connection
+  // (worker-plane-auth plan §6.9). The new CA is generated, cross-signed by
+  // the current one, and signs every certificate from now on; the previous
+  // CA stays in every holder's trust bundle for one certificate lifetime (24
+  // hours), and chains carry the cross-signed certificate meanwhile, so a
+  // holder that has not refreshed its bundle yet keeps verifying. Nodes
+  // re-issue their certificates within one heartbeat (the reply names the
+  // new CA). Join tokens minted before the rotation keep working during the
+  // overlap; after it, mint new ones. ACL: `net:write` (unscoped).
   rpc RotateMeshCa (RotateMeshCaRequest) returns (RotateMeshCaReply);
 
   // Worker plane: fetches the merged policy body for a hash the heartbeat
@@ -1713,6 +1736,19 @@ message WorkerConfig {
   //
   // Default: empty string (this node accepts no edge starts).
   string edge_boot = 13;
+
+  // JSON-encoded security settings for workers of this type, folded by the
+  // manager from the worker config's top-level blocks
+  // (docs/network-handlers.md, "The host guard"):
+  //
+  // - `hostGuard`: `{"allow": ["10.0.1.7:9100"], "deny": ["192.0.2.10/32"]}`.
+  //   Destinations no allocation may reach through the datapath are fixed
+  //   (loopback, the node's own addresses, link-local, cloud metadata);
+  //   `allow` opens one `ip:port` (or `cidr:port`) each, `deny` adds
+  //   destinations. Job policy can't widen the guard; only this can.
+  //
+  // Default: empty string (the default guard, no overrides).
+  string security = 14;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -4265,11 +4301,32 @@ message GetMeshCaRequest {}
 
 // Reply payload for GetMeshCa.
 message GetMeshCaReply {
-  // The CA certificate, PEM; empty when none exists yet.
+  // The signing CA certificate, PEM; empty when none exists yet.
   string cert_pem = 1;
 
-  // When the current CA was created (RFC 3339); empty when none exists.
+  // When the signing CA was created (RFC 3339); empty when none exists.
   string created_at = 2;
+
+  // Every CA a holder should trust, PEM: the signing CA, then the previous
+  // CA while a rotation's overlap lasts. Clients that verify node or
+  // manager certificates (`legion sandbox start --node`, direct exec) use
+  // this, not `cert_pem`.
+  string bundle_pem = 3;
+
+  // The signing CA's pin (`sha256:<hex of its DER>`), as join tokens carry
+  // it in `caHash`.
+  string pin = 4;
+
+  // Where a rotation stands: `stable` (one CA) or `overlap` (the new CA
+  // signs and the previous one is still trusted until `overlap_until`).
+  string phase = 5;
+
+  // When the previous CA leaves the bundle (RFC 3339); empty when `stable`.
+  string overlap_until = 6;
+
+  // The previous CA certificate, PEM, while it is still trusted; empty
+  // otherwise.
+  string previous_cert_pem = 7;
 }
 
 // Request payload for RotateMeshCa.
@@ -4282,6 +4339,14 @@ message RotateMeshCaReply {
 
   // When it was created (RFC 3339).
   string created_at = 2;
+
+  // The new CA's pin (`sha256:<hex>`), which join tokens minted from now on
+  // carry.
+  string pin = 3;
+
+  // When the previous CA leaves the trust bundle (RFC 3339): one node
+  // certificate lifetime from now.
+  string overlap_until = 4;
 }
 
 // Request payload for IssueNodeCertificate.
@@ -4289,20 +4354,34 @@ message IssueNodeCertificateRequest {
   // The worker node the certificate is for. Must match the caller's
   // authenticated per-node credential.
   string node_id = 1;
+
+  // Required. A PEM certificate signing request for a key the worker
+  // generated and keeps. Only its public key is used; the manager chooses
+  // the certificate's names.
+  string csr_pem = 2;
+
+  // Simulator only: sign a fleet certificate (`<fleet>.fleet.legion`,
+  // `legion://fleet/<fleet>`) instead of a node certificate. The node must
+  // have registered with config attribute `workerFleet` equal to this name.
+  // Empty for every real worker.
+  string fleet = 3;
 }
 
 // Reply payload for IssueNodeCertificate.
 message IssueNodeCertificateReply {
-  // The node certificate, PEM. SANs: `<node>.node.legion` and
-  // `legion://node/<node id>`.
+  // The node certificate chain, PEM, leaf first. SANs: `<node>.node.legion`
+  // and `legion://node/<node id>` (or the fleet names for a fleet
+  // certificate). During a CA rotation's overlap the chain also carries the
+  // new CA cross-signed by the previous one.
   string cert_pem = 1;
 
-  // The certificate's private key, PEM. Treat as a secret: never log it,
-  // never write it to disk — the worker holds it in memory and re-issues
-  // after a restart.
-  string key_pem = 2;
+  reserved 2;
+  reserved "key_pem";
 
-  // The mesh CA certificate, PEM. What a node verifies its peers against.
+  // The cluster CA trust bundle, PEM: the signing CA, plus the previous CA
+  // while a rotation's overlap lasts. What a node verifies managers and
+  // peers against. A worker joining with a token checks that this bundle
+  // contains the token's pinned CA before trusting it.
   string ca_pem = 3;
 
   // Certificate expiry as Unix seconds.
@@ -4923,6 +5002,13 @@ message HeartbeatReply {
   //
   // Default: false. Never set for a heartbeat that carried no report.
   bool content_resync = 10;
+
+  // The pin (`sha256:<hex>`) of the cluster CA the managers sign with now.
+  // A worker whose CA bundle does not contain it re-issues its node
+  // certificate at once instead of waiting for its refresh timer: that is
+  // how a `legion net ca rotate` reaches every node within one heartbeat.
+  // Empty when no cluster CA exists yet.
+  string cluster_ca_pin = 11;
 }
 
 // Why one allocation is being stopped.
@@ -7480,22 +7566,50 @@ message Eval {
 
 // Worker is the per-node runtime API called by the manager.
 service Worker {
+  // The worker plane (docs/architecture-managers-workers.md, "The worker
+  // plane"). Every worker serves this service over mutual TLS with its node
+  // certificate (`<node>.node.legion`, `legion://node/<id>`), on
+  // `LEGION_WORKER_HOST:LEGION_WORKER_PORT` (default `0.0.0.0:4848`). There
+  // is no plaintext listener. Client certificates are requested, not
+  // required; one that is presented must chain to the cluster CA or the
+  // handshake fails.
+  //
+  // Each RPC admits named caller classes, checked before anything else:
+  // - `manager`: a client certificate from the cluster CA carrying a
+  //   `legion://manager/<id>` URI SAN. A node's certificate is signed by the
+  //   same CA but is not a manager certificate.
+  // - `ticket`: no client certificate; the request carries a ticket the RPC
+  //   verifies offline.
+  // A request that presents a certificate other than a manager's is refused
+  // with Unauthenticated, never treated as a ticket holder.
+  // `tests/worker_plane_classes.rs` fails the build when an RPC here has no
+  // class.
+
   // Delivers one allocation payload to worker for execution/reconciliation.
+  // Caller class: manager. Errors: Unauthenticated without a manager
+  // certificate.
   rpc PostWork (PostWorkRequest) returns (PostWorkReply);
 
-  // Requests the worker process to restart itself.
+  // Requests the worker process to restart itself. Caller class: manager.
+  // Errors: Unauthenticated without a manager certificate;
+  // FailedPrecondition when `node_id` names a node other than this worker
+  // (a manager holding a stale address never restarts the wrong machine).
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 
   // Reads captured stdout/stderr files for one allocation on this node.
+  // Caller class: manager. Errors: Unauthenticated without a manager
+  // certificate.
   rpc GetTaskLogs (GetTaskLogsRequest) returns (GetTaskLogsReply);
 
-  // Runs an exec session against a local allocation. Called only by the
-  // manager (worker plane); the manager has already authorized the caller and
-  // rendered any action command into a raw argv on the `ExecStart` frame.
+  // Runs an exec session against a local allocation. Caller class: manager.
+  // The manager has already authorized the caller and rendered any action
+  // command into a raw argv on the `ExecStart` frame. Errors:
+  // Unauthenticated without a manager certificate ("ExecTask admits a
+  // manager certificate or an exec ticket; this request carried neither").
   rpc ExecTask (stream ExecClientFrame) returns (stream ExecServerFrame);
 
   // Starts work on this node from a boot ticket, without any call to a
-  // manager on the critical path (docs/edge-boot.md).
+  // manager on the critical path (docs/edge-boot.md). Caller class: ticket.
   //
   // This is the edge entry point: a platform's router hands the node a
   // ticket it minted ahead of time, the node verifies it offline against the
@@ -7509,8 +7623,8 @@ service Worker {
   //
   // Rejected with FailedPrecondition unless the worker was configured with
   // `edgeBoot.acceptClaims: true`. Callers are authorized by the ticket
-  // alone; the worker holds no user credentials and verifies no other
-  // identity.
+  // alone; a client certificate, if presented, is ignored, and the worker
+  // holds no user credentials.
   rpc StartClaim (StartClaimRequest) returns (stream StartClaimReply);
 }
 
@@ -9247,7 +9361,11 @@ message TestNetPolicyReply {
   string verdict = 1;
 
   // The rule that decided (`policy/<name>#<index>`, `task#<index>`, or
-  // `fallthrough`); empty on allow-by-absence.
+  // `fallthrough`); empty on allow-by-absence. `host-guard` for an egress
+  // target the host guard refuses, which is answered before any policy: the
+  // manager resolves the name and judges the built-in classes (loopback,
+  // link-local, cloud metadata). A node's own addresses and its `hostGuard`
+  // overrides are judged on the worker only.
   string source = 2;
 
   // The rule's `reason`, if any.
@@ -9297,11 +9415,17 @@ message NetDenial {
   // `host:port` (egress destination or ingress peer).
   string destination = 5;
 
-  // The rule that denied: `policy/<name>#<index>`, `task#<index>`, or
-  // `fallthrough`.
+  // What denied. A rule: `policy/<name>#<index>`, `task#<index>`, or
+  // `fallthrough`. Or a layer below policy: `host-guard` (the destination,
+  // or every address its name resolved to, is loopback, this node, link-local
+  // / cloud metadata, or in the worker's `hostGuard.deny`; no policy can
+  // allow it), `gate` (the edge-boot gate is shut), or `policy-pending` (a
+  // gated allocation whose policy has not arrived).
   string source = 6;
 
-  // The rule's reason, if any.
+  // The rule's reason, if any. For `host-guard`, the address and its class,
+  // e.g. `169.254.169.254 is link-local (cloud metadata); allocations may not
+  // reach it`, or `<name> resolves to <ip> (<class>); ...` for a hostname.
   string reason = 7;
 
   // `tcp`, `http`, or `dns`.

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::RuntimeFlavor;
 use tokio::sync::Semaphore;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 /// Cap on concurrently in-flight `PostWork` sends across all evals.
 ///
@@ -24,33 +24,6 @@ const MAX_IN_FLIGHT_DISPATCHES: usize = 512;
 fn dispatch_permits() -> Arc<Semaphore> {
     static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     Arc::clone(PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT_DISPATCHES))))
-}
-
-/// Process-wide worker channel cache.
-///
-/// `dispatch_allocations` used to build a fresh lazy channel per CALL, so
-/// every eval re-dialed every worker it placed onto — a sampled manager
-/// under load showed `__connect` among its top kernel calls (~350
-/// connects/sec locally; an eval touching 44 workers at rig rates implies
-/// ~1,300/sec). A tonic `Channel` multiplexes and reconnects on its own,
-/// so one per worker address for the life of the process is the correct
-/// shape. Entries are never evicted: the value is a cheap handle, the key
-/// space is the fleet's address set, and a dead worker's channel simply
-/// fails sends until the address disappears from placements.
-fn cached_worker_client(address: &str) -> R<WorkerClient<Channel>> {
-    static CLIENTS: OnceLock<std::sync::Mutex<HashMap<String, WorkerClient<Channel>>>> =
-        OnceLock::new();
-    let cache = CLIENTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache
-        .lock()
-        .map_err(|_| anyhow::anyhow!("worker client cache poisoned"))?;
-    if let Some(client) = guard.get(address) {
-        return Ok(client.clone());
-    }
-    let endpoint = Endpoint::from_shared(address.to_owned())?;
-    let client = WorkerClient::new(endpoint.connect_lazy());
-    guard.insert(address.to_owned(), client.clone());
-    Ok(client)
 }
 
 #[instrument(err, skip_all)]
@@ -100,13 +73,21 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         let node = node_cache
             .get(&allocation.node_id)
             .context("Missing node in cache")?;
-        let Some(worker_address) = worker_address_for_node(node) else {
-            warn!(
-                node_id = %allocation.node_id,
-                "Skipping allocation dispatch; worker address missing"
-            );
-            continue;
+        // Dispatch is best-effort: a node the manager can't dial (no address
+        // yet, or a pre-mTLS worker) still gets this allocation on its next
+        // heartbeat reply.
+        let target = match crate::manager::worker_plane::WorkerTarget::for_node(node) {
+            Ok(target) => target,
+            Err(status) => {
+                debug!(
+                    node_id = %allocation.node_id,
+                    reason = %status.message(),
+                    "Skipping allocation push; the heartbeat reply carries it"
+                );
+                continue;
+            }
         };
+        let worker_address = target.address.clone();
 
         let instance = match allocation.instance_id.as_deref() {
             Some(instance_id) => store.get_instance(instance_id)?,
@@ -123,10 +104,19 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         };
 
         if !clients.contains_key(&worker_address) {
-            clients.insert(
-                worker_address.clone(),
-                cached_worker_client(&worker_address)?,
-            );
+            match crate::manager::worker_plane::WorkerPlane::global().client_for(store, &target) {
+                Ok(client) => {
+                    clients.insert(worker_address.clone(), client);
+                }
+                Err(status) => {
+                    warn!(
+                        node_id = %allocation.node_id,
+                        error = %status.message(),
+                        "Skipping allocation push; the heartbeat reply carries it"
+                    );
+                    continue;
+                }
+            }
         }
         pending.push((
             worker_address,
@@ -326,9 +316,9 @@ fn speculative_claim_for(
         );
         return Ok(None);
     }
-    let Some(worker_address) = worker_address_for_node(&node) else {
+    if worker_address_for_node(&node).is_none() {
         return Ok(None);
-    };
+    }
 
     let claim_id = crate::structs::edge_boot::new_claim_id();
     let lease_deadline_unix = time::OffsetDateTime::now_utc().unix_timestamp()
@@ -358,8 +348,9 @@ fn speculative_claim_for(
     let payload = build_task_allocation_with(task, &allocation, None, &[], Some(provisional))?;
 
     let sent = run_dispatch_future(async {
-        let endpoint = Endpoint::from_shared(worker_address.clone())?;
-        let mut client = WorkerClient::new(endpoint.connect_lazy());
+        let mut client = crate::manager::worker_plane::WorkerPlane::global()
+            .client(store, &node)
+            .map_err(|status| anyhow!("{}", status.message()))?;
         client
             .post_work(crate::structs::PostWorkRequest {
                 allocation: Some(payload),
@@ -436,8 +427,7 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
         .get_task_config_by_id(allocation.task_config_id)?
         .with_context(|| format!("missing task config {}", allocation.task_config_id))?;
     let node = store.get_node(&allocation.node_id)?;
-    let worker_address =
-        worker_address_for_node(&node).context("worker address missing for ratification")?;
+    worker_address_for_node(&node).context("worker address missing for ratification")?;
     let instance = match allocation.instance_id.as_deref() {
         Some(instance_id) => store.get_instance(instance_id)?,
         None => None,
@@ -460,8 +450,9 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
     payload.provisional = Some(provisional);
 
     run_dispatch_future(async {
-        let endpoint = Endpoint::from_shared(worker_address.clone())?;
-        let mut client = WorkerClient::new(endpoint.connect_lazy());
+        let mut client = crate::manager::worker_plane::WorkerPlane::global()
+            .client(store, &node)
+            .map_err(|status| anyhow!("{}", status.message()))?;
         client
             .post_work(crate::structs::PostWorkRequest {
                 allocation: Some(payload),
@@ -500,11 +491,7 @@ where
 }
 
 fn worker_address_for_node(node: &crate::structs::Node) -> Option<String> {
-    let attrs = node.config_attrs.as_object()?;
-    attrs
-        .get("workerAddress")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
+    crate::manager::worker_plane::worker_address(node)
 }
 
 pub fn build_task_allocation(

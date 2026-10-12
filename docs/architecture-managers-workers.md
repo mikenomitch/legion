@@ -53,12 +53,15 @@ in the manager config.
 
 Create a join token with `legion join-token create` (the `CreateJoinToken`
 RPC). It requires `node:write` when ACLs are enabled. The printed token bundles
-the manager address, a secret, and the worker type. The manager stores only a
-hash of the secret. See docs/auth-and-acls.md.
+the manager address, a secret, the worker type, and the pin of the cluster CA
+(`caHash`). The manager stores only a hash of the secret. See
+docs/auth-and-acls.md.
 
 Worker startup (`run_worker`) flow:
 
-1. Decode the join token locally (address, worker type, secret).
+1. Decode the join token locally (address, worker type, secret, CA pin). A
+   token without a CA pin (format v1) is refused with a hint to mint a new
+   one.
 2. Connect to manager from token `addr`.
 3. Call `WorkerPreRegister` (carrying the join secret when present) to fetch
    worker-type config (`pool`, attributes, resource limits, additional checks).
@@ -67,8 +70,11 @@ Worker startup (`run_worker`) flow:
    - Else reuse existing single worker state dir.
    - Else generate random ID (optionally with configured prefix).
 5. Restore persisted allocations from local worker state file if task PIDs are still alive.
-6. Start worker gRPC server (`Worker` service) on `127.0.0.1:4848` by default.
-7. Fingerprint node + run node/task readiness checks.
+6. Load (or, on first start, generate) the node's private key from
+   `<worker state dir>/identity/node.key` (mode `0600`). The key never leaves
+   the host.
+7. Fingerprint node + run node/task readiness checks, and work out the
+   advertised address (see [Ports and addresses](#ports-and-addresses)).
 8. Register node via `WorkerRegister`. When ACLs are enforced, the reply
    carries a per-node token that the worker attaches to all later
    worker-plane calls. Re-registering rotates the token. If a heartbeat comes
@@ -76,7 +82,22 @@ Worker startup (`run_worker`) flow:
    automatically. Re-registration keeps the node's availability, so a
    drained node stays drained across a worker restart. Only a new node
    starts `available`.
-9. Enter steady-state loops:
+9. Send a CSR to `IssueNodeCertificate` and check that the CA bundle in the
+   reply contains the join token's pin. A mismatch stops the join:
+
+   ```text
+   error: the manager at https://10.0.0.5:4747 presented cluster CA sha256:51aa07...,
+   but this join token pins sha256:9c1e4f...
+   Hint: the address may not be your manager, or the CA was rotated after this token
+   was minted. Mint a new token with `legion join-token create`.
+   ```
+
+   The certificate and bundle persist next to the key, so a worker restarted
+   while every manager is down still serves its plane (edge boot needs that).
+10. Start the worker plane (`Worker` service): mutual TLS with the node
+    certificate on `0.0.0.0:4848` by default (see [The worker
+    plane](#the-worker-plane)).
+11. Enter steady-state loops:
    - Heartbeats every `heartbeatSeconds` (worker-type config, default 2s,
      clamped to 1–300s). Each beat gets ±10% jitter so a fleet that started
      together does not stay in lockstep. With adaptive cadence (on by
@@ -140,8 +161,112 @@ how to measure), see
 
 ### Worker APIs used by manager
 
-- `PostWork`: manager dispatches task allocations to workers.
-- `RestartWorker`: manager can instruct a worker process restart.
+- `PostWork`: manager dispatches task allocations to workers. Best effort: a
+  push that fails (an unreachable worker, a worker on an older protocol) costs
+  one heartbeat interval, because the heartbeat reply carries the full desired
+  set.
+- `GetTaskLogs`: `legion job logs`.
+- `ExecTask`: `legion exec`, actions, the UI terminal, and the MCP exec tools,
+  proxied by the manager.
+- `RestartWorker`: `legion node restart`. The worker refuses a request naming
+  another node, so a stale address can't restart the wrong machine.
+- `StartClaim`: not called by managers. Edge routers call it with a boot
+  ticket ([edge-boot.md](edge-boot.md)).
+
+### The worker plane
+
+The `Worker` service is always served over mutual TLS, on every platform and
+in every mode, including `--run-worker`. There is no plaintext worker
+listener and no setting that turns one on.
+
+- **Server identity.** The worker presents its node certificate,
+  `<node>.node.legion` and `legion://node/<id>`, signed by the cluster CA
+  from a CSR. The worker generated the key; the manager chose the names.
+- **Client identity.** Client certificates are requested but not required,
+  because edge routers and direct-exec clients authenticate with tickets.
+  A certificate that is presented must chain to the cluster CA, or the
+  handshake fails.
+- **Caller classes.** Each RPC admits named classes of caller:
+
+  | RPC | Admits | Check |
+  | --- | --- | --- |
+  | `PostWork`, `GetTaskLogs`, `RestartWorker` | manager | a client certificate from the cluster CA carrying `legion://manager/<id>` |
+  | `ExecTask` | manager | as above |
+  | `StartClaim` | ticket | the boot ticket in the request; a client certificate is ignored |
+
+  A node's certificate is signed by the same CA, but it is not a manager
+  certificate: the role in the URI SAN is what the worker checks. A request
+  that presents a non-manager certificate is refused outright, never treated
+  as a ticket holder. `tests/worker_plane_classes.rs` parses the proto and
+  fails the build when a `Worker` RPC has no class, the same way
+  `tests/acl_endpoints.rs` guards the `Manager` service.
+
+  ```console
+  $ grpcurl -cacert ca.pem 10.0.1.7:4848 legion.Worker/GetTaskLogs
+  ERROR:
+    Code: Unauthenticated
+    Message: GetTaskLogs is a manager-only worker RPC: present a Legion manager certificate
+  ```
+
+- **Manager certificates.** Each manager mints its own client certificate
+  (`legion://manager/<id>`, where the id is the raft `nodeId`, or `local`)
+  from the CA key it already holds through the store, and re-mints it every 8
+  hours. Nothing is distributed.
+- **The manager verifies the worker it dials.** Every manager-to-worker call
+  (dispatch, exec, actions, logs, restart) dials the node's advertised
+  address with the cluster CA as the only root and checks the server
+  certificate against `<node>.node.legion`, so a worker that registered a
+  stolen or stale address can't receive another node's work. Channels are
+  cached per node.
+- **No plaintext, no older protocol.** A manager dials only workers that
+  report protocol version 3 and an `https://` address. A protocol-2 worker
+  keeps heartbeating and runs the work its heartbeat replies carry, but exec,
+  logs, and restart against it fail with an error naming its version.
+- **Certificate lifetime.** Node certificates are valid for 24 hours and are
+  re-issued after 8, on the heartbeat loop, with no listener restart.
+
+### Ports and addresses
+
+| Port | Who listens | Who dials it |
+| --- | --- | --- |
+| `4747` (`server.port`) | manager: gRPC API, raft transport, OIDC discovery | CLI, UI, MCP, workers, peer managers |
+| `4748` (`server.port + 1`) | manager: exec WebSocket | the UI terminal |
+| `4749` (`server.port + 2`) | manager: `/metrics`, health probes | Prometheus, load balancers |
+| `4848` (`LEGION_WORKER_PORT`) | worker plane (mTLS) | managers; edge routers (`StartClaim`) |
+
+Operators must allow 4848 from managers to workers (and from routers, with
+edge boot), and 4747 from workers to managers. The mesh also dials node to
+node on task ports.
+
+The worker binds `LEGION_WORKER_HOST` (default `0.0.0.0`) and advertises one
+address, recorded as the node's `workerAddress` (`https://<host>:<port>`):
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `LEGION_WORKER_HOST` | `0.0.0.0` | Address the worker plane binds |
+| `LEGION_WORKER_PORT` | `4848` | Port it binds and advertises |
+| `LEGION_WORKER_ADVERTISE_ADDR`, `--advertise-addr` on `legion join` and `legion start worker` | auto | Host, or `host:port`, that managers and routers dial |
+
+Auto-detection picks the local address of the worker's route to its manager
+(a connected UDP socket's local address; no packet is sent). On a VPC that is
+the private IP managers on the same network dial. A worker co-located with
+its manager gets `127.0.0.1`. Behind NAT, or with asymmetric routing, the
+guess is wrong; set the override. Several workers on one host share a route,
+so give each its own port and, if they must be told apart by address,
+`--advertise-addr`. The worker logs what it chose:
+
+```text
+INFO Worker plane listening on 0.0.0.0:4848 (mTLS); advertised as https://10.0.1.7:4848
+```
+
+Service discovery endpoints, the mesh, and edge boot all take the host from
+`workerAddress`, so a correct address is what makes them work across hosts.
+
+The worker simulator (`legion start worker --simulate N`) serves its whole
+fleet from one listener with one fleet certificate
+(`<prefix>.fleet.legion`), issued through the first simulated node to
+register. Its nodes carry the `workerFleet` attribute, and managers verify
+the fleet's name for them.
 
 ### Allocation reconciliation model
 
@@ -186,7 +311,13 @@ Two code paths exist:
 ## What Is Not Implemented Yet
 
 - Worker-to-manager TLS: the worker's connection to the manager does not
-  configure TLS, even when the manager has `server.tls` enabled.
+  configure TLS, even when the manager has `server.tls` enabled. Heartbeat
+  replies, which carry rendered KV secrets, travel in plaintext, and the CA
+  pin check happens on the certificate reply rather than at the TLS
+  handshake.
+- Workers behind NAT that managers can't dial: exec, logs, restart, and the
+  mesh need a reachable `workerAddress`. Work still reaches such a worker
+  through heartbeat replies.
 - TLS certificate rotation: the manager reads `certPath` and `keyPath` once
   at startup. To rotate the certificate, restart the manager.
 

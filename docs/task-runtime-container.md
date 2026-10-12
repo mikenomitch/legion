@@ -324,9 +324,14 @@ namespace for the allocation before it starts. The container joins it by path
 through an OCI `network` namespace entry. The namespace holds only loopback and
 the datapath's listeners: upstream ports, VIPs, the resolver, and an egress
 proxy at `127.0.0.1:1080` exported as `HTTP_PROXY` / `HTTPS_PROXY` /
-`ALL_PROXY`. A tool that ignores the proxy has no route out, so it can't
-bypass egress policy. The full model, the fail-closed rules, and the limits
-(no raw UDP, no ICMP, no inbound to undeclared ports, Linux only) are in
+`ALL_PROXY`. A tool that ignores the proxy has no route out, so its only way
+off the namespace is a connection the datapath judges. Every destination the
+proxy dials is checked against the [host guard](network-handlers.md#the-host-guard)
+first: the node itself (loopback and its own addresses), link-local (the
+cloud metadata service), and other allocations' listeners are refused
+whatever the job's policy says, and a hostname is judged by the address it
+resolves to. The full model, the fail-closed rules, and the limits (no raw
+UDP, no ICMP, no inbound to undeclared ports, Linux only) are in
 [Network Handlers](network-handlers.md#gated-mode).
 
 ## Capability Summary

@@ -101,6 +101,7 @@ keep that hot path lean. The check runs once per registration.
 
 | Version | Added | Behavior with an older worker |
 | --- | --- | --- |
+| 3 | The authenticated worker plane: the worker serves `Worker` over mutual TLS with a node certificate it requested by CSR, binds all interfaces, and advertises a reachable `https://` address ([Managers and Workers](architecture-managers-workers.md#the-worker-plane)). Join tokens are format v2 and pin the cluster CA | Managers never dial a worker in plaintext. A protocol-2 worker keeps registering, heartbeating, and running the work its heartbeat replies carry, but exec, actions, logs, and restart against it fail with an error naming its protocol version until it is upgraded. Push dispatch to it is skipped (the heartbeat delivers the work one interval later). Join tokens minted by an older manager (format v1) are refused; mint new ones |
 | 2 | Workers report task-process exits (`terminated_allocations` on the heartbeat), so a batch task's `Success` comes from its exit code. See [Task Supervision](task-supervision.md) | The manager reads the node's advertised `protocolVersion` and keeps the pre-2 behavior for batch tasks placed there: the task is marked `Success` at placement, as before. Nothing stalls mid-rollout. New placements get exit-code-based status once the worker is upgraded. |
 | 1 | The versioned handshake itself | Workers reporting `0` are pre-versioning builds and are accepted with a warning |
 

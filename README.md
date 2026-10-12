@@ -108,6 +108,14 @@ legion join-token create --ttl 24h
 legion join lgnjoin_...
 ```
 
+The token pins your cluster's CA, so the new worker refuses anything that
+answers at the manager's address but isn't your manager. Managers reach
+workers over mutual TLS on port 4848, so allow 4848 from the managers to the
+workers (and 4747 from the workers to the managers). The worker advertises
+its address on the route to the manager; set `--advertise-addr` if that
+isn't the address managers should dial (see
+[Managers and Workers](docs/architecture-managers-workers.md#ports-and-addresses)).
+
 ### Example job specs
 
 A few from [`configs/jobs/`](configs/jobs/), roughly simplest first:
@@ -310,21 +318,18 @@ each feature.
 Don't run Legion where untrusted workloads share a host with other work, or
 on a network you don't trust. Known gaps:
 
-- **The worker API authenticates no one.** It listens only on loopback, but
-  any process on the same host, including an `exec` task or a host-network
-  container, can run commands in other allocations on that node. The
-  [worker-plane auth plan](internal_docs/plans/worker-plane-auth-plan.md)
-  fixes this.
 - **Linux containers and `exec` tasks share the host's network by default**,
   so they can reach the worker and manager ports, the cloud metadata service,
-  and anything else on the host. With ACLs off (the default), the manager's
-  port is full control of the cluster. `gated` mode doesn't help yet, because
-  its egress proxy still dials loopback and link-local addresses for the
-  task. Don't run untrusted code in them yet. The
-  [same plan](internal_docs/plans/worker-plane-auth-plan.md) covers it.
-- **The worker-to-manager channel is plaintext.**
-- **Workers on other hosts can't serve exec, logs, or the service mesh yet**,
-  because they advertise a loopback address. Covered by the same plan.
+  and anything else on the host. `network.mode = "gated"` closes this for
+  containers and non-root `exec` tasks: the namespace has no route except
+  Legion's listeners, and every destination they dial is judged by the
+  [host guard](docs/network-handlers.md#the-host-guard), which refuses the
+  node, link-local, and cloud metadata. Set `gated` explicitly for untrusted
+  code. The
+  [worker-plane auth plan](internal_docs/plans/worker-plane-auth-plan.md)
+  makes it the default.
+- **The worker-to-manager channel is plaintext.** The worker plane (manager
+  to worker) is mutual TLS; the other direction is covered by the same plan.
 
 ### What's next
 

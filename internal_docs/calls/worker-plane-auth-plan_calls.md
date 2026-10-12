@@ -515,3 +515,196 @@ stale file. The warning and the error hint both point at the fix.
 silently replacing someone's credential is worse than one confusing error
 with a hint. The manager can't tell a stale token from a live one for another
 cluster. **Safety won over one step of convenience.**
+
+## 20. CA rotation cross-signs the new CA and switches signing at once
+
+Made while implementing Phase 1, and a deviation from plan §6.9. The plan
+kept signing with the old CA "until every node has fetched the bundle", then
+switched. The implementation generates the new CA, cross-signs it with the
+old one, and signs with the new CA immediately. Leaves carry the cross
+certificate in their chain during a 24-hour overlap, and the trust bundle
+holds both CAs for that overlap.
+
+```console
+$ legion net ca rotate
+Rotated the cluster CA. The new CA (pin sha256:...) signs every certificate from now on.
+The previous CA stays trusted until 2026-11-03T18:05:11Z, so no worker-plane or mesh connection breaks;
+```
+
+**Alternative.** The plan's three steps: publish a bundle, track which nodes
+have fetched it, switch signing once every live node has, then drop the old
+CA 24 hours later.
+
+**Trade-off.** Chains grow by one certificate during the overlap. A worker
+that is offline for the whole overlap can't verify the new CA when it comes
+back and must re-join. The plan's version would have stranded it too, once
+the old CA dropped.
+
+**Why.** "Every node has fetched" needs per-node acknowledgement state on the
+control lane and a decision about nodes that never come back. Cross-signing is
+how public CAs roll their roots: a holder that trusts either CA verifies
+either chain, so nothing has to be tracked. The heartbeat reply now names the
+signing CA's pin (`HeartbeatReply.cluster_ca_pin`), so nodes re-issue within
+one beat rather than within 8 hours. **Simplicity won, with no connection
+broken during the overlap.**
+
+## 21. The simulator's fleet certificate is requested through its first node
+
+Made while implementing Phase 1, answering open question 4. The simulator
+serves every simulated node from one listener, so it holds one certificate
+(`<prefix>.fleet.legion`, `legion://fleet/<prefix>`). It asks for it with
+`IssueNodeCertificate { fleet = "<prefix>" }` using the first registered
+node's token. The manager signs a fleet certificate only for a node whose
+registration carried `workerFleet = "<prefix>"`, and verifies the fleet name
+when it dials any node with that attribute.
+
+**Alternative.** One certificate with a SAN per node (5,000 names for a
+5,000-node fleet), or a plaintext stub listener for the simulator.
+
+**Trade-off.** A real worker could register with `workerFleet` set and get a
+fleet certificate. That gains it nothing: it can change only its own node
+record, so it can only receive its own work. The simulator's listener starts
+a moment after its first node registers, and a push before then waits one
+heartbeat.
+
+**Why.** The benchmark rig has to measure dispatch over the same mTLS the real
+fleet pays for. A plaintext stub would hide the handshake cost the plan asks
+to measure, and a 5,000-SAN certificate is absurd to sign and to parse on
+every handshake. **Fidelity of the benchmark won.**
+
+## 22. The host guard judges `proxy` handler targets too, so a node-local proxy needs an `allow` entry
+
+Made while implementing Phase 2. The plan names the egress proxy and external
+upstreams. The datapath also dials `proxy` handler targets, and a policy
+object's handler can name any `host:port`, so those dials go through the same
+resolve-judge-dial step. A handler pointing at a node-local sidecar
+(`target = "127.0.0.1:15001"`) is refused until the operator opens it:
+
+```nickel
+hostGuard = { allow = ["127.0.0.1:15001"] },
+```
+
+Handler health (`legion net doctor`, the heartbeat report) shows the refusal
+as `host-guard: 127.0.0.1 is loopback; allocations may not reach it`.
+
+**Alternative.** Trust handler targets, since policy objects are written by
+`net:write` holders, not by the allocation.
+
+**Trade-off.** A cluster that runs a node-local proxy hop breaks until each
+worker type lists it, and the `allow` entry is per worker type, not per
+policy.
+
+**Why.** An inline policy is part of the job, so "written by the operator" is
+not guaranteed, and a hop the allocation's traffic is handed to is still a
+connection made on its behalf. One rule for every dial is simpler to reason
+about than a list of trusted paths. **Simplicity of the boundary won** over a
+one-line config change for the clusters that need it.
+
+## 23. `authz` calls and the node's own traffic are not judged
+
+Made while implementing Phase 2. `authz` handler calls, artifact fetches, and
+the worker's calls to the manager go out without the host guard. An `authz`
+call carries request facts (method, path, headers the policy forwards), never
+task bytes, and its answer is a verdict the task never sees.
+
+**Alternative.** Judge `authz` URLs as well, refusing loopback and
+link-local webhooks.
+
+**Trade-off.** A policy author can make the worker POST request facts to a
+link-local or loopback address. They can't read the answer, and IMDSv2's
+token call is a `PUT`.
+
+**Why.** The common `authz` deployment is a node-local or loopback service, so
+judging it would break the main use for little gain. The limit is in
+`docs/network-handlers.md` ("The host guard", Limits). **Ease of the common
+setup won.**
+
+## 24. The listener waits for its certificate; registration and heartbeats do not
+
+Made while implementing Phase 1. Issuance is eager (right after
+registration), but a failed first issuance is not fatal unless the CA fails
+the join token's pin. The worker keeps heartbeating and running work, retries
+on every heartbeat, and the worker plane listener starts the moment a
+certificate (issued or persisted) is held.
+
+**Alternative.** Refuse to finish joining until the certificate is issued.
+
+**Trade-off.** For a few heartbeats after a manager hiccup, a worker can be
+registered without serving exec or logs. Dispatch survives: heartbeats carry
+the work.
+
+**Why.** A worker that crash-loops because a manager blinked during
+registration is worse than one that serves its plane a few seconds late. The
+pin mismatch stays fatal because it is the one failure where continuing would
+mean trusting an impostor. **Availability won where it costs no trust.**
+
+## 25. Several workers on one host need `--advertise-addr` to be told apart
+
+Found while implementing Phase 1. The plan's integration test runs two
+workers in one process on `127.0.0.2` and `127.0.0.3`, relying on
+auto-detection. On Linux the source address of the route to any `127/8`
+manager is `127.0.0.1`, so both would advertise `127.0.0.1`. The end-to-end
+test (`tests/worker_plane_e2e.rs`) runs one real worker through the binary
+instead, and the docs say co-located workers need their own port and, to be
+distinguished by address, `--advertise-addr`.
+
+**Alternative.** Bind and advertise the bind address when it is a specific
+IP (`LEGION_WORKER_HOST=127.0.0.2` advertises `127.0.0.2`).
+
+**Trade-off.** One more rule in a two-input default.
+
+**Why.** Binding a specific address and advertising another is a real
+topology (a NAT'd interface), so tying them together would be wrong for
+someone. The override already exists for exactly this. **Simplicity of the
+default won.**
+
+## 26. `--advertise-host` on the simulator became `--advertise-addr`, defaulting to the route
+
+Made while implementing Phase 1. The simulator's flag is now the same flag
+`legion join` and `legion start worker` take, with the same default (the
+route's source address toward the manager) instead of `127.0.0.1`. The AWS rig
+passes `--advertise-addr`.
+
+**Alternative.** Keep the simulator's flag as it was.
+
+**Trade-off.** Scripts that passed `--advertise-host` break (no alias, per
+AGENTS.md).
+
+**Why.** Two flags for the same concept is the kind of drift the plan exists
+to remove, and `127.0.0.1` as a default only worked when the simulator shared
+a host with its manager. **One concept won.**
+
+## 27. `legion net policy test` judges only the built-in classes
+
+Made while implementing Phase 2. `TestNetPolicy` runs on the manager. It
+resolves the name there and judges the classes that are the same on every
+node (loopback, unspecified, link-local, cloud metadata). A node's own
+addresses and its `hostGuard` entries are judged only on the worker.
+
+**Alternative.** Ask a node to judge (a worker-plane RPC), or carry each worker
+type's overrides into the manager's check.
+
+**Trade-off.** `net policy test` can say `allow` for a target a node refuses
+because it is that node's address or in its `hostGuard.deny`. The node's
+`net.denied` event is the authority, and the docs say so.
+
+**Why.** A dry-run that needs a live node per question is a heavier tool than
+the one agents call in a loop. The built-in classes cover the cases people
+ask about (metadata, `localhost`). **Simplicity of the dry-run won.**
+
+## 28. A name that does not resolve is a failed dial, not a denial
+
+Made while implementing Phase 2. When an external target's name does not
+resolve, the guard has no address to judge. The connection fails like any
+dial failure (`502` in HTTP mode, a closed connection at L4) with no
+`net.denied` event. A `proxy` handler may still take the flow, since the
+handler resolves the name itself.
+
+**Alternative.** Record a `host-guard` denial for unresolved names.
+
+**Trade-off.** A typo in an external upstream shows up as a dial error, not a
+policy verdict.
+
+**Why.** Reporting a denial for something that was never judged would make
+the guard look like it refused a name it never saw an address for. **Accurate
+verdicts won.**

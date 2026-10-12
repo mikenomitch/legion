@@ -26,7 +26,7 @@ How to use it:
       datapath listeners. Found while preparing the pre-launch AWS spot
       check, which is paused until Phase 1 lands. Its host-guard rows need
       Phases 2 and 3. Plan:
-      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (PLANNED)
+      [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) (IN EXECUTION)
       · calls: [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md).
       Phases in ship order, most dangerous gap first:
   - [x] Phase 0: ACLs on by default. The first management token is minted at
@@ -35,16 +35,21 @@ How to use it:
         are removed (plan §6.10). Anonymous denials are now `Unauthenticated`
         with a hint naming the token file (calls entry 17). Docs:
         [auth-and-acls.md](../docs/auth-and-acls.md#quick-start).
-  - [ ] Phase 1: the mTLS worker plane with per-RPC caller classes,
-        including the sandbox-exec plan's `ticket` class on `ExecTask`, CSR
-        issuance, the CA pin in join tokens, reachable bind and advertise,
-        and two-step CA rotation (plan §6.1 to §6.6, §6.9).
-  - [ ] Phase 2: the host guard in the datapath. The gated egress proxy
-        dials loopback, link-local, and node-local addresses from the host
-        namespace today, and CIDR rules never see hostnames
-        (`src/worker/netd/proxy.rs:512`, `:621`, `:879`), so the documented
-        metadata deny rule is bypassed by a name. Resolve, judge, then dial
-        (plan §6.11).
+  - [x] Phase 1: the mTLS worker plane with per-RPC caller classes, CSR
+        issuance, the CA pin in join tokens (v2), reachable bind and
+        advertise (`--advertise-addr`, route-detected), two-step CA rotation
+        by cross-signing, and the simulator's fleet certificate (plan §6.1
+        to §6.6, §6.9; calls 20 to 26). Docs:
+        [architecture-managers-workers.md](../docs/architecture-managers-workers.md#the-worker-plane),
+        [auth-and-acls.md](../docs/auth-and-acls.md#the-worker-plane).
+        The `ticket` class on `ExecTask` ships with sandbox-exec Phase 2
+        below; until then `ExecTask` is manager-only.
+  - [x] Phase 2: the host guard in the datapath. Resolve once, judge every
+        address, dial what was judged, on the gated egress proxy's three
+        paths, external upstreams, and `proxy` handler targets, with the
+        worker-type `hostGuard` overrides and `host-guard` in denials,
+        `net policy test`, and `net doctor` (plan §6.11; calls 22, 23, 27,
+        28). Docs: [network-handlers.md](../docs/network-handlers.md#the-host-guard).
   - [ ] Phase 3: Linux containers gated by default with `gated-default`
         deny, ingress twins and a resolver for every gated allocation, and a
         validate warning (plan §6.12).
@@ -61,9 +66,15 @@ How to use it:
         on `job:write` (plan §6.15, §6.16).
   - [ ] Phase 8: reachability diagnostics: `Worker/Probe`,
         `WORKER_UNREACHABLE` (plan §6.7).
-  - [ ] Fix the public docs now, ahead of Phase 2: `docs/network-handlers.md:556`
-        says gated "cannot be bypassed" for `container` and `exec`, but the
-        proxy reaches the host, and a root `exec` task can `setns` back out.
+  - [x] Fix the public docs' "cannot be bypassed" claims for gated
+        `container` and `exec`: they now describe the host guard, and that a
+        root `exec` task can `setns` back out.
+  - [ ] `authz` webhooks, artifact fetches, and the worker's own calls are
+        not judged by the host guard (calls entry 23). Revisit if `authz`
+        ever returns data to the task.
+  - [ ] `legion net policy test` judges only the host guard's built-in
+        classes, not a node's own addresses or its `hostGuard` entries
+        (calls entry 27).
 
 - [ ] **Pre-launch spot check findings (2026-10-11), from reading the code
       while preparing the AWS run.** None of these block the worker-plane

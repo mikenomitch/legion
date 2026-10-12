@@ -10,7 +10,7 @@ use std::path::PathBuf;
 // version (workers reporting 0 are pre-versioning builds and are accepted
 // with a warning); they reject newer workers so operators upgrade managers
 // before workers. See docs/upgrades.md for the full skew policy.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // === Worker → task-runtime environment ===
 // Task runtimes are in-process dylibs with no config channel of their own, so

@@ -108,7 +108,7 @@ use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
 
 // Phase 6: ForkInstance, `from_snapshot` creates, and snapshot names.
@@ -1441,6 +1441,10 @@ pub struct ManagerDaemonService {
     /// row lands. A failover shows nothing until the next heartbeat, which is
     /// at most one interval of incompleteness and never a wrong answer.
     provisional_claims: Arc<Mutex<HashMap<String, Vec<crate::structs::ProvisionalClaimReport>>>>,
+    /// The signing CA's pin, for `HeartbeatReply.cluster_ca_pin`, re-read at
+    /// most every few seconds: it changes only on a CA rotation, and the
+    /// heartbeat path must not pay a store read per beat for it.
+    ca_pin_cache: Arc<Mutex<Option<(String, std::time::Instant)>>>,
     /// Heartbeat cadence settings (`heartbeat`, docs/heartbeat-cadence-and-scale.md).
     /// Read by the cadence report; the served interval itself comes from the
     /// status checker's ladder through the liveness table.
@@ -1512,6 +1516,7 @@ impl ManagerDaemonService {
             exec_enabled: true,
             edge_boot: crate::structs::EdgeBootConfigFull::default(),
             provisional_claims: Arc::new(Mutex::new(HashMap::new())),
+            ca_pin_cache: Arc::new(Mutex::new(None)),
             heartbeat: crate::structs::HeartbeatConfigFull::default(),
             net_policy_cache: Arc::new(Mutex::new(HashMap::new())),
             net_policy_generation: Arc::new(Mutex::new(None)),
@@ -1521,6 +1526,27 @@ impl ManagerDaemonService {
             usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
             eval_threads: 1,
         }
+    }
+
+    /// The signing cluster CA's pin, cached for a few seconds (see
+    /// `ca_pin_cache`). Empty when no CA exists yet.
+    fn cluster_ca_pin(&self) -> String {
+        const TTL: Duration = Duration::from_secs(5);
+        let mut cache = self.ca_pin_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((pin, read_at)) = cache.as_ref() {
+            if read_at.elapsed() < TTL {
+                return pin.clone();
+            }
+        }
+        let pin = self
+            .store
+            .mesh_ca()
+            .ok()
+            .flatten()
+            .and_then(|ca| ca.pin().ok())
+            .unwrap_or_default();
+        *cache = Some((pin.clone(), std::time::Instant::now()));
+        pin
     }
 
     /// Overrides how often long-lived streams re-check their credential.
@@ -6125,10 +6151,33 @@ impl Manager for ManagerDaemonService {
             .mesh_ca()
             .map_err(|e| map_store_error("Error reading the mesh CA", e))?;
         Ok(Response::new(match ca {
-            Some(ca) => GetMeshCaReply {
-                cert_pem: ca.cert_pem,
-                created_at: ca.created_at,
-            },
+            Some(ca) => {
+                let phase = ca.phase(time::OffsetDateTime::now_utc());
+                let (phase_name, overlap_until) = match phase {
+                    crate::storage::netpolicy_store::CaRotationPhase::Stable => {
+                        ("stable", String::new())
+                    }
+                    crate::storage::netpolicy_store::CaRotationPhase::Overlap { until } => (
+                        "overlap",
+                        until
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default(),
+                    ),
+                };
+                GetMeshCaReply {
+                    bundle_pem: ca.bundle_pem(),
+                    pin: ca.pin().unwrap_or_default(),
+                    phase: phase_name.to_string(),
+                    previous_cert_pem: if overlap_until.is_empty() {
+                        String::new()
+                    } else {
+                        ca.previous_cert_pem.clone().unwrap_or_default()
+                    },
+                    overlap_until,
+                    cert_pem: ca.cert_pem,
+                    created_at: ca.created_at,
+                }
+            }
             None => GetMeshCaReply::default(),
         }))
     }
@@ -6151,11 +6200,21 @@ impl Manager for ManagerDaemonService {
             .store
             .rotate_mesh_ca()
             .map_err(|e| map_store_error("Error rotating the mesh CA", e))?;
+        let overlap_until = match ca.phase(time::OffsetDateTime::now_utc()) {
+            crate::storage::netpolicy_store::CaRotationPhase::Overlap { until } => until
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            crate::storage::netpolicy_store::CaRotationPhase::Stable => String::new(),
+        };
         info!(
             accessor = identity.accessor_id.as_deref().unwrap_or("-"),
-            "Rotated the mesh CA; nodes re-issue on their next heartbeat"
+            overlap_until = %overlap_until,
+            "Rotated the cluster CA; the new CA signs now, the previous one stays trusted \
+             until the overlap ends, and nodes re-issue on their next heartbeat"
         );
         Ok(Response::new(RotateMeshCaReply {
+            pin: ca.pin().unwrap_or_default(),
+            overlap_until,
             cert_pem: ca.cert_pem,
             created_at: ca.created_at,
         }))
@@ -6190,24 +6249,46 @@ impl Manager for ManagerDaemonService {
                 )));
             }
         }
-        self.store
+        let node = self
+            .store
             .get_node(&req.node_id)
             .map_err(|_| Status::not_found(format!("node {:?} is not registered", req.node_id)))?;
+        if req.csr_pem.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "csr_pem is required: workers generate their own key and send a certificate \
+                 signing request; the manager never generates or returns a node's private key",
+            ));
+        }
+        // The certificate's names come from the authenticated caller, never
+        // from the CSR. A fleet certificate (the simulator) needs the node to
+        // have registered as part of that fleet.
+        let subject = if req.fleet.is_empty() {
+            crate::manager::mesh_ca::CsrSubject::Node(req.node_id.clone())
+        } else {
+            let registered = crate::manager::worker_plane::worker_fleet(&node);
+            if registered.as_deref() != Some(req.fleet.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "node {:?} did not register as part of fleet {:?} (its workerFleet is {:?})",
+                    req.node_id,
+                    req.fleet,
+                    registered.unwrap_or_default()
+                )));
+            }
+            crate::manager::mesh_ca::CsrSubject::Fleet(req.fleet.clone())
+        };
         let ca = self
             .store
             .ensure_mesh_ca()
-            .map_err(|e| map_store_error("Error creating the mesh CA", e))?;
-        let (cert_pem, key_pem, expires_at) =
-            crate::manager::mesh_ca::issue_node_cert(&ca.cert_pem, &ca.key_pem, &req.node_id)
+            .map_err(|e| map_store_error("Error creating the cluster CA", e))?;
+        let (cert_pem, expires_at) =
+            crate::manager::mesh_ca::sign_csr(&ca.cert_pem, &ca.key_pem, &req.csr_pem, &subject)
                 .map_err(|e| {
-                    error!(error = ?e, "Error signing a node certificate");
-                    Status::internal("failed to sign the node certificate")
+                    Status::invalid_argument(format!("invalid certificate signing request: {e:#}"))
                 })?;
-        info!(node_id = %req.node_id, expires_at, "Issued mesh node certificate");
+        info!(node_id = %req.node_id, fleet = %req.fleet, expires_at, "Issued node certificate");
         Ok(Response::new(IssueNodeCertificateReply {
-            cert_pem,
-            key_pem,
-            ca_pem: ca.cert_pem,
+            cert_pem: format!("{cert_pem}{}", ca.chain_suffix()),
+            ca_pem: ca.bundle_pem(),
             expires_at,
         }))
     }
@@ -6487,6 +6568,7 @@ impl Manager for ManagerDaemonService {
             next_interval_seconds,
             checkpoint_requests,
             content_resync,
+            cluster_ca_pin: self.cluster_ca_pin(),
         };
 
         Ok(Response::new(reply))
@@ -6647,6 +6729,7 @@ impl Manager for ManagerDaemonService {
             heartbeat_seconds: worker_config.heartbeat_seconds,
             resource_enforcement: worker_config.resource_enforcement,
             edge_boot: worker_config.edge_boot,
+            security: worker_config.security,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -6909,12 +6992,8 @@ impl Manager for ManagerDaemonService {
             &AclScope::pool(&node.pool),
         )?;
 
-        let worker_address = worker_address_for_node(&node)
-            .ok_or_else(|| Status::failed_precondition("Worker address missing"))?;
-
-        let mut client = WorkerClient::connect(worker_address)
-            .await
-            .map_err(|e| Status::unavailable(format!("Failed to connect to worker: {e}")))?;
+        let mut client =
+            crate::manager::worker_plane::WorkerPlane::global().client(&self.store, &node)?;
         let response = client
             .restart_worker(tonic::Request::new(RestartWorkerRequest {
                 node_id: node_id.clone(),
@@ -7975,6 +8054,40 @@ impl Manager for ManagerDaemonService {
         let (host, ip, port, mut path) = parsed;
         if !req.path.trim().is_empty() {
             path = Some(req.path.trim().to_string());
+        }
+        // The host guard sits below every policy, so it answers first, by
+        // the address the name resolves to (resolved here, on the manager).
+        // Its built-in classes are the same on every node; a node's own
+        // addresses and its `hostGuard` overrides are judged on the worker.
+        if direction == "egress" {
+            let guard_host = host
+                .clone()
+                .or_else(|| ip.map(|ip| ip.to_string()))
+                .unwrap_or_default();
+            if !guard_host.is_empty() {
+                let guard = crate::structs::host_guard::HostGuard::default();
+                let refused = crate::worker::netd::guard::resolve_and_guard(
+                    &crate::worker::netd::guard::SystemResolver,
+                    Some(&guard),
+                    &guard_host,
+                    port,
+                )
+                .await;
+                if let Err(crate::worker::netd::guard::GuardRefusal::Denied(reason)) = refused {
+                    let hint = crate::structs::host_guard::GuardDenial::hint();
+                    return Ok(Response::new(TestNetPolicyReply {
+                        verdict: "deny".into(),
+                        source: crate::structs::host_guard::HOST_GUARD_SOURCE.into(),
+                        explanation: format!(
+                            "{}: {reason}. Hint: {hint}",
+                            crate::structs::host_guard::HOST_GUARD_SOURCE
+                        ),
+                        reason,
+                        direction: direction.into(),
+                        protocol: chain.map(|c| c.protocol.clone()).unwrap_or_default(),
+                    }));
+                }
+            }
         }
         let Some(chain) = chain else {
             return Ok(Response::new(TestNetPolicyReply {
@@ -9651,14 +9764,6 @@ enum RegistrationGrant {
     Node(String),
 }
 
-fn worker_address_for_node(node: &Node) -> Option<String> {
-    let attrs = node.config_attrs.as_object()?;
-    attrs
-        .get("workerAddress")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
-}
-
 /// Marker error: the StreamEvents client went away, stop the stream task.
 struct StreamSendStopped;
 
@@ -9718,19 +9823,16 @@ async fn fetch_allocation_logs(
     let node = store
         .get_node(&allocation.node_id)
         .map_err(|e| format!("failed to load node {}: {e}", allocation.node_id))?;
-    let worker_address = worker_address_for_node(&node)
-        .ok_or_else(|| format!("worker address missing for node {}", allocation.node_id))?;
-
-    if !clients.contains_key(&worker_address) {
-        let endpoint = Endpoint::from_shared(worker_address.clone())
-            .map_err(|e| format!("invalid worker address {worker_address}: {e}"))?;
-        clients.insert(
-            worker_address.clone(),
-            WorkerClient::new(endpoint.connect_lazy()),
-        );
+    let target = crate::manager::worker_plane::WorkerTarget::for_node(&node)
+        .map_err(|status| status.message().to_string())?;
+    if !clients.contains_key(&target.address) {
+        let client = crate::manager::worker_plane::WorkerPlane::global()
+            .client_for(store, &target)
+            .map_err(|status| status.message().to_string())?;
+        clients.insert(target.address.clone(), client);
     }
     let client = clients
-        .get_mut(&worker_address)
+        .get_mut(&target.address)
         .expect("worker client just inserted");
 
     let reply = client
@@ -12238,10 +12340,28 @@ mod tests {
 
     #[tokio::test]
     async fn manager_forwards_worker_restart() -> R<()> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let addr = listener.local_addr()?;
-        drop(listener);
-        let worker_address = format!("http://{}", addr);
+        let store = setup_store()?;
+        // The worker plane is mTLS: serve the test worker with node-1's
+        // certificate from this cluster's CA, and require manager
+        // certificates from the same CA.
+        let ca = store.ensure_mesh_ca()?;
+        let (key_pem, csr) = crate::manager::mesh_ca::generate_csr("node-1")?;
+        let (cert_pem, _) = crate::manager::mesh_ca::sign_csr(
+            &ca.cert_pem,
+            &ca.key_pem,
+            &csr,
+            &crate::manager::mesh_ca::CsrSubject::Node("node-1".into()),
+        )?;
+        let identity = crate::cluster_tls::SwappableIdentity::new();
+        identity.set(crate::cluster_tls::certified_key(&cert_pem, &key_pem)?);
+        let roots = crate::cluster_tls::SwappableRoots::from_pem(&ca.bundle_pem())?;
+        let tls = crate::cluster_tls::server_config(
+            identity,
+            Some(crate::cluster_tls::ClusterClientVerifier::new(roots)),
+            false,
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let worker_address = format!("https://{}", listener.local_addr()?);
 
         let called = Arc::new(Mutex::new(None));
         let worker = TestWorker {
@@ -12252,15 +12372,16 @@ mod tests {
         tokio::spawn(async move {
             Server::builder()
                 .add_service(crate::structs::worker_server::WorkerServer::new(worker))
-                .serve_with_shutdown(addr, async {
-                    let _ = shutdown_rx.await;
-                })
+                .serve_with_incoming_shutdown(
+                    crate::cluster_tls::tls_incoming(listener, tls),
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                )
                 .await
                 .ok();
         });
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let store = setup_store()?;
         let node = Node {
             id: "node-1".into(),
             status: "ready".into(),
@@ -12270,11 +12391,11 @@ mod tests {
             heartbeat_source: String::new(),
             config_attrs: json!({ "workerAddress": worker_address }),
             fingerprint_attrs: json!({}),
-            dynamic_attrs: json!({}),
+            dynamic_attrs: json!({ "protocolVersion": crate::constants::PROTOCOL_VERSION }),
             health_checks: json!({}),
         };
         store.insert_node(NodeMsg::from(node))?;
-        let manager = ManagerDaemonService::new(store);
+        let manager = ManagerDaemonService::new(store.clone());
 
         let response = manager
             .restart_worker(Request::new(RestartWorkerRequest {
@@ -12283,8 +12404,38 @@ mod tests {
             .await?;
 
         assert_eq!(response.into_inner().message, "ok");
-        let guard = called.lock().expect("mutex");
-        assert_eq!(guard.as_deref(), Some("node-1"));
+        assert_eq!(
+            called.lock().expect("mutex").as_deref(),
+            Some("node-1"),
+            "the worker saw the restart"
+        );
+
+        // A pre-mTLS worker (protocol 2, plaintext address) is never dialed.
+        let old = Node {
+            id: "node-old".into(),
+            status: "ready".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
+            config_attrs: json!({ "workerAddress": "http://127.0.0.1:1" }),
+            fingerprint_attrs: json!({}),
+            dynamic_attrs: json!({ "protocolVersion": 2 }),
+            health_checks: json!({}),
+        };
+        store.insert_node(NodeMsg::from(old))?;
+        let status = manager
+            .restart_worker(Request::new(RestartWorkerRequest {
+                node_id: "node-old".into(),
+            }))
+            .await
+            .expect_err("a protocol-2 worker is refused");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().contains("protocol 2"),
+            "{}",
+            status.message()
+        );
 
         let _ = shutdown_tx.send(());
         Ok(())

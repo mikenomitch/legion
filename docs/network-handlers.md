@@ -471,10 +471,18 @@ Then:
 - Workloads never hold certificates. The node attributes identity, which
   keeps a per-user sandbox's identity out of the sandbox.
 
-`legion net ca show` prints the CA certificate (never the key).
-`legion net ca rotate` replaces it. Every node re-issues its certificate on
-its next heartbeat, and until then, peers on different CAs refuse each other.
-They never fall back to plaintext.
+The mesh CA is the cluster CA, the same one behind the worker plane
+([Auth & ACLs](auth-and-acls.md#the-worker-plane)). A node's mesh
+certificate is its node certificate: the worker generates the key and the
+manager signs a CSR.
+
+`legion net ca show` prints the CA trust bundle (never a key), its pin, and
+where a rotation stands. `legion net ca rotate` rotates it in two steps that
+break no mesh connection: the new CA, cross-signed by the old one, signs at
+once, and the old one stays in every trust bundle for one certificate
+lifetime (24 hours). Every node re-issues on its next heartbeat. Peers never
+fall back to plaintext ([Rotating the cluster
+CA](auth-and-acls.md#rotating-the-cluster-ca)).
 
 ### Certificates from KV
 
@@ -553,7 +561,7 @@ certificate revocation. The 24-hour lifetime takes its place.
 | `mode` | Meaning | Default for |
 | --- | --- | --- |
 | `host` | host networking. Policy is cooperative (proxy env vars, upstreams, the resolver) | `container`, `exec`, `sandbox` |
-| `gated` | the workload's network namespace holds loopback and the datapath only, so a `container` or non-root `exec` task can't open a socket around it. It is not yet a full boundary: the egress proxy dials from the host and does not refuse loopback, link-local, or the node's own addresses, and CIDR rules only match IP literals, so a hostname reaches a denied range. A root `exec` task can also leave the namespace. For a `sandbox`, it is a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | — |
+| `gated` | the workload's network namespace holds loopback and the datapath only, so a `container` or non-root `exec` task can't open a socket around it. Every destination the egress proxy dials is judged by the [host guard](#the-host-guard) and then by policy, by the address a name resolves to. A root `exec` task can leave the namespace. For a `sandbox`, it is a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | — |
 | `auto` | `host` for every runtime | — |
 | `bridge`, `cni/<name>` | reserved for the datapath plugin, rejected at submit | — |
 
@@ -620,8 +628,8 @@ as `/legion/legion`. It relays `127.0.0.1:1080` to host vsock port 1080 and
 `127.0.0.1:53/udp` to host port 53 (using DNS-over-TCP framing). So the same
 `HTTP_PROXY` / `ALL_PROXY` / `LEGION_EGRESS_PROXY` variables and the same
 `resolv.conf` a gated container gets work unchanged. The node checks every
-connection, and the guest cannot bypass it because there is no other way
-out.
+connection (the [host guard](#the-host-guard) first, then policy), and the
+guest has no other way out.
 
 What is and is not enforced:
 
@@ -657,6 +665,133 @@ Requirements and limits:
 - IPv4 loopback only inside the namespace.
 - No raw UDP and no ICMP.
 - No inbound traffic except through the datapath's ingress listeners (below).
+
+## The host guard
+
+The host guard is a fixed set of destinations no allocation may reach
+through the datapath: its own node, the cloud's link-local services, and
+other allocations' listeners. It sits **below** policy. A job's rules and
+stored policy objects can't widen it; only the node's operator can, in the
+worker config.
+
+| Class | Addresses | Why |
+| --- | --- | --- |
+| loopback | `127.0.0.0/8`, `::1` | the node's own services: Legion's ports, other allocations' upstreams and VIPs |
+| unspecified | `0.0.0.0/8`, `::` | the same services by another name |
+| this node | every address on the node's interfaces, re-read every heartbeat | the same services by the node's IP |
+| link-local | `169.254.0.0/16`, `fe80::/10` | AWS, GCP, Azure, OCI, and DigitalOcean metadata, ECS task metadata (`169.254.170.2`), the VPC resolver |
+| cloud metadata | `fd00:ec2::254`, `100.100.100.200` | AWS IPv6 metadata, Alibaba Cloud metadata |
+| `hostGuard.deny` | operator CIDRs | anything else the operator wants treated like metadata |
+
+IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1`) are judged as the IPv4
+address they map.
+
+**Where it applies.** Every connection the datapath dials to a destination
+the allocation named:
+
+- the gated egress proxy, on all three paths (HTTP `CONNECT`, absolute-URI
+  HTTP, SOCKS5);
+- external upstreams (`to = "tcp://…"`, `tls://`, `http://`, `https://`), in
+  L4 and HTTP mode;
+- `proxy` handler targets, on egress and ingress. A handler that points at
+  a node-local proxy (`target = "127.0.0.1:15001"`) needs a
+  `hostGuard.allow` entry for that port; until then its health reports
+  `host-guard: 127.0.0.1 is loopback; allocations may not reach it`.
+
+Service upstreams are not judged: their endpoints come from the service
+catalog, which Legion fills, not from the allocation. Neither are `authz`
+handler calls, which the worker makes itself with request facts, never task
+bytes, and whose answer is a verdict the task never sees.
+
+**Resolve once, judge, dial what was judged.** A hostname is resolved once,
+every address it resolves to is judged, and the dial goes only to an address
+that passed. Nothing resolves the name again between the verdict and the
+connect, so `localhost`, `2130706433`, `0177.0.0.1`, a public name that
+resolves to `169.254.169.254`, and a name that rebinds between two lookups
+are all refused. A name that resolves to a mix of addresses dials only the
+ones that passed. CIDR rules in policy are matched against the same resolved
+addresses, so a hostname can't reach a range a CIDR rule denies.
+
+**Order of checks** on every gated listener: the edge-boot `boot` gate, then
+the host guard, then `policy-pending`, then the egress chain. A host-guard
+denial is final; no policy can turn it into an allow.
+
+**What a task sees** is the ordinary denial shape with source `host-guard`:
+
+```console
+$ curl -sS -x $HTTP_PROXY http://169.254.169.254/latest/meta-data/   # inside a gated task
+curl: (56) CONNECT tunnel failed, response 403
+
+HTTP/1.1 403 Forbidden
+Legion-Denied-By: host-guard
+Legion-Denied-Reason: 169.254.169.254 is link-local (cloud metadata); allocations may not reach it
+```
+
+An L4 upstream closes the connection instead. Either way the denial is
+reported on the next heartbeat as a `net.denied` event with
+`source = "host-guard"`, and `legion net policy test` explains it before the
+chain:
+
+```console
+$ legion net policy test web --to http://instance-data.ec2.internal/
+✗ deny host-guard: instance-data.ec2.internal resolves to 169.254.169.254 (link-local); allocations may not reach it. Hint: the host guard is set on the worker (hostGuard.allow), not in job policy
+```
+
+`net policy test` runs on the manager, so it judges the built-in classes
+(and resolves names from the manager). A node's own addresses and its
+`hostGuard` entries are judged on the worker; a `net.denied` event from the
+node is the authority. `legion net doctor` lists the guard as an
+informational step for every allocation whose egress proxy is up.
+
+**Operator overrides**, in the worker-type config, for the rare host service
+an allocation should reach on purpose:
+
+```nickel
+hostGuard = {
+  # Opened on purpose: the node exporter, for a metrics-scraping job.
+  allow = ["10.0.1.7:9100"],
+  # Extra destinations to treat like metadata.
+  deny = ["192.0.2.10/32"],
+},
+```
+
+`allow` takes `ip:port` or `cidr:port` (`[fd00::7]:9100` for IPv6) and
+nothing broader, so an override opens one service and not the node. The
+built-in classes can't be removed, only punched through one port at a time.
+An invalid entry fails manager startup with the entry named. A bare address
+in `allow` is refused for the same reason.
+
+**Limits.**
+
+- The guard is in the datapath. A `host`-mode task dials the network
+  directly, so nothing stops it reaching the node or the metadata service;
+  use `gated`, and the defense in depth under "Cloud metadata" below.
+- A root `exec` task in `gated` mode can `setns` back into the host
+  namespace.
+- The guard judges destinations, not the node's own outbound traffic:
+  artifact fetches, `authz` webhooks, and the worker's own calls to the
+  manager are not judged.
+
+### Cloud metadata
+
+The cloud instance metadata service (`169.254.169.254`, `fd00:ec2::254`,
+`100.100.100.200`) serves the instance's role credentials to anyone who can
+reach it. The host guard refuses it for every connection the datapath
+dials, so a gated task cannot reach it through Legion. A `host`-mode task
+can, because its traffic does not pass through Legion.
+
+As defense in depth on AWS, require IMDSv2 and set the hop limit to 1, so a
+token request from inside a container's network namespace never gets an
+answer even if something routes it:
+
+```console
+$ aws ec2 modify-instance-metadata-options --instance-id i-0123456789abcdef0 \
+    --http-tokens required --http-put-response-hop-limit 1
+```
+
+GCP and Azure require a `Metadata-Flavor: Google` or `Metadata: true`
+header, which a browser-style SSRF can't set but a task can. Grant each
+node's instance role only what the worker itself needs.
 
 ## The datapath across worker restarts
 
@@ -902,11 +1037,11 @@ This section lists what that covers and what it does not.
   upstream and to names resolved through the allocation's resolver. A
   process that dials a raw address bypasses it. `mode = "gated"` (Linux,
   `container` and `exec`) closes that gap, because the namespace has no
-  route except Legion's listeners. But the egress proxy dials from the host
-  and does not refuse loopback, link-local (including the cloud metadata
-  service), or the node's own addresses, CIDR rules match only IP literals
-  (a hostname reaches a denied range), and a root `exec` task can leave the
-  namespace. Don't rely on `gated` to contain untrusted code yet. On macOS, egress stays cooperative, and
+  route except Legion's listeners, and every destination those listeners
+  dial is judged by the [host guard](#the-host-guard) before policy. A root
+  `exec` task can still leave the namespace, and a host-mode task can still
+  dial the node and the metadata service directly, so `host` mode is
+  cooperative. On macOS, egress stays cooperative, and
   there are no VIPs, per-allocation resolvers, or gated namespaces. A gated
   `sandbox` is captured over vsock. That path is implemented and
   unit-tested but not exercised on a real VMM in CI. `auto` resolves to

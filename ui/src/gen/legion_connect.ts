@@ -1252,14 +1252,27 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Issue a short-lived **mesh certificate** for a worker node — the
-     * credential behind `certFrom = "legion"` (docs/network-handlers.md,
-     * "mTLS"). The first call creates the cluster's mesh CA (replicated with
-     * the control lane); every call signs a fresh key pair for the node with
-     * `<node>.node.legion` and `legion://node/<node id>` as its SANs, valid for
-     * 24 hours. Workers call it on their heartbeat loop once any allocation on
-     * the node terminates or originates mesh TLS, and again after a third of
-     * the lifetime has passed.
+     * Sign a worker node's **node certificate** from a CSR. The certificate is
+     * the node's identity on every plane Legion runs between its own
+     * processes: the mTLS worker plane listener (what a manager verifies when
+     * it dials the node, docs/auth-and-acls.md, "The worker plane") and the
+     * mesh (`certFrom = "legion"`, docs/network-handlers.md, "mTLS").
+     *
+     * The worker generates its key pair locally and sends only a CSR; the
+     * private key never crosses the network. The manager signs the CSR's
+     * public key with the cluster CA and SANs it chooses itself,
+     * `<node>.node.legion` and `legion://node/<node id>`, ignoring every name,
+     * extension, and subject the CSR requests. Valid for 24 hours. Workers call
+     * it right after registration (the listener needs it), again after a third
+     * of the lifetime, and at once when a heartbeat reply names a CA their
+     * bundle lacks (a rotation). The first call creates the cluster CA
+     * (replicated with the control lane).
+     *
+     * `fleet` is for the simulator only (`legion start worker --simulate`),
+     * which serves every simulated node from one listener: the certificate
+     * then names the fleet (`<fleet>.fleet.legion`, `legion://fleet/<name>`)
+     * instead of the node, and the caller's node must have registered with the
+     * `workerFleet` config attribute set to the same name.
      *
      * The node's *workload* identities are never certificates: a dialing node
      * names the workload it forwards for in a PROXY protocol v2 TLV inside the
@@ -1271,6 +1284,8 @@ export const Manager = {
      * (`node:<node_id>`) must match the request's `node_id`.
      *
      * Errors:
+     * - InvalidArgument: `csr_pem` is missing or is not a valid CSR, or
+     *   `fleet` does not match the node's registered `workerFleet`.
      * - NotFound: no node with `node_id` is registered.
      * - PermissionDenied: `node_id` does not match the caller's credential.
      * - Internal: the CA could not be created or signing failed.
@@ -2103,10 +2118,13 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * The mesh CA certificate — what an operator hands a non-Legion client
-     * that must reach a mesh-TLS port, or verifies a node certificate against.
-     * Never the key. Empty `cert_pem` when no node has asked for a certificate
-     * yet (the CA is created on first use). ACL: `net:read`.
+     * The cluster CA — what an operator hands a non-Legion client that must
+     * reach a mesh-TLS port or the worker plane (`legion sandbox start --node`,
+     * `legion exec --direct`), or verifies a node certificate against. Returns
+     * the signing CA, the full trust bundle (both CAs during a rotation), the
+     * pin new join tokens carry, and where a rotation stands. Never a key.
+     * Empty `cert_pem` when no CA exists yet (it is created on first use: the
+     * first join token or node certificate). ACL: `net:read`.
      *
      * @generated from rpc legion.Manager.GetMeshCa
      */
@@ -2117,10 +2135,15 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Replace the mesh CA. Every node re-issues its certificate on its next
-     * heartbeat (within one interval); until a node has, its peers on the new
-     * CA refuse it and it refuses them — expect a heartbeat's worth of
-     * refused mesh connections, never plaintext. ACL: `net:write` (unscoped).
+     * Rotate the cluster CA in two steps, without breaking any connection
+     * (worker-plane-auth plan §6.9). The new CA is generated, cross-signed by
+     * the current one, and signs every certificate from now on; the previous
+     * CA stays in every holder's trust bundle for one certificate lifetime (24
+     * hours), and chains carry the cross-signed certificate meanwhile, so a
+     * holder that has not refreshed its bundle yet keeps verifying. Nodes
+     * re-issue their certificates within one heartbeat (the reply names the
+     * new CA). Join tokens minted before the rotation keep working during the
+     * overlap; after it, mint new ones. ACL: `net:write` (unscoped).
      *
      * @generated from rpc legion.Manager.RotateMeshCa
      */
@@ -2549,6 +2572,25 @@ export const Manager = {
 /**
  * Worker is the per-node runtime API called by the manager.
  *
+ * The worker plane (docs/architecture-managers-workers.md, "The worker
+ * plane"). Every worker serves this service over mutual TLS with its node
+ * certificate (`<node>.node.legion`, `legion://node/<id>`), on
+ * `LEGION_WORKER_HOST:LEGION_WORKER_PORT` (default `0.0.0.0:4848`). There
+ * is no plaintext listener. Client certificates are requested, not
+ * required; one that is presented must chain to the cluster CA or the
+ * handshake fails.
+ *
+ * Each RPC admits named caller classes, checked before anything else:
+ * - `manager`: a client certificate from the cluster CA carrying a
+ *   `legion://manager/<id>` URI SAN. A node's certificate is signed by the
+ *   same CA but is not a manager certificate.
+ * - `ticket`: no client certificate; the request carries a ticket the RPC
+ *   verifies offline.
+ * A request that presents a certificate other than a manager's is refused
+ * with Unauthenticated, never treated as a ticket holder.
+ * `tests/worker_plane_classes.rs` fails the build when an RPC here has no
+ * class.
+ *
  * @generated from service legion.Worker
  */
 export const Worker = {
@@ -2556,6 +2598,8 @@ export const Worker = {
   methods: {
     /**
      * Delivers one allocation payload to worker for execution/reconciliation.
+     * Caller class: manager. Errors: Unauthenticated without a manager
+     * certificate.
      *
      * @generated from rpc legion.Worker.PostWork
      */
@@ -2566,7 +2610,10 @@ export const Worker = {
       kind: MethodKind.Unary,
     },
     /**
-     * Requests the worker process to restart itself.
+     * Requests the worker process to restart itself. Caller class: manager.
+     * Errors: Unauthenticated without a manager certificate;
+     * FailedPrecondition when `node_id` names a node other than this worker
+     * (a manager holding a stale address never restarts the wrong machine).
      *
      * @generated from rpc legion.Worker.RestartWorker
      */
@@ -2578,6 +2625,8 @@ export const Worker = {
     },
     /**
      * Reads captured stdout/stderr files for one allocation on this node.
+     * Caller class: manager. Errors: Unauthenticated without a manager
+     * certificate.
      *
      * @generated from rpc legion.Worker.GetTaskLogs
      */
@@ -2588,9 +2637,11 @@ export const Worker = {
       kind: MethodKind.Unary,
     },
     /**
-     * Runs an exec session against a local allocation. Called only by the
-     * manager (worker plane); the manager has already authorized the caller and
-     * rendered any action command into a raw argv on the `ExecStart` frame.
+     * Runs an exec session against a local allocation. Caller class: manager.
+     * The manager has already authorized the caller and rendered any action
+     * command into a raw argv on the `ExecStart` frame. Errors:
+     * Unauthenticated without a manager certificate ("ExecTask admits a
+     * manager certificate or an exec ticket; this request carried neither").
      *
      * @generated from rpc legion.Worker.ExecTask
      */
@@ -2602,7 +2653,7 @@ export const Worker = {
     },
     /**
      * Starts work on this node from a boot ticket, without any call to a
-     * manager on the critical path (docs/edge-boot.md).
+     * manager on the critical path (docs/edge-boot.md). Caller class: ticket.
      *
      * This is the edge entry point: a platform's router hands the node a
      * ticket it minted ahead of time, the node verifies it offline against the
@@ -2616,8 +2667,8 @@ export const Worker = {
      *
      * Rejected with FailedPrecondition unless the worker was configured with
      * `edgeBoot.acceptClaims: true`. Callers are authorized by the ticket
-     * alone; the worker holds no user credentials and verifies no other
-     * identity.
+     * alone; a client certificate, if presented, is ignored, and the worker
+     * holds no user credentials.
      *
      * @generated from rpc legion.Worker.StartClaim
      */

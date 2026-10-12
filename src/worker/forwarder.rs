@@ -184,6 +184,22 @@ pub struct ForwarderContext {
     edges: Arc<crate::worker::netd::graph::EdgeLedger>,
     /// Ingress connections and bytes per allocation, for the idle policy.
     activity: Arc<crate::worker::netd::activity::ActivityLedger>,
+    /// The host guard (worker-plane-auth plan §6.11). Every worker builds its
+    /// context with [`ForwarderContext::new`], which installs the default
+    /// guard; `None` only for a context built without policy (`Default`, the
+    /// unit tests that predate it).
+    host_guard: Option<Arc<crate::structs::host_guard::HostGuard>>,
+    /// Name resolution for destinations the host guard judges; the system
+    /// resolver when unset.
+    resolver: Option<Arc<dyn crate::worker::netd::guard::Resolver>>,
+}
+
+/// The default guard: no operator overrides, the node's current interface
+/// addresses.
+fn default_host_guard() -> crate::structs::host_guard::HostGuard {
+    let guard = crate::structs::host_guard::HostGuard::default();
+    guard.set_node_addrs(crate::structs::host_guard::interface_addresses());
+    guard
 }
 
 /// One external handler hop as the datapath has seen it.
@@ -229,6 +245,48 @@ impl ForwarderContext {
             kv_certs: Mutex::new(HashMap::new()),
             edges: Arc::new(crate::worker::netd::graph::EdgeLedger::new()),
             activity: Arc::new(crate::worker::netd::activity::ActivityLedger::new()),
+            host_guard: Some(Arc::new(default_host_guard())),
+            resolver: None,
+        }
+    }
+
+    /// Replaces the host guard (the worker installs the one its config
+    /// describes; tests open their loopback origins with `allow` entries).
+    pub fn with_host_guard(mut self, guard: Arc<crate::structs::host_guard::HostGuard>) -> Self {
+        self.host_guard = Some(guard);
+        self
+    }
+
+    /// Replaces the resolver (tests answer names without DNS).
+    pub fn with_resolver(
+        mut self,
+        resolver: Arc<dyn crate::worker::netd::guard::Resolver>,
+    ) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// The host guard every destination an allocation names is judged by.
+    pub fn host_guard(&self) -> Option<&crate::structs::host_guard::HostGuard> {
+        self.host_guard.as_deref()
+    }
+
+    /// The resolver the guard's resolve-then-judge step uses.
+    pub fn resolver(&self) -> &dyn crate::worker::netd::guard::Resolver {
+        static SYSTEM: crate::worker::netd::guard::SystemResolver =
+            crate::worker::netd::guard::SystemResolver;
+        match &self.resolver {
+            Some(resolver) => resolver.as_ref(),
+            None => &SYSTEM,
+        }
+    }
+
+    /// Re-reads the node's interface addresses into the guard, so an
+    /// address added after start is guarded too. Cheap; the heartbeat loop
+    /// calls it every tick.
+    pub fn refresh_node_addresses(&self) {
+        if let Some(guard) = &self.host_guard {
+            guard.set_node_addrs(crate::structs::host_guard::interface_addresses());
         }
     }
 
@@ -1330,14 +1388,75 @@ async fn forward_external(
     shared: Arc<UpstreamShared>,
     target: UpstreamTarget,
 ) {
-    let facts = ConnectFacts {
-        host: Some(target.host.as_str()),
-        ip: target.host.parse().ok(),
-        port: target.port,
-        identity: None,
-    };
     let destination = target.addr();
-    if deny_if_policy_says_so(&shared, &facts, &destination).await {
+    // The boot gate before anything else, as everywhere in the datapath.
+    if shared.gated && crate::worker::netd::netns::gate_is_shut(shared.allocation_id) {
+        let facts = ConnectFacts {
+            host: Some(target.host.as_str()),
+            ip: target.host.parse().ok(),
+            port: target.port,
+            identity: None,
+        };
+        deny_if_policy_says_so(&shared, &facts, &destination).await;
+        let _ = client.shutdown().await;
+        return;
+    }
+    // Resolve once, judge every address against the host guard, and dial
+    // only what passed (worker-plane-auth plan §6.11): `to = "tcp://localhost:4747"`
+    // and a name that resolves to the metadata service are refused here.
+    let addrs = match crate::worker::netd::guard::resolve_and_guard(
+        shared.context.resolver(),
+        shared.context.host_guard(),
+        &target.host,
+        target.port,
+    )
+    .await
+    {
+        Ok(addrs) => addrs,
+        Err(crate::worker::netd::guard::GuardRefusal::Denied(reason)) => {
+            deny_connection(
+                &shared,
+                &destination,
+                crate::structs::host_guard::HOST_GUARD_SOURCE,
+                Some(&reason),
+            );
+            let _ = client.shutdown().await;
+            return;
+        }
+        Err(crate::worker::netd::guard::GuardRefusal::Unresolved(reason)) => {
+            debug!(
+                allocation_id = shared.allocation_id,
+                upstream = %shared.service,
+                %reason,
+                "External upstream did not resolve"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            return;
+        }
+    };
+    // Policy per resolved address: a name rule matches the name, a CIDR
+    // rule the address. Only addresses every check passed are dialed.
+    let mut allowed = Vec::with_capacity(addrs.len());
+    for addr in &addrs {
+        let facts = ConnectFacts {
+            host: Some(target.host.as_str()),
+            ip: Some(addr.ip()),
+            port: target.port,
+            identity: None,
+        };
+        if !policy_denies(&shared, &facts) {
+            allowed.push(*addr);
+        }
+    }
+    if allowed.is_empty() {
+        let facts = ConnectFacts {
+            host: Some(target.host.as_str()),
+            ip: addrs.first().map(|addr| addr.ip()),
+            port: target.port,
+            identity: None,
+        };
+        deny_if_policy_says_so(&shared, &facts, &destination).await;
         let _ = client.shutdown().await;
         return;
     }
@@ -1347,7 +1466,7 @@ async fn forward_external(
         protocol: PROTOCOL_TCP,
         destination: &destination,
         host: Some(target.host.as_str()),
-        ip: target.host.parse().ok(),
+        ip: allowed.first().map(|addr| addr.ip()),
         port: target.port,
         ..Default::default()
     };
@@ -1365,7 +1484,7 @@ async fn forward_external(
         }
     }
     let _inflight_guard = InflightGuard::acquire(&shared, &destination);
-    let upstream = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&destination)).await
+    let upstream = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&allowed[..])).await
     {
         Ok(Ok(upstream)) => {
             shared.context.edges().record_connection(
@@ -1453,6 +1572,25 @@ async fn forward_external(
 /// Evaluate the allocation's egress policy for one destination. Returns true
 /// when the connection must be closed, having recorded the denial and the
 /// metric. No policy (or an allow / defer verdict) returns false.
+/// Whether the allocation's egress verdict (the gate, pending policy, then
+/// the chain) would refuse `facts`, without recording anything.
+fn policy_denies(shared: &Arc<UpstreamShared>, facts: &ConnectFacts<'_>) -> bool {
+    if shared.gated {
+        if crate::worker::netd::netns::gate_is_shut(shared.allocation_id) {
+            return true;
+        }
+        let policy = shared.context.policy_for(shared.allocation_id);
+        if policy.is_none() && !shared.context.policy_known(shared.allocation_id) {
+            return true;
+        }
+    }
+    let policy = shared.context.policy_for(shared.allocation_id);
+    matches!(
+        egress_connect_verdict(policy.as_deref(), facts),
+        Verdict::Deny { .. }
+    )
+}
+
 async fn deny_if_policy_says_so(
     shared: &Arc<UpstreamShared>,
     facts: &ConnectFacts<'_>,
@@ -1569,33 +1707,31 @@ async fn hand_off(
     target: ProxyTarget,
     destination: Option<SocketAddr>,
 ) {
-    let mut proxy = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&target.addr)).await
-    {
-        Ok(Ok(stream)) => stream,
-        other => {
-            let err = match other {
-                Ok(Err(err)) => err.to_string(),
-                _ => "dial timed out".to_string(),
-            };
-            debug!(
-                allocation_id = shared.allocation_id,
-                upstream = %shared.service,
-                proxy = %target.addr,
-                error = %err,
-                "Proxy handler dial failed"
-            );
-            shared.context.note_handler(
-                shared.allocation_id,
-                &target.source,
-                crate::structs::netpolicy::HANDLER_PROXY,
-                &target.addr,
-                Err(format!("dial {}: {err}", target.addr)),
-            );
-            net_metrics::connection("egress", PROTOCOL_TCP, "error");
-            let _ = client.shutdown().await;
-            return;
-        }
-    };
+    let mut proxy =
+        match crate::worker::netd::guard::dial_guarded(&shared.context, &target.addr, DIAL_TIMEOUT)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                debug!(
+                    allocation_id = shared.allocation_id,
+                    upstream = %shared.service,
+                    proxy = %target.addr,
+                    error = %err,
+                    "Proxy handler dial failed"
+                );
+                shared.context.note_handler(
+                    shared.allocation_id,
+                    &target.source,
+                    crate::structs::netpolicy::HANDLER_PROXY,
+                    &target.addr,
+                    Err(format!("dial {}: {err}", target.addr)),
+                );
+                net_metrics::connection("egress", PROTOCOL_TCP, "error");
+                let _ = client.shutdown().await;
+                return;
+            }
+        };
     if target.proxy_protocol {
         let header =
             handlers::proxy_header(&shared.context, facts, client.peer_addr().ok(), destination);
@@ -1845,6 +1981,68 @@ mod tests {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
         panic!("timed out waiting for {what}");
+    }
+
+    /// An external upstream on a context with the default host guard and a
+    /// resolver that answers `metadata.test` with the metadata address.
+    fn guarded_external(
+        port: u16,
+        to: &str,
+    ) -> (
+        UpstreamForwarder,
+        Arc<crate::worker::netd::policy::Denials>,
+        UpstreamSpec,
+    ) {
+        let cache = Arc::new(crate::worker::netd::NetPolicyCache::new());
+        let denials = Arc::new(crate::worker::netd::policy::Denials::new());
+        let resolver = crate::worker::netd::guard::test_support::FakeResolver::new();
+        resolver.answer(
+            "metadata.test",
+            vec![vec!["169.254.169.254".parse().unwrap()]],
+        );
+        let context = ForwarderContext::new(cache, denials.clone()).with_resolver(resolver);
+        let forwarder = UpstreamForwarder::with_context(Arc::new(context));
+        let mut upstream = spec(port, "round_robin");
+        upstream.service = "ext".into();
+        upstream.to = Some(to.to_string());
+        (forwarder, denials, upstream)
+    }
+
+    #[tokio::test]
+    async fn external_upstreams_to_the_host_or_metadata_are_refused_by_the_host_guard_test() {
+        // A live origin on loopback: without the guard the dial would succeed.
+        let origin = spawn_echo("x").await;
+        let origin_port: u16 = origin.rsplit(':').next().unwrap().parse().unwrap();
+        for (to, refused) in [
+            (format!("tcp://localhost:{origin_port}"), "localhost"),
+            (format!("tcp://127.0.0.1:{origin_port}"), "127.0.0.1"),
+            ("tcp://metadata.test:80".to_string(), "169.254.169.254"),
+        ] {
+            let port = free_port().await;
+            let (forwarder, denials, upstream) = guarded_external(port, &to);
+            forwarder.sync(&[upstream]).await;
+            let mut client = connect(port).await;
+            let mut buf = [0u8; 1];
+            let read = tokio::time::timeout(TEST_TIMEOUT, client.read(&mut buf))
+                .await
+                .expect("the forwarder closed the refused connection");
+            assert!(
+                matches!(read, Ok(0) | Err(_)),
+                "{to}: nothing may be served, read {read:?}"
+            );
+            let mut recorded = Vec::new();
+            wait_until("the host-guard denial", || {
+                recorded.extend(denials.drain());
+                !recorded.is_empty()
+            })
+            .await;
+            assert_eq!(recorded[0].source, "host-guard", "{to}: {recorded:?}");
+            assert!(
+                recorded[0].reason.contains(refused),
+                "{to}: reason names {refused}: {}",
+                recorded[0].reason
+            );
+        }
     }
 
     #[tokio::test]

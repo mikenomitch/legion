@@ -134,4 +134,16 @@
     #     # Tolerance for clock disagreement with the minting manager.
     #     clockSkew = "30s",
     # },
+    # The host guard (docs/network-handlers.md, "The host guard"): the fixed
+    # floor of destinations no allocation on this node may reach through the
+    # datapath — loopback, the node's own addresses, link-local (cloud
+    # metadata), and the metadata endpoints outside link-local. Job policy
+    # can't widen it; only these entries can. Both lists default to empty.
+    # hostGuard = {
+    #     # Holes, one service each: `ip:port` or `cidr:port`. Never a bare
+    #     # address or range.
+    #     allow = ["10.0.1.7:9100"],
+    #     # Extra destinations to refuse like metadata: IPs or CIDRs.
+    #     deny = ["10.0.0.2/32"],
+    # },
 }

@@ -2,7 +2,8 @@
 
 > **Judgement calls:** [worker-plane-auth-plan_calls.md](../calls/worker-plane-auth-plan_calls.md)
 
-**Status: IN EXECUTION.** Phase 0 (ACLs on by default) shipped. The plan
+**Status: IN EXECUTION.** Phases 0 (ACLs on by default), 1 (the mTLS worker
+plane) and 2 (the host guard in the datapath) shipped. The plan
 has two halves that share one threat: something reaching a node's control
 plane that shouldn't.
 

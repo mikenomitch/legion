@@ -91,7 +91,7 @@ ExecStart=/opt/legion/bin/legion start worker $TOKEN \\
     --simulate $slice \\
     --profiles /opt/legion/configs/profiles.json \\
     --name-prefix sim-$idx \\
-    --advertise-host $private \\
+    --advertise-addr $private \\
     --register-rate 250
 Restart=on-failure
 LimitNOFILE=1048576

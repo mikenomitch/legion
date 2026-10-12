@@ -12,6 +12,7 @@ pub mod config;
 pub mod edge_boot;
 pub mod eval;
 pub mod fork;
+pub mod host_guard;
 pub mod instance;
 pub mod job;
 pub mod ledger;

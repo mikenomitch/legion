@@ -922,8 +922,9 @@ pub fn catalog() -> Vec<Capability> {
             name: "net.ca.show",
             cli: "legion net ca show",
             grpc: Some("Manager/GetMeshCa"),
-            summary: "Print the mesh CA certificate (never the key): what an outside client \
-                 trusts to reach a mesh-TLS port, or verifies a node certificate against.",
+            summary: "Print the cluster CA trust bundle (never a key), its pin, and the \
+                 rotation phase: what an outside client trusts to reach a mesh-TLS port or a \
+                 worker plane, or verifies a node certificate against.",
             mutates: false,
             read_only_safe: true,
         },
@@ -931,8 +932,9 @@ pub fn catalog() -> Vec<Capability> {
             name: "net.ca.rotate",
             cli: "legion net ca rotate",
             grpc: Some("Manager/RotateMeshCa"),
-            summary: "Replace the mesh CA. Every node re-issues its certificate on its next \
-                 heartbeat; expect one heartbeat interval of refused mesh connections.",
+            summary: "Rotate the cluster CA in two steps: the new CA, cross-signed by the old \
+                 one, signs at once and the old one stays trusted for 24h, so no connection \
+                 breaks. Nodes re-issue within one heartbeat.",
             mutates: true,
             read_only_safe: false,
         },

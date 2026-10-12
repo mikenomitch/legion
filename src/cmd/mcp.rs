@@ -651,13 +651,13 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_net_ca_show",
-            description: "The mesh CA certificate (PEM, never the key) behind certFrom = \"legion\": what a non-Legion client trusts to reach a mesh-TLS port. Empty until the first node asks for a certificate.",
+            description: "The cluster CA (PEM, never a key): the trust bundle (both CAs during a rotation), the pin join tokens carry, and the rotation phase. What a non-Legion client trusts to reach a mesh-TLS port or a worker plane. Empty until the first join token or node certificate.",
             input_schema: empty_schema,
             mutates: false,
         },
         ToolDef {
             name: "legion_net_ca_rotate",
-            description: "Replace the mesh CA. Every node re-issues its certificate on its next heartbeat; until then peers on different CAs refuse each other (never plaintext). Mutating.",
+            description: "Rotate the cluster CA in two steps: the new CA (cross-signed by the old one) signs at once, the old one stays trusted for 24 hours, and nodes re-issue within one heartbeat. No connection breaks. Mutating.",
             input_schema: empty_schema,
             mutates: true,
         },

@@ -10,12 +10,11 @@
 //! The caller may act on `booted` and must be prepared for `refused` at any
 //! point until `ratified`.
 
-use crate::cmd::helpers::json_flag;
+use crate::cmd::helpers::{json_flag, worker_plane_client};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::edge_boot::{Gate, RefusalReason};
-use crate::structs::{worker_client::WorkerClient, StartClaimRequest};
-use tonic::transport::Endpoint;
+use crate::structs::StartClaimRequest;
 
 pub fn config() -> Command {
     let start_cmd = Command::new("start")
@@ -38,8 +37,24 @@ pub fn config() -> Command {
                 .long("node")
                 .value_name("ADDR")
                 .required(true)
-                .help("Worker address to start on, e.g. http://10.0.1.7:4848"),
+                .help(
+                    "Worker address to start on, e.g. https://10.0.1.7:4848. The worker plane \
+                     is always TLS; its certificate is verified against the cluster CA",
+                ),
         )
+        .arg(
+            Arg::new("node-name")
+                .long("node-name")
+                .value_name("NODE")
+                .help(
+                    "Node id the worker at --node must prove it is (its certificate names \
+                     <NODE>.node.legion). Without it, any node of this cluster is accepted",
+                ),
+        )
+        .arg(Arg::new("ca").long("ca").value_name("FILE").help(
+            "Cluster CA bundle (PEM) to verify the worker against. Default: fetched \
+                     from the manager with your token (`legion net ca show`)",
+        ))
         .arg(
             Arg::new("ticket")
                 .long("ticket")
@@ -104,9 +119,14 @@ async fn start(arg_matches: &ArgMatches) -> R<()> {
         None => Gate::Off,
     };
 
-    let endpoint = Endpoint::from_shared(node.clone())
-        .with_context(|| format!("invalid worker address {node}"))?;
-    let mut client = WorkerClient::new(endpoint.connect_lazy());
+    let mut client = worker_plane_client(
+        &node,
+        arg_matches
+            .get_one::<String>("node-name")
+            .map(String::as_str),
+        arg_matches.get_one::<String>("ca").map(String::as_str),
+    )
+    .await?;
 
     let response = output::resolve(
         format,

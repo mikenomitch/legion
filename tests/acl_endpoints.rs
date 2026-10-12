@@ -1088,6 +1088,10 @@ async fn call_endpoint(
             .issue_node_certificate(req(
                 IssueNodeCertificateRequest {
                     node_id: NODE_ID.into(),
+                    csr_pem: legion::manager::mesh_ca::generate_csr(NODE_ID)
+                        .expect("csr")
+                        .1,
+                    fleet: String::new(),
                 },
                 token,
             ))

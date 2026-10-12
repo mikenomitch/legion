@@ -20,7 +20,7 @@ legion start worker $TOKEN --simulate 1000 \
   --name-prefix sim-a \
   --ready-after 500ms \
   --register-rate 100 \
-  --advertise-host 10.0.1.17
+  --advertise-addr 10.0.1.17
 ```
 
 `$TOKEN` is an ordinary join token (`legion join-token create`). All
@@ -33,7 +33,7 @@ flags except `--simulate` are optional:
 | `--name-prefix <P>` | `sim` | Node ids are `<prefix>-<profile>-<idx>`. |
 | `--ready-after <DUR>` | `0s` | Delay before a dispatched allocation is reported running (models task-start latency). |
 | `--register-rate <N/s>` | `100` | Registration ramp, so a large fleet doesn't stampede a fresh manager. |
-| `--advertise-host <HOST>` | `127.0.0.1` | Host the manager dials for task dispatch to this fleet. Set it to the machine's reachable address when the manager runs elsewhere. |
+| `--advertise-addr <HOST>` | the route's source address toward the manager | Host the manager dials for task dispatch to this fleet (the port is the fleet listener's own). Set it when the manager should use another address. |
 
 ### Profiles
 
@@ -98,10 +98,19 @@ constraint (for example `constraints = { simulated = { operator = "is_not_set" }
   the manager's push dispatch (`PostWork`) gets exercised. Dispatched
   allocations are acknowledged after `--ready-after` and echoed in
   heartbeats. No process is spawned and no runtime plugin loads.
-- **Restart-safe by naming.** There is no state directory. Node ids are
-  deterministic, so a restarted process re-registers the same nodes
-  (registration is an upsert). The manager sees a restart as a brief
-  fleet blip, the same as a rebooted worker host.
+- **One fleet certificate.** The stub endpoint is the real worker plane:
+  mutual TLS, manager certificates required. One listener can't hold a
+  certificate per node, so the fleet uses one fleet certificate
+  (`<prefix>.fleet.legion`), signed from a CSR sent through the first node
+  to register. Every node carries `workerFleet = "<prefix>"`, and the
+  manager verifies the fleet's name for them. The listener starts once that
+  certificate is issued, a moment after the first registration; a push
+  before then waits for the next heartbeat.
+- **Restart-safe by naming.** Node ids are deterministic, so a restarted
+  process re-registers the same nodes (registration is an upsert). The
+  manager sees a restart as a brief fleet blip, the same as a rebooted
+  worker host. The only state is the fleet's key and certificate, under
+  `<data dir>/sim/<prefix>/identity/`.
 - **Status line.** Every 30s the process logs `Simulated fleet
   status` with nodes registered, achieved vs. expected heartbeat rate,
   cumulative failures, and acked allocations. Scripts can watch this to

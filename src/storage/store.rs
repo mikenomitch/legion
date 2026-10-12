@@ -6707,6 +6707,7 @@ impl Store {
             heartbeat_seconds: row.get(10)?,
             resource_enforcement: row.get(11)?,
             edge_boot: row.get(12)?,
+            security: row.get(13)?,
         })
     }
 
@@ -8637,6 +8638,7 @@ impl Store {
             ":heartbeat_seconds": config.heartbeat_seconds,
             ":resource_enforcement": config.resource_enforcement,
             ":edge_boot": config.edge_boot,
+            ":security": config.security,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -20637,6 +20639,7 @@ mod tests {
             host_volumes: String::new(),
             resource_enforcement: String::new(),
             edge_boot: String::new(),
+            security: String::new(),
             name: "test".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -20674,6 +20677,7 @@ mod tests {
             host_volumes: String::new(),
             resource_enforcement: String::new(),
             edge_boot: String::new(),
+            security: String::new(),
             name: "empty".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
