@@ -362,6 +362,77 @@ Batch tasks can set `schedule` (`every` or cron). After a submit, update, or res
 
 `task.schedule` is rejected for any lifecycle other than `batch`.
 
+## Job Status
+
+`Job.status` is what `legion job list`, `legion job info`, `ListJobs`,
+`GetJobInfo`, the MCP job tools, and the UI show. The manager works it out
+from the job's workload each time it is read, so a service reads `running`
+and a finished batch job reads `complete`:
+
+```console
+$ legion job list
+NAME      STATUS     PRIORITY  ...
+web       running    normal
+nightly   complete   normal
+report    scheduled  normal
+migrate   failed     normal
+```
+
+The first matching row wins:
+
+| Status | Meaning |
+| --- | --- |
+| `stopped` | `legion job stop` stopped the job. `legion job run` brings it back. |
+| `failed` | A required KV key vanished (`onDelete = "fail"`; see [KV store](kv-store.md#fail-semantics-and-recovery)). |
+| `running` | At least one allocation of the job is live: placed and not yet terminal. |
+| `failed` | Nothing is live, and a task's last run failed: it spent its restart and move budgets, or exited unsuccessfully under a policy that does not restart it ([task supervision](task-supervision.md)). |
+| `pending` | Nothing is live, and a task that wants an allocation hasn't finished. It is waiting to be placed (no node fits, or no node is up) or waiting on a `dependsOn` condition. |
+| `scheduled` | Nothing is live or pending, and a cron task (`schedule`) finished its last run and is waiting for the next. |
+| `complete` | Nothing is live, and every task that wants an allocation finished successfully. |
+| `suspended` | No task wants an allocation, and at least one keyed instance is [suspended](suspend-and-resume.md). |
+| `idle` | No task wants an allocation: every task is scaled to `count = 0`, or a keyed task has no pending, active, or rescheduling instances. |
+
+How the inputs are read:
+
+- **Live allocations count across every version of the job.** A job in the
+  middle of a rollout still has old-version allocations serving, so it reads
+  `running`.
+- **Task outcomes come from the latest version.** Submitting a new version
+  of a finished batch job moves it back to `pending` until the new tasks
+  place, then `running`, then `complete`.
+- **A failed task wins over its blocked dependents.** If `migrate` failed and
+  `api` waits on `migrate` succeeding, the job reads `failed`, not `pending`.
+- **A task wants an allocation** when its `count` is above zero, or, for a
+  keyed stateful task, when it has at least one pending, active, or
+  rescheduling instance.
+
+`legion job list --status <value>` and `ListJobsRequest.status` filter on the
+derived status, and `ListJobsReply.status_counts` counts it.
+
+### The stored lifecycle flag
+
+The state store's `job.status` column is not the derived status. It is a
+lifecycle flag the derivation starts from: `active` from submit until the job
+is stopped, `stopped` after `legion job stop`, and `failed` after a KV
+dependency failure. A `legion state query` against the `job` table returns
+the flag, so count allocations when you want the workload (see
+[Diagnosing scheduler performance](diagnosing-scheduler-performance.md)).
+
+### Known limitations
+
+- **One outcome per task, not per replica.** A task's outcome is the last
+  exit any of its allocations reported. In a batch task with `count = 3` where
+  one replica failed and the last one to exit succeeded, the job reads
+  `complete`. The allocations list has the per-replica truth.
+- **Lost nodes.** An allocation on a node that is lost but not yet
+  rescheduled still counts as live, so the job reads `running` until the
+  manager replaces it.
+- **Old workers.** A worker older than protocol version 2 never reports exits.
+  Its batch allocations stay placed, so a batch job on such a worker reads
+  `running` indefinitely.
+- **Read cost.** `ListJobs` derives every job's status with three aggregate
+  queries per call: over allocations, latest-version tasks, and instances.
+
 ## Job Timestamps: `created_at` and `updated_at`
 
 Every job has two timestamps, both unix seconds on the wire (`Job.created_at`,
@@ -388,7 +459,7 @@ The mtime tracks changes to the job record. It does not track the workload runni
 | A byte-identical spec is resubmitted | no (nothing changed) |
 | `legion job stop` (status → `stopped`) | yes |
 | Job marked `failed`, including a failed KV dependency | yes |
-| Job recovered to `done` from `stopped` or `failed` | yes |
+| Job brought back from `stopped` (resubmit) or a KV `failed` (recovery) | yes |
 | A restart request is acknowledged | yes |
 | An allocation is placed, replaced, or removed | **no** |
 | Health checks, task-status writes, node heartbeats | **no** |

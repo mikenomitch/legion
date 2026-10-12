@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Legion Notes</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    form { display: flex; gap: .5rem; margin: 1rem 0; }
+    input { flex: 1; padding: .5rem; font: inherit; }
+    button { padding: .5rem 1rem; font: inherit; cursor: pointer; }
+    ul { padding: 0; list-style: none; }
+    li { padding: .5rem 0; border-bottom: 1px solid #ddd; }
+    small, .meta { color: #666; }
+    .meta { font-family: ui-monospace, monospace; font-size: .85rem; }
+  </style>
+</head>
+<body>
+  <h1>Legion Notes</h1>
+  <p class="meta" id="meta">loading…</p>
+  <form id="add">
+    <input id="body" placeholder="Write a note" maxlength="500" required>
+    <button>Add</button>
+  </form>
+  <ul id="notes"></ul>
+  <script>
+    const meta = document.getElementById("meta");
+    const list = document.getElementById("notes");
+
+    async function load() {
+      const res = await fetch("/api/notes");
+      const data = await res.json();
+      meta.textContent = `served by api alloc ${data.served_by} · cache ${data.cache}`;
+      list.replaceChildren(...data.notes.map((n) => {
+        const li = document.createElement("li");
+        li.textContent = n.body + " ";
+        const at = document.createElement("small");
+        at.textContent = n.at;
+        li.append(at);
+        return li;
+      }));
+    }
+
+    document.getElementById("add").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const input = document.getElementById("body");
+      await fetch("/api/notes", { method: "POST", body: JSON.stringify({ body: input.value }) });
+      input.value = "";
+      load();
+    });
+
+    load().catch((err) => (meta.textContent = `error: ${err}`));
+  </script>
+</body>
+</html>

@@ -37,6 +37,12 @@ architecture and behavior docs are public.
 
 ## Notes
 
+- [launch-spot-check-findings.md](launch-spot-check-findings.md) — the
+  2026-10-11 pre-launch spot check on a real 3-manager, 2-worker AWS cluster
+  and macOS: what works, eight P0s (batch tasks never finish, DAG ordering,
+  HA strands workers, stock images fail in Linux containers, and more), and
+  the shims the run needed. The rig and runbook are in
+  [`tests/spot-check/`](../tests/spot-check/README.md).
 - [aws-phase1-findings.md](aws-phase1-findings.md) — the first real AWS
   benchmark run (2026-08-02/03): phase 1 passed, and it surfaced a
   manager heartbeat ceiling that was fsync-bound through raft. Start here
@@ -97,9 +103,10 @@ When one is required and what goes in it:
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [edge-boot-plan.md](plans/edge-boot-plan.md) | shipped (phases 1–4); phase 0 measurement not run, phase 5 backlog |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
-| [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | planned (gated sandboxes take memory checkpoints and become the sandbox default with deny-by-default egress, Legion-addressed TAPs as the fallback; Phase 0 is a real-VMM gate) |
+| [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | in execution (Phases 1 to 4 built: gated memory checkpoints, default deny, the static guest agent, gated idle signals, Legion-addressed TAPs; Phase 0, the real-VMM gate, is pending, so the gated-by-default flip is held; Phase 5 ingress not started) |
 | [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
 | [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
+| [job-status-plan.md](plans/job-status-plan.md) | shipped (per-replica outcomes and status-change events deferred) |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
 | [checkpoint-encryption-plan.md](plans/checkpoint-encryption-plan.md) | shipped (2026-10-11: published checkpoint parts sealed under per-part keys from the keyring's checkpoint key, with manual checkpoint-key rotation, parallel sealing, and streaming decrypt deferred) |
@@ -142,6 +149,8 @@ When one is required and what goes in it:
 | [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md) | shipped |
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
 | [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md) | shipped |
+| [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md) | shipped (2026-10-12; public-address auto-detect, a manager reverse proxy, and `GetAllocation` deferred) |
+| [manager-reverse-proxy-plan.md](plans/manager-reverse-proxy-plan.md) | planned (open an allocation's or instance's web UI through the manager when node ports are closed: one-time code for a target-scoped cookie, an L4 tunnel on the worker plane, a new `proxy` ACL resource; subpath first, a host per target in Phase 2, `legion proxy` port-forward in Phase 3; multi-host needs worker-plane-auth Phase 1) |
 | [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md) | shipped (2026-09-02; embedding the UI in the binary deliberately left open) |
 | [ui-task-and-template-redesign-plan.md](plans/ui-task-and-template-redesign-plan.md) | shipped 2026-10-12 (task page tabs, guided template launch, Actions tab; run history, server-side fan-out and a template plan RPC deferred) |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
@@ -188,10 +197,12 @@ by project impact. The full template and a worked example:
 - [heartbeat-scale-plan_calls.md](calls/heartbeat-scale-plan_calls.md)
 - [host-convergence-plan_calls.md](calls/host-convergence-plan_calls.md)
 - [host-process-supervision-plan_calls.md](calls/host-process-supervision-plan_calls.md)
+- [job-status-plan_calls.md](calls/job-status-plan_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
 - [jsonb-text-affinity-plan_calls.md](calls/jsonb-text-affinity-plan_calls.md)
 - [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)
 - [read-model-coherence-plan_calls.md](calls/read-model-coherence-plan_calls.md)
+- [operator-ui-gaps-plan_calls.md](calls/operator-ui-gaps-plan_calls.md)
 - [ui-holistic-polish-plan_calls.md](calls/ui-holistic-polish-plan_calls.md)
 - [ui-task-and-template-redesign-plan_calls.md](calls/ui-task-and-template-redesign-plan_calls.md)
 - [checkpoint-encryption-plan_calls.md](calls/checkpoint-encryption-plan_calls.md)
@@ -200,6 +211,7 @@ by project impact. The full template and a worked example:
 - [kv-cert-delivery-plan_calls.md](calls/kv-cert-delivery-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)
 - [manager-contention-instrumentation_calls.md](calls/manager-contention-instrumentation_calls.md)
+- [manager-reverse-proxy-plan_calls.md](calls/manager-reverse-proxy-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
 - [namespaces-plan_calls.md](calls/namespaces-plan_calls.md)

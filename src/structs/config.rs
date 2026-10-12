@@ -2509,6 +2509,33 @@ pub struct WorkerSandboxConfig {
     /// node planned for.
     #[serde(default, rename = "vmmOverheadMiB")]
     pub vmm_overhead_mib: Option<u64>,
+    /// The bridges TAP-wired sandboxes join on this node, each with the
+    /// address pool Legion leases guests from (docs/task-runtime-sandbox.md,
+    /// "Addressing"). A sandbox with `config.network = { mode = "tap",
+    /// bridge = "br0" }` places only on nodes that declare `br0` here.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bridges: std::collections::BTreeMap<String, SandboxBridgeConfig>,
+}
+
+/// One bridge's guest address pool (worker `sandbox.bridges.<name>`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxBridgeConfig {
+    /// The bridge's network (`10.88.0.0/16`): the guest's netmask comes
+    /// from its prefix.
+    pub subnet: String,
+    /// The guests' default route (`10.88.0.1`). Optional: without it guests
+    /// reach only their own segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    /// The part of `subnet` Legion leases from (`10.88.128.0/17`). Defaults
+    /// to the whole subnet. Keep it out of any DHCP pool on the bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
+    /// Resolvers written to each guest's `/etc/resolv.conf`. Defaults to
+    /// the gateway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<String>,
 }
 
 fn default_enforcement_enabled() -> bool {

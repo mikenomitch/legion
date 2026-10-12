@@ -50,8 +50,8 @@ pub fn fork_mac(allocation_id: i64) -> String {
 /// Two features share it, so one instance always asks for one device:
 ///
 /// - a forked sandbox's NIC is moved to it on restore, and
-/// - `config.network = { mode = "tap", tap = "auto", bridge = ... }` boots
-///   every instance on it.
+/// - `config.network = { mode = "tap", bridge = ... }` boots every instance
+///   on it.
 ///
 /// Derived from the instance id (not the allocation) so an instance that is
 /// suspended and resumed, or forked and later resumed, asks for the same
@@ -68,87 +68,65 @@ pub fn allocation_tap_owner(allocation_id: i64) -> String {
     format!("alloc-{allocation_id}")
 }
 
-/// The host TAP device a sandbox task names by hand
-/// (`config.network = { mode = "tap", tap = "tap0" }`). `None` for every
-/// other task, including one on `tap = "auto"`, whose device is per instance.
-///
-/// A fixed device serves one guest per node, which is the predicate behind
-/// [`validate_fixed_tap`] at submit and the disk-fork refusal at the API.
-pub fn sandbox_fixed_tap(task: &crate::structs::TaskConfig) -> Option<&str> {
-    if task.runtime != "sandbox" {
-        return None;
-    }
-    let network = task.config.get("network")?;
-    if network.get("mode").and_then(serde_json::Value::as_str) != Some("tap") {
-        return None;
-    }
-    network
-        .get("tap")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|tap| !tap.is_empty() && *tap != "auto")
-}
-
-/// Submit-time check: a sandbox on a fixed TAP must never have two guests
-/// that could land on one node, because the second one fails to boot with
-/// `sandbox needs TAP device tap0 ..., but another process holds it`.
-///
-/// That rules out a keyed task (any number of instances, plus forks that
-/// boot cold and disk snapshot seeds), a task whose `count` is above one,
-/// and a rollout with `replacement = "createFirst"`, which places the new
-/// allocation before the old one stops (preferring the old one's node).
-/// `count` is the count to check, so `job scale` can ask the same question
-/// of the count it is about to set.
-pub fn validate_fixed_tap(
-    task: &crate::structs::TaskConfig,
-    count: u32,
-    create_first: bool,
-) -> Result<(), String> {
-    let Some(tap) = sandbox_fixed_tap(task) else {
-        return Ok(());
+/// A VMM version as `(major, minor, patch)`, from `1.16.1`, `v1.13`, or
+/// `1.12.0-dev`. A missing patch reads as 0. `None` when the major or minor
+/// part is not a number.
+pub fn parse_vmm_semver(version: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = version.trim().trim_start_matches('v').split('.');
+    let number = |part: Option<&str>| -> Option<u32> {
+        let digits: String = part?.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
     };
-    let keyed = task
-        .stateful
-        .as_ref()
-        .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed);
-    let why = if keyed {
-        "it is a keyed task (stateful.mode = \"keyed\"), so a second instance, a fork that boots \
-         cold, or a disk snapshot seed on the same node fails to boot"
-            .to_string()
-    } else if count > 1 {
-        format!(
-            "it runs count = {count}, and two of its allocations on one node would both need \
-             the device, so the second fails to boot"
-        )
-    } else if create_first {
-        "its rollout uses replacement = \"createFirst\", which starts the replacement next to \
-         the old allocation (on its node when it fits), so the replacement fails to boot"
-            .to_string()
-    } else {
-        return Ok(());
-    };
-    Err(format!(
-        "task {:?} attaches its sandbox to the fixed TAP device {tap:?} (config.network.tap), \
-         which serves one guest per node, but {why}\nHint: set config.network = {{ mode = \
-         \"tap\", tap = \"auto\", bridge = \"<the bridge {tap} is on>\" }}, so Legion creates a \
-         TAP per instance",
-        task.name
-    ))
+    let major = number(parts.next())?;
+    let minor = number(parts.next())?;
+    Some((major, minor, number(parts.next()).unwrap_or(0)))
 }
 
 /// Whether a Firecracker version can move a restored NIC to a different TAP
 /// device (`network_overrides` on `PUT /snapshot/load`, added in 1.12).
 /// An unparseable version is assumed not to.
 pub fn firecracker_can_override_tap(version: &str) -> bool {
-    let mut parts = version
-        .trim()
-        .trim_start_matches('v')
-        .split('.')
-        .map(|part| part.parse::<u32>().ok());
-    match (parts.next().flatten(), parts.next().flatten()) {
-        (Some(major), Some(minor)) => (major, minor) >= (1, 12),
-        _ => false,
+    parse_vmm_semver(version).is_some_and(|version| version >= (1, 12, 0))
+}
+
+/// The oldest Firecracker that can move a restored gated guest's vsock to
+/// the restoring allocation's socket: 1.16.0 added `vsock_override` on
+/// `PUT /snapshot/load`, and 1.16.1 fixed guest-to-host connections timing
+/// out after a restore with a TX descriptor in flight, which is exactly the
+/// gated datapath's traffic (gated plan §6.2, calls entry 12).
+pub const FIRECRACKER_VSOCK_OVERRIDE_MIN: (u32, u32, u32) = (1, 16, 1);
+
+/// Whether a Firecracker version can take a memory checkpoint of a gated
+/// sandbox. An unparseable version is assumed not to.
+pub fn firecracker_can_override_vsock(version: &str) -> bool {
+    parse_vmm_semver(version).is_some_and(|version| version >= FIRECRACKER_VSOCK_OVERRIDE_MIN)
+}
+
+/// Why a gated sandbox cannot take a memory checkpoint on this VMM, as the
+/// refusal the manager and the worker both give. `None` when it can: any
+/// cloud-hypervisor, and Firecracker 1.16.1 or later. `subject` names the
+/// instance or allocation, `fix` is the hint's fallback (`use --checkpoint
+/// disk`, `use --disk`).
+pub fn gated_memory_checkpoint_refusal(
+    subject: &str,
+    node: &str,
+    vmm: &str,
+    version: Option<&str>,
+    fix: &str,
+) -> Option<String> {
+    if vmm != "firecracker" {
+        return None;
     }
+    let version = version.unwrap_or("unknown");
+    if firecracker_can_override_vsock(version) {
+        return None;
+    }
+    let (major, minor, patch) = FIRECRACKER_VSOCK_OVERRIDE_MIN;
+    Some(format!(
+        "{subject} is gated, and node {node} runs Firecracker {version}, which cannot move a \
+         restored guest's vsock to a new socket (that needs Firecracker {major}.{minor}.{patch} \
+         or later)\nHint: upgrade Firecracker on the node, or {fix}"
+    ))
 }
 
 #[cfg(test)]
@@ -187,6 +165,64 @@ mod tests {
     }
 
     #[test]
+    fn vmm_versions_parse_with_or_without_a_patch() {
+        assert_eq!(parse_vmm_semver("1.16.1"), Some((1, 16, 1)));
+        assert_eq!(parse_vmm_semver("v1.13"), Some((1, 13, 0)));
+        assert_eq!(parse_vmm_semver("1.12.0-dev"), Some((1, 12, 0)));
+        assert_eq!(parse_vmm_semver("52.0"), Some((52, 0, 0)));
+        assert_eq!(parse_vmm_semver("unknown"), None);
+        assert_eq!(parse_vmm_semver("1"), None);
+    }
+
+    /// Gated plan §6.2: 1.16.0 added the override, 1.16.1 fixed the restore
+    /// timeout on the gated traffic pattern, so the floor is 1.16.1.
+    #[test]
+    fn gated_memory_checkpoints_need_firecracker_1_16_1() {
+        for (version, ok) in [
+            ("1.7.0", false),
+            ("1.12.0", false),
+            ("1.15.0", false),
+            ("1.16.0", false),
+            ("1.16.1", true),
+            ("v1.16.2", true),
+            ("1.17.0", true),
+            ("2.0", true),
+            ("unknown", false),
+        ] {
+            assert_eq!(firecracker_can_override_vsock(version), ok, "{version}");
+            let refusal = gated_memory_checkpoint_refusal(
+                "instance user-42",
+                "w-03",
+                "firecracker",
+                Some(version),
+                "use --checkpoint disk",
+            );
+            assert_eq!(refusal.is_none(), ok, "{version}: {refusal:?}");
+        }
+        let refusal = gated_memory_checkpoint_refusal(
+            "instance user-42",
+            "w-03",
+            "firecracker",
+            Some("1.15.0"),
+            "use --checkpoint disk",
+        )
+        .unwrap();
+        assert_eq!(
+            refusal,
+            "instance user-42 is gated, and node w-03 runs Firecracker 1.15.0, which cannot move \
+             a restored guest's vsock to a new socket (that needs Firecracker 1.16.1 or \
+             later)\nHint: upgrade Firecracker on the node, or use --checkpoint disk"
+        );
+        // cloud-hypervisor has no floor beyond Legion's own.
+        assert!(
+            gated_memory_checkpoint_refusal("x", "n", "cloud-hypervisor", Some("35.0"), "f")
+                .is_none()
+        );
+        // A node that reports no version is refused rather than trusted.
+        assert!(gated_memory_checkpoint_refusal("x", "n", "firecracker", None, "f").is_some());
+    }
+
+    #[test]
     fn firecracker_tap_override_needs_1_12() {
         assert!(!firecracker_can_override_tap("1.7.0"));
         assert!(!firecracker_can_override_tap("1.11.2"));
@@ -194,51 +230,5 @@ mod tests {
         assert!(firecracker_can_override_tap("v1.13.1"));
         assert!(firecracker_can_override_tap("2.0"));
         assert!(!firecracker_can_override_tap("unknown"));
-    }
-
-    fn sandbox(network: serde_json::Value, stateful: Option<&str>) -> crate::structs::TaskConfig {
-        let mut value = serde_json::json!({
-            "name": "workspace",
-            "runtime": "sandbox",
-            "config": { "image": "alpine", "command": ["sleep", "1"], "network": network },
-        });
-        if let Some(mode) = stateful {
-            value["stateful"] = serde_json::json!({ "mode": mode });
-        }
-        serde_json::from_value(value).expect("task parses")
-    }
-
-    #[test]
-    fn a_fixed_tap_is_refused_wherever_two_guests_could_share_a_node() {
-        let fixed = serde_json::json!({ "mode": "tap", "tap": "tap0" });
-        let keyed = sandbox(fixed.clone(), Some("keyed"));
-        assert_eq!(sandbox_fixed_tap(&keyed), Some("tap0"));
-        let err = validate_fixed_tap(&keyed, 1, false).unwrap_err();
-        assert!(err.contains("keyed task"), "{err}");
-        assert!(err.contains("Hint: set config.network"), "{err}");
-        assert!(err.contains("tap = \"auto\""), "{err}");
-
-        // Slot mode and stateless tasks: only a count above one, or a
-        // createFirst rollout, puts two guests on one node.
-        for stateful in [Some("slot"), None] {
-            let task = sandbox(fixed.clone(), stateful);
-            assert!(validate_fixed_tap(&task, 1, false).is_ok());
-            let err = validate_fixed_tap(&task, 3, false).unwrap_err();
-            assert!(err.contains("count = 3"), "{err}");
-            let err = validate_fixed_tap(&task, 1, true).unwrap_err();
-            assert!(err.contains("createFirst"), "{err}");
-        }
-    }
-
-    #[test]
-    fn auto_taps_and_tapless_sandboxes_pass_the_fixed_tap_check() {
-        let auto = sandbox(
-            serde_json::json!({ "mode": "tap", "tap": "auto", "bridge": "br0" }),
-            Some("keyed"),
-        );
-        assert_eq!(sandbox_fixed_tap(&auto), None);
-        assert!(validate_fixed_tap(&auto, 8, true).is_ok());
-        let none = sandbox(serde_json::json!({ "mode": "none" }), Some("keyed"));
-        assert!(validate_fixed_tap(&none, 8, true).is_ok());
     }
 }

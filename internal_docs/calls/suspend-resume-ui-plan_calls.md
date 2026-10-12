@@ -228,6 +228,10 @@ transitions, which is its own change. Deriving it on the page fixes the
 reading where it was wrong, with no server risk. The index wording is a
 TODO.
 
+**Superseded** by [job-status-plan.md](../plans/job-status-plan.md): the
+manager now derives the status for every surface, and the page's client-side
+derivation is gone.
+
 ## 10. The workers index fans out one GetNodeUsage per row
 
 **Superseded by entry 7** (ListNodeUsage). The fan-out remains only as the

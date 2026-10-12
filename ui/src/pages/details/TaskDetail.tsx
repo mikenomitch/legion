@@ -44,7 +44,7 @@ import {
 import {
   artifactProgressPercent,
   buildTaskInstancesByName,
-  extractJobSpecData,
+  extractJobSpecFromReply,
   parseArtifactStates,
   shortenArtifactDigest,
   type ArtifactStateRow,
@@ -56,6 +56,9 @@ import { allows } from '../../utils/acl'
 import { pluralize, toDate } from '../../utils/format'
 import type { Tone } from '../../utils/status'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../../utils/volumes'
+import { instanceHref } from '../../utils/instances'
+import { nodePublicAddress } from '../../utils/services'
+import { AllocationLink } from '../../components/AllocationLink'
 
 // Checksum column value: pinned sources carry their digest in the source
 // (`…@sha256:…`); otherwise fall back to the declared checksum.
@@ -119,6 +122,8 @@ type InstanceRow = {
   running: boolean
   health?: AllocationRuntime
   network?: AllocNetwork
+  // The node's public address (LEGION_WORKER_PUBLIC_ADDRESS), for port links.
+  publicAddress?: string
   artifacts: ArtifactStateRow[]
   rollout?: RolloutAllocationStatus
   instanceId?: string
@@ -154,8 +159,8 @@ const instanceTooltip = (row: InstanceRow): string =>
     .filter(Boolean)
     .join(' · ')
 
-const instanceSecondary = (row: InstanceRow): string =>
-  [row.rollout?.role, row.instanceId ? `instance ${row.instanceId}` : undefined].filter(Boolean).join(' · ')
+// The rollout role; the instance id is a link beside the allocation id.
+const instanceSecondary = (row: InstanceRow): string => row.rollout?.role ?? ''
 
 type HealthSummary = { healthy: number; unhealthy: number; unknown: number; total: number; tone: Tone }
 
@@ -312,7 +317,7 @@ function TaskDetailContent() {
     const latestRollout = rollouts.rollouts[0]
     const rolloutStatus = latestRollout ? await managerClient.getRolloutStatus({ id: latestRollout.id }) : undefined
 
-    const taskSpec = extractJobSpecData(spec.submissions)?.tasks.find((entry) => entry.name === task)
+    const taskSpec = extractJobSpecFromReply(spec)?.tasks.find((entry) => entry.name === task)
     const instancesByTask = buildTaskInstancesByName(rolloutStatus?.groups ?? [])
     const taskInstances = instancesByTask.get(task)
 
@@ -322,6 +327,13 @@ function TaskDetailContent() {
     const jobAllocations = (ledger?.nodes ?? [])
       .flatMap((node) => node.allocations)
       .filter((alloc) => alloc.jobId === job && runnableStatuses.has(alloc.status))
+    // Port links use a node's public address when its worker declares one.
+    const publicAddresses = new Map(
+      (ledger?.nodes ?? []).flatMap((entry) => {
+        const address = nodePublicAddress(entry.node?.configAttrs)
+        return entry.node && address ? [[entry.node.id, address] as const] : []
+      }),
+    )
 
     // Endpoints for the service this task declares (if any), unhealthy
     // included so a failing endpoint is visible rather than absent.
@@ -347,6 +359,7 @@ function TaskDetailContent() {
       taskSpec,
       taskInstances,
       jobAllocations,
+      publicAddresses,
       ledgerAvailable: ledger !== undefined,
       latestRollout,
       groups: rolloutStatus?.groups ?? [],
@@ -367,16 +380,16 @@ function TaskDetailContent() {
   }, ([job, task]) => `${job}/${task}`),
   )
 
-  // The ledger identifies allocations by task_config_id only, so the task name
-  // comes from the same state-store lookup that carries health — or, for a
-  // token whose state-store read was denied, from the latest rollout.
+  // The ledger names each allocation's task (`LedgerAllocation.task_name`).
+  // An older manager leaves it empty; the state-store lookup that carries
+  // health, or the latest rollout, then supplies the mapping.
+  const allocationTask = (alloc: LedgerAllocation): string | undefined =>
+    alloc.taskName || data()?.allocationHealth.get(Number(alloc.id))?.taskName
   const taskAllocations = createMemo((): LedgerAllocation[] => {
     const current = data()
     if (!current) return []
     const inRollout = new Set((current.taskInstances?.allocations ?? []).map((allocation) => String(allocation.allocationId)))
-    return current.jobAllocations.filter(
-      (alloc) => current.allocationHealth.get(Number(alloc.id))?.taskName === taskName() || inRollout.has(String(alloc.id)),
-    )
+    return current.jobAllocations.filter((alloc) => allocationTask(alloc) === taskName() || inRollout.has(String(alloc.id)))
   })
 
   // Allocations the exec panel may target. The manager rejects exec into an
@@ -386,15 +399,12 @@ function TaskDetailContent() {
   // task whenever the task↔allocation mapping is available; a job-scoped token
   // without `state:read` gets an empty map, and there we still show the job's
   // allocations rather than an empty section (the manager is the real gate).
-  const execAllocations = createMemo(() => {
-    const runtime = data()?.allocationHealth
-    const allocations = data()?.jobAllocations ?? []
-    if (!runtime || runtime.size === 0) return allocations
-    return allocations.filter((alloc) => {
-      const known = runtime.get(Number(alloc.id))
-      return known === undefined || known.taskName === taskName()
-    })
-  })
+  const execAllocations = createMemo(() =>
+    (data()?.jobAllocations ?? []).filter((alloc) => {
+      const task = allocationTask(alloc)
+      return task === undefined || task === taskName()
+    }),
+  )
   // Strings, not ledger rows: rows are new objects every poll, and the target
   // picker's options must survive a poll for the selection to hold.
   const execTargetIds = createMemo(() => execAllocations().map((alloc) => String(alloc.id)))
@@ -419,6 +429,7 @@ function TaskDetailContent() {
         running: true,
         health: current.allocationHealth.get(Number(alloc.id)) ?? rolloutHealth(rollout),
         network: parseAllocNetwork(alloc.network),
+        publicAddress: current.publicAddresses.get(alloc.nodeId),
         // The rollout's copy is the one the old runtime card showed; the
         // ledger carries the same heartbeat payload for rollout-less deploys.
         artifacts: parseArtifactStates(rollout?.artifactStates ?? alloc.artifactStates),
@@ -703,7 +714,15 @@ function TaskDetailContent() {
                             {(row) => (
                               <tr class={cx(trHoverClass, row().running && row().health?.healthy === false && 'bg-red-500/5')}>
                                 <td class={tdClass} title={instanceTooltip(row())}>
-                                  <span class="font-mono text-xs font-semibold">#{row().key}</span>
+                                  <AllocationLink id={row().id} job={jobName()} />
+                                  <Show when={row().instanceId}>
+                                    <A
+                                      class="ml-1.5 font-mono text-2xs text-muted hover:text-brass-strong"
+                                      href={instanceHref(jobName(), row().instanceId!)}
+                                    >
+                                      {row().instanceId}
+                                    </A>
+                                  </Show>
                                   <Show when={instanceSecondary(row())}>
                                     <div class="text-2xs text-faint">{instanceSecondary(row())}</div>
                                   </Show>
@@ -727,7 +746,7 @@ function TaskDetailContent() {
                                   </Show>
                                 </td>
                                 <td class={tdClass}>
-                                  <AllocationPorts network={row().network} />
+                                  <AllocationPorts network={row().network} publicAddress={row().publicAddress} />
                                 </td>
                                 <td class={tdClass}>
                                   <ArtifactSummary rows={row().artifacts} />

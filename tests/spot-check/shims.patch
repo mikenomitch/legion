@@ -1,0 +1,36 @@
+diff --git a/src/worker/task_manager.rs b/src/worker/task_manager.rs
+index 7b32a369..c3c080c6 100644
+--- a/src/worker/task_manager.rs
++++ b/src/worker/task_manager.rs
+@@ -4085,9 +4085,15 @@ fn spawn_provisional_staging_thread(
+     let gate = job.gate;
+     let manager_for_thread = manager.clone();
+     let claim_for_thread = claim_id.clone();
++    // SPOT-CHECK SHIM, not for merge as-is: staging runs on a plain OS thread,
++    // and the health monitor it starts afterwards calls tokio::spawn, which
++    // panics outside a runtime ("there is no reactor running"). Carry the
++    // runtime into the thread so artifact-staged tasks get health checks.
++    let runtime = tokio::runtime::Handle::try_current().ok();
+     let spawned = std::thread::Builder::new()
+         .name(format!("provisional-staging-{allocation_id}"))
+         .spawn(move || {
++            let _runtime = runtime.as_ref().map(|handle| handle.enter());
+             let manager = manager_for_thread;
+             let result = job.stage();
+ 
+@@ -4134,9 +4140,15 @@ fn spawn_provisional_staging_thread(
+ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob) {
+     let allocation_id = job.allocation.id;
+     let manager_for_thread = manager.clone();
++    // SPOT-CHECK SHIM, not for merge as-is: staging runs on a plain OS thread,
++    // and the health monitor it starts afterwards calls tokio::spawn, which
++    // panics outside a runtime ("there is no reactor running"). Carry the
++    // runtime into the thread so artifact-staged tasks get health checks.
++    let runtime = tokio::runtime::Handle::try_current().ok();
+     let spawned = std::thread::Builder::new()
+         .name(format!("artifact-staging-{allocation_id}"))
+         .spawn(move || {
++            let _runtime = runtime.as_ref().map(|handle| handle.enter());
+             let manager = manager_for_thread;
+             let result = job.stage();
+ 

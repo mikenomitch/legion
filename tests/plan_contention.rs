@@ -115,9 +115,7 @@ fn events_of_kind(store: &Store, kind: &str) -> R<Vec<SchedulerEventRecord>> {
             after_id,
             limit: Some(1_000),
             kind: Some(kind.to_string()),
-            job_id: None,
-            node_id: None,
-            level: None,
+            ..Default::default()
         })?;
         let Some(last) = page.last() else {
             break;

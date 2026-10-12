@@ -54,32 +54,32 @@ use crate::structs::{
     IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
     IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
     JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
-    JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvValueType,
-    LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest,
-    ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
-    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobTemplatesReply,
-    ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
-    ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
-    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
-    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply,
-    ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
-    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
-    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
-    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
-    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
-    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
-    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
-    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
-    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
-    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
-    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
-    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvJobReference,
+    KvValueType, LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply,
+    ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply,
+    ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
+    ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply,
+    ListKvRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply,
+    ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
+    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
+    ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest,
+    ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node,
+    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
+    PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent,
+    RaftStatus, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest,
+    RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest,
+    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
+    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
+    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RotateMeshCaReply,
+    RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest,
+    SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, ServiceEdge,
+    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
+    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
+    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
+    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
@@ -729,6 +729,10 @@ fn map_instance_info(
         pending_op,
         idle_since,
         idle_after_seconds,
+        // From the node's network status report, which the handlers
+        // attach ([`attach_guest_address`]).
+        guest_address: None,
+        guest_bridge: None,
     }
 }
 
@@ -794,6 +798,40 @@ fn idle_policy_unmeasured_detail(
          so the instance will not suspend when idle",
         idle.after.as_secs()
     ))
+}
+
+/// The `egress-unenforced` detail for an allocation of `task`: a sandbox
+/// whose `auto` network would be gated, running on a dev backend that has
+/// no vsock to the datapath (gated plan §6.6). `None` otherwise, and while
+/// the gated default is closed. Lookup failures degrade to no detail.
+fn egress_unenforced_detail(
+    store: &Store,
+    allocation: &crate::structs::Allocation,
+    task: &crate::structs::TaskConfig,
+) -> Option<String> {
+    if !store.sandbox_gated_default() || task.runtime != "sandbox" {
+        return None;
+    }
+    let node = store.get_node(&allocation.node_id).ok()?;
+    let node_vmm = node
+        .fingerprint_attrs
+        .get(crate::structs::checkpoint::ATTR_SANDBOX_VMM)
+        .and_then(Value::as_str);
+    crate::structs::network::egress_unenforced_detail(task, node_vmm, true)
+}
+
+/// [`egress_unenforced_detail`] for an instance's current allocation.
+fn instance_egress_unenforced_detail(store: &Store, instance: &Instance) -> Option<String> {
+    if !store.sandbox_gated_default() || instance.state != InstanceState::Active {
+        return None;
+    }
+    let allocation = store
+        .get_allocation_by_id(instance.current_alloc_id?)
+        .ok()??;
+    let task = store
+        .get_task_config_by_id(allocation.task_config_id)
+        .ok()??;
+    egress_unenforced_detail(store, &allocation, &task)
 }
 
 /// `pending-loss-confirmation` diagnostic for instance get/list: when an
@@ -882,21 +920,33 @@ fn scheduler_event_filter(
     node_id: Option<String>,
     level: Option<String>,
 ) -> SchedulerEventFilter {
-    let normalize = |value: Option<String>| {
-        value.and_then(|value| {
-            let trimmed = value.trim().to_string();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-    };
     SchedulerEventFilter {
         // Explicit 0 means "from the very beginning"; only reject negatives.
         after_id: after_id.filter(|id| *id >= 0),
         limit,
-        kind: normalize(kind),
-        job_id: normalize(job_id),
-        node_id: normalize(node_id),
-        level: normalize(level),
+        kind: normalize_event_filter_value(kind),
+        job_id: normalize_event_filter_value(job_id),
+        node_id: normalize_event_filter_value(node_id),
+        level: normalize_event_filter_value(level),
+        instance_id: None,
+        allocation_id: None,
     }
+}
+
+/// `GetJobSpecReply.rendered_jobspec`: the stored config as the JSON shape
+/// `RunJobRequest.parsed_jobspec` takes.
+fn rendered_jobspec_json(config: &JobConfig) -> Result<String, Status> {
+    serde_json::to_string(config).map_err(|error| {
+        error!(?error, job = %config.name, "Error serializing job config");
+        Status::internal("Error serializing job config")
+    })
+}
+
+fn normalize_event_filter_value(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
 }
 
 // Outbound buffer for one StreamEvents subscriber. Slow consumers exert
@@ -3776,7 +3826,7 @@ impl Manager for ManagerDaemonService {
 
         let job = self
             .store
-            .get_job(&name)
+            .get_job_with_status(&name)
             .map_err(|e| map_store_error("Error getting job", e))?;
         let template = self
             .store
@@ -3947,14 +3997,18 @@ impl Manager for ManagerDaemonService {
             AclScope::none(),
         )?;
         let request = request.into_inner();
-        let filter = scheduler_event_filter(
-            request.after_id,
-            request.limit,
-            request.kind,
-            request.job_id,
-            request.node_id,
-            request.level,
-        );
+        let filter = SchedulerEventFilter {
+            instance_id: normalize_event_filter_value(request.instance_id),
+            allocation_id: request.allocation_id,
+            ..scheduler_event_filter(
+                request.after_id,
+                request.limit,
+                request.kind,
+                request.job_id,
+                request.node_id,
+                request.level,
+            )
+        };
 
         let events = self
             .store
@@ -4069,14 +4123,18 @@ impl Manager for ManagerDaemonService {
         )?;
         let credential = self.stream_credential(&request);
         let request = request.into_inner();
-        let filter = scheduler_event_filter(
-            request.after_id,
-            None,
-            request.kind,
-            request.job_id,
-            request.node_id,
-            request.level,
-        );
+        let filter = SchedulerEventFilter {
+            instance_id: normalize_event_filter_value(request.instance_id),
+            allocation_id: request.allocation_id,
+            ..scheduler_event_filter(
+                request.after_id,
+                None,
+                request.kind,
+                request.job_id,
+                request.node_id,
+                request.level,
+            )
+        };
 
         let store = self.store.clone();
         // Subscribe before replaying history so no event can fall between the
@@ -4123,7 +4181,19 @@ impl Manager for ManagerDaemonService {
                 };
                 match received {
                     Ok(event) => {
-                        if event.id <= last_sent || !filter.matches(&event) {
+                        // The instance filter's allocation half reads the
+                        // allocation row, so an allocation placed after the
+                        // stream opened still matches.
+                        let allocation_instance = |id: i64| {
+                            store
+                                .get_allocation_by_id(id)
+                                .ok()
+                                .flatten()
+                                .and_then(|allocation| allocation.instance_id)
+                        };
+                        if event.id <= last_sent
+                            || !filter.matches_with(&event, allocation_instance)
+                        {
                             continue;
                         }
                         last_sent = event.id;
@@ -4415,10 +4485,12 @@ impl Manager for ManagerDaemonService {
             .store
             .get_submissions_for_config(&config.id())
             .map_err(|e| map_store_error("Error getting submissions", e))?;
+        let rendered_jobspec = rendered_jobspec_json(&config)?;
 
-        let reply = GetJobSpecReply { submissions };
-
-        Ok(Response::new(reply))
+        Ok(Response::new(GetJobSpecReply {
+            submissions,
+            rendered_jobspec,
+        }))
     }
 
     async fn get_job_spec_by_config(
@@ -4442,8 +4514,17 @@ impl Manager for ManagerDaemonService {
             .store
             .get_submissions_for_config(&config_id)
             .map_err(|e| map_store_error("Error getting submissions", e))?;
+        let config = self
+            .store
+            .get_job_config_by_id_optional(&config_id)
+            .map_err(|e| map_store_error("Error getting job config", e))?
+            .ok_or_else(|| Status::not_found("Job config not found"))?;
+        let rendered_jobspec = rendered_jobspec_json(&config)?;
 
-        Ok(Response::new(GetJobSpecReply { submissions }))
+        Ok(Response::new(GetJobSpecReply {
+            submissions,
+            rendered_jobspec,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -4491,9 +4572,12 @@ impl Manager for ManagerDaemonService {
             .eq_ignore_ascii_case("desc");
         let (page, page_size) = parse_page(request.page, request.page_size);
 
+        // `status` is derived from each job's workload (running, pending,
+        // complete, ...), so the query, filter, counts, and sort below all
+        // see what a reader sees.
         let mut jobs = self
             .store
-            .get_jobs()
+            .get_jobs_with_status()
             .map_err(|e| map_store_error("Error getting jobs", e))?;
         // Provenance feeds the `templates` rule selector so template-scoped
         // identities see the jobs their templates created. One batch query
@@ -4680,12 +4764,6 @@ impl Manager for ManagerDaemonService {
             inner.task_group.as_deref(),
             inner.task_name.as_deref(),
         )?;
-        // The submit-time fixed-TAP rule, asked of the count being set: a
-        // second guest on a fixed TAP fails to boot (docs/task-runtime-sandbox.md).
-        if let Some(count) = inner.count {
-            crate::structs::fork::validate_fixed_tap(task, count, false)
-                .map_err(Status::failed_precondition)?;
-        }
         let (task_group, task_name, spec_count) =
             (task.group.clone(), task.name.clone(), task.count.num);
         let job_config_id = config.id();
@@ -5656,6 +5734,7 @@ impl Manager for ManagerDaemonService {
             .store
             .instance_lineage_for_job(&inner.job_id)
             .map_err(|e| map_store_error("Error listing instances", e))?;
+        let addresses = guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner()));
         let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         let instances = self
             .store
@@ -5666,7 +5745,9 @@ impl Manager for ManagerDaemonService {
             .map(|instance| {
                 let state = suspend.remove(&instance.instance_id).unwrap_or_default();
                 let history = history.remove(&instance.instance_id).unwrap_or_default();
-                map_instance_info(&self.store, &usage, instance, state, history)
+                let mut info = map_instance_info(&self.store, &usage, instance, state, history);
+                attach_guest_address(&mut info, &addresses);
+                info
             })
             .collect();
 
@@ -5711,10 +5792,15 @@ impl Manager for ManagerDaemonService {
 
         let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         let idle_unmeasured = idle_policy_unmeasured_detail(&self.store, &usage, &instance);
+        let egress_unenforced = instance_egress_unenforced_detail(&self.store, &instance);
         let mut info = map_instance_info(&self.store, &usage, instance, suspend, history);
         drop(usage);
+        attach_guest_address(
+            &mut info,
+            &guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner())),
+        );
         if info.detail.is_none() {
-            info.detail = idle_unmeasured;
+            info.detail = idle_unmeasured.or(egress_unenforced);
         }
         Ok(Response::new(GetInstanceReply {
             instance: Some(info),
@@ -7827,6 +7913,21 @@ impl Manager for ManagerDaemonService {
             .store
             .allocation_health_for_allocations(&allocation_ids)
             .map_err(|e| map_store_error("Error getting allocation health", e))?;
+        // Task names, so a client can group a job's allocations by task
+        // without a second lookup.
+        let task_config_ids: Vec<i64> = ledger
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .allocations
+                    .iter()
+                    .map(|allocation| allocation.task_config_id)
+            })
+            .collect();
+        let task_names = self
+            .store
+            .task_names_for_configs(&task_config_ids)
+            .map_err(|e| map_store_error("Error getting task names", e))?;
 
         let mut nodes: Vec<LedgerNode> = ledger.into_iter().map(Into::into).collect();
         for node in &mut nodes {
@@ -7834,6 +7935,10 @@ impl Manager for ManagerDaemonService {
                 allocation.artifact_states = allocation_health
                     .get(&allocation.id)
                     .and_then(|snapshot| snapshot.artifact_states.clone());
+                allocation.task_name = task_names
+                    .get(&allocation.task_config_id)
+                    .cloned()
+                    .unwrap_or_default();
             }
         }
         nodes.retain(|entry| match &entry.node {
@@ -7998,17 +8103,23 @@ impl Manager for ManagerDaemonService {
             .as_ref()
             .map(|n| n.mode.clone())
             .unwrap_or_else(|| "auto".to_string());
-        let effective_mode = effective
-            .mode
-            .clone()
-            .unwrap_or_else(|| declared_mode.clone());
+        let effective_mode = effective.mode.clone().unwrap_or_else(|| {
+            crate::structs::network::resolve_network_mode_with(
+                &declared_mode,
+                &task.runtime,
+                &crate::structs::network::AutoModeFacts::for_task(&task),
+                self.store.sandbox_gated_default(),
+            )
+        });
         let node_status_json = self.net_status_for_task(&req.job_id, &task.name);
+        let notes = self.egress_unenforced_notes(&req.job_id, &task);
         Ok(Response::new(ShowNetPolicyReply {
             effective_json: serde_json::to_string(&effective).unwrap_or_default(),
             matched_policies: matched,
             declared_mode,
             effective_mode,
             node_status_json,
+            notes,
         }))
     }
 
@@ -8090,6 +8201,43 @@ impl Manager for ManagerDaemonService {
             }
         }
         let Some(chain) = chain else {
+            // A gated task's egress that nothing covers is denied
+            // (`gated-default`), exactly as its datapath would.
+            let declared_mode = task
+                .network
+                .as_ref()
+                .map(|network| network.mode.as_str())
+                .unwrap_or(crate::structs::netpolicy::MODE_AUTO);
+            let mode = effective.mode.clone().unwrap_or_else(|| {
+                crate::structs::network::resolve_network_mode_with(
+                    declared_mode,
+                    &task.runtime,
+                    &crate::structs::network::AutoModeFacts::for_task(&task),
+                    self.store.sandbox_gated_default(),
+                )
+            });
+            if direction == "egress" && mode == crate::structs::netpolicy::MODE_GATED {
+                let destination = host
+                    .clone()
+                    .or_else(|| ip.map(|ip| ip.to_string()))
+                    .unwrap_or_else(|| target.clone());
+                let reason = format!(
+                    "task {} is gated and nothing allows {destination}",
+                    task.name
+                );
+                return Ok(Response::new(TestNetPolicyReply {
+                    verdict: "deny".into(),
+                    source: crate::structs::netpolicy::SOURCE_GATED_DEFAULT.into(),
+                    explanation: format!(
+                        "{target}: denied by {} — {reason}",
+                        crate::structs::netpolicy::SOURCE_GATED_DEFAULT
+                    ),
+                    reason,
+                    direction: direction.into(),
+                    protocol: String::new(),
+                    hint: crate::structs::netpolicy::gated_default_hint(&destination),
+                }));
+            }
             return Ok(Response::new(TestNetPolicyReply {
                 verdict: "allow".into(),
                 source: String::new(),
@@ -8099,6 +8247,7 @@ impl Manager for ManagerDaemonService {
                 explanation: format!(
                     "no {direction} policy applies to this task; everything is allowed"
                 ),
+                hint: String::new(),
             }));
         };
         let identity_str = req.identity.trim();
@@ -8172,6 +8321,7 @@ impl Manager for ManagerDaemonService {
             direction: direction.into(),
             protocol: chain.protocol.clone(),
             explanation,
+            hint: String::new(),
         }))
     }
 
@@ -8502,6 +8652,7 @@ impl Manager for ManagerDaemonService {
                 allocation_id: endpoint.allocation_id,
                 node_id: endpoint.node_id,
                 address: endpoint.address.unwrap_or_default(),
+                public_address: endpoint.public_address.unwrap_or_default(),
                 port: u32::from(endpoint.port.unwrap_or(0)),
                 healthy: endpoint.healthy,
                 health_status: endpoint.health_status,
@@ -8545,19 +8696,40 @@ impl Manager for ManagerDaemonService {
 
     #[instrument(skip_all)]
     async fn get_kv(&self, request: Request<GetKvRequest>) -> Result<Response<GetKvReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Kv,
             AclAction::Read,
             AclScope::path(&request.get_ref().key),
         )?;
         let req = request.into_inner();
-        let entry = self
+        let entry = if req.metadata_only {
+            self.store.get_kv_metadata(&req.key)
+        } else {
+            self.store.get_kv(&req.key)
+        }
+        .map_err(|e| map_store_error("Error getting kv entry", e))?;
+        // Who reads this key, limited to jobs the caller may see.
+        let references = self
             .store
-            .get_kv(&req.key)
-            .map_err(|e| map_store_error("Error getting kv entry", e))?;
+            .job_kv_references_for_key(&req.key)
+            .map_err(|e| map_store_error("Error getting kv references", e))?
+            .into_iter()
+            .filter(|reference| {
+                identity.allows(
+                    AclResource::Job,
+                    AclAction::Read,
+                    &self.job_read_scope(&reference.job_id),
+                )
+            })
+            .map(|reference| KvJobReference {
+                job_id: reference.job_id,
+                job_config_id: reference.job_config_id,
+                json_pointer: reference.json_pointer,
+            })
+            .collect();
 
-        Ok(Response::new(GetKvReply { entry }))
+        Ok(Response::new(GetKvReply { entry, references }))
     }
 
     /// Resolves an artifact credential from KV for a worker about to fetch.
@@ -8614,10 +8786,14 @@ impl Manager for ManagerDaemonService {
         let identity =
             self.check_acl(&request, AclResource::Kv, AclAction::Read, AclScope::any())?;
         let req = request.into_inner();
-        let mut entries = self
-            .store
-            .list_kv(&req.prefix)
-            .map_err(|e| map_store_error("Error listing kv entries", e))?;
+        // Values only on request: browsing key names should not decrypt and
+        // ship every secret in the prefix.
+        let entries = if req.include_values {
+            self.store.list_kv(&req.prefix)
+        } else {
+            self.store.list_kv_keys(&req.prefix)
+        };
+        let mut entries = entries.map_err(|e| map_store_error("Error listing kv entries", e))?;
         entries.retain(|entry| {
             identity.allows(
                 AclResource::Kv,
@@ -10622,10 +10798,23 @@ impl ManagerDaemonService {
         desired: &[crate::structs::TaskAllocation],
     ) -> Vec<AllocNetPolicy> {
         use crate::structs::netpolicy::NetSelectorFacts;
+        // Gated by placement, which can resolve `auto` with no `network`
+        // block on the task at all (a default sandbox, gated plan Phase 2):
+        // the allocation's own network records it.
+        let placed_gated = |allocation: &crate::structs::TaskAllocation| {
+            allocation
+                .network
+                .contains(crate::structs::netpolicy::MODE_GATED)
+                && serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
+                    .is_ok_and(|placed| placed.is_gated())
+        };
         let any_inline = desired
             .iter()
             .any(|allocation| !allocation.task_network.trim().is_empty());
-        if self.net_policy_generation_cached() == 0 && !any_inline {
+        if self.net_policy_generation_cached() == 0
+            && !any_inline
+            && !desired.iter().any(placed_gated)
+        {
             return Vec::new();
         }
         // Stored policies once per heartbeat; the node's pool once, and only
@@ -10676,11 +10865,15 @@ impl ManagerDaemonService {
             };
             let (effective, _) = merge_net_policies(&stored, &facts, network.as_ref());
             // A gated allocation is told about an *empty* policy too, so the
-            // node can tell "known: nothing applies" (allow through the
-            // datapath) from "pending" (fail closed).
-            let gated = network
-                .as_ref()
-                .is_some_and(|n| n.mode == crate::structs::netpolicy::MODE_GATED)
+            // node can tell "known: nothing covers it" (`gated-default`) from
+            // "pending" (`policy-pending`). Gated by its declaration, by a
+            // `require` policy, or by placement resolving `auto` (a default
+            // sandbox, gated plan Phase 2), which the allocation's own
+            // network records.
+            let gated = placed_gated(allocation)
+                || network
+                    .as_ref()
+                    .is_some_and(|n| n.mode == crate::structs::netpolicy::MODE_GATED)
                 || effective.mode.as_deref() == Some(crate::structs::netpolicy::MODE_GATED);
             if effective.is_empty() && !gated {
                 continue;
@@ -10858,6 +11051,7 @@ impl ManagerDaemonService {
                     allocation_id: row.allocation_id,
                     node_id: row.node_id.clone(),
                     address: row.address.clone().unwrap_or_default(),
+                    public_address: row.public_address.clone().unwrap_or_default(),
                     port: u32::from(row.port.unwrap_or(0)),
                     healthy: row.healthy,
                     health_status: row.health_status.clone(),
@@ -10921,6 +11115,44 @@ impl ManagerDaemonService {
         }
         // Idle edges age out with their last bucket.
         edges.retain(|_, window| now - window.last_seen <= EDGE_WINDOW_MINUTES * 60);
+    }
+
+    /// The `egress-unenforced` note for each running allocation of `task`
+    /// that lands on a dev backend while the gated default is open (gated
+    /// plan §6.6). Lookup failures degrade to no note.
+    fn egress_unenforced_notes(
+        &self,
+        job_id: &str,
+        task: &crate::structs::TaskConfig,
+    ) -> Vec<String> {
+        if !self.store.sandbox_gated_default() || task.runtime != "sandbox" {
+            return Vec::new();
+        }
+        let Ok(allocations) = self.store.allocs_for_job(job_id) else {
+            return Vec::new();
+        };
+        let mut notes = Vec::new();
+        for allocation in allocations {
+            let is_task = self
+                .store
+                .get_task_config_by_id(allocation.task_config_id)
+                .ok()
+                .flatten()
+                .is_some_and(|candidate| candidate.name == task.name);
+            if !is_task || allocation.status != crate::constants::ALLOCATION_STATUS_PLACED {
+                continue;
+            }
+            if let Some(note) = egress_unenforced_detail(&self.store, &allocation, task) {
+                let note = format!(
+                    "allocation {} on node {}: {note}",
+                    allocation.id, allocation.node_id
+                );
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
+            }
+        }
+        notes
     }
 
     fn net_status_for_task(&self, job_id: &str, task_name: &str) -> Vec<String> {
@@ -11136,7 +11368,39 @@ fn net_status_json(node_id: &str, status: &crate::structs::NetAllocStatus) -> Va
         "tlsReady": status.tls_ready,
         "tlsError": status.tls_error,
         "meshIdentity": status.mesh_identity,
+        "guestAddress": status.guest_address,
+        "guestBridge": status.guest_bridge,
     })
+}
+
+/// Every TAP sandbox guest address the nodes reported, by allocation id, as
+/// `(address, bridge)` (`NetAllocStatus.guest_address`).
+fn guest_addresses(
+    status: &HashMap<String, Vec<crate::structs::NetAllocStatus>>,
+) -> HashMap<i64, (String, String)> {
+    status
+        .values()
+        .flatten()
+        .filter(|entry| !entry.guest_address.is_empty())
+        .map(|entry| {
+            (
+                entry.allocation_id,
+                (entry.guest_address.clone(), entry.guest_bridge.clone()),
+            )
+        })
+        .collect()
+}
+
+/// Fill `info`'s guest address from the node reports, for its running
+/// allocation.
+fn attach_guest_address(info: &mut InstanceInfo, addresses: &HashMap<i64, (String, String)>) {
+    if let Some((address, bridge)) = info
+        .current_alloc_id
+        .and_then(|allocation_id| addresses.get(&allocation_id))
+    {
+        info.guest_address = Some(address.clone());
+        info.guest_bridge = Some(bridge.clone());
+    }
 }
 
 fn net_policy_to_proto(
@@ -11262,6 +11526,7 @@ fn build_upstream_endpoints(
                         allocation_id: row.allocation_id,
                         node_id: row.node_id,
                         address: row.address.unwrap_or_default(),
+                        public_address: row.public_address.unwrap_or_default(),
                         port: u32::from(row.port.unwrap_or(0)),
                         healthy: row.healthy,
                         health_status: row.health_status,
@@ -11682,6 +11947,129 @@ mod tests {
         Ok(())
     }
 
+    /// Gated plan §6.7: the node's report of a TAP guest's leased address
+    /// reaches the instance serving that allocation, and no other.
+    #[test]
+    fn a_reported_guest_address_reaches_its_instance() {
+        let report = |allocation_id, address: &str| crate::structs::NetAllocStatus {
+            allocation_id,
+            mode: "host".into(),
+            guest_address: address.into(),
+            guest_bridge: if address.is_empty() { "" } else { "br0" }.into(),
+            ..Default::default()
+        };
+        let status = HashMap::from([(
+            "w-03".to_string(),
+            vec![report(7, "10.88.128.7"), report(8, "")],
+        )]);
+        let addresses = guest_addresses(&status);
+        let mut running = InstanceInfo {
+            current_alloc_id: Some(7),
+            ..Default::default()
+        };
+        attach_guest_address(&mut running, &addresses);
+        assert_eq!(running.guest_address.as_deref(), Some("10.88.128.7"));
+        assert_eq!(running.guest_bridge.as_deref(), Some("br0"));
+        for current_alloc_id in [Some(8), Some(9), None] {
+            let mut other = InstanceInfo {
+                current_alloc_id,
+                ..Default::default()
+            };
+            attach_guest_address(&mut other, &addresses);
+            assert_eq!(other.guest_address, None);
+        }
+    }
+
+    /// Gated plan Phase 2: an allocation placed gated by `auto` (a sandbox
+    /// that declares no `network` block) is told about its empty policy,
+    /// so its node denies with `gated-default` instead of waiting forever
+    /// on `policy-pending`, even on a cluster with no policy objects.
+    #[test]
+    fn a_placement_gated_allocation_gets_its_empty_policy() -> R<()> {
+        let manager = ManagerDaemonService::new(setup_store()?);
+        let placed = |allocation_id: i64, mode: &str| crate::structs::TaskAllocation {
+            allocation_id,
+            task_runtime: "sandbox".into(),
+            network: json!({ "mode": mode }).to_string(),
+            ..Default::default()
+        };
+        let assignments =
+            manager.build_net_policies("node-1", &[placed(7, "gated"), placed(8, "host")]);
+        assert_eq!(assignments.len(), 1, "{assignments:?}");
+        assert_eq!(assignments[0].allocation_id, 7);
+        assert!(!assignments[0].policy_hash.is_empty());
+        Ok(())
+    }
+
+    /// Gated plan §6.5: `net policy test` answers like the datapath. A gated
+    /// task that no egress chain covers is denied with `gated-default` and
+    /// the fix; a host task is allowed; and with the Phase 2 gate open, a
+    /// sandbox that declares nothing is gated by default too.
+    #[tokio::test]
+    async fn net_policy_test_reports_the_gated_default() -> R<()> {
+        let store = setup_store()?;
+        let job = |name: &str, runtime: &str, network: Option<Value>| -> R<JobConfig> {
+            let mut task = serde_json::json!({
+                "name": "workspace",
+                "runtime": runtime,
+                "config": { "image": "alpine", "command": ["sleep", "1"] },
+            });
+            if let Some(network) = network {
+                task["network"] = network;
+            }
+            Ok(JobConfig {
+                priority: Default::default(),
+                name: name.into(),
+                tasks: vec![serde_json::from_value(task)?],
+                rollout: None,
+                rollout_by_group: Default::default(),
+                version: None,
+            })
+        };
+        store.handle_job_submit(
+            &job("gated", "container", Some(json!({ "mode": "gated" })))?,
+            &[submission()],
+        )?;
+        store.handle_job_submit(&job("plain", "container", None)?, &[submission()])?;
+        store.handle_job_submit(&job("agents", "sandbox", None)?, &[submission()])?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let test = |job_id: &'static str| {
+            let manager = &manager;
+            async move {
+                manager
+                    .test_net_policy(Request::new(TestNetPolicyRequest {
+                        job_id: job_id.into(),
+                        to: "https://example.com".into(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .map(|reply| reply.into_inner())
+            }
+        };
+
+        let reply = test("gated").await?;
+        assert_eq!(reply.verdict, "deny");
+        assert_eq!(reply.source, "gated-default");
+        assert_eq!(
+            reply.reason,
+            "task workspace is gated and nothing allows example.com"
+        );
+        assert!(
+            reply
+                .hint
+                .contains("add \"example.com\" to network.egress.allow"),
+            "{}",
+            reply.hint
+        );
+        assert_eq!(test("plain").await?.verdict, "allow");
+
+        // The default sandbox: host until Phase 0 opens the gate.
+        assert_eq!(test("agents").await?.verdict, "allow");
+        store.set_sandbox_gated_default(true);
+        assert_eq!(test("agents").await?.source, "gated-default");
+        Ok(())
+    }
+
     /// `ListJobs.status` narrows the page to one status (case-insensitively)
     /// while `status_counts` keeps counting the whole query-matched set, so a
     /// filter control can show "stopped (1)" while "running" is selected.
@@ -11700,6 +12088,9 @@ mod tests {
             .into_inner();
         assert_eq!(all.total_count, 3);
         assert_eq!(all.status_counts.get("stopped"), Some(&1));
+        // The status is derived from the workload: nothing is placed, so the
+        // two live jobs read `pending`, not the stored lifecycle `active`.
+        assert_eq!(all.status_counts.get("pending"), Some(&2));
         assert_eq!(all.status_counts.values().sum::<u32>(), 3);
 
         let stopped = manager
@@ -12775,7 +13166,7 @@ mod tests {
             evals_of_kind(&manager.store, "kv-del-none", "rollout_tick")?,
             0
         );
-        assert_eq!(manager.store.get_job("kv-del-none")?.status, "done");
+        assert_eq!(manager.store.get_job("kv-del-none")?.status, "active");
         // The last rendered value is kept in the desired config.
         assert_eq!(
             task_env_value(&manager.store, "kv-del-none", 0, "WATCHED")?,
@@ -12802,7 +13193,7 @@ mod tests {
             evals_of_kind(&manager.store, "kv-del-restart", "job_update")?,
             1
         );
-        assert_eq!(manager.store.get_job("kv-del-restart")?.status, "done");
+        assert_eq!(manager.store.get_job("kv-del-restart")?.status, "active");
         Ok(())
     }
 
@@ -12899,7 +13290,7 @@ mod tests {
         // Recovery path: putting the key back resolves through onChange.
         put_kv_entry(&manager, "recover/key", "v2").await?;
 
-        assert_eq!(store.get_job("kv-recover")?.status, "done");
+        assert_eq!(store.get_job("kv-recover")?.status, "active");
         assert_eq!(evals_of_kind(&store, "kv-recover", "job_update")?, 1);
         assert_eq!(task_env_value(&store, "kv-recover", 0, "WATCHED")?, "v2");
         Ok(())
@@ -13050,9 +13441,9 @@ mod tests {
         assert_eq!(stamped.status, "failed:missing_kv_dependency");
 
         // Put the key back: onChange=restart recovers — job status back to
-        // done and a job_update enqueued to replace the failed allocations.
+        // active and a job_update enqueued to replace the failed allocations.
         put_kv_entry(&manager, "clr/key", "v2").await?;
-        assert_eq!(store.get_job("kv-clr")?.status, "done");
+        assert_eq!(store.get_job("kv-clr")?.status, "active");
         assert_eq!(evals_of_kind(&store, "kv-clr", "job_update")?, 1);
         Ok(())
     }
@@ -13084,7 +13475,7 @@ mod tests {
             watched_env_jobspec("kv-none", "none/key", "none", "fail"),
         )
         .await?;
-        assert_eq!(store.get_job("kv-none")?.status, "done");
+        assert_eq!(store.get_job("kv-none")?.status, "active");
         Ok(())
     }
 
@@ -13123,7 +13514,7 @@ mod tests {
             evals_of_kind(&manager.store, "kv-unwatched", "rollout_tick")?,
             0
         );
-        assert_eq!(manager.store.get_job("kv-unwatched")?.status, "done");
+        assert_eq!(manager.store.get_job("kv-unwatched")?.status, "active");
         // The put still refreshed the desired config (state-only update).
         assert_eq!(
             task_env_value(&manager.store, "kv-unwatched", 0, "WATCHED")?,
@@ -13496,7 +13887,7 @@ mod tests {
 
         // Only a replacement clears the failure stamps, so the put restarts.
         put_kv_entry(&manager, "certs/gone", "pem-2").await?;
-        assert_eq!(store.get_job("kv-live-fail")?.status, "done");
+        assert_eq!(store.get_job("kv-live-fail")?.status, "active");
         assert_eq!(evals_of_kind(&store, "kv-live-fail", "job_update")?, 1);
         Ok(())
     }

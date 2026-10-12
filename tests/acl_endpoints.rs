@@ -760,13 +760,17 @@ async fn call_endpoint(
             .await
             .map(|_| ()),
         "GetKv" => svc
-            .get_kv(req(GetKvRequest { key: KV_KEY.into() }, token))
+            .get_kv(req(GetKvRequest {
+                    key: KV_KEY.into(),
+                    ..Default::default()
+                }, token))
             .await
             .map(|_| ()),
         "ListKv" => svc
             .list_kv(req(
                 ListKvRequest {
                     prefix: String::new(),
+                    include_values: true,
                 },
                 token,
             ))
@@ -2334,6 +2338,7 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
         .get_kv(req(
             GetKvRequest {
                 key: "secret/hidden".into(),
+                ..Default::default()
             },
             Some(&secret),
         ))
@@ -2346,6 +2351,7 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
         .list_kv(req(
             ListKvRequest {
                 prefix: String::new(),
+                include_values: true,
             },
             Some(&secret),
         ))

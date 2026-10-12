@@ -453,10 +453,12 @@ export const Manager = {
      * - NotFound: no snapshot with that id or name in the job.
      * - InvalidArgument: the snapshot was taken from another task, or more
      *   than 64 instances were asked for.
-     * - FailedPrecondition: the snapshot is not `local` or `published`, is a
-     *   suspend or fork checkpoint (owned by an instance, not a seed; take a
-     *   manual snapshot), or is a memory snapshot and the task now declares
-     *   gated networking.
+     * - FailedPrecondition: the snapshot is not `local` or `published`, or is
+     *   a suspend or fork checkpoint (owned by an instance, not a seed; take a
+     *   manual snapshot). A memory snapshot whose network shape the task no
+     *   longer has (a gated guest into a TAP config, or the reverse) is
+     *   accepted here and fails the restore by name (`restore needs gated
+     *   networking: ...`), after which `onRestoreFailure` decides.
      *
      * @generated from rpc legion.Manager.CreateInstances
      */
@@ -640,8 +642,11 @@ export const Manager = {
      *   pending, rescheduling, stopped, or terminated); its node runs a worker
      *   without the `checkpoint` capability (the message names the worker
      *   version: upgrade it); a memory checkpoint was asked of a runtime that
-     *   supports disk only (`Hint: use --checkpoint disk`), of a gated
-     *   sandbox, or of a sandbox not launched for memory checkpoints.
+     *   supports disk only (`Hint: use --checkpoint disk`), of a sandbox not
+     *   launched for memory checkpoints, or of a gated sandbox on a
+     *   Firecracker older than 1.16.1, which cannot move a restored guest's
+     *   vsock to its new allocation's socket (`Hint: upgrade Firecracker on
+     *   the node, or use --checkpoint disk`).
      *   With `suspend.durability = "store"`, the instance's data is
      *   on a node-local volume (`local-dir`, or a driver advertising
      *   `nodeLocal`), or its node's worker has no `contentStore` (it does not
@@ -738,10 +743,12 @@ export const Manager = {
      *   - a disk fork of an instance with no `stateful.storage` volume, or one
      *     whose volume driver lacks the `snapshot` or `clone` op (so `exec`
      *     and `container` tasks without a snapshot-capable volume cannot fork);
-     *   - a memory fork of a task that cannot take one (not a sandbox, not
-     *     launched for memory checkpoints, or gated networking), or of a
-     *     Firecracker sandbox wired to a TAP device on Firecracker older than
-     *     1.12, which cannot move a restored NIC to a new TAP device;
+     *   - a memory fork of a task that cannot take one (not a sandbox, or not
+     *     launched for memory checkpoints), of a Firecracker sandbox wired to
+     *     a TAP device on Firecracker older than 1.12, which cannot move a
+     *     restored NIC to a new TAP device, or of a gated Firecracker sandbox
+     *     on Firecracker older than 1.16.1, which cannot move a restored
+     *     guest's vsock to the fork's own socket;
      *   - a disk fork of a sandbox wired to a TAP device: every fork would
      *     boot on the TAP device the origin holds;
      *   - `spread = true` with a disk checkpoint, with an instance that has a
@@ -863,8 +870,10 @@ export const Manager = {
      *     `checkpoint` capability (the message names the worker version;
      *     upgrade the worker);
      *   - `memory` was asked for a task that cannot take one: not a `sandbox`
-     *     task, no `snapshots` block, `snapshots.memory = false`, or gated
-     *     networking (which memory checkpoints do not support yet);
+     *     task, no `snapshots` block, or `snapshots.memory = false`;
+     *   - `memory` was asked of a gated sandbox on a Firecracker older than
+     *     1.16.1, which cannot move a restored guest's vsock to a new socket
+     *     (the message names the node and version);
      *   - `disk` was asked for an instance with no `stateful.storage` volume;
      *   - a snapshot of this instance is already being captured.
      * - AlreadyExists: `name` is already used by another snapshot of the job.

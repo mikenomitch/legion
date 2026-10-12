@@ -46,6 +46,65 @@ Manager API and CLI support:
 - delete
 - json patch (for JSON values only)
 
+### Listing never returns values
+
+`ListKv` returns every matching entry's key, type, version, timestamps, and
+`encrypted` flag, but **not its value**. `value` comes back as the empty
+string, and the manager does not decrypt anything to answer a listing.
+Browsing key names is not a bulk secret read.
+
+```bash
+legion kv list app/                 # keys, types, versions
+legion kv list app/ --values --json # opt in: decrypts every listed entry
+```
+
+Over gRPC, set `ListKvRequest.include_values = true` to get values in a
+listing. `GetKv` returns the value. `GetKvRequest.metadata_only = true`
+returns the entry without its value, also without decrypting.
+
+### Which jobs read a key
+
+`GetKv` also returns `references`: the jobs whose current config reads the
+key, one entry per place it is read (a `$path/key` reference or a task's
+`kvInjections` env var or file), each with a JSON pointer into the job
+config. Only jobs you hold `job:read` on are listed. References are recorded
+when a job version is submitted (see [Job KV References](#job-kv-references)),
+so a job drops out when a newer version stops reading the key.
+
+```
+$ legion kv get fullstack/db-password
+...
+used by:
+  fullstack /tasks/api/kvInjections/env/DB_PASSWORD
+```
+
+`--json` prints the entry only. Use `GetKv` directly for `references`.
+
+### In the UI
+
+The KV Store page lists keys and types only. Selecting a key loads its
+metadata (type, version, timestamps, encrypted-at-rest) with the value
+masked:
+
+- **Reveal** fetches and shows the value. It re-masks after 60 seconds, on
+  **Hide**, or when you switch keys, refresh, leave the page, or background
+  the tab. The plaintext is dropped from the page each time.
+- **Copy value** fetches the value straight to the clipboard without showing
+  it.
+- **Reveal to edit** edits the shown value. The save is version-checked
+  against the version you revealed.
+- **Replace value** writes a new value without revealing the old one. The
+  save is version-checked against the metadata version.
+- **Used by** lists the jobs that read the key, each linked to its job page.
+  Delete warns when any job does.
+- **+ New** only creates. Naming a key that exists is refused rather than
+  overwriting a value nobody saw. To rename a key, create the new one and
+  delete the old.
+
+The encryption-at-rest status strip (keyring state, root key, counts,
+rotation) is at the top of this page. It needs `operator:read` and is hidden
+without it.
+
 Value normalization rules:
 
 - `string`: stored as-is
@@ -309,7 +368,7 @@ Recovery paths:
 
 - Put the missing key back. The put resolves through the edge's `onChange`.
   A `restart` or `rollout` action re-renders the config, clears the
-  `failed:missing_kv_dependency` stamps, flips the job status back to `done`,
+  `failed:missing_kv_dependency` stamps, clears the job's `failed` status,
   and replaces the failed allocations.
 - `onChange = "none"` doesn't recover on its own. A put re-renders and stores
   the desired config but schedules nothing, so the job stays `failed` with its
@@ -396,5 +455,5 @@ Recover by putting the key back:
 
 ```sh
 cargo run -- kv put demo/banner back
-cargo run -- job list -j        # status: done; task restarted with BANNER=back
+cargo run -- job list -j        # status: running; task restarted with BANNER=back
 ```

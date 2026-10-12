@@ -892,7 +892,9 @@ pub fn catalog() -> Vec<Capability> {
             grpc: None,
             summary: "Internal: the gated sandbox guest agent, started by the generated guest \
                  init inside a microVM to relay the guest's loopback proxy and DNS ports to the \
-                 node datapath over vsock. Not for operators or agents to run.",
+                 node datapath over vsock. On a sandbox launched for memory checkpoints it also \
+                 runs the resume watch and closes its relays on a restore. Not for operators or \
+                 agents to run.",
             mutates: false,
             read_only_safe: false,
         },

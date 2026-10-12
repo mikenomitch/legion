@@ -255,10 +255,12 @@ service Manager {
   // - NotFound: no snapshot with that id or name in the job.
   // - InvalidArgument: the snapshot was taken from another task, or more
   //   than 64 instances were asked for.
-  // - FailedPrecondition: the snapshot is not `local` or `published`, is a
-  //   suspend or fork checkpoint (owned by an instance, not a seed; take a
-  //   manual snapshot), or is a memory snapshot and the task now declares
-  //   gated networking.
+  // - FailedPrecondition: the snapshot is not `local` or `published`, or is
+  //   a suspend or fork checkpoint (owned by an instance, not a seed; take a
+  //   manual snapshot). A memory snapshot whose network shape the task no
+  //   longer has (a gated guest into a TAP config, or the reverse) is
+  //   accepted here and fails the restore by name (`restore needs gated
+  //   networking: ...`), after which `onRestoreFailure` decides.
   rpc CreateInstances (CreateInstancesRequest) returns (CreateInstancesReply);
 
   // Destroys a keyed-mode instance: stops its current allocation, drops its
@@ -410,8 +412,11 @@ service Manager {
   //   pending, rescheduling, stopped, or terminated); its node runs a worker
   //   without the `checkpoint` capability (the message names the worker
   //   version: upgrade it); a memory checkpoint was asked of a runtime that
-  //   supports disk only (`Hint: use --checkpoint disk`), of a gated
-  //   sandbox, or of a sandbox not launched for memory checkpoints.
+  //   supports disk only (`Hint: use --checkpoint disk`), of a sandbox not
+  //   launched for memory checkpoints, or of a gated sandbox on a
+  //   Firecracker older than 1.16.1, which cannot move a restored guest's
+  //   vsock to its new allocation's socket (`Hint: upgrade Firecracker on
+  //   the node, or use --checkpoint disk`).
   //   With `suspend.durability = "store"`, the instance's data is
   //   on a node-local volume (`local-dir`, or a driver advertising
   //   `nodeLocal`), or its node's worker has no `contentStore` (it does not
@@ -502,10 +507,12 @@ service Manager {
   //   - a disk fork of an instance with no `stateful.storage` volume, or one
   //     whose volume driver lacks the `snapshot` or `clone` op (so `exec`
   //     and `container` tasks without a snapshot-capable volume cannot fork);
-  //   - a memory fork of a task that cannot take one (not a sandbox, not
-  //     launched for memory checkpoints, or gated networking), or of a
-  //     Firecracker sandbox wired to a TAP device on Firecracker older than
-  //     1.12, which cannot move a restored NIC to a new TAP device;
+  //   - a memory fork of a task that cannot take one (not a sandbox, or not
+  //     launched for memory checkpoints), of a Firecracker sandbox wired to
+  //     a TAP device on Firecracker older than 1.12, which cannot move a
+  //     restored NIC to a new TAP device, or of a gated Firecracker sandbox
+  //     on Firecracker older than 1.16.1, which cannot move a restored
+  //     guest's vsock to the fork's own socket;
   //   - a disk fork of a sandbox wired to a TAP device: every fork would
   //     boot on the TAP device the origin holds;
   //   - `spread = true` with a disk checkpoint, with an instance that has a
@@ -597,8 +604,10 @@ service Manager {
   //     `checkpoint` capability (the message names the worker version;
   //     upgrade the worker);
   //   - `memory` was asked for a task that cannot take one: not a `sandbox`
-  //     task, no `snapshots` block, `snapshots.memory = false`, or gated
-  //     networking (which memory checkpoints do not support yet);
+  //     task, no `snapshots` block, or `snapshots.memory = false`;
+  //   - `memory` was asked of a gated sandbox on a Firecracker older than
+  //     1.16.1, which cannot move a restored guest's vsock to a new socket
+  //     (the message names the node and version);
   //   - `disk` was asked for an instance with no `stateful.storage` volume;
   //   - a snapshot of this instance is already being captured.
   // - AlreadyExists: `name` is already used by another snapshot of the job.
@@ -2500,10 +2509,22 @@ message GetJobSpecByConfigRequest {
 
 // Reply payload for GetJobSpec.
 message GetJobSpecReply {
-  // Submissions associated with the latest job config.
-  //
-  // Field number intentionally remains `2` for compatibility.
+  // Source submissions associated with the job config, exactly as the
+  // submitter sent them (usually Nickel source, not JSON). Read these to show
+  // what was typed; read `rendered_jobspec` to learn what the job is.
   repeated Submission submissions = 2;
+
+  // The job config the manager stored, as a JSON object: `name`, `priority`,
+  // `version`, `rollout`/`rollout_by_group` when set, and `tasks` — each
+  // task in the same camelCase shape `RunJobRequest.parsed_jobspec` accepts
+  // (`group`, `runtime`, `lifecycle`, `count`, `dependsOn`, `config`,
+  // `resources`, `checks`, `network`, `service`, `stateful`, ...).
+  //
+  // This is the authoritative structure of the job whatever language it was
+  // written in, with scale overrides NOT applied (`count` is the spec's).
+  // Empty string only when the config could not be loaded, which the
+  // manager reports as an error instead.
+  string rendered_jobspec = 3;
 }
 
 // One job spec history entry.
@@ -3130,6 +3151,13 @@ message ForkInstanceReply {
   // `local`: the forks run on `node_id`. `store` (a spread fork): the
   // checkpoint is published first, and each fork runs on its own node.
   string durability = 8;
+
+  // One-line notes about side effects of the fork's capture on the origin,
+  // printed by `legion instance fork` as `note: ...`. Today: a memory fork
+  // of a gated sandbox on Firecracker resets the origin's open network
+  // connections (the origin keeps running). Empty when there is nothing to
+  // say, and on a deduplicated reply.
+  repeated string notes = 9;
 }
 
 // Request payload for ReplaceInstance.
@@ -3362,6 +3390,22 @@ message InstanceInfo {
   // otherwise. See docs/suspend-and-resume.md, "When a resume cannot
   // restore".
   optional InstanceColdBoot cold_boot = 34;
+
+  // The IPv4 address the running allocation's guest holds, for a `sandbox`
+  // on `config.network = { mode = "tap", bridge = ... }`. Legion leases it
+  // from the bridge's pool in the node's worker config
+  // (`sandbox.bridges.<bridge>`) at boot, and leases a fresh one on every
+  // restore and fork, which the guest applies before its workload runs
+  // again: a fork never answers on its origin's address, and a resume on
+  // the same node gets its previous address back when it is still free.
+  // From the node's latest network status report, so unset for a few
+  // seconds after a start, and unset for gated and loopback-only sandboxes
+  // and every other runtime. See docs/task-runtime-sandbox.md, "Addressing".
+  optional string guest_address = 35;
+
+  // The bridge `guest_address` belongs to (`br0`). Set exactly when
+  // `guest_address` is.
+  optional string guest_bridge = 36;
 }
 
 // A cold boot that replaced a restore (InstanceInfo.cold_boot).
@@ -3565,6 +3609,14 @@ message CreateSnapshotReply {
   // `idempotency_key` rather than applied fresh. The snapshot is then the one
   // the original call created, in whatever state it has reached since.
   bool deduplicated = 2;
+
+  // One-line notes about side effects of this capture the caller should
+  // know, printed by `legion snapshot create` as `note: ...`. Today: a live
+  // memory capture of a gated sandbox on Firecracker resets the guest's open
+  // network connections (Firecracker resets every vsock connection at
+  // snapshot time; the guest keeps running and new connections work). Empty
+  // when there is nothing to say, and on a deduplicated reply.
+  repeated string notes = 3;
 }
 
 // Request payload for ListSnapshots.
@@ -4173,8 +4225,9 @@ message ListJobsRequest {
   // Default: `20`.
   optional uint32 page_size = 5;
 
-  // Keep only jobs whose status equals this value (case-insensitive, exact —
-  // `run` does not match `running`; use `query` for substring search).
+  // Keep only jobs whose derived status (see `Job.status`) equals this value
+  // (case-insensitive, exact — `run` does not match `running`; use `query`
+  // for substring search).
   // Applied after `query` and before paging, so `total_count` reflects the
   // filtered set. Omit or leave empty to return every status.
   optional string status = 6;
@@ -4188,9 +4241,33 @@ message Job {
   // Job name.
   string name = 2;
 
-  // Job status string.
+  // Job status, derived from the job's workload each time it is read. First
+  // match wins:
   //
-  // Current values written by manager include: done, stopped, failed.
+  // - `stopped`: `StopJob` stopped the job. `RunJob` brings it back.
+  // - `failed`: a required KV dependency vanished (`onDelete: fail`), or
+  //   nothing is live and a task's last run failed (it spent its restart and
+  //   move budgets, or exited unsuccessfully under a policy that does not
+  //   restart it).
+  // - `running`: at least one allocation of any version of the job is live
+  //   (placed and not yet terminal).
+  // - `pending`: nothing is live, and a task that wants an allocation has not
+  //   finished: it is waiting to be placed (no node fits, or no node is up)
+  //   or waiting on a `dependsOn` condition.
+  // - `scheduled`: nothing is live, nothing is pending, and a cron task
+  //   (`schedule`) finished its last run and waits for the next one.
+  // - `complete`: nothing is live, and every task that wants an allocation
+  //   finished successfully. A batch job reads this once it is done.
+  // - `suspended`: no task wants an allocation, and at least one keyed
+  //   instance is suspended.
+  // - `idle`: no task wants an allocation: every task is scaled to zero, or
+  //   a keyed task has no pending, active, or rescheduling instances.
+  //
+  // Task outcomes come from the job's latest spec version; live allocations
+  // count from every version, so a job mid-rollout reads `running`. The
+  // state store's `job.status` column is not this value: it holds the
+  // lifecycle flag (`active`, `stopped`, `failed`) the derivation starts
+  // from.
   string status = 3;
 
   // Unix timestamp (seconds) when job was created. Immutable for the life of
@@ -6786,12 +6863,48 @@ message GetKvRequest {
   //
   // Must be non-empty.
   string key = 1;
+
+  // Return the entry without its value: `entry.value` is the empty string
+  // and the manager does not decrypt it. Everything else (type, version,
+  // timestamps, `encrypted`, and `GetKvReply.references`) is returned.
+  //
+  // For a client that shows a key's details and reveals the value only on
+  // request. Default `false`. Needs the same `kv:read` as a full read.
+  bool metadata_only = 2;
 }
 
 // Reply payload for GetKv.
 message GetKvReply {
   // Entry when found; unset when key does not exist.
   optional KvEntry entry = 1;
+
+  // Jobs whose current config reads this key: through a `$path/key`
+  // reference anywhere in the jobspec, or through a task's `kvInjections`
+  // (env vars and files rendered from KV). One entry per place the key is
+  // read, so a job that reads it twice appears twice with different
+  // `json_pointer`s.
+  //
+  // Recorded at submit time from the job's latest config; a job that stopped
+  // reading the key drops out when its next version is submitted. Only jobs
+  // the caller holds `job:read` on are listed, so the list can be shorter
+  // than the real set. Returned even when `entry` is unset, so a reference
+  // to a key that was deleted is still visible.
+  repeated KvJobReference references = 2;
+}
+
+// One place a job's config reads a KV key (GetKvReply.references).
+message KvJobReference {
+  // Job that reads the key.
+  string job_id = 1;
+
+  // Job config that recorded the reference (the job's latest version when
+  // it was submitted).
+  string job_config_id = 2;
+
+  // Where in the job config the key is read, as a JSON pointer: for example
+  // `/tasks/0/config/env/DB_PASSWORD` for a `$path/key` reference, or
+  // `/tasks/web/kvInjections/env/GREETING` for an injected env var.
+  string json_pointer = 3;
 }
 
 // Request payload for ListKv.
@@ -6800,6 +6913,16 @@ message ListKvRequest {
   //
   // Default empty string matches all keys.
   string prefix = 1;
+
+  // Return each entry's value. Default `false`: entries come back with
+  // `value` set to the empty string, and the manager never decrypts them.
+  //
+  // Listing is for browsing keys; reading a secret should be a deliberate
+  // act, so a listing does not ship every plaintext to whoever asks for the
+  // key names. Fetch one value with `GetKv`, or set this to `true` (as
+  // `legion kv list --values` does) to get them all. Every other field
+  // (type, version, timestamps, `encrypted`) is returned either way.
+  bool include_values = 2;
 }
 
 // Reply payload for ListKv.
@@ -7090,6 +7213,16 @@ message ServiceEndpoint {
   // PROXY protocol v2 TLV; a plain client dialing the port directly is
   // refused at the handshake.
   bool mesh_tls = 13;
+
+  // Public host name or IP of the endpoint's node, when its worker was
+  // started with `LEGION_WORKER_PUBLIC_ADDRESS`; empty otherwise.
+  //
+  // `address` is where the cluster reaches the endpoint (usually a private
+  // address); this is where a client outside the private network reaches
+  // the same `port`, for links in the UI and CLI. Display only: nothing in
+  // the cluster dials it, and it does not open the port — the node's
+  // firewall or security group must still allow the traffic.
+  string public_address = 14;
 }
 
 // Request payload for ListServiceEdges.
@@ -7377,6 +7510,14 @@ message LedgerAllocation {
   // stateless tasks. Full instance metadata (mode, state, slot index,
   // storage handle) is available via `GetInstance` / `ListInstances`.
   optional string instance_id = 9;
+
+  // Name of the task this allocation runs (the `name` of the task config
+  // named by `task_config_id`).
+  //
+  // Lets a client group a job's allocations by task without a second
+  // lookup. Empty only when the task config row is gone, which a live
+  // allocation never sees.
+  string task_name = 11;
 }
 
 // Request payload for UpdateNodeDynamic.
@@ -7491,6 +7632,35 @@ message ListEventsRequest {
 
   // Optional severity filter. Values: `info`, `warn`, `error`.
   optional string level = 6;
+
+  // Optional stateful instance filter: only events about this instance.
+  //
+  // An event is about an instance when its `metadata_json` names it — as
+  // `instanceId` (suspend, resume, restore, fork, snapshot, volume, and
+  // provisional-start events) or `instance_id` (`node.pressure`), as one of `instances` (the
+  // forks an `instance.forked` or `instance.fork_failed` created), or as one
+  // of `suspending` (the instances an `instance.make_room` suspended) — or
+  // when it is about an allocation that fulfilled the instance, matched the
+  // way `allocation_id` matches (so `allocation.placed`, `allocation.failed`,
+  // `allocation.stopping`, and the rest). The allocation match covers
+  // allocations the manager still has a row for; events about an allocation
+  // whose row has since been pruned match only through their metadata.
+  //
+  // Combines with the other filters (AND). Matched exactly; an unknown id
+  // simply matches nothing.
+  optional string instance_id = 7;
+
+  // Optional allocation filter: only events about this allocation.
+  //
+  // Matches `SchedulerEvent.allocation_id`, and also the batched events that
+  // cover several allocations and so leave that field unset: they list them
+  // in metadata as `placements[].allocationId` (`allocation.placed`) or
+  // `allocations[].allocationId` (`allocation.stopping`,
+  // `allocation.preempted`), or `victims[].allocationId`
+  // (`allocation.preempt_planned`). A batched event lists at most its first
+  // 20 allocations, so a batch of more than 20 matches only for those 20. `allocation.removed` events name no allocation ids and never
+  // match.
+  optional int64 allocation_id = 8;
 }
 
 // Reply payload for ListEvents.
@@ -7525,6 +7695,17 @@ message StreamEventsRequest {
 
   // Optional severity filter. Values: `info`, `warn`, `error`.
   optional string level = 5;
+
+  // Optional stateful instance filter. Same semantics as
+  // `ListEventsRequest.instance_id`, with one difference for live events:
+  // the allocation match is resolved against the instance's allocations when
+  // each event arrives, so an allocation placed after the stream opened is
+  // still matched.
+  optional string instance_id = 6;
+
+  // Optional allocation filter. Same semantics as
+  // `ListEventsRequest.allocation_id`.
+  optional int64 allocation_id = 7;
 }
 
 // Internal eval queue item.
@@ -9323,7 +9504,10 @@ message ShowNetPolicyReply {
   // Names of the stored policies that matched, in application order.
   repeated string matched_policies = 2;
 
-  // The task's declared `network.mode` and the mode the merge resolved.
+  // The task's declared `network.mode`, and the mode it resolves to: the one
+  // a matching `require` policy imposes, else the declared one with `auto`
+  // resolved for the task's runtime (assuming a microVM node for a sandbox;
+  // each allocation's node status carries the mode it actually runs in).
   string declared_mode = 3;
   string effective_mode = 4;
 
@@ -9332,6 +9516,14 @@ message ShowNetPolicyReply {
   // JSON `NetAllocStatus` objects. Best effort and at most one heartbeat
   // stale.
   repeated string node_status_json = 5;
+
+  // Notes about how the task's network is actually enforced, beyond its
+  // mode, printed by `legion net doctor` as warnings. Today:
+  // `egress-unenforced: ...` for a sandbox that runs without Legion's
+  // egress policy only because its node is a dev backend (Apple
+  // `container`, a Linux OCI runtime) with no vsock to the datapath. Empty
+  // in the common case.
+  repeated string notes = 6;
 }
 
 // Request payload for TestNetPolicy.
@@ -9361,7 +9553,9 @@ message TestNetPolicyReply {
   string verdict = 1;
 
   // The rule that decided (`policy/<name>#<index>`, `task#<index>`, or
-  // `fallthrough`); empty on allow-by-absence. `host-guard` for an egress
+  // `fallthrough`); empty on allow-by-absence. `gated-default` when the task
+  // runs gated and no task block or policy object covers its egress at all:
+  // gated denies everything nothing allows. `host-guard` for an egress
   // target the host guard refuses, which is answered before any policy: the
   // manager resolves the name and judges the built-in classes (loopback,
   // link-local, cloud metadata). A node's own addresses and its `hostGuard`
@@ -9377,6 +9571,11 @@ message TestNetPolicyReply {
 
   // Human-readable one-line explanation.
   string explanation = 6;
+
+  // How to change the verdict, when there is an obvious fix. Set for a
+  // `gated-default` denial: allow the destination in the task's
+  // `network.egress.allow`, or apply a policy object. Empty otherwise.
+  string hint = 7;
 }
 
 // Request payload for FetchNetPolicy (worker plane).
@@ -9493,6 +9692,16 @@ message NetAllocStatus {
 
   // Whether this node currently holds a mesh certificate.
   bool mesh_identity = 14;
+
+  // A TAP-wired `sandbox`'s guest address, leased from its bridge's pool
+  // (`sandbox.bridges.<bridge>` in the worker config) at boot and on every
+  // restore and fork. Empty for every other allocation. The manager surfaces
+  // it as `InstanceInfo.guest_address`. A TAP sandbox is reported here even
+  // when it declares no ports, upstreams, or VIPs, with `mode = "host"`.
+  string guest_address = 15;
+
+  // The bridge `guest_address` belongs to. Empty exactly when it is.
+  string guest_bridge = 16;
 }
 
 // One external handler hop as the datapath sees it.

@@ -455,6 +455,11 @@ Clients use `https://` in `LEGION_ADDR` (CA configurable via
 `LEGION_TLS_CA_CERT`). Join tokens minted by a TLS-enabled manager advertise
 an `https://` address automatically.
 
+The exec WebSocket listener (`server.port + 1`, used by the UI terminal and
+actions) serves TLS with the same certificate and key. The telemetry
+listener (`/metrics` and health probes, `server.port + 2` by default) stays
+plaintext whatever `server.tls` says.
+
 ### Introspection
 
 `legion acl whoami` (CLI), `WhoAmI` (gRPC), the UI Access page, and the

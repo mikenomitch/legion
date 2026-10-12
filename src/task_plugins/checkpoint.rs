@@ -5,14 +5,14 @@
 //! manager can read it without depending on worker code. See
 //! `internal_docs/plans/suspend-resume-and-oversubscription-plan.md` §6.5.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::prelude::*;
-use crate::structs::checkpoint::{MemoryPart, ResumeIdentity};
+use crate::structs::checkpoint::MemoryPart;
 
 /// What a task runtime can capture for one task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -239,119 +239,12 @@ pub fn sha256_file(path: &Path) -> R<(String, u64)> {
 // Identity disk
 // ---------------------------------------------------------------------------
 
-/// Size of the identity disk every memory-checkpointable sandbox boots with.
-/// Large enough for a token and some env, small enough to write per restore.
-pub const IDENTITY_DISK_BYTES: u64 = 1024 * 1024;
-/// First bytes of an identity disk, so the guest agent can find it among the
-/// attached devices and refuse anything else.
-pub const IDENTITY_DISK_MAGIC: &[u8; 8] = b"LEGIONID";
-/// Identity disk format version.
-pub const IDENTITY_DISK_VERSION: u32 = 1;
-const IDENTITY_HEADER_BYTES: usize = 16;
-
-/// Write a fresh identity disk at `path`: a 1 MiB raw image holding
-/// `LEGIONID`, a format version, a payload length (both little-endian
-/// `u32`), and the identity as JSON, zero-padded.
-///
-/// It is a raw image rather than a filesystem so the host can write one per
-/// restore without `mkfs` or a mount, and the guest can read it with a plain
-/// `read(2)` of the block device. Written to a temp name and renamed into
-/// place, owner-only, because it can carry a workload-identity token.
-pub fn write_identity_disk(path: &Path, identity: &ResumeIdentity) -> R<()> {
-    let payload = serde_json::to_vec(identity)?;
-    let capacity = IDENTITY_DISK_BYTES as usize - IDENTITY_HEADER_BYTES;
-    if payload.len() > capacity {
-        bail!(
-            "identity payload is {} bytes, the identity disk holds {capacity}",
-            payload.len()
-        );
-    }
-    let staging = path.with_extension("img.new");
-    let _ = std::fs::remove_file(&staging);
-    {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&staging)
-            .with_context(|| format!("failed to create identity disk {}", staging.display()))?;
-        file.write_all(IDENTITY_DISK_MAGIC)?;
-        file.write_all(&IDENTITY_DISK_VERSION.to_le_bytes())?;
-        file.write_all(&(payload.len() as u32).to_le_bytes())?;
-        file.write_all(&payload)?;
-        file.set_len(IDENTITY_DISK_BYTES)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&staging, path)
-        .with_context(|| format!("failed to publish identity disk {}", path.display()))?;
-    Ok(())
-}
-
-/// Rewrite a running guest's identity disk in place, for a token refresh.
-///
-/// [`write_identity_disk`] renames a new file over the path, which a VMM
-/// that already opened the old file never sees. This writes into the same
-/// file (the VMM's open disk), so the guest's next uncached read of the
-/// device returns the new identity. A read that races the write gets a
-/// length that does not match its JSON and fails to parse, and the guest's
-/// handler simply reads again on its next poll.
-pub fn rewrite_identity_disk_in_place(path: &Path, identity: &ResumeIdentity) -> R<()> {
-    use std::io::{Seek, SeekFrom};
-    let payload = serde_json::to_vec(identity)?;
-    let capacity = IDENTITY_DISK_BYTES as usize - IDENTITY_HEADER_BYTES;
-    if payload.len() > capacity {
-        bail!(
-            "identity payload is {} bytes, the identity disk holds {capacity}",
-            payload.len()
-        );
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to open identity disk {}", path.display()))?;
-    // Payload first, then the header that points at it.
-    file.seek(SeekFrom::Start(IDENTITY_HEADER_BYTES as u64))?;
-    file.write_all(&payload)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(IDENTITY_DISK_MAGIC)?;
-    file.write_all(&IDENTITY_DISK_VERSION.to_le_bytes())?;
-    file.write_all(&(payload.len() as u32).to_le_bytes())?;
-    file.sync_all()?;
-    Ok(())
-}
-
-/// Read an identity disk (or the block device it is attached as). The guest
-/// agent's resume handler uses this; the host uses it in tests.
-pub fn read_identity_disk(path: &Path) -> R<ResumeIdentity> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut header = [0u8; IDENTITY_HEADER_BYTES];
-    file.read_exact(&mut header)?;
-    if &header[..8] != IDENTITY_DISK_MAGIC {
-        bail!("{} is not a Legion identity disk", path.display());
-    }
-    let version = u32::from_le_bytes(header[8..12].try_into().expect("4 bytes"));
-    if version != IDENTITY_DISK_VERSION {
-        bail!(
-            "identity disk {} is format {version}, this binary reads {IDENTITY_DISK_VERSION}",
-            path.display()
-        );
-    }
-    let len = u32::from_le_bytes(header[12..16].try_into().expect("4 bytes")) as usize;
-    if len > IDENTITY_DISK_BYTES as usize - IDENTITY_HEADER_BYTES {
-        bail!(
-            "identity disk {} claims an impossible payload length",
-            path.display()
-        );
-    }
-    let mut payload = vec![0u8; len];
-    file.read_exact(&mut payload)?;
-    serde_json::from_slice(&payload).context("identity disk payload is not valid JSON")
-}
+/// The identity disk's format is shared with the guest, which reads it, so
+/// it lives in the `legion-guest` crate (see `legion_guest::identity`).
+pub use legion_guest::identity::{
+    read_identity_disk, rewrite_identity_disk_in_place, write_identity_disk, IDENTITY_DISK_BYTES,
+    IDENTITY_DISK_MAGIC, IDENTITY_DISK_VERSION,
+};
 
 /// Fresh entropy for a restored guest, hex-encoded. Forks of one snapshot
 /// share an RNG state until something reseeds it; this is what the guest
@@ -366,6 +259,7 @@ pub fn fresh_entropy() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structs::checkpoint::ResumeIdentity;
 
     /// An in-place rewrite keeps the file (the inode a running VMM holds
     /// open) and reads back as the new identity.
@@ -405,6 +299,13 @@ mod tests {
             on_resume: vec!["/bin/reconnect".into()],
             fork: false,
             files: Vec::new(),
+            guest_addr: Some(legion_guest::identity::GuestAddr {
+                address: "10.88.128.42".into(),
+                prefix: 16,
+                gateway: Some("10.88.0.1".into()),
+                dns: vec!["10.88.0.1".into()],
+                bridge: "br0".into(),
+            }),
         }
     }
 

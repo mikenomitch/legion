@@ -82,7 +82,7 @@
                 # down. Uncomment on a host with a bridge and
                 # CAP_NET_ADMIN; with the default loopback-only guest there
                 # is no network to gate, which is strictly stronger.
-                # network = { mode = "tap", tap = "auto", bridge = "br0" },
+                # network = { mode = "tap", bridge = "br0" },
             },
             resources = {
                 cpu = 2000,

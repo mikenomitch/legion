@@ -734,7 +734,8 @@ function TargetCallout(props: { review: Review; templateName: string }) {
     case 'existing': {
       const provenance = target.provenance
       const fromThisTemplate = provenance?.name === props.templateName
-      const state = target.status === 'stopped' || target.status === 'failed' ? target.status : 'running'
+      // The manager's derived status (running, pending, complete, ...).
+      const state = target.status || 'existing'
       return (
         <Note tone="warn">
           <p class="font-display text-base font-semibold">

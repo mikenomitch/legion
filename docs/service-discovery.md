@@ -400,8 +400,49 @@ service's `meta` map. By convention, clients use `meta.protocol` (`http`,
 
 The UI has a Services page with the same catalog, per-endpoint health, and a
 visual version of `doctor`. Endpoints link straight to the address when the
-service speaks HTTP. Job and task pages show their own services, assigned
-ports, declared checks, and per-allocation health.
+service speaks HTTP (see [Public addresses](#public-addresses) for nodes on a
+private network). Job and task pages show their own services, assigned ports,
+declared checks, and per-allocation health. In the Network page's service
+graph, each service box opens its service page and each caller box opens its
+job.
+
+### Public addresses
+
+An endpoint's `address` is where the *cluster* reaches it: the node's
+in-cluster address, usually private (`10.x`, `172.16–31.x`, `192.168.x`). A
+browser outside that network can't open it. To give the UI and CLI a link
+that works, start each worker with its public host name or IP:
+
+```bash
+LEGION_WORKER_PUBLIC_ADDRESS=203.0.113.7 legion join <token>
+
+# EC2: read the instance's public IPv4 from the metadata service (IMDSv2)
+TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+LEGION_WORKER_PUBLIC_ADDRESS=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/public-ipv4) legion join <token>
+```
+
+The value must be a bare host name or IP (no scheme, no port). Anything else
+is ignored with a warning. The worker registers it as the `publicAddress`
+node attribute, and every endpoint on that node carries it as
+`ServiceEndpoint.public_address`:
+
+- the UI links the public address (badged `public`) and shows the in-cluster
+  one beside it. Allocation port chips on the job, task, worker, and
+  allocation pages do the same;
+- `legion service resolve` adds a `PUBLIC` column, and `-j` adds
+  `publicAddress`.
+
+It is display only. Nothing in the cluster dials the public address, and
+setting it does not open the port. The node's firewall or security group must
+still allow inbound traffic to the task's host port. Without a public address,
+private endpoint addresses are still linked (a VPN or tunnel may reach them)
+but dimmed and badged `private`, with a tooltip naming this variable.
+
+Not done yet: detecting the public address automatically from cloud
+metadata, and reaching nodes that have no open ports at all through the
+manager.
 
 `doctor` checks these layers in order: service declared, allocations placed,
 nodes alive, port assigned, health checks passing. At the first failing layer

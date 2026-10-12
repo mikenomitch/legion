@@ -28,8 +28,22 @@ const sectionLabels: Record<string, string> = {
   deployments: 'Rollouts',
 }
 
-// Path segments with no route of their own (see buildCrumbs).
-const unlinkedSegments = new Set(['tasks', 'specs', 'oidc'])
+// Path segments with no route of their own and no better target: the
+// crumb is a label rather than a link to a 404 (see crumbHref).
+const unlinkedSegments = new Set(['oidc'])
+
+// Collections inside a job that are sections of the job page rather than
+// pages of their own: their crumb goes back to the job.
+const JOB_SECTIONS = new Map([
+  ['tasks', 'Tasks'],
+  ['specs', 'Specs'],
+  ['instances', 'Instances'],
+])
+
+// Sections with detail pages but no index page: `/allocations/7` is a page,
+// `/allocations` is not, so the section crumb is a label, not a link, and the
+// bare path stays unknown.
+const DETAIL_ONLY_SECTIONS = new Map([['allocations', 'Allocations']])
 
 /** True when the first path segment is a section the app has a page for. */
 export const isKnownSection = (segment: string | undefined): boolean =>
@@ -54,6 +68,7 @@ const labelForSegment = (segments: readonly string[], index: number): string => 
   const decoded = decodeSegment(current)
 
   if (index === 0 && sectionLabels[current]) return sectionLabels[current]
+  if (index === 0 && DETAIL_ONLY_SECTIONS.has(current)) return DETAIL_ONLY_SECTIONS.get(current)!
 
   if (previous === 'jobs') return decoded
   if (previous === 'templates') return decoded
@@ -64,12 +79,23 @@ const labelForSegment = (segments: readonly string[], index: number): string => 
   if (previous === 'volumes') return decoded
   if (previous === 'specs') return decoded
   if (previous === 'tasks') return decoded
+  if (previous === 'instances') return decoded
+  if (previous === 'allocations') return `#${decoded}`
 
-  if (current === 'specs') return 'Specs'
-  if (current === 'tasks') return 'Tasks'
+  if (segments[0] === 'jobs' && index === 2 && JOB_SECTIONS.has(current)) return JOB_SECTIONS.get(current)!
   if (sectionLabels[current]) return sectionLabels[current]
 
   return titleCase(decoded)
+}
+
+// Where an intermediate crumb leads: its own path, the job page for a job's
+// tasks, specs, or instances (`/jobs/web/instances` has no page), and
+// nowhere for a section without an index (`/allocations`).
+const crumbHref = (segments: readonly string[], index: number, path: string): string | undefined => {
+  if (unlinkedSegments.has(segments[index])) return undefined
+  if (index === 0 && DETAIL_ONLY_SECTIONS.has(segments[0])) return undefined
+  if (segments[0] === 'jobs' && index === 2 && JOB_SECTIONS.has(segments[2])) return `/jobs/${segments[1]}`
+  return path
 }
 
 export const buildCrumbs = (pathname: string): Breadcrumb[] => {
@@ -78,16 +104,15 @@ export const buildCrumbs = (pathname: string): Breadcrumb[] => {
   if (normalized === '/') return crumbs
 
   const segments = normalized.split('/').filter(Boolean)
-  if (!isKnownSection(segments[0])) return [...crumbs, { label: 'Not found' }]
+  const detailOnly = DETAIL_ONLY_SECTIONS.has(segments[0]) && segments.length > 1
+  if (!isKnownSection(segments[0]) && !detailOnly) return [...crumbs, { label: 'Not found' }]
 
   let href = ''
   segments.forEach((segment, index) => {
     href += `/${segment}`
     crumbs.push({
       label: labelForSegment(segments, index),
-      // `/jobs/:id/tasks`, `/jobs/:id/specs` and `/oidc` are not pages of
-      // their own, so those crumbs are labels rather than links to a 404.
-      href: index === segments.length - 1 || unlinkedSegments.has(segment) ? undefined : href,
+      href: index === segments.length - 1 ? undefined : crumbHref(segments, index, href),
     })
   })
 

@@ -537,24 +537,27 @@ show you this.
 
 ## Symptom: nothing is running and nothing reports an error
 
-**Decision: don't trust `legion job info`'s status field or
-`evals_processed_total{status="error"}`.** Neither one reports placement
-failure. Count allocations instead.
+**Decision: read `legion job info`'s status, and don't trust
+`evals_processed_total{status="error"}`.** A job with nothing placed reads
+`pending`, but the error counter doesn't report placement failure. Count
+allocations to see how much placed.
 
 **Worked example**
 
 A run ended with 264 evals in `status: failed` in the eval table, while
 `legion_evals_processed_total{status="error"}` never moved. Jobs where every
-task had failed to place reported `status: done`.
+task had failed to place read `pending`.
 
-Two separate gaps caused that:
+Two things explain that:
 
-1. **The job `status` field is a lifecycle flag.** It doesn't tell you whether
-   placement worked. A job row is inserted with `status = "done"` at submit
-   time, and only the KV reactive-update failure path ever writes `failed`. A
-   job whose placements all failed keeps the status it was created with.
-   `GetJobInfo` returns the job row and nothing about its allocations, so
-   `legion job info` can't tell you whether a job placed.
+1. **`pending` means nothing of the job is live.** The job status is derived
+   from the workload (see
+   [Job Status](jobs-tasks-and-scheduling.md#job-status)): with no live
+   allocation and a task that wants one, the job reads `pending`. That covers
+   both "not placed yet" and "can't be placed", so read the eval table for
+   the reason (below). The state store's
+   `job.status` column is a lifecycle flag (`active`) and says nothing about
+   placement, so don't read it for this.
 2. **Terminal eval failures don't reliably reach the counter.**
    `legion_evals_processed_total{status="error"}` is recorded from the eval
    worker's return value. The two retry outcomes (not-leader and
@@ -566,7 +569,10 @@ Two separate gaps caused that:
 **What to read instead**
 
 ```console
-# Did the work actually place? Count allocations, not job status.
+# Which jobs have nothing live? (derived status)
+$ legion job list --status pending
+
+# How much placed? Count allocations. (j.status here is the lifecycle flag.)
 $ legion state query "SELECT j.id AS job, j.status, COUNT(a.id) AS allocations \
     FROM job j LEFT JOIN job_config jc ON jc.job_id = j.id \
     LEFT JOIN allocation a ON a.job_config_id = jc.id \
@@ -584,7 +590,7 @@ $ legion events list --kind allocation
 ```
 
 `legion state seed-queries` installs `agent:recent-failed-evals` and
-`agent:jobs-overview` (job, status, allocation count) as saved queries. This is
+`agent:jobs-overview` (job, lifecycle flag, allocation count, live count) as saved queries. This is
 the fastest way to see the allocation count next to the status.
 
 **Why an eval fails terminally**

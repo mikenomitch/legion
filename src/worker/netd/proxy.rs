@@ -18,7 +18,9 @@
 //!
 //! Every denial is a `403` (HTTP) or a SOCKS `connection not allowed` reply,
 //! recorded for the heartbeat with the deciding rule, exactly like a refused
-//! upstream dial. Dialing happens from the host namespace — the worker's —
+//! upstream dial. Every accepted connection is tracked in the activity
+//! ledger (`super::activity`), so idle detection sees an open egress
+//! connection and its bytes as they move, not only when the splice ends. Dialing happens from the host namespace — the worker's —
 //! which is what makes the namespace a boundary and the proxy the door.
 
 use crate::prelude::*;
@@ -28,7 +30,7 @@ use crate::worker::netd::guard::{self, GuardRefusal};
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::netns;
-use crate::worker::netd::policy::egress_connect_verdict;
+use crate::worker::netd::policy::{egress_connect_verdict, gated_egress_connect_verdict};
 use crate::worker::netd::proxyproto::Prefixed;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -264,6 +266,11 @@ async fn run(listener: TcpListener, proxy: Arc<Proxy>) {
                 continue;
             }
         };
+        // Counted as open (and its bytes as activity, as they move) for the
+        // idle policy's `connections` and `network` signals, until it
+        // closes: a quiet model call through the proxy keeps the task
+        // awake when it asks for `connections`.
+        let client = proxy.context.activity().track(proxy.allocation_id, client);
         let proxy = proxy.clone();
         tokio::spawn(async move {
             handle(client, Some(peer), proxy).await;
@@ -281,6 +288,9 @@ async fn run_unix(listener: tokio::net::UnixListener, proxy: Arc<Proxy>) {
                 continue;
             }
         };
+        // The same tracking as `run`: a gated sandbox's egress is the one
+        // datapath traffic an idle policy can see for it.
+        let client = proxy.context.activity().track(proxy.allocation_id, client);
         let proxy = proxy.clone();
         tokio::spawn(async move {
             handle(client, None, proxy).await;
@@ -344,7 +354,8 @@ async fn judge(
                     Some("network policy has not arrived yet".into()),
                 ));
             }
-            let verdict = egress_connect_verdict(
+            let verdict = connect_verdict(
+                proxy,
                 policy.as_deref(),
                 &ConnectFacts {
                     host: Some(host),
@@ -388,7 +399,8 @@ async fn judge(
                     },
                 )
             }
-            _ => egress_connect_verdict(
+            _ => connect_verdict(
+                proxy,
                 policy.as_deref(),
                 &ConnectFacts {
                     host: Some(host),
@@ -410,6 +422,21 @@ async fn judge(
         return Err(Refused::Denied(source, reason));
     }
     Ok(allowed)
+}
+
+/// The connect-time verdict: a gated allocation that no egress chain
+/// covers denies (`gated-default`); a cooperative one allows with
+/// attribution.
+fn connect_verdict(
+    proxy: &Proxy,
+    policy: Option<&crate::structs::netpolicy::EffectivePolicy>,
+    facts: &ConnectFacts<'_>,
+) -> Verdict {
+    if proxy.gated {
+        gated_egress_connect_verdict(policy, facts)
+    } else {
+        egress_connect_verdict(policy, facts)
+    }
 }
 
 /// Dials the judged addresses in order, with the dial timeout. `None` for
@@ -1485,6 +1512,309 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out)).await;
         assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 403"));
         assert!(denials.drain().iter().any(|d| d.path == "/secret"));
+    }
+
+    /// One policy body per allocation, each allowing `allow` over HTTP.
+    fn gated_context(
+        policies: &[(i64, &[&str])],
+        open_ports: &[u16],
+    ) -> (Arc<ForwarderContext>, Arc<Denials>) {
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let mut assignments = Vec::new();
+        for (allocation_id, allow) in policies {
+            let mut object: NetPolicyObject = serde_json::from_value(json!({
+                "name": "p", "enforcement": "require",
+                "egress": { "protocol": "http", "allow": allow }
+            }))
+            .unwrap();
+            object.normalize_and_validate().unwrap();
+            let policy = merge_policies(&[object], InlinePolicy::default());
+            assignments.push(AllocNetPolicy {
+                allocation_id: *allocation_id,
+                policy_hash: policy.hash.clone(),
+            });
+            let hash = policy.hash.clone();
+            cache.insert_body(&hash, policy).unwrap();
+        }
+        cache.apply_assignments(&assignments);
+        (
+            Arc::new(
+                ForwarderContext::new(cache, denials.clone())
+                    .with_host_guard(guard_opening(open_ports)),
+            ),
+            denials,
+        )
+    }
+
+    /// A gated sandbox's proxy on its own allocation's vsock socket.
+    fn vsock_spec(root: &std::path::Path, allocation_id: i64) -> ProxySpec {
+        let base =
+            crate::task_plugins::vsock_socket_base_for(&root.join(allocation_id.to_string()));
+        ProxySpec {
+            allocation_id,
+            netns: None,
+            listen: None,
+            unix: Some(crate::worker::netd::guest_agent::host_socket_path(
+                &base,
+                crate::worker::netd::guest_agent::PROXY_PORT,
+            )),
+        }
+    }
+
+    async fn get_via(socket: &std::path::Path, origin_port: u16, path: &str) -> String {
+        let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        stream
+            .write_all(
+                format!("GET http://127.0.0.1:{origin_port}{path} HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out)).await;
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    /// Gated plan §6.3, scenario 2: a resume is a new allocation, and its
+    /// restored guest's traffic arrives on that allocation's own listener,
+    /// so it is judged by the policy in force at resume. Here a policy that
+    /// stopped allowing `/poll` while the instance slept denies the first
+    /// post-resume request, attributed to the new allocation and never to
+    /// the suspended one.
+    #[tokio::test]
+    async fn a_resumed_gated_sandbox_is_judged_by_its_new_allocations_policy() {
+        let origin_port = origin().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (context, denials) =
+            gated_context(
+            &[(7, &["127.0.0.1/**"]), (8, &["127.0.0.1/health"])],
+            &[origin_port],
+        );
+        let proxies = EgressProxies::new(context);
+        let before = vsock_spec(dir.path(), 7);
+        proxies.sync(std::slice::from_ref(&before)).await;
+        let response = get_via(before.unix.as_deref().unwrap(), origin_port, "/poll").await;
+        assert!(response.contains("200 OK"), "{response}");
+
+        // Suspended: allocation 7 leaves the node. Resumed as 8.
+        let after = vsock_spec(dir.path(), 8);
+        proxies.sync(std::slice::from_ref(&after)).await;
+        assert!(!proxies.is_running(7));
+        let response = get_via(after.unix.as_deref().unwrap(), origin_port, "/poll").await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        let drained = denials.drain();
+        assert!(!drained.is_empty());
+        assert!(
+            drained.iter().all(|denial| denial.allocation_id == 8),
+            "{drained:?}"
+        );
+    }
+
+    /// Gated plan §9, fork attribution: three forks of a gated sandbox each
+    /// run on their own allocation's socket, so every connection, denial,
+    /// and service-graph edge carries the fork's own allocation (which the
+    /// manager maps to its instance). Stopping the origin leaves the forks
+    /// working, and nothing is ever attributed to the origin.
+    #[tokio::test]
+    async fn forks_of_a_gated_sandbox_are_attributed_to_their_own_allocations() {
+        let origin_port = origin().await;
+        let dir = tempfile::tempdir().unwrap();
+        let allow: &[&str] = &["127.0.0.1/ok/**"];
+        let (context, denials) =
+            gated_context(
+            &[(7, allow), (11, allow), (12, allow), (13, allow)],
+            &[origin_port],
+        );
+        let proxies = EgressProxies::new(context.clone());
+        let specs: Vec<ProxySpec> = [7, 11, 12, 13]
+            .into_iter()
+            .map(|id| vsock_spec(dir.path(), id))
+            .collect();
+        proxies.sync(&specs).await;
+        let forks = &specs[1..];
+        for fork in forks {
+            let socket = fork.unix.as_deref().unwrap();
+            let response = get_via(socket, origin_port, "/ok/work").await;
+            assert!(response.contains("200 OK"), "{response}");
+            let response = get_via(socket, origin_port, "/secret").await;
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        }
+        let edges = context.edges().drain();
+        let mut edge_allocations: Vec<i64> = edges.iter().map(|edge| edge.allocation_id).collect();
+        edge_allocations.dedup();
+        assert_eq!(edge_allocations, vec![11, 12, 13], "{edges:?}");
+        let mut denied: Vec<i64> = denials
+            .drain()
+            .iter()
+            .map(|denial| denial.allocation_id)
+            .collect();
+        denied.sort();
+        assert_eq!(denied, vec![11, 12, 13]);
+
+        // The origin stops; its forks keep their doors.
+        proxies.sync(forks).await;
+        assert!(!proxies.is_running(7));
+        for fork in forks {
+            let response = get_via(fork.unix.as_deref().unwrap(), origin_port, "/ok/after").await;
+            assert!(response.contains("200 OK"), "{response}");
+        }
+        assert!(context
+            .edges()
+            .drain()
+            .iter()
+            .all(|edge| edge.allocation_id != 7));
+    }
+
+    /// Gated plan §6.9, Phase 3: a connection through a gated sandbox's
+    /// egress proxy counts as open for the `connections` signal from accept
+    /// to close, and bytes stamp the allocation's activity as they move,
+    /// while the tunnel is still open, not only when the splice ends. So a
+    /// long model stream is seen throughout.
+    #[tokio::test]
+    async fn an_open_egress_tunnel_counts_and_stamps_bytes_as_they_move() {
+        // An origin that echoes for as long as the connection stays open.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (context, _denials) = gated_context(&[(9, &["127.0.0.1"])], &[port]);
+        let proxies = EgressProxies::new(context.clone());
+        let spec = vsock_spec(dir.path(), 9);
+        proxies.sync(std::slice::from_ref(&spec)).await;
+        let ledger = context.activity();
+        let open = |ledger: &crate::worker::netd::activity::ActivityLedger| {
+            ledger
+                .snapshot()
+                .get(&9)
+                .map(|activity| activity.open_connections)
+                .unwrap_or(0)
+        };
+        assert_eq!(open(ledger), 0);
+
+        let mut stream = tokio::net::UnixStream::connect(spec.unix.as_deref().unwrap())
+            .await
+            .unwrap();
+        stream
+            .write_all(format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("200 Connection Established"));
+        assert_eq!(open(ledger), 1, "open while the tunnel is");
+
+        // A quiet stretch, then bytes through the open tunnel stamp the
+        // allocation at once.
+        ledger.rewind(9, 1);
+        stream.write_all(b"model tokens").await.unwrap();
+        let mut echo = [0u8; 12];
+        stream.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"model tokens");
+        assert!(
+            ledger.snapshot()[&9].last_bytes_unix > 1,
+            "stamped mid-stream, before the splice ends"
+        );
+        assert!(
+            context
+                .edges()
+                .drain()
+                .iter()
+                .all(|edge| edge.bytes_out == 0 && edge.bytes_in == 0),
+            "the service graph still counts bytes only when the splice ends"
+        );
+
+        drop(stream);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while open(ledger) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the close was never counted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Gated plan §6.5, calls entry 3: a gated allocation that no task
+    /// block and no policy object covers denies every destination with
+    /// `gated-default`, readable in the `403` and the denial. Writing
+    /// `egress = { policy = "allow" }` restores allow-all with attribution.
+    #[tokio::test]
+    async fn a_gated_allocation_with_no_policy_denies_by_default() {
+        let origin_port = origin().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let empty = merge_policies(&[], InlinePolicy::default());
+        let mut allow: crate::structs::netpolicy::ChainConfig =
+            serde_json::from_value(json!({ "policy": "allow", "accessLog": true })).unwrap();
+        crate::structs::netpolicy::validate_inline_chain(
+            "workspace",
+            crate::structs::netpolicy::Direction::Egress,
+            &mut allow,
+        )
+        .unwrap();
+        let open = merge_policies(
+            &[],
+            InlinePolicy {
+                egress: Some(&allow),
+                ..InlinePolicy::default()
+            },
+        );
+        cache.apply_assignments(&[
+            AllocNetPolicy {
+                allocation_id: 7,
+                policy_hash: empty.hash.clone(),
+            },
+            AllocNetPolicy {
+                allocation_id: 8,
+                policy_hash: open.hash.clone(),
+            },
+        ]);
+        cache.insert_body(&empty.hash.clone(), empty).unwrap();
+        cache.insert_body(&open.hash.clone(), open).unwrap();
+        let context = Arc::new(
+            ForwarderContext::new(cache, denials.clone())
+                .with_host_guard(guard_opening(&[origin_port])),
+        );
+        let proxies = EgressProxies::new(context);
+        let (shut, opened) = (vsock_spec(dir.path(), 7), vsock_spec(dir.path(), 8));
+        proxies.sync(&[shut.clone(), opened.clone()]).await;
+
+        let response = get_via(shut.unix.as_deref().unwrap(), origin_port, "/anything").await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("legion-denied-by: gated-default"),
+            "{response}"
+        );
+        let drained = denials.drain();
+        assert!(
+            drained.iter().any(|denial| denial.allocation_id == 7
+                && denial.source == "gated-default"
+                && denial.reason.contains("nothing allows 127.0.0.1")),
+            "{drained:?}"
+        );
+
+        let response = get_via(opened.unix.as_deref().unwrap(), origin_port, "/anything").await;
+        assert!(response.contains("200 OK"), "{response}");
     }
 
     #[tokio::test]
