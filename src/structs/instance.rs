@@ -35,6 +35,14 @@ pub enum InstanceMode {
     /// may not choose.
     /// `count.num` does not drive keyed tasks: live instances do.
     Keyed,
+    /// Session mode (`docs/session-mode.md`): unnamed instances run inside a
+    /// per-node envelope with no row in the store, and a caller id or a
+    /// promotion makes one keyed. Only ever seen in a jobspec as written:
+    /// parsing normalizes a session task into a keyed task that keeps its
+    /// `stateful.envelope` block, plus its generated envelope task (see
+    /// [`crate::structs::session::normalize_session_tasks`]), so a stored
+    /// config never carries it.
+    Session,
 }
 
 impl InstanceMode {
@@ -42,6 +50,7 @@ impl InstanceMode {
         match self {
             InstanceMode::Slot => "slot",
             InstanceMode::Keyed => "keyed",
+            InstanceMode::Session => "session",
         }
     }
 }
@@ -180,6 +189,10 @@ pub struct Instance {
     /// and its row is deleted on destroy (sandbox-scaling plan, Phase 4).
     #[serde(default = "named_default")]
     pub named: bool,
+    /// The session this instance was promoted from (PromoteInstance,
+    /// docs/session-mode.md). Written once, when the row is inserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from: Option<String>,
 }
 
 fn named_default() -> bool {

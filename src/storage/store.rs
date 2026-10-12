@@ -23,6 +23,7 @@ pub use blocked_evals::{BlockedEval, CAPACITY_REPLAY_WINDOW};
 mod eval_claims;
 mod fork_ops;
 mod group_commit;
+mod session_ops;
 mod snapshot_ops;
 mod suspend_ops;
 // The job status GetJobInfo/ListJobs report, derived from the workload.
@@ -36,6 +37,7 @@ use crate::storage::Lane;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
+pub use session_ops::{PromoteSession, PromotedSession};
 pub use snapshot_ops::{
     DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
     SnapshotReportOutcome, SnapshotReportRecord,
@@ -1341,6 +1343,9 @@ pub struct Store {
     // rebuilt from worker reports after a restart or failover. Shared across
     // clones so the heartbeat handler writes what every Scheduler reads.
     content_locations: Arc<crate::storage::content_index::ContentLocationIndex>,
+    // Which node runs which session (docs/session-mode.md): soft state like
+    // the content index, folded from this manager's workers' heartbeats.
+    sessions: Arc<crate::storage::session_index::SessionIndex>,
     // Queued snapshot warms (WarmSnapshot), per node. Leader-local soft
     // state like the content index: best effort, never replicated.
     snapshot_warms: Arc<crate::storage::snapshot_warm::SnapshotWarmQueue>,
@@ -1971,6 +1976,7 @@ impl Store {
             )),
             liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
             content_locations: Arc::new(crate::storage::content_index::ContentLocationIndex::new()),
+            sessions: Arc::new(crate::storage::session_index::SessionIndex::new()),
             snapshot_warms: Arc::new(crate::storage::snapshot_warm::SnapshotWarmQueue::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -7251,6 +7257,7 @@ impl Store {
             restore_from: row.get(11)?,
             identity_epoch: row.get::<_, i64>(12)?.max(0) as u64,
             named: row.get::<_, i64>(13)? != 0,
+            promoted_from: row.get(14)?,
         };
 
         Ok(instance)
@@ -8477,6 +8484,30 @@ impl Store {
     /// The content location index (see [`crate::storage::content_index`]).
     pub fn content_locations(&self) -> &Arc<crate::storage::content_index::ContentLocationIndex> {
         &self.content_locations
+    }
+
+    /// The session index (see [`crate::storage::session_index`]).
+    pub fn sessions(&self) -> &Arc<crate::storage::session_index::SessionIndex> {
+        &self.sessions
+    }
+
+    /// Ask every other manager for its session index's answer to `request`
+    /// (`RaftTransport.QuerySessions`, docs/session-mode.md). Empty outside
+    /// raft mode, where this manager hears every heartbeat. A member that
+    /// fails to answer is left out, which leaves the nodes it covers
+    /// uncovered: a listing says so with `complete = false`.
+    pub async fn query_peer_sessions(
+        &self,
+        request: crate::structs::QuerySessionsRequest,
+    ) -> Vec<crate::structs::QuerySessionsReply> {
+        match self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+        {
+            Some(driver) => driver.query_peer_sessions(request).await,
+            None => Vec::new(),
+        }
     }
 
     /// Queued snapshot warms (see [`crate::storage::snapshot_warm`]).
@@ -10583,6 +10614,18 @@ impl Store {
                 // `taskResourceDefaults` (the sandbox guest size, docs/
                 // task-runtime-sandbox.md "Guest size").
                 let mut task = task.clone();
+                // A session task's envelope reserves exactly what its spec
+                // declares: cluster defaults would add amounts (a default
+                // `disk`, say) that every session also gets, and admission
+                // would then fit one session per envelope.
+                if crate::structs::session::envelope_serves(&task).is_some() {
+                    let mut resources = task.resources.as_object().cloned().unwrap_or_default();
+                    if let Some(cpus) = resources.remove("cpus") {
+                        resources.entry("cpu").or_insert(cpus);
+                    }
+                    task.resources = Value::Object(resources);
+                    return Ok(task);
+                }
                 crate::task_plugins::normalize_runtime_task(&mut task);
                 let resources = self
                     .resource_policy
@@ -13343,7 +13386,7 @@ impl Store {
                  instance.task_name, instance.mode, instance.state, instance.slot_index, \
                  instance.current_alloc_id, instance.storage_handle, instance.created_at, \
                  instance.updated_at, instance.restore_from, instance.identity_epoch, \
-                 instance.named \
+                 instance.named, instance.promoted_from \
                  FROM instance \
                  LEFT JOIN volume ON volume.instance_id = instance.instance_id \
                  AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
@@ -27277,6 +27320,8 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -27708,6 +27753,8 @@ mod tests {
                     retain_on_scale_in: Some(false),
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -27867,6 +27914,8 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: Some(false),
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -27946,6 +27995,8 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: Some(false),
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("drop-db", "noop")
         };
@@ -28019,6 +28070,8 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new(name, "noop")
         }

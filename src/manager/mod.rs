@@ -18,6 +18,7 @@ pub mod rollout;
 pub mod rollout_strategy;
 pub mod scheduler;
 pub mod server;
+pub mod sessions;
 pub mod telemetry;
 pub mod usage;
 pub mod worker_plane;

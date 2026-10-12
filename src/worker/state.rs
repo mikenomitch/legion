@@ -46,6 +46,11 @@ pub struct PersistedAllocation {
     /// the manager's id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<i64>,
+    /// A promoted session (docs/session-mode.md): it still runs inside its
+    /// task's envelope, so a restarted worker keeps counting it against the
+    /// envelope's room.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_envelope: bool,
     /// The CPU/memory placement worker core handed this allocation (see
     /// `src/worker/resources.rs`). Persisted because it is the *unit of
     /// recovery*: a restarted worker rebuilds its core allocator and both

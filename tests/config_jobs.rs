@@ -179,7 +179,20 @@ fn maximal_job_spec_parse() {
 
     assert_eq!(config.name, "maximal-demo");
     assert_eq!(config.version, Some(1));
-    assert_eq!(config.tasks.len(), 6);
+    // Seven declared tasks, plus the envelope task Legion generates for the
+    // `scratch` session task at parse.
+    assert_eq!(config.tasks.len(), 8);
+    let scratch = config
+        .tasks
+        .iter()
+        .find(|task| task.name == "scratch")
+        .expect("maximal must declare the session-mode scratch task");
+    assert!(legion::structs::session::is_session_task(scratch));
+    assert!(config
+        .tasks
+        .iter()
+        .any(|task| task.name == "scratch-envelope"
+            && task.runtime == legion::structs::session::ENVELOPE_RUNTIME));
 
     // The keyed-mode stateful task (sandbox group) round-trips and validates.
     let sandbox = config

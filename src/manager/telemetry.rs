@@ -828,6 +828,13 @@ pub struct Metrics {
     /// `legion_instance_archived_total{mode}` (docs/metrics.md, "Suspend
     /// and resume"; sandbox-scaling Phase 5)
     pub instance_archived_total: Arc<CounterVec>,
+    /// `legion_session_starts_total{outcome}` (docs/metrics.md, "Sessions";
+    /// sandbox-scaling Phase 6)
+    pub session_starts_total: Arc<CounterVec>,
+    /// `legion_session_stops_total{reason}` (docs/metrics.md, "Sessions")
+    pub session_stops_total: Arc<CounterVec>,
+    /// `legion_session_promotions_total` (docs/metrics.md, "Sessions")
+    pub session_promotions_total: Arc<Counter>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
     /// `legion_store_write_lock_wait_seconds`
@@ -1278,6 +1285,30 @@ impl Metrics {
                 labels: &["mode"],
             },
             series: Series::new(),
+        });
+        let session_starts_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_session_starts_total",
+                help: "Session creates this manager's session router answered, by outcome (started|deduplicated|no_envelope|no_room|refused). None writes the replicated store.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let session_stops_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_session_stops_total",
+                help: "Sessions this manager ended on their nodes, by reason (stop|destroy|duplicate).",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let session_promotions_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_session_promotions_total",
+                help: "Running sessions promoted to keyed instances (PromoteInstance), one scheduler-lane entry each.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
         });
         let node_cpu_used_millicores = Arc::new(GaugeVec {
             meta: FamilyMeta {
@@ -1788,6 +1819,9 @@ impl Metrics {
             Arc::clone(&checkpoint_publish_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&checkpoint_publish_total) as Arc<dyn RenderMetric>,
             Arc::clone(&instance_archived_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_stops_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_promotions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
@@ -1891,6 +1925,9 @@ impl Metrics {
             checkpoint_publish_seconds,
             checkpoint_publish_total,
             instance_archived_total,
+            session_starts_total,
+            session_stops_total,
+            session_promotions_total,
             allocations,
             store_write_lock_wait_seconds,
             store_read_lock_wait_seconds,

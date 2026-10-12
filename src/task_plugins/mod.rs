@@ -14,6 +14,7 @@ use std::process::{Child, Command};
 
 pub mod checkpoint;
 mod container;
+mod envelope;
 mod exec;
 pub mod exec_isolation;
 mod exec_session;
@@ -1706,6 +1707,10 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
         "exec" => Ok(LoadedTaskPlugin::new(Box::new(ExecTaskPlugin), None)),
         "container" => Ok(LoadedTaskPlugin::new(Box::new(ContainerTaskPlugin), None)),
         "sandbox" => Ok(LoadedTaskPlugin::new(Box::new(SandboxTaskPlugin), None)),
+        crate::structs::session::ENVELOPE_RUNTIME => Ok(LoadedTaskPlugin::new(
+            Box::new(envelope::EnvelopeTaskPlugin),
+            None,
+        )),
         other => {
             let plugin_root = plugin_root_dir();
             let paths = plugin_paths("tasks", other, &plugin_root);
@@ -2336,6 +2341,8 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
+                envelope: None,
+                promote: None,
             }),
             config: json!({"command": ["true"]}),
             ..TaskConfig::new("db", "exec")
@@ -2455,6 +2462,8 @@ mod tests {
                     initial_instances: None,
                     on_lost: None,
                     storage: None,
+                    envelope: None,
+                    promote: None,
                 }),
                 config: json!({"command": ["true"]}),
                 ..TaskConfig::new("sandbox", "exec")

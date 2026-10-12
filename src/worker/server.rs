@@ -42,6 +42,17 @@ pub trait ClaimRatifier: Send + Sync {
     ) -> R<crate::structs::RatifyClaimReply>;
 }
 
+/// The status a refused provisional start answers with. A session refused
+/// for room is RESOURCE_EXHAUSTED, which the manager's session router reads as
+/// "try the next node"; everything else is FAILED_PRECONDITION, as before.
+fn admission_status(err: &anyhow::Error) -> Status {
+    use crate::worker::task_manager::SessionRefusal;
+    match err.downcast_ref::<SessionRefusal>() {
+        Some(SessionRefusal::EnvelopeFull { .. }) => Status::resource_exhausted(format!("{err:#}")),
+        _ => Status::failed_precondition(format!("{err:#}")),
+    }
+}
+
 pub struct WorkerDaemonService {
     pub task_manager: Arc<Mutex<WorkerTaskManager>>,
     /// Workload-identity delivery/refresh; `None` when this worker runs
@@ -78,7 +89,7 @@ impl Worker for WorkerDaemonService {
             if allocation.allocation_id == 0 {
                 let admitted =
                     edge::admit_and_launch(&self.task_manager, &allocation, &provisional)
-                        .map_err(|err| Status::failed_precondition(format!("{err:#}")))?;
+                        .map_err(|err| admission_status(&err))?;
                 return Ok(Response::new(PostWorkReply {
                     message: format!("Provisional start {} admitted", admitted.claim_id),
                 }));
@@ -333,6 +344,7 @@ impl Worker for WorkerDaemonService {
                 origin: "edge".into(),
                 on_refused: task_gate.on_refused.as_str().to_string(),
                 ticket_jti: claims.jti.clone(),
+                session: None,
             }),
         )
         .map_err(|err| Status::internal(format!("failed to build payload: {err:#}")))?;
@@ -395,6 +407,29 @@ impl Worker for WorkerDaemonService {
         });
 
         Ok(Response::new(reply))
+    }
+
+    /// End sessions on this node (docs/session-mode.md). Reached by the same
+    /// callers, and trusted the same way, as `PostWork`, which starts them.
+    #[instrument(err, skip_all, fields(sessions))]
+    async fn stop_sessions(
+        &self,
+        request: Request<crate::structs::StopSessionsRequest>,
+    ) -> Result<Response<crate::structs::StopSessionsReply>, Status> {
+        authorize(&request, "StopSessions")?;
+        let request = request.into_inner();
+        tracing::Span::current().record("sessions", request.session_ids.len());
+        let reason = if request.reason.is_empty() {
+            "stop".to_string()
+        } else {
+            request.reason
+        };
+        let stopped = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .stop_sessions(&request.session_ids, &format!("requested ({reason})"));
+        Ok(Response::new(crate::structs::StopSessionsReply { stopped }))
     }
 }
 

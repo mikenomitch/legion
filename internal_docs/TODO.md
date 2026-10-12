@@ -264,7 +264,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#17](https://github.com/mikenomitch/legion/pull/17) | Fixes for every 2026-10-11 spot-check finding, including Phase 1 of the worker plane | [plan](plans/launch-spot-check-fixes-plan.md) · [calls](calls/launch-spot-check-fixes-plan_calls.md); AWS re-run pending |
+| [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
 | [#4](https://github.com/mikenomitch/legion/pull/4) | Rename crate to `legion-rs`, crates.io metadata, `cargo install` docs | Not published yet; follow-ups under Templates, registry & packaging |
@@ -824,14 +824,14 @@ How to use it:
       of the ~6 ops are actually separable before any design.
       **Half done (2026-10-12):** sandbox-scaling Phase 1 made eval claims
       leader memory and fused the settle into the plan apply, so a placing
-      eval is one entry ([calls](calls/sandbox-scaling-plan_calls.md) #11,
-      #17). What is left is the lane itself, and it now bounds keyed
+      eval is one entry ([calls](calls/sandbox-scaling-plan_calls.md) #15,
+      #23). What is left is the lane itself, and it now bounds keyed
       sandbox lifecycles at ~50/s on a 4-vCPU host, against the plan's
       ≥ 5× target of ~125/s: ~6 ms of serial lane time per entry (capture
       3.2 ms, propose → apply 2.7 ms), the pipeline thread ~54% busy, the
       manager at 1.1 of 4 cores, and the same in `single` and `lanes`
       ([plan §14.3](plans/sandbox-scaling-plan.md#143-phase-1-group-commit-and-write-trimming),
-      [calls](calls/sandbox-scaling-plan_calls.md) #13). Levers: more
+      [calls](calls/sandbox-scaling-plan_calls.md) #17). Levers: more
       placements per plan entry (sandbox placements average 1.09 plans per
       entry, one eval each), a cheaper capture (each write executes twice,
       once to capture and once to apply), or a pipelined lane.
@@ -1708,25 +1708,28 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 - [ ] **Sandbox scaling to very large session counts**:
       [plan](plans/sandbox-scaling-plan.md) (IN EXECUTION) ·
       [calls](calls/sandbox-scaling-plan_calls.md) ·
-      [docs](../docs/sandboxes-at-scale.md). Phases 0–3 shipped (Done,
+      [docs](../docs/sandboxes-at-scale.md),
+      [session mode](../docs/session-mode.md). Phases 0–6 shipped (Done,
       below): a keyed sandbox lifecycle is 8 raft entries, work streams to
-      nodes, and a full cluster blocks creates instead of failing them.
-      Every keyed sandbox is still a raft row and a tombstone forever; raft
-      should hold only envelopes and named instances.
+      nodes, a full cluster blocks creates instead of failing them, unnamed
+      ids leave no tombstone, idle keyed instances archive to the bucket,
+      and an unnamed session starts and stops with no raft entry. Session
+      mode shipped without idle sessions, identity, or a session log; those
+      and the other Phase 6 gaps are the items below.
   - [ ] **The lifecycle rate reached ~2× Phase 0, not the ≥ 5× target.**
         ~50 lifecycles/s against ~25/s on the 4-vCPU reference host; the
         scheduler lane's serial per-entry cost is the bound. Tracked with
         its levers in "Cut the raft round trips per eval, or widen the lane
         pipeline" under Scheduling & placement
         ([plan §14.3](plans/sandbox-scaling-plan.md#143-phase-1-group-commit-and-write-trimming),
-        [calls](calls/sandbox-scaling-plan_calls.md) #13).
+        [calls](calls/sandbox-scaling-plan_calls.md) #17).
   - [ ] **Run the sandbox campaign on the AWS rig.** Every Phase 0–3 number
         is from a single-host substitute. `benchmarks/aws/scripts/run-sandbox-campaign.sh`
         (3 managers, one load box, ~$1/hour) produces the ceiling,
         per-lifecycle raft and CPU cost, memory per resident sandbox, and
         labelled projections; record them in plan §14 and
         `benchmarks/scheduler/README.md`
-        ([calls](calls/sandbox-scaling-plan_calls.md) #14, #41).
+        ([calls](calls/sandbox-scaling-plan_calls.md) #20, #60).
   - [ ] **Suspend and resume still wait on heartbeats.** Checkpoint
         requests and reports ride the heartbeat, so a suspend takes ~3 s and
         a resume ~2 s at p50 on the default 2 s cadence, while placements
@@ -1737,30 +1740,76 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] **Edge-boot provisional deltas on the stream.** Speculative dispatch
         still pushes with `PostWork` and the verdict arrives on the
         `RatifyClaim` reply
-        ([calls](calls/sandbox-scaling-plan_calls.md) #30).
+        ([calls](calls/sandbox-scaling-plan_calls.md) #39).
   - [ ] **Checkpoint budget reports and `snapshot warm` as blocked-eval wake
         events.** Only registration, node changes, readiness, and freed
         allocations wake today
-        ([calls](calls/sandbox-scaling-plan_calls.md) #33).
+        ([calls](calls/sandbox-scaling-plan_calls.md) #42).
   - [ ] **Arm the fused settle in more handlers.** Only `job_reschedule`
         without a batch follow-up settles inside its plan; `job_submit`,
         `job_update`, and `job_scale` still settle in a separate entry
-        ([calls](calls/sandbox-scaling-plan_calls.md) #17).
+        ([calls](calls/sandbox-scaling-plan_calls.md) #23).
   - [ ] **Rollout ticks and node-scoped passes do not block.** They keep the
         old terminal outcome when nothing fits
-        ([calls](calls/sandbox-scaling-plan_calls.md) #32).
+        ([calls](calls/sandbox-scaling-plan_calls.md) #41).
   - [ ] **The raft seam test does not read `src/storage/store/*.rs`.**
         `tests/raft_seam.rs` parses only `store.rs` and `acl_store.rs`, so a
         replicated write added in a store submodule (`eval_claims.rs`,
         `blocked_evals.rs`) is not checked for a lane classification
-        ([calls](calls/sandbox-scaling-plan_calls.md) #39).
-  - [ ] Phase 4: server-minted ids grow to 130 bits and leave no tombstone.
-        Caller ids may not take that shape.
-  - [ ] Phase 5: archive suspended keyed instances to content-store
-        manifests (`suspend.archive`).
-  - [ ] Phase 6: `stateful.mode = "session"`: envelopes, the session
-        router, leases, node session logs, the leader index, and
-        `PromoteInstance`. Its user docs are drafted in plan §15.
+        ([calls](calls/sandbox-scaling-plan_calls.md) #48).
+  - [ ] **Idle sessions: suspend an unpromoted session to a bucket
+        manifest.** A session cannot be suspended, forked, or snapshotted
+        today; it has to be promoted first, which costs an entry and a row
+        (plan §6.5, [calls](calls/sandbox-scaling-plan_calls.md) #18). The
+        Phase 5 manifest format and `manifests/` layout are the starting
+        point (#50). Phase 7's wake for sessions needs it.
+  - [ ] **Workload identity for sessions.** A session task may not declare
+        `identities`. Needs the signed lease of plan §6.3 in place of the
+        start-time lease, and the envelope-scoped token check of §6.8
+        ([calls](calls/sandbox-scaling-plan_calls.md) #18, #33, #34).
+  - [ ] **The node session log, its shipper, and per-session events.**
+        Sessions are counted (`legion_session_starts_total`,
+        `legion_session_stops_total`), not recorded; a worker restart ends
+        its unpromoted sessions because nothing is on disk (plan §6.4,
+        [calls](calls/sandbox-scaling-plan_calls.md) #19, #32, #37).
+  - [ ] **Edge-started sessions.** Prefix boot tickets do not start
+        sessions; every session starts through a manager's router (plan
+        §6.3, [calls](calls/sandbox-scaling-plan_calls.md) #30).
+  - [ ] **More ways to promote.** `promote.onVolume` and promotion by
+        `snapshot create --name` (plan §6.6) are not built; only a caller id
+        at create and `legion instance promote` promote
+        ([calls](calls/sandbox-scaling-plan_calls.md) #18).
+  - [ ] **Ports, services, and network policy for sessions.** A session
+        task that declares them is refused at submit, since the node
+        datapath serves allocations and a session has none
+        (`src/structs/session.rs`, `validate_session_task`).
+  - [ ] **Sessions at scale on simulated nodes, and more than one
+        manager.** Simulated workers do not run sessions and
+        `legion-loadgen` has no session mode, so plan §13's 10^4-start run
+        on `raft_lanes`, the leader-kill "complete within one full-report
+        period" check, and the peer fan-out are tested only by fake-node
+        integration tests and unit tests
+        (`tests/session_integration.rs`,
+        [calls](calls/sandbox-scaling-plan_calls.md) #58).
+  - [ ] **Router locality.** The router ranks by free room only; plan §6.4
+        also preferred nodes whose content store holds the image
+        ([calls](calls/sandbox-scaling-plan_calls.md) #27). Matters once
+        sessions restore (idle sessions, above).
+  - [ ] **`legion_sessions_envelope_free{job}`.** Plan §15 promised an
+        envelope free-room gauge; only start and stop counters exist.
+  - [ ] **Ended sessions are remembered per manager.** A retried stop that
+        reaches another manager answers `NOT_FOUND`
+        ([calls](calls/sandbox-scaling-plan_calls.md) #55).
+  - [ ] **Batch session creates.** `CreateInstance` with `count` is refused
+        on a session task ([calls](calls/sandbox-scaling-plan_calls.md)
+        #57).
+  - [ ] **Phase 5's 10^6 acceptance run, and archive in the op-count
+        test.** Archiving was tested at 20 instances
+        (`tests/archive_integration.rs`, local store); plan §13's 10^6
+        archived instances leaving 10^6 slim rows, a resume under the
+        published-resume time, and a `tests/raft_lifecycle_ops.rs` stage
+        proving the archive adds no entry to its publish are not measured
+        ([calls](calls/sandbox-scaling-plan_calls.md) #8).
   - [ ] Phase 7: wake on request through `legion start gateway` and
         `suspend.wake` (plan §6.14). The suspend plan's Phase 8 keeps
         node-local wake on connect.
@@ -4198,7 +4247,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       creates the keyed instance when the ticket names an id that never
       existed, and places it in one group-committed entry, so an edge start
       is one entry and a refused ratification leaves the ticket unspent
-      ([sandbox-scaling calls](calls/sandbox-scaling-plan_calls.md) #23,
+      ([sandbox-scaling calls](calls/sandbox-scaling-plan_calls.md) #31,
       [docs](../docs/edge-boot.md)).
 - [x] **Sandbox scaling Phases 0–3** (2026-10-12,
       [#27](https://github.com/mikenomitch/legion/pull/27)):
@@ -4215,7 +4264,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         Baseline: 22 entries per lifecycle, ~25 lifecycles/s.
   - [x] Phase 0 found and fixed: a keyed instance left `pending` by a full
         cluster was never retried by the capacity pass
-        (`tests/capacity_retry.rs`, calls #38).
+        (`tests/capacity_retry.rs`, calls #47).
   - [x] Phase 1: 8 entries per lifecycle. Allocation health is written only
         on change; eval claims are leader memory; a placing eval settles
         inside its plan; stop and destroy queue no eval; concurrent instance
@@ -4240,6 +4289,29 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
   - [x] A standalone AWS sandbox campaign
         (`benchmarks/aws/scripts/run-sandbox-campaign.sh`,
         `analysis/sandbox_report.py`), not yet run (open above).
+- [x] **Sandbox scaling Phases 4–6** (2026-10-12,
+      [#30](https://github.com/mikenomitch/legion/pull/30)):
+      [plan](plans/sandbox-scaling-plan.md) §16 ·
+      [calls](calls/sandbox-scaling-plan_calls.md) ·
+      [docs](../docs/session-mode.md). Open gaps are above, under Task
+      runtimes.
+  - [x] Phase 4: server-minted keyed ids are `<task>-<26 base32>` (130
+        bits) and destroy deletes their row; caller ids keep tombstones and
+        may not take that shape; the upgrade marks every existing row named
+        ([docs](../docs/stateful-workloads.md#id-rules)).
+  - [x] Phase 5: `suspend.archive = "slim" | "manifestOnly"` moves a
+        published checkpoint's record into the bucket in the publish
+        report's entry; `instance start` reads it back; `instance list
+        --include-idle` pages the bucket
+        ([docs](../docs/suspend-and-resume.md#archiving-idle-instances)).
+  - [x] Phase 6: `stateful.mode = "session"`: generated envelope tasks, the
+        session router, node session reports and the per-manager session
+        index, duplicate convergence, derived-id idempotency,
+        `PromoteInstance` / `legion instance promote`, `durable`,
+        `complete`, and `asOf` on the instance surfaces, the MCP tool and
+        catalog entry. An unnamed session's start and stop write no raft
+        entry; a promotion writes one
+        ([docs](../docs/session-mode.md)).
 
 ## Persistence
 

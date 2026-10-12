@@ -19,6 +19,7 @@ pub mod ledger;
 pub mod netpolicy;
 pub mod network;
 pub mod node;
+pub mod session;
 pub mod snapshot;
 pub mod stop;
 pub mod suspend;

@@ -205,6 +205,23 @@ service Manager {
   // `from_snapshot` restores the new instance from a snapshot
   // instead of booting it empty. See `CreateInstances` for the contract,
   // which is the same for one instance.
+  //
+  // Session-mode tasks (`stateful.mode = "session"`, docs/session-mode.md):
+  // a create without `instance_id` starts an unnamed session and writes
+  // nothing to the replicated store. The manager's session router picks a
+  // node whose envelope for the task has room (most room first, from the
+  // session index), sends the start straight to that node, and tries the
+  // next node when one refuses. The reply carries `mode = "session"`,
+  // `durable = false`, and the node. With an `idempotency_key` the session
+  // id is derived from the key, the caller, the job, and the task, so a
+  // retry finds the running session and answers `deduplicated` without any
+  // record. A create with `instance_id` is an ordinary keyed create (a named
+  // instance is durable from birth), unless the task sets
+  // `stateful.promote.onName = false`, which refuses it. `from_snapshot` is
+  // refused for a session. Session-specific errors:
+  // - ResourceExhausted: no node's envelope for the task has room. Retryable
+  //   once sessions end or envelopes are added.
+  // - FailedPrecondition: no node holds an envelope for the task yet.
   rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceReply);
 
   // Creates several keyed-mode stateful instances in one atomic call and
@@ -296,8 +313,16 @@ service Manager {
   // applies to Suspended instances the same way, and their suspend
   // checkpoint is reclaimed on its node.
   //
+  // A running session (docs/session-mode.md) is ended on its node, which
+  // leaves nothing behind: a session has no row to tombstone. The same coarse
+  // `job:write` check precedes the session lookup as in GetInstance. Ending a
+  // session writes nothing, so `idempotency_key` records nothing for it;
+  // instead, a repeat on the manager that ended the session within the last
+  // ten minutes answers `"Session <id> already ended"`, and a repeat that
+  // lands on another manager answers NotFound.
+  //
   // Errors:
-  // - NotFound: no instance row with this id exists.
+  // - NotFound: no instance row and no running session has this id.
   // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
   //   by the scheduler via `count.num`, not this API).
   rpc DestroyInstance (DestroyInstanceRequest) returns (DestroyInstanceReply);
@@ -326,8 +351,12 @@ service Manager {
   // Stopping an already-stopped instance succeeds as a no-op, so the call is
   // safe to retry even without an idempotency key.
   //
+  // On a running session (docs/session-mode.md) stop is destroy: the session
+  // ends on its node and nothing remains to start again. A repeat behaves as
+  // DestroyInstance describes for sessions.
+  //
   // Errors:
-  // - NotFound: no instance row with this id exists.
+  // - NotFound: no instance row and no running session has this id.
   // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
   //   by the scheduler via `count.num`; stop the job or scale in instead).
   // - FailedPrecondition: the instance is Terminated. Destroyed instances
@@ -370,8 +399,12 @@ service Manager {
   // rescheduling) succeeds as a no-op, so the call is safe to retry even
   // without an idempotency key.
   //
+  // A running session (docs/session-mode.md) is live too, and answers the
+  // same no-op.
+  //
   // Errors:
-  // - NotFound: no instance row with this id exists.
+  // - NotFound: no instance row, archive manifest, or running session has
+  //   this id.
   // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
   //   by the scheduler via `count.num`, not this API).
   // - FailedPrecondition: the instance is Terminated (destroyed ids are
@@ -443,6 +476,10 @@ service Manager {
   // the reason in the snapshot's `error` and `snapshot.publish_failed`, and
   // the manager asks the node to publish again after one minute, then five
   // (three attempts in all).
+  //
+  // A running session (docs/session-mode.md) cannot be suspended: the call
+  // answers FailedPrecondition and names PromoteInstance, which gives the
+  // session a row without restarting it.
   rpc SuspendInstance (SuspendInstanceRequest) returns (SuspendInstanceReply);
 
   // Fork and named snapshots ----------------------------------------------
@@ -531,6 +568,10 @@ service Manager {
   //     `stateful.storage` volume (forks clone it on the origin's node, so
   //     a fork elsewhere could not get its copy), or on a node whose worker
   //     has no `contentStore` to publish to.
+  //
+  // A running session (docs/session-mode.md) cannot be forked: the call
+  // answers FailedPrecondition and names PromoteInstance, which gives the
+  // session a row without restarting it.
   rpc ForkInstance (ForkInstanceRequest) returns (ForkInstanceReply);
 
   // Operator override for the node-loss confirmation gate (the K8s analog is
@@ -557,19 +598,66 @@ service Manager {
   // - FailedPrecondition: the instance has no current allocation, or its
   //   allocation's node is not `lost` (the gate only ever holds allocations
   //   on lost nodes; everything else reschedules through the normal paths).
+  //
+  // A running session (docs/session-mode.md) cannot be replaced: the call
+  // answers FailedPrecondition and names PromoteInstance, which gives the
+  // session a row without restarting it.
   rpc ReplaceInstance (ReplaceInstanceRequest) returns (ReplaceInstanceReply);
 
   // Lists stateful instances (slot and keyed) for a job, optionally filtered
   // by group. Includes Terminated rows (slot rows retained for scale-out
   // re-materialization; keyed rows retained forever as never-recycle
   // tombstones).
+  //
+  // The job's running sessions (docs/session-mode.md) follow the rows, read
+  // from the session index of this manager and every peer: `durable =
+  // false`, `mode = "session"`. `complete` says whether every node that can
+  // run sessions has reported, and `as_of` when the index was read.
   rpc ListInstances (ListInstancesRequest) returns (ListInstancesReply);
 
   // Returns one stateful instance by id.
   //
+  // A session (docs/session-mode.md) has no row: when the id names none,
+  // the manager looks it up in the session index its peers and the nodes'
+  // heartbeats keep, after a coarse `job:read` check on any job (so a
+  // caller without job access cannot probe which session ids exist), then
+  // enforces `job:read` on the session's own job.
+  //
   // Errors:
-  // - NotFound: no instance row with this id exists.
+  // - NotFound: no instance row and no running session has this id.
   rpc GetInstance (GetInstanceRequest) returns (GetInstanceReply);
+
+  // Promotes a running session (docs/session-mode.md) to a keyed instance:
+  // one scheduler-lane entry writes an instance row and an allocation row
+  // bound to it on the session's node, and the node adopts the running
+  // session as that allocation in place. Nothing restarts. From then on the
+  // instance is keyed: listed exactly, at most one live allocation, rescheduled
+  // on node loss, and kept as a tombstone on destroy when it is named.
+  //
+  // The new allocation reserves nothing of its own: the session already sits
+  // inside its node's envelope, and stays inside it until it stops. A
+  // replacement placed after node loss reserves the task's full resources,
+  // like any keyed placement.
+  //
+  // ACL: `job:write` on the session's job, checked coarsely before the
+  // session lookup and precisely after it.
+  //
+  // Retry-safe without a key too: when the instance the request would create
+  // already exists and was promoted from this session, the reply describes
+  // it with `deduplicated = true`.
+  //
+  // The manager pushes the new allocation to the session's node right away.
+  // The push is best effort: the rows are written either way, and a node the
+  // push misses adopts the session from its next desired set.
+  //
+  // Errors:
+  // - NotFound: no running session has this id.
+  // - AlreadyExists: `new_id` (or the session id) names an existing instance
+  //   that was not promoted from this session, including a tombstone.
+  // - InvalidArgument: `new_id` is not a valid keyed id, or the task sets
+  //   `stateful.promote.onName = false` and `new_id` is set.
+  // - FailedPrecondition: the session's job config no longer has its task.
+  rpc PromoteInstance (PromoteInstanceRequest) returns (PromoteInstanceReply);
 
   // === SNAPSHOTS (see docs/suspend-and-resume.md) ===
 
@@ -623,6 +711,10 @@ service Manager {
   //   - `disk` was asked for an instance with no `stateful.storage` volume;
   //   - a snapshot of this instance is already being captured.
   // - AlreadyExists: `name` is already used by another snapshot of the job.
+  //
+  // A running session (docs/session-mode.md) cannot be snapshotted: the call
+  // answers FailedPrecondition and names PromoteInstance, which gives the
+  // session a row without restarting it.
   rpc CreateSnapshot (CreateSnapshotRequest) returns (CreateSnapshotReply);
 
   // Lists snapshots, newest first, optionally filtered by job, instance, or
@@ -705,6 +797,10 @@ service Manager {
   // placed on any node whose fingerprint passes the manifest's `compat`,
   // preferring nodes that already hold its parts (the `locality` score), and
   // that node fetches the parts from the content store before restoring.
+  //
+  // A running session (docs/session-mode.md) cannot be restored: the call
+  // answers FailedPrecondition and names PromoteInstance, which gives the
+  // session a row without restarting it.
   rpc RestoreInstance (RestoreInstanceRequest) returns (RestoreInstanceReply);
 
   // Points a snapshot name (an alias) at a snapshot of the same job,
@@ -3029,6 +3125,28 @@ message CreateInstanceReply {
   // `from_snapshot` (a name resolves to the snapshot it named at call
   // time). Empty when the instance boots empty.
   string restoring_from = 3;
+
+  // `keyed` for an instance with a row, `session` for an unnamed session of
+  // a session-mode task (docs/session-mode.md), started on a node with
+  // envelope room and recorded nowhere but on that node and in the
+  // managers' session index.
+  string mode = 4;
+
+  // Whether the instance has a row in the replicated store, and so the
+  // keyed guarantees: an exact listing, at most one live allocation,
+  // rescheduling on node loss. False for a session until it is promoted
+  // (PromoteInstance).
+  bool durable = 5;
+
+  // The node a session was started on. Empty for a keyed create, whose
+  // placement the scheduler decides after this call returns.
+  string node_id = 6;
+
+  // A session's state: `starting` for a session this call started, or the
+  // state its node last reported (`starting` or `running`) for a
+  // deduplicated create. Empty for a keyed create (see `GetInstance` for its
+  // state).
+  string state = 7;
 }
 
 // Request payload for CreateInstances (atomic batch create).
@@ -3154,7 +3272,8 @@ message StartInstanceReply {
   // - `"Started instance <id>"` — moved stopped -> pending and queued for
   //  placement by this request.
   // - `"Instance <id> already running"` — no-op on a live
-  //  (pending/active/rescheduling) instance.
+  //  (pending/active/rescheduling) instance, or on a running session
+  //  (docs/session-mode.md).
   // - `"Resuming instance <id> from <snapshot> on <node>"` — a suspended
   //  instance queued to restore from its checkpoint.
   // - `"Started instance <id> cold ..."` — a suspended instance booting
@@ -3571,6 +3690,32 @@ message InstanceInfo {
   // The archive manifest's URL (`s3://…/manifests/<job>/<group>/<task>/<id>.json`
   // or `file://…`). Set exactly when `archived` is.
   optional string manifest_url = 41;
+
+  // Whether the instance has a row in the replicated store (docs/session-mode.md).
+  // True for every slot and keyed instance, including a promoted session.
+  // False for an unnamed session (`mode = "session"`): it lives on its node
+  // and in the managers' session index, ends when its node is lost, and is
+  // listed from that index, which can lag its node by a heartbeat. Also
+  // false for an archived instance with no row (`archive = "manifestOnly"`),
+  // whose archive manifest is its whole record.
+  bool durable = 42;
+
+  // The session this instance was promoted from (PromoteInstance), kept for
+  // the instance's lifetime. Equal to `instance_id` when the promotion kept
+  // the session's id. Unset for instances that were never sessions.
+  optional string promoted_from = 43;
+
+  // The node running a session (`mode = "session"`). Unset for instances
+  // with a row, whose node is their current allocation's.
+  optional string node_id = 44;
+
+  // When the manager that started the session issued it, RFC 3339. Of two
+  // copies of one session id on two nodes, the later one is stopped.
+  // Sessions only.
+  optional string lease_issued_at = 45;
+
+  // The envelope allocation the session runs inside. Sessions only.
+  optional int64 envelope_alloc_id = 46;
 }
 
 // A cold boot that replaced a restore (InstanceInfo.cold_boot).
@@ -3625,6 +3770,58 @@ message ListInstancesReply {
   // With `include_idle`: the token for the next page of the bucket
   // listing. Empty when the listing is complete.
   string next_idle_page_token = 2;
+
+  // Whether the running sessions listed (`mode = "session"`) are every
+  // session the job has: true when, for every live node that can run
+  // sessions, some manager holds a full session report. False right after a
+  // manager starts or a node joins, until those reports land (one heartbeat
+  // each). Always true for a job with no session task. Rows are always
+  // listed in full.
+  bool complete = 3;
+
+  // When the session part of the listing was read, RFC 3339. A session's
+  // own entry can be up to one heartbeat older than this.
+  string as_of = 4;
+}
+
+// Request payload for PromoteInstance.
+message PromoteInstanceRequest {
+  // The running session to promote.
+  string instance_id = 1;
+
+  // A name for the promoted instance. Must be a valid keyed id
+  // (`[A-Za-z0-9._-]{1,128}`, not the minted shape) that no instance has
+  // ever had. Empty keeps the session's own id, which stays unnamed: its row
+  // is deleted on destroy, like any minted id. Refused when the task sets
+  // `stateful.promote.onName = false`. The running workload keeps the
+  // `LEGION_INSTANCE_ID` it started with until it restarts.
+  string new_id = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`. The
+  // recorded replay carries the promoted instance id.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for PromoteInstance.
+message PromoteInstanceReply {
+  // The promoted instance's id: `new_id`, or the session id.
+  string instance_id = 1;
+
+  // The session it was promoted from.
+  string promoted_from = 2;
+
+  // The node the session runs on, which the new allocation is bound to.
+  string node_id = 3;
+
+  // The allocation the node adopts the session as.
+  int64 allocation_id = 4;
+
+  // Always true: the instance now has a row.
+  bool durable = 5;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 6;
 }
 
 // Request payload for GetInstance.
@@ -4890,6 +5087,63 @@ message HeartbeatRequest {
   // Absent from workers that do not stream, which get today's full desired
   // set in every reply.
   optional WorkStreamState work_stream = 15;
+
+  // The sessions this node runs (docs/session-mode.md), for the manager's
+  // in-memory session index. Same epoch protocol as `content_locations`: a
+  // worker process opens with a full report, then sends deltas against the
+  // epoch the manager last acknowledged; a manager that cannot apply one
+  // sets `HeartbeatReply.session_resync`, and the next report is full. A
+  // worker also sends a full report every 30 beats, as a backstop. Absent
+  // from workers without the `sessions` capability.
+  optional SessionReport session_report = 16;
+}
+
+// One heartbeat's session report. See `HeartbeatRequest.session_report`.
+message SessionReport {
+  // The worker's session epoch after this report. A worker process starts
+  // at 0 and its first (full) report carries 1. A delta that changes
+  // something carries `base_epoch + 1`; an unchanged probe carries
+  // `base_epoch`.
+  uint64 epoch = 1;
+
+  // The epoch this delta applies on top of. Ignored when `full`.
+  uint64 base_epoch = 2;
+
+  // True when `upserts` is every session on the node, replacing whatever the
+  // manager held. `removed` is empty on a full report.
+  bool full = 3;
+
+  // Sessions started or changed since `base_epoch` (or all of them).
+  repeated SessionStatus upserts = 4;
+
+  // Session ids that ended since `base_epoch`: stopped, exited, promoted
+  // (a promoted session is an allocation from then on), or killed because
+  // their envelope left the node.
+  repeated string removed = 5;
+}
+
+// One session as its node reports it.
+message SessionStatus {
+  // The session id (`<task>-<26 base32>`).
+  string session_id = 1;
+
+  // Its job, the exact job config it runs, and its task.
+  string job_id = 2;
+  string job_config_id = 3;
+  string task_name = 4;
+
+  // The envelope allocation it runs inside, by the manager's id. Changes
+  // when a job update replaces the envelope on the node.
+  int64 envelope_allocation_id = 5;
+
+  // `starting` (admitted, not running yet) or `running`.
+  string state = 6;
+
+  // When the manager that started it issued it, unix milliseconds.
+  int64 lease_issued_at_unix_ms = 7;
+
+  // The session's reserved resources, as a JSON object.
+  string resources = 8;
 }
 
 // Where a worker's `StreamWork` delivery stands, as its heartbeat reports
@@ -5439,6 +5693,17 @@ message HeartbeatReply {
   // field; an empty list leaves the worker's known set unchanged.
   // See docs/architecture-managers-workers.md.
   repeated string manager_addresses = 13;
+
+  // The manager could not apply the request's `session_report` (it holds
+  // no state for the node, or the epochs disagree): the worker sends a full
+  // report next.
+  bool session_resync = 14;
+
+  // Sessions this node should end now (docs/session-mode.md): the later of
+  // two copies of one session id the manager found on two nodes. Re-sent on
+  // every beat until the node's report no longer lists them. Sessions the
+  // node does not run are ignored.
+  repeated string stop_sessions = 15;
 }
 
 // Why one allocation is being stopped.
@@ -8176,6 +8441,27 @@ service Worker {
   // against the cluster CA (`legion net ca show`), as `legion sandbox
   // start` does.
   rpc StartClaim (StartClaimRequest) returns (stream StartClaimReply);
+
+  // Ends sessions on this node (docs/session-mode.md). Called by a manager
+  // for `instance stop` or `instance destroy` on a session, and to stop the
+  // later copy of a duplicated session id. Ids the node does not run are
+  // ignored, so the call is idempotent.
+  rpc StopSessions (StopSessionsRequest) returns (StopSessionsReply);
+}
+
+// Request payload for Worker.StopSessions.
+message StopSessionsRequest {
+  // The sessions to end.
+  repeated string session_ids = 1;
+
+  // Why, for the node's log: `stop`, `destroy`, or `duplicate`.
+  string reason = 2;
+}
+
+// Reply payload for Worker.StopSessions.
+message StopSessionsReply {
+  // The ids this node was running and has ended.
+  repeated string stopped = 1;
 }
 
 // === EXEC / ACTIONS ===
@@ -8688,6 +8974,14 @@ message TaskAllocation {
   // same as declaring `always`: the policy then follows `task_lifecycle`
   // (`onFailure` for `batch`, `always` otherwise).
   string task_restart = 27;
+
+  // The session this allocation's instance was promoted from
+  // (PromoteInstance, docs/session-mode.md). A node running that session
+  // adopts it as this allocation instead of starting anything, through any
+  // delivery path (a push, a heartbeat's desired set, the work stream).
+  // A node without it starts the allocation normally, which is what a
+  // replacement after node loss does. Empty otherwise.
+  string promoted_from_session = 28;
 }
 
 // Request payload for PostWork.
@@ -9246,6 +9540,23 @@ message ProvisionalAllocation {
   // Never the ticket itself — no ticket material ever appears in a log,
   // event, or store row.
   string ticket_jti = 7;
+
+  // Set when this start is an unnamed session (docs/session-mode.md) sent by
+  // a manager's session router. The node admits it against its envelope for
+  // the task instead of its own free resources, keeps it under the claim id
+  // `session:<instance_id>` with no lease deadline, never reports it in
+  // `provisional_claims`, and reports it in `session_report` instead. It
+  // runs until it exits, is stopped, is promoted, or its envelope leaves the
+  // node. Refused with RESOURCE_EXHAUSTED when the envelope has no room and
+  // FAILED_PRECONDITION when the node holds no envelope for the task.
+  optional SessionStart session = 8;
+}
+
+// A session start (`ProvisionalAllocation.session`).
+message SessionStart {
+  // When the router issued the session, unix milliseconds. Breaks a tie
+  // between two copies of one session id: the later one is stopped.
+  int64 lease_issued_at_unix_ms = 1;
 }
 
 // One unratified claim a worker is holding, reported on every heartbeat.
@@ -9703,6 +10014,17 @@ service RaftTransport {
   // `Unimplemented`, and the command reports that the target must be
   // upgraded.
   rpc TriggerElection (TriggerElectionRequest) returns (TriggerElectionReply);
+
+  // Reads this manager's session index (docs/session-mode.md). Each manager
+  // indexes the sessions of the nodes that heartbeat to it, so a manager
+  // answering a GetInstance, ListInstances, or CreateInstance for a session
+  // asks every peer and merges the answers. Read-only, and answered by
+  // every member, leader or not.
+  //
+  // ACL: manager-plane internal, authenticated by cluster secret metadata.
+  // It is not a `Manager` RPC, so it takes no ACL row; the calling manager
+  // has already authorized its own caller.
+  rpc QuerySessions (QuerySessionsRequest) returns (QuerySessionsReply);
 }
 
 // Request payload for RaftTransport.TriggerElection.
@@ -9723,6 +10045,62 @@ message TriggerElectionReply {
 
   // Raft groups (lane wire names) on which the campaign was started.
   repeated string lanes = 2;
+}
+
+// Request payload for RaftTransport.QuerySessions. Exactly one of
+// `session_id` and `job_id` is set.
+message QuerySessionsRequest {
+  // Every entry for this session id (normally one; two while a duplicate
+  // converges).
+  string session_id = 1;
+
+  // Every session of this job, or of this job's `task_name` when set.
+  string job_id = 2;
+  string task_name = 3;
+
+  // With `job_id`: return only per-node totals in `node_usage`, not the
+  // sessions themselves. What the session router reads.
+  bool usage_only = 4;
+}
+
+// Reply payload for RaftTransport.QuerySessions.
+message QuerySessionsReply {
+  // The matching sessions, with the node each runs on.
+  repeated IndexedSession sessions = 1;
+
+  // The nodes this manager holds a full session report for, and how long
+  // ago each last reported. A node that moved between managers can be held
+  // by two for a while; the caller takes the node's sessions from the
+  // manager that heard from it last.
+  repeated CoveredNode covered_nodes = 2;
+
+  // With `usage_only`: per-node totals of the matching sessions.
+  repeated NodeSessionUsage node_usage = 3;
+}
+
+// A node a manager's session index covers (`QuerySessionsReply`).
+message CoveredNode {
+  string node_id = 1;
+  // Milliseconds since the node's last session report reached this manager.
+  uint64 age_ms = 2;
+}
+
+// One session in a manager's session index.
+message IndexedSession {
+  string node_id = 1;
+  SessionStatus status = 2;
+  // Recorded by this manager's session router when it started the session,
+  // and not yet in a report from the node. Stands in for the report for a
+  // heartbeat or two, so a read right after a create finds the session.
+  bool recent = 3;
+}
+
+// The sessions of one job (and task) on one node, totalled.
+message NodeSessionUsage {
+  string node_id = 1;
+  uint32 sessions = 2;
+  // Summed `resources`, as a JSON object of amounts.
+  string resources = 3;
 }
 
 // Request payload for RaftTransport.FetchRootKey.

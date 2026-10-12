@@ -57,11 +57,28 @@ pub struct ClaimRecord {
     pub ticket_jti: String,
     /// Manager-minted allocation id, once ratified.
     pub allocation_id: Option<i64>,
+    /// Set for a session (docs/session-mode.md): work admitted into its
+    /// task's envelope rather than the node's free capacity. A session has no
+    /// lease deadline and is never ratified by the store; it is ratified only
+    /// when promoted, and then still runs inside the envelope.
+    pub session: Option<SessionClaim>,
+}
+
+/// What a session claim carries beyond an ordinary claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionClaim {
+    /// When the manager's router issued the session, unix milliseconds. Of
+    /// two copies of one session id, the later is stopped.
+    pub lease_issued_at_unix_ms: i64,
 }
 
 impl ClaimRecord {
     pub fn is_ratified(&self) -> bool {
         self.allocation_id.is_some()
+    }
+
+    pub fn is_session(&self) -> bool {
+        self.session.is_some()
     }
 }
 
@@ -150,9 +167,14 @@ impl ClaimTable {
     /// ratification binds the payload to the claim; starting the payload on
     /// its own would run it twice. (A payload names no instance, so two
     /// instances of one task are not told apart; the caller only defers.)
+    ///
+    /// Sessions never match: a committed payload is never a session's
+    /// ratification (a promotion names its session explicitly, see
+    /// `TaskAllocation.promoted_from_session`).
     pub fn unratified_matches(&self, job_config_id: &str, task_name: &str) -> bool {
         self.claims.values().any(|claim| {
             !claim.is_ratified()
+                && !claim.is_session()
                 && claim.job_config_id == job_config_id
                 && claim.task_name == task_name
         })
@@ -174,7 +196,8 @@ impl ClaimTable {
     /// Local keys of claims that are NOT yet ratified. These are exempt from
     /// the heartbeat reconcile's stop sweep for the length of their lease:
     /// the manager cannot list work it does not know about, and an absence
-    /// must not be read as "stop this".
+    /// must not be read as "stop this". Sessions are among them for as long
+    /// as they run: no desired set ever lists one.
     pub fn unratified_local_keys(&self) -> Vec<i64> {
         self.claims
             .values()
@@ -193,11 +216,14 @@ impl ClaimTable {
     /// Claims whose lease has expired and which are still unratified. These
     /// are killed unconditionally — the backstop for every failure mode the
     /// reply path cannot cover (a partition, a dead manager, a lost reply).
+    /// Sessions have no lease deadline and never expire.
     pub fn expired(&self, now: Instant) -> Vec<ClaimRecord> {
         let mut expired = self
             .claims
             .values()
-            .filter(|claim| !claim.is_ratified() && now >= claim.lease_deadline)
+            .filter(|claim| {
+                !claim.is_ratified() && !claim.is_session() && now >= claim.lease_deadline
+            })
             .cloned()
             .collect::<Vec<_>>();
         expired.sort_by(|a, b| a.claim_id.cmp(&b.claim_id));
@@ -205,11 +231,24 @@ impl ClaimTable {
     }
 
     /// Every unratified claim, sorted by claim id, for the heartbeat report.
+    /// Sessions are left out: they go in the session report instead.
     pub fn unratified(&self) -> Vec<ClaimRecord> {
         let mut claims = self
             .claims
             .values()
-            .filter(|claim| !claim.is_ratified())
+            .filter(|claim| !claim.is_ratified() && !claim.is_session())
+            .cloned()
+            .collect::<Vec<_>>();
+        claims.sort_by(|a, b| a.claim_id.cmp(&b.claim_id));
+        claims
+    }
+
+    /// Every session claim, promoted or not, sorted by claim id.
+    pub fn sessions(&self) -> Vec<ClaimRecord> {
+        let mut claims = self
+            .claims
+            .values()
+            .filter(|claim| claim.is_session())
             .cloned()
             .collect::<Vec<_>>();
         claims.sort_by(|a, b| a.claim_id.cmp(&b.claim_id));
@@ -408,6 +447,7 @@ mod claims_test {
             on_refused: OnRefused::Kill,
             ticket_jti: String::new(),
             allocation_id: None,
+            session: None,
         }
     }
 
@@ -484,6 +524,29 @@ mod claims_test {
                 .get(&table.get("clm_b").unwrap().local_key),
             Some(&8123)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sessions_never_expire_and_stay_out_of_the_claims_report_test() -> R<()> {
+        let mut table = ClaimTable::new();
+        let mut session = record("session:workspace-a", "workspace-a");
+        session.lease_deadline = Instant::now() - Duration::from_secs(1);
+        session.session = Some(SessionClaim {
+            lease_issued_at_unix_ms: 1,
+        });
+        let session = table.insert(session)?;
+        table.insert(record("clm_b", "user-2"))?;
+
+        assert!(table.expired(Instant::now()).is_empty());
+        assert_eq!(table.unratified().len(), 1);
+        assert_eq!(table.sessions().len(), 1);
+        // Still protected from the reconcile sweep: no desired set lists it.
+        assert!(table.unratified_local_keys().contains(&session.local_key));
+        // A committed payload of the same task is not this session's
+        // ratification.
+        table.remove("clm_b");
+        assert!(!table.unratified_matches("jc-1", "workspace"));
         Ok(())
     }
 

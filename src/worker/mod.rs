@@ -19,6 +19,7 @@ pub mod plane;
 pub mod pressure;
 pub mod resources;
 pub mod server;
+pub mod session_report;
 pub mod simulate;
 pub mod state;
 pub mod task_health;

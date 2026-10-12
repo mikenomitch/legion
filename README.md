@@ -272,6 +272,11 @@ they should. Legion handles all three.
   control plane 8 replicated writes, down from 22. Concurrent creates and
   suspends share a single write, so the cost per sandbox falls under load.
   See [Sandboxes at scale](docs/sandboxes-at-scale.md).
+- **Sessions that write nothing.** For sandboxes that are disposable,
+  [session mode](docs/session-mode.md) starts them straight onto a node's
+  reserved room with no replicated write at all, lists them from what the
+  nodes report, and promotes any one to a durable instance without
+  restarting it.
 - **Work lands in one round trip.** Each node holds one stream to its
   manager, so a placement reaches it as soon as it commits, at any
   heartbeat interval. A node running 10,000 sandboxes sends a heartbeat of a
@@ -355,10 +360,10 @@ add:
 
 - **Faster sandbox wake-ups**: wake on connect, lazy memory restore, and diff
   snapshots on top of [suspend and resume](docs/suspend-and-resume.md).
-- **Sandbox scaling to very large session counts**: ephemeral sessions,
-  node-reported state, idle sessions in object storage that wake on
-  request, and sequenced delivery of work, so raft holds only what must be
-  durable ([plan](internal_docs/plans/sandbox-scaling-plan.md)).
+- **Sandbox scaling to very large session counts**: idle sessions in
+  object storage that wake on request, workload identity for sessions, and
+  denser sandboxes per node
+  ([plan](internal_docs/plans/sandbox-scaling-plan.md)).
 - **Exec into microVM sandboxes**, and exec sessions that skip the manager
   ([plan](internal_docs/plans/sandbox-exec-plan.md)).
 - **Built-in ingress gateway, autoscaler, cert-manager, and GitOps tools**, or
@@ -395,7 +400,8 @@ start:
   [Running Redis](docs/guides/redis.md) ·
   [Serving TLS Certificates from KV](docs/guides/tls-certificates.md) ·
   [Running Agent Sandboxes](docs/guides/agent-sandboxes.md) ·
-  [Sandboxes at Scale](docs/sandboxes-at-scale.md)
+  [Sandboxes at Scale](docs/sandboxes-at-scale.md) ·
+  [Session Mode](docs/session-mode.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md)

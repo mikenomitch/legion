@@ -60,6 +60,7 @@ Pick by how the work comes into existence and what must survive a failure:
 | A fixed number of interchangeable replicas with no per-replica state (web, API, workers) | no `stateful` block: `count` | Nothing to keep across a reschedule; the cheapest path, and `count` scales it |
 | A fixed set of replicas, each owning its own data (a database replica set, a quorum, a sharded cache) | `slot` | Replica *N* must come back as replica *N* with replica *N*'s disk; ids are readable and reused within the pool |
 | Units created and destroyed on demand by an API, each with its own identity and possibly its own state (per-user sandboxes, per-agent or per-session workspaces, a dev environment per branch, a game server per match, a CI runner per job) | `keyed` | Each unit is created by `CreateInstance`, survives node loss and reschedules under its own id, can be suspended, resumed, and forked, and its id is never recycled |
+| Very many short-lived units created by an API, disposable on node loss (agent sandboxes and tool runs, CI runners, function-style invocations) | `session` | Starts write nothing to the replicated store, so the start rate and the count are bound by nodes, not by the control plane; you give up rescheduling on node loss, an exact instant listing, and a durable record per unit, and can promote any session to `keyed` without stopping it ([Session mode](session-mode.md)) |
 
 What each mode guarantees and costs:
 
@@ -156,7 +157,8 @@ restore checks, and its failure modes.
     runtime = "exec",
     count = 3,                    # slot cardinality: slots 0, 1, 2
     stateful = {
-      mode = "slot",              # 'slot' (default) | 'keyed'
+      mode = "slot",              # 'slot' (default) | 'keyed' | 'session'
+                                 # (session: see docs/session-mode.md)
       # requireId = true,        # keyed only: refuse creates without --id
       # initialInstances = ["user-1", "user-2"],  # keyed only: seed list
       onLost = {                  # optional; node-loss fencing policy — see
@@ -187,7 +189,8 @@ restore checks, and its failure modes.
 Validation rules (enforced at `job validate` and submit time):
 
 - `mode` defaults to `'slot'`. Set `'keyed'` explicitly to use the
-  instance-management model.
+  instance-management model, or `'session'` for units that start without a
+  raft write ([Session mode](session-mode.md), which lists its own rules).
 - `requireId` is only valid in keyed mode.
 - Slot mode requires `count.num >= 1` and can't be combined with `count.per`
   (per-attribute pools would collide on slot ids).
@@ -260,7 +263,7 @@ dispatch time, so they are present at process start for `exec` and
 | --- | --- | --- |
 | `LEGION_ALLOC_ID` | **all** tasks (stateless too) | Current allocation id. Changes with each placement. |
 | `LEGION_INSTANCE_ID` | stateful tasks | Stable instance id. Survives reschedules. |
-| `LEGION_INSTANCE_MODE` | stateful tasks | `slot` or `keyed`. |
+| `LEGION_INSTANCE_MODE` | stateful tasks | `slot`, `keyed`, or `session` (an unnamed [session](session-mode.md)). |
 | `LEGION_INSTANCE_SLOT` | slot mode only | Ordinal slot index `0..count-1`. |
 | `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-runtime) for why exec and container tasks get different values. |
 | `LEGION_VOLUME_<NAME>` | per declared volume | Same, for every volume including `volumes[]` claims. |

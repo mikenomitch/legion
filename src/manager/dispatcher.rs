@@ -346,6 +346,7 @@ fn speculative_claim_for(
         origin: "manager".into(),
         on_refused: speculative.on_refused.as_str().to_string(),
         ticket_jti: String::new(),
+        session: None,
     };
     // A placeholder allocation with id 0: the payload's own `allocation_id`
     // is 0 for exactly this reason, and the node keys the work by claim id.
@@ -457,6 +458,7 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
         origin: "manager".into(),
         on_refused: String::new(),
         ticket_jti: String::new(),
+        session: None,
     };
     // Built with the ordinary runtime env (LEGION_ALLOC_ID and friends): from
     // here on this is a normal allocation, and the node replaces the payload
@@ -650,6 +652,11 @@ pub fn build_task_allocation_with(
         task_suspend,
         task_snapshots,
         identity_epoch: instance.map_or(0, |instance| instance.identity_epoch),
+        // A node still running the session adopts it as this allocation
+        // (docs/session-mode.md, "Promotion"); any other node starts it.
+        promoted_from_session: instance
+            .and_then(|instance| instance.promoted_from.clone())
+            .unwrap_or_default(),
         task_lifecycle: task.lifecycle.to_string(),
         task_restart,
     })
@@ -891,6 +898,7 @@ mod tests {
             restore_from: None,
             identity_epoch: 0,
             named: true,
+            promoted_from: None,
         }
     }
 
@@ -1051,6 +1059,8 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -1077,6 +1087,8 @@ mod tests {
                     replace_after: Some("2m".into()),
                 }),
                 storage: None,
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -1193,6 +1205,7 @@ mod tests {
                 origin: "edge".into(),
                 on_refused: "kill".into(),
                 ticket_jti: "tkt_1".into(),
+                session: None,
             }),
         )?;
         assert_eq!(built.allocation_id, 0);
@@ -1269,6 +1282,8 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("workspace", "exec")
         };
@@ -1297,6 +1312,8 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("workspace", "exec")
         };

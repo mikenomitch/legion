@@ -92,6 +92,7 @@ pub const WORKER_RPC_CALLERS: &[(&str, &[Caller])] = &[
     ("GetTaskLogs", &[Caller::Manager]),
     ("ExecTask", &[Caller::Manager]),
     ("StartClaim", &[Caller::Ticket]),
+    ("StopSessions", &[Caller::Manager]),
 ];
 
 /// The caller classes `rpc` admits; empty for an RPC missing from the table.

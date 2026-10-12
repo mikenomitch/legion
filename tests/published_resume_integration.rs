@@ -301,6 +301,8 @@ fn job(durability: &str) -> JobConfig {
             initial_instances: None,
             on_lost: None,
             storage: None,
+            envelope: None,
+            promote: None,
         }),
         suspend: Some(SuspendConfig {
             durability: Some(durability.into()),

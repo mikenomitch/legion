@@ -296,13 +296,15 @@ impl ManagerDaemonService {
                 .map_err(Status::invalid_argument)?;
         }
 
-        let instance = self
+        let Some(instance) = self
             .store
             .get_instance(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?
-            .ok_or_else(|| {
-                Status::not_found(format!("instance {} not found", inner.instance_id))
-            })?;
+        else {
+            return Err(self
+                .missing_instance(&identity, &inner.instance_id, "snapshotted")
+                .await);
+        };
         self.enforce_snapshot_scope(&identity, AclAction::Write, &instance.job_id)?;
 
         let allocation = match (instance.state, instance.current_alloc_id) {
@@ -626,13 +628,15 @@ impl ManagerDaemonService {
             }));
         }
 
-        let instance = self
+        let Some(instance) = self
             .store
             .get_instance(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?
-            .ok_or_else(|| {
-                Status::not_found(format!("instance {} not found", inner.instance_id))
-            })?;
+        else {
+            return Err(self
+                .missing_instance(&identity, &inner.instance_id, "restored")
+                .await);
+        };
         self.enforce_snapshot_scope(&identity, AclAction::Read, &instance.job_id)?;
         acl::enforce(
             &identity,

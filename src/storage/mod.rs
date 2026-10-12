@@ -11,6 +11,7 @@ pub mod netpolicy_store;
 pub mod persistence;
 pub mod queries;
 pub mod raft;
+pub mod session_index;
 pub mod snapshot_warm;
 pub mod store;
 pub mod work_log;

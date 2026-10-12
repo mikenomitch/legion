@@ -775,6 +775,53 @@
             },
         },
         {
+            name = "scratch",
+            runtime = "exec",
+            group = "scratch",
+            # Session-mode task (see docs/session-mode.md): `legion instance
+            # create maximal-demo --group scratch` without --id starts an
+            # unnamed session straight on a node with envelope room and
+            # writes nothing to the replicated store. It is lost with its
+            # node, listed from the nodes' reports, and becomes a keyed
+            # instance with `legion instance promote <id>`. The task sees
+            # LEGION_INSTANCE_MODE = "session". A session task may not
+            # declare storage, volumes, ports, a service, connect upstreams,
+            # identities, requireId, or initialInstances.
+            stateful = {
+                mode = "session",
+                # The room each eligible node keeps for this task's sessions.
+                # Legion places one generated `scratch-envelope` allocation
+                # per node (on workers with the `sessions` capability) with
+                # these resources, and admits sessions against it.
+                envelope = {
+                    # Must set cpu and memory, and every amount `resources`
+                    # below declares; a session must fit.
+                    resources = { cpu = 4000, memory = 4096 },
+                    # Extra placement constraints for the envelopes, on top
+                    # of the task's own `constraints`. Optional.
+                    constraints = { node_class = "sandbox" },
+                },
+                # Whether a caller-chosen id is accepted (`instance create
+                # --id`, a keyed instance from birth; `instance promote
+                # --id`, a rename). Default true. With false, every create
+                # starts an unnamed session and a promotion keeps its id.
+                promote = {
+                    onName = true,
+                },
+            },
+            config = {
+                command = ["sleep", "600"],
+            },
+            # One session's size, in the envelope's units.
+            resources = {
+                cpu = 250,
+                memory = 256,
+            },
+            constraints = {
+                os = "linux",
+            },
+        },
+        {
             # microVM sandbox (see docs/task-kind-sandbox.md). Same shape as
             # the container kind plus what a VM needs: guest size and a
             # kernel. Persistent state is a *block-mode volume*: a guest

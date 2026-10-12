@@ -1276,6 +1276,8 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("db", "service")
         };
@@ -1360,6 +1362,8 @@ mod tests {
                     retain_on_scale_in: None,
                     retain_on_stop: None,
                 }),
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("sandbox", "service")
         };

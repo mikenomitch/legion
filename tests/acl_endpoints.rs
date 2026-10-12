@@ -161,6 +161,9 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ReplaceInstance", Plane::Protected("job:write")),
         ("ListInstances", Plane::Protected("job:read")),
         ("GetInstance", Plane::Protected("job:read")),
+        // The session's job is known only after the index lookup, so the
+        // coarse gate is `job:write` on any job.
+        ("PromoteInstance", Plane::Protected("job:write")),
         // Snapshots are their own resource: a memory snapshot holds the
         // workload's in-memory secrets, which `job:write` must not imply.
         // RestoreInstance also needs `job:write` (it replaces an allocation);
@@ -940,6 +943,16 @@ async fn call_endpoint(
         "SuspendInstance" => svc
             .suspend_instance(req(
                 legion::structs::SuspendInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "PromoteInstance" => svc
+            .promote_instance(req(
+                PromoteInstanceRequest {
                     instance_id: "missing-instance".into(),
                     ..Default::default()
                 },

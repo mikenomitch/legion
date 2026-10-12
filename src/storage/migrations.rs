@@ -1921,6 +1921,12 @@ fn migration_list() -> Vec<M<'static>> {
         // the end, since raft changesets bind columns by position. Scheduler
         // lane, like `instance`.
         M::up("ALTER TABLE instance ADD COLUMN manifest_url TEXT;").down(""),
+        // Session promotion (sandbox-scaling plan, Phase 6;
+        // docs/session-mode.md, "Promotion"): the session a keyed instance
+        // was promoted from, written once when PromoteInstance inserts the
+        // row. Appended at the end, since raft changesets bind columns by
+        // position. Scheduler lane, like `instance`.
+        M::up("ALTER TABLE instance ADD COLUMN promoted_from TEXT;").down(""),
     ]
 }
 

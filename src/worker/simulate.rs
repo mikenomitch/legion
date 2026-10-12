@@ -744,6 +744,16 @@ impl Worker for SimWorkerService {
             "restarting a simulated node would restart the whole fleet process",
         ))
     }
+
+    /// Simulated nodes run no sessions: they do not advertise the
+    /// `sessions` capability, so no envelope is placed on them and no router
+    /// sends them a start.
+    async fn stop_sessions(
+        &self,
+        _request: Request<crate::structs::StopSessionsRequest>,
+    ) -> Result<Response<crate::structs::StopSessionsReply>, Status> {
+        Ok(Response::new(crate::structs::StopSessionsReply::default()))
+    }
 }
 
 /// A launched fleet: observability for tests and drivers, plus the point
@@ -1307,6 +1317,8 @@ async fn heartbeat_sim_node(
         usage: None,
         // Nor anything to checkpoint, unless faking the channel.
         snapshot_reports: snapshot_reports.clone(),
+        // Nor sessions (no `sessions` capability).
+        session_report: None,
     }));
     let reply = match client.clone().heartbeat(req).await {
         Ok(reply) => reply.into_inner(),

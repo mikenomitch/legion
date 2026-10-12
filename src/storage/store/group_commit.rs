@@ -190,6 +190,8 @@ mod group_commit_test {
                 initial_instances: None,
                 on_lost: None,
                 storage: None,
+                envelope: None,
+                promote: None,
             }),
             ..TaskConfig::new("workspace", "noop")
         };

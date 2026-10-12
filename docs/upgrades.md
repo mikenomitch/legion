@@ -262,6 +262,29 @@ The release that added [archived instances](suspend-and-resume.md#archiving-idle
   and a `manifestOnly` instance, which has no row, is not found. Start the
   archived instances you need before a downgrade.
 
+## Session mode
+
+The release that added [session mode](session-mode.md) changed these
+shapes:
+
+- **Managers first, as always.** A worker advertises the `sessions`
+  capability only once it runs a version with session support, and
+  envelopes are placed only on workers that advertise it. A session job
+  submitted while every worker is older places no envelope, and creates
+  answer `FailedPrecondition` until a worker upgrades.
+- **Heartbeats carry a session report**, and replies may ask for a resync
+  or name sessions to stop. An older manager ignores the report, so a
+  worker upgraded first runs sessions nobody indexes; upgrade managers
+  first.
+- **`legion instance list -j` adds `complete` and `asOf`**, and
+  `instance create -j` adds `mode`, `durable`, `node`, and `state`. Existing
+  fields are unchanged.
+- **The `instance.promoted_from` column** is appended by the upgrade.
+  Downgrading a manager loses it, and a promoted instance reads as an
+  ordinary keyed instance.
+- **Downgrading a worker** ends its running sessions: an older worker does
+  not know them. Promote the sessions you need first.
+
 ## Task-plugin ABI
 
 Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by

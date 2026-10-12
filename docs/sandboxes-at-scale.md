@@ -46,6 +46,16 @@ Choose `keyed` over a plain `count` when sandboxes come and go on demand and
 each one is a distinct thing someone can name and come back to; see
 [Choosing a mode](stateful-workloads.md#choosing-a-mode).
 
+> **Keyed or session?** Use `keyed` when each sandbox must survive its
+> node dying (it is rescheduled with its storage), when sandboxes keep
+> volumes or need suspend and resume, or when you need an exact, durable
+> record of every sandbox: per-user workspaces people come back to. Use
+> `session` when sandboxes are disposable, created by the thousands per
+> second, and numerous enough that a row per sandbox would weigh on the
+> control plane: per-task agent sandboxes, tool executions, CI. A session
+> that turns out to matter can be promoted to a keyed instance without
+> stopping it. The trade-offs are in [Session mode](session-mode.md).
+
 ## What each step costs
 
 The control plane's cost is raft entries: each is a quorum round on one
@@ -139,12 +149,15 @@ runtime's own boot or restore time for the end-to-end figure.
 
 ## Limits to know about
 
-- **Every sandbox is a row, and a destroyed one leaves a tombstone** for the
-  life of its job, so the store grows with history, not with the running
-  set. A pending instance row is about 216 bytes (a suspended one about
-  1.7 KB with its checkpoint record); 10^6 instances is a ~217 MB store
-  image, which every new manager and lagging follower receives. Destroying
-  the job clears its history.
+- **Every keyed sandbox is a row.** A named one leaves a tombstone after
+  destroy for the life of its job; a server-minted one leaves no row
+  ([Id rules](stateful-workloads.md#id-rules)). A pending instance row is
+  about 216 bytes (a suspended one about 1.7 KB with its checkpoint
+  record); 10^6 instances is a ~217 MB store image, which every new manager
+  and lagging follower receives. Archiving an idle instance shrinks it to a
+  slim row, or to none for a server-minted id
+  ([Archiving idle instances](suspend-and-resume.md#archiving-idle-instances)),
+  and a [session](session-mode.md) has no row while it runs.
 - **Suspend and resume wait on heartbeats.** Checkpoint requests and their
   reports still ride the heartbeat, so a suspend or resume takes one to two
   heartbeat intervals of control-plane time on top of the checkpoint itself

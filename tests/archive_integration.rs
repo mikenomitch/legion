@@ -291,6 +291,8 @@ fn job(archive: &str, on_restore_failure: Option<&str>) -> JobConfig {
             initial_instances: None,
             on_lost: None,
             storage: None,
+            envelope: None,
+            promote: None,
         }),
         suspend: Some(SuspendConfig {
             durability: Some("store".into()),

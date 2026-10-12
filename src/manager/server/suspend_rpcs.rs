@@ -283,13 +283,15 @@ impl ManagerDaemonService {
             return Ok(Response::new(recorded.into_reply(true)));
         }
 
-        let instance = self
+        let Some(instance) = self
             .store
             .get_instance(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?
-            .ok_or_else(|| {
-                Status::not_found(format!("instance {} not found", inner.instance_id))
-            })?;
+        else {
+            return Err(self
+                .missing_instance(&identity, &inner.instance_id, "suspended")
+                .await);
+        };
         acl::enforce(
             &identity,
             AclResource::Job,
