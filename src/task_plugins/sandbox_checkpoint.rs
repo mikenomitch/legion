@@ -924,7 +924,7 @@ pub(crate) fn ensure_auto_tap(
     bridge: &str,
     scratch: &Path,
 ) -> R<()> {
-    let need = format!("sandbox needs TAP device {device} (network.tap = \"auto\")");
+    let need = format!("sandbox needs TAP device {device} on bridge {bridge}");
     let state = taps.state(device).with_context(|| need.clone())?;
     match state {
         TapState::Free => {
@@ -1083,7 +1083,7 @@ fn retarget_cloud_hypervisor_config(
 }
 
 /// How long a gated restore waits for the datapath's egress proxy socket
-/// before resuming the guest anyway (gated plan §6.3, calls entry 13).
+/// before resuming the guest anyway (gated plan §6.3, calls entry 25).
 pub(crate) const DATAPATH_WAIT: Duration = Duration::from_secs(5);
 
 /// Wait up to `timeout` for the egress proxy's socket beside a gated guest's
@@ -2423,7 +2423,7 @@ mod tests {
         Ok(())
     }
 
-    /// Gated plan §6.3, calls entry 13: a restore whose datapath has not
+    /// Gated plan §6.3, calls entry 25: a restore whose datapath has not
     /// bound the egress proxy socket waits, then resumes the guest anyway
     /// (fail-closed: each dial is reset) instead of failing into a cold boot.
     #[test]
@@ -2508,7 +2508,7 @@ mod tests {
         Ok(())
     }
 
-    /// Gated plan §6.2, calls entry 7: a Firecracker too old to move the
+    /// Gated plan §6.2, calls entry 12: a Firecracker too old to move the
     /// vsock refuses the capture before pausing, so the guest never stops
     /// for a checkpoint it could not restore.
     #[test]

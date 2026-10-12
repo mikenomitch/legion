@@ -189,7 +189,7 @@ pub(super) fn gated_capture_refusal(
 /// The note a live memory capture of `allocation` deserves, for the
 /// `notes` of CreateSnapshot and ForkInstance: Firecracker resets every open
 /// vsock connection at snapshot time, so a gated guest that keeps running
-/// loses its open connections (gated plan §6.3, calls entry 8).
+/// loses its open connections (gated plan §6.3, calls entry 13).
 pub(super) fn gated_capture_note(
     task: &TaskConfig,
     allocation: &crate::structs::Allocation,

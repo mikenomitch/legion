@@ -3208,6 +3208,163 @@ mod tests {
         Ok(())
     }
 
+    /// Gated plan Phase 0, G0.1: boot a gated sandbox on a real VMM with the
+    /// node datapath bound on its vsock host sockets, and prove from inside
+    /// the guest that an allowed fetch succeeds through the proxy, a denied
+    /// one gets `403` with `Legion-Denied-By`, a name resolves through the
+    /// relay, and a raw IP is unreachable without the proxy. Opt-in, like
+    /// `sandbox_microvm_boots_and_captures_console`: it needs KVM, the VMM,
+    /// a guest kernel with `CONFIG_VIRTIO_VSOCKETS=y`, the static guest
+    /// binary, and outbound HTTP from the host. See
+    /// internal_docs/suspend-resume-linux-verification.md, "Gated
+    /// sandboxes".
+    ///
+    /// ```text
+    /// LEGION_SANDBOX_KERNEL=/var/lib/legion/kernels/vmlinux \
+    /// LEGION_GUEST_BINARY=$PWD/target/x86_64-unknown-linux-musl/dist/legion-guest \
+    /// cargo test --lib sandbox_gated_boots -- --ignored --nocapture --test-threads 1
+    /// ```
+    fn gated_boot(hypervisor: &str) -> R<()> {
+        use crate::structs::netpolicy::{merge_policies, InlinePolicy, NetPolicyObject};
+        use crate::worker::netd::{guest_agent, Denials, NetPolicyCache};
+
+        if std::env::var_os(microvm::GUEST_BINARY_ENV).is_none() {
+            bail!(
+                "set {} to the static legion-guest build: the test binary cannot serve as the \
+                 guest agent",
+                microvm::GUEST_BINARY_ENV
+            );
+        }
+        let allowed =
+            std::env::var("LEGION_GATED_TEST_ALLOW").unwrap_or_else(|_| "example.com".into());
+        let denied =
+            std::env::var("LEGION_GATED_TEST_DENY").unwrap_or_else(|_| "example.org".into());
+        let image = std::env::var("LEGION_SANDBOX_TEST_IMAGE")
+            .unwrap_or_else(|_| "alpine:latest".to_string());
+        let script = format!(
+            "wget -q -O /dev/null http://{allowed}/ && echo ALLOWED-OK; \
+             wget -S -O /dev/null http://{denied}/ 2>&1 | grep -i 'legion-denied-by' && echo DENIED-OK; \
+             nslookup {allowed} 127.0.0.1 >/dev/null 2>&1 && echo DNS-OK; \
+             if nc -w 3 1.1.1.1 443 </dev/null >/dev/null 2>&1; then echo RAW-REACHED; else echo RAW-BLOCKED; fi"
+        );
+        let task = task_with(json!({
+            "image": image,
+            "hypervisor": hypervisor,
+            "command": ["/bin/sh", "-c", script],
+            "env": {
+                "http_proxy": "http://127.0.0.1:1080",
+                "HTTP_PROXY": "http://127.0.0.1:1080",
+            },
+        }));
+        let allocation = Allocation {
+            network: Some(crate::structs::AllocNetwork {
+                mode: Some(crate::structs::netpolicy::MODE_GATED.to_string()),
+                ..Default::default()
+            }),
+            ..alloc()
+        };
+        assert!(crate::task_plugins::allocation_is_gated(&allocation));
+
+        let tmp = tempfile::tempdir()?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().join("allocs").join(allocation.id.to_string())),
+            log_dir: Some(tmp.path().join("logs")),
+            ..TaskInstance::default()
+        };
+        let scratch = work_root(&allocation, &instance);
+        std::fs::create_dir_all(&scratch)?;
+        let base = vsock_socket_base(&scratch);
+
+        // The node datapath for this one allocation: its policy, the egress
+        // proxy on `<base>_1080`, and the resolver on `<base>_53`.
+        let mut object: NetPolicyObject = serde_json::from_value(json!({
+            "name": "phase0", "enforcement": "require",
+            "egress": { "protocol": "http", "allow": [format!("{allowed}/**")] },
+        }))?;
+        object.normalize_and_validate()?;
+        let policy = merge_policies(&[object], InlinePolicy::default());
+        let cache = Arc::new(NetPolicyCache::new());
+        cache.apply_assignments(&[crate::structs::AllocNetPolicy {
+            allocation_id: allocation.id,
+            policy_hash: policy.hash.clone(),
+        }]);
+        cache.insert_body(&policy.hash.clone(), policy)?;
+        let denials = Arc::new(Denials::new());
+        let context = Arc::new(crate::worker::forwarder::ForwarderContext::new(
+            cache,
+            denials.clone(),
+        ));
+        let runtime = tokio::runtime::Runtime::new()?;
+        let proxies = crate::worker::netd::proxy::EgressProxies::new(context.clone());
+        let dns = crate::worker::netd::dns::NetDns::new(
+            context,
+            crate::worker::netd::dns::NetDns::host_forwarders(),
+        );
+        runtime.block_on(async {
+            proxies
+                .sync(&[crate::worker::netd::proxy::ProxySpec {
+                    allocation_id: allocation.id,
+                    netns: None,
+                    listen: None,
+                    unix: Some(guest_agent::host_socket_path(
+                        &base,
+                        guest_agent::PROXY_PORT,
+                    )),
+                }])
+                .await;
+            dns.sync(&[crate::worker::netd::dns::DnsSpec {
+                allocation_id: allocation.id,
+                resolver: None,
+                names: BTreeMap::new(),
+                netns: None,
+                unix: Some(guest_agent::host_socket_path(&base, guest_agent::DNS_PORT)),
+            }])
+            .await;
+        });
+        assert!(
+            proxies.is_running(allocation.id),
+            "the egress proxy is bound"
+        );
+
+        let plugin = SandboxTaskPlugin;
+        plugin.prepare(&allocation, &task, &mut instance)?;
+        plugin.start(&allocation, &task, &mut instance)?;
+        let mut child = instance.child.take().expect("VMM child handle");
+        let status = child.wait()?;
+        let console =
+            std::fs::read_to_string(instance.log_dir.as_ref().unwrap().join("stdout.log"))?;
+        eprintln!("{console}");
+        assert!(status.success(), "VMM exited cleanly: {status:?}");
+        assert!(
+            console.contains("guest agent started"),
+            "the agent ran: {console}"
+        );
+        for marker in ["ALLOWED-OK", "DENIED-OK", "DNS-OK", "RAW-BLOCKED"] {
+            assert!(console.contains(marker), "missing {marker}: {console}");
+        }
+        assert!(
+            denials
+                .drain()
+                .iter()
+                .any(|denial| denial.allocation_id == allocation.id),
+            "the denied fetch was recorded against the allocation"
+        );
+        drop(runtime);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Phase 0: requires KVM + Firecracker 1.16.1+ + a vsock guest kernel + legion-guest"]
+    fn sandbox_gated_boots_firecracker() -> R<()> {
+        gated_boot("firecracker")
+    }
+
+    #[test]
+    #[ignore = "Phase 0: requires KVM + cloud-hypervisor + a vsock guest kernel + legion-guest"]
+    fn sandbox_gated_boots_cloud_hypervisor() -> R<()> {
+        gated_boot("cloud-hypervisor")
+    }
+
     /// The highest `counter=N` a guest has printed to its console so far.
     fn last_counter(log: &Path) -> Option<u64> {
         std::fs::read_to_string(log)

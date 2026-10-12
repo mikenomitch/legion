@@ -828,7 +828,7 @@ pub(crate) fn install_guest_payload(
 }
 
 /// The binary a guest runs as `/legion/legion`: its guest agent and resume
-/// handler (calls entry 6 of the gated plan).
+/// handler (calls entry 10 of the gated plan).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GuestBinary {
     pub path: PathBuf,
@@ -1318,7 +1318,7 @@ mod tests {
 
     /// A gated sandbox launched for checkpoints runs one process: the agent
     /// owns the resume watch, so a restore can close its relays.
-    /// Gated plan §6.5, calls entry 6: the static `legion-guest` beside the
+    /// Gated plan §6.5, calls entry 10: the static `legion-guest` beside the
     /// worker wins, an explicit override must exist, and with neither the
     /// worker copies itself (the glibc fallback).
     #[test]

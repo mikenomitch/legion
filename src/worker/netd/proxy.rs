@@ -1623,7 +1623,7 @@ mod tests {
         }
     }
 
-    /// Gated plan §6.5, calls entry 2: a gated allocation that no task
+    /// Gated plan §6.5, calls entry 3: a gated allocation that no task
     /// block and no policy object covers denies every destination with
     /// `gated-default`, readable in the `403` and the denial. Writing
     /// `egress = { policy = "allow" }` restores allow-all with attribution.

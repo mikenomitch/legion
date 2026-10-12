@@ -93,7 +93,7 @@ pub fn firecracker_can_override_tap(version: &str) -> bool {
 /// the restoring allocation's socket: 1.16.0 added `vsock_override` on
 /// `PUT /snapshot/load`, and 1.16.1 fixed guest-to-host connections timing
 /// out after a restore with a TX descriptor in flight, which is exactly the
-/// gated datapath's traffic (gated plan §6.2, calls entry 7).
+/// gated datapath's traffic (gated plan §6.2, calls entry 12).
 pub const FIRECRACKER_VSOCK_OVERRIDE_MIN: (u32, u32, u32) = (1, 16, 1);
 
 /// Whether a Firecracker version can take a memory checkpoint of a gated

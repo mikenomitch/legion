@@ -76,7 +76,7 @@ pub const MODES: &[&str] = &[MODE_AUTO, MODE_HOST, MODE_GATED];
 
 /// The verdict source when a gated allocation's egress reaches a
 /// destination and no task block or policy object covers its egress at all
-/// (gated plan §6.5, calls entry 2): gated means nothing leaves unless a
+/// (gated plan §6.5, calls entry 3): gated means nothing leaves unless a
 /// rule says so, on every runtime. It names itself in the `403`, the
 /// `net.denied` event, and `legion net policy test`.
 pub const SOURCE_GATED_DEFAULT: &str = "gated-default";

@@ -2291,7 +2291,7 @@ fn dns_specs(
         let sandbox = is_gated_sandbox(allocation);
         // Every gated sandbox gets a resolver on its vsock socket, VIP block
         // or not: without one, a guest with no upstreams has no DNS at all
-        // (gated plan §6.5, calls entry 11). Everything else needs a block.
+        // (gated plan §6.5, calls entry 20). Everything else needs a block.
         if resolver.is_none() && !sandbox {
             continue;
         }
@@ -3581,7 +3581,7 @@ mod tests {
         }
     }
 
-    /// Gated plan §6.5, calls entry 11: every gated sandbox gets a resolver
+    /// Gated plan §6.5, calls entry 20: every gated sandbox gets a resolver
     /// on its vsock socket even with no upstreams (and so no VIP block),
     /// and never binds an address. A gated container still needs a block
     /// (its namespace resolver gap is tracked separately).
