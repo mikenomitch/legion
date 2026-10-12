@@ -14,6 +14,7 @@ import type {
 } from '../../gen/legion_pb'
 import { AccessGate } from '../../components/AccessGate'
 import { AllocationLink } from '../../components/AllocationLink'
+import EnvelopeCard from '../../components/EnvelopeCard'
 import LogViewer from '../../components/LogViewer'
 import { PressureSteps } from '../../components/NodeUsagePanel'
 import { InstanceEventSummary, PressureExplanation, SnapshotEventSummary } from '../../components/PressureHistory'
@@ -82,6 +83,7 @@ import {
   pressureSummary,
 } from '../../utils/usage'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../../utils/volumes'
+import { ENVELOPE_COPY, envelopeServes, sessionsPerEnvelope } from '../../utils/sessions'
 
 /*
  * One allocation: one placement of one task of one job version on one worker.
@@ -92,6 +94,11 @@ import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../../utils
  * each section reads from whichever RPC the caller's token can see
  * (utils/allocationDetail.ts). An allocation the manager no longer has still
  * gets a page: its events outlive it and say what it was and why it ended.
+ *
+ * An envelope allocation (docs/session-mode.md) runs nothing: it reserves a
+ * node's room for a session task's sessions. Its page says so, offers a
+ * count of the sessions inside it, and leaves out health, network, logs,
+ * and exec, which have nothing to show for a placeholder.
  */
 
 const isRolloutDone = (status: string) =>
@@ -507,12 +514,22 @@ function AllocationDetailContent() {
     },
     loadSpec,
   )
-  const taskSpec = createMemo(() => {
-    const name = taskName()
+  const specTasks = createMemo(() => {
     const job = jobId()
     const result = valueOf(specResult)
-    if (!name || !result || result.key !== `${job}|${configId() ?? ''}`) return undefined
-    return result.spec?.tasks.find((task) => task.name === name)
+    if (!result || result.key !== `${job}|${configId() ?? ''}`) return undefined
+    return result.spec?.tasks
+  })
+  const taskSpec = createMemo(() => {
+    const name = taskName()
+    return name ? specTasks()?.find((task) => task.name === name) : undefined
+  })
+  // The session task this allocation is the envelope for, if it is one. The
+  // rendered spec lists the session task, never its generated envelope.
+  const envelopeFor = createMemo(() => envelopeServes(taskName(), specTasks()))
+  const servedSpec = createMemo(() => {
+    const served = envelopeFor()
+    return served ? specTasks()?.find((task) => task.name === served) : undefined
   })
 
   const nodeId = createMemo(() => ledgerEntry()?.nodeId || stateRow()?.nodeId || rolloutEntry()?.nodeId || eventFacts().nodeId)
@@ -607,7 +624,7 @@ function AllocationDetailContent() {
     return instance.currentAllocId
   })
 
-  const canExec = createMemo(() => running() && Boolean(jobId()) && Boolean(taskName()))
+  const canExec = createMemo(() => running() && Boolean(jobId()) && Boolean(taskName()) && !envelopeFor())
   // The task page's Actions panel, aimed at this one allocation. Targets and
   // actions are compared by content so a poll does not rebuild the panel.
   const actionTargets = createMemo(
@@ -633,7 +650,7 @@ function AllocationDetailContent() {
   )
   const [actionEntry, setActionEntry] = createSignal<string>()
   const selectedAction = () => actionEntry() ?? jobActions()?.[0]?.name ?? SHELL_ENTRY
-  const canTailLogs = createMemo(() => exists() && Boolean(jobId()))
+  const canTailLogs = createMemo(() => exists() && Boolean(jobId()) && !envelopeFor())
 
   const statusParts = createMemo(() => splitStatus(status()))
 
@@ -668,6 +685,11 @@ function AllocationDetailContent() {
                 <Show when={lifecycle()}>{(value) => <Badge tone="neutral">{value()}</Badge>}</Show>
                 <Show when={instanceId()}>
                   <Badge tone="accent" title="Fulfils a stable instance of a stateful task">stateful</Badge>
+                </Show>
+                <Show when={envelopeFor()}>
+                  <Badge tone="info" title={ENVELOPE_COPY}>
+                    session envelope
+                  </Badge>
                 </Show>
                 <Show when={usageEntry()?.usage && usageEntry()!.reservedMemoryMib > 0 && bytesToMiB(usageEntry()!.usage!.memoryCurrentBytes) > usageEntry()!.reservedMemoryMib}>
                   <Badge tone="warn" title="Using more memory than it reserved: first to give memory back under node pressure">over reservation</Badge>
@@ -907,8 +929,21 @@ function AllocationDetailContent() {
               </dl>
             </SectionCard>
 
+            <Show when={envelopeFor()}>
+              {(served) => (
+                <EnvelopeCard
+                  jobId={jobId()}
+                  allocationId={allocationId()!}
+                  nodeId={nodeId()}
+                  servedTask={served()}
+                  perEnvelope={sessionsPerEnvelope(servedSpec())}
+                  reserved={reservedResources()}
+                />
+              )}
+            </Show>
+
             {/* --- 2. Is it OK ---------------------------------------------- */}
-            <Show when={exists()}>
+            <Show when={exists() && !envelopeFor()}>
               <div id="allocation-health" class="scroll-mt-20">
                 <SectionCard
                   title="Health"
@@ -1060,6 +1095,7 @@ function AllocationDetailContent() {
             <Show when={exists()}>
               <div class="grid items-start gap-4 lg:grid-cols-2">
                 {/* --- 3. How do I reach it ---------------------------------- */}
+                <Show when={!envelopeFor()}>
                 <SectionCard title="Network" description="The address and ports assigned at placement, and the endpoints it registered.">
                   <div class="space-y-4">
                     <Show
@@ -1199,6 +1235,7 @@ function AllocationDetailContent() {
                     </Show>
                   </div>
                 </SectionCard>
+                </Show>
 
                 {/* --- 4. What is it using ----------------------------------- */}
                 <SectionCard
@@ -1396,6 +1433,7 @@ function AllocationDetailContent() {
             </div>
 
             {/* --- 6. Look inside ------------------------------------------ */}
+            <Show when={!envelopeFor()}>
             <div id="allocation-logs" class="scroll-mt-20">
               <SectionCard title="Logs" description="stdout and stderr captured by the worker, tailed live.">
                 <Show
@@ -1417,8 +1455,9 @@ function AllocationDetailContent() {
                 </Show>
               </SectionCard>
             </div>
+            </Show>
 
-            <Show when={exists()}>
+            <Show when={exists() && !envelopeFor()}>
               <div id="allocation-exec" class="scroll-mt-20">
                 <SectionCard title="Exec & actions" description="Run a command, open a shell, or trigger a declared action inside this allocation.">
                   <Show
@@ -1549,10 +1588,13 @@ function AllocationDetailContent() {
                   </ul>
                   <div class="space-y-1.5">
                     <p class="eyebrow">From the CLI</p>
-                    <Show when={running()}>
+                    <Show when={running() && !envelopeFor()}>
                       <CliLine command={`legion exec ${String(allocationId())} -it -- /bin/sh`} />
                     </Show>
-                    <Show when={jobId() && exists()}>
+                    <Show when={envelopeFor() && jobId()}>
+                      <CliLine command={`legion instance list ${jobId()} -j`} note="Lists the job's sessions; each names its envelope (envelopeAllocId)" />
+                    </Show>
+                    <Show when={jobId() && exists() && !envelopeFor()}>
                       <CliLine command={`legion job logs ${jobId()} --allocation ${String(allocationId())} --follow`} />
                     </Show>
                     <CliLine command={`legion events list --allocation ${String(allocationId())}`} />

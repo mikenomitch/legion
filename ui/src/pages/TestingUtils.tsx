@@ -1,10 +1,15 @@
-import { For, type JSX } from 'solid-js'
+import { For, Show, createSignal, type JSX } from 'solid-js'
 import { CompactNodeUsage, NodeUsageCard } from '../components/NodeUsagePanel'
 import InstancesTable from '../components/InstancesTable'
+import InstancesPanel, { DeferredInstancesCard } from '../components/InstancesPanel'
+import EnvelopeCard from '../components/EnvelopeCard'
+import { largeSessionListing, sessionListing } from '../fixtures/sessions'
+import type { InstanceInfo } from '../gen/legion_pb'
+import { promoteBlocker } from '../utils/sessions'
 import { NodeContentCard } from '../components/NodeContentCard'
 import { InstanceEventSummary, PressureExplanation, PressureHistoryCard, SnapshotEventSummary } from '../components/PressureHistory'
 import { SnapshotHolders, SnapshotsTable } from '../components/SnapshotsPanel'
-import { Card, EmptyState, Note, PageHeader, SectionCard } from '../components/ui'
+import { Button, Card, EmptyState, Note, PageHeader, SectionCard } from '../components/ui'
 import {
   emptyNode,
   instanceEvents,
@@ -19,7 +24,7 @@ import {
   unreportedContent,
   unreportedNode,
 } from '../fixtures/suspendResume'
-import { forkPlan, resumeBlocker, suspendPlan } from '../utils/instances'
+import { forkPlan, resumeBlocker, stopBlocker, suspendPlan } from '../utils/instances'
 import { snapshotBudgets } from '../utils/usage'
 import { GetNodeUsageReply, SnapshotBudget, SuspendedCapacity } from '../gen/legion_pb'
 
@@ -42,7 +47,19 @@ function Fixture(props: { title: string; note: string; children: JSX.Element }) 
   )
 }
 
+// The large session listing, built on request: a quarter of a million
+// messages takes the browser a moment to make.
+const LARGE_SESSIONS = 250_000
+const LARGE_NODES = 1200
+
 export default function TestingUtils() {
+  const [large, setLarge] = createSignal<InstanceInfo[]>()
+  const [buildMs, setBuildMs] = createSignal<number>()
+  const buildLarge = () => {
+    const started = performance.now()
+    setLarge(largeSessionListing(LARGE_SESSIONS, LARGE_NODES))
+    setBuildMs(Math.round(performance.now() - started))
+  }
   return (
     <div class="space-y-8">
       <PageHeader
@@ -139,6 +156,79 @@ export default function TestingUtils() {
             }}
           </For>
         </Card>
+      </Fixture>
+
+      <Fixture
+        title="Sessions: a mixed listing"
+        note="A session job's Instances card: a renamed promotion, a promotion that kept its id, and running and starting sessions in two envelopes on two nodes. Row actions are left off here, since they call the manager; the card under it says what each row would offer."
+      >
+        <InstancesPanel
+          jobName="agents"
+          instances={sessionListing}
+          toRow={(instance) => ({ instance })}
+          actions={false}
+          listing={{ complete: true, asOf: new Date().toISOString(), paused: false, refreshing: false, onRefresh: () => undefined }}
+        />
+        <Card class="space-y-1 text-xs">
+          <For each={sessionListing}>
+            {(instance) => (
+              <p>
+                <span class="mr-2 inline-block w-72 truncate align-bottom font-mono">{instance.instanceId}</span>
+                <span class="text-muted">
+                  promote: {promoteBlocker(instance, instance.jobId) ?? 'yes'} · stop: {stopBlocker(instance, instance.jobId) ?? 'yes'}
+                </span>
+              </p>
+            )}
+          </For>
+        </Card>
+      </Fixture>
+
+      <Fixture
+        title="Sessions: a quarter of a million"
+        note={`${LARGE_SESSIONS.toLocaleString('en-US')} running sessions over ${LARGE_NODES.toLocaleString('en-US')} nodes, from a partial index, too large to re-poll. The card counts in one pass and renders 100 rows at a time.`}
+      >
+        <Show
+          when={large()}
+          fallback={
+            <Card class="flex flex-wrap items-center gap-3 text-sm text-muted">
+              <Button size="sm" onClick={buildLarge}>
+                Build the listing
+              </Button>
+              <span>Builds {LARGE_SESSIONS.toLocaleString('en-US')} InstanceInfo messages in this tab.</span>
+            </Card>
+          }
+        >
+          {(listing) => (
+            <>
+              <p class="text-xs text-faint">Built in {buildMs()} ms.</p>
+              <InstancesPanel
+                jobName="agents"
+                instances={listing()}
+                toRow={(instance) => ({ instance })}
+                actions={false}
+                listing={{ complete: false, asOf: new Date().toISOString(), paused: true, refreshing: false, onRefresh: () => undefined }}
+              />
+            </>
+          )}
+        </Show>
+      </Fixture>
+
+      <Fixture title="Sessions: listing not loaded" note="What the job page shows instead when the job's envelopes could hold more sessions than it fetches unasked, and when it cannot count them.">
+        <DeferredInstancesCard jobName="agents" capacity={72_000} envelopes={1200} onLoad={() => undefined} loading={false} />
+        <DeferredInstancesCard jobName="agents" envelopes={0} onLoad={() => undefined} loading={false} />
+      </Fixture>
+
+      <Fixture title="Session envelope" note="The allocation page's card for an envelope. Without a job it offers no count, so nothing here calls the manager.">
+        <EnvelopeCard
+          allocationId={4101n}
+          nodeId="w-17"
+          servedTask="workspace"
+          perEnvelope={60}
+          reserved={[
+            { key: 'cpu', label: 'CPU', value: '30000 MHz' },
+            { key: 'memory', label: 'Memory', value: '61440 MiB' },
+          ]}
+        />
       </Fixture>
 
       <Fixture title="Snapshots: durability, names, fork and suspend checkpoints" note="Published with two names, a store snapshot whose publish is retrying, a fork checkpoint, a disk suspend checkpoint (size reads in place), and a manual disk snapshot.">

@@ -57,6 +57,7 @@ import { pluralize, toDate } from '../../utils/format'
 import type { Tone } from '../../utils/status'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../../utils/volumes'
 import { instanceHref } from '../../utils/instances'
+import { envelopeServes, envelopeTaskName, isSessionTask, jobInstancesHref } from '../../utils/sessions'
 import { nodePublicAddress } from '../../utils/services'
 import { AllocationLink } from '../../components/AllocationLink'
 
@@ -470,7 +471,7 @@ function TaskDetailContent() {
   const desiredCount = createMemo(() => {
     const current = data()
     const spec = current?.taskSpec
-    if (!spec || spec.count?.per || spec.lifecycle === 'batch' || spec.stateful?.mode === 'keyed') return undefined
+    if (!spec || spec.count?.per || spec.lifecycle === 'batch' || spec.stateful?.mode === 'keyed' || isSessionTask(spec)) return undefined
     return current?.scale?.effectiveCount ?? spec.count?.num
   })
 
@@ -603,6 +604,39 @@ function TaskDetailContent() {
           <Switch>
             <Match when={activeTab() === 'overview'}>
               <div class="space-y-4" role="tabpanel" aria-label="Overview">
+                {/* Session mode (docs/session-mode.md): the task's sessions are
+                    not allocations, and its envelope task's allocations run
+                    nothing. Say so before the allocation cards below. */}
+                <Show when={isSessionTask(data()!.taskSpec)}>
+                  <Note tone="info">
+                    <span class="font-medium">A session task.</span> Its sessions are not allocations, so they are not listed below: each runs
+                    inside its node's envelope (task{' '}
+                    <A class={linkClass} href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(envelopeTaskName(taskName()))}`}>
+                      {envelopeTaskName(taskName())}
+                    </A>
+                    ), which reserves the room.{' '}
+                    <A class={linkClass} href={jobInstancesHref(jobName(), { mode: 'session', task: taskName() })}>
+                      Its running sessions
+                    </A>{' '}
+                    are on the job page.
+                  </Note>
+                </Show>
+                <Show when={!data()!.taskSpec && envelopeServes(taskName())}>
+                  {(served) => (
+                    <Note tone="info">
+                      <span class="font-medium">A session envelope.</span> Legion generated this task for{' '}
+                      <A class={linkClass} href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(served())}`}>
+                        {served()}
+                      </A>
+                      : one allocation per eligible node, each reserving room for that task's sessions. Envelopes run nothing, so they report no
+                      health, ports, or logs.{' '}
+                      <A class={linkClass} href={jobInstancesHref(jobName(), { mode: 'session', task: served() })}>
+                        The sessions
+                      </A>{' '}
+                      are on the job page.
+                    </Note>
+                  )}
+                </Show>
                 <div class={cx('grid grid-cols-2 gap-3', data()!.taskSpec?.service ? 'lg:grid-cols-4' : 'lg:grid-cols-3')}>
                   <StatCard
                     label="Instances"

@@ -506,6 +506,69 @@ Known limitations:
 - A macOS worker reports no usage, so the idle countdown and populated usage
   are only visible on Linux workers with enforcement on, and on `/testing`.
 
+## Sessions
+
+Sessions ([session-mode.md](session-mode.md)) appear wherever instances do,
+labelled as sessions, and every page that touches them is bounded so a job
+with a million of them stays usable. `utils/sessions.ts` holds the
+vocabulary and the limits.
+
+- **Job page, Instances card.** A `session` badge in the Mode column, the
+  envelope allocation and node in the Allocation column, and **Promote**
+  (with an optional new name, hidden when `stateful.promote.onName = false`)
+  and **End** per row, each a two-step confirm that needs `job:write`.
+  Promoted instances say which session they came from. Above the table: how
+  many sessions run on how many nodes, whether every node has reported to
+  the session index (`complete`), when it was read (`asOf`), and the busiest
+  nodes as filter chips. State and mode chips and a text filter (id, node,
+  or task, case-sensitive) narrow the table; the mode, node, envelope, and
+  task filters are in the URL, so
+  `/jobs/agents?mode=session&node=w-17#instances` opens one node's sessions.
+- **Job page, elsewhere.** A session task's card shows its envelopes'
+  status and how many sessions run; the header counts sessions; envelope
+  rows in Allocations are badged and link to their sessions.
+- **Instance page.** A session reads as `Session`, `session · not durable`,
+  with its node and envelope, Promote and End in the header, and a note on
+  what it gives up. Promoting under a new name opens the new instance's
+  page. After a session ends, the page says it ended. Snapshots, suspend,
+  and fork say to promote first.
+- **Allocation page, envelopes.** An allocation of `<task>-envelope` gets a
+  **Session envelope** card: what it reserves, how many sessions fit (from
+  the spec), a **Count its sessions** button, and a link to them on the job
+  page. Health, Network, Logs, and Exec are hidden, since an envelope runs
+  nothing.
+- **Worker and task pages.** Envelope allocations on a worker are badged and
+  link to the job's sessions on that worker. A session task's page says its
+  sessions are not allocations; an envelope task's page says it was
+  generated and runs nothing.
+
+### Limits at scale
+
+`ListInstances` returns every running session of a job in one reply, with
+no paging and no filter, so the UI bounds what it does with it:
+
+| Limit | Value | What happens |
+| --- | --- | --- |
+| Rows rendered | 100 at a time, at most 1,000 | "Showing the first N of M", **Show more**, then the filter or `legion instance list <job> -j` |
+| Re-polling | listings under 5,000 | At 5,000 or more the card stops refreshing every 2 seconds and offers **Refresh**; an action refreshes it once |
+| Fetching | envelopes could hold at most 50,000 sessions | Above that, or when the page cannot tell (no `node:read`, or the spec does not size both the envelope and the session), the card explains and waits for **Load instances and sessions**. `?load=1` loads straight away |
+| Job allocations | 200 at a time | **Show more** |
+
+The envelope card's count and the instance page's fork lineage read the
+listing too: the count only on click, and fork lineage not at all for a
+session or in a job with session tasks.
+
+Known limitations:
+
+- Seeing one node's or one envelope's sessions still reads the job's whole
+  listing; there is no node or envelope filter on the RPC.
+- Without `node:read` a session job's instances always wait for **Load**.
+- On the worker page an envelope is recognized by its task name alone, so a
+  task named `<x>-envelope` in a job without sessions is badged too.
+- Sessions are created from the CLI or the API, not the UI.
+- `/testing` renders a mixed session listing, a 250,000-session listing
+  built in the browser, both "not loaded" states, and the envelope card.
+
 ## Job Templates
 
 `/templates` lists the cluster's [job templates](job-templates.md).

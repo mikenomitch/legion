@@ -336,6 +336,20 @@ copy at every instant should be promoted (or created with `--id`).
 - Watch `legion_session_starts_total{outcome}`: a rising `no_room` or
   `refused` count means the envelopes are too small for the arrival rate.
 
+## In the UI
+
+The job page's Instances card lists sessions beside keyed instances, with a
+`session` badge, the node and envelope each runs in, and **Promote** and
+**End** per row (`job:write`). Above the table it counts sessions by node and
+says whether every node has reported (`complete`) and when the index was read
+(`asOf`). Envelope allocations say what they reserve and link to their
+sessions. See [UI architecture](ui-architecture.md#sessions) for every page.
+
+Because `ListInstances` returns every session in one reply, the UI renders
+100 rows at a time, stops re-polling a listing of 5,000 or more, and does not
+fetch at all, until asked, when the job's envelopes could hold more than
+50,000 sessions. For the full list use `legion instance list <job> -j`.
+
 ## Agents
 
 Sessions use the same surfaces as keyed instances: `legion_instance_create`

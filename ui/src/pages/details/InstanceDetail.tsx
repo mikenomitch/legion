@@ -1,6 +1,6 @@
 import { Code, ConnectError } from '@connectrpc/connect'
-import { A, useParams } from '@solidjs/router'
-import { For, Show, createMemo, createResource, createSignal, type JSX } from 'solid-js'
+import { A, useNavigate, useParams } from '@solidjs/router'
+import { For, Show, createEffect, createMemo, createResource, createSignal, type JSX } from 'solid-js'
 import { AccessGate } from '../../components/AccessGate'
 import { EventTimeline, createEventFeed, eventCategory } from '../../components/EventTimeline'
 import { InstanceActionButtons, createInstanceActions } from '../../components/InstanceActions'
@@ -41,6 +41,7 @@ import {
 } from '../../utils/instances'
 import { extractJobSpecData, type JobTask } from '../../utils/jobspec'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
+import { LARGE_LISTING, SESSION_COPY, isSession, isSessionTask, jobInstancesHref } from '../../utils/sessions'
 import { mayReadSnapshots, restoreBlocker } from '../../utils/snapshots'
 import { statusTone } from '../../utils/status'
 import { fetchNodeUsage, formatCores, formatIdle, formatMiB, heldLabel, percentOf, reservationLabel } from '../../utils/usage'
@@ -57,6 +58,12 @@ import { fetchNodeUsage, formatCores, formatIdle, formatMiB, heldLabel, percentO
  * cadence, each part degrading on its own: the node (GetLedger, node:read),
  * the reservation (GetNodeUsage, node:read; the task spec otherwise), forks
  * (ListInstances), snapshots (snapshot:read), and events (operator:read).
+ *
+ * A session (docs/session-mode.md) gets the same page in its own words:
+ * its node and envelope come from GetInstance itself, it offers Promote and
+ * End, and the cards about allocations, checkpoints, and snapshots say why
+ * they are empty. Forks are not looked up for a session (it cannot have
+ * any), nor in a job with session tasks, whose listing holds every session.
  * Unchanged objects are kept across polls, so an armed confirm or an open
  * fork form survives every refresh.
  */
@@ -90,6 +97,7 @@ const CATEGORY_ORDER = ['instance', 'allocation', 'snapshot', 'node', 'volume']
 const MODE_COPY: Record<string, string> = {
   keyed: 'Keyed: created on demand through the API, never recycled while its job exists.',
   slot: 'Slot: one of the ordinal slots 0..count.num-1. A replacement for the slot reuses this id and its storage.',
+  session: SESSION_COPY,
 }
 
 const STATE_COPY: Record<string, string> = {
@@ -101,8 +109,15 @@ const STATE_COPY: Record<string, string> = {
   terminated: 'No longer desired. The row is kept so the id is never reused while the job exists.',
 }
 
+// A session reports `pending` while its node admits it and `active` once it runs.
+const SESSION_STATE_COPY: Record<string, string> = {
+  pending: 'Starting: its node admitted it into the envelope and is starting it.',
+  active: 'Running on its node, inside the envelope allocation that reserves its room.',
+}
+
 function InstanceDetailContent() {
   const params = useParams()
+  const navigate = useNavigate()
   const instanceId = createMemo(() => decodeURIComponent(params.instanceId))
   const routeJob = createMemo(() => decodeURIComponent(params.id))
   const tick = usePoll()
@@ -148,27 +163,43 @@ function InstanceDetailContent() {
 
   // Forks of this instance, and the task spec (for the reservation and the
   // suspend plan when the node cannot be read).
+  //
+  // Forks come from ListInstances, which has no paging and lists every
+  // running session too. So a session (which has no forks) and a job with
+  // session tasks skip it, and a listing of LARGE_LISTING or more is kept
+  // rather than re-read every few seconds; an action here re-reads it.
   const mergeInstances = stableList<InstanceInfo>((entry) => entry.instanceId, (a, b) => InstanceInfo.equals(a, b))
-  const [jobContext, { refetch: refetchJob }] = createResource(
-    () => [jobId(), slowTick()] as const,
+  const session = createMemo(() => (instance() ? isSession(instance()!) : undefined))
+  let forkListing: { job: string; instances: InstanceInfo[] } | undefined
+  let forceForks = false
+  const [jobContext, { refetch: refetchContext }] = createResource(
+    () => (session() === undefined ? undefined : ([jobId(), session()!, slowTick()] as const)),
     garnish(
-      async ([job]: readonly [string, number]) => {
-        const [instances, tasks] = await Promise.all([
-          managerClient.listInstances({ jobId: job }).then((reply) => mergeInstances(reply.instances)),
-          managerClient
-            .getJobSpec({ name: job })
-            .then((reply) => extractJobSpecData(reply.submissions)?.tasks ?? [])
-            .catch((): JobTask[] => []),
-        ])
-        return { job, instances, tasks }
+      async ([job, isSessionInstance]: readonly [string, boolean, number]) => {
+        const tasks = await managerClient
+          .getJobSpec({ name: job })
+          .then((reply) => extractJobSpecData(reply.submissions)?.tasks ?? [])
+          .catch((): JobTask[] => [])
+        const forced = forceForks
+        forceForks = false
+        if (isSessionInstance || tasks.some(isSessionTask)) return { job, instances: undefined as InstanceInfo[] | undefined, tasks }
+        const kept = forkListing?.job === job && forkListing.instances.length >= LARGE_LISTING && !forced ? forkListing : undefined
+        const instances = kept?.instances ?? mergeInstances((await managerClient.listInstances({ jobId: job })).instances)
+        forkListing = { job, instances }
+        return { job, instances: instances as InstanceInfo[] | undefined, tasks }
       },
-      ([job]) => job,
+      ([job, isSessionInstance]) => `${job}/${String(isSessionInstance)}`,
       undefined,
     ),
   )
+  const refetchJob = () => {
+    forceForks = true
+    void refetchContext()
+  }
   const context = () => (jobContext()?.job === jobId() ? jobContext() : undefined)
   const task = createMemo(() => context()?.tasks.find((entry) => entry.name === instance()?.task))
-  const forks = createMemo(() => (context()?.instances ?? []).filter((entry) => entry.forkedFrom === instanceId()))
+  // Undefined when forks are not looked up (see above).
+  const forks = createMemo(() => context()?.instances?.filter((entry) => entry.forkedFrom === instanceId()))
 
   // The node running the current allocation, from the ledger (node:read).
   const [placement] = createResource(
@@ -244,9 +275,21 @@ function InstanceDetailContent() {
       void refetch()
       void refetchSnapshots()
       // A fork adds instances this page lists under Fork lineage.
-      void refetchJob()
+      refetchJob()
+    },
+    // A promotion that renamed the session lives at its new id.
+    onPromoted: (promoted) => {
+      if (promoted !== instanceId()) navigate(instanceHref(jobId(), promoted))
     },
   })
+  // What this id was when it last answered, so a session that ends reads as
+  // ended rather than as a mistyped id.
+  const [lastMode, setLastMode] = createSignal<{ id: string; mode: string }>()
+  createEffect(() => {
+    const current = instance()
+    if (current) setLastMode({ id: current.instanceId, mode: current.mode })
+  })
+  const endedSession = () => lastMode()?.id === instanceId() && lastMode()?.mode === 'session'
 
   // Events about this instance: its own (metadata names it) and its
   // allocations'. Starts with the route, so a missing instance still shows
@@ -263,7 +306,7 @@ function InstanceDetailContent() {
       }
     >
       {(state) => (
-        <Show when={state().kind === 'ok'} fallback={<NotLoaded state={state()} job={routeJob()} feed={feed} />}>
+        <Show when={state().kind === 'ok'} fallback={<NotLoaded state={state()} job={routeJob()} feed={feed} session={endedSession()} />}>
           <div class="space-y-4">
             <Header
               instance={instance()!}
@@ -295,7 +338,7 @@ function InstanceDetailContent() {
               provisionalNodeId={loaded()?.provisionalNodeId ?? ''}
             />
 
-            <SectionCard title="Overview" description={STATE_COPY[instance()!.state]}>
+            <SectionCard title="Overview" description={(session() ? SESSION_STATE_COPY : STATE_COPY)[instance()!.state]}>
               <DefList
                 cols={3}
                 items={[
@@ -304,6 +347,9 @@ function InstanceDetailContent() {
                     'Mode',
                     <span title={MODE_COPY[instance()!.mode]}>
                       {instance()!.mode}
+                      <Show when={session() && !instance()!.durable}>
+                        <span class="text-faint"> · not durable</span>
+                      </Show>
                       <Show when={instance()!.slotIndex !== undefined}>
                         <span class="text-faint"> · slot {String(instance()!.slotIndex)}</span>
                       </Show>
@@ -324,7 +370,19 @@ function InstanceDetailContent() {
                   ['Group', <span class="font-mono text-xs">{instance()!.group || '—'}</span>],
                   [
                     'Allocation',
-                    <Show when={allocId() !== undefined} fallback={<span class="text-faint">{noAllocationCopy(instance()!)}</span>}>
+                    <Show
+                      when={allocId() !== undefined}
+                      fallback={
+                        <Show when={session() && instance()!.envelopeAllocId !== undefined} fallback={<span class="text-faint">{noAllocationCopy(instance()!)}</span>}>
+                          <span class="text-faint" title="A session has no allocation of its own: it is admitted into its node's envelope, which reserves the room">
+                            none: runs in envelope{' '}
+                            <A href={`/allocations/${String(instance()!.envelopeAllocId)}`} class={cx(linkClass, 'font-mono text-xs')}>
+                              #{String(instance()!.envelopeAllocId)}
+                            </A>
+                          </span>
+                        </Show>
+                      }
+                    >
                       <span class="inline-flex flex-wrap items-center gap-2">
                         <A href={`/allocations/${String(allocId())}`} class={cx(linkClass, 'font-mono text-xs')}>
                           #{String(allocId())}
@@ -336,7 +394,7 @@ function InstanceDetailContent() {
                   [
                     'Node',
                     <Show
-                      when={nodeId()}
+                      when={nodeId() ?? instance()!.nodeId}
                       fallback={
                         <Show
                           when={allocId() === undefined && instance()!.checkpointNodeId}
@@ -385,7 +443,13 @@ function InstanceDetailContent() {
                   ['Updated', <RelativeTime value={instance()!.updatedAt} title="Last state or binding change" />],
                   [
                     'Fork lineage',
-                    <ForkLineage jobId={jobId()} origin={instance()!.forkedFrom} forks={forks()} loading={context() === undefined && jobContext.loading} />,
+                    <ForkLineage
+                      jobId={jobId()}
+                      origin={instance()!.forkedFrom}
+                      forks={forks()}
+                      loading={context() === undefined && jobContext.loading}
+                      session={session()}
+                    />,
                   ],
                 ]}
               />
@@ -430,6 +494,18 @@ function InstanceDetailContent() {
                   </div>
                 )}
               </Show>
+              <Show when={session()}>
+                <p class="mt-4 text-xs text-faint">
+                  Issued <RelativeTime value={instance()!.leaseIssuedAt} /> by the manager that routed it.{' '}
+                  <Show when={instance()!.nodeId}>
+                    {(node) => (
+                      <A href={jobInstancesHref(jobId(), { mode: 'session', node: node() })} class={linkClass}>
+                        This job's other sessions on {node()}
+                      </A>
+                    )}
+                  </Show>
+                </p>
+              </Show>
               <Show when={instance()!.mode === 'keyed' && instance()!.state !== 'terminated'}>
                 <p class="mt-4 text-xs text-faint">
                   Destroy from the CLI with{' '}
@@ -446,7 +522,7 @@ function InstanceDetailContent() {
 
             <EventsCard feed={feed} instanceId={instanceId()} jobId={jobId()} />
 
-            <Show when={mayReadSnapshots(jobId())}>
+            <Show when={mayReadSnapshots(jobId()) && !session()}>
               <SectionCard
                 title="Snapshots"
                 description="Point-in-time captures of this instance, newest first. Restore rolls it back in place: the running allocation is replaced by one started from the snapshot."
@@ -532,7 +608,7 @@ function Header(props: { instance: InstanceInfo; row: () => InstanceRow; actions
   return (
     <PageHeader
       class="!mb-0"
-      eyebrow={props.instance.mode === 'slot' ? 'Slot instance' : 'Instance'}
+      eyebrow={props.instance.mode === 'slot' ? 'Slot instance' : props.instance.mode === 'session' ? 'Session' : 'Instance'}
       title={<span class="font-mono text-lg md:text-xl">{props.instance.instanceId}</span>}
       badges={
         <span class="inline-flex flex-wrap items-center gap-1.5">
@@ -551,6 +627,18 @@ function Header(props: { instance: InstanceInfo; row: () => InstanceRow; actions
             <Badge tone="neutral" title={`Forked from ${props.instance.forkedFrom}`}>
               fork
             </Badge>
+          </Show>
+          <Show when={props.instance.mode === 'session'}>
+            <Badge tone="info" title={SESSION_COPY}>
+              session · not durable
+            </Badge>
+          </Show>
+          <Show when={props.instance.promotedFrom}>
+            {(origin) => (
+              <Badge tone="neutral" title={`Promoted in place from session ${origin()} (PromoteInstance)`}>
+                promoted
+              </Badge>
+            )}
           </Show>
           <CopyButton text={props.instance.instanceId} label="" />
         </span>
@@ -594,6 +682,23 @@ function Callouts(props: { instance: InstanceInfo; routeJob: string; provisional
   const gated = () => detail()?.startsWith('pending-loss-confirmation')
   return (
     <>
+      <Show when={props.instance.mode === 'session'}>
+        <Note tone="info">
+          <span class="font-medium">A session, not a keyed instance.</span> Nothing about it is in the replicated store: its node holds it and
+          the managers list it from an in-memory index that can lag the node by a heartbeat. It ends when it exits, when you end it, or when its
+          node is lost, and is not rescheduled. Promote it to give it a row in place, without a restart: it then reschedules on node loss and
+          can be suspended, forked, and snapshotted.
+        </Note>
+      </Show>
+      <Show when={props.instance.promotedFrom}>
+        {(origin) => (
+          <Note tone="neutral">
+            Promoted from session <span class="font-mono text-xs">{origin()}</span>. Its node adopted the running session as this instance's
+            allocation, so nothing restarted; the workload keeps the <code class="font-mono text-xs">LEGION_INSTANCE_ID</code> it started
+            with until it restarts.
+          </Note>
+        )}
+      </Show>
       <Show when={props.instance.jobId !== props.routeJob}>
         <Note tone="info">
           This instance belongs to job{' '}
@@ -655,11 +760,18 @@ function Callouts(props: { instance: InstanceInfo; routeJob: string; provisional
   )
 }
 
-function ForkLineage(props: { jobId: string; origin?: string; forks: readonly InstanceInfo[]; loading: boolean }) {
+function ForkLineage(props: { jobId: string; origin?: string; forks?: readonly InstanceInfo[]; loading: boolean; session?: boolean }) {
+  const forks = () => props.forks ?? []
+  const fallback = () => {
+    if (props.session) return 'none: a session cannot be forked'
+    if (props.loading) return '…'
+    if (props.forks === undefined) return 'not looked up: this job runs sessions, so its listing is too large to scan here'
+    return 'not a fork, no forks'
+  }
   return (
     <Show
-      when={props.origin || props.forks.length > 0}
-      fallback={<span class="text-faint">{props.loading ? '…' : 'not a fork, no forks'}</span>}
+      when={props.origin || forks().length > 0}
+      fallback={<span class="text-faint">{fallback()}</span>}
     >
       <div class="space-y-1 text-xs">
         <Show when={props.origin}>
@@ -672,10 +784,10 @@ function ForkLineage(props: { jobId: string; origin?: string; forks: readonly In
             </div>
           )}
         </Show>
-        <Show when={props.forks.length > 0}>
+        <Show when={forks().length > 0}>
           <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span class="text-faint">forks</span>
-            <For each={props.forks}>
+            <For each={forks()}>
               {(fork) => (
                 <A href={instanceHref(props.jobId, fork.instanceId)} class="inline-flex items-center gap-1 font-mono text-ink hover:text-brass-strong" title={fork.state}>
                   <Dot tone={statusTone(fork.state)} />
@@ -722,9 +834,11 @@ function ResourcesCard(props: { row: InstanceRow }) {
         fallback={
           <div class="space-y-1 text-sm text-muted">
             <p>
-              {instance().state === 'suspended'
-                ? 'Suspended: it holds no allocation, so nothing runs or is measured.'
-                : 'No allocation right now, so nothing is reserved or measured.'}
+              {instance().mode === 'session'
+                ? "A session has no allocation of its own: it runs inside its node's envelope, which reserves its room. Per-session usage is not reported; the envelope allocation's page shows the room it holds."
+                : instance().state === 'suspended'
+                  ? 'Suspended: it holds no allocation, so nothing runs or is measured.'
+                  : 'No allocation right now, so nothing is reserved or measured.'}
             </p>
             <Show when={heldLabel(instance().heldMemoryMib, instance().heldCpuMhz)}>
               {(held) => (
@@ -838,7 +952,11 @@ function CheckpointCard(props: { instance: InstanceInfo }) {
           when={instance().checkpointSupport}
           fallback={
             <p class="text-sm text-faint">
-              {instance().state === 'active' ? 'This manager does not report checkpoint support.' : 'Only an active instance with a running allocation can be checkpointed.'}
+              {instance().mode === 'session'
+                ? 'Nothing: a session cannot be suspended, forked, or snapshotted. Promote it first.'
+                : instance().state === 'active'
+                  ? 'This manager does not report checkpoint support.'
+                  : 'Only an active instance with a running allocation can be checkpointed.'}
             </p>
           }
         >
@@ -961,7 +1079,7 @@ function EventsCard(props: { feed: ReturnType<typeof createEventFeed>; instanceI
 }
 
 /** NotFound, or a first load that failed. Events still show for a gone instance while the journal remembers it. */
-function NotLoaded(props: { state: Loading; job: string; feed: ReturnType<typeof createEventFeed> }) {
+function NotLoaded(props: { state: Loading; job: string; feed: ReturnType<typeof createEventFeed>; session?: boolean }) {
   return (
     <div class="space-y-4">
       <Show
@@ -972,11 +1090,22 @@ function NotLoaded(props: { state: Loading; job: string; feed: ReturnType<typeof
           <EmptyState
             icon="boxes"
             title={
-              <>
-                No instance <span class="font-mono">{props.state.id}</span>
-              </>
+              <Show
+                when={props.session}
+                fallback={
+                  <>
+                    No instance <span class="font-mono">{props.state.id}</span>
+                  </>
+                }
+              >
+                Session <span class="font-mono">{props.state.id}</span> has ended
+              </Show>
             }
-            body="It may have been destroyed along with its job, or the id is mistyped. Keyed ids are never reused while their job exists."
+            body={
+              props.session
+                ? 'It exited, was ended, or its node or envelope went away. A session leaves nothing behind: no row, no tombstone, no events of its own.'
+                : 'It may have been destroyed along with its job, or the id is mistyped. Keyed ids are never reused while their job exists.'
+            }
           >
             <A href={`/jobs/${encodeURIComponent(props.job)}`} class={cx(linkClass, 'mt-2 text-sm')}>
               Back to {props.job}

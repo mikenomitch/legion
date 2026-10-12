@@ -169,6 +169,7 @@ When one is required and what goes in it:
 | [wake-on-request-plan.md](plans/wake-on-request-plan.md) | in execution: Phase 1 shipped (`suspend.wake`, `legion start gateway` that resumes a suspended keyed instance on a request and holds it until the instance serves, `CONNECT` for any declared port, a wake webhook, wake fields on `GetInstance`); gateway metrics, waking sessions, and node-local wake on connect planned |
 | [sandbox-exec-plan.md](plans/sandbox-exec-plan.md) | in execution: Phases 1 to 3 built and Phase 0 measured on one host; KVM and rig verification open (exec into Linux microVMs over the guest agent's vsock, and direct exec with worker-verified tickets as a third caller class on the worker-plane-auth listener; implemented together with worker-plane-auth, which it amends in §9) |
 | [suspend-resume-ui-plan.md](plans/suspend-resume-ui-plan.md) | shipped (UI-1 to UI-6, with the §7.3 server reads: ListNodeUsage, GetNodeContent, last_stop, checkpoint_support) |
+| [session-ui-plan.md](plans/session-ui-plan.md) | shipped (UI only: sessions and envelopes on the job, instance, allocation, node, and task pages, Promote and End, and bounded fetching, polling, and rendering for very large session counts; `ListInstances` paging, counts, and node/envelope filters deferred to the API) |
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
 | [data-dir-env-plan.md](plans/data-dir-env-plan.md) | shipped (`LEGION_DATA_DIR`; no config-file field, by design) |
 
@@ -243,6 +244,7 @@ by project impact. The full template and a worked example:
 - [stateful-workloads-and-instance-identity-plan_calls.md](calls/stateful-workloads-and-instance-identity-plan_calls.md)
 - [suspend-resume-and-oversubscription-plan_calls.md](calls/suspend-resume-and-oversubscription-plan_calls.md)
 - [suspend-resume-ui-plan_calls.md](calls/suspend-resume-ui-plan_calls.md)
+- [session-ui-plan_calls.md](calls/session-ui-plan_calls.md)
 - [volume-plugin-system-plan_calls.md](calls/volume-plugin-system-plan_calls.md)
 - [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md)
 - [worker-simulation-plan_calls.md](calls/worker-simulation-plan_calls.md)

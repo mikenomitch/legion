@@ -11,6 +11,13 @@ export type JobTaskStateful = {
   mode: string
   requireId?: boolean
   storagePath?: string
+  /**
+   * Session mode (docs/session-mode.md): what each node's envelope reserves
+   * for this task's sessions (`stateful.envelope.resources`), by resource key.
+   */
+  envelope?: Record<string, number>
+  /** `stateful.promote.onName`: whether a promotion may rename the session. Defaults to true. */
+  promoteOnName?: boolean
 }
 
 // A declared task artifact, normalized from either the string shorthand or
@@ -109,6 +116,8 @@ export type JobTask = {
   ports: JobTaskPort[]
   service?: JobTaskService
   resources?: JobTaskResources
+  /** Every numeric amount in `resources`, by key, as the spec declares it. */
+  resourceAmounts?: Record<string, number>
   snapshots?: JobTaskSnapshots
   actions: JobTaskAction[]
 }
@@ -156,11 +165,25 @@ const normalizeStateful = (value: unknown): JobTaskStateful | undefined => {
   const mode = readTaskString(raw.mode)
   if (!mode) return undefined
   const storage = raw.storage && typeof raw.storage === 'object' ? (raw.storage as Record<string, unknown>) : undefined
+  const envelope = raw.envelope && typeof raw.envelope === 'object' ? (raw.envelope as Record<string, unknown>) : undefined
+  const promote = raw.promote && typeof raw.promote === 'object' ? (raw.promote as Record<string, unknown>) : undefined
   return {
     mode,
     requireId: raw.requireId === true || undefined,
     storagePath: storage ? readTaskString(storage.path) || undefined : undefined,
+    envelope: envelope ? readAmounts(envelope.resources) : undefined,
+    promoteOnName: promote && typeof promote.onName === 'boolean' ? promote.onName : undefined,
   }
+}
+
+/** Every numeric entry of a resources block, by key (`{ cpu: 500, memory: 512 }`). */
+const readAmounts = (value: unknown): Record<string, number> => {
+  const amounts: Record<string, number> = {}
+  if (!value || typeof value !== 'object') return amounts
+  for (const [key, amount] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof amount === 'number' && Number.isFinite(amount)) amounts[key] = amount
+  }
+  return amounts
 }
 
 const readNumber = (value: unknown): number | undefined =>
@@ -410,6 +433,7 @@ const normalizeTask = (value: unknown): JobTask | null => {
     ports,
     service: normalizeService(raw.service),
     resources: normalizeResources(raw.resources),
+    resourceAmounts: readAmounts(raw.resources),
     snapshots: normalizeSnapshots(raw.snapshots),
     actions: (Array.isArray(raw.actions) ? raw.actions : [])
       .map((action) => normalizeAction(action))
