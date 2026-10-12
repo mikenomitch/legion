@@ -65,8 +65,10 @@ two samples of both.
 ## Symptom: throughput fell when I scaled up
 
 **Decision: check the rejection share first.** If it is high, reduce
-`evalThreads`. If it isn't, `evalThreads` is the wrong knob to lower, and
-raising it is more likely to help.
+`evalThreads`, or let the manager reduce it for you, which is what
+[adaptive scheduler concurrency](adaptive-scheduler-concurrency.md) does, and
+only while the rejection share is actually high. If it isn't, `evalThreads` is
+the wrong knob to lower, and raising it is more likely to help.
 
 > **More eval threads usually help.** An earlier version of this page said to
 > reduce concurrency, based on a test where 4 eval threads beat 16. That test
@@ -151,8 +153,25 @@ actual capacity limits.
 
 **Actions, in order**
 
-1. **Lower `evalThreads`** in the manager config and re-measure, but only if
-   the rejection share above is high. Start at half and bisect.
+1. **Let the manager pick the number for you.** Turn on adaptive scheduler
+   concurrency and leave `evalThreads` at your core count: the manager measures
+   its own conflict rate and moves the number of concurrent planners between a
+   floor and that ceiling, so nobody has to bisect.
+
+   ```nickel
+   # configs/manager.ncl
+   { schedulerSettings = { adaptiveConcurrency = { mode = "enforce" } } }
+   ```
+
+   It defaults to `observe`, which computes and exports the limit it *would*
+   enforce without acting. Run that first on your own workload and read
+   `legion scheduler concurrency`. It also answers the question the manual
+   bisect cannot: whether your conflicts are concurrency-driven at all, or
+   whether the pool is simply full (state `saturated`, which means add nodes).
+   See [adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md).
+
+2. **Or lower `evalThreads`** by hand and re-measure, but only if the
+   rejection share above is high. Start at half and bisect.
 
    ```nickel
    # configs/manager.ncl
@@ -175,13 +194,13 @@ actual capacity limits.
    the pool. Watch `legion_store_read_lock_wait_seconds` alongside whatever you
    were trying to fix.
 
-2. **Confirm candidate lists are on.** `schedulerSettings.plan_candidates`
+3. **Confirm candidate lists are on.** `schedulerSettings.plan_candidates`
    defaults to `8`. Setting it to `0` disables them and goes back to
    single-node submissions, which turns every race into a rejection. If someone
    set it to `0` for a mixed-version upgrade window and never set it back,
    that alone can cause this symptom.
 
-3. **Don't raise `plan_conflict_max_retries` first.** More retries means more
+4. **Don't raise `plan_conflict_max_retries` first.** More retries means more
    plans built against a snapshot that is already losing. It moves the wasted
    work around without reducing it.
 
@@ -519,26 +538,26 @@ show you this.
 ## Symptom: nothing is running and nothing reports an error
 
 **Decision: read `legion job info`'s status, and don't trust
-`evals_processed_total{status="error"}`.** A job nothing could be placed for
-reads `pending`; the counter does not report placement failure. Count
-allocations to see how far short a job is.
+`evals_processed_total{status="error"}`.** A job with nothing placed reads
+`pending`, but the error counter doesn't report placement failure. Count
+allocations to see how much placed.
 
 **Worked example**
 
 A run ended with 264 evals in `status: failed` in the eval table, while
 `legion_evals_processed_total{status="error"}` never moved. Jobs where every
-task had failed to place reported `status: done`.
+task had failed to place read `pending`.
 
-Two separate gaps caused that:
+Two things explain that:
 
-1. **The job `status` field was a lifecycle flag.** It said `done` for every
-   accepted job, placed or not. The reported status is now derived from the
-   job's allocations and task statuses (`running`, `pending`, `complete`,
-   `failed`, `stopped`; see
-   [Job Status](jobs-tasks-and-scheduling.md#job-status)), so a job whose
-   placements all failed reads `pending`. The `job` table's own `status`
-   column, which `legion state query` shows, is still the stored flag
-   (`done`, `stopped`, `failed`).
+1. **`pending` means nothing of the job is live.** The job status is derived
+   from the workload (see
+   [Job Status](jobs-tasks-and-scheduling.md#job-status)): with no live
+   allocation and a task that wants one, the job reads `pending`. That covers
+   both "not placed yet" and "can't be placed", so read the eval table for
+   the reason (below). The state store's
+   `job.status` column is a lifecycle flag (`active`) and says nothing about
+   placement, so don't read it for this.
 2. **Terminal eval failures don't reliably reach the counter.**
    `legion_evals_processed_total{status="error"}` is recorded from the eval
    worker's return value. The two retry outcomes (not-leader and
@@ -550,7 +569,10 @@ Two separate gaps caused that:
 **What to read instead**
 
 ```console
-# Did the work actually place? Count allocations, not job status.
+# Which jobs have nothing live? (derived status)
+$ legion job list --status pending
+
+# How much placed? Count allocations. (j.status here is the lifecycle flag.)
 $ legion state query "SELECT j.id AS job, j.status, COUNT(a.id) AS allocations \
     FROM job j LEFT JOIN job_config jc ON jc.job_id = j.id \
     LEFT JOIN allocation a ON a.job_config_id = jc.id \
@@ -568,7 +590,7 @@ $ legion events list --kind allocation
 ```
 
 `legion state seed-queries` installs `agent:recent-failed-evals` and
-`agent:jobs-overview` (job, status, allocation count) as saved queries. This is
+`agent:jobs-overview` (job, lifecycle flag, allocation count, live count) as saved queries. This is
 the fastest way to see the allocation count next to the status.
 
 **Why an eval fails terminally**
@@ -595,7 +617,8 @@ allocations, instead of on the counter.
 
 | Knob | Where | Turn it when | Do **not** turn it when |
 | --- | --- | --- | --- |
-| `evalThreads` | manager config | Rejection share is high, or the scheduler lane's `pipeline_wait` is high, and the lane's ops are `applied` instead of `empty`. In those cases, turn it down. On an uncontended cluster, the opposite applies. At 5,000 nodes, throughput rose at every step from 4 to 32 threads (177.27 -> 251.68 alloc/s), and we haven't measured where that stops. It also sizes the read pool (`evalThreads + 4`, capped at 16). | You haven't looked at `plan_apply_total{outcome}` and `raft_ops_total{op,outcome}`. Without those, changing it in either direction is guessing. |
+| `evalThreads` | manager config | Rejection share is high, or the scheduler lane's `pipeline_wait` is high, and the lane's ops are `applied` instead of `empty`. In those cases, turn it down, or set `adaptiveConcurrency.mode = "enforce"` and let the manager find the level below it. On an uncontended cluster, the opposite applies. At 5,000 nodes, throughput rose at every step from 4 to 32 threads (177.27 -> 251.68 alloc/s), and we haven't measured where that stops. It also sizes the read pool (`evalThreads + 4`, capped at 16). | You haven't looked at `plan_apply_total{outcome}` and `raft_ops_total{op,outcome}`. Without those, changing it in either direction is guessing. |
+| `schedulerSettings.adaptiveConcurrency.mode` | manager config | You're tuning `evalThreads` by hand, or you can't tell contention from a full pool. `observe` first, then `enforce`. | It's never a bad time to run `observe`. It changes nothing ([adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md)). |
 | `schedulerSettings.plan_candidates` | manager config | It's `0` and you're not mid-upgrade. Set it back to `8`. | Rejections are low. The default is right. |
 | `schedulerSettings.plan_conflict_max_retries` | manager config | Contention is bursty and short-lived (default `3`, max `20`). | Rejections are sustained. More retries wastes more plans. |
 | `schedulerSettings.plan_apply_batch_max` | manager config | Group commit is engaging and you want fewer commits (default `16`, max `128`). | `coalesce_batch_size`'s `le="1"` bucket is near `_count`. Batching isn't engaging, so the cap isn't the constraint. |

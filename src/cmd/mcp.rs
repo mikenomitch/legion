@@ -95,7 +95,7 @@ fn job_list_schema() -> Value {
         "properties": {
             "status": {
                 "type": "string",
-                "description": "Only jobs with this exact status (case-insensitive), e.g. running, stopped, failed. Omit for all."
+                "description": "Only jobs with this exact status (case-insensitive), one of running, pending, failed, scheduled, complete, suspended, idle, stopped. Omit for all."
             }
         },
         "additionalProperties": false
@@ -422,6 +422,12 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_scheduler_concurrency",
+            description: "Report how many evals the manager will PLAN at once, and why. Returns the current limit against its floor/ceiling (`evalThreads`), the smoothed plan-conflict rate, the fallback rate (races absorbed by candidate lists — these are successes, not failures), goodput in placements/sec, and a `state` of steady|throttled|probing|saturated. Read this before concluding that a cluster is slow or full: `throttled` means the scheduler is deliberately admitting fewer planners and work will drain, while `saturated` means backing off did NOT help and the conflicts are capacity-driven — the answer there is more nodes, not waiting or resubmitting (docs/adaptive-scheduler-concurrency.md).",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_boot_ticket_create",
             description: "Mint a boot ticket: a short-lived capability that lets one edge node start one workload without calling a manager (docs/edge-boot.md). Names an exact job config, one task, one instance (or a non-empty instance prefix), one node pool, and a gate ceiling. Single-use by default and revocable only by expiry, so prefer short TTLs. The token is returned ONCE. Mutating.",
             input_schema: || json!({
@@ -518,7 +524,9 @@ fn tool_defs() -> Vec<ToolDef> {
                     "kind": { "type": "string", "description": "Kind filter, exact or category prefix (e.g. 'eval' matches eval.*)." },
                     "job_id": { "type": "string", "description": "Filter by exact job ID." },
                     "node_id": { "type": "string", "description": "Filter by exact node ID." },
-                    "level": { "type": "string", "enum": ["info", "warn", "error"], "description": "Filter by severity." }
+                    "level": { "type": "string", "enum": ["info", "warn", "error"], "description": "Filter by severity." },
+                    "instance_id": { "type": "string", "description": "Only events about this stateful instance: suspends, resumes, forks, snapshots, and its allocations' placements and failures." },
+                    "allocation_id": { "type": "integer", "description": "Filter by exact allocation ID." }
                 },
                 "additionalProperties": false
             }),
@@ -1216,6 +1224,13 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             grpc(client.rotate_data_key(crate::structs::RotateDataKeyRequest { idempotency_key }))
                 .await
         }
+        "legion_scheduler_concurrency" => {
+            let mut client = connect().await?;
+            grpc(
+                client.get_scheduler_concurrency(crate::structs::GetSchedulerConcurrencyRequest {}),
+            )
+            .await
+        }
         "legion_node_drain" => {
             let node_id = str_arg(&args, "node_id")?;
             let mode = str_arg(&args, "mode")?;
@@ -1619,6 +1634,8 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 job_id: opt_str_arg(&args, "job_id"),
                 node_id: opt_str_arg(&args, "node_id"),
                 level: opt_str_arg(&args, "level"),
+                instance_id: opt_str_arg(&args, "instance_id"),
+                allocation_id: args.get("allocation_id").and_then(Value::as_i64),
             };
             let mut client = connect().await?;
             grpc(client.list_events(request)).await

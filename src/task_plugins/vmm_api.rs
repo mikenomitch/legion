@@ -257,7 +257,10 @@ impl FirecrackerApi {
     /// `resume: false` the VM stays paused so drives can be repointed first.
     /// `network_overrides` (Phase 6, Firecracker 1.12+) moves each named
     /// NIC (`iface_id`) to another host TAP device (`host_dev_name`), which
-    /// is how a fork stops sharing its origin's TAP. Empty sends none, so
+    /// is how a fork stops sharing its origin's TAP. `vsock_override`
+    /// (Firecracker 1.16+) moves the vsock device's host socket to
+    /// `uds_path`, which is how every restore of a gated sandbox lands on
+    /// its own allocation's datapath. Absent overrides are not sent, so
     /// older Firecrackers see the request they always did.
     pub(crate) fn load_snapshot(
         &self,
@@ -265,6 +268,7 @@ impl FirecrackerApi {
         memory: &Path,
         resume: bool,
         network_overrides: &[(&str, &str)],
+        vsock_override: Option<&Path>,
     ) -> R<()> {
         let mut body = json!({
             "snapshot_path": state.display().to_string(),
@@ -281,6 +285,9 @@ impl FirecrackerApi {
                     json!({ "iface_id": iface_id, "host_dev_name": host_dev_name })
                 })
                 .collect();
+        }
+        if let Some(uds_path) = vsock_override {
+            body["vsock_override"] = json!({ "uds_path": uds_path.display().to_string() });
         }
         self.call("PUT", "/snapshot/load", Some(body), SNAPSHOT_TIMEOUT)
             .map(|_| ())
@@ -567,7 +574,13 @@ mod tests {
         api.pause()?;
         api.create_snapshot(Path::new("/c/vm-state"), Path::new("/c/memory"))?;
         api.resume()?;
-        api.load_snapshot(Path::new("/c/vm-state"), Path::new("/c/memory"), false, &[])?;
+        api.load_snapshot(
+            Path::new("/c/vm-state"),
+            Path::new("/c/memory"),
+            false,
+            &[],
+            None,
+        )?;
         api.update_drive("identity", Path::new("/a/identity.img"))?;
         // Phase 6: a fork's load moves the NIC to its own TAP.
         api.load_snapshot(
@@ -575,6 +588,15 @@ mod tests {
             Path::new("/c/memory"),
             false,
             &[("eth0", "lgf0123456789ab")],
+            None,
+        )?;
+        // A gated restore moves the vsock to its own allocation's socket.
+        api.load_snapshot(
+            Path::new("/c/vm-state"),
+            Path::new("/c/memory"),
+            false,
+            &[],
+            Some(Path::new("/allocs/9/.sandbox/vsock.sock")),
         )?;
 
         let seen = vmm.drain();
@@ -591,6 +613,7 @@ mod tests {
                 ("PATCH", "/vm"),
                 ("PUT", "/snapshot/load"),
                 ("PATCH", "/drives/identity"),
+                ("PUT", "/snapshot/load"),
                 ("PUT", "/snapshot/load"),
             ]
         );
@@ -609,9 +632,19 @@ mod tests {
         assert_eq!(load["mem_backend"]["backend_path"], "/c/memory");
         assert_eq!(load["resume_vm"], false);
         assert!(
-            load.get("network_overrides").is_none(),
+            load.get("network_overrides").is_none() && load.get("vsock_override").is_none(),
             "a plain restore sends no overrides, so older Firecrackers accept it"
         );
+        assert_eq!(
+            seen[7].body.as_ref().unwrap()["vsock_override"],
+            json!({ "uds_path": "/allocs/9/.sandbox/vsock.sock" })
+        );
+        assert!(seen[7]
+            .body
+            .as_ref()
+            .unwrap()
+            .get("network_overrides")
+            .is_none());
         assert_eq!(
             seen[6].body.as_ref().unwrap()["network_overrides"],
             json!([{ "iface_id": "eth0", "host_dev_name": "lgf0123456789ab" }])

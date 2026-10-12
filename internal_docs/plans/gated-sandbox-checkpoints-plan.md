@@ -2,9 +2,32 @@
 
 > **Judgement calls:** [`calls/gated-sandbox-checkpoints-plan_calls.md`](../calls/gated-sandbox-checkpoints-plan_calls.md)
 
-Status: **PLANNED** (written 2026-10-11). Nothing here is built. Phase 0 is a
-gate: it boots a gated sandbox on a real VMM for the first time and measures
-what the rest of the plan assumes. Deliberately deferred and named:
+Status: **IN EXECUTION** (written 2026-10-11, Phases 1 to 4 built
+2026-10-12 on a Linux host without KVM).
+
+- **Phase 0 (the gate): pending.** No gated guest has booted. The opt-in
+  boot tests (`sandbox_gated_boots_firecracker`, `_cloud_hypervisor`) and
+  checks G0.1 to G4.1, with exact commands, are in the verification doc's
+  [Gated sandboxes](../suspend-resume-linux-verification.md#gated-sandboxes)
+  section.
+- **Phase 1: built.** Gated sandboxes take memory checkpoints (suspend,
+  snapshots, forks, publish), with the vsock retargeted on every restore and
+  the Firecracker 1.16.1 floor. Unit- and integration-tested against fake
+  VMMs; G1.1 to G1.5 pending.
+- **Phase 2: built, flip held.** Default deny (`gated-default`) on every
+  gated runtime, the resolver, the static `legion-guest` agent, and the
+  submit refusals ship. The flip of `auto` to `gated` for sandboxes is
+  implemented and tested but held closed behind `SANDBOX_GATED_BY_DEFAULT =
+  false` until G0.1 and G2.1 pass (calls entry 2).
+- **Phase 3: built.** `connections` counts gated egress, and `network`
+  stamps bytes mid-stream. G3.1 pending.
+- **Phase 4: built.** `sandbox.bridges` pools, leases, `ip=` at boot,
+  netlink re-addressing on restore (run for real in a network namespace),
+  the implicit bridge constraint, and `config.network.tap` and `mac`
+  removed. G4.1 pending.
+- **Phase 5 (ingress): not started.**
+
+Deliberately deferred and named:
 transparent capture inside the guest, UDP and ICMP through the datapath,
 `exec` over the guest agent's vsock, cooperative egress policy in macOS dev
 mode, and the `legion netd` process split. Each is in §4 (non-goals) or
@@ -128,7 +151,7 @@ Firecracker's own answer to cloned networking,
 runs each clone in its own network namespace with the same TAP name and the
 same guest IP, and NATs each clone to a unique address. We take its point
 that a restored guest's identity must be fixed by the host, and reject the
-mechanism for the TAP fallback (§6.7, calls entry 4).
+mechanism for the TAP fallback (§6.7, calls entry 6).
 
 **cloud-hypervisor.** Same `<socket>_<port>` convention, ported from
 Firecracker ([vsock.md](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/docs/vsock.md)).
@@ -162,14 +185,14 @@ The products that run agent-written code by default deny or allowlist. The
 products that are general compute open everything. Legion's sandbox is the
 former, and a curated allowlist has a known failure mode: a list that drifts
 from where tooling actually connects, which users report against Claude Code
-on the web's Trusted list. §6.5 and calls entry 2 decide.
+on the web's Trusted list. §6.5 and calls entry 3 decide.
 
 **Kubernetes and Consul.** Kubernetes `NetworkPolicy` allows everything
 until a policy selects a pod. Default-deny is a pattern you add. Consul's
 service mesh with `default_policy = "deny"` denies until an intention
 allows, and its transparent proxy redirects traffic with iptables inside the
 pod's namespace so unmodified tools work. We take Consul's default and
-reject transparent redirect for now (§4, calls entry 16). Inside a microVM
+reject transparent redirect for now (§4, calls entry 28). Inside a microVM
 it would be safe, since the vsock stays the only door, and it is the
 leading follow-on.
 
@@ -530,7 +553,7 @@ If it never appears, the guest resumes anyway with no door (each dial gets a
 vsock reset, which the agent turns into a closed connection), the
 allocation reports `net_capture_unavailable`, and `legion net doctor` names
 the unbound socket. Fail closed, never a failed restore over a transient
-bind error (calls entry 13).
+bind error (calls entry 25).
 
 **In-flight connections are reset.** A memory checkpoint closes every open
 guest connection:
@@ -545,7 +568,7 @@ guest connection:
   VMM closes its side, and the upstream connections close with them.
 
 The guest agent makes this uniform. It takes over the resume handler's
-identity-disk watch (one process, `legion guest-agent`, calls entry 14), and
+identity-disk watch (one process, `legion guest-agent`, calls entry 26), and
 when it sees a restore it closes every relay it holds. A guest client
 therefore gets a prompt connection reset on every VMM version, never a hang.
 New connections dial a fresh vsock stream, which reaches the new
@@ -663,7 +686,7 @@ everything, block nothing" behavior writes it:
 network = { egress = { policy = "allow", accessLog = true } },
 ```
 
-Why deny and not a friendlier default (calls entry 2):
+Why deny and not a friendlier default (calls entry 3):
 
 - **Every registry an agent needs is also an exfiltration channel.** Behind
   `CONNECT`, the proxy sees a host and a port, not a method, so it cannot
@@ -792,7 +815,7 @@ host NAT, the common setup, every node can use the same range. When an
 operator stretches one L2 segment across nodes, each node needs a disjoint
 range, which the public doc says.
 
-Why a Legion pool and not "re-run DHCP after restore" (calls entry 4): DHCP
+Why a Legion pool and not "re-run DHCP after restore" (calls entry 6): DHCP
 re-addressing depends on a client inside the image (Debian slim has none),
 on the operator running a DHCP server, and on the client honoring a restart
 at the right moment, and when any of those fail, forks collide silently,
@@ -1136,7 +1159,7 @@ the explicit `config.network` modes and `egress.policy = "allow"`.
   allowlist locally, without enforcement. Lean: yes, as a small follow-on
   after Phase 2, since a laptop is where an author first writes the
   allowlist.
-- **A curated policy shipped on by default.** Lean: no (calls entry 2). The
+- **A curated policy shipped on by default.** Lean: no (calls entry 3). The
   shipped `agent-sandbox-egress.ncl` is opt-in.
 - **Throughput.** If G0.2 shows the proxy path far below what package
   installs need, a vhost-vsock datapath or splice offload becomes a phase.

@@ -1,8 +1,9 @@
 //! Idle detection: the worker half of the idle policy (suspend plan §6.7,
 //! docs/suspend-and-resume.md "Idle policy").
 //!
-//! The worker sees every signal (datapath bytes and open ingress
-//! connections, cgroup CPU, exec sessions), so it decides when an allocation
+//! The worker sees every signal (datapath bytes and open datapath
+//! connections, ingress and gated egress alike, cgroup CPU, exec sessions),
+//! so it decides when an allocation
 //! went quiet and reports that as `idle_since_unix` with usage. The manager
 //! owns the instance row, so it decides when quiet has lasted long enough
 //! and starts the suspend (`src/manager/idle.rs`).
@@ -38,10 +39,12 @@ pub struct IdlePolicy {
 pub struct IntervalActivity {
     /// Average CPU over the interval, thousandths of a core.
     pub cpu_millicores: u64,
-    /// Bytes moved through the node datapath (egress edges or ingress
-    /// connections) during the interval.
+    /// Bytes moved through the node datapath (egress edges, ingress
+    /// connections, or a gated allocation's egress proxy, stamped as they
+    /// move) during the interval.
     pub network_bytes: bool,
-    /// Ingress connections open at the sample.
+    /// Datapath connections open at the sample: ingress, and egress through
+    /// a gated allocation's proxy.
     pub open_connections: u32,
     /// Exec sessions open at the sample.
     pub exec_sessions: u32,

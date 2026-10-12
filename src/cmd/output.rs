@@ -251,17 +251,17 @@ mod tests {
     #[test]
     fn a_server_hint_replaces_the_generic_one() {
         let status = Status::failed_precondition(
-            "task \"workspace\" asks for memory checkpoints, but sandbox memory checkpoints \
-             don't support gated networking yet\nHint: use --disk",
+            "instance user-42 is gated, and node w-03 runs Firecracker 1.15.0, which cannot move \
+             a restored guest's vsock to a new socket (that needs Firecracker 1.16.1 or \
+             later)\nHint: upgrade Firecracker on the node, or use --disk",
         );
         let err = CliError::from_status("create snapshot", &status);
-        assert_eq!(err.hint.as_deref(), Some("use --disk"));
-        assert!(!err.message.contains("Hint:"), "{}", err.message);
-        assert!(
-            err.message.ends_with("gated networking yet"),
-            "{}",
-            err.message
+        assert_eq!(
+            err.hint.as_deref(),
+            Some("upgrade Firecracker on the node, or use --disk")
         );
+        assert!(!err.message.contains("Hint:"), "{}", err.message);
+        assert!(err.message.ends_with("1.16.1 or later)"), "{}", err.message);
     }
 
     #[test]

@@ -295,7 +295,7 @@ fn evals_of_kind(store: &Store, kind: &str) -> Vec<String> {
 /// inside one changeset, proposed to a quorum and applied on followers.
 fn process_eval_queue(store: &Store) -> R<Vec<(String, bool)>> {
     use legion::storage::events::drafts;
-    use legion::storage::store::{EvalBatchLimits, EvalCompletion};
+    use legion::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion};
 
     // A small cap with one worker: the batch is the whole ready queue, so
     // the multi-eval path is what actually runs here rather than a
@@ -303,7 +303,7 @@ fn process_eval_queue(store: &Store) -> R<Vec<(String, bool)>> {
     let limits = EvalBatchLimits { max: 8, workers: 1 };
 
     let mut out = Vec::new();
-    let mut batch = store.claim_evals(limits)?;
+    let mut batch = store.claim_evals(limits, ClaimScope::Any)?;
     while !batch.is_empty() {
         let mut completions: Vec<(String, EvalCompletion)> = Vec::with_capacity(batch.len());
         for eval in &batch {
@@ -331,7 +331,7 @@ fn process_eval_queue(store: &Store) -> R<Vec<(String, bool)>> {
             out.push((eval.kind.clone(), ok));
             assert!(out.len() < 60, "eval queue is not draining");
         }
-        batch = store.complete_evals_and_claim_next(completions, limits)?;
+        batch = store.complete_evals_and_claim_next(completions, limits, ClaimScope::Any)?;
     }
     Ok(out)
 }

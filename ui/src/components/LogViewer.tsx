@@ -1,5 +1,7 @@
+import { Code, ConnectError } from '@connectrpc/connect'
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import { managerClient } from '../grpcClient'
+import { AllocationLink } from './AllocationLink'
 import { Button, Dot, Icon, Note, cx, inputClass, selectClass } from './ui'
 
 // Live-tailing task log viewer.
@@ -17,6 +19,9 @@ type LogViewerProps = {
   job: string
   // When set, restrict to these allocation ids (e.g. a single task's allocations).
   allocationIds?: bigint[]
+  // Allocation id the allocation filter starts on (a deep link to one
+  // instance). Read once at mount; the picker owns the filter after that.
+  initialAllocation?: string
 }
 
 type LogLine = {
@@ -35,7 +40,7 @@ type StreamFilter = 'all' | 'stdout' | 'stderr'
 export default function LogViewer(props: LogViewerProps) {
   const [lines, setLines] = createSignal<LogLine[]>([])
   const [streamFilter, setStreamFilter] = createSignal<StreamFilter>('all')
-  const [allocFilter, setAllocFilter] = createSignal<string>('all')
+  const [allocFilter, setAllocFilter] = createSignal<string>(props.initialAllocation ?? 'all')
   const [knownAllocs, setKnownAllocs] = createSignal<string[]>([])
   const [follow, setFollow] = createSignal(true)
   const [wrap, setWrap] = createSignal(true)
@@ -57,6 +62,9 @@ export default function LogViewer(props: LogViewerProps) {
     const ids = props.allocationIds
     return ids && ids.length > 0 ? new Set(ids.map((id) => id.toString())) : undefined
   }
+  // One allocation is read directly (`allocation_id`), so the manager proxies
+  // a single worker read instead of one per allocation of the whole job.
+  const singleAlloc = () => (props.allocationIds?.length === 1 ? props.allocationIds[0] : undefined)
 
   const appendChunk = (alloc: string, stream: string, chunk: string) => {
     const key = `${alloc}:${stream}`
@@ -77,6 +85,7 @@ export default function LogViewer(props: LogViewerProps) {
     try {
       const resp = await managerClient.getAllocationLogs({
         job: props.job,
+        allocationId: singleAlloc(),
         stream: streamFilter(),
         tail: true,
         maxBytes: BigInt(WINDOW_BYTES),
@@ -127,6 +136,10 @@ export default function LogViewer(props: LogViewerProps) {
       const allocList = Array.from(seenAllocs).sort()
       if (allocList.length !== knownAllocs().length) setKnownAllocs(allocList)
     } catch (err) {
+      if (err instanceof ConnectError && err.code === Code.NotFound && singleAlloc() !== undefined) {
+        setError(`Allocation #${String(singleAlloc())} no longer exists, so its logs can't be read through the manager.`)
+        return
+      }
       setError(err instanceof Error ? err.message : String(err))
     }
   }
@@ -160,6 +173,18 @@ export default function LogViewer(props: LogViewerProps) {
     const nearBottom =
       container.scrollHeight - container.scrollTop - container.clientHeight < 24
     if (nearBottom !== follow()) setFollow(nearBottom)
+  }
+
+  // The picker and per-line prefix show whenever more than one allocation is
+  // in view — a task can run several instances too. A filter seeded from
+  // `initialAllocation` keeps the picker (and its own option) on screen even
+  // before, or without, any output from it, so it can always be cleared.
+  const multipleAllocs = () => knownAllocs().length > 1
+  const showAllocPicker = () => multipleAllocs() || allocFilter() !== 'all'
+  const allocOptions = () => {
+    const known = knownAllocs()
+    const selected = allocFilter()
+    return selected === 'all' || known.includes(selected) ? known : [...known, selected]
   }
 
   const allocLines = () => {
@@ -207,7 +232,7 @@ export default function LogViewer(props: LogViewerProps) {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${props.job}-logs.txt`
+    a.download = singleAlloc() !== undefined ? `${props.job}-alloc-${String(singleAlloc())}-logs.txt` : `${props.job}-logs.txt`
     a.click()
     URL.revokeObjectURL(url)
   }
@@ -236,7 +261,7 @@ export default function LogViewer(props: LogViewerProps) {
           {filterBtn('stderr', 'stderr')}
         </div>
 
-        <Show when={!props.allocationIds && knownAllocs().length > 1}>
+        <Show when={showAllocPicker()}>
           <select
             class={cx(selectClass, 'w-auto py-1 text-xs')}
             value={allocFilter()}
@@ -244,7 +269,7 @@ export default function LogViewer(props: LogViewerProps) {
             aria-label="Filter by allocation"
           >
             <option value="all">All allocations</option>
-            <For each={knownAllocs()}>{(id) => <option value={id}>alloc #{id}</option>}</For>
+            <For each={allocOptions()}>{(id) => <option value={id}>alloc #{id}</option>}</For>
           </select>
         </Show>
 
@@ -306,8 +331,13 @@ export default function LogViewer(props: LogViewerProps) {
           <For each={visibleLines()}>
             {(line) => (
               <div class={`flex gap-2 ${wrap() ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}>
-                <Show when={!props.allocationIds && knownAllocs().length > 1}>
-                  <span class="shrink-0 select-none text-neutral-600">#{line.alloc}</span>
+                <Show when={multipleAllocs()}>
+                  <AllocationLink
+                    id={line.alloc}
+                    job={props.job}
+                    variant="inherit"
+                    class="shrink-0 select-none text-neutral-600 hover:text-neutral-300"
+                  />
                 </Show>
                 <span
                   class={`shrink-0 select-none ${

@@ -75,3 +75,9 @@ export const noteToneClasses: Record<Tone, string> = {
   neutral: 'border-line bg-surface2 text-muted',
   accent: 'border-brass/30 bg-brass/5 text-brass-strong',
 }
+
+// Rollout states the engine never leaves. Pages that follow a rollout live
+// stop polling once it reaches one of these.
+const TERMINAL_ROLLOUT_STATUSES = new Set(['completed', 'failed', 'done', 'cancelled', 'completed_incomplete'])
+
+export const isRolloutDone = (status: string): boolean => TERMINAL_ROLLOUT_STATUSES.has(status.toLowerCase())

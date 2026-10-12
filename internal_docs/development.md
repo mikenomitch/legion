@@ -122,6 +122,29 @@ Two things to know before reaching for it:
 
 The profile and the reasoning behind each setting live in `Cargo.toml`.
 
+### The guest binary (`legion-guest`)
+
+A release ships a second artifact per architecture: `legion-guest`, the
+static build of the sandbox guest agent and resume handler (the `guest/`
+workspace crate). Workers copy it into every sandbox guest that needs it, so
+it must run on any image, and a musl static build does
+(docs/task-runtime-sandbox.md, "The guest agent"):
+
+```bash
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+cargo build -p legion-guest --profile dist --target x86_64-unknown-linux-musl
+cargo build -p legion-guest --profile dist --target aarch64-unknown-linux-musl  # needs an aarch64 linker
+```
+
+The x86_64 build needs no C toolchain (the crate is pure Rust over `libc`):
+`static-pie linked`, 750 KB with `--profile dist`, measured 2026-10-12. It
+runs in an empty chroot with no libc at all, which the glibc `legion` binary
+cannot. Install it beside the worker binary as `legion-guest`, or point the
+worker's `LEGION_GUEST_BINARY` at it.
+
+Publishing to crates.io: `legion-rs` depends on `legion-guest` by path and
+version, so publish `legion-guest` first.
+
 ### Testing GRPC endpoints
 
 Can use this command to inspect them/test:

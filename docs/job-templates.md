@@ -156,13 +156,30 @@ individual versions, only whole templates.
 
 ### In the UI
 
-The **Templates** page (under Workloads) lists templates. Identities with
-`template:write` also get a source editor. A template's page shows a typed
-form built from the variable definitions (text inputs, number fields,
-toggles, selects, option chips, a JSON editor). It also has a **Preview
-rendered spec** button (dry run) and a **Submit job** button. Submissions link
-to the created job. A job created from a template shows a
-`template: <name> v<N>` badge that links back.
+The **Templates** page (under Workloads) lists templates. A template's page
+launches it in three steps:
+
+1. **Variables** — a typed form built from the variable definitions (text
+   inputs, number fields, toggles, selects, option chips, a JSON editor) and a
+   version picker.
+2. **Review** — whether the launch creates a new job or updates a running one.
+   For an update it shows which values changed since the job's last launch
+   from this template, and a diff of the job's current rendered spec against
+   the new one, so re-launching over someone's environment is never a
+   surprise.
+3. **Launch** — submits exactly what was reviewed and follows the rollout. It
+   also offers the equivalent `legion template run` command.
+
+The **Source** tab shows each version's Nickel source; identities with
+`template:write` also get the editor for publishing a new version. A job
+created from a template shows a `template: <name> v<N>` badge that links
+back.
+
+The Review diff compares rendered specs; it does not predict placements (use
+`legion job plan` for that). A token that may only run templates cannot read a
+job that does not exist yet, so its Review cannot tell a new job from an
+update. See [UI architecture](ui-architecture.md#job-templates) for the
+details.
 
 ### What a run records
 

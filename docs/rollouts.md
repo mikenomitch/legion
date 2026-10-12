@@ -181,6 +181,24 @@ reschedule of an unchanged spec (`job run --force-reschedule`), a KV-triggered
 restart, and `legion job scale` all place the latest config. To move a
 rolled-back job forward, submit a corrected spec.
 
+## A newer version supersedes a running rollout
+
+A rollout always targets the job's latest config when it starts. A newer
+version can arrive while it runs: `job run` supersedes it explicitly, but a
+KV-triggered restart or in-place update re-renders the job without going
+through `job run`. A rollout whose target is no longer the job's latest config
+must not keep ticking. It treats every allocation outside its target as old,
+so it would retire the newer version's allocations and then place nothing,
+because the scheduler skips a superseded config.
+
+So every rollout tick first checks its target. When the target is stale, the
+rollout ends `cancelled` with the message `Rollout superseded: job config
+<latest> replaced its target <old>` (also written as a `warn` rollout event).
+Scale-ins it was deferring are released, and a `job_reschedule` eval for the
+latest config re-places anything already retired. A job that was stuck this
+way (0 allocations, rollout `running` forever, scale-outs disappearing within
+seconds) recovers on the rollout's next tick.
+
 ## Capacity blocking and incomplete completion
 
 When replacements cannot place:

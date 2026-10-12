@@ -599,8 +599,15 @@ Inside, the task gets:
 | Env var | Value |
 | --- | --- |
 | `LEGION_NETWORK_MODE` | `gated` |
-| `LEGION_EGRESS_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` | `http://127.0.0.1:1080` |
-| `NO_PROXY` | `localhost,127.0.0.0/8,svc.legion` |
+| `LEGION_EGRESS_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and lower-case `http_proxy`, `https_proxy`, `all_proxy` | `http://127.0.0.1:1080` |
+| `NO_PROXY`, `no_proxy` | `localhost,127.0.0.0/8,svc.legion` |
+| `NODE_USE_ENV_PROXY` | `1` |
+
+Both cases are set because tools disagree: curl ignores upper-case
+`HTTP_PROXY` for plain HTTP, and apt reads only lower case.
+`NODE_USE_ENV_PROXY=1` makes Node's built-in `fetch` and `http` honor the
+variables on Node 22.21 and 24.5 or later. Older Node ignores it, and so has
+no route out.
 
 The proxy supports three protocols:
 
@@ -615,14 +622,65 @@ variables has no route and fails.** That failure is how the policy is
 enforced. Transparent capture (a TUN inside the namespace so unmodified tools
 work) is not implemented.
 
-Two fail-closed rules apply only to gated allocations. Every listener denies
-while the allocation's policy has not arrived (`policy-pending`), and while
-its [edge-boot](edge-boot.md) `boot` gate is shut (`gate`). The gate check
-runs before the policy, so a shut gate denies every destination, even ones
-the policy allows. A gated allocation with no policy at all (nothing matched
-and nothing inline) is told so explicitly, and it allows everything through
-the proxy, with attribution. So for gated `container` and `exec` tasks, the
-`boot` gate is enforced, unlike the advisory gate in host networking.
+Three fail-closed rules apply only to gated allocations. Every listener
+denies while the allocation's policy has not arrived (`policy-pending`), and
+while its [edge-boot](edge-boot.md) `boot` gate is shut (`gate`). The gate
+check runs before the policy, so a shut gate denies every destination, even
+ones the policy allows. So for gated `container` and `exec` tasks, the `boot`
+gate is enforced, unlike the advisory gate in host networking. And a gated
+allocation that nothing allows is denied, below.
+
+### Default deny
+
+**Gated means nothing leaves unless a rule says so.** A gated allocation
+whose egress no task block and no policy object covers (nothing matched and
+nothing inline) denies every destination, on every runtime. The verdict
+names its own source, `gated-default`, so the `403`, the `net.denied` event,
+and `legion net policy test` all say why:
+
+```console
+$ curl -sS https://example.com          # inside the gated task
+curl: (56) CONNECT tunnel failed, response 403
+
+$ legion net policy test agents --to https://example.com
+✗ deny https://example.com: denied by gated-default — task workspace is gated and nothing allows example.com
+  Hint: add "example.com" to network.egress.allow, or apply a policy object; network.egress = { policy = "allow" } allows everything
+```
+
+A plain-HTTP request gets the JSON `403` body with
+`Legion-Denied-By: gated-default`. The allocation's resolver answers a name
+nothing allows with `NXDOMAIN` in one round trip and records the same
+denial, while its own `*.svc.legion` names still resolve. Declared
+`connect.upstreams` are an explicit allowance and are not affected.
+`legion net doctor` warns on the policy layer when a gated task has nothing
+covering its egress.
+
+Opening it is one line in the task:
+
+```nickel
+network = { mode = "gated", egress = { allow = ["pypi.org", "files.pythonhosted.org"] } },
+```
+
+To observe everything and block nothing, which is what a gated allocation
+with no policy did before, write it:
+
+```nickel
+network = { mode = "gated", egress = { policy = "allow", accessLog = true } },
+```
+
+For agent sandboxes, `configs/policies/agent-sandbox-egress.ncl` is a
+ready-made `default` policy for `runtimes = ["sandbox"]` that opens the
+common read paths: PyPI's index and files, npm's registry, crates.io, Go's
+module proxy, and GitHub's clone and download hosts. Read it before you
+apply it. Behind HTTPS `CONNECT` the proxy sees a host and a port, not a
+method, so a registry it opens for downloads is open for uploads too (npm's
+registry takes `npm publish`, `github.com` takes `git push`), and each line
+says so. It never applies unless you apply it, and it never lists a model
+API: which one your platform calls is yours to add.
+
+```console
+legion net policy apply -f configs/policies/agent-sandbox-egress.ncl
+```
 
 ### Sandboxes
 
@@ -632,40 +690,77 @@ host end is the node datapath. Before the guest boots, the worker binds the
 allocation's egress proxy on the VMM's host socket for guest port 1080, and
 its resolver on the socket for port 53. The sockets are
 `<alloc dir>/.sandbox/vsock.sock_1080` and `_53`, the naming both
-Firecracker and cloud-hypervisor use.
+Firecracker and cloud-hypervisor use. Every gated sandbox gets the resolver,
+whether or not it declares upstreams, so names resolve in the guest from the
+first boot.
 
 Inside the guest, the generated init starts `legion guest-agent` before the
-task's command. The agent is the worker's own binary, copied into the rootfs
-as `/legion/legion`. It relays `127.0.0.1:1080` to host vsock port 1080 and
+task's command. It relays `127.0.0.1:1080` to host vsock port 1080 and
 `127.0.0.1:53/udp` to host port 53 (using DNS-over-TCP framing). So the same
-`HTTP_PROXY` / `ALL_PROXY` / `LEGION_EGRESS_PROXY` variables and the same
-`resolv.conf` a gated container gets work unchanged. The node checks every
-connection, and the guest cannot bypass it because there is no other way
-out.
+proxy variables and the same `resolv.conf` a gated container gets work
+unchanged. The node checks every connection, and the guest cannot bypass it
+because there is no other way out.
+
+**The guest agent binary.** The worker copies `legion-guest`, a statically
+linked build of the agent and the resume handler, into the rootfs as
+`/legion/legion`, so it runs on any image, `alpine:latest` and busybox
+included. Install it next to the worker binary (or point
+`LEGION_GUEST_BINARY` at it in the worker's environment). Without it, the
+worker copies itself and logs a warning at start. That fallback needs a
+compatible glibc in the image: on a musl image the agent cannot run, init
+says so on the console, and the guest has no network, which fails closed.
 
 What is and is not enforced:
 
 - The guest is untrusted throughout. Policy, handlers, identity, and the
   service graph all run on the host side of the vsock. The agent decides
   nothing.
-- A gated sandbox cannot also have a TAP device
-  (`config.network.mode = "tap"` is rejected at start). It also needs a
-  microVM backend. With `hypervisor = "dev"` (a container standing in for a
-  VM), the start fails with that reason instead of running unprotected.
+- A gated guest that no policy covers denies everything
+  ([Default deny](#default-deny)).
+- A gated sandbox cannot also have a `config.network` (a TAP, or `none`):
+  submit refuses the pair, `task "workspace" sets network.mode = "gated" and
+  config.network = { mode = "tap" }. A gated guest has no NIC`, with a hint
+  to drop one of them. It also needs a microVM backend. With `hypervisor =
+  "dev"` (a container standing in for a VM), the start fails with that
+  reason instead of running unprotected.
+- Ingress into a gated sandbox is not supported yet: the guest has no NIC,
+  and the datapath does not dial into a guest. Submit refuses
+  `network.ports` on a gated sandbox (`ingress into a gated sandbox is not
+  supported yet`). Wire the guest to a TAP to serve ports.
 - The edge-boot `boot` gate uses the same policy-withheld marker the vsock
   listeners check, so a provisional sandbox has no network until it is
   ratified.
 - `legion net doctor` and the UI report the sandbox like any gated
-  allocation. `capture_ready` means both host sockets are bound.
+  allocation. `capture_ready` means both host sockets are bound, and an
+  unbound one is named: `egress proxy is not bound on the guest's vsock
+  socket <path>`.
+- Every gated guest uses vsock CID 3. Both VMMs implement vsock over Unix
+  sockets in user space, so a CID is private to its guest, and the datapath
+  attributes a connection by the socket it arrived on, never by anything the
+  guest says.
 
-Current status: the host side (VMM configuration, listeners, status) and the
-agent are implemented and unit-tested over Unix sockets with the VMMs'
-naming. This repository's CI has no KVM, so it does not run an end-to-end
-boot with a real VMM. `auto` resolves to `host` for sandboxes, as it does
-for every runtime.
-If the copied binary cannot run on the image's libc, init reports it on the
-console and the guest has no network. This fails closed, and `net doctor`
-shows the proxy never connecting. UDP inside the guest and transparent
+**Memory checkpoints.** A gated sandbox suspends, resumes, snapshots, and
+forks with memory. The host socket path is derived from the allocation, and
+every restore moves the guest onto the restoring allocation's own socket
+(Firecracker's `vsock_override`, needing 1.16.1 or later, or
+cloud-hypervisor's restored `config.json`). The new allocation's listeners
+are bound before the restore, so a restored or forked guest's traffic is
+attributed to the new allocation and judged by the policy in force at
+restore. A checkpoint closes the guest's open connections: the guest agent
+closes the relays it holds when it sees the restore, so clients get a prompt
+close rather than a hang. See
+[suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
+
+Current status: the host side (VMM configuration, listeners, status, the
+restore-time socket move) and the agent are implemented and unit-tested over
+Unix sockets with the VMMs' naming, and against fake VMM APIs. This
+repository's CI has no KVM, so it does not run an end-to-end boot or restore
+with a real VMM. `auto` resolves to `host` for sandboxes, as it does for
+every runtime.
+If the guest binary cannot run on the image (the glibc fallback on a musl
+image), init reports it on the console and the guest has no network. This
+fails closed, and `net doctor` shows the proxy never connecting. UDP inside
+the guest and transparent
 capture are not implemented.
 
 Requirements and limits:
@@ -675,6 +770,10 @@ Requirements and limits:
 - The worker needs `CAP_SYS_ADMIN`. It already does, for `exec` hardening's
   mount namespace and for running the OCI runtime.
 - IPv4 loopback only inside the namespace.
+- A gated `container` or `exec` task that declares no `connect.upstreams`
+  has no resolver in its namespace. Proxy-aware tools work, because the
+  proxy resolves the names they send it, but a tool that resolves a name
+  itself fails. (A gated `sandbox` always gets its resolver.)
 - No raw UDP and no ICMP.
 - No inbound traffic except through the datapath's ingress listeners (below).
 

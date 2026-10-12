@@ -2,7 +2,7 @@
 
 Calls made while fixing the 2026-10-11 pre-launch spot-check findings
 ([plan](../plans/launch-spot-check-fixes-plan.md),
-[findings](../spot-check-2026-10-11-findings.md)). The worker-plane half
+[findings](../launch-spot-check-findings.md)). The worker-plane half
 (P0-1) executes Phase 1 of the worker-plane plan, so its calls live in that
 plan's doc: [worker-plane-auth-plan_calls.md](worker-plane-auth-plan_calls.md),
 entries 10, 11, 15, and 20 to 25.

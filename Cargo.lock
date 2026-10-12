@@ -2135,6 +2135,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "legion-guest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "legion-rs"
 version = "0.1.0"
 dependencies = [
@@ -2162,6 +2173,7 @@ dependencies = [
  "jsonwebtoken",
  "landlock",
  "lazy_static",
+ "legion-guest",
  "libc",
  "libloading",
  "nickel-lang-core",

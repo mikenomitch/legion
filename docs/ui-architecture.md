@@ -62,7 +62,9 @@ Routes in `App.tsx`:
 
 - `/` overview dashboard (KPI stat cards, active rollouts, workers, recent
   scheduler activity, allocations)
-- `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`)
+- `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`,
+  `/jobs/:id/instances/:instanceId`)
+- `/allocations/:id` (no index page; every allocation id in the UI links here)
 - `/templates` (+ `/templates/:name`)
 - `/services` (+ `/services/:name`)
 - `/rollouts` (+ `/rollouts/:id`). `/deployments` redirects here.
@@ -228,11 +230,11 @@ the Access page reports it instead.
   [Job Timestamps](jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).
   The list is sorted newest-change-first by default, matching Rollouts,
   Templates, and Manager. The job detail view (`pages/details/JobDetail.tsx`):
-  - shows created/updated under the title, and the job's status badge
-    (`running`, `pending`, `complete`, `failed`, or `stopped`; see
-    [Job Status](jobs-tasks-and-scheduling.md#job-status)).
-  - offers **Stop job** (two-step confirm, hidden once the job is stopped,
-    failed or destroyed) beside **Delete job**, both gated by `job:write`.
+  - shows created/updated under the title, and a tooltip on the status
+    badge that says what the derived status means (for example, `pending`:
+    a task is waiting to be placed or for a dependency).
+  - offers **Stop job** (two-step confirm, hidden once the job is stopped
+    or destroyed) beside **Delete job**, both gated by `job:write`.
     Destroy needs a stopped job first, which is why Stop lives there.
   - has a **Scale** card (`components/ScalePanel.tsx`). Per task, it shows
     the spec count, the override with its source and age, the effective count
@@ -252,10 +254,10 @@ the Access page reports it instead.
   - shows a "Memory pressure" card, beside "Preemption history", when a
     node's pressure response acted on this job's allocations, and Memory and
     Idle columns on the allocation table.
-- `pages/details/TaskDetail.tsx`: definition, volumes, artifacts, discovery,
-  health, runtime allocations, exec, logs. The header badge is the same live
-  per-task status the job page's task cards show
-  (`utils/allocations.ts` `fetchTaskStatusByName`), so the two pages agree.
+- `pages/details/TaskDetail.tsx`: four tabs, polled as one resource. See
+  [Task page](#task-page). The header badge is the same live per-task status
+  the job page's task cards show (`utils/allocations.ts`
+  `fetchTaskStatusByName`), so the two pages agree.
 - `pages/details/NodeDetail.tsx` → `components/NodeDeepView.tsx`: the worker
   page, polled. The header has **Cordon** / **Drain** (two-step confirm)
   while the node is available and **Uncordon** while it is drained. These
@@ -283,11 +285,50 @@ the Access page reports it instead.
   `node.pressure` rows show the detail and hint as labeled lines, and
   `snapshot.*` rows show snapshot, instance, kind, size, and error, above
   the raw JSON.
-- `KeyValue.tsx`: key tree browser and CRUD/patch editor.
-- `Manager.tsx`: manager config snapshots.
+- `KeyValue.tsx`: key tree browser and CRUD/patch editor. Values are never
+  listed (`ListKv` without `include_values`). A selected key loads with
+  `GetKv { metadata_only }` and stays masked until **Reveal** (re-masked
+  after 60s, on Hide, on switching keys, refresh, or a hidden tab).
+  **Copy value** copies without showing it, and **Replace value** writes
+  without revealing. **Used by** lists `GetKvReply.references`, and delete
+  warns when any job reads the key. **+ New** only creates. The KV
+  encryption-at-rest strip (`components/KeyringStrip.tsx`, `operator:read`)
+  sits at the top. See [KV Store](kv-store.md#in-the-ui).
+- `Manager.tsx`: manager config snapshots. `pages/details/ManagerNodeDetail.tsx`
+  renders the published config as an at-a-glance summary, feature tiles
+  (exec, telemetry, ACLs, workload identity, KV encryption, edge boot,
+  auto-suspend, adaptive heartbeats), and per-area cards. Unknown keys go
+  under "Other settings" as dotted paths, secret-looking values are redacted
+  everywhere (including **Copy JSON** and the raw view), and the store's
+  `YYYY-MM-DD HH:MM:SS +HH:MM:SS` timestamps parse
+  (`utils/managerTime.ts`).
+- `pages/details/InstanceDetail.tsx` (`/jobs/:id/instances/:instanceId`): one
+  stateful instance from `GetInstance`. It shows state, current allocation
+  and node, storage, fork lineage, last stop and cold boot, usage against the
+  reservation, checkpoint and what it can checkpoint now, the shared
+  instance controls (`components/InstanceActions.tsx`, also used by the job
+  page's Instances card, plus Stop/Start here), its snapshots, and an event
+  timeline (`components/EventTimeline.tsx`) from
+  `ListEvents { instance_id }`.
+- `pages/details/AllocationDetail.tsx` (`/allocations/:id`): one allocation.
+  It covers placement (job, task, group, instance, worker, spec version and
+  whether it is current, the rollout that produced it), health with the
+  declared checks and why it last stopped, network (public and cluster
+  address, ports, the endpoint it registered), resources (memory gauge
+  against reservation and ceiling, CPU, idle, pressure order), an event
+  timeline from `ListEvents { allocation_id }`, logs, the task's
+  **Actions** panel aimed at this allocation, and storage. The row comes from
+  the ledger, so without `node:read` the page falls back to the job's
+  rollout (a `?job=` hint from the linking page helps) and to events. An
+  allocation the ledger no longer has is shown as ended, with its events.
+  `components/AllocationLink.tsx` renders the `#id` links used across the
+  UI.
 - `Raft.tsx`: under Cluster navigation. Polled consensus status, recent raft
   history, and operator commands (election, failover, membership, and join
-  tokens).
+  tokens). Commands that act on another manager (Transfer Leader, Add Voter,
+  Add Learner, Remove Member) open an inline target form, with known peer
+  ids suggested, instead of sharing one always-visible field. Transfer Leader
+  is disabled while this manager is the only settled voter.
 - `components/LogViewer.tsx`: the live task log tail, with stream and
   allocation filters and **Find in logs** (case-insensitive, hits
   highlighted, "N of M lines match").
@@ -309,10 +350,22 @@ Discovery shows up in three places, all reading the same projection:
   endpoints for that task, the declared `checks` table, and the latest
   per-allocation health snapshot.
 
-Allocation ports and health come from the state store
-(`utils/allocations.ts`). The ledger carries the assigned `network` blob but
-not the owning task name or the health snapshot. So one SQL query per job
-joins `allocation` → `task_config` → `allocation_health`.
+The ledger carries each allocation's assigned `network` blob and its task
+name (`LedgerAllocation.task_name`), so pages group a job's allocations by
+task without another lookup. Health snapshots still come from the state store
+(`utils/allocations.ts`): one SQL query per job joins `allocation` →
+`task_config` → `allocation_health`.
+
+Endpoint and port links use the node's public address
+(`ServiceEndpoint.public_address`, or `publicAddress` in the node's
+`configAttrs`) when its worker was started with
+`LEGION_WORKER_PUBLIC_ADDRESS`, with the in-cluster address beside it.
+Without one, private addresses (RFC 1918, CGNAT, loopback, link-local, ULA)
+are still linked but dimmed and badged `private`, with a tooltip naming the
+variable (`utils/services.ts`; see
+[Public addresses](service-discovery.md#public-addresses)). In the Network
+page's service graph, service boxes open the service and caller boxes open
+the job.
 
 ## Volumes
 
@@ -329,6 +382,45 @@ Storage shows up wherever you'd ask "where is my data"
   owning instance, and node.
 - **Worker detail**: volumes materialized on that host, with a note that
   draining or losing the node strands the node-local ones.
+
+## Task Page
+
+`/jobs/:id/tasks/:taskName` answers "is this task healthy, and if not, which
+instance and why" first, and keeps configuration on its own tab. The header
+carries the live status, an `N/M healthy` badge, and **Logs** / **Open shell**
+buttons.
+
+| Tab | Contents |
+| --- | --- |
+| **Overview** | Tiles for instances (running, or running / desired when the task has a plain count — a `job scale` override wins over the spec), health, endpoints (when the task declares a service), and failures in the last 24h. One **Instances** table: allocation, node, status, health with the reported reason, ports, artifact progress, and per-row **Logs** / **Shell** buttons; unhealthy rows sort first. **Health checks** (declared) beside **Recent events**. |
+| **Logs** | The live log viewer for this task's allocations. With more than one allocation in view it has an allocation picker. |
+| **Actions** | The task's declared actions as a list, the chosen one as a typed form with the argv it will run, a target (one instance, all running, or only the unhealthy ones), and an exit code and output per instance. **Open a shell** is the last list entry. The tab stays mounted once opened, so a shell or a running action survives switching to Logs and back. See [Exec & Actions](#exec--actions-interactive-terminal). |
+| **Spec** | Definition (including declared resources: cpus, memory reservation, memoryMax), service & ports with live endpoints, volumes, declared artifacts, and the effective network policy. |
+
+The tab is in the URL: `?tab=overview|logs|actions|spec` (default
+`overview`; an unknown value falls back to it, and `exec`, the tab's former
+id, opens Actions). `?alloc=<allocation id>` picks the allocation the Logs and
+Actions tabs start on, and `?action=<name>|shell` picks the Actions list
+entry. A row's **Logs** / **Shell** buttons set them, so a link can land on
+one allocation's logs (`/jobs/web/tasks/api?tab=logs&alloc=4219`) or a shell
+in it (`?tab=actions&action=shell&alloc=4219`). Tab changes replace the history
+entry rather than adding one.
+
+The page degrades per permission rather than failing: events (and the
+failures tile) need `operator:read`, which `ListEvents` requires; the desired
+count needs `scale:read`; matching events to this task needs `state:read`;
+allocation placement needs `node:read`. Without one, that piece says it is
+unavailable or falls back.
+
+Known limits:
+
+- **Health is one verdict per allocation.** The store keeps one healthy flag
+  and status string per allocation, not each check's last result, so the
+  Overview lists the declared checks and each instance's overall health.
+- **Failures are counted from events.** There is no restart counter; the tile
+  counts `allocation.failed` events for this task's task configs among the
+  job's last 200 events, and shows `N+` when that window is shorter than a
+  day.
 
 ## Usage, pressure, and snapshots
 
@@ -389,9 +481,11 @@ pages and the fixtures share one vocabulary.
   the same checks the RPCs apply, and shows its blocker message as the
   tooltip. Against a manager without the field the UI falls back to the job
   spec.
-- **Job status.** The manager reports a derived status (`running`,
-  `pending`, `complete`, `failed`, `stopped`), and the job page and index
-  show it as is.
+- **Job status.** The Jobs index and the job page both show the status the
+  manager derives from the workload (`running`, `pending`, `complete`,
+  `scheduled`, `failed`, `suspended`, `idle`, `stopped`; see
+  [Job Status](jobs-tasks-and-scheduling.md#job-status)). The status chips
+  filter on it.
 - **Events.** `snapshot` and `instance` are filter categories, and their
   expanded rows show the snapshot, instance, kind, size, durations, forks,
   and error above the raw JSON.
@@ -415,21 +509,46 @@ Known limitations:
 ## Job Templates
 
 `/templates` lists the cluster's [job templates](job-templates.md).
-`/templates/:name` is where you use a template:
+`/templates/:name` has two tabs, **Launch** and **Source**.
 
-- The run form is generated from the template's declared variables: text
-  inputs, textareas, number fields, toggles, `<select>`s, option chips for
-  `multi_select`, and a JSON editor for `json` variables. Form state is a
-  single `Record<string, unknown>` seeded from the declared defaults. It is
-  converted to typed JSON only at submit.
-- **Preview rendered spec** calls `RenderJobTemplate`, the same render the
-  submit does, so what you see is what gets submitted. Editing any value
-  invalidates a stale preview.
-- Submitting links straight to the created job. That job's page shows a
-  `template: <name> v<N>` badge linking back to the template version that
-  made it.
-- The source editor (new template, new version) renders only for identities
-  holding `template:write`.
+**Launch** is a three-step guided launch:
+
+1. **Variables.** A form generated from the template's declared variables:
+   text inputs, textareas, number fields, toggles, `<select>`s, option chips
+   for `multi_select`, and a JSON editor for `json` variables, plus the version
+   picker. Form state is a single `Record<string, unknown>` seeded from the
+   declared defaults, converted to typed JSON only when sent. **Next: review**
+   calls `RenderJobTemplate`; a render error stays on this step.
+2. **Review.** Says whether the launch **creates a new job** or **updates the
+   running job** (naming the template and version it was last launched from).
+   A values table shows what will be sent, and — when the job's current config
+   came from this same template — marks values that changed since that launch
+   (`was 1`) and keys that are new. Below it, a unified diff of the job's
+   recorded rendered spec (`job.rendered.json`) against the new render, keys
+   sorted so ordering is not a change; a new job, or a job with no JSON spec
+   recorded, gets the full rendered spec instead. Editing any value or
+   switching version sends you back to step 1.
+3. **Launch.** Calls `RunJobTemplate` with exactly the reviewed values and
+   version, then follows the rollout it started (matched on the new config
+   id) with per-group progress until it settles. **Copy as CLI** copies the
+   equivalent `legion template run <name> --version <N> --var …/--var-json …`
+   command, version pinned.
+
+The created job's page shows a `template: <name> v<N>` badge linking back to
+the template version that made it.
+
+**Source** shows the selected version's Nickel source and the version list.
+The publish editor (new version) renders only for identities holding
+`template:write`; the header's **New version** button opens it.
+
+Known limits:
+
+- The Review diff is of rendered specs. It does not say how many allocations
+  a change replaces or whether it fits; use `legion job plan` for that.
+- A token that may only launch through templates is denied `GetJobInfo` even
+  for a job that does not exist yet, so its Review says it cannot tell whether
+  the job exists, and it cannot follow the rollout.
+- The diff is skipped (full spec shown) above 20,000 lines.
 
 ## ACL-Aware Rendering
 
@@ -448,7 +567,9 @@ same rule that a selector never matches a request without that attribute.
   login link (anonymous) or a switch-identity link (authenticated). The gate
   lives at the page level because wrapping the router's outlet in any
   conditional captures it once, which freezes navigation while the URL keeps
-  changing.
+  changing. The Overview spans every resource, so it gates differently: with
+  ACLs enforced, an anonymous visitor gets the same log-in card (`LoginGate`)
+  and a logged-in identity sees each card it can read.
 - **Mutating controls** (stop/destroy job, scale, cordon/drain/uncordon,
   rollout advance/stop, KV save/delete/patch, raft commands, saved-query
   writes, exec and actions, template publish/delete, snapshot
@@ -477,7 +598,8 @@ All of this is cosmetic. The manager is the only enforcement point.
 ## Stateful Workloads
 
 Allocation views (node detail allocation summaries, Homepage ledger cards,
-job detail allocation table) show a compact mono instance-id pill when
+job detail allocation table, the task page's Instances table) show the
+instance id, linked to its instance page, when
 `LedgerAllocation.instance_id` is set. This makes a rescheduled stateful
 allocation visibly the same instance. Stateless allocations are unchanged.
 
@@ -536,23 +658,61 @@ committed files differ, so a proto change cannot merge without its client.
 ## Exec & Actions (interactive terminal)
 
 The task detail page (`pages/details/JobDetail.tsx` → `TaskDetail.tsx`) has an
-**Exec & Actions** section listing this task's running allocations. These are
-the job's allocations from `GetLedger`, narrowed to the ones that run the
-page's task. The ledger carries only `task_config_id`, so the task name comes
-from the state-store lookup that also carries allocation health. A token
-without `state:read` cannot make that mapping. In that case the section lists
-every running allocation of the job (the manager still rejects an exec whose
-allocation runs a different task). Each listed allocation gets an
-`AllocationExecPanel` with a command launcher (interactive-tty toggle). For
-tasks that declare actions, it also shows action forms generated from the
-parameter schema (`ListJobActions`, filtered to this task).
+**Actions** tab (`components/TaskActions.tsx`). Its targets are the job's
+allocations from `GetLedger`, narrowed to the ones that run the page's task.
+The ledger carries only `task_config_id`, so the task name comes from the
+state-store lookup that also carries allocation health. A token without
+`state:read` cannot make that mapping. In that case every running allocation
+of the job is offered (the manager still rejects an exec whose allocation runs
+a different task).
+
+The left list is the task's actions (`ListJobActions`, filtered to this task)
+plus **Open a shell**. The chosen action shows:
+
+- **Parameters**, one control per declared type: an `enum` of up to four
+  values is a segmented control, five or more a chip group; `int` and
+  `string` are text inputs checked as you type against `min`/`max` and
+  `pattern` (the same rules as `ActionParam::validate_value`); a `sensitive`
+  string is masked; `bool` is a switch. A required empty value, or any value
+  that fails its check, disables **Run** with the reason under the field.
+  Empty optional values are left out, so the manager applies the default.
+- **Runs**: the action's `command` from the jobspec with the current values
+  substituted for `${param.<name>}` (sensitive values masked). The manager
+  still renders the real argv; this is a preview.
+- **Run on**: one instance (chips with health dots; default the URL's
+  `alloc`, else the first unhealthy, else the first), all running, or only the
+  unhealthy ones. A `tty` action runs in one instance only.
+- **Run**, and under it the equivalent `legion action run <job> <action>
+  --alloc <id> --param k=v` line (`***` for sensitive values).
+- **Result**: one row per instance with its exit code, duration, last line,
+  and output (stderr tinted), opened automatically for a failure or a single
+  target.
+
+Running on several instances opens one exec session per allocation, all at
+once; there is no multi-allocation RPC. A `tty` action, and the shell entry
+(command plus an *Interactive (tty)* toggle), open an xterm.js terminal. The
+action list, form values, and results are kept while you switch actions, and
+open sessions close when you leave the page. There is no run history: results
+live in the page.
 
 Exec is the one part of the UI that does not use gRPC-Web, because browsers
 cannot do bidirectional streaming over it. `ui/src/lib/execSocket.ts` opens a
-WebSocket to the manager's exec bridge (`ws://<host>:<port+1>/v1/exec/ws`).
+WebSocket to the manager's exec bridge at `<host>:<port+1>/v1/exec/ws`.
 It exchanges protobuf `ExecClientFrame`/`ExecServerFrame` messages (the same
 frames the CLI uses), one per binary WS frame. The bearer token rides in the
 first frame.
+
+The exec WebSocket follows `server.tls`. The UI uses `wss://` when the
+manager endpoint is `https://`, and `ws://` otherwise. When `server.tls` is
+enabled, the exec listener serves TLS with the same certificate and key as
+the gRPC listener. It accepts only TLS, and a plaintext `ws://` connection
+fails its handshake. When TLS is off, the listener stays plaintext. The
+browser has to trust the certificate on the exec port as well as on the
+manager port. A certificate-warning exception you click through for the
+manager port may not cover `port+1`, because some browsers (Firefox, for
+example) record exceptions per host and port. If the terminal fails to
+connect while the rest of the UI works, check that first. Trusting the CA
+that signed the certificate covers both ports.
 
 `components/ExecTerminal.tsx` binds those frames to an xterm.js terminal
 (`@xterm/xterm` + `@xterm/addon-fit`) and sends resize frames when the

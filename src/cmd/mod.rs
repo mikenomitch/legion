@@ -25,6 +25,7 @@ pub mod oidc;
 pub mod output;
 pub mod raft;
 pub mod sandbox;
+pub mod scheduler;
 pub mod service;
 pub mod snapshot;
 pub mod start;
@@ -69,6 +70,7 @@ pub fn cli() -> Command {
         .subcommand(snapshot::config())
         .subcommand(state::config())
         .subcommand(raft::config())
+        .subcommand(scheduler::config())
         .subcommand(acl::config())
         .subcommand(exec::config())
         .subcommand(action::config())

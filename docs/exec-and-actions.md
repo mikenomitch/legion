@@ -54,10 +54,15 @@ manager's or the worker's own message: for example `FailedPrecondition` when
 the allocation is not running, or `Unavailable` naming the node and port the
 manager could not reach.
 
-In the UI, open a task (Jobs → a job → a task) and use the **Exec &
-Actions** panel on any running allocation. Type a command and toggle
-*Interactive (tty)* if you want a shell. An embedded terminal (xterm.js)
-streams the session.
+In the UI, open a task (Jobs → a job → a task), go to its **Actions** tab
+and pick **Open a shell** at the bottom of the list, or press **Open shell** in
+the header or **Shell** on an instance's row in the Overview. Pick the
+instance, type a command, and toggle *Interactive (tty)* if you want a shell.
+An embedded terminal (xterm.js) streams the session. A link can open it on one
+allocation: `/jobs/web/tasks/api?tab=actions&action=shell&alloc=4217`.
+
+The allocation page (`/allocations/<id>`) has the same **Actions** panel
+aimed at that one allocation.
 
 ## Actions
 
@@ -133,9 +138,16 @@ legion action list web --json                            # the actions as data
 legion action run web flush-cache --json                 # one envelope, as for exec
 ```
 
-In the UI, the same **Exec & Actions** panel shows each action with a form
-built from its parameter schema (enum → dropdown, int/string → validated
-input). *Run* streams output into the terminal and shows the exit code.
+In the UI, the task page's **Actions** tab lists the task's actions. The
+chosen one gets a form built from its parameter schema — a segmented control
+or chips for `enum`, a switch for `bool`, inputs checked against `min`/`max`
+and `pattern` as you type, a masked input for `sensitive` — plus a preview of
+the argv it will run and the equivalent `legion action run` command. You can
+run it on one instance, on all running instances, or only on the unhealthy
+ones; each instance gets its own exit code and output. Running on several
+instances opens one session per allocation from the browser, so each is
+audited separately. A `tty` action opens a terminal in one instance.
+`?tab=actions&action=<name>` links straight to an action.
 
 ## Which task runtimes support exec
 
@@ -238,6 +250,13 @@ UI   ──WebSocket /v1/exec/ws───────┘        (proxies frames)
   frame. The handshake's `Origin` must be loopback or listed in
   `server.allowedOrigins` ([UI Architecture](ui-architecture.md#allowed-browser-origins)),
   so a web page cannot open a session.
+- The WebSocket listener follows `server.tls`. When TLS is enabled, it serves
+  `wss://` with the same certificate and key as the gRPC listener, and it
+  refuses plaintext connections. When TLS is off, it serves plaintext `ws://`.
+  The UI picks `wss://` whenever its manager endpoint is `https://`. A browser
+  that does not trust the certificate on `port + 1` fails the terminal while
+  the rest of the UI works
+  ([UI Architecture](ui-architecture.md#exec--actions-interactive-terminal)).
 - Interactive sessions use a PTY on the worker (`portable-pty`: openpty on
   Unix, ConPTY on Windows). Sessions end when the connection closes. There is
   no detach/reattach.

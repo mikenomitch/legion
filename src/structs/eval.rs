@@ -1810,4 +1810,58 @@ mod tests {
         assert_eq!(pending_reschedules(&store, &v1)?, 1);
         Ok(())
     }
+
+    /// A rollout whose target is no longer the job's latest config (a
+    /// KV-triggered restart re-rendered the job past it) must not retire the
+    /// newer allocations as "old": it cancels itself, and the latest config
+    /// is rescheduled.
+    #[test]
+    fn stale_rollout_cancels_instead_of_retiring_newer_allocations() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node("node-1", "a").into())?;
+        let subs = [Submission {
+            path: "job.ncl".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&single_task_job("stale", 1), &subs)?;
+        let v1 = store.get_job_config("stale")?.id();
+        store.handle_job_submit(&single_task_job("stale", 2), &subs)?;
+        let v2 = store.get_job_config("stale")?.id();
+        let rollout = store.create_rollout(
+            "stale",
+            Some(&v1),
+            &v2,
+            "running",
+            None,
+            None,
+            None,
+            None,
+            "{}",
+        )?;
+        // A newer version lands without going through RunJob, and its
+        // allocation is placed.
+        store.handle_job_submit(&single_task_job("stale", 3), &subs)?;
+        let v3 = store.get_job_config("stale")?.id();
+        let v3_task = store.get_task_configs_for_job_config(&v3)?[0].0;
+        let v3_alloc = store.place_alloc("node-1", v3_task)?;
+
+        job_eval("rollout_tick", "stale", &v2).handle(&store)?;
+
+        let rollout = store.get_rollout(rollout.id)?.context("rollout")?;
+        assert_eq!(rollout.status, "cancelled");
+        assert!(
+            rollout.message.contains("superseded"),
+            "{:?}",
+            rollout.message
+        );
+        let remaining: Vec<i64> = store
+            .allocs_for_job("stale")?
+            .iter()
+            .map(|allocation| allocation.id)
+            .collect();
+        assert_eq!(remaining, vec![v3_alloc.id]);
+        assert_eq!(pending_reschedules(&store, &v3)?, 1);
+        Ok(())
+    }
 }

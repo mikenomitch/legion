@@ -33,6 +33,8 @@ const ICON_PATHS: Record<string, string> = {
   x: 'M18 6 6 18 M6 6l12 12',
   chevronRight: 'm9 18 6-6-6-6',
   chevronLeft: 'm15 18-6-6 6-6',
+  chevronDown: 'm6 9 6 6 6-6',
+  chevronUp: 'm18 15-6-6-6 6',
   copy: 'M8 8h12v12H8z M16 8V6a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2',
   check: 'M20 6 9 17l-5-5',
   play: 'm6 3 14 9-14 9V3z',
@@ -62,6 +64,9 @@ const ICON_PATHS: Record<string, string> = {
   activity: 'M22 12h-4l-3 9L9 3l-3 9H2',
   user: 'M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2 M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
   clock: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z M12 6v6l4 2',
+  // Lucide `waypoints`: services joined by the paths between them.
+  waypoints:
+    'M12 7a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z M10.2 6.3 6.3 10.2 M4.5 14.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z M7 12h10 M19.5 14.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z M13.8 17.7l3.9-3.9 M12 22a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z',
   compass: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z m4.24-14.24-2.12 6.36-6.36 2.12 2.12-6.36 6.36-2.12z',
   minus: 'M5 12h14',
   square: 'M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z',

@@ -109,7 +109,8 @@ The manager's `persistence.type` decides how its state survives a manager failur
   manager issues its own join token for it.
 
 TLS is off by default. Turn it on with `server.tls { enabled, certPath, keyPath }`
-in the manager config.
+in the manager config. It covers the gRPC listener and the exec WebSocket
+listener (`server.port + 1`). The telemetry listener stays plaintext.
 
 ## Worker Startup and Join Flow
 

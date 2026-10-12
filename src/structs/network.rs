@@ -36,9 +36,10 @@ pub const VIP_FIRST_HOST: u8 = 2;
 pub const GATED_PROXY_ADDR: &str = "127.0.0.1";
 pub const GATED_PROXY_PORT: u16 = 1080;
 
-/// Resolve a task's declared `network.mode` for a runtime: `auto` is `host`
-/// for every runtime today (`sandbox` moves to `gated` when its vsock
-/// transport lands), and an explicit value is itself.
+/// Resolve a task's declared `network.mode` without node facts: an explicit
+/// value is itself, and `auto` is `host`. Placement resolves `auto` with the
+/// node in hand ([`resolve_network_mode_with`]); submit-time checks that need
+/// the same answer use [`task_runs_gated`].
 pub fn resolve_network_mode(declared: &str, _runtime: &str) -> String {
     let declared = declared.trim().to_ascii_lowercase();
     if declared.is_empty() || declared == crate::structs::netpolicy::MODE_AUTO {
@@ -46,6 +47,220 @@ pub fn resolve_network_mode(declared: &str, _runtime: &str) -> String {
     } else {
         declared
     }
+}
+
+/// Gated plan Phase 2: `network.mode = "auto"` (the default) resolves to
+/// `gated` for a `sandbox` with no `config.network` on a microVM node, so
+/// the safe network is what an author gets by writing nothing.
+///
+/// **Held at `false` until Phase 0 passes.** Phase 0 is the plan's gate: it
+/// boots a gated sandbox on a real VMM for the first time
+/// (`internal_docs/suspend-resume-linux-verification.md`, "Gated
+/// sandboxes"), and the default must not move to a datapath that has never
+/// run. The resolution is implemented and tested with the gate open; flipping
+/// this constant ships it. Until then a manager started with
+/// [`SANDBOX_GATED_DEFAULT_ENV`]`=1` opens it, for that verification.
+pub const SANDBOX_GATED_BY_DEFAULT: bool = false;
+
+/// Manager environment variable that opens [`SANDBOX_GATED_BY_DEFAULT`]'s
+/// gate before it ships, for verifying Phase 2 on a KVM host. Not a
+/// supported setting.
+pub const SANDBOX_GATED_DEFAULT_ENV: &str = "LEGION_SANDBOX_GATED_DEFAULT";
+
+/// Whether `auto` resolves to `gated` for sandboxes in this process: the
+/// constant, or the verification override.
+pub fn sandbox_gated_by_default() -> bool {
+    SANDBOX_GATED_BY_DEFAULT
+        || std::env::var(SANDBOX_GATED_DEFAULT_ENV)
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+}
+
+/// What resolving `auto` needs to know about a task and the node it lands
+/// on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoModeFacts<'a> {
+    /// The sandbox declares `config.network` (`none` or `tap`), which is an
+    /// explicit choice of its own network.
+    pub sandbox_config_network: bool,
+    /// The sandbox's `config.hypervisor`, when it sets one.
+    pub hypervisor: Option<&'a str>,
+    /// The node's `sandbox.vmm` attribute. `None` when there is no node yet
+    /// (a submit-time check), which reads as a microVM node, the case the
+    /// default exists for.
+    pub node_vmm: Option<&'a str>,
+}
+
+impl<'a> AutoModeFacts<'a> {
+    /// The task's half of the facts: `config.network` and `hypervisor`.
+    pub fn for_task(task: &'a crate::structs::TaskConfig) -> Self {
+        Self::from_config(&task.config)
+    }
+
+    /// [`Self::for_task`] from the task's runtime config alone (what the
+    /// store keeps in `task_config.config`).
+    pub fn from_config(config: &'a Value) -> Self {
+        AutoModeFacts {
+            sandbox_config_network: config
+                .get("network")
+                .is_some_and(|network| !network.is_null()),
+            hypervisor: config
+                .get("hypervisor")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            node_vmm: None,
+        }
+    }
+
+    /// Whether the sandbox runs as a microVM: an explicit VMM, or `auto` on
+    /// a node whose default is one. A dev backend (Apple `container`, an
+    /// OCI runtime) has no vsock to the datapath.
+    pub fn runs_microvm(&self) -> bool {
+        match self.hypervisor.map(str::to_ascii_lowercase).as_deref() {
+            Some("firecracker" | "fc" | "cloud-hypervisor" | "cloudhypervisor" | "ch") => true,
+            Some("dev") => false,
+            _ => self
+                .node_vmm
+                .is_none_or(|vmm| matches!(vmm, "firecracker" | "cloud-hypervisor")),
+        }
+    }
+}
+
+/// Resolve a task's declared `network.mode` at placement. An explicit value
+/// is itself, and is never downgraded. `auto` is `gated` for a sandbox with
+/// no `config.network` that runs as a microVM, when `sandbox_gated_default`
+/// is open ([`sandbox_gated_by_default`]), and `host` everywhere else: other
+/// runtimes, a sandbox that declares its own network, and a dev backend,
+/// which says so (`egress-unenforced`).
+pub fn resolve_network_mode_with(
+    declared: &str,
+    runtime: &str,
+    facts: &AutoModeFacts<'_>,
+    sandbox_gated_default: bool,
+) -> String {
+    let declared = declared.trim().to_ascii_lowercase();
+    if !declared.is_empty() && declared != crate::structs::netpolicy::MODE_AUTO {
+        return declared;
+    }
+    if sandbox_gated_default
+        && runtime == "sandbox"
+        && !facts.sandbox_config_network
+        && facts.runs_microvm()
+    {
+        crate::structs::netpolicy::MODE_GATED.to_string()
+    } else {
+        crate::structs::netpolicy::MODE_HOST.to_string()
+    }
+}
+
+/// Whether a task's own spec puts it on gated networking on a microVM node:
+/// it declares `gated`, or it is a sandbox whose `auto` resolves there.
+/// Submit-time checks use this (only the declared mode and the task's
+/// config are visible at submit; a stored `require` policy can also impose
+/// `gated` at placement).
+pub fn task_runs_gated(task: &crate::structs::TaskConfig, sandbox_gated_default: bool) -> bool {
+    let declared = task
+        .network
+        .as_ref()
+        .map(|network| network.mode.as_str())
+        .unwrap_or(crate::structs::netpolicy::MODE_AUTO);
+    resolve_network_mode_with(
+        declared,
+        &task.runtime,
+        &AutoModeFacts::for_task(task),
+        sandbox_gated_default,
+    ) == crate::structs::netpolicy::MODE_GATED
+}
+
+/// Submit-time checks for a `sandbox` on gated networking (gated plan §6.5,
+/// §6.8): combinations that cannot work are refused here, with the fix,
+/// rather than failing at start or never working at all.
+///
+/// - An explicit `network.mode = "gated"` with a `config.network`: a gated
+///   guest has no NIC (and `none` has no vsock), so the two contradict.
+/// - Advertised ports (`network.ports`) on a sandbox that runs gated: the
+///   guest has no NIC and the datapath does not dial into a guest yet, so
+///   nothing could reach them.
+pub fn validate_gated_sandbox(
+    task: &crate::structs::TaskConfig,
+    sandbox_gated_default: bool,
+) -> Result<(), String> {
+    if task.runtime != "sandbox" {
+        return Ok(());
+    }
+    let declared_gated = task.network.as_ref().is_some_and(|network| {
+        network
+            .mode
+            .trim()
+            .eq_ignore_ascii_case(crate::structs::netpolicy::MODE_GATED)
+    });
+    if declared_gated {
+        if let Some(config_network) = task.config.get("network").filter(|value| !value.is_null()) {
+            let mode = config_network
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("none");
+            return Err(format!(
+                "task {:?} sets network.mode = \"gated\" and config.network = {{ mode = \"{mode}\" \
+                 }}. A gated guest has no NIC\nHint: drop config.network to stay gated, or drop \
+                 network.mode to use the guest's own network",
+                task.name
+            ));
+        }
+    }
+    let ports = task
+        .network
+        .as_ref()
+        .map(|network| network.ports.len())
+        .unwrap_or(0);
+    if ports > 0 && task_runs_gated(task, sandbox_gated_default) {
+        return Err(format!(
+            "task {:?} declares network.ports on a gated sandbox, but ingress into a gated \
+             sandbox is not supported yet: the guest has no NIC, and the datapath does not dial \
+             into a guest, so nothing could reach those ports\nHint: wire the guest to a TAP \
+             (config.network = {{ mode = \"tap\", ... }}) to serve ports, or drop network.ports",
+            task.name
+        ));
+    }
+    Ok(())
+}
+
+/// Why a sandbox that runs without Legion's egress policy because of its
+/// backend, not its spec, says so: `auto` on a dev backend while the gated
+/// default is open. `None` when this does not apply. Shown as the
+/// instance's `detail` and by `legion net doctor`.
+pub fn egress_unenforced_detail(
+    task: &crate::structs::TaskConfig,
+    node_vmm: Option<&str>,
+    sandbox_gated_default: bool,
+) -> Option<String> {
+    if !sandbox_gated_default || task.runtime != "sandbox" {
+        return None;
+    }
+    let declared = task
+        .network
+        .as_ref()
+        .map(|network| network.mode.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !(declared.is_empty() || declared == crate::structs::netpolicy::MODE_AUTO) {
+        return None;
+    }
+    let facts = AutoModeFacts {
+        node_vmm,
+        ..AutoModeFacts::for_task(task)
+    };
+    if facts.sandbox_config_network || facts.runs_microvm() {
+        return None;
+    }
+    let backend = match node_vmm {
+        Some("apple-container") => "Apple container has no vsock to the datapath",
+        _ => "a dev-mode container has no vsock to the datapath",
+    };
+    Some(format!(
+        "egress-unenforced: dev mode runs sandbox {} without Legion's egress policy ({backend})",
+        task.name
+    ))
 }
 
 /// Whether this platform routes all of 127/8 to loopback without
@@ -649,16 +864,25 @@ impl AllocNetwork {
         if self.is_gated() {
             // The only door out of a gated namespace. NO_PROXY keeps the
             // task's own loopback, its VIPs, and the zone off the proxy.
+            // Both cases, because tools disagree: curl ignores upper-case
+            // HTTP_PROXY for plain HTTP, and apt reads only lower case.
+            // NODE_USE_ENV_PROXY makes Node's built-in fetch and http honor
+            // them (Node 22.21 and 24.5 or later; older Node ignores it).
             let proxy = format!("http://{GATED_PROXY_ADDR}:{GATED_PROXY_PORT}");
+            let no_proxy = format!("localhost,127.0.0.0/8,{SVC_ZONE}");
             pairs.push(("LEGION_EGRESS_PROXY".to_string(), proxy.clone()));
             pairs.push(("LEGION_NETWORK_MODE".to_string(), "gated".to_string()));
-            pairs.push(("HTTP_PROXY".to_string(), proxy.clone()));
-            pairs.push(("HTTPS_PROXY".to_string(), proxy.clone()));
-            pairs.push(("ALL_PROXY".to_string(), proxy));
-            pairs.push((
-                "NO_PROXY".to_string(),
-                format!("localhost,127.0.0.0/8,{SVC_ZONE}"),
-            ));
+            for (upper, lower) in [
+                ("HTTP_PROXY", "http_proxy"),
+                ("HTTPS_PROXY", "https_proxy"),
+                ("ALL_PROXY", "all_proxy"),
+            ] {
+                pairs.push((upper.to_string(), proxy.clone()));
+                pairs.push((lower.to_string(), proxy.clone()));
+            }
+            pairs.push(("NO_PROXY".to_string(), no_proxy.clone()));
+            pairs.push(("no_proxy".to_string(), no_proxy));
+            pairs.push(("NODE_USE_ENV_PROXY".to_string(), "1".to_string()));
         } else if let Some(mode) = self.mode.as_deref() {
             pairs.push(("LEGION_NETWORK_MODE".to_string(), mode.to_string()));
         }
@@ -734,6 +958,11 @@ pub struct ServiceEndpointRow {
     pub allocation_id: i64,
     pub node_id: String,
     pub address: Option<String>,
+    /// The node's `publicAddress`, when its worker declares one: where a
+    /// client outside the private network reaches `port`. Display only;
+    /// nothing in the cluster dials it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_address: Option<String>,
     pub port: Option<u16>,
     pub healthy: bool,
     pub health_status: String,
@@ -1556,6 +1785,200 @@ mod tests {
             lookup.get("LEGION_ADDR_HTTP_2").map(String::as_str),
             Some("10.0.0.5:20000")
         );
+    }
+
+    /// Gated plan §6.5: both cases of every proxy variable, because tools
+    /// disagree (curl ignores upper-case `HTTP_PROXY` for plain HTTP, apt
+    /// reads only lower case), and `NODE_USE_ENV_PROXY` for Node's fetch.
+    #[test]
+    fn a_gated_allocation_gets_both_cases_of_the_proxy_variables() {
+        let network = AllocNetwork {
+            mode: Some("gated".into()),
+            ..AllocNetwork::default()
+        };
+        let lookup: std::collections::HashMap<_, _> = network.env_pairs().into_iter().collect();
+        for key in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "LEGION_EGRESS_PROXY",
+        ] {
+            assert_eq!(
+                lookup.get(key).map(String::as_str),
+                Some("http://127.0.0.1:1080"),
+                "{key}"
+            );
+        }
+        assert_eq!(lookup["NO_PROXY"], lookup["no_proxy"]);
+        assert_eq!(lookup["NO_PROXY"], "localhost,127.0.0.0/8,svc.legion");
+        assert_eq!(
+            lookup.get("NODE_USE_ENV_PROXY").map(String::as_str),
+            Some("1")
+        );
+        let host = AllocNetwork {
+            mode: Some("host".into()),
+            ..AllocNetwork::default()
+        };
+        assert!(!host
+            .env_pairs()
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("http_proxy")));
+    }
+
+    fn task_of(runtime: &str, network: Option<Value>, config: Value) -> crate::structs::TaskConfig {
+        let mut task = json!({ "name": "workspace", "runtime": runtime, "config": config });
+        if let Some(network) = network {
+            task["network"] = network;
+        }
+        serde_json::from_value(task).expect("task parses")
+    }
+
+    /// Gated plan §6.5's resolution table, with the Phase 2 gate open and
+    /// closed: `auto` is `gated` only for a sandbox with no
+    /// `config.network` on a microVM, an explicit mode is never changed,
+    /// and every other runtime stays `host`.
+    #[test]
+    fn auto_resolves_per_the_gated_default_table() {
+        let plain = json!({ "image": "alpine", "command": ["sh"] });
+        let tap = json!({ "image": "alpine", "command": ["sh"], "network": { "mode": "tap" } });
+        let dev = json!({ "image": "alpine", "command": ["sh"], "hypervisor": "dev" });
+        let fc = json!({ "image": "alpine", "command": ["sh"], "hypervisor": "firecracker" });
+        let resolve = |runtime: &str, declared: &str, config: &Value, node: Option<&str>, open| {
+            resolve_network_mode_with(
+                declared,
+                runtime,
+                &AutoModeFacts {
+                    node_vmm: node,
+                    ..AutoModeFacts::from_config(config)
+                },
+                open,
+            )
+        };
+        let cases: &[(&str, &str, &Value, Option<&str>, &str)] = &[
+            ("sandbox", "auto", &plain, Some("firecracker"), "gated"),
+            ("sandbox", "", &plain, Some("cloud-hypervisor"), "gated"),
+            ("sandbox", "auto", &plain, Some("apple-container"), "host"),
+            ("sandbox", "auto", &plain, Some("oci-runtime"), "host"),
+            ("sandbox", "auto", &dev, Some("firecracker"), "host"),
+            ("sandbox", "auto", &fc, Some("apple-container"), "gated"),
+            ("sandbox", "auto", &tap, Some("firecracker"), "host"),
+            ("sandbox", "auto", &plain, None, "gated"),
+            ("sandbox", "gated", &dev, Some("apple-container"), "gated"),
+            ("sandbox", "host", &plain, Some("firecracker"), "host"),
+            ("container", "auto", &plain, Some("firecracker"), "host"),
+            ("exec", "auto", &plain, Some("firecracker"), "host"),
+            ("container", "gated", &plain, None, "gated"),
+        ];
+        for (runtime, declared, config, node, want) in cases {
+            assert_eq!(
+                resolve(runtime, declared, config, *node, true),
+                *want,
+                "{runtime} {declared:?} {config} on {node:?}"
+            );
+        }
+        // Closed (today): `auto` is `host` everywhere, explicit is itself.
+        assert_eq!(
+            resolve("sandbox", "auto", &plain, Some("firecracker"), false),
+            "host"
+        );
+        assert_eq!(
+            resolve("sandbox", "gated", &plain, Some("firecracker"), false),
+            "gated"
+        );
+        assert!(!task_runs_gated(
+            &task_of("sandbox", None, plain.clone()),
+            false
+        ));
+        assert!(task_runs_gated(
+            &task_of("sandbox", None, plain.clone()),
+            true
+        ));
+        assert!(!task_runs_gated(
+            &task_of("sandbox", None, tap.clone()),
+            true
+        ));
+        assert!(task_runs_gated(
+            &task_of("exec", Some(json!({ "mode": "gated" })), plain.clone()),
+            false
+        ));
+    }
+
+    /// Gated plan §6.8: gated plus `config.network`, and ports on a gated
+    /// sandbox, are refused at submit with the fix.
+    #[test]
+    fn contradictory_gated_sandboxes_are_refused_at_submit() {
+        let gated = Some(json!({ "mode": "gated" }));
+        let tap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "tap" } });
+        let err =
+            validate_gated_sandbox(&task_of("sandbox", gated.clone(), tap), false).unwrap_err();
+        assert_eq!(
+            err,
+            "task \"workspace\" sets network.mode = \"gated\" and config.network = { mode = \"tap\" \
+             }. A gated guest has no NIC\nHint: drop config.network to stay gated, or drop \
+             network.mode to use the guest's own network"
+        );
+        let none = json!({ "image": "a", "command": ["sh"], "network": { "mode": "none" } });
+        assert!(validate_gated_sandbox(&task_of("sandbox", gated.clone(), none), false).is_err());
+
+        let plain = json!({ "image": "a", "command": ["sh"] });
+        let ports = Some(json!({ "mode": "gated", "ports": [{ "name": "http" }] }));
+        let err =
+            validate_gated_sandbox(&task_of("sandbox", ports, plain.clone()), false).unwrap_err();
+        assert!(
+            err.contains("ingress into a gated sandbox is not supported yet"),
+            "{err}"
+        );
+        assert!(err.contains("Hint: wire the guest to a TAP"), "{err}");
+        // A default sandbox with ports: refused only once the default is
+        // gated, and never one that declares its own network.
+        let auto_ports = Some(json!({ "ports": [{ "name": "http" }] }));
+        let default = task_of("sandbox", auto_ports.clone(), plain.clone());
+        assert!(validate_gated_sandbox(&default, false).is_ok());
+        assert!(validate_gated_sandbox(&default, true).is_err());
+        let tap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "tap" } });
+        assert!(validate_gated_sandbox(&task_of("sandbox", auto_ports, tap), true).is_ok());
+        // Other runtimes and plain gated sandboxes pass.
+        assert!(
+            validate_gated_sandbox(&task_of("sandbox", gated.clone(), plain.clone()), true).is_ok()
+        );
+        assert!(validate_gated_sandbox(
+            &task_of(
+                "container",
+                Some(json!({ "mode": "gated", "ports": [{ "name": "http" }] })),
+                plain
+            ),
+            true
+        )
+        .is_ok());
+    }
+
+    /// Gated plan §6.6: a default sandbox on a dev backend says it runs
+    /// without egress policy, once the default is gated; an explicit choice
+    /// never does.
+    #[test]
+    fn a_default_sandbox_on_a_dev_backend_says_egress_is_unenforced() {
+        let plain = json!({ "image": "a", "command": ["sh"] });
+        let task = task_of("sandbox", None, plain.clone());
+        let detail = egress_unenforced_detail(&task, Some("apple-container"), true).unwrap();
+        assert_eq!(
+            detail,
+            "egress-unenforced: dev mode runs sandbox workspace without Legion's egress policy \
+             (Apple container has no vsock to the datapath)"
+        );
+        assert!(egress_unenforced_detail(&task, Some("apple-container"), false).is_none());
+        assert!(egress_unenforced_detail(&task, Some("firecracker"), true).is_none());
+        let host = task_of("sandbox", Some(json!({ "mode": "host" })), plain.clone());
+        assert!(egress_unenforced_detail(&host, Some("apple-container"), true).is_none());
+        let tap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "none" } });
+        assert!(egress_unenforced_detail(
+            &task_of("sandbox", None, tap),
+            Some("oci-runtime"),
+            true
+        )
+        .is_none());
     }
 
     //

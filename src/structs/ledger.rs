@@ -131,6 +131,8 @@ impl From<Allocation> for LedgerAllocation {
             // Enriched from allocation_health snapshots by the manager's
             // GetLedger handler; the core Allocation carries no health data.
             artifact_states: None,
+            // Enriched by the GetLedger handler from the task config.
+            task_name: String::new(),
         }
     }
 }
@@ -148,6 +150,7 @@ impl LedgerAllocation {
             instance_id,
             network,
             artifact_states: _,
+            task_name: _,
         } = self;
 
         let resources: Value =

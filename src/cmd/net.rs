@@ -911,6 +911,7 @@ async fn test(matches: &ArgMatches) -> R<()> {
             "source": reply.source,
             "reason": reply.reason,
             "explanation": reply.explanation,
+            "hint": (!reply.hint.is_empty()).then_some(&reply.hint),
         }));
         return Ok(());
     }
@@ -920,6 +921,9 @@ async fn test(matches: &ArgMatches) -> R<()> {
         _ => "?",
     };
     println!("{mark} {} {}", reply.verdict, reply.explanation);
+    if !reply.hint.is_empty() {
+        println!("  Hint: {}", reply.hint);
+    }
     Ok(())
 }
 
@@ -1013,7 +1017,19 @@ pub(crate) fn diagnose_network(
     let mut steps = Vec::new();
 
     // 1. Policy.
-    if effective.is_empty() {
+    let gated = reply.effective_mode == "gated";
+    if effective.is_empty() && gated {
+        // Gated with nothing covering egress: `gated-default` denies it all.
+        steps.push(DoctorStep {
+            layer: "policy",
+            status: "warn",
+            detail: format!(
+                "no network policy covers {job_id}/{task_name}'s egress, and it is gated, so \
+                 every destination is denied (gated-default)"
+            ),
+            hint: Some("add the hosts it needs to `network.egress.allow`, apply a policy object, or set `network.egress = { policy = \"allow\" }` to allow everything".into()),
+        });
+    } else if effective.is_empty() {
         steps.push(DoctorStep {
             layer: "policy",
             status: "info",
@@ -1076,6 +1092,17 @@ pub(crate) fn diagnose_network(
         hint: (!enforced && effective.egress.is_some())
             .then(|| "for an unbypassable boundary set `network.mode = \"gated\"` (Linux, container/exec) or impose it with a `require` policy".to_string()),
     });
+
+    // A sandbox whose default network would be gated, running on a dev
+    // backend: its egress is not judged at all.
+    for note in &reply.notes {
+        steps.push(DoctorStep {
+            layer: "mode",
+            status: "warn",
+            detail: note.clone(),
+            hint: Some("run it on a node with Firecracker or cloud-hypervisor, or set `network.mode = \"gated\"` so it refuses to start unenforced".into()),
+        });
+    }
 
     // 3. Datapath readiness, per running allocation.
     if statuses.is_empty() {

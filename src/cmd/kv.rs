@@ -62,6 +62,12 @@ pub fn config() -> Command {
                 .help("Prefix to filter keys")
                 .required(false),
         )
+        .arg(
+            Arg::new("values")
+                .long("values")
+                .action(ArgAction::SetTrue)
+                .help("Include each entry's value in --json output (decrypts every listed entry)"),
+        )
         .arg(json_flag());
 
     let delete_cmd = Command::new("delete")
@@ -163,8 +169,9 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 .get_one::<String>("prefix")
                 .map(String::as_str)
                 .unwrap_or("");
+            let include_values = arg_matches.get_flag("values");
             let format = OutputFormat::from_matches(arg_matches);
-            list_kv(prefix, format).await
+            list_kv(prefix, include_values, format).await
         }
         Some(("delete", arg_matches)) => {
             let key = arg_matches
@@ -264,18 +271,26 @@ async fn get_kv(key: &str, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = GetKvRequest {
         key: key.to_string(),
+        metadata_only: false,
     };
     let response = output::resolve(
         format,
         "failed to get kv entry",
         client.get_kv(tonic::Request::new(request)).await,
     )?;
-    match response.into_inner().entry {
+    let reply = response.into_inner();
+    match reply.entry {
         Some(entry) => print_entry(&entry, format)?,
         // A missing key is a failure, in both formats: `{ok:false}` with
         // `NotFound` and a non-zero exit, so `legion kv get k || legion kv put
         // k v` does what it reads like (docs/kv-store.md).
         None => return Err(output::fail_local(format, missing_key_error(key))),
+    }
+    if !format.is_json() && !reply.references.is_empty() {
+        println!("used by:");
+        for reference in &reply.references {
+            println!("  {} {}", reference.job_id, reference.json_pointer);
+        }
     }
 
     Ok(())
@@ -291,10 +306,11 @@ fn missing_key_error(key: &str) -> CliError {
 }
 
 #[instrument(err, skip_all)]
-async fn list_kv(prefix: &str, format: OutputFormat) -> R<()> {
+async fn list_kv(prefix: &str, include_values: bool, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = ListKvRequest {
         prefix: prefix.to_string(),
+        include_values,
     };
     let response = output::resolve(
         format,

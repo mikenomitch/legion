@@ -808,30 +808,33 @@
                 # An ${artifact.<name>} reference works here too.
                 kernel = "/var/lib/legion/kernels/vmlinux",
                 kernel_args = "quiet",
-                network = {
-                    # "none" (default, loopback only) or "tap". Not used
-                    # when the task's own `network.mode` below is "gated".
-                    mode = "none",
-                    # With mode = "tap": a pre-created host TAP device (one
-                    # guest per node, so refused on a keyed task, with
-                    # count above one, or with a createFirst rollout), or
-                    # "auto" for a TAP Legion creates per instance (`lgf` +
-                    # a hash of the instance id), attaches to `bridge`,
-                    # recreates on resume, and deletes with the allocation:
-                    # tap = "auto",
-                    # The host bridge an auto TAP joins. Required with
-                    # tap = "auto", refused with a fixed tap.
-                    # bridge = "br0",
-                    # Guest MAC. An auto TAP defaults to one derived from
-                    # the allocation id.
-                    # mac = "02:00:00:00:00:01",
-                },
+                # The guest's own network, for a sandbox that is not gated.
+                # This task is gated (the task-level `network` below), and
+                # submit refuses a gated sandbox with a `config.network`: a
+                # gated guest has no NIC. So it is shown commented out.
+                # network = {
+                #     # "none" (default, loopback only) or "tap".
+                #     mode = "tap",
+                #     # The host bridge the guest's NIC joins (required with
+                #     # mode = "tap"). Legion creates a TAP per instance
+                #     # (`lgf` + a hash of the instance id) on it, recreates
+                #     # it on resume, and deletes it with the allocation. The
+                #     # guest's address is leased from the bridge's pool in
+                #     # the worker config (sandbox.bridges.br0), applied at
+                #     # boot and re-leased on every restore and fork, and the
+                #     # task only places on nodes that declare br0. The MAC is
+                #     # derived from the allocation id.
+                #     bridge = "br0",
+                # },
             },
             # The task-level network block applies to sandboxes too: "gated"
             # boots the guest with no NIC and a vsock to the node datapath,
             # where the egress policy decides (docs/network-handlers.md,
-            # "Sandboxes"). "auto" is "host" until the vsock path is
-            # exercised on a real VMM in CI.
+            # "Sandboxes"). A gated task that nothing allows denies every
+            # destination (`gated-default`), so list what it needs.
+            # Ingress ports are refused on a gated sandbox (no NIC to reach).
+            # "auto" is "host" until the vsock path is exercised on a real
+            # VMM.
             network = {
                 mode = "gated",
                 egress = { allow = ["pypi.org", "files.pythonhosted.org"] },
@@ -840,14 +843,15 @@
             # `ttl` deletes a snapshot this long after it was taken (unset:
             # never), `keep` caps snapshots per instance (default 5, the
             # oldest goes first). `memory` (default true) launches a sandbox
-            # on a real VMM ready for memory snapshots. This task is gated,
-            # and memory snapshots do not support gated networking yet, so
-            # it takes disk snapshots only; `memory = true` here would fail
-            # job validation with that reason.
+            # on a real VMM ready for memory snapshots. A gated sandbox takes
+            # them too: every restore moves its vsock onto the restoring
+            # allocation's own datapath socket (Firecracker 1.16.1 or later),
+            # and a memory snapshot closes the guest's open connections.
+            # `memory = false` takes disk snapshots only.
             snapshots = {
                 ttl = "7d",
                 keep = 5,
-                memory = false,
+                memory = true,
             },
             resources = {
                 cpu = 1000,

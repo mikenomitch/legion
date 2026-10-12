@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# `legion`, aimed at the spot-check rig's current leader with the management
+# token, whatever LEGION_ADDR your shell (or mise) has set.
+#
+#   tests/spot-check/infra/lg job list
+set -euo pipefail
+source "$(dirname "$0")/env.sh"
+eval "$("$SC_DIR/infra/cli-env.sh")"
+exec legion "$@"

@@ -146,6 +146,9 @@ The generated `/legion/init` is plain POSIX shell, so it runs on whatever
 - mounts each volume disk at its declared `path`, with the filesystem the
   driver reported (read-only when claimed read-only). A volume with no `path`
   is attached but left unmounted for raw device access.
+- starts the [guest agent](#the-guest-agent) when the guest needs it: the
+  gated datapath's relay, and the resume handler for a guest launched for
+  memory checkpoints or with identity token files
 - sources `/legion/env` and `cd`s to the working directory
 - runs the command and echoes `legion: sandbox command exited with status N`
 - powers the machine off so the VMM exits
@@ -154,10 +157,51 @@ The kernel cmdline carries `panic=1` as a backstop, so even a wedged guest
 terminates instead of hanging the allocation.
 
 **Rebuilds are fingerprinted.** Legion rebuilds the root disk only when the
-image, command, env, working dir, volume mounts, or artifacts change. Without
-this, a crash-looping sandbox would re-extract and re-format a
-multi-hundred-MiB image on every restart. The fingerprint hashes env values,
-since they can be secrets. The values are never logged or stored.
+image, command, env, working dir, volume mounts, artifacts, or guest agent
+binary change. Without this, a crash-looping sandbox would re-extract and
+re-format a multi-hundred-MiB image on every restart. The fingerprint hashes
+env values, since they can be secrets. The values are never logged or stored.
+
+### The guest agent
+
+Some guests run a small Legion program next to the workload, copied into the
+root disk as `/legion/legion`:
+
+- **The gated datapath's relay** (`guest-agent`), on a gated sandbox. It
+  relays the guest's loopback proxy and resolver ports to the node over vsock
+  ([network-handlers.md](network-handlers.md#sandboxes)).
+- **The resume handler**, on a sandbox launched for memory checkpoints or
+  with identity token files. It refreshes the guest's identity, RNG, clock,
+  token files, and a TAP guest's address after a restore and runs `onResume`
+  ([Identity after a restore](#identity-after-a-restore)). On a gated
+  sandbox the relay runs it in the same process, so a restore also closes
+  the relays the capture left dead.
+
+The program is `legion-guest`, a statically linked build of just these two
+jobs (under 1 MB), which runs on any image with `/bin/sh`: glibc, musl
+(`alpine:latest`), and busybox alike. Ship it with the worker:
+
+| Where the worker looks | |
+| --- | --- |
+| `LEGION_GUEST_BINARY` in the worker's environment | Used when set. A path that does not exist fails the sandbox's start with that reason |
+| `legion-guest` in the same directory as the worker binary | The normal install |
+| neither | The worker copies **itself**, and warns at start: `No static legion-guest binary beside the worker` |
+
+The fallback works only where the image's libc can run the worker binary (a
+glibc image close enough to the worker's build host). On a musl image it
+cannot, so init prints `legion: guest agent missing ...` or the binary fails
+to start. A gated guest then has no network at all (fail-closed), and a
+restored guest keeps its old identity. Installing `legion-guest` fixes both;
+the root disk rebuilds on the next start, because the binary is part of its
+fingerprint.
+
+Build it for each architecture the workers run:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build -p legion-guest --profile dist --target x86_64-unknown-linux-musl
+# target/x86_64-unknown-linux-musl/dist/legion-guest
+```
 
 ## Stateful Sandboxes
 
@@ -249,7 +293,7 @@ Optional:
 | `hypervisor` | `auto` | `auto`, `cloud-hypervisor`, `firecracker`, `dev`. |
 | `kernel` | `LEGION_SANDBOX_KERNEL`, then `/var/lib/legion/kernels/vmlinux` | Uncompressed guest kernel. `${artifact.<name>}` works here. |
 | `kernel_args` | none | Appended to Legion's kernel cmdline. |
-| `network` | `{ mode: 'none' }` | `{ mode: 'tap', tap: 'tap0', mac: … }` attaches the guest to a **pre-created** host TAP device. `{ mode: 'tap', tap: 'auto', bridge: 'br0' }` has Legion create a TAP per instance on that bridge. See [Networking](#networking). |
+| `network` | `{ mode: 'none' }` | `{ mode: 'tap', bridge: 'br0' }` gives the guest a NIC on a TAP device Legion creates per instance on that host bridge, with an address leased from the bridge's pool. See [Networking](#networking). |
 
 Persistent state is not part of the runtime config. Declare
 `stateful.storage` (or `volumes[]`) on the task with `mode = "block"`. See
@@ -330,25 +374,30 @@ uses, so a second sandbox of one image on a node downloads nothing.
 
 ## Networking
 
-Guest networking needs a host TAP device. The default is `mode = "none"`,
-which gives the guest loopback only. That suits compute sandboxes. With
-`mode = "tap"` there are two ways to get the device:
+A sandbox's network is one of three shapes:
 
-| `config.network` | Device | Instances per node | Memory checkpoints |
-| --- | --- | --- | --- |
-| `{ mode = "tap", tap = "tap0" }` | Pre-created by the operator (or a network plugin). Legion attaches it | One, since every instance names the same device. Refused on a keyed task, with `count` above one, or with a `createFirst` rollout | Yes |
-| `{ mode = "tap", tap = "auto", bridge = "br0" }` | Created by Legion per instance and attached to `bridge` | Any number | Yes |
+| Shape | How | What the guest gets |
+| --- | --- | --- |
+| Loopback only | The default (`config.network` unset, or `{ mode = "none" }`) | No NIC. Suits compute sandboxes |
+| Gated | The task's `network.mode = "gated"` (see [Gated networking](#gated-networking) below) | No NIC. A vsock to the node datapath, where policy, handlers, and identity judge every connection |
+| TAP | `config.network = { mode = "tap", bridge = "br0" }` | A NIC on a host bridge, with an address Legion leases it |
+
+Gated is the shape for untrusted code: the guest has no NIC, and every
+connection is judged by policy. TAP is the escape hatch for raw networking:
+L2 adjacency on the bridge, protocols the egress proxy cannot carry (UDP,
+ICMP, SSH without a proxy command), and bulk throughput. Egress from a TAP
+guest is whatever the bridge and its NAT allow, so enforce it there.
 
 ```nickel
 config = {
   image = "ghcr.io/acme/agent-base:2026-10",
   command = ["/usr/local/bin/harness"],
-  network = { mode = "tap", tap = "auto", bridge = "br0" },
+  network = { mode = "tap", bridge = "br0" },
 },
 ```
 
-**Auto TAPs.** With `tap = "auto"`, the node creates a persistent TAP for
-each instance, enslaves it to `bridge`, brings it up, and deletes it when the
+**TAP devices.** For a TAP sandbox the node creates a persistent TAP for each
+instance, enslaves it to `bridge`, brings it up, and deletes it when the
 allocation is destroyed. The device is named `lgf` plus 12 hex characters of
 the instance id's SHA-256 (the allocation id for a task without instances),
 which fits the kernel's 15-character limit. It is the same name a memory fork
@@ -358,72 +407,154 @@ of that instance gets, so one instance always asks for one device:
   the same bridge (see [Networking](suspend-and-resume.md#networking)).
 - A fork gets its own `lgf` device on the bridge (see
   [Networking for forks](suspend-and-resume.md#networking-for-forks)).
-- The guest's MAC defaults to a locally administered address derived from
-  the allocation id (`02:4c:...`), so guests on one bridge never collide. Set
-  `mac` to pin one.
+- The guest's MAC is a locally administered address derived from the
+  allocation id (`02:4c:...`), so guests on one bridge never collide.
 
-The bridge, its addressing, and DHCP on it are yours. Legion only attaches
-TAPs to it. Have the guest image use DHCP, since every instance boots from
-the same image. Creating TAPs needs `CAP_NET_ADMIN` and the `ip` tool on the
+Any number of TAP sandboxes fit on a node, and each one can take memory
+checkpoints. Creating TAPs needs `CAP_NET_ADMIN` and the `ip` tool on the
 worker. A device of that name that already exists and is free (left by a
 worker crash) is reused and re-attached to `bridge`. One that another process
-holds fails the boot by name: `sandbox needs TAP device lgf... (network.tap =
-"auto"): it exists and another process holds it`.
+holds fails the boot by name: `sandbox needs TAP device lgf...: it exists and
+another process holds it, so this instance already runs a guest on this
+node`.
 
-`bridge` is required with `tap = "auto"` and refused with a fixed `tap`,
-because a fixed device is wired by whoever created it.
-
-**Fixed TAPs.** A device serves one guest, so a task with a fixed `tap` runs
-one guest per node. Submit, `job validate`, and `job plan` refuse every spec
-that could put a second guest on one node, and so does `job scale` above one:
-
-- a keyed task (`stateful.mode = "keyed"`), since any instance, fork, or
-  snapshot seed can land next to another,
-- a `count` above one, slot mode or stateless, since two allocations can
-  share a node,
-- a rollout with `replacement = "createFirst"`, which starts the replacement
-  before the old allocation stops, on its node when it fits.
+`config.network.tap` and `config.network.mac` no longer exist. Submit names
+the replacement:
 
 ```text
-Error: jobspec failed validation: task "workspace" attaches its sandbox to the fixed TAP
-device "tap0" (config.network.tap), which serves one guest per node, but it is a keyed
-task (stateful.mode = "keyed"), so a second instance, a fork that boots cold, or a disk
-snapshot seed on the same node fails to boot
-Hint: set config.network = { mode = "tap", tap = "auto", bridge = "<the bridge tap0 is
-on>" }, so Legion creates a TAP per instance
+Error: jobspec failed validation: task box config invalid: config.network.tap is gone:
+Legion creates a TAP per instance on network.bridge and leases the guest an address from
+the bridge's pool
+Hint: Set bridge = "<the bridge tap0 was on>", and declare sandbox.bridges.<bridge> in the
+worker config (docs/task-runtime-sandbox.md, "Addressing")
 ```
 
-A fixed TAP fits a single long-lived guest, such as one slot instance. A job
-stored before this rule still runs, and a boot on a TAP another VMM holds
-fails with `sandbox needs TAP device tap0 ..., but another process holds it`.
+### Addressing
+
+Every TAP guest gets its IPv4 address from a pool the worker config declares
+for its bridge. Legion applies it at boot and leases a fresh one on every
+restore and fork, so the address an image baked in, an address the captured
+guest held, and the origin's address in a fork are all replaced. No image
+needs network configuration of its own.
+
+```nickel
+# worker config
+sandbox = {
+  bridges = {
+    br0 = {
+      subnet = "10.88.0.0/16",   # the bridge's network: the guest's netmask
+      gateway = "10.88.0.1",     # the guest's default route
+      range = "10.88.128.0/17",  # what Legion leases (default: the whole subnet)
+      dns = ["10.88.0.1"],       # the guest's resolv.conf (default: the gateway)
+    },
+  },
+},
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `subnet` | required | The bridge's IPv4 network, `a.b.c.d/n` (`/30` or wider). The guest's netmask comes from it |
+| `gateway` | none | The guest's default route. Must be inside `subnet`. Never leased |
+| `range` | `subnet` | The CIDR Legion leases from. Must be inside `subnet`. The subnet's network and broadcast addresses, the gateway, and the resolvers are never leased |
+| `dns` | the gateway | Resolvers written to the guest's `/etc/resolv.conf` |
+
+The manager checks every worker type's pools when it loads the config, so a
+malformed CIDR, a range outside its subnet, or a gateway outside its subnet
+fails there by name (`sandbox.bridges.br0.range 10.99.0.0/24 is outside
+subnet 10.88.0.0/16`).
+
+- **At boot** the kernel command line carries the lease as kernel IP
+  autoconfiguration, ahead of the task's own `kernel_args`:
+  `ip=10.88.128.7::10.88.0.1:255.255.0.0:legion-sbx-42:eth0:off`. The guest
+  kernel needs `CONFIG_IP_PNP=y` (Firecracker's and cloud-hypervisor's
+  reference guest kernels have it). The root disk's `/etc/resolv.conf` is
+  written from `dns`, replacing the image's file (or symlink).
+- **After a restore or fork** the identity disk carries the new lease, and
+  the guest's resume handler flushes `eth0`'s addresses, applies the new one
+  and its default route through netlink, and rewrites `/etc/resolv.conf`.
+  The image needs no `ip` tool. This needs the resume handler, which every
+  sandbox launched for memory checkpoints runs.
+- **The lease** is a file in the allocation's scratch dir (`guest-addr.json`).
+  The set of leases on a node is the set of those files, so a worker restart
+  rebuilds it from disk, a restarted allocation keeps its address, and the
+  lease is released when the allocation is destroyed. A resume on the same
+  node asks for the address its checkpoint recorded first, and gets it unless
+  another guest holds it. A fork never asks for its origin's.
+- **The address is visible**: `LEGION_GUEST_ADDR` in the guest's env (and in
+  `/legion/resume.env` after a restore), and an `address:` line in `legion
+  instance get` (`InstanceInfo.guest_address` and `guest_bridge` in JSON):
+
+  ```text
+  address: 10.88.128.7 (br0)
+  ```
+
+- **Placement.** A worker advertises the bridges it declares as the node
+  attribute `sandbox.bridges` (`["br0"]`), and a TAP sandbox gets an implicit
+  constraint at submit, `{ key = "sandbox.bridges", operator = "contains",
+  value = "br0" }`, which `job get` shows. A TAP sandbox never places on a
+  node that cannot address its guest. With no such node, placement fails
+  like any unsatisfiable constraint.
+- **Exhaustion fails the start by name**: `bridge br0's sandbox range
+  10.88.128.0/17 is full (32766 addresses leased on node w-03)`. So does a
+  node that runs the task without a pool for its bridge (`sandbox needs bridge
+  br0's address pool, and this worker's config declares no
+  sandbox.bridges.br0`), which only a node reporting stale attributes reaches.
+
+Pools are node-local. When `br0` on each node is its own L2 segment behind
+host NAT, the common setup, every node can use the same range. When one L2
+segment spans nodes, give each node a disjoint `range`. When the bridge also
+runs a DHCP server for other hosts, keep its pool outside `range`. The bridge
+itself, its gateway address, and any NAT behind it are the operator's: Legion
+only attaches TAPs to it and leases addresses on it.
 
 `LEGION_PORT_*` and `LEGION_ADDR_*` are still exported into the guest, but
 nothing maps host ports into the VM yet.
 
-**Idle detection.** A TAP-wired guest's traffic never crosses the node
+### Idle detection and the boot gate
+
+A TAP-wired guest's traffic never crosses the node
 datapath, so the idle policy's `network` signal reads the TAP's counters
 instead: bytes the guest sends (`/sys/class/net/<tap>/statistics/rx_bytes`)
 count as activity. See
 [what each signal sees on a sandbox](suspend-and-resume.md#what-each-signal-sees-on-a-sandbox).
 
-**Gated networking.** Set the task's `network.mode = "gated"` (the block next
+A TAP guest's single, operator-owned interface also makes `sandbox` the only
+runtime whose [edge boot](edge-boot.md) `boot` gate is a true network
+boundary. A guest started before its placement is durable boots with the TAP
+device attached but administratively down. Firecracker cannot hotplug a NIC,
+so the gate has to be on the link instead of on the attachment. Only
+ratification brings the link up. A loopback-only guest has nothing to gate,
+which is stronger still, and a gated guest's gate is its datapath listeners.
+Legion changes link state only and installs no per-interface filter. If you
+want extra isolation, add one yourself.
+
+### Gated networking
+
+Set the task's `network.mode = "gated"` (the block next
 to `service` and `connect`, not `config.network`). The guest then boots with
 no NIC at all. Its only way out is a vsock to the node datapath, where policy,
 handlers, and identity judge every connection. The worker binds the host end
-before boot. The generated init starts `legion guest-agent` (the Legion binary,
-copied into the rootfs) to relay the guest's loopback proxy and resolver ports
-over the vsock. See [network-handlers.md](network-handlers.md#sandboxes) for
+before boot. The generated init starts the guest agent (`/legion/legion
+guest-agent`, see [The guest agent](#the-guest-agent)) to relay the guest's
+loopback proxy and resolver ports over the vsock. See [network-handlers.md](network-handlers.md#sandboxes) for
 the mechanics, what is enforced, and current status. It is unit-tested over
 Unix sockets but not yet boot-tested on a VMM in CI.
 
-This single, operator-owned interface also makes `sandbox` the only runtime
-whose [edge boot](edge-boot.md) `boot` gate is a true network boundary. A
-guest started before its placement is durable boots with the TAP device
-attached but administratively down. Firecracker cannot hotplug a NIC, so the
-gate has to be on the link instead of on the attachment. Only ratification
-brings the link up. With the default `mode = "none"` there is nothing to gate,
-which is stronger still. Legion changes link state only and installs no
-per-interface filter. If you want extra isolation, add one yourself.
+A gated guest that no policy covers denies every destination
+(`gated-default`, see
+[Default deny](network-handlers.md#default-deny)), so open what the guest
+needs in `network.egress.allow`. Every gated sandbox gets a resolver, and the
+guest's proxy variables come in both cases plus `NODE_USE_ENV_PROXY=1`.
+Submit refuses a gated sandbox that also sets `config.network`, and one that
+declares `network.ports` (ingress into a gated guest is not supported yet).
+
+A gated sandbox takes memory checkpoints like any other: suspend, resume,
+snapshots, forks, and publish. Every restore moves the guest's vsock onto the
+restoring allocation's own socket, so the restored guest is judged by the new
+allocation's identity and current policy, and forks never share a door. On
+Firecracker this needs 1.16.1 or later. A memory checkpoint closes the
+guest's open connections. See
+[suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
 
 ## Artifacts Support
 
@@ -587,8 +718,10 @@ started `legion guest-resume` at first boot, which polls the identity disk
 copy). When the disk names a new allocation, the handler reseeds the RNG
 from the disk's fresh entropy (`RNDADDENTROPY`), steps the clock to the
 host's time, sets the hostname (and the NIC's MAC when the restore assigns
-one), writes `/legion/identity.json`, `/legion/resume.env`, and one file per
-env-delivered token under `/legion/identity/`, and finally runs
+one), re-addresses a TAP guest's `eth0` with its new lease over netlink
+([Addressing](#addressing)), writes `/legion/identity.json`,
+`/legion/resume.env` (with `LEGION_GUEST_ADDR` on a TAP guest), and one file
+per env-delivered token under `/legion/identity/`, and finally runs
 `suspend.onResume`. Each step is logged to the console, and a failed step
 does not stop the others. VMGenID, where the VMM exposes it, reseeds the
 kernel RNG on its own as well. See [suspend and
@@ -665,21 +798,32 @@ memory restore, since the device rides the snapshot.
   script. Scratch and distroless images do not work yet.
 - The guest's exit status is reported on the console, not as the VMM's exit
   code. Restart policies see the VMM exit, and health checks work as usual.
-- **Memory checkpoints of gated sandboxes are refused.** The guest's vsock
-  socket path is part of its saved state. A task that declares
-  `network.mode = "gated"` and a `snapshots` block without `memory = false`,
-  or a `suspend` block without `checkpoint = "disk"`, fails job validation
-  with that reason and a hint. When gating comes from a
-  stored policy, the sandbox launches without checkpoint support, and
-  `legion snapshot create --memory` fails with the same reason.
+- **TAP guests are IPv4 only, and need `CONFIG_IP_PNP=y`** in the guest
+  kernel for their boot address. A kernel without it ignores the `ip=`
+  argument and the guest boots with an unconfigured `eth0` (the console
+  shows no `IP-Config` line). A restored guest is re-addressed by the resume
+  handler either way.
+- **Memory checkpoints of a gated sandbox need Firecracker 1.16.1 or later**
+  (or cloud-hypervisor). On an older Firecracker, a memory suspend, snapshot,
+  or fork is refused before capture with the node's version and the fix.
+- **A memory checkpoint closes a gated guest's open connections.** On
+  Firecracker that includes a running origin's, for a live snapshot or a
+  fork. Retry interrupted calls. See
+  [suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
+- **A gated sandbox's socket path must fit a Unix socket.** The datapath
+  listens on `<worker state>/allocs/<id>/.sandbox/vsock.sock_1080`, and a
+  path over 107 bytes fails the start or restore with `gated sandbox socket
+  path ... is N bytes, over the 107-byte Unix socket limit: shorten the
+  worker's state path`.
 - **Running processes keep their old environment after a restore.** The
   resume handler refreshes the hostname, RNG, clock, and the identity files,
   but a process's env is fixed at exec. Read the new token from
   `/legion/identity/<ENV>` or `/legion/resume.env`, or restart the process
   from `suspend.onResume`.
-- **The resume handler is the worker's binary.** A guest whose libc cannot
-  run it (a musl image with a glibc worker build, for example) restores
-  without refreshing its identity, and init says so on the console.
+- **A worker without `legion-guest` copies itself into the guest.** That
+  binary needs the image's glibc, so on a musl image a gated guest has no
+  network and a restore keeps its old identity. See
+  [The guest agent](#the-guest-agent).
 - **A TAP device is restored by name.** Both VMMs reopen the TAP device
   name recorded in the saved state. Before a restore the worker checks that
   the task still names the same device, uses it when it exists and is free,

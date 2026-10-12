@@ -598,6 +598,17 @@ pub fn catalog() -> Vec<Capability> {
             mutates: false,
             read_only_safe: true,
         },
+        // --- Scheduler diagnostics ---
+        Capability {
+            name: "scheduler.concurrency",
+            cli: "legion scheduler concurrency",
+            grpc: Some("Manager/GetSchedulerConcurrency"),
+            summary: "Report how many evals the manager will plan at once and why: the current \
+                 limit against evalThreads, the plan-conflict and fallback rates, goodput, and \
+                 whether conflicts are concurrency-driven (wait) or capacity-driven (add nodes).",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- State store (the agent's introspection workhorse) ---
         Capability {
             name: "state.query",
@@ -892,7 +903,9 @@ pub fn catalog() -> Vec<Capability> {
             grpc: None,
             summary: "Internal: the gated sandbox guest agent, started by the generated guest \
                  init inside a microVM to relay the guest's loopback proxy and DNS ports to the \
-                 node datapath over vsock. Not for operators or agents to run.",
+                 node datapath over vsock. On a sandbox launched for memory checkpoints it also \
+                 runs the resume watch and closes its relays on a restore. Not for operators or \
+                 agents to run.",
             mutates: false,
             read_only_safe: false,
         },

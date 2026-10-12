@@ -2,7 +2,7 @@
 
 Fixes every finding from the 2026-10-11 pre-launch spot check: three raft managers with ACLs on and two spot workers on AWS, plus a local macOS cluster. Single-node demos mostly worked there; the multi-node story did not. This PR fixes the multi-node story.
 
-- **The report:** `internal_docs/spot-check-2026-10-11-findings.md`.
+- **The report:** `internal_docs/launch-spot-check-findings.md`.
 - **The plan:** `internal_docs/plans/launch-spot-check-fixes-plan.md`. §8 gives the root cause each fix found, which in several cases differs from the report's reading, and the outcome for each finding. §8.7 lists what was deferred.
 - **Judgement calls:** `internal_docs/calls/launch-spot-check-fixes-plan_calls.md` (52 entries, ranked). The worker-plane calls are in `worker-plane-auth-plan_calls.md`, entries 10, 11, 15 and 20–25.
 - **TODO.md:** shipped work is checked off under "Pre-launch spot check (2026-10-11)". Deferred work is open under "Follow-ups from the 2026-10-11 spot-check fixes".

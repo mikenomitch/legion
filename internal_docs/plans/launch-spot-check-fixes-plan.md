@@ -3,7 +3,7 @@
 > **Judgement calls:** [launch-spot-check-fixes-plan_calls.md](../calls/launch-spot-check-fixes-plan_calls.md)
 
 **Status: IN EXECUTION.** Every finding of the 2026-10-11 pre-launch spot
-check ([spot-check-2026-10-11-findings.md](../spot-check-2026-10-11-findings.md))
+check ([launch-spot-check-findings.md](../launch-spot-check-findings.md))
 is fixed in [PR #17](https://github.com/mikenomitch/legion/pull/17) (open).
 The per-finding outcome is in [§8](#8-outcome-per-finding); what was
 deliberately deferred is in [§8.7](#87-deliberately-deferred), and each of

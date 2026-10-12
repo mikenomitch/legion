@@ -25,7 +25,7 @@ container, with CI's environment (`CARGO_PROFILE_DEV_DEBUG=0`,
 
 - **Umbrella plan:** `internal_docs/plans/launch-spot-check-fixes-plan.md`,
   with §8 (per-finding outcome) and §8.7 (deferred).
-- **Findings record:** `internal_docs/spot-check-2026-10-11-findings.md`.
+- **Findings record:** `internal_docs/launch-spot-check-findings.md`.
 - **Merged calls doc:** `internal_docs/calls/launch-spot-check-fixes-plan_calls.md`
   (52 entries).
 - **Registrations:** both are registered in `internal_docs/README.md`.

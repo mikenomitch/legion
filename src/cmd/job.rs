@@ -174,7 +174,7 @@ pub fn config() -> Command {
             Arg::new("status")
                 .long("status")
                 .value_name("STATUS")
-                .help("Only jobs with this exact status (e.g. running, stopped, failed)"),
+                .help("Only jobs with this exact status: running, pending, failed, scheduled, complete, suspended, idle, or stopped"),
         )
         .arg(json_flag());
 
@@ -948,6 +948,7 @@ async fn fetch_kv_entry(
 ) -> R<KvEntry> {
     let request = tonic::Request::new(GetKvRequest {
         key: key.to_string(),
+        metadata_only: false,
     });
     let response = client
         .get_kv(request)

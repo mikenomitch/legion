@@ -23,7 +23,9 @@ mod oci_bundle;
 mod oci_image;
 pub mod resource_enforcement;
 mod sandbox;
+pub(crate) mod sandbox_addr;
 mod sandbox_checkpoint;
+pub(crate) use microvm::warn_if_no_static_guest_binary;
 pub use sandbox::{sandbox_usage_source, vsock_socket_base_for, SandboxUsageSource};
 pub use sandbox_checkpoint::{
     firecracker_needs_api_socket, sandbox_checkpoint_support, sandbox_vmm_attrs, IDENTITY_DRIVE_ID,
@@ -1127,16 +1129,11 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                 .map_err(|err| anyhow!("task {}: {err}", task.name))?;
         }
         crate::structs::suspend::validate_suspend(task).map_err(|err| anyhow!(err))?;
-        // One predicate decides "asks for memory checkpoints", so submit-time
-        // refusals and the worker's launch decision can never disagree.
-        crate::structs::snapshot::validate_memory_checkpoint_network(task)
-            .map_err(|err| anyhow!(err))?;
-        let create_first = config
-            .rollout_config_for_group(&task.group)
-            .and_then(|rollout| rollout.replacement)
-            == Some(crate::structs::RolloutReplacement::CreateFirst);
-        crate::structs::fork::validate_fixed_tap(task, task.count.num, create_first)
-            .map_err(|err| anyhow!(err))?;
+        crate::structs::network::validate_gated_sandbox(
+            task,
+            crate::structs::network::sandbox_gated_by_default(),
+        )
+        .map_err(|err| anyhow!(err))?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.runtime, false)?;
             let plugin = registry
@@ -2251,12 +2248,15 @@ mod tests {
         assert!(err.to_string().contains("Sidecar task"));
     }
 
+    /// Gated plan Phase 4: `config.network.tap` is gone, and submit names
+    /// the replacement. A TAP sandbox on a bridge, keyed and creating first,
+    /// is fine: every instance gets its own device and address.
     #[test]
-    fn a_fixed_tap_sandbox_is_refused_when_its_rollout_creates_first() -> R<()> {
-        let config = |replacement| JobConfig {
+    fn a_hand_named_tap_is_refused_at_submit_with_its_replacement() -> R<()> {
+        let config = |network: Value| JobConfig {
             priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
-                replacement: Some(replacement),
+                replacement: Some(crate::structs::RolloutReplacement::CreateFirst),
                 ..Default::default()
             }),
             rollout_by_group: Default::default(),
@@ -2265,17 +2265,23 @@ mod tests {
                 config: json!({
                     "image": "alpine",
                     "command": ["sleep", "60"],
-                    "network": { "mode": "tap", "tap": "tap0" },
+                    "network": network,
                 }),
                 ..TaskConfig::new("box", "sandbox")
             }],
             version: None,
         };
-        let err = validate_job_config(&config(crate::structs::RolloutReplacement::CreateFirst))
-            .expect_err("createFirst would boot two guests on tap0");
-        assert!(format!("{err:#}").contains("createFirst"), "{err:#}");
-        assert!(format!("{err:#}").contains("Hint:"), "{err:#}");
-        validate_job_config(&config(crate::structs::RolloutReplacement::DestroyFirst))?;
+        let err = validate_job_config(&config(json!({ "mode": "tap", "tap": "tap0" })))
+            .expect_err("a hand-named TAP");
+        assert!(
+            format!("{err:#}").contains("config.network.tap is gone"),
+            "{err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("Set bridge = \"<the bridge tap0 was on>\""),
+            "{err:#}"
+        );
+        validate_job_config(&config(json!({ "mode": "tap", "bridge": "br0" })))?;
         Ok(())
     }
 

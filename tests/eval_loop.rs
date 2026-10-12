@@ -418,10 +418,7 @@ fn dag_steps_wait_for_their_dependency_to_succeed() -> R<()> {
     )?;
     drain_evals(&store)?;
     assert!(allocations_of(&store, "pipeline", "validate")?.is_empty());
-    assert_eq!(
-        store.derived_job_statuses(Some("pipeline"))?["pipeline"],
-        "running"
-    );
+    assert_eq!(store.get_job_with_status("pipeline")?.status, "running");
 
     let fetch = allocations_of(&store, "pipeline", "fetch")?[0].id;
     report_exit(&store, fetch, true)?;
@@ -465,10 +462,7 @@ fn a_failed_step_blocks_its_success_dependent() -> R<()> {
         "serve must not start after validate failed"
     );
     // Nothing is live, and a task failed for good.
-    assert_eq!(
-        store.derived_job_statuses(Some("broken"))?["broken"],
-        "failed"
-    );
+    assert_eq!(store.get_job_with_status("broken")?.status, "failed");
     Ok(())
 }
 
@@ -529,10 +523,7 @@ fn a_finished_batch_job_reads_complete_and_reruns_from_the_top() -> R<()> {
         true,
     )?;
     drain_evals(&store)?;
-    assert_eq!(
-        store.derived_job_statuses(Some("nightly"))?["nightly"],
-        "complete"
-    );
+    assert_eq!(store.get_job_with_status("nightly")?.status, "complete");
 
     // The next run (a schedule tick, a forced reschedule) starts at fetch.
     store.enqueue_eval(
@@ -563,16 +554,17 @@ fn a_job_with_nothing_placed_reads_pending() -> R<()> {
     assert!(outcomes
         .iter()
         .any(|(kind, result)| kind == "job_submit" && result.is_err()));
-    assert_eq!(
-        store.derived_job_statuses(Some("too-big"))?["too-big"],
-        "pending"
-    );
+    assert_eq!(store.get_job_with_status("too-big")?.status, "pending");
 
     let mut fits = make_job_config("fits", 1);
     fits.tasks[0].resources = json!({ "memory": 64 });
     submit(&store, &fits)?;
     drain_evals(&store)?;
-    let statuses = store.derived_job_statuses(None)?;
+    let statuses: std::collections::HashMap<String, String> = store
+        .get_jobs_with_status()?
+        .into_iter()
+        .map(|job| (job.name, job.status))
+        .collect();
     assert_eq!(statuses["fits"], "running");
     assert_eq!(statuses["too-big"], "pending");
     Ok(())

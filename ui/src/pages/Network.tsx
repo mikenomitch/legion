@@ -13,7 +13,6 @@ import {
   LoadingRows,
   MonoBadge,
   Note,
-  PageHeader,
   SectionCard,
   StatCard,
   TableShell,
@@ -186,11 +185,7 @@ function NetworkContent() {
 
   return (
     <div>
-      <PageHeader
-        eyebrow="Network"
-        title="Network"
-        subtitle="Who calls whom on the datapath, with request rates, errors and denials; and the selector-scoped egress and ingress policy that decides it. Policies apply to matching tasks within one heartbeat; nothing restarts."
-      />
+      {/* The layout's header names this page (title and copy from the nav). */}
 
       <div class="mb-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <StatCard

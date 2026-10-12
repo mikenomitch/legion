@@ -6,11 +6,13 @@ import {
   formatMs,
   idleSecondsLeft,
   idleSecondsSoFar,
+  instanceHref,
   isPlatformStop,
   pendingOpLabel,
   stopCauseLabel,
   stopCauseTone,
   suspendReasonLabel,
+  volumeIdFromHandle,
 } from '../utils/instances'
 import type { JobTask } from '../utils/jobspec'
 import { bytesToMiB, formatCores, formatIdle, formatMiB, heldLabel, idleSecondsFromUsage, reservationLabel } from '../utils/usage'
@@ -22,10 +24,12 @@ import { Badge, MonoBadge, RelativeTime, StatusBadge, TableShell, cx, tableClass
  * what each one's current allocation reserves and uses, its checkpoint when
  * suspended, its idle countdown, why it last stopped, and its fork lineage.
  *
- * Columns are a list, so the job page adds the actions column without
- * touching the rest. Each cell takes the row as an accessor and reads it
- * inside its own JSX, so a poll that changes one number updates that cell
- * only. Rows are keyed by instance id, not object identity: an armed
+ * Each id links to the instance's own page (pages/details/InstanceDetail),
+ * and the allocation to its page. Columns are a list, so the job page adds
+ * the actions column without touching the rest. Each cell takes the row as
+ * an accessor and reads it inside its own JSX, so a poll that changes one
+ * number updates that cell only. Rows are keyed by instance id, not object
+ * identity: an armed
  * Suspend or Resume confirm survives every poll as long as the instance
  * exists (internal_docs/calls/suspend-resume-ui-plan_calls.md).
  */
@@ -47,23 +51,38 @@ export type InstanceColumn = {
   cell: (row: Accessor<InstanceRow>) => JSX.Element
 }
 
-// A storage handle is `{plugin}/{volume_id}`; plugin names never contain a
-// slash, so the split is unambiguous.
-const volumeIdFromHandle = (handle: string) => handle.slice(handle.indexOf('/') + 1)
+export type InstanceMemory = {
+  /** Measured use of the current allocation, MiB. */
+  used?: number
+  /** Peak use the node measured, MiB. */
+  peak?: number
+  /** The reservation the scheduler packs on (`resources.memory`), MiB. */
+  reserved?: number
+  /** The burst ceiling (`resources.memoryMax`), MiB. */
+  max?: number
+  /** Using more than its reservation: the first to give memory back under node pressure. */
+  bursting: boolean
+}
 
-const reservedMiB = (row: InstanceRow): number | undefined => row.allocation?.reservedMemoryMib ?? row.task?.resources?.memory
-const maxMiB = (row: InstanceRow): number | undefined =>
-  row.allocation ? row.allocation.memoryMaxMib || undefined : row.task?.resources?.memoryMax
-
-const usedMiB = (row: InstanceRow): number | undefined => {
+/**
+ * Memory for an instance row: measured use from the instance's own `usage`
+ * (or the node's view of its allocation), the reservation and ceiling from
+ * the node when it can be read, else from the task's spec.
+ */
+export const instanceMemory = (row: InstanceRow): InstanceMemory => {
   const usage = row.instance.usage ?? row.allocation?.usage
-  return usage ? bytesToMiB(usage.memoryCurrentBytes) : undefined
+  const used = usage ? bytesToMiB(usage.memoryCurrentBytes) : undefined
+  const peak = usage && usage.memoryPeakBytes > 0n ? bytesToMiB(usage.memoryPeakBytes) : undefined
+  const reserved = row.allocation?.reservedMemoryMib ?? row.task?.resources?.memory
+  const max = row.allocation ? row.allocation.memoryMaxMib || undefined : row.task?.resources?.memoryMax
+  return { used, peak, reserved, max, bursting: used !== undefined && reserved !== undefined && used > reserved }
 }
 
 function MemoryCell(props: { row: InstanceRow }) {
-  const used = () => usedMiB(props.row)
-  const reserved = () => reservedMiB(props.row)
-  const bursting = () => used() !== undefined && reserved() !== undefined && used()! > reserved()!
+  const memory = () => instanceMemory(props.row)
+  const used = () => memory().used
+  const reserved = () => memory().reserved
+  const bursting = () => memory().bursting
   return (
     <div class="font-mono text-xs tabular-nums">
       <span
@@ -74,7 +93,7 @@ function MemoryCell(props: { row: InstanceRow }) {
       </span>
       <Show when={props.row.instance.currentAllocId !== undefined && reserved()}>
         <div class="text-2xs text-faint" title="Reservation / burst ceiling (resources.memoryMax), MiB">
-          res/max {reservationLabel(reserved(), maxMiB(props.row))}
+          res/max {reservationLabel(reserved(), memory().max)}
         </div>
       </Show>
     </div>
@@ -252,14 +271,20 @@ export const INSTANCE_COLUMNS: InstanceColumn[] = [
     class: 'font-mono text-xs',
     cell: (row) => (
       <div>
-        <span>{row().instance.instanceId}</span>
+        <A
+          href={instanceHref(row().instance.jobId, row().instance.instanceId)}
+          class="font-medium text-ink underline-offset-2 hover:text-brass-strong hover:underline"
+          title="Open this instance: its allocation, checkpoint, snapshots, and events"
+        >
+          {row().instance.instanceId}
+        </A>
         <Show when={row().instance.forkedFrom}>
           {(origin) => (
             <div class="text-2xs text-faint" title="Created by forking this instance (ForkInstance)">
               fork of{' '}
-              <a href={`#instance-${encodeURIComponent(origin())}`} class="hover:text-brass-strong">
+              <A href={instanceHref(row().instance.jobId, origin())} class="hover:text-brass-strong">
                 {origin()}
-              </a>
+              </A>
             </div>
           )}
         </Show>
@@ -278,7 +303,17 @@ export const INSTANCE_COLUMNS: InstanceColumn[] = [
     key: 'allocation',
     header: 'Allocation',
     class: 'font-mono text-xs text-muted',
-    cell: (row) => (row().instance.currentAllocId !== undefined ? `#${String(row().instance.currentAllocId)}` : '-'),
+    cell: (row) => (
+      <Show when={row().instance.currentAllocId !== undefined} fallback="-">
+        <A
+          href={`/allocations/${String(row().instance.currentAllocId)}`}
+          class="hover:text-brass-strong"
+          title="Open the allocation fulfilling this instance"
+        >
+          #{String(row().instance.currentAllocId)}
+        </A>
+      </Show>
+    ),
   },
   {
     key: 'memory',
@@ -341,7 +376,9 @@ export default function InstancesTable(props: { rows: readonly InstanceRow[]; co
   // notifies when that row's object changes.
   const ids = createMemo(() => props.rows.map((row) => row.instance.instanceId))
   return (
-    <TableShell>
+    // `relative` keeps the actions column's sr-only header (absolutely
+    // positioned) inside the scroller; without it the page scrolls sideways.
+    <TableShell class="relative">
       <table class={tableClass}>
         <thead class={theadClass}>
           <tr>
