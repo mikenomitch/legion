@@ -480,8 +480,6 @@ lower node id, and the other node is asked to end its copy:
   reply (`HeartbeatReply.stop_sessions`), until the node stops listing it;
 - by any manager that reads both copies while answering `get`, `stop`, or
   an idempotent create;
-- by the manager that served an idempotent create, which looks again 20
-  seconds later;
 - by every manager's duplicate sweep: once a second, each manager asks its
   peers, in one call, about the idempotency-derived ids newly reported to
   it, and asks the node of each losing copy to end it. This is what

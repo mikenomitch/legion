@@ -7,6 +7,14 @@ because the API lacks it: server-side paging, a count-only reply, and node
 and envelope filters on `ListInstances` (§8). Not verified in a browser
 against a live session cluster yet (§9).
 
+> **Update:** `ListInstances` gained session paging and counts
+> (`session_limit`, `session_page_token`, `session_count`,
+> `sessions_by_node`) and `ListSessionNodes` arrived. The UI now pages
+> sessions and takes counts from the replies, so the Load gate is gone and
+> an Edge nodes card was added; see calls 1 and 2. Node and envelope
+> filters on the RPC are still deferred. `docs/ui-architecture.md` describes
+> what ships.
+
 ## 1. Problem
 
 Session mode (`stateful.mode = "session"`, [docs](../../docs/session-mode.md))

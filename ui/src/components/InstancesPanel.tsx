@@ -30,12 +30,15 @@ import { Badge, Button, CopyButton, FilterChips, Note, RelativeTime, SectionCard
  * links to the instance's own page, which adds Stop, Start, and the
  * instance's events. Instance create and destroy stay in the CLI.
  *
- * Built for a job with a million sessions: counts come from one pass over
- * the listing, filters scan it without copying it, and the table renders at
- * most INSTANCE_PAGE rows at a time (INSTANCE_RENDER_MAX in all). Rows are
- * built only for what is shown. The mode, node, envelope, and task filters
- * live in the URL, so the node and allocation pages can link straight to
- * "this node's sessions".
+ * Built for a job with a million sessions: the owner hands it the job's
+ * rows and one page of sessions (ListInstances `session_limit`), with the
+ * manager's own session totals and per-node counts in `listing.sessions`,
+ * and the card pages through the rest with Prev and Next. Filters scan what
+ * is loaded without copying it, and the table renders at most
+ * INSTANCE_PAGE rows at a time (INSTANCE_RENDER_MAX in all). Rows are built
+ * only for what is shown. The mode, node, envelope, and task filters live in
+ * the URL, so the node and allocation pages can link straight to "this
+ * node's sessions".
  */
 
 // The states worth a filter chip, in the order an operator acts on them.
@@ -56,6 +59,26 @@ export type InstanceListing = {
   paused: boolean
   refreshing: boolean
   onRefresh: () => void
+  /** The session paging and the manager's totals; without it the card counts what it was given. */
+  sessions?: SessionPaging
+}
+
+/** One page of a session listing, and the totals the manager counted. */
+export type SessionPaging = {
+  /** ListInstancesReply.session_count: every running session of the job. */
+  count: number
+  /** ListInstancesReply.sessions_by_node. */
+  byNode: ReadonlyMap<string, number>
+  /** Sessions before this page, in id order. */
+  offset: number
+  /** Sessions on this page. */
+  onPage: number
+  hasPrev: boolean
+  /** The reply carried a `next_session_page_token`. */
+  hasNext: boolean
+  onPrev: () => void
+  onNext: () => void
+  onFirst: () => void
 }
 
 const param = (value: string | string[] | undefined): string | undefined => {
@@ -163,10 +186,10 @@ export default function InstancesPanel(props: {
         )}
       </Show>
 
-      <Show when={counts().sessions > 0 || props.listing?.paused || props.listing?.complete === false}>
+      <Show when={counts().sessions > 0 || (props.listing?.sessions?.count ?? 0) > 0 || props.listing?.paused || props.listing?.complete === false}>
         <SessionSummary
-          sessions={counts().sessions}
-          sessionsByNode={counts().sessionsByNode}
+          sessions={props.listing?.sessions?.count ?? counts().sessions}
+          sessionsByNode={props.listing?.sessions?.byNode ?? counts().sessionsByNode}
           listing={props.listing}
           total={counts().total}
           activeNode={filter().node}
@@ -231,7 +254,13 @@ export default function InstancesPanel(props: {
         when={rows().length > 0}
         fallback={
           <p class="px-4 py-4 text-sm text-muted">
-            {counts().total === 0 ? 'No instances or running sessions yet.' : 'Nothing matches the filter.'}
+            {counts().total === 0
+              ? props.listing?.sessions?.hasPrev
+                ? 'No sessions past this point any more: they ended since the last page.'
+                : 'No instances or running sessions yet.'
+              : props.listing?.sessions && (props.listing.sessions.hasNext || props.listing.sessions.hasPrev)
+                ? 'Nothing on this page of sessions matches the filter. Try the next page.'
+                : 'Nothing matches the filter.'}
           </p>
         }
       >
@@ -242,7 +271,8 @@ export default function InstancesPanel(props: {
         <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-line px-4 py-2.5 text-xs text-muted">
           <span>
             Showing the first {formatCount(rows().length)} of {formatCount(page().matching)}
-            {filtered() ? ' matching' : ''}.
+            {filtered() ? ' matching' : ''}
+            {props.listing?.sessions && (props.listing.sessions.hasNext || props.listing.sessions.hasPrev) ? ' on this page' : ''}.
           </span>
           <Show
             when={limit() < INSTANCE_RENDER_MAX}
@@ -327,6 +357,38 @@ function SessionSummary(props: {
           )}
         </Show>
       </div>
+      <Show when={props.listing?.sessions}>
+        {(paging) => (
+          <Show when={paging().hasNext || paging().hasPrev}>
+            <div class="flex flex-wrap items-center gap-x-2 gap-y-1" role="navigation" aria-label="Session pages">
+              <span>
+                <Show
+                  when={paging().onPage > 0}
+                  fallback={<>No sessions past the first {formatCount(paging().offset)}</>}
+                >
+                  Sessions {formatCount(paging().offset + 1)}–{formatCount(paging().offset + paging().onPage)} of {formatCount(paging().count)}
+                </Show>
+                <span class="text-faint">, in id order</span>
+              </span>
+              <Button size="xs" disabled={!paging().hasPrev} onClick={paging().onFirst}>
+                First
+              </Button>
+              <Button size="xs" disabled={!paging().hasPrev} onClick={paging().onPrev}>
+                Prev
+              </Button>
+              <Button size="xs" disabled={!paging().hasNext} onClick={paging().onNext}>
+                Next
+              </Button>
+            </div>
+          </Show>
+        )}
+      </Show>
+      <Show when={props.activeNode !== undefined && props.listing?.sessions && (props.listing.sessions.hasNext || props.listing.sessions.hasPrev)}>
+        <p class="text-faint">
+          <span class="font-mono">{props.activeNode}</span> runs {formatCount(props.sessionsByNode.get(props.activeNode!) ?? 0)} sessions in all; the
+          node filter narrows the page loaded, so page on to see the rest of them.
+        </p>
+      </Show>
       <Show when={busiest().length > 1}>
         <div class="flex flex-wrap items-center gap-1.5">
           <span class="text-2xs font-semibold uppercase tracking-wide text-faint">Busiest nodes</span>
@@ -352,43 +414,5 @@ function SessionSummary(props: {
         </div>
       </Show>
     </div>
-  )
-}
-
-/**
- * The Instances card before the listing is fetched: the job's envelopes
- * could hold more sessions than a browser should decode in one reply
- * (ListInstances has no paging), so the page waits to be asked.
- */
-export function DeferredInstancesCard(props: { jobName: string; capacity?: number; envelopes: number; onLoad: () => void; loading: boolean }) {
-  return (
-    <SectionCard title="Instances" description="Stable identities for stateful tasks, and the job's running sessions.">
-      <div class="space-y-3 text-sm text-muted">
-        <p>
-          <Show
-            when={props.capacity !== undefined}
-            fallback={
-              <>
-                This job runs sessions, and how many its envelopes can hold is not known here (counting envelopes needs{' '}
-                <code class="font-mono text-xs">node:read</code>, and the spec must size both the envelope and the session).
-              </>
-            }
-          >
-            This job's {formatCount(props.envelopes)} {props.envelopes === 1 ? 'envelope' : 'envelopes'} can hold up to{' '}
-            <span class="font-semibold text-ink">{formatCount(props.capacity!)}</span> sessions.
-          </Show>{' '}
-          The manager lists instances and sessions in a single reply with no paging, so the list is not loaded automatically. Loading it reads every running session once; the page
-          then shows the first {formatCount(INSTANCE_PAGE)} and counts the rest.
-        </p>
-        <div class="flex flex-wrap items-center gap-2">
-          <Button size="sm" icon="boxes" disabled={props.loading} onClick={props.onLoad}>
-            {props.loading ? 'Loading…' : 'Load instances and sessions'}
-          </Button>
-          <span class="text-xs text-faint">or from the CLI:</span>
-          <code class="rounded bg-surface2 px-1 font-mono text-xs">{listCommand(props.jobName)}</code>
-          <CopyButton text={listCommand(props.jobName)} label="" size="xs" />
-        </div>
-      </div>
-    </SectionCard>
   )
 }

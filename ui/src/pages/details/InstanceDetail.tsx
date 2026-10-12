@@ -41,7 +41,7 @@ import {
 } from '../../utils/instances'
 import { extractJobSpecData, type JobTask } from '../../utils/jobspec'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
-import { LARGE_LISTING, SESSION_COPY, isSession, isSessionTask, jobInstancesHref } from '../../utils/sessions'
+import { LARGE_LISTING, SESSION_COPY, isSession, jobInstancesHref } from '../../utils/sessions'
 import { mayReadSnapshots, restoreBlocker } from '../../utils/snapshots'
 import { statusTone } from '../../utils/status'
 import { fetchNodeUsage, formatCores, formatIdle, formatMiB, heldLabel, percentOf, reservationLabel } from '../../utils/usage'
@@ -63,7 +63,8 @@ import { fetchNodeUsage, formatCores, formatIdle, formatMiB, heldLabel, percentO
  * its node and envelope come from GetInstance itself, it offers Promote and
  * End, and the cards about allocations, checkpoints, and snapshots say why
  * they are empty. Forks are not looked up for a session (it cannot have
- * any), nor in a job with session tasks, whose listing holds every session.
+ * any); for anything else the listing asks for no sessions
+ * (`session_limit: 0`), since a fork is always a row.
  * Unchanged objects are kept across polls, so an armed confirm or an open
  * fork form survives every refresh.
  */
@@ -164,10 +165,11 @@ function InstanceDetailContent() {
   // Forks of this instance, and the task spec (for the reservation and the
   // suspend plan when the node cannot be read).
   //
-  // Forks come from ListInstances, which has no paging and lists every
-  // running session too. So a session (which has no forks) and a job with
-  // session tasks skip it, and a listing of LARGE_LISTING or more is kept
-  // rather than re-read every few seconds; an action here re-reads it.
+  // Forks come from ListInstances with `session_limit: 0`: forks are rows,
+  // so the job's sessions are never read here, however many it runs. A
+  // session (which has no forks) skips it, and a listing of LARGE_LISTING or
+  // more rows is kept rather than re-read every few seconds; an action here
+  // re-reads it.
   const mergeInstances = stableList<InstanceInfo>((entry) => entry.instanceId, (a, b) => InstanceInfo.equals(a, b))
   const session = createMemo(() => (instance() ? isSession(instance()!) : undefined))
   let forkListing: { job: string; instances: InstanceInfo[] } | undefined
@@ -182,9 +184,9 @@ function InstanceDetailContent() {
           .catch((): JobTask[] => [])
         const forced = forceForks
         forceForks = false
-        if (isSessionInstance || tasks.some(isSessionTask)) return { job, instances: undefined as InstanceInfo[] | undefined, tasks }
+        if (isSessionInstance) return { job, instances: undefined as InstanceInfo[] | undefined, tasks }
         const kept = forkListing?.job === job && forkListing.instances.length >= LARGE_LISTING && !forced ? forkListing : undefined
-        const instances = kept?.instances ?? mergeInstances((await managerClient.listInstances({ jobId: job })).instances)
+        const instances = kept?.instances ?? mergeInstances((await managerClient.listInstances({ jobId: job, sessionLimit: 0 })).instances)
         forkListing = { job, instances }
         return { job, instances: instances as InstanceInfo[] | undefined, tasks }
       },
@@ -765,7 +767,7 @@ function ForkLineage(props: { jobId: string; origin?: string; forks?: readonly I
   const fallback = () => {
     if (props.session) return 'none: a session cannot be forked'
     if (props.loading) return '…'
-    if (props.forks === undefined) return 'not looked up: this job runs sessions, so its listing is too large to scan here'
+    if (props.forks === undefined) return 'not looked up'
     return 'not a fork, no forks'
   }
   return (

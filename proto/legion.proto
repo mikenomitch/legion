@@ -3953,7 +3953,6 @@ message InstanceColdBoot {
   string at = 3;
 }
 
-// Request payload for ListInstances.
 // Request for `Manager.ListSessionNodes`.
 message ListSessionNodesRequest {
   // The job. Required.
@@ -4005,6 +4004,7 @@ message ListSessionNodesReply {
   string as_of = 4;
 }
 
+// Request payload for ListInstances.
 message ListInstancesRequest {
   // Job name whose instances to list.
   string job_id = 1;

@@ -1,27 +1,36 @@
 import { A } from '@solidjs/router'
-import { For, Show, createSignal } from 'solid-js'
+import { Show, createEffect, createSignal, on } from 'solid-js'
+import type { SessionNode } from '../gen/legion_pb'
 import { managerClient } from '../grpcClient'
 import type { ResourceEntry } from '../utils/allocationDetail'
-import { instanceHref } from '../utils/instances'
-import { ENVELOPE_COPY, formatCount, isSession, jobInstancesHref, takeMatching } from '../utils/sessions'
+import { ENVELOPE_COPY, SESSION_NODE_REASONS, countMap, formatCount, formatRoom, jobInstancesHref } from '../utils/sessions'
 import { Badge, Button, Note, RelativeTime, SectionCard, linkClass } from './ui'
 
 /*
  * What an envelope allocation is (docs/session-mode.md): a placeholder that
  * reserves one node's room for a session task's sessions. It runs nothing,
  * so health, ports, logs, and exec do not apply; what matters is how much
- * room it holds and which sessions sit in it.
+ * room it holds and how many sessions sit in it.
  *
- * Its sessions come from ListInstances, which returns every session of the
- * job in one reply with no node or envelope filter. So they are counted
- * only when asked, once, and only the first few are listed here; the job
- * page's Instances card, filtered to this envelope, pages through the rest.
+ * A node holds one envelope per session task, so the envelope's sessions are
+ * its node's sessions of that task: ListSessionNodes says how many, whether
+ * the node takes edge starts, and the room left, without listing a single
+ * session. A manager that refuses it falls back to ListInstances with
+ * `session_limit: 0`, whose per-node totals cover every session task of the
+ * job. Either costs the same at any session count, so the card reads it on
+ * open. The sessions themselves are on the job page's Instances card,
+ * filtered to this node and task.
  */
 
-// Session ids listed on the card after a count.
-const SHOWN = 10
-
-type Count = { matching: number; ids: string[]; total: number; complete: boolean; asOf: string }
+/** What the card shows about the envelope's node. */
+export type EnvelopeCount = {
+  /** Sessions in the envelope. */
+  sessions: number
+  /** The node's ListSessionNodes entry; absent on the ListInstances fallback. */
+  node?: SessionNode
+  complete: boolean
+  asOf: string
+}
 
 export default function EnvelopeCard(props: {
   jobId?: string
@@ -33,26 +42,40 @@ export default function EnvelopeCard(props: {
   perEnvelope?: number
   /** What the allocation reserves (its `resources`). */
   reserved: readonly ResourceEntry[]
+  /** A count to show without asking the manager (the /testing fixtures). */
+  initial?: EnvelopeCount
 }) {
-  const [count, setCount] = createSignal<Count>()
+  const [count, setCount] = createSignal<EnvelopeCount | undefined>(props.initial)
   const [loading, setLoading] = createSignal(false)
   const [error, setError] = createSignal<string>()
 
   const load = async () => {
-    if (!props.jobId) return
+    const jobId = props.jobId
+    const nodeId = props.nodeId
+    if (!jobId || !nodeId) return
     setLoading(true)
     setError(undefined)
     try {
-      const reply = await managerClient.listInstances({ jobId: props.jobId })
-      const id = props.allocationId
-      const { shown, matching } = takeMatching(reply.instances, (instance) => isSession(instance) && instance.envelopeAllocId === id, SHOWN)
-      setCount({ matching, ids: shown.map((instance) => instance.instanceId), total: reply.instances.length, complete: reply.complete, asOf: reply.asOf })
+      try {
+        const reply = await managerClient.listSessionNodes({ jobId, taskName: props.servedTask })
+        const node = reply.nodes.find((entry) => entry.nodeId === nodeId)
+        setCount({ sessions: node?.sessions ?? 0, node, complete: true, asOf: reply.asOf })
+      } catch {
+        const reply = await managerClient.listInstances({ jobId, sessionLimit: 0 })
+        setCount({ sessions: countMap(reply.sessionsByNode).get(nodeId) ?? 0, complete: reply.complete, asOf: reply.asOf })
+      }
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
     } finally {
       setLoading(false)
     }
   }
+  // Read on open, and again if the allocation's job or node arrives late.
+  createEffect(
+    on([() => props.jobId, () => props.nodeId, () => props.servedTask], () => {
+      if (!props.initial) void load()
+    }),
+  )
 
   return (
     <SectionCard
@@ -92,18 +115,48 @@ export default function EnvelopeCard(props: {
           </Show>
           <Show when={count()}>
             {(value) => (
-              <div>
-                <p class="eyebrow">Running in it</p>
-                <p class="mt-0.5 text-ink">
-                  {formatCount(value().matching)}
-                  <Show when={props.perEnvelope}>
-                    <span class="text-faint"> of {formatCount(props.perEnvelope!)}</span>
-                  </Show>
-                  <span class="ml-2 text-xs text-faint">
-                    read <RelativeTime value={value().asOf || undefined} />
-                  </span>
-                </p>
-              </div>
+              <>
+                <div>
+                  <p class="eyebrow">Running in it</p>
+                  <p class="mt-0.5 text-ink">
+                    {formatCount(value().sessions)}
+                    <Show when={props.perEnvelope}>
+                      <span class="text-faint"> of {formatCount(props.perEnvelope!)}</span>
+                    </Show>
+                    <Show when={value().asOf}>
+                      <span class="ml-2 text-xs text-faint">
+                        read <RelativeTime value={value().asOf} />
+                      </span>
+                    </Show>
+                  </p>
+                </div>
+                <Show when={value().node}>
+                  {(node) => (
+                    <>
+                      <div>
+                        <p class="eyebrow">Edge starts</p>
+                        <p class="mt-0.5">
+                          <Show when={node().accepting} fallback={<Badge tone="warn" title={SESSION_NODE_REASONS[node().reason] ?? node().reason}>{node().reason || 'not accepting'}</Badge>}>
+                            <Badge tone="ok" title={`Room for ${formatCount(node().weight)} more`}>accepting</Badge>
+                          </Show>
+                        </p>
+                      </div>
+                      <Show when={node().room}>
+                        <div title="The envelope's room left, from the node's last report plus the managers' own recent starts">
+                          <p class="eyebrow">Room left</p>
+                          <p class="mt-0.5 font-mono text-xs text-ink">{formatRoom(node().room)}</p>
+                        </div>
+                      </Show>
+                      <Show when={node().tag}>
+                        <div title="Session ids minted on this node carry this tag before their final dot">
+                          <p class="eyebrow">Node tag</p>
+                          <p class="mt-0.5 font-mono text-xs text-ink">{node().tag}</p>
+                        </div>
+                      </Show>
+                    </>
+                  )}
+                </Show>
+              </>
             )}
           </Show>
         </div>
@@ -111,34 +164,19 @@ export default function EnvelopeCard(props: {
         <Show when={count()?.complete === false}>
           <Note tone="warn">Some nodes have not reported their sessions to any manager yet, so this count may be low.</Note>
         </Show>
-        <Show when={error()}>{(message) => <Note tone="danger">Could not list sessions: {message()}</Note>}</Show>
-
-        <Show when={count() && count()!.ids.length > 0}>
-          <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-            <For each={count()!.ids}>
-              {(id) => (
-                <A href={instanceHref(props.jobId!, id)} class="font-mono text-muted hover:text-brass-strong">
-                  {id}
-                </A>
-              )}
-            </For>
-            <Show when={count()!.matching > count()!.ids.length}>
-              <span class="text-faint">and {formatCount(count()!.matching - count()!.ids.length)} more</span>
-            </Show>
-          </div>
+        <Show when={count() && !count()!.node}>
+          <Note tone="info">Counted from the job's per-node session totals, which include every session task the job has on this node.</Note>
         </Show>
+        <Show when={error()}>{(message) => <Note tone="danger">Could not count sessions: {message()}</Note>}</Show>
 
         <Show when={props.jobId}>
           <div class="flex flex-wrap items-center gap-2">
-            <Button size="xs" icon="refresh" disabled={loading()} onClick={() => void load()}>
-              {loading() ? 'Counting…' : count() ? 'Count again' : 'Count its sessions'}
+            <Button size="xs" icon="refresh" disabled={loading() || !props.nodeId} onClick={() => void load()}>
+              {loading() ? 'Counting…' : 'Count again'}
             </Button>
-            <A href={jobInstancesHref(props.jobId!, { mode: 'session', envelope: String(props.allocationId) })} class={linkClass + ' text-xs'}>
+            <A href={jobInstancesHref(props.jobId!, { mode: 'session', task: props.servedTask, node: props.nodeId })} class={linkClass + ' text-xs'}>
               Open its sessions on the job page
             </A>
-            <span class="text-2xs text-faint">
-              Counting reads the job's whole session listing once{count() ? ` (${formatCount(count()!.total)} instances last time)` : ''}.
-            </span>
           </div>
         </Show>
       </div>

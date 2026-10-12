@@ -1,11 +1,11 @@
-import { For, Show, createSignal, type JSX } from 'solid-js'
+import { For, Show, createMemo, createSignal, type JSX } from 'solid-js'
 import { CompactNodeUsage, NodeUsageCard } from '../components/NodeUsagePanel'
 import InstancesTable from '../components/InstancesTable'
-import InstancesPanel, { DeferredInstancesCard } from '../components/InstancesPanel'
+import InstancesPanel, { type InstanceListing } from '../components/InstancesPanel'
 import EnvelopeCard from '../components/EnvelopeCard'
-import { largeSessionListing, sessionListing } from '../fixtures/sessions'
-import type { InstanceInfo } from '../gen/legion_pb'
-import { promoteBlocker } from '../utils/sessions'
+import SessionNodesCard from '../components/SessionNodesCard'
+import { largeSessionListing, listInstancesFrom, sessionIndex, sessionListing, sessionNodesFrom, type SessionIndex } from '../fixtures/sessions'
+import { SESSION_PAGE, countMap, createSessionPager, isSession, promoteBlocker } from '../utils/sessions'
 import { NodeContentCard } from '../components/NodeContentCard'
 import { InstanceEventSummary, PressureExplanation, PressureHistoryCard, SnapshotEventSummary } from '../components/PressureHistory'
 import { SnapshotHolders, SnapshotsTable } from '../components/SnapshotsPanel'
@@ -51,15 +51,47 @@ function Fixture(props: { title: string; note: string; children: JSX.Element }) 
 // messages takes the browser a moment to make.
 const LARGE_SESSIONS = 250_000
 const LARGE_NODES = 1200
+// Sessions one envelope admits in the large listing, so its busiest nodes are full.
+const LARGE_PER_ENVELOPE = 600
+
+/**
+ * The job page's paging over a fixture index: the same pager and request
+ * (`session_limit: SESSION_PAGE`), answered by listInstancesFrom instead of
+ * the manager.
+ */
+function PagedSessionsPanel(props: { index: SessionIndex; complete: boolean }) {
+  const pager = createSessionPager(SESSION_PAGE)
+  const reply = createMemo(() => listInstancesFrom(props.index, { sessionLimit: SESSION_PAGE, sessionPageToken: pager.token() }, props.complete))
+  const listing = (): InstanceListing => ({
+    complete: reply().complete,
+    asOf: reply().asOf,
+    paused: false,
+    refreshing: false,
+    onRefresh: () => undefined,
+    sessions: {
+      count: Number(reply().sessionCount),
+      byNode: countMap(reply().sessionsByNode),
+      offset: pager.offset(),
+      onPage: reply().instances.filter(isSession).length,
+      hasPrev: pager.hasPrev(),
+      hasNext: Boolean(reply().nextSessionPageToken),
+      onPrev: pager.prev,
+      onNext: () => pager.next(reply().nextSessionPageToken),
+      onFirst: pager.first,
+    },
+  })
+  return <InstancesPanel jobName="agents" instances={reply().instances} toRow={(instance) => ({ instance })} actions={false} listing={listing()} />
+}
 
 export default function TestingUtils() {
-  const [large, setLarge] = createSignal<InstanceInfo[]>()
+  const [large, setLarge] = createSignal<SessionIndex>()
   const [buildMs, setBuildMs] = createSignal<number>()
   const buildLarge = () => {
     const started = performance.now()
-    setLarge(largeSessionListing(LARGE_SESSIONS, LARGE_NODES))
+    setLarge(sessionIndex(largeSessionListing(LARGE_SESSIONS, LARGE_NODES)))
     setBuildMs(Math.round(performance.now() - started))
   }
+  const mixed = sessionIndex(sessionListing)
   return (
     <div class="space-y-8">
       <PageHeader
@@ -162,13 +194,7 @@ export default function TestingUtils() {
         title="Sessions: a mixed listing"
         note="A session job's Instances card: a renamed promotion, a promotion that kept its id, and running and starting sessions in two envelopes on two nodes. Row actions are left off here, since they call the manager; the card under it says what each row would offer."
       >
-        <InstancesPanel
-          jobName="agents"
-          instances={sessionListing}
-          toRow={(instance) => ({ instance })}
-          actions={false}
-          listing={{ complete: true, asOf: new Date().toISOString(), paused: false, refreshing: false, onRefresh: () => undefined }}
-        />
+        <PagedSessionsPanel index={mixed} complete />
         <Card class="space-y-1 text-xs">
           <For each={sessionListing}>
             {(instance) => (
@@ -185,7 +211,7 @@ export default function TestingUtils() {
 
       <Fixture
         title="Sessions: a quarter of a million"
-        note={`${LARGE_SESSIONS.toLocaleString('en-US')} running sessions over ${LARGE_NODES.toLocaleString('en-US')} nodes, from a partial index, too large to re-poll. The card counts in one pass and renders 100 rows at a time.`}
+        note={`${LARGE_SESSIONS.toLocaleString('en-US')} running sessions over ${LARGE_NODES.toLocaleString('en-US')} nodes, from a partial index, served the way ListInstances pages them: ${SESSION_PAGE} sessions a page with the manager's totals, 100 rows rendered at a time, and the Edge nodes card from a ListSessionNodes reply.`}
       >
         <Show
           when={large()}
@@ -198,32 +224,23 @@ export default function TestingUtils() {
             </Card>
           }
         >
-          {(listing) => (
+          {(index) => (
             <>
-              <p class="text-xs text-faint">Built in {buildMs()} ms.</p>
-              <InstancesPanel
-                jobName="agents"
-                instances={listing()}
-                toRow={(instance) => ({ instance })}
-                actions={false}
-                listing={{ complete: false, asOf: new Date().toISOString(), paused: true, refreshing: false, onRefresh: () => undefined }}
-              />
+              <p class="text-xs text-faint">Built and indexed in {buildMs()} ms.</p>
+              <PagedSessionsPanel index={index()} complete={false} />
+              <SessionNodesCard jobId="agents" taskName="workspace" perEnvelope={LARGE_PER_ENVELOPE} reply={sessionNodesFrom(index(), LARGE_PER_ENVELOPE)} />
             </>
           )}
         </Show>
       </Fixture>
 
-      <Fixture title="Sessions: listing not loaded" note="What the job page shows instead when the job's envelopes could hold more sessions than it fetches unasked, and when it cannot count them.">
-        <DeferredInstancesCard jobName="agents" capacity={72_000} envelopes={1200} onLoad={() => undefined} loading={false} />
-        <DeferredInstancesCard jobName="agents" envelopes={0} onLoad={() => undefined} loading={false} />
-      </Fixture>
-
-      <Fixture title="Session envelope" note="The allocation page's card for an envelope. Without a job it offers no count, so nothing here calls the manager.">
+      <Fixture title="Session envelope" note="The allocation page's card for an envelope, with its node's ListSessionNodes entry given rather than read, so nothing here calls the manager.">
         <EnvelopeCard
           allocationId={4101n}
           nodeId="w-17"
           servedTask="workspace"
           perEnvelope={60}
+          initial={{ sessions: 3, complete: true, asOf: new Date().toISOString(), node: sessionNodesFrom(mixed, 60).nodes.find((node) => node.nodeId === 'w-17') }}
           reserved={[
             { key: 'cpu', label: 'CPU', value: '30000 MHz' },
             { key: 'memory', label: 'Memory', value: '61440 MiB' },

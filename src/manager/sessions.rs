@@ -35,11 +35,6 @@ const ROUTER_ATTEMPTS: usize = 3;
 /// Bound on one start or stop call to a worker.
 const WORKER_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// When an idempotent create checks whether a retry raced its session onto
-/// a second node: two heartbeats at the default cadence, by which time both
-/// copies have reported.
-const DUPLICATE_CHECK_AFTER: Duration = Duration::from_secs(20);
-
 /// A recent start stands in for a node report when the start was issued
 /// after the report, less this allowance for clock skew between managers.
 const RECENT_SKEW_MS: i64 = 1_000;
@@ -755,7 +750,6 @@ pub async fn start(
 ) -> Result<StartedSession, Status> {
     let metrics = crate::manager::telemetry::metrics();
     let job_id = config.name.as_str();
-    let derived = derived_id.is_some();
     if let Some(session_id) = derived_id {
         if let Some(existing) = find(store, session_id).await {
             metrics.session_starts_total.inc(&["deduplicated"]);
@@ -853,9 +847,6 @@ pub async fn start(
                     NoteUse::Started(session_amounts(&status)),
                 );
                 metrics.session_starts_total.inc(&["started"]);
-                if derived {
-                    schedule_duplicate_check(store, session_id);
-                }
                 debug!(session_id, node_id = %node_id, "Session started");
                 return Ok(StartedSession {
                     session_id: session_id.to_string(),
@@ -986,17 +977,6 @@ fn worker_client(
     let target = crate::manager::worker_plane::WorkerTarget::for_node(&node)?;
     let client = crate::manager::worker_plane::WorkerPlane::global().client_for(store, &target)?;
     Ok((client, target))
-}
-
-/// After an idempotent start, look for a copy a concurrent retry started on
-/// another node (through another manager), and stop the later one.
-fn schedule_duplicate_check(store: &Store, session_id: &str) {
-    let store = store.clone();
-    let session_id = session_id.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(DUPLICATE_CHECK_AFTER).await;
-        let _ = find(&store, &session_id).await;
-    });
 }
 
 #[cfg(test)]

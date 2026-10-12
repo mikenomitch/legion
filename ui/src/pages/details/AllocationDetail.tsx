@@ -96,8 +96,8 @@ import { ENVELOPE_COPY, envelopeServes, sessionsPerEnvelope } from '../../utils/
  * gets a page: its events outlive it and say what it was and why it ended.
  *
  * An envelope allocation (docs/session-mode.md) runs nothing: it reserves a
- * node's room for a session task's sessions. Its page says so, offers a
- * count of the sessions inside it, and leaves out health, network, logs,
+ * node's room for a session task's sessions. Its page says so, counts the
+ * sessions inside it (ListSessionNodes), and leaves out health, network, logs,
  * and exec, which have nothing to show for a placeholder.
  */
 
@@ -1592,7 +1592,7 @@ function AllocationDetailContent() {
                       <CliLine command={`legion exec ${String(allocationId())} -it -- /bin/sh`} />
                     </Show>
                     <Show when={envelopeFor() && jobId()}>
-                      <CliLine command={`legion instance list ${jobId()} -j`} note="Lists the job's sessions; each names its envelope (envelopeAllocId)" />
+                      <CliLine command={`legion session nodes ${jobId()} --task ${envelopeFor()}`} note="Each node's envelope for the task: its sessions, room left, and whether it takes edge starts" />
                     </Show>
                     <Show when={jobId() && exists() && !envelopeFor()}>
                       <CliLine command={`legion job logs ${jobId()} --allocation ${String(allocationId())} --follow`} />

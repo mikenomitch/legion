@@ -3709,28 +3709,28 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
         `task`), envelope cards on the allocation page, envelope badges on
         the job and worker pages, notes on session and envelope task pages,
         fixtures at `/testing`
-  - [x] Bounded at scale: 100 rows at a time (1,000 max), no re-poll past
-        5,000 instances, no automatic fetch when envelopes could hold more
-        than 50,000 sessions, job allocations 200 at a time, fork lineage
-        not looked up in session jobs
-  - [ ] Server paging and a session limit on `ListInstances`
-        (`page_size`, `page_token`). Until then every view of sessions
-        reads the job's whole listing in one reply
-        ([plan §8](plans/session-ui-plan.md#8-what-the-api-lacks-deferred),
-        [calls 1](calls/session-ui-plan_calls.md#1-past-50000-possible-sessions-the-job-page-does-not-fetch-the-listing-until-asked))
+  - [x] Bounded at scale: sessions read 500 at a time with First/Prev/Next,
+        100 rows rendered at a time, no re-poll past 5,000 instances, job
+        allocations 200 at a time
+  - [x] Server paging and a session limit on `ListInstances`
+        (`session_limit`, `session_page_token`; #36,
+        [calls 1](calls/session-ui-plan_calls.md#1-the-job-page-reads-one-500-session-page-and-pages-with-prevnext-counts-come-from-the-reply))
+  - [x] Session counts without the listing: `session_count` and
+        `sessions_by_node` on every `ListInstances` reply
+        (`session_limit = 0` for counts only), and per-node counts from
+        `ListSessionNodes` (#36,
+        [calls 2](calls/session-ui-plan_calls.md#2-per-task-and-per-envelope-counts-come-from-listsessionnodes-not-the-listing))
   - [ ] `ListInstances` filters for `node_id`, `envelope_alloc_id`, `mode`,
         and `task`, so the node page and the envelope card can show their
         own sessions without the job's listing
-        ([calls 4](calls/session-ui-plan_calls.md#4-node-envelope-task-and-mode-filters-live-in-the-url))
-  - [ ] Session counts without the listing (by task, node, and envelope,
-        on `GetJobInfo` or a count-only `ListInstances`), so the job page
-        can show the summary before, or instead of, loading
+        ([calls 6](calls/session-ui-plan_calls.md#6-node-envelope-task-and-mode-filters-live-in-the-url))
   - [ ] The runtime (or an envelope flag) on `LedgerAllocation`, so the
         worker page stops recognizing envelopes by name
-        ([calls 5](calls/session-ui-plan_calls.md#5-an-envelope-is-recognized-by-name-confirmed-by-the-spec-when-there-is-one))
-  - [ ] Browser check against a live session cluster (Promote, End, the
-        envelope card's count, the deferral card); checked by typecheck,
-        build, `/testing`, and a 1,000,000-row run of the helpers only
+        ([calls 7](calls/session-ui-plan_calls.md#7-an-envelope-is-recognized-by-name-confirmed-by-the-spec-when-there-is-one))
+  - [ ] Browser check against a live session cluster (Promote, End,
+        paging, the envelope card, the edge-nodes card); checked by
+        typecheck, build, `/testing`, and a 250,000-session paging run of
+        the fixtures only
 
 Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 

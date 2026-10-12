@@ -1,4 +1,5 @@
-import type { InstanceInfo } from '../gen/legion_pb'
+import { createSignal } from 'solid-js'
+import type { InstanceInfo, SessionNode } from '../gen/legion_pb'
 import { allows, jobScope } from './acl'
 import type { JobTask } from './jobspec'
 
@@ -9,11 +10,13 @@ import type { JobTask } from './jobspec'
  * browser down.
  *
  * Sessions have no rows. ListInstances reads them from the managers'
- * in-memory session index and returns every one in a single reply: it has no
- * paging, no limit, and no node or envelope filter. So the UI never renders
- * a full listing, polls a large one only on request, and does not fetch one
- * automatically when the job's envelopes could hold more sessions than a
- * browser should decode at once.
+ * in-memory session index, a page at a time in session id order
+ * (`session_limit`, `session_page_token`), and counts them for free
+ * (`session_count`, `sessions_by_node`). So the UI asks for one page of
+ * SESSION_PAGE sessions and pages with the reply's token, takes every count
+ * from the reply rather than the page, and asks for no sessions at all
+ * (`session_limit: 0`) where it only needs counts or the job's rows.
+ * Per-task and per-node counts come from ListSessionNodes.
  */
 
 /** Rows an instances table renders before "Show more". */
@@ -23,17 +26,18 @@ export const INSTANCE_PAGE = 100
 export const INSTANCE_RENDER_MAX = 1000
 
 /**
- * A listing at least this long is no longer re-polled every two seconds:
- * the job page keeps the last one and refreshes it on request.
+ * Sessions the job page asks ListInstances for at a time
+ * (`session_limit`). One page is re-read every poll, so it stays small; the
+ * card pages through the rest with the reply's token.
  */
-export const LARGE_LISTING = 5000
+export const SESSION_PAGE = 500
 
 /**
- * When a job's envelopes could hold more sessions than this, the job page
- * does not fetch the listing until asked: ListInstances returns every
- * session in one reply.
+ * A listing at least this long is no longer re-polled every two seconds:
+ * the job page keeps the last one and refreshes it on request. With sessions
+ * paged, only a job with thousands of keyed or slot rows reaches it.
  */
-export const AUTO_LIST_MAX_SESSIONS = 50_000
+export const LARGE_LISTING = 5000
 
 /** Suffix of a session task's generated envelope task (`workspace-envelope`). */
 export const ENVELOPE_SUFFIX = '-envelope'
@@ -205,16 +209,79 @@ export const takeMatching = <T>(items: readonly T[], keep: (item: T) => boolean,
 }
 
 /** The job page's link to its Instances card, narrowed by `filter`. */
-export const jobInstancesHref = (jobId: string, filter: Omit<InstanceFilter, 'text' | 'state'> & { load?: boolean } = {}): string => {
+export const jobInstancesHref = (jobId: string, filter: Omit<InstanceFilter, 'text' | 'state'> = {}): string => {
   const params = new URLSearchParams()
   if (filter.mode) params.set('mode', filter.mode)
   if (filter.task) params.set('task', filter.task)
   if (filter.node) params.set('node', filter.node)
   if (filter.envelope) params.set('envelope', filter.envelope)
-  if (filter.load) params.set('load', '1')
   const query = params.toString()
   return `/jobs/${encodeURIComponent(jobId)}${query ? `?${query}` : ''}#instances`
 }
 
 /** The CLI line that lists a job's instances in full. */
 export const listCommand = (jobId: string): string => `legion instance list ${jobId} -j`
+
+/** A proto `map<string, uint64>` as numbers (counts never near 2^53). */
+export const countMap = (map: { [key: string]: bigint } | undefined): Map<string, number> =>
+  new Map(Object.entries(map ?? {}).map(([key, value]) => [key, Number(value)]))
+
+/**
+ * Where the job page is in the session listing: a stack of page tokens, so
+ * Prev needs no token from the manager. The first page's token is empty.
+ */
+export type SessionPager = {
+  /** The `session_page_token` of the page shown. */
+  token: () => string
+  /** How many sessions come before this page, in id order. */
+  offset: () => number
+  hasPrev: () => boolean
+  /** Move to the page after this one; `token` is the reply's `next_session_page_token`. */
+  next: (token: string) => void
+  prev: () => void
+  first: () => void
+}
+
+export const createSessionPager = (pageSize: number = SESSION_PAGE): SessionPager => {
+  const [stack, setStack] = createSignal<string[]>([''])
+  return {
+    token: () => stack()[stack().length - 1],
+    offset: () => (stack().length - 1) * pageSize,
+    hasPrev: () => stack().length > 1,
+    next: (token) => {
+      if (token) setStack((tokens) => [...tokens, token])
+    },
+    prev: () => setStack((tokens) => (tokens.length > 1 ? tokens.slice(0, -1) : tokens)),
+    first: () => setStack(['']),
+  }
+}
+
+/** Why a node takes no new edge starts, in words (ListSessionNodes `reason`). */
+export const SESSION_NODE_REASONS: Record<string, string> = {
+  lost: 'lost: the node stopped heartbeating',
+  down: 'down',
+  draining: 'draining',
+  ineligible: 'ineligible',
+  'no-address': 'no worker-plane address advertised',
+  'no-edge-sessions': 'does not serve StartSession (edgeBoot.acceptClaims is off)',
+  full: 'full: its envelope has no room for another session',
+}
+
+/** Sessions on each node, from a ListSessionNodes reply. */
+export const sessionsOnNodes = (nodes: readonly SessionNode[]): Map<string, number> => new Map(nodes.map((node) => [node.nodeId, node.sessions]))
+
+/** `{"cpu":21500,"memory":44032}` as `cpu 21500 · memory 44032`; the raw string when it is not an object. */
+export const formatRoom = (room: string): string => {
+  if (!room) return ''
+  try {
+    const parsed: unknown = JSON.parse(room)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return Object.entries(parsed as Record<string, unknown>)
+        .map(([key, value]) => `${key} ${String(value)}`)
+        .join(' · ')
+    }
+  } catch {
+    // Not JSON: show it as sent.
+  }
+  return room
+}

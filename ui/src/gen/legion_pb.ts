@@ -6437,7 +6437,226 @@ export class InstanceColdBoot extends Message<InstanceColdBoot> {
 
 /**
  * Request payload for ListInstances.
+ * Request for `Manager.ListSessionNodes`.
  *
+ * @generated from message legion.ListSessionNodesRequest
+ */
+export class ListSessionNodesRequest extends Message<ListSessionNodesRequest> {
+  /**
+   * The job. Required.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * The session task. Optional when the job has exactly one.
+   *
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  constructor(data?: PartialMessage<ListSessionNodesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListSessionNodesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListSessionNodesRequest {
+    return new ListSessionNodesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListSessionNodesRequest {
+    return new ListSessionNodesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListSessionNodesRequest {
+    return new ListSessionNodesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListSessionNodesRequest | PlainMessage<ListSessionNodesRequest> | undefined, b: ListSessionNodesRequest | PlainMessage<ListSessionNodesRequest> | undefined): boolean {
+    return proto3.util.equals(ListSessionNodesRequest, a, b);
+  }
+}
+
+/**
+ * One node holding an envelope for the session task.
+ *
+ * @generated from message legion.SessionNode
+ */
+export class SessionNode extends Message<SessionNode> {
+  /**
+   * The node id.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * The node's worker-plane address (`https://host:4848`), where
+   * `Worker.StartSession`, `GetSession`, and `StopSession` are served.
+   * Empty when the node has not advertised one.
+   *
+   * @generated from field: string address = 2;
+   */
+  address = "";
+
+  /**
+   * The node's tag: the 8 characters a session id minted on this node
+   * carries before its final `.` (`workspace-q4n7c2rd.01J...`). A picker
+   * maps a session id's tag to this node to route requests for it.
+   *
+   * @generated from field: string tag = 3;
+   */
+  tag = "";
+
+  /**
+   * Whether a picker should send new edge starts here: the node is ready,
+   * available (not draining or ineligible), has an address, advertises the
+   * `edge-sessions` capability, and its envelope has room for one more
+   * session of this task.
+   *
+   * @generated from field: bool accepting = 4;
+   */
+  accepting = false;
+
+  /**
+   * Why `accepting` is false: `lost`, `down`, `draining`, `ineligible`,
+   * `no-address`, `no-edge-sessions` (the node does not serve
+   * `StartSession`: `edgeBoot.acceptClaims` is off), or `full`. Empty when
+   * accepting.
+   *
+   * @generated from field: string reason = 5;
+   */
+  reason = "";
+
+  /**
+   * The envelope's room left, as a JSON object of amounts (`{"cpu":21500,
+   * "memory":44032}`), from the last reports plus this manager's own
+   * recent starts.
+   *
+   * @generated from field: string room = 6;
+   */
+  room = "";
+
+  /**
+   * How many more sessions of this task's size fit in `room`: a weight for
+   * weighted balancers. 0 when full.
+   *
+   * @generated from field: uint32 weight = 7;
+   */
+  weight = 0;
+
+  /**
+   * Sessions the node last reported for this task.
+   *
+   * @generated from field: uint32 sessions = 8;
+   */
+  sessions = 0;
+
+  constructor(data?: PartialMessage<SessionNode>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SessionNode";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "tag", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "accepting", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "room", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "weight", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "sessions", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SessionNode {
+    return new SessionNode().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SessionNode {
+    return new SessionNode().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SessionNode {
+    return new SessionNode().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SessionNode | PlainMessage<SessionNode> | undefined, b: SessionNode | PlainMessage<SessionNode> | undefined): boolean {
+    return proto3.util.equals(SessionNode, a, b);
+  }
+}
+
+/**
+ * Reply for `Manager.ListSessionNodes`.
+ *
+ * @generated from message legion.ListSessionNodesReply
+ */
+export class ListSessionNodesReply extends Message<ListSessionNodesReply> {
+  /**
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  /**
+   * One entry per node with an envelope, sorted by node id.
+   *
+   * @generated from field: repeated legion.SessionNode nodes = 3;
+   */
+  nodes: SessionNode[] = [];
+
+  /**
+   * When the list was read, RFC 3339.
+   *
+   * @generated from field: string as_of = 4;
+   */
+  asOf = "";
+
+  constructor(data?: PartialMessage<ListSessionNodesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListSessionNodesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "nodes", kind: "message", T: SessionNode, repeated: true },
+    { no: 4, name: "as_of", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListSessionNodesReply {
+    return new ListSessionNodesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListSessionNodesReply {
+    return new ListSessionNodesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListSessionNodesReply {
+    return new ListSessionNodesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListSessionNodesReply | PlainMessage<ListSessionNodesReply> | undefined, b: ListSessionNodesReply | PlainMessage<ListSessionNodesReply> | undefined): boolean {
+    return proto3.util.equals(ListSessionNodesReply, a, b);
+  }
+}
+
+/**
  * @generated from message legion.ListInstancesRequest
  */
 export class ListInstancesRequest extends Message<ListInstancesRequest> {
@@ -6484,6 +6703,24 @@ export class ListInstancesRequest extends Message<ListInstancesRequest> {
    */
   idlePageSize = 0;
 
+  /**
+   * The most running sessions (`mode = "session"`) to return, in session
+   * id order. Unset: 5000. At most 50000. 0 returns no sessions, only
+   * `session_count` and `sessions_by_node`: what a dashboard needs at any
+   * scale. Rows are always listed in full.
+   *
+   * @generated from field: optional uint32 session_limit = 6;
+   */
+  sessionLimit?: number;
+
+  /**
+   * Where the session listing resumes: the previous reply's
+   * `next_session_page_token`. Empty starts at the lowest id.
+   *
+   * @generated from field: string session_page_token = 7;
+   */
+  sessionPageToken = "";
+
   constructor(data?: PartialMessage<ListInstancesRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6497,6 +6734,8 @@ export class ListInstancesRequest extends Message<ListInstancesRequest> {
     { no: 3, name: "include_idle", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 4, name: "idle_page_token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "idle_page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "session_limit", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 7, name: "session_page_token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListInstancesRequest {
@@ -6559,6 +6798,30 @@ export class ListInstancesReply extends Message<ListInstancesReply> {
    */
   asOf = "";
 
+  /**
+   * The token for the next page of sessions (`session_page_token`). Empty
+   * when this reply holds the last of them.
+   *
+   * @generated from field: string next_session_page_token = 5;
+   */
+  nextSessionPageToken = "";
+
+  /**
+   * How many running sessions the job has, from the session index's
+   * per-node totals, whatever `session_limit` returned. Counted like
+   * `complete`: nodes not reported yet are missing from it.
+   *
+   * @generated from field: uint64 session_count = 6;
+   */
+  sessionCount = protoInt64.zero;
+
+  /**
+   * `session_count` by node id.
+   *
+   * @generated from field: map<string, uint64> sessions_by_node = 7;
+   */
+  sessionsByNode: { [key: string]: bigint } = {};
+
   constructor(data?: PartialMessage<ListInstancesReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6571,6 +6834,9 @@ export class ListInstancesReply extends Message<ListInstancesReply> {
     { no: 2, name: "next_idle_page_token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "complete", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 4, name: "as_of", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "next_session_page_token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "session_count", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "sessions_by_node", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 4 /* ScalarType.UINT64 */} },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListInstancesReply {
@@ -11145,7 +11411,10 @@ export class SessionReport extends Message<SessionReport> {
  */
 export class SessionStatus extends Message<SessionStatus> {
   /**
-   * The session id (`<task>-<26 base32>`).
+   * The session id: `<task>-<node tag>.<26 base32>` when minted by a router
+   * or a node (the tag names the node it started on, session durability
+   * plan §6.3), or `<task>-<26 base32>` when derived from an idempotency
+   * key.
    *
    * @generated from field: string session_id = 1;
    */
@@ -11177,14 +11446,18 @@ export class SessionStatus extends Message<SessionStatus> {
   envelopeAllocationId = protoInt64.zero;
 
   /**
-   * `starting` (admitted, not running yet) or `running`.
+   * `starting` (admitted, not running yet), `running`, `suspended`
+   * (checkpointed on its node, nothing running, not using envelope room),
+   * or `evicted` (a local-only checkpoint that is gone; reported for
+   * `suspend.keepFor` so the answer is `evicted`, not `not found`).
    *
    * @generated from field: string state = 6;
    */
   state = "";
 
   /**
-   * When the manager that started it issued it, unix milliseconds.
+   * When the session was issued, unix milliseconds: by the manager that
+   * routed it, or by the node itself for an edge start.
    *
    * @generated from field: int64 lease_issued_at_unix_ms = 7;
    */
@@ -11196,6 +11469,32 @@ export class SessionStatus extends Message<SessionStatus> {
    * @generated from field: string resources = 8;
    */
   resources = "";
+
+  /**
+   * The session's generation (session durability plan §6.7): 1 at start,
+   * one more for every resume that claimed its manifest. Of two copies of
+   * one session id, the higher generation survives, then the earlier
+   * lease, then the lower node id.
+   *
+   * @generated from field: uint64 generation = 9;
+   */
+  generation = protoInt64.zero;
+
+  /**
+   * Who started it: `manager` (a manager's session router) or `edge` (a
+   * session ticket presented to `Worker.StartSession`).
+   *
+   * @generated from field: string origin = 10;
+   */
+  origin = "";
+
+  /**
+   * For an edge start, the `jti` of the session ticket it was started
+   * with. Empty otherwise.
+   *
+   * @generated from field: string ticket_jti = 11;
+   */
+  ticketJti = "";
 
   constructor(data?: PartialMessage<SessionStatus>) {
     super();
@@ -11213,6 +11512,9 @@ export class SessionStatus extends Message<SessionStatus> {
     { no: 6, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "lease_issued_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 8, name: "resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 10, name: "origin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "ticket_jti", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SessionStatus {
@@ -21838,6 +22140,342 @@ export class Eval extends Message<Eval> {
 }
 
 /**
+ * Request payload for Worker.StartSession.
+ *
+ * @generated from message legion.StartSessionRequest
+ */
+export class StartSessionRequest extends Message<StartSessionRequest> {
+  /**
+   * The session ticket.
+   *
+   * @generated from field: string ticket = 1;
+   */
+  ticket = "";
+
+  /**
+   * The job and session task to start. Optional: they default to the
+   * ticket's, and must match it when set.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Optional idempotency key. The same key always derives the same session
+   * id, so a retry to the same node is answered from its table.
+   *
+   * @generated from field: string idempotency_key = 4;
+   */
+  idempotencyKey = "";
+
+  /**
+   * Wait until the session is running before answering (default true:
+   * `false` answers once the session is admitted, in state `starting`).
+   *
+   * @generated from field: optional bool wait = 5;
+   */
+  wait?: boolean;
+
+  constructor(data?: PartialMessage<StartSessionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StartSessionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "wait", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartSessionRequest {
+    return new StartSessionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StartSessionRequest {
+    return new StartSessionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StartSessionRequest {
+    return new StartSessionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StartSessionRequest | PlainMessage<StartSessionRequest> | undefined, b: StartSessionRequest | PlainMessage<StartSessionRequest> | undefined): boolean {
+    return proto3.util.equals(StartSessionRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for Worker.StartSession.
+ *
+ * @generated from message legion.StartSessionReply
+ */
+export class StartSessionReply extends Message<StartSessionReply> {
+  /**
+   * The new session's id: `<task>-<this node's tag>.<26 base32>`, or the
+   * derived id for an idempotent start.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  /**
+   * This node's id.
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  /**
+   * `running`, or `starting` when the caller did not wait.
+   *
+   * @generated from field: string state = 3;
+   */
+  state = "";
+
+  /**
+   * True when an idempotent retry found the session already running here.
+   *
+   * @generated from field: bool deduplicated = 4;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<StartSessionReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StartSessionReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartSessionReply {
+    return new StartSessionReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StartSessionReply {
+    return new StartSessionReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StartSessionReply {
+    return new StartSessionReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StartSessionReply | PlainMessage<StartSessionReply> | undefined, b: StartSessionReply | PlainMessage<StartSessionReply> | undefined): boolean {
+    return proto3.util.equals(StartSessionReply, a, b);
+  }
+}
+
+/**
+ * Request payload for Worker.StopSession.
+ *
+ * @generated from message legion.StopSessionRequest
+ */
+export class StopSessionRequest extends Message<StopSessionRequest> {
+  /**
+   * The session ticket.
+   *
+   * @generated from field: string ticket = 1;
+   */
+  ticket = "";
+
+  /**
+   * The session to end.
+   *
+   * @generated from field: string session_id = 2;
+   */
+  sessionId = "";
+
+  constructor(data?: PartialMessage<StopSessionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StopSessionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopSessionRequest {
+    return new StopSessionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StopSessionRequest {
+    return new StopSessionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StopSessionRequest {
+    return new StopSessionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StopSessionRequest | PlainMessage<StopSessionRequest> | undefined, b: StopSessionRequest | PlainMessage<StopSessionRequest> | undefined): boolean {
+    return proto3.util.equals(StopSessionRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for Worker.StopSession.
+ *
+ * @generated from message legion.StopSessionReply
+ */
+export class StopSessionReply extends Message<StopSessionReply> {
+  /**
+   * True when this call ended the session; false when it was already gone.
+   *
+   * @generated from field: bool stopped = 1;
+   */
+  stopped = false;
+
+  /**
+   * This node's id.
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  constructor(data?: PartialMessage<StopSessionReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StopSessionReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "stopped", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopSessionReply {
+    return new StopSessionReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StopSessionReply {
+    return new StopSessionReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StopSessionReply {
+    return new StopSessionReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StopSessionReply | PlainMessage<StopSessionReply> | undefined, b: StopSessionReply | PlainMessage<StopSessionReply> | undefined): boolean {
+    return proto3.util.equals(StopSessionReply, a, b);
+  }
+}
+
+/**
+ * Request payload for Worker.GetSession.
+ *
+ * @generated from message legion.GetSessionRequest
+ */
+export class GetSessionRequest extends Message<GetSessionRequest> {
+  /**
+   * The session id.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  /**
+   * A session ticket, for the `ticket` caller class. Empty for a manager.
+   *
+   * @generated from field: string ticket = 2;
+   */
+  ticket = "";
+
+  constructor(data?: PartialMessage<GetSessionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetSessionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetSessionRequest {
+    return new GetSessionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetSessionRequest {
+    return new GetSessionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetSessionRequest {
+    return new GetSessionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetSessionRequest | PlainMessage<GetSessionRequest> | undefined, b: GetSessionRequest | PlainMessage<GetSessionRequest> | undefined): boolean {
+    return proto3.util.equals(GetSessionRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for Worker.GetSession.
+ *
+ * @generated from message legion.GetSessionReply
+ */
+export class GetSessionReply extends Message<GetSessionReply> {
+  /**
+   * The session, as this node reports it in its heartbeat.
+   *
+   * @generated from field: legion.SessionStatus session = 1;
+   */
+  session?: SessionStatus;
+
+  /**
+   * This node's id.
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  constructor(data?: PartialMessage<GetSessionReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetSessionReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session", kind: "message", T: SessionStatus },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetSessionReply {
+    return new GetSessionReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetSessionReply {
+    return new GetSessionReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetSessionReply {
+    return new GetSessionReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetSessionReply | PlainMessage<GetSessionReply> | undefined, b: GetSessionReply | PlainMessage<GetSessionReply> | undefined): boolean {
+    return proto3.util.equals(GetSessionReply, a, b);
+  }
+}
+
+/**
  * Request payload for Worker.StopSessions.
  *
  * @generated from message legion.StopSessionsRequest
@@ -24248,6 +24886,24 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   promotedFromSession = "";
 
+  /**
+   * On an envelope allocation only: the full spec of the session task the
+   * envelope serves, as JSON, and that task's config id
+   * (docs/session-mode.md, "Starting at the edge"). A node holding the
+   * envelope can then start the task's sessions from a session ticket
+   * (`Worker.StartSession`) with no manager on the path: the spec it starts
+   * is exactly the one its envelope was placed for. Empty on every other
+   * allocation.
+   *
+   * @generated from field: string session_task_spec = 29;
+   */
+  sessionTaskSpec = "";
+
+  /**
+   * @generated from field: int64 session_task_config_id = 30;
+   */
+  sessionTaskConfigId = protoInt64.zero;
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -24284,6 +24940,8 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 26, name: "task_lifecycle", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 27, name: "task_restart", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 28, name: "promoted_from_session", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 29, name: "session_task_spec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 30, name: "session_task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {
@@ -26717,6 +27375,23 @@ export class IssueBootTicketRequest extends Message<IssueBootTicketRequest> {
    */
   idempotencyKey?: string;
 
+  /**
+   * What the ticket authorizes: `boot` (the default) or `session`.
+   *
+   * A `session` ticket (session durability plan §6.4) lets its holder start,
+   * read, and stop sessions of one session task, on any node of `pool` that
+   * holds the task's envelope (`Worker.StartSession`, `GetSession`,
+   * `StopSession`), until it expires. It names no instance, prefix, or job
+   * config (the node starts the spec of the envelope it holds), so
+   * `instance_id`, `instance_prefix`, `job_config_id`, and `gate` must be
+   * empty. It is not spent per session: `uses` must be 0 or 1 and is
+   * recorded as 0 (unlimited); the envelopes' room bounds what it can
+   * start. The task must be a session task.
+   *
+   * @generated from field: string scope = 11;
+   */
+  scope = "";
+
   constructor(data?: PartialMessage<IssueBootTicketRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -26735,6 +27410,7 @@ export class IssueBootTicketRequest extends Message<IssueBootTicketRequest> {
     { no: 8, name: "ttl", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 9, name: "uses", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 10, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 11, name: "scope", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueBootTicketRequest {
@@ -26963,6 +27639,13 @@ export class BootTicket extends Message<BootTicket> {
    */
   createdAt = "";
 
+  /**
+   * `boot` or `session` (see `IssueBootTicketRequest.scope`).
+   *
+   * @generated from field: string scope = 13;
+   */
+  scope = "";
+
   constructor(data?: PartialMessage<BootTicket>) {
     super();
     proto3.util.initPartial(data, this);
@@ -26983,6 +27666,7 @@ export class BootTicket extends Message<BootTicket> {
     { no: 10, name: "expires_at_unix", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 11, name: "accessor_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 12, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "scope", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): BootTicket {
@@ -27522,6 +28206,32 @@ export class QuerySessionsRequest extends Message<QuerySessionsRequest> {
    */
   usageOnly = false;
 
+  /**
+   * Every reported entry for each of these session ids, when
+   * `session_id` is empty: the managers' batched duplicate sweep, which
+   * asks its peers about all the derived ids newly reported to it once a
+   * second in one call. Router starts not yet reported are not included.
+   *
+   * @generated from field: repeated string session_ids = 5;
+   */
+  sessionIds: string[] = [];
+
+  /**
+   * With `job_id` (not `usage_only`): only sessions whose id sorts after
+   * this one. With `limit`, a page of a listing.
+   *
+   * @generated from field: string after_session_id = 6;
+   */
+  afterSessionId = "";
+
+  /**
+   * With `job_id` (not `usage_only`): at most this many sessions, the
+   * lowest ids first. 0 returns them all.
+   *
+   * @generated from field: uint32 limit = 7;
+   */
+  limit = 0;
+
   constructor(data?: PartialMessage<QuerySessionsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -27534,6 +28244,9 @@ export class QuerySessionsRequest extends Message<QuerySessionsRequest> {
     { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "usage_only", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "session_ids", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 6, name: "after_session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "limit", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): QuerySessionsRequest {
