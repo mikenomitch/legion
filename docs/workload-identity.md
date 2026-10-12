@@ -656,6 +656,42 @@ per-task `sub` security boundary, so matchers accept only `kv` and
 > artifacts is not yet supported, because it needs the fetching allocation's
 > id passed in the request.)
 
+## The manager's own identity, and why Legion does not issue it
+
+Tasks and worker nodes receive identities that Legion issues. The manager is
+the other way round. Where it needs a cloud credential for itself, which today
+means shipping its state to object storage under
+[streaming persistence](persistence-streaming.md), it presents an identity
+issued by the platform it runs on: EKS IRSA, a SPIRE JWT-SVID, Vault, an EC2
+instance profile or an ECS task role. On EKS that takes no Legion config at
+all; elsewhere it is two environment variables:
+
+```ini
+# The manager's service unit
+Environment=AWS_ROLE_ARN=arn:aws:iam::123456789012:role/legion-manager-state
+Environment=AWS_WEB_IDENTITY_TOKEN_FILE=/run/spire/svid/jwt
+```
+
+There is deliberately no `managerIdentities` block, even though the symmetry
+with `nodeIdentities` makes one look natural:
+
+- Legion's signing key lives in the SQLite store that streaming persistence
+  backs up. A self-issued credential would mean that reading the store is
+  enough to overwrite its backups.
+- A restore runs before any store exists, so there would be no key and no
+  token to restore with.
+- AWS validates a token by fetching the issuer's JWKS from the manager, so the
+  manager's ability to back itself up would depend on the manager being
+  reachable.
+
+The general rule: **an identity may not be issued by the system it is used to
+protect.** Node identities satisfy it, because the manager is a separate trust
+root from the worker. The manager's own backups cannot satisfy it against the
+manager's own issuer.
+
+The resolution order, IAM policy and failure modes are in
+[Streaming persistence: Credentials](persistence-streaming.md#credentials).
+
 ## Provider integration cookbook
 
 In every case, you configure the relying party to trust Legion's issuer

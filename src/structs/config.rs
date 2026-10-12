@@ -1845,6 +1845,13 @@ pub struct PersistenceConfigFull {
 pub struct StreamingPersistenceConfig {
     pub replica_url: Option<String>,
     pub sync_interval: Option<String>,
+    /// Literal object-storage keys for every store streaming persistence
+    /// opens: the WAL replica, the restore a new primary runs, and the lease
+    /// object. Unset (the default) uses the manager's ambient AWS credentials
+    /// — environment keys, then web identity (EKS IRSA, SPIRE, Vault), then
+    /// an ECS task role, then instance metadata. See
+    /// docs/persistence-streaming.md#credentials.
+    pub credentials: Option<StreamingCredentialsConfig>,
     pub lease: Option<StreamingLeaseConfig>,
 }
 
@@ -1853,7 +1860,40 @@ pub struct StreamingPersistenceConfig {
 pub struct StreamingPersistenceConfigFull {
     pub replica_url: String,
     pub sync_interval: String,
+    /// See [`StreamingPersistenceConfig::credentials`]. Stays optional: unset
+    /// means "ambient credentials", not "empty keys".
+    pub credentials: Option<StreamingCredentialsConfig>,
     pub lease: StreamingLeaseConfigFull,
+}
+
+/// Literal S3 keys for streaming persistence
+/// (`persistence.streaming.credentials`).
+///
+/// One block for all three consumers, so the replica and the lease can never
+/// authenticate as different principals. Prefer leaving it unset and giving
+/// the manager a platform identity instead; this exists for object stores
+/// that only issue keys (R2, MinIO, Backblaze).
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingCredentialsConfig {
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    /// Only for temporary keys (an `ASIA…` key id from STS).
+    pub session_token: Option<String>,
+}
+
+/// Hand-written so that a `{:?}` of the manager config (or of the persistence
+/// driver that holds it) never prints a secret. The key id is withheld too:
+/// it is half of the pair and no log needs it.
+impl std::fmt::Debug for StreamingCredentialsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("StreamingCredentialsConfig")
+            .field("access_key_id", &redact(&self.access_key_id))
+            .field("secret_access_key", &redact(&self.secret_access_key))
+            .field("session_token", &redact(&self.session_token))
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1935,14 +1975,17 @@ pub struct StreamingLeaseConfigFull {
     pub object_storage: StreamingObjectStorageLeaseConfigFull,
 }
 
+/// Where the lease object lives. Credentials are not here: the lease uses
+/// `persistence.streaming.credentials` (or the ambient chain), the same as the
+/// replica. `deny_unknown_fields` makes a config that still carries the old
+/// `accessKeyId`/`secretAccessKey` fail to load rather than silently fall
+/// back to a different principal.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StreamingObjectStorageLeaseConfig {
     pub bucket: Option<String>,
     pub region: Option<String>,
     pub endpoint: Option<String>,
-    pub access_key_id: Option<String>,
-    pub secret_access_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1951,8 +1994,6 @@ pub struct StreamingObjectStorageLeaseConfigFull {
     pub bucket: String,
     pub region: String,
     pub endpoint: Option<String>,
-    pub access_key_id: Option<String>,
-    pub secret_access_key: Option<String>,
 }
 
 impl From<ManagerConfigFull> for ManagerConfig {
@@ -2150,6 +2191,7 @@ impl Default for StreamingPersistenceConfigFull {
         Self {
             replica_url: String::new(),
             sync_interval: "1s".to_string(),
+            credentials: None,
             lease: StreamingLeaseConfigFull::default(),
         }
     }
@@ -2163,6 +2205,7 @@ impl StreamingPersistenceConfig {
                 .sync_interval
                 .clone()
                 .unwrap_or_else(|| "1s".to_string()),
+            credentials: self.credentials.clone(),
             lease: self
                 .lease
                 .as_ref()
@@ -2244,8 +2287,6 @@ impl Default for StreamingObjectStorageLeaseConfigFull {
             bucket: String::new(),
             region: "auto".to_string(),
             endpoint: None,
-            access_key_id: None,
-            secret_access_key: None,
         }
     }
 }
@@ -2256,8 +2297,6 @@ impl StreamingObjectStorageLeaseConfig {
             bucket: self.bucket.clone().unwrap_or_default(),
             region: self.region.clone().unwrap_or_else(|| "auto".to_string()),
             endpoint: self.endpoint.clone(),
-            access_key_id: self.access_key_id.clone(),
-            secret_access_key: self.secret_access_key.clone(),
         }
     }
 }
@@ -2277,6 +2316,7 @@ impl From<StreamingPersistenceConfigFull> for StreamingPersistenceConfig {
         Self {
             replica_url: Some(value.replica_url),
             sync_interval: Some(value.sync_interval),
+            credentials: value.credentials,
             lease: Some(value.lease.into()),
         }
     }
@@ -2322,8 +2362,6 @@ impl From<StreamingObjectStorageLeaseConfigFull> for StreamingObjectStorageLease
             bucket: Some(value.bucket),
             region: Some(value.region),
             endpoint: value.endpoint,
-            access_key_id: value.access_key_id,
-            secret_access_key: value.secret_access_key,
         }
     }
 }
@@ -3181,6 +3219,40 @@ mod tests {
             config.with_defaults().heartbeat,
             HeartbeatConfigFull::default()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_credentials_are_one_block_for_replica_and_lease_test() -> R<()> {
+        let config: StreamingPersistenceConfig = serde_json::from_value(serde_json::json!({
+            "replicaUrl": "s3://state/prod",
+            "credentials": { "accessKeyId": "AKIA", "secretAccessKey": "s" },
+            "lease": { "provider": "object_storage", "objectStorage": { "bucket": "state" } },
+        }))?;
+        let full = config.with_defaults();
+        let creds = full.credentials.as_ref().expect("credentials kept");
+        assert_eq!(creds.access_key_id.as_deref(), Some("AKIA"));
+        assert_eq!(creds.session_token, None);
+
+        // Unset stays unset: the ambient chain, not empty keys.
+        let config: StreamingPersistenceConfig =
+            serde_json::from_value(serde_json::json!({ "replicaUrl": "s3://state/prod" }))?;
+        assert!(config.with_defaults().credentials.is_none());
+
+        // Keys on the lease block were removed. A config that still has them
+        // must fail to load rather than quietly authenticate the lease as
+        // whatever the ambient chain finds.
+        let err = serde_json::from_value::<StreamingPersistenceConfig>(serde_json::json!({
+            "lease": { "objectStorage": { "bucket": "state", "accessKeyId": "AKIA" } },
+        }))
+        .expect_err("lease keys are rejected");
+        assert!(err.to_string().contains("accessKeyId"), "{err}");
+
+        let err = serde_json::from_value::<StreamingPersistenceConfig>(serde_json::json!({
+            "credentials": { "provider": "webIdentity" },
+        }))
+        .expect_err("unknown credential fields are rejected");
+        assert!(err.to_string().contains("provider"), "{err}");
         Ok(())
     }
 
