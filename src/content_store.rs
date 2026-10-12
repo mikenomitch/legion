@@ -845,9 +845,14 @@ impl ContentStore {
                 return Ok(());
             }
         }
+        // Name what statvfs reported, so the refusal can be checked against
+        // `df -B1` on the node.
+        let free = (self.free_space)(&self.root)
+            .map(|free| format!("{free} bytes free"))
+            .unwrap_or_else(|| "free space unknown".to_string());
         bail!(
-            "node disk is below content.minFreeDisk ({floor} bytes) and no unpinned content is \
-             left to evict"
+            "node disk is below content.minFreeDisk ({free}, floor {floor} bytes) and no \
+             unpinned content is left to evict"
         )
     }
 
@@ -1791,7 +1796,11 @@ mod tests {
         let err = store
             .put_bytes(ContentClass::Artifacts, b"new", PutOptions::default())
             .unwrap_err();
-        assert!(format!("{err:#}").contains("minFreeDisk"), "{err:#}");
+        assert_eq!(
+            format!("{err:#}"),
+            "node disk is below content.minFreeDisk (50 bytes free, floor 100 bytes) and no \
+             unpinned content is left to evict"
+        );
         assert!(!store.contains(&old.digest)?);
         assert!(store.contains(&pinned.digest)?);
         Ok(())
