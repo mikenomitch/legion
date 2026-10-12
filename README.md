@@ -257,7 +257,9 @@ they should. Legion handles all three.
   its network shut until the manager confirms it is the only instance.
 - **Simple egress control.** [Network handlers](docs/network-handlers.md)
   give each task its own egress allowlist and proxy middleware, so you
-  can customize what traffic is allowed or inject secrets safely.
+  can customize what traffic is allowed, and
+  [inject API keys](docs/network-handlers.md#credential-injection) on the
+  way out so the sandbox never holds them.
 - **Agent sandboxes that park when idle.** A sandbox
   [suspends](docs/suspend-and-resume.md) to a memory checkpoint after a few
   quiet minutes, frees its reservation (or keeps a share, so the resume
