@@ -536,6 +536,49 @@ async fn a_listing_is_complete_once_every_envelope_node_reported_test() -> R<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_session_listing_pages_and_counts_test() -> R<()> {
+    let cluster = Cluster::new("agents-page", &["n1", "n2"]).await?;
+    let mut ids = Vec::new();
+    for _ in 0..5 {
+        ids.push(cluster.create(None).await?.instance_id);
+    }
+    ids.sort();
+    cluster.report("n1").await?;
+    cluster.report("n2").await?;
+    let page = |limit: u32, token: String| {
+        cluster
+            .svc
+            .list_instances(Request::new(ListInstancesRequest {
+                job_id: cluster.job.clone(),
+                session_limit: Some(limit),
+                session_page_token: token,
+                ..Default::default()
+            }))
+    };
+
+    // Counts only: no sessions, the totals by node.
+    let counted = page(0, String::new()).await?.into_inner();
+    assert!(counted.instances.is_empty());
+    assert_eq!(counted.session_count, 5);
+    assert_eq!(counted.sessions_by_node.values().sum::<u64>(), 5);
+    assert!(counted.complete);
+
+    let mut listed = Vec::new();
+    let mut token = String::new();
+    loop {
+        let reply = page(2, token).await?.into_inner();
+        assert!(reply.instances.len() <= 2);
+        listed.extend(reply.instances.into_iter().map(|info| info.instance_id));
+        token = reply.next_session_page_token;
+        if token.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(listed, ids, "every session once, in id order");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idempotent_create_finds_the_running_session_test() -> R<()> {
     let cluster = Cluster::new("agents-idem", &["n1", "n2"]).await?;
     let first = cluster.create(Some("req-1")).await?;

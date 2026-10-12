@@ -516,6 +516,27 @@ impl SessionIndex {
                     sessions.push(inner.indexed(&start.node_id, &start.status, true));
                 }
             }
+            // A page: ids after `after_session_id`, in id order, at most
+            // `limit` of them.
+            if !request.after_session_id.is_empty() {
+                sessions.retain(|entry| {
+                    entry
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.session_id > request.after_session_id)
+                });
+            }
+            if request.limit > 0 {
+                let id = |entry: &IndexedSession| {
+                    entry
+                        .status
+                        .as_ref()
+                        .map(|status| status.session_id.clone())
+                        .unwrap_or_default()
+                };
+                sessions.sort_by_cached_key(|entry| (id(entry), entry.node_id.clone()));
+                sessions.truncate(request.limit as usize);
+            }
         }
         QuerySessionsReply {
             sessions,

@@ -6537,16 +6537,28 @@ impl Manager for ManagerDaemonService {
 
         // Running sessions have no row: they come from the session index
         // of this manager and its peers, after the rows.
-        let (sessions, complete, as_of) = self
-            .list_job_sessions(&inner.job_id, group.as_deref())
+        let session_limit = inner
+            .session_limit
+            .unwrap_or(DEFAULT_SESSION_LIST_LIMIT)
+            .min(MAX_SESSION_LIST_LIMIT);
+        let listing = self
+            .list_job_sessions(
+                &inner.job_id,
+                group.as_deref(),
+                session_limit,
+                &inner.session_page_token,
+            )
             .await;
-        instances.extend(sessions);
+        instances.extend(listing.infos);
 
         Ok(Response::new(ListInstancesReply {
             instances,
             next_idle_page_token,
-            complete,
-            as_of,
+            complete: listing.complete,
+            as_of: listing.as_of,
+            next_session_page_token: listing.next_page_token,
+            session_count: listing.count,
+            sessions_by_node: listing.by_node,
         }))
     }
 
@@ -13186,6 +13198,12 @@ fn volume_info(volume: crate::structs::Volume) -> crate::structs::VolumeInfo {
         updated_at: volume.updated_at,
     }
 }
+
+/// Sessions a ListInstances reply carries when the caller does not say.
+const DEFAULT_SESSION_LIST_LIMIT: u32 = 5_000;
+
+/// The most sessions one ListInstances reply carries.
+const MAX_SESSION_LIST_LIMIT: u32 = 50_000;
 
 impl ManagerDaemonService {
     /// Mint a boot ticket (`IssueBootTicketRequest.scope = "boot"`).

@@ -518,6 +518,7 @@ async fn a_manifest_only_instance_lives_in_the_bucket_until_started() -> R<()> {
                 include_idle: !token.is_empty() || size > 0,
                 idle_page_token: token.into(),
                 idle_page_size: size,
+                ..Default::default()
             }))
     };
     let plain = list("", 0).await?.into_inner();

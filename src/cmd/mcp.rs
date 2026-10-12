@@ -195,7 +195,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_list",
-            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `coldBoot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`coldBoot.reason` says why). An `archived` instance is suspended with its checkpoint moved to an archive manifest (`manifestUrl`); start it as usual. With `include_idle`, archived instances that have no row (suspend.archive = \"manifestOnly\") are listed from the bucket after the rows, one page at a time: pass `nextIdlePageToken` back as `idle_page_token`. A session task's running sessions are listed too, with `durable: false`; `complete: false` means some node's sessions could not be read, so the list may be missing some.",
+            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `coldBoot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`coldBoot.reason` says why). An `archived` instance is suspended with its checkpoint moved to an archive manifest (`manifestUrl`); start it as usual. With `include_idle`, archived instances that have no row (suspend.archive = \"manifestOnly\") are listed from the bucket after the rows, one page at a time: pass `nextIdlePageToken` back as `idle_page_token`. A session task's running sessions are listed too, with `durable: false`, a page at a time (session_limit, default 5000; pass nextSessionPageToken back as session_page_token), with sessionCount and sessionsByNode totals; `complete: false` means some node's sessions could not be read, so the list may be missing some.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -203,7 +203,9 @@ fn tool_defs() -> Vec<ToolDef> {
                     "group": { "type": "string", "description": "Optional task-group filter." },
                     "include_idle": { "type": "boolean", "description": "Also list archived instances with no row, from the contentStore. Default false." },
                     "idle_page_token": { "type": "string", "description": "With include_idle: the previous reply's nextIdlePageToken." },
-                    "idle_page_size": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "With include_idle: the most bucket-listed instances to return (default 1000)." }
+                    "idle_page_size": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "With include_idle: the most bucket-listed instances to return (default 1000)." },
+                    "session_limit": { "type": "integer", "minimum": 0, "maximum": 50000, "description": "The most running sessions to list, in id order (default 5000). 0 lists none and returns only sessionCount and sessionsByNode, which is the cheap way to count sessions at any scale." },
+                    "session_page_token": { "type": "string", "description": "The previous reply's nextSessionPageToken, for the next page of sessions." }
                 },
                 "required": ["job_id"],
                 "additionalProperties": false
@@ -1554,6 +1556,11 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 .and_then(Value::as_u64)
                 .map(|size| size.min(u64::from(u32::MAX)) as u32)
                 .unwrap_or(0);
+            let session_limit = args
+                .get("session_limit")
+                .and_then(Value::as_u64)
+                .map(|limit| limit.min(u64::from(u32::MAX)) as u32);
+            let session_page_token = opt_str_arg(&args, "session_page_token").unwrap_or_default();
             let mut client = connect().await?;
             grpc(client.list_instances(ListInstancesRequest {
                 job_id,
@@ -1561,6 +1568,8 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 include_idle,
                 idle_page_token,
                 idle_page_size,
+                session_limit,
+                session_page_token,
             }))
             .await
         }

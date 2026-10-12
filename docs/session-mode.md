@@ -252,6 +252,17 @@ The reply adds two fields:
 - **`asOf`**: when the session part was read. A session's own entry can be
   up to one heartbeat older.
 
+**Paging and counts.** A reply carries at most `--session-limit` sessions
+(default 5,000, at most 50,000), lowest ids first, and
+`nextSessionPageToken` when more remain: pass it back as
+`--session-page-token`. Every reply also carries `sessionCount` and
+`sessionsByNode`, read from the per-node totals each manager keeps rather
+than from the sessions themselves, so `--session-limit 0` counts a job's
+sessions at any scale without listing one. A page is read from every
+manager's index at that moment, so a session that starts or ends between
+pages can be missed or not; a session id that two nodes briefly share can
+show only one copy at a page boundary.
+
 A session that started a moment ago appears from the router's record of
 the start until its node reports it. A node silent for 120 seconds is
 dropped from the index, and its sessions disappear from listings.

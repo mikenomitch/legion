@@ -4028,6 +4028,16 @@ message ListInstancesRequest {
   // With `include_idle`: the most bucket-listed instances to return.
   // Default 1000, at most 10000.
   uint32 idle_page_size = 5;
+
+  // The most running sessions (`mode = "session"`) to return, in session
+  // id order. Unset: 5000. At most 50000. 0 returns no sessions, only
+  // `session_count` and `sessions_by_node`: what a dashboard needs at any
+  // scale. Rows are always listed in full.
+  optional uint32 session_limit = 6;
+
+  // Where the session listing resumes: the previous reply's
+  // `next_session_page_token`. Empty starts at the lowest id.
+  string session_page_token = 7;
 }
 
 // Reply payload for ListInstances.
@@ -4052,6 +4062,18 @@ message ListInstancesReply {
   // When the session part of the listing was read, RFC 3339. A session's
   // own entry can be up to one heartbeat older than this.
   string as_of = 4;
+
+  // The token for the next page of sessions (`session_page_token`). Empty
+  // when this reply holds the last of them.
+  string next_session_page_token = 5;
+
+  // How many running sessions the job has, from the session index's
+  // per-node totals, whatever `session_limit` returned. Counted like
+  // `complete`: nodes not reported yet are missing from it.
+  uint64 session_count = 6;
+
+  // `session_count` by node id.
+  map<string, uint64> sessions_by_node = 7;
 }
 
 // Request payload for PromoteInstance.
@@ -10920,6 +10942,14 @@ message QuerySessionsRequest {
   // asks its peers about all the derived ids newly reported to it once a
   // second in one call. Router starts not yet reported are not included.
   repeated string session_ids = 5;
+
+  // With `job_id` (not `usage_only`): only sessions whose id sorts after
+  // this one. With `limit`, a page of a listing.
+  string after_session_id = 6;
+
+  // With `job_id` (not `usage_only`): at most this many sessions, the
+  // lowest ids first. 0 returns them all.
+  uint32 limit = 7;
 }
 
 // Reply payload for RaftTransport.QuerySessions.

@@ -14,6 +14,17 @@ use crate::structs::{
 };
 use serde::{Deserialize, Serialize};
 
+/// The session half of a ListInstances reply.
+#[derive(Debug, Default)]
+pub(super) struct SessionListing {
+    pub infos: Vec<InstanceInfo>,
+    pub complete: bool,
+    pub as_of: String,
+    pub next_page_token: String,
+    pub count: u64,
+    pub by_node: std::collections::HashMap<String, u64>,
+}
+
 /// What a promotion records under its idempotency key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RecordedPromotion {
@@ -223,17 +234,22 @@ impl ManagerDaemonService {
         }
     }
 
-    /// The running sessions of a job for ListInstances, after its rows: the
-    /// infos, whether every node holding an envelope for the job has
-    /// reported, and when the view was read.
+    /// The running sessions of a job for ListInstances: a page of them in id
+    /// order, whether every envelope node has reported, when the index was
+    /// read, the next page's token, and the totals by node.
     pub(super) async fn list_job_sessions(
         &self,
         job_id: &str,
         group: Option<&str>,
-    ) -> (Vec<InstanceInfo>, bool, String) {
-        let config = match self.store.get_job_config(job_id) {
-            Ok(config) => config,
-            Err(_) => return (Vec::new(), true, String::new()),
+        limit: u32,
+        after: &str,
+    ) -> SessionListing {
+        let mut listing = SessionListing {
+            complete: true,
+            ..Default::default()
+        };
+        let Ok(config) = self.store.get_job_config(job_id) else {
+            return listing;
         };
         let session_tasks: Vec<&TaskConfig> = config
             .tasks
@@ -242,55 +258,94 @@ impl ManagerDaemonService {
             .filter(|task| group.is_none_or(|group| task.group == group))
             .collect();
         if session_tasks.is_empty() {
-            return (Vec::new(), true, String::new());
+            return listing;
         }
-        let view = sessions::query(
+        // One task named when the group narrows to one, so peers filter.
+        let task_name = match (group, session_tasks.as_slice()) {
+            (Some(_), [only]) => only.name.clone(),
+            _ => String::new(),
+        };
+
+        // Totals, from the per-node usage every index keeps: cheap at any
+        // count.
+        let usage = sessions::query(
             &self.store,
             QuerySessionsRequest {
                 job_id: job_id.to_string(),
+                task_name: task_name.clone(),
+                usage_only: true,
                 ..Default::default()
             },
         )
         .await;
-        let mut by_id: std::collections::BTreeMap<String, Vec<IndexedSession>> =
-            std::collections::BTreeMap::new();
-        for entry in view.sessions {
-            let Some(status) = entry.status.as_ref() else {
-                continue;
-            };
-            if !session_tasks
-                .iter()
-                .any(|task| task.name == status.task_name)
-            {
-                continue;
-            }
-            by_id
-                .entry(status.session_id.clone())
-                .or_default()
-                .push(entry);
+        for (node_id, node_usage) in &usage.usage {
+            listing.count += u64::from(node_usage.sessions);
+            listing
+                .by_node
+                .insert(node_id.clone(), u64::from(node_usage.sessions));
         }
-        let infos = by_id
-            .into_values()
-            .filter_map(sessions::winner)
-            .map(|(kept, _)| {
-                let task_name = kept
-                    .status
-                    .as_ref()
-                    .map(|status| status.task_name.clone())
-                    .unwrap_or_default();
-                sessions::instance_info(&kept, &sessions::group_of(&config, &task_name))
-            })
-            .collect();
-        let mut complete = true;
+        listing.as_of = usage.as_of.clone();
+        let mut covered = usage.covered;
+
+        if limit > 0 {
+            let view = sessions::query(
+                &self.store,
+                QuerySessionsRequest {
+                    job_id: job_id.to_string(),
+                    task_name: task_name.clone(),
+                    after_session_id: after.to_string(),
+                    limit: limit.saturating_add(1),
+                    ..Default::default()
+                },
+            )
+            .await;
+            covered.extend(view.covered);
+            listing.as_of = view.as_of;
+            let mut by_id: std::collections::BTreeMap<String, Vec<IndexedSession>> =
+                std::collections::BTreeMap::new();
+            for entry in view.sessions {
+                let Some(status) = entry.status.as_ref() else {
+                    continue;
+                };
+                by_id
+                    .entry(status.session_id.clone())
+                    .or_default()
+                    .push(entry);
+            }
+            if by_id.len() > limit as usize {
+                let keep: Vec<String> = by_id.keys().take(limit as usize).cloned().collect();
+                listing.next_page_token = keep.last().cloned().unwrap_or_default();
+                by_id.retain(|id, _| keep.binary_search(id).is_ok());
+            }
+            listing.infos = by_id
+                .into_values()
+                .filter_map(sessions::winner)
+                .filter(|(kept, _)| {
+                    kept.status.as_ref().is_some_and(|status| {
+                        session_tasks
+                            .iter()
+                            .any(|task| task.name == status.task_name)
+                    })
+                })
+                .map(|(kept, _)| {
+                    let task_name = kept
+                        .status
+                        .as_ref()
+                        .map(|status| status.task_name.clone())
+                        .unwrap_or_default();
+                    sessions::instance_info(&kept, &sessions::group_of(&config, &task_name))
+                })
+                .collect();
+        }
         for task in &session_tasks {
             match sessions::envelope_nodes(&self.store, job_id, &task.name) {
                 Ok(nodes) => {
-                    complete &= nodes.iter().all(|node| view.covered.contains(node));
+                    listing.complete &= nodes.iter().all(|node| covered.contains(node));
                 }
-                Err(_) => complete = false,
+                Err(_) => listing.complete = false,
             }
         }
-        (infos, complete, view.as_of)
+        listing
     }
 
     pub(super) async fn promote_instance_rpc(
