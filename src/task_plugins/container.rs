@@ -37,10 +37,65 @@ struct ContainerTaskConfig {
     #[serde(default)]
     files: Vec<ContainerInjectedFile>,
 
+    /// The Linux privilege floor (docs/task-runtime-container.md,
+    /// "Security"). Both defaults are on; either opt-out makes the task
+    /// host-level. Ignored on macOS, where each container is a VM.
+    #[serde(default)]
+    security: ContainerSecurity,
+
     /// Additional plugin-specific fields reserved for forward compatibility.
     #[serde(default, flatten)]
     #[schemars(skip)]
     _extra: HashMap<String, Value>,
+}
+
+/// `config.security`: what confines a Linux container beyond its
+/// namespaces and its three capabilities.
+#[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ContainerSecurity {
+    /// Run the container in its own user namespace: container ids 0-65535
+    /// map to a 65,536-id host range that belongs to this allocation alone,
+    /// so container root is not host root. `false` runs container root as
+    /// host root, which makes the task host-level. Default `true`.
+    #[serde(default = "default_true")]
+    #[schemars(default = "default_true")]
+    pub(crate) user_namespace: bool,
+    /// `"default"`: refuse the syscalls Docker's default profile refuses
+    /// (mounts, namespaces, kernel modules, `bpf`, the keyring, ...).
+    /// `"unconfined"`: no filter, which makes the task host-level.
+    #[serde(default = "default_seccomp")]
+    #[schemars(default = "default_seccomp")]
+    pub(crate) seccomp: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_seccomp() -> String {
+    SECCOMP_DEFAULT.to_string()
+}
+
+/// `security.seccomp` values.
+pub(crate) const SECCOMP_DEFAULT: &str = "default";
+pub(crate) const SECCOMP_UNCONFINED: &str = "unconfined";
+
+impl Default for ContainerSecurity {
+    fn default() -> Self {
+        ContainerSecurity {
+            user_namespace: true,
+            seccomp: default_seccomp(),
+        }
+    }
+}
+
+impl ContainerSecurity {
+    /// Whether either opt-out is set, which makes the task host-level
+    /// (worker-plane-auth plan §6.16).
+    pub(crate) fn is_host_level(&self) -> bool {
+        !self.user_namespace || self.seccomp == SECCOMP_UNCONFINED
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -66,8 +121,25 @@ impl ContainerTaskConfig {
         if self.command.is_empty() {
             bail!("container task command must include at least one entry");
         }
+        if ![SECCOMP_DEFAULT, SECCOMP_UNCONFINED].contains(&self.security.seccomp.as_str()) {
+            bail!(
+                "security.seccomp must be \"{SECCOMP_DEFAULT}\" or \"{SECCOMP_UNCONFINED}\" \
+                 (got {:?})",
+                self.security.seccomp
+            );
+        }
         Ok(())
     }
+}
+
+/// The container's `config.security`, for checks outside the runtime (the
+/// host-level classification, validate warnings). Defaults when the config
+/// does not parse; the runtime's own validation reports that.
+pub(crate) fn container_security(config: &Value) -> ContainerSecurity {
+    config
+        .get("security")
+        .and_then(|security| serde_json::from_value(security.clone()).ok())
+        .unwrap_or_default()
 }
 
 /// Env override selecting the Linux OCI runtime binary. Defaults to `youki`;
@@ -853,6 +925,23 @@ impl TaskPlugin for ContainerTaskPlugin {
                 } else {
                     None
                 };
+                // The privilege floor (worker-plane-auth plan §6.14): an id
+                // range of this allocation's own, the default seccomp
+                // profile, and a cgroup namespace.
+                let id_map = if config.security.user_namespace {
+                    let alloc_dir = instance
+                        .alloc_dir
+                        .clone()
+                        .unwrap_or_else(|| scratch.clone());
+                    Some(crate::task_plugins::userns::claim(&alloc_dir)?)
+                } else {
+                    None
+                };
+                let security = oci_bundle::BundleSecurity {
+                    id_map,
+                    seccomp: config.security.seccomp == SECCOMP_DEFAULT,
+                    cgroup_namespace: true,
+                };
                 let image_stop_signal = oci_bundle::build_bundle(
                     &layout,
                     &bundle,
@@ -866,6 +955,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                         resolver: resolver.as_deref(),
                         resolv_conf: None,
                         netns: gated_netns.as_deref(),
+                        security,
                     },
                 )?;
                 // Recorded now, while the layout is still on disk: teardown
@@ -1528,6 +1618,187 @@ mod tests {
         assert!(
             stderr.contains("stderr-line"),
             "stderr captured: {stderr:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_floor_is_on_by_default_and_opt_outs_are_warned_test() -> R<()> {
+        let parsed = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine", "command": ["true"],
+        }))?;
+        assert_eq!(parsed.security, ContainerSecurity::default());
+        assert!(parsed.security.user_namespace);
+        assert_eq!(parsed.security.seccomp, "default");
+        assert!(ContainerTaskConfig::from_value(&json!({
+            "image": "alpine", "command": ["true"], "security": { "seccomp": "loose" },
+        }))
+        .is_err());
+        assert!(
+            ContainerTaskConfig::from_value(&json!({
+                "image": "alpine", "command": ["true"], "security": { "userNs": false },
+            }))
+            .is_err(),
+            "unknown security fields are refused"
+        );
+
+        let job: crate::structs::JobConfig = serde_json::from_value(json!({
+            "name": "j",
+            "tasks": [
+                { "name": "floor", "runtime": "container",
+                  "config": { "image": "alpine", "command": ["true"] } },
+                { "name": "rootful", "runtime": "container",
+                  "config": { "image": "alpine", "command": ["true"],
+                              "security": { "userNamespace": false, "seccomp": "unconfined" } } },
+            ],
+        }))?;
+        let warnings = crate::task_plugins::container_security_warnings(&job);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings
+            .iter()
+            .all(|w| w.contains("\"rootful\"") && w.contains("host-level")));
+        assert!(!crate::task_plugins::container_opts_out_of_the_floor(
+            &job.tasks[0]
+        ));
+        assert!(crate::task_plugins::container_opts_out_of_the_floor(
+            &job.tasks[1]
+        ));
+        Ok(())
+    }
+
+    /// Runs one container to completion with `command` and returns its
+    /// stdout. `alloc_dir` is the allocation's private directory (its user
+    /// namespace slot lives there).
+    #[cfg(target_os = "linux")]
+    fn run_to_completion(
+        id: i64,
+        command: Value,
+        alloc_dir: &std::path::Path,
+        volumes: Vec<crate::task_plugins::MountedVolume>,
+    ) -> R<String> {
+        let plugin = ContainerTaskPlugin;
+        let allocation = alloc_with_id(id);
+        let task = container_task("floor", command);
+        let mut instance = TaskInstance {
+            alloc_dir: Some(alloc_dir.to_path_buf()),
+            log_dir: Some(alloc_dir.join("logs")),
+            volumes,
+            ..TaskInstance::default()
+        };
+        plugin.start(&allocation, &task, &mut instance)?;
+        let status = instance.child.take().expect("child handle set").wait()?;
+        let stdout = std::fs::read_to_string(alloc_dir.join("logs").join("stdout.log"))?;
+        let stderr = std::fs::read_to_string(alloc_dir.join("logs").join("stderr.log"))?;
+        assert!(
+            status.success(),
+            "container {id}: {status:?}\n{stdout}\n{stderr}"
+        );
+        Ok(stdout)
+    }
+
+    /// Worker-plane-auth plan Phase 6, on a real runtime: container root is
+    /// an unprivileged host id from this allocation's own range, the
+    /// default seccomp profile refuses a new user namespace, and the
+    /// container sees its own cgroup as the root. Needs root, an OCI
+    /// runtime, and network:
+    ///
+    /// ```text
+    /// LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_security -- --ignored --nocapture
+    /// ```
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root, an OCI runtime (youki/runc/crun) + network"]
+    fn oci_runtime_security_floor_holds_test() -> R<()> {
+        let allocs = tempfile::tempdir()?;
+        let alloc_dir = allocs.path().join("9501");
+        let stdout = run_to_completion(
+            9501,
+            json!([
+                "/bin/sh",
+                "-c",
+                "echo uid_map: $(cat /proc/self/uid_map); \
+                 unshare -U true 2>/dev/null; echo unshare=$?; \
+                 echo cgroups: $(cut -d: -f3 /proc/self/cgroup | sort -u)"
+            ]),
+            &alloc_dir,
+            Vec::new(),
+        )?;
+        let range = crate::task_plugins::userns::claim(&alloc_dir)?;
+        assert!(
+            stdout.contains(&format!("uid_map: 0 {} {}", range.host_base, range.size)),
+            "container root is the range's base, not host root: {stdout}"
+        );
+        assert!(
+            !stdout.contains("unshare=0"),
+            "seccomp refuses a new user namespace: {stdout}"
+        );
+        assert!(
+            stdout.contains("cgroups: /\n") || stdout.trim_end().ends_with("cgroups: /"),
+            "the container sees its own cgroup as the root: {stdout}"
+        );
+        Ok(())
+    }
+
+    /// A volume keeps its host owners on disk and works across a reschedule
+    /// to an allocation with a different id range: idmapped mounts. Needs
+    /// root, an OCI runtime, network, and a kernel and filesystem with
+    /// idmapped mounts (Linux 5.12+).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root, an OCI runtime (youki/runc/crun) + network"]
+    fn oci_runtime_security_volume_survives_a_new_range_test() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        let allocs = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let volume = crate::task_plugins::MountedVolume {
+            name: "data".into(),
+            mode: crate::volumes::VolumeMode::Filesystem,
+            host_path: data.path().to_path_buf(),
+            path: Some("/data".into()),
+            fs: None,
+            fresh: false,
+            read_only: false,
+        };
+        // Two allocations at once, so they hold different ranges.
+        let first = allocs.path().join("9601");
+        let second = allocs.path().join("9602");
+        let first_range = crate::task_plugins::userns::claim(&first)?;
+        let second_range = crate::task_plugins::userns::claim(&second)?;
+        assert_ne!(first_range, second_range);
+        run_to_completion(
+            9601,
+            json!([
+                "/bin/sh",
+                "-c",
+                "echo one > /data/note && chmod 600 /data/note"
+            ]),
+            &first,
+            vec![volume.clone()],
+        )?;
+        let meta = std::fs::metadata(data.path().join("note"))?;
+        assert_eq!(
+            (meta.uid(), meta.gid()),
+            (0, 0),
+            "on disk, container root's file is owned by host root"
+        );
+        let stdout = run_to_completion(
+            9602,
+            json!([
+                "/bin/sh",
+                "-c",
+                "cat /data/note && echo two >> /data/note && stat -c %u /data/note"
+            ]),
+            &second,
+            vec![volume],
+        )?;
+        assert!(stdout.contains("one"), "{stdout}");
+        assert!(
+            stdout.trim_end().ends_with('0'),
+            "owned by container root inside: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data.path().join("note"))?,
+            "one\ntwo\n"
         );
         Ok(())
     }

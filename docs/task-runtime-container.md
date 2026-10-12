@@ -386,6 +386,78 @@ in its own VM on its own network, and macOS has no network namespaces. The
 full model, the fail-closed rules, and the limits are in
 [Network Handlers](network-handlers.md#gated-mode).
 
+## Security
+
+On Linux, every container gets a privilege floor on top of its namespaces
+and its three capabilities (`CAP_AUDIT_WRITE`, `CAP_KILL`,
+`CAP_NET_BIND_SERVICE`, with `noNewPrivileges`). It is on by default:
+
+```nickel
+config = {
+  image = "postgres:17",
+  command = ["postgres"],
+  security = {
+    userNamespace = true,   # false runs container root as host root
+    seccomp = "default",    # "unconfined" removes the filter
+  },
+},
+```
+
+- **A user namespace per allocation.** Container ids `0-65535` map to a
+  65,536-id range on the host that belongs to this allocation alone, so
+  container root is an unprivileged host id no other allocation or host user
+  shares. The worker owns the pool (host ids from `1048576`, 4,096 ranges
+  per node; don't hand those ids to anything else) and records each
+  allocation's range in its private directory, so an in-place restart keeps
+  it. Image layers are extracted with their owners already shifted into the
+  range. The task directory and every volume are **idmapped mounts**: on
+  disk they keep host ownership, inside they belong to container root, so a
+  volume reattached to an allocation with a different range keeps working,
+  and files the worker rewrites later (KV files, templates) stay readable.
+  Inside a user namespace `/sys` is a read-only bind of the host's, not a
+  fresh `sysfs`, because a gated or host network namespace does not belong
+  to the container's user namespace.
+- **A default seccomp profile.** It refuses, with `EPERM`, the syscalls
+  Docker's default profile refuses: `mount` and the new mount API,
+  `unshare`, `setns`, and `clone` with a namespace flag, kernel modules and
+  `kexec`, `bpf`, `perf_event_open`, `userfaultfd`, the kernel keyring,
+  clock and time setting, `reboot`, swap, `acct`, `quotactl`, `pivot_root`,
+  cross-process memory access, handle-based opens, NUMA policy, and legacy
+  syscalls. `clone3` answers `ENOSYS`, so libc falls back to `clone`, whose
+  flags the filter can see. Docker's profile is an allowlist; Legion's is a
+  denylist over the same calls, so a syscall a future kernel adds is allowed
+  until the list names it.
+- **A cgroup namespace**, so the container sees its own cgroup as the root
+  and not the host's tree.
+
+**Opting out** of either is per task. `userNamespace = false` runs container
+root as host root, and `seccomp = "unconfined"` removes the filter. Each
+makes the task host-level, and `job validate`, `job run`, and `job plan`
+say so:
+
+```text
+warning: task "db" sets security.userNamespace = false: on Linux nodes its root is host
+root, so a container escape owns the node. The task is host-level (it needs the host
+grant on job:write)
+```
+
+**Requirements and failure modes.**
+
+- Idmapped mounts need Linux 5.12 or later and a filesystem that supports
+  them (ext4, xfs, btrfs; tmpfs from 6.3). Without them, a start with a task
+  directory or volume fails with the runtime's error naming the mount; set
+  `userNamespace = false` on that node's jobs, or move them to a newer
+  kernel.
+- An image whose files are owned by ids above `65535` cannot be extracted
+  into a range; the start fails naming the file.
+- More than 4,096 containers with a user namespace on one node at once fail
+  to start with `no free user namespace range on this node`.
+- macOS needs none of this: Apple `container` runs each container in its own
+  VM with its own kernel, and `security` is ignored there.
+- Verified with `runc` 1.5 (`oci_runtime_security_*` tests below). `youki`
+  and `crun` take the same OCI fields, but the floor has not been run on them
+  in this repository.
+
 ## Capability Summary
 
 | Capability | Supported |
@@ -444,13 +516,19 @@ node, as root:
 cargo test --lib gated_start_overhead -- --ignored --nocapture
 # a whole container start, host vs gated, 20 runs each
 LEGION_OCI_RUNTIME=runc cargo test --lib container_start_latency -- --ignored --nocapture
+# the privilege floor: container root's host id, seccomp refusing a new user
+# namespace, the cgroup namespace, and a volume across two id ranges
+LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_security -- --ignored --nocapture
 ```
 
 On a 4-core Linux 6.18 VM with `runc` and an unoptimized build, the
 namespace and listeners added p50 1.0 ms and p99 3.9 ms (teardown p50
 0.1 ms). A whole `alpine` container start that runs `/bin/true` took p50
 354 ms and p99 414 ms on host networking, and p50 360 ms and p99 506 ms
-gated.
+gated. With the [privilege floor](#security) on as well (user namespace,
+seccomp, cgroup namespace), a rerun measured p50 396 ms and p99 497 ms on
+host networking and p50 376 ms and p99 482 ms gated: at 20 runs, the floor's
+cost is inside the run-to-run noise.
 
 ## Current Scope and Limitations
 

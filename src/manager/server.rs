@@ -1988,6 +1988,7 @@ impl ManagerDaemonService {
                 .chain(crate::task_plugins::resource_submit_warnings(&config))
                 .chain(crate::structs::suspend::sandbox_submit_warnings(&config))
                 .chain(self.gated_egress_submit_warnings(&config))
+                .chain(crate::task_plugins::container_security_warnings(&config))
                 .collect(),
         })
     }
@@ -4502,7 +4503,11 @@ impl Manager for ManagerDaemonService {
             index_usage,
             preemptions,
             preemption_mode: scheduler.preemption_settings().mode.as_str().to_string(),
-            warnings: self.gated_egress_submit_warnings(&config),
+            warnings: self
+                .gated_egress_submit_warnings(&config)
+                .into_iter()
+                .chain(crate::task_plugins::container_security_warnings(&config))
+                .collect(),
         };
 
         Ok(Response::new(reply))

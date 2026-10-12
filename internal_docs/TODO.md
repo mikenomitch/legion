@@ -89,9 +89,25 @@ How to use it:
         `EPERM` and the counter reports it). Built on a hybrid-cgroup host,
         where only the rendered table was checked against the real `nft`
         (`the_rendered_table_passes_nft_check_test`).
-  - [ ] Phase 6: the container privilege floor: per-allocation user
-        namespaces, Docker's default seccomp profile, a cgroup namespace
-        (plan §6.14).
+  - [x] Phase 6: the container privilege floor: per-allocation user
+        namespaces from a worker-owned id pool, shifted layer extraction,
+        idmapped task directory and volumes, a default seccomp profile over
+        Docker's blocked set, a cgroup namespace, `/sys` bound read-only
+        under a user namespace, the `security` block, and opt-out warnings
+        (plan §6.14; calls 37 to 39). Docs:
+        [task-runtime-container.md](../docs/task-runtime-container.md#security).
+  - [ ] Run the privilege floor on youki and crun
+        (`LEGION_OCI_RUNTIME=youki cargo test --lib oci_runtime_security -- --ignored`).
+        Only runc 1.5 was available when it was built.
+  - [ ] Vendor Docker's default seccomp allowlist once CI can run it on every
+        runtime (calls entry 37): the shipped profile is a denylist over the
+        same blocked set.
+  - [ ] Five pre-existing ignored runc tests fail on a hybrid-cgroup host
+        before and after the floor (`oci_runtime_exec_runs_inside_the_container`,
+        `..._sees_task_dir_files_and_their_rewrites`,
+        `..._enforces_a_declared_memory_limit`, `..._stop_force_kills_at_the_deadline`,
+        `..._stop_lets_a_trapping_container_drain`). Re-run them on a cgroup v2
+        host to tell environment from bug.
   - [ ] Phase 7: `exec` trust. Gated `exec` refuses root, the user switch
         drops supplementary groups (it never calls `setgroups` today,
         `src/task_plugins/exec.rs:679-687`), and host-level jobs need `host`

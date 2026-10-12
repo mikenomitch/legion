@@ -1358,6 +1358,7 @@ impl SandboxTaskPlugin {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                security: oci_bundle::BundleSecurity::default(),
             },
         )?;
         let mut cmd = Command::new(binary);

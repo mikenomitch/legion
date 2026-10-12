@@ -884,3 +884,68 @@ now has a `legion/` tree.
 cgroup is the one identity every runtime already carries (runc, the exec
 supervisor, the VMM). Skipping the guard would make a scheduling knob silently
 turn a security floor off. **One consistent floor won.**
+
+## 37. The seccomp profile is a denylist over Docker's blocked set, not Docker's JSON
+
+Made while implementing Phase 6. The plan says to embed Docker's default
+profile verbatim. That profile is an allowlist of roughly 350 syscalls across
+architectures, with argument filters and capability-conditional blocks.
+Legion ships the inverse: allow by default, refuse with `EPERM` the syscalls
+Docker documents as blocked (mounts and the new mount API, `unshare`,
+`setns`, namespace flags on `clone`, modules, `kexec`, `bpf`, the keyring,
+clocks, `reboot`, and the rest), and `clone3` with `ENOSYS`.
+
+**Alternative.** Vendor Docker's JSON with its Apache-2.0 notice.
+
+**Trade-off.** A syscall a future kernel adds is allowed until the list names
+it, where Docker's allowlist refuses it by default. Some calls Docker allows
+only with an argument filter (`personality`) are allowed outright.
+
+**Why.** A reproduction of a 900-line allowlist that is wrong for one
+architecture breaks containers in ways that look like application bugs, and
+there is no way to verify one against every runtime here. The denylist is
+short enough to review line by line, covers what an escape needs (namespaces,
+mounts, modules, `bpf`, the keyring), and the doc states the difference.
+Revisit by vendoring the real profile once a CI runner can run it on every
+runtime. **Reviewability won.**
+
+## 38. The task directory is an idmapped mount, not chowned to the range
+
+Made while implementing Phase 6. The plan says to chown `/legion/task` to the
+range's root, the way `exec` hands its tree to `user`. The worker rewrites
+files there after start (KV files with `onChange = "update"`, templates), and
+a file it creates as host root after the chown would be unreadable to a
+`0600`-mode consumer inside. So the task directory is an idmapped mount, the
+same as volumes: on disk it stays host-owned, inside it is container root's.
+
+**Alternative.** Chown at start, and chown every later write.
+
+**Trade-off.** Idmapped mounts need Linux 5.12+ and a supporting filesystem
+(tmpfs from 6.3), so an older node fails a userns container's start instead
+of running it.
+
+**Why.** Every write path would otherwise need to know about ranges, and one
+missed path is a silent permission failure. The kernel floor is already
+required for volumes. **One mechanism won.**
+
+## 39. Inside a user namespace, `/sys` is a read-only bind
+
+Made while implementing Phase 6, settling the plan's open ordering question.
+Mounting `sysfs` needs the network namespace to belong to the container's
+user namespace, and neither a gated namespace (the worker creates it) nor the
+host's does. Legion binds the host's `/sys` read-only (`rbind`, `nosuid`,
+`noexec`, `nodev`, `ro`) whenever the container has a user namespace, instead
+of creating the gated namespace inside the allocation's user namespace.
+
+**Alternative.** Create the gated namespace inside the user namespace, so
+`sysfs` mounts.
+
+**Trade-off.** The container sees the host's `/sys` (read-only), including the
+host's network interfaces under `/sys/class/net`, rather than a view of its
+own namespace.
+
+**Why.** It works on every runtime (it is what runc falls back to on its own)
+and keeps the worker's namespace code unchanged. Verified with runc 1.5, gated
+and host, in `container_start_latency_host_vs_gated_benchmark` and the
+`oci_runtime_security_*` tests; youki and crun were not available here.
+**Portability won.**

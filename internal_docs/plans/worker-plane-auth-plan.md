@@ -4,8 +4,8 @@
 
 **Status: IN EXECUTION.** Phases 0 (ACLs on by default), 1 (the mTLS worker
 plane), 2 (the host guard in the datapath), 3 (Linux containers gated by
-default), 4 (the encrypted worker-to-manager channel), and 5 (the host guard
-in the kernel) shipped. The plan
+default), 4 (the encrypted worker-to-manager channel), 5 (the host guard in
+the kernel), and 6 (the container privilege floor) shipped. The plan
 has two halves that share one threat: something reaching a node's control
 plane that shouldn't.
 
@@ -1517,6 +1517,14 @@ item in `internal_docs/TODO.md`.
   loading the table and dropping a real connection
   (`kernel_guard_loads_and_drops_metadata_from_an_allocation_test`, ignored,
   needs a cgroup v2 host).
+- **Phase 6** ran on the same VM with runc 1.5.1: the
+  `oci_runtime_security_*` tests (container root is the range's base id,
+  `unshare -U` is refused, the cgroup namespace holds, and a volume written by
+  one allocation is read and appended by another with a different range,
+  with host-root ownership on disk), the start benchmark with the floor on,
+  and the unit tests for the spec, the pool, and the profile. Not run: youki
+  and crun. Five older ignored runc tests fail here with and without the
+  floor (listed in TODO.md).
 
 ## 10. Rollout and backward compatibility
 

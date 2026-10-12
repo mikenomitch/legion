@@ -39,6 +39,18 @@ pub(crate) struct ImageConfig {
 /// The directory is cleared first: a rootfs assembled over stale content
 /// would silently resurrect files a newer image deleted.
 pub(crate) fn materialize_rootfs(oci_layout: &Path, rootfs: &Path) -> R<ImageConfig> {
+    materialize_rootfs_shifted(oci_layout, rootfs, None)
+}
+
+/// [`materialize_rootfs`], writing every file's owner already shifted into
+/// `shift` (a user-namespaced container's host id range): the layer's
+/// `uid:gid` becomes `base+uid:base+gid`, so container root owns its rootfs
+/// without a separate chown pass.
+pub(crate) fn materialize_rootfs_shifted(
+    oci_layout: &Path,
+    rootfs: &Path,
+    shift: Option<crate::task_plugins::userns::IdRange>,
+) -> R<ImageConfig> {
     let image = read_image_config(oci_layout)?;
     if rootfs.exists() {
         std::fs::remove_dir_all(rootfs)
@@ -47,8 +59,14 @@ pub(crate) fn materialize_rootfs(oci_layout: &Path, rootfs: &Path) -> R<ImageCon
     std::fs::create_dir_all(rootfs)
         .with_context(|| format!("create rootfs {}", rootfs.display()))?;
     for layer in &image.layers {
-        extract_layer(layer, rootfs)
+        extract_layer(layer, rootfs, shift)
             .with_context(|| format!("extract layer {}", layer.display()))?;
+    }
+    #[cfg(unix)]
+    if let Some(range) = shift {
+        // The root directory itself, which no layer entry names.
+        std::os::unix::fs::lchown(rootfs, Some(range.host_base), Some(range.host_base))
+            .with_context(|| format!("chown {}", rootfs.display()))?;
     }
     Ok(image)
 }
@@ -80,7 +98,7 @@ pub(crate) fn build_bundle(
             .with_context(|| format!("clear bundle dir {}", bundle_dir.display()))?;
     }
     let rootfs = bundle_dir.join("rootfs");
-    let image = materialize_rootfs(oci_layout, &rootfs)?;
+    let image = materialize_rootfs_shifted(oci_layout, &rootfs, ctx.security.id_map)?;
 
     // Resolve the image user against the *extracted* rootfs so named users
     // (`postgres`, `nobody:nogroup`) map to their real uid/gid instead of
@@ -106,6 +124,7 @@ pub(crate) fn build_bundle(
         resolver: ctx.resolver,
         resolv_conf: resolv_conf.as_deref(),
         netns: ctx.netns,
+        security: ctx.security,
     };
     let spec = build_spec(command, env, &image, &user, &ctx);
     let config_path = bundle_dir.join("config.json");
@@ -208,7 +227,11 @@ fn safe_relative(path: &Path) -> Option<PathBuf> {
 /// Extracts one image layer over `rootfs`, applying overlayfs whiteouts:
 /// `.wh.<name>` deletes `<name>`, and `.wh..wh..opq` clears the directory's
 /// existing contents (an opaque directory) before later entries land.
-fn extract_layer(blob: &Path, rootfs: &Path) -> R<()> {
+fn extract_layer(
+    blob: &Path,
+    rootfs: &Path,
+    shift: Option<crate::task_plugins::userns::IdRange>,
+) -> R<()> {
     let mut file = std::fs::File::open(blob)?;
     let mut magic = [0u8; 4];
     let read = file.read(&mut magic)?;
@@ -259,7 +282,23 @@ fn extract_layer(blob: &Path, rootfs: &Path) -> R<()> {
 
         // `unpack_in` re-validates the path against the rootfs and resolves
         // hardlink/symlink targets safely.
-        entry.unpack_in(rootfs)?;
+        let unpacked = entry.unpack_in(rootfs)?;
+        #[cfg(unix)]
+        if let (true, Some(range)) = (unpacked, shift) {
+            let header = entry.header();
+            let uid = range.shift(header.uid().unwrap_or(0));
+            let gid = range.shift(header.gid().unwrap_or(0));
+            let (Some(uid), Some(gid)) = (uid, gid) else {
+                bail!(
+                    "{} is owned by an id outside the container's 0-{} range",
+                    rel.display(),
+                    range.size - 1
+                );
+            };
+            // `lchown`: a symlink is re-owned, never followed.
+            std::os::unix::fs::lchown(rootfs.join(&rel), Some(uid), Some(gid))
+                .with_context(|| format!("chown {}", rel.display()))?;
+        }
     }
     Ok(())
 }
@@ -559,6 +598,23 @@ pub(crate) struct BundleContext<'a> {
     /// created by the worker before start and holding loopback plus the
     /// datapath's listeners only.
     pub(crate) netns: Option<&'a Path>,
+    /// The privilege floor (docs/task-runtime-container.md, "Security").
+    pub(crate) security: BundleSecurity,
+}
+
+/// What confines a container beyond its namespaces and capabilities
+/// (worker-plane-auth plan §6.14). `Default` is none of it, which is what
+/// the sandbox runtime's dev mode and the bundle tests ask for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BundleSecurity {
+    /// A user namespace mapping container ids `0-65535` to this host range.
+    /// The rootfs is extracted with shifted owners, and the task directory
+    /// and volumes are idmapped mounts, so files keep their host owners.
+    pub(crate) id_map: Option<crate::task_plugins::userns::IdRange>,
+    /// The default seccomp profile (`crate::task_plugins::seccomp`).
+    pub(crate) seccomp: bool,
+    /// A cgroup namespace: the container sees its own cgroup as the root.
+    pub(crate) cgroup_namespace: bool,
 }
 
 fn build_spec(
@@ -586,9 +642,22 @@ fn build_spec(
               "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"] }),
         json!({ "destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue",
               "options": ["nosuid", "noexec", "nodev"] }),
-        json!({ "destination": "/sys", "type": "sysfs", "source": "sysfs",
-              "options": ["nosuid", "noexec", "nodev", "ro"] }),
     ];
+    // Inside a user namespace, `sysfs` can only be mounted when the network
+    // namespace belongs to that user namespace too, and a gated or host
+    // network namespace does not. A read-only recursive bind of the host's
+    // `/sys` works on every runtime (and is what runc falls back to).
+    if ctx.security.id_map.is_some() {
+        mounts.push(
+            json!({ "destination": "/sys", "type": "bind", "source": "/sys",
+              "options": ["rbind", "nosuid", "noexec", "nodev", "ro"] }),
+        );
+    } else {
+        mounts.push(
+            json!({ "destination": "/sys", "type": "sysfs", "source": "sysfs",
+              "options": ["nosuid", "noexec", "nodev", "ro"] }),
+        );
+    }
     mounts.extend(dns_mounts(ctx.resolv_conf));
     // The allocation's task directory, read-write, at the canonical mount
     // point. The *directory* is mounted, never individual files: the worker
@@ -596,16 +665,23 @@ fn build_spec(
     // through a directory bind mount and silently breaks through a per-file
     // one (the well-known docker pitfall).
     if let Some(task_dir) = ctx.task_dir {
-        mounts.push(json!({
-            "destination": crate::constants::CONTAINER_TASK_DIR,
-            "type": "bind",
-            "source": task_dir.display().to_string(),
-            "options": ["rbind", "rprivate", "rw"],
-        }));
+        mounts.push(idmapped(
+            json!({
+                "destination": crate::constants::CONTAINER_TASK_DIR,
+                "type": "bind",
+                "source": task_dir.display().to_string(),
+                "options": ["rbind", "rprivate", "rw"],
+            }),
+            ctx.security.id_map,
+        ));
     }
     // Volumes last so a job can deliberately shadow a default mount point —
     // the task-dir mount included.
-    mounts.extend(volume_mounts(ctx.volumes));
+    mounts.extend(
+        volume_mounts(ctx.volumes)
+            .into_iter()
+            .map(|mount| idmapped(mount, ctx.security.id_map)),
+    );
 
     // Namespaces: pid/ipc/uts/mount as before, plus — for a gated
     // allocation — the worker-created network namespace, joined by path. A
@@ -618,6 +694,12 @@ fn build_spec(
     ];
     if let Some(netns) = ctx.netns {
         namespaces.push(json!({ "type": "network", "path": netns.display().to_string() }));
+    }
+    if ctx.security.id_map.is_some() {
+        namespaces.push(json!({ "type": "user" }));
+    }
+    if ctx.security.cgroup_namespace {
+        namespaces.push(json!({ "type": "cgroup" }));
     }
 
     // The device-cgroup deny rule is unconditional; declared limits are
@@ -675,7 +757,27 @@ fn build_spec(
     if let Some(assignment) = ctx.assignment {
         spec["linux"]["cgroupsPath"] = Value::String(assignment.cgroup_path.display().to_string());
     }
+    if let Some(range) = ctx.security.id_map {
+        spec["linux"]["uidMappings"] = range.oci_mapping();
+        spec["linux"]["gidMappings"] = range.oci_mapping();
+    }
+    if ctx.security.seccomp {
+        spec["linux"]["seccomp"] = crate::task_plugins::seccomp::default_profile();
+    }
     spec
+}
+
+/// A bind mount, made an idmapped mount under a user namespace: files keep
+/// their host owners on disk, and appear inside with the container's ids
+/// (a host-root-owned file is the container root's). So a volume reattached
+/// to an allocation with a different range keeps working, and files the
+/// worker writes into the task directory later stay readable inside.
+fn idmapped(mut mount: Value, id_map: Option<crate::task_plugins::userns::IdRange>) -> Value {
+    if let Some(range) = id_map {
+        mount["uidMappings"] = range.oci_mapping();
+        mount["gidMappings"] = range.oci_mapping();
+    }
+    mount
 }
 
 #[cfg(test)]
@@ -747,6 +849,7 @@ mod tests {
             resolver: Some("127.42.0.1"),
             resolv_conf: None,
             netns: Some(netns),
+            security: BundleSecurity::default(),
         };
         let spec = build_spec(
             &["true".to_string()],
@@ -775,6 +878,83 @@ mod tests {
             .unwrap()
             .iter()
             .any(|n| n["type"] == "network"));
+    }
+
+    #[test]
+    fn the_privilege_floor_shapes_the_spec_test() {
+        let image = ImageConfig::default();
+        let user = ResolvedUser::default();
+        let range = crate::task_plugins::userns::IdRange::for_slot(3);
+        let task_dir = Path::new("/srv/legion/allocs/7/task");
+        let ctx = BundleContext {
+            hostname: "legion-7",
+            volumes: &[],
+            task_dir: Some(task_dir),
+            assignment: None,
+            resolver: None,
+            resolv_conf: None,
+            netns: None,
+            security: BundleSecurity {
+                id_map: Some(range),
+                seccomp: true,
+                cgroup_namespace: true,
+            },
+        };
+        let spec = build_spec(
+            &["true".to_string()],
+            &Default::default(),
+            &image,
+            &user,
+            &ctx,
+        );
+        let namespaces: Vec<&str> = spec["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["type"].as_str())
+            .collect();
+        assert!(namespaces.contains(&"user") && namespaces.contains(&"cgroup"));
+        let mapping = json!([{ "containerID": 0, "hostID": range.host_base, "size": 65536 }]);
+        assert_eq!(spec["linux"]["uidMappings"], mapping);
+        assert_eq!(spec["linux"]["gidMappings"], mapping);
+        assert_eq!(spec["linux"]["seccomp"]["defaultAction"], "SCMP_ACT_ALLOW");
+        let mounts = spec["mounts"].as_array().unwrap();
+        let sys = mounts.iter().find(|m| m["destination"] == "/sys").unwrap();
+        assert_eq!(
+            sys["type"], "bind",
+            "a user namespace binds /sys instead of mounting sysfs"
+        );
+        let task = mounts
+            .iter()
+            .find(|m| m["destination"] == crate::constants::CONTAINER_TASK_DIR)
+            .unwrap();
+        assert_eq!(
+            task["uidMappings"], mapping,
+            "the task directory is idmapped"
+        );
+
+        // With the floor off, none of it.
+        let plain = BundleContext {
+            security: BundleSecurity::default(),
+            ..ctx
+        };
+        let spec = build_spec(
+            &["true".to_string()],
+            &Default::default(),
+            &image,
+            &user,
+            &plain,
+        );
+        assert!(spec["linux"].get("uidMappings").is_none());
+        assert!(spec["linux"].get("seccomp").is_none());
+        let sys = spec["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["destination"] == "/sys")
+            .unwrap()
+            .clone();
+        assert_eq!(sys["type"], "sysfs");
     }
 
     #[test]
@@ -911,6 +1091,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                security: BundleSecurity::default(),
             },
         );
 
@@ -976,6 +1157,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                security: BundleSecurity::default(),
             },
         )
     }
@@ -1091,6 +1273,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                security: BundleSecurity::default(),
             },
         );
 
@@ -1152,6 +1335,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                security: BundleSecurity::default(),
             },
         );
         let env = spec["process"]["env"].as_array().unwrap();

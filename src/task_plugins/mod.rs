@@ -31,6 +31,8 @@ pub use sandbox_checkpoint::{
     firecracker_needs_api_socket, sandbox_checkpoint_support, sandbox_vmm_attrs, IDENTITY_DRIVE_ID,
 };
 mod schema_docs;
+pub mod seccomp;
+pub mod userns;
 mod vmm_api;
 
 pub use checkpoint::{AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport};
@@ -1474,6 +1476,43 @@ fn tiny_cpu_warning(task: &TaskConfig) -> Option<String> {
 /// the runtime cannot enforce, and whatever each runtime's
 /// [`TaskPlugin::check_resources`] has to say. Never fails: a runtime that
 /// will not load is a validation error reported elsewhere.
+/// Warnings for a container that opts out of the privilege floor
+/// (worker-plane-auth plan §6.14): each opt-out names its cost, because it
+/// makes container root host root or removes the syscall filter.
+pub fn container_security_warnings(config: &JobConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for task in config
+        .tasks
+        .iter()
+        .filter(|task| task.runtime == "container")
+    {
+        let security = container::container_security(&task.config);
+        if !security.user_namespace {
+            warnings.push(format!(
+                "task {:?} sets security.userNamespace = false: on Linux nodes its root is host \
+                 root, so a container escape owns the node. The task is host-level (it needs \
+                 the host grant on job:write)",
+                task.name
+            ));
+        }
+        if security.seccomp == container::SECCOMP_UNCONFINED {
+            warnings.push(format!(
+                "task {:?} sets security.seccomp = \"unconfined\": mounts, new namespaces, \
+                 kernel modules, bpf, and the keyring are all reachable from inside. The task \
+                 is host-level (it needs the host grant on job:write)",
+                task.name
+            ));
+        }
+    }
+    warnings
+}
+
+/// Whether a container task opts out of the privilege floor, which makes it
+/// host-level (worker-plane-auth plan §6.16).
+pub fn container_opts_out_of_the_floor(task: &crate::structs::TaskConfig) -> bool {
+    task.runtime == "container" && container::container_security(&task.config).is_host_level()
+}
+
 pub fn resource_submit_warnings(config: &JobConfig) -> Vec<String> {
     let mut registry = TaskPluginRegistry::new();
     let mut warnings = Vec::new();

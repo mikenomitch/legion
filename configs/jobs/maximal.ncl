@@ -909,6 +909,18 @@
                 env = {
                     LEGION_TASK = "container",
                 },
+                # The Linux privilege floor (docs/task-runtime-container.md,
+                # "Security"), shown with its defaults. Either opt-out makes
+                # the task host-level (it needs the `host` grant on job:write).
+                security = {
+                    # Container ids 0-65535 map to a 65,536-id host range of
+                    # this allocation's own. false runs container root as
+                    # host root.
+                    userNamespace = true,
+                    # "default" refuses mounts, namespaces, kernel modules,
+                    # bpf, the keyring, ... "unconfined" removes the filter.
+                    seccomp = "default",
+                },
             },
             resources = {
                 # Real limits on Linux when the worker runs with

@@ -560,6 +560,7 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
         &config,
         |_| false,
     ));
+    warnings.extend(crate::task_plugins::container_security_warnings(&config));
 
     if format.is_json() {
         output::print_success(&json!({
