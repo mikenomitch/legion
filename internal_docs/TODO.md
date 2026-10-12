@@ -2917,7 +2917,7 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       [proposal](plans/scheduler-sharding-strategies-proposal.md) (with a
       [calls doc](calls/scheduler-sharding-strategies-proposal_calls.md)):
       the option map for scaling eval/alloc throughput by adding raft
-      groups. Headline recommendation (revision 2): pool-keyed *node-owned*
+      groups. Headline recommendation (revision 3, 2026-10-12): pool-keyed *node-owned*
       scheduler shards where a shard is a raft group **plus its own state
       file** (`scheduler-<k>.sqlite`) — extra groups over the shared
       `store.sqlite` only overlap the quorum round-trip and the arithmetic
@@ -2926,13 +2926,19 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       on the anchor (N writers + N pipelines on one box, composites/backup
       untouched); rung B spreads leadership; rung C is online resharding.
       Job-keyed (Omega-style) shards rejected; more write-class lanes
-      refused as a scaling axis. Gated on Phase 0: read the
-      capture-vs-propose ratio from archived `legion_raft_capture_seconds` /
-      `legion_raft_propose_apply_seconds`, micro-bench N pipelines over one
-      file vs N files, then the native submitter for the production number.
-      Names the cross-file consequences to audit (cross-lane `ON DELETE
-      CASCADE`s, shard-resident `scheduler_event`, attach cap of 8,
-      `ID_STRIDE` widening).
+      refused as a scaling axis. Revision 3 adds that the October AWS
+      campaigns show two regimes: small fleets look commit-bound (rung A's
+      case), while at the largest fleets the leader is planning-bound with
+      an idle commit path and idle followers, where M3 (plan shipping)
+      is the cheaper lever, so M3 is now a peer of rung A, not a fallback.
+      Gated on Phase 0: read the capture-vs-propose ratio and the
+      eval-phase split from the October S3 archives (`collect.sh` now
+      scrapes both raft series) and micro-bench N pipelines over one file
+      vs N files. Names the cross-file consequences to audit (cross-lane
+      `ON DELETE CASCADE`s including `allocation_health` →
+      `allocation`, shard-resident `scheduler_event`, per-shard
+      adaptive-concurrency limits, per-file schema checks, attach cap of
+      8, `ID_STRIDE` widening).
 - [x] Version handshake between manager and worker — protocol version plus
       build-skew reporting, upgrade order in [docs/upgrades.md](../docs/upgrades.md)
       ([#137](https://github.com/mikenomitch/legion/pull/137))

@@ -1,6 +1,6 @@
 # Scheduler Sharding Strategies: Scaling the Control Plane by Adding Raft Groups (proposal)
 
-**Status: PROPOSAL, revision 2** — an exploration document, like
+**Status: PROPOSAL, revision 3 (2026-10-12)** — an exploration document, like
 [`scheduler-architecture-review-plan.md`](scheduler-architecture-review-plan.md):
 it evaluates the ways Legion's scheduler could be sharded across more raft
 groups ("lanes", shards, or whole clusters) so that adding groups adds node
@@ -12,6 +12,64 @@ in [`multi-raft-persistence-plan.md`](multi-raft-persistence-plan.md) §Phase 8.
 
 > **Judgement calls:** [`../calls/scheduler-sharding-strategies-proposal_calls.md`](../calls/scheduler-sharding-strategies-proposal_calls.md)
 
+### What revision 3 changed, and why
+
+Revision 3 re-checks revision 2 against `main` six weeks later. The
+mechanism facts revision 2 relied on all still hold: `CAPTURE_MUTEX` is
+still one process-global lock (`capture.rs:163`), the pipeline is still
+serial per group, every lane still writes the one `store.sqlite`, and the
+whole-file snapshot path still exists. Every code citation has been
+re-anchored. What changed is the evidence and the surroundings:
+
+1. **The wall has been measured, and it depends on fleet size.** The
+   October AWS campaigns ([docs/benchmarks.md](../../docs/benchmarks.md),
+   [`plan-path-fleet-scaling-plan.md`](plan-path-fleet-scaling-plan.md))
+   are the post-batching ceiling revision 2 said nobody had measured.
+   `web_fleet` places 829 alloc/s at 1k nodes and 327 at 50k on a native
+   submitter. The 1k–2k cells did not move when planning got cheaper,
+   which points at the commit path. At 5k–10k, the
+   pre-fix campaign saw raft pipeline wait at 1–3 ms and write-lock wait
+   p99 at 0.5 ms with the leader near CPU-bound (2.9 of 4 cores) and the
+   followers at ~0.2 cores. At 50k the plan step dominates (about 45 ms per
+   job) with the leader at about half its cores. So "the writer is the
+   wall" is consistent with the small-fleet cells. It does not hold for large
+   fleets, where the wall is planning on one leader while the other
+   managers idle. §1.3 and §9 now say this, and Phase 0 shrinks to the one
+   question still open: on the current binary, how close is the writer to
+   its limit at the sizes where it binds?
+2. **M3 is promoted from "fallback" to a peer of rung A.** If the large
+   fleet wall is planner CPU with writer headroom, plan shipping (M3) adds
+   planners across managers without shards and without rung B's
+   forwarding and backup rework. Revision 2 ranked it below rung B on the
+   assumption that the writer and the planner would saturate together. The
+   campaign says they do not. Phase 0 now picks between rung A and M3 by
+   regime.
+3. **New tables and couplings.** Sandbox checkpoints added `snapshot` and
+   `snapshot_alias` to the scheduler lane. Both are job-scoped, so they
+   live in the job's shard (§5.3). `allocation_health` (status lane)
+   carries an `ON DELETE CASCADE` into `allocation` (§5.2), which becomes a
+   cross-*file* reference under shards. The adaptive eval-concurrency
+   controller ([docs/scheduler-and-eval-loop.md](../../docs/scheduler-and-eval-loop.md)
+   §"`evalThreads` is a ceiling") reads a cluster-wide conflict rate. Under
+   shards it has to be per shard, or one hot shard's conflicts throttle
+   the others' planners (§M4, rung A).
+4. **Snapshots got cheaper to build and dearer to hold.** Snapshot builds
+   now read on their own connection and no longer block writes, but the
+   engine holds each image in memory to build, serve, and install it
+   ([docs/multi-raft.md](../../docs/multi-raft.md)). Per-shard files cut
+   the size of each image, which is a second, memory-side reason for the
+   file as the unit. Schema-skew refusal (an older-schema member refuses
+   writes it cannot apply) has to become per file (§M4 bill, item 5).
+5. **Small corrections.** "Oversubscription" now names a shipped feature
+   (a per-worker schedulable-capacity multiplier, [docs/resource-enforcement.md](../../docs/resource-enforcement.md)).
+   The invariant this document cares about is renamed *no overfill past
+   schedulable capacity*, which the feature does not change. Namespaces
+   are still unbuilt but now have a plan
+   ([`namespaces-plan.md`](namespaces-plan.md)), and §5.5 says why they
+   are not a shard key. The read model is maintained by apply-time
+   changeset projection rather than per-apply reloads, which does not
+   change §1.4's memory argument.
+
 ### What revision 2 changed, and why
 
 Revision 1 recommended pool-keyed scheduler shards as N raft groups over the
@@ -22,16 +80,16 @@ them:
 
 1. **A raft group without its own state file is not a shard.** The pipeline
    is strictly serial per group — capture, then `block_on(client_write)`,
-   then reply (`src/storage/raft/driver.rs:1499`, `:1535`) — and both the
+   then reply (`src/storage/raft/driver.rs:1696`, `:1795`) — and both the
    capture and the apply hold the process-global `CAPTURE_MUTEX`
-   (`src/storage/raft/capture.rs:200`, `:522`). Extra groups over one file
+   (`src/storage/raft/capture.rs:230`, `:760`). Extra groups over one file
    therefore overlap only the quorum round-trip. Since the batching work
    landed, the local write work per batch (tens of ms at depth) dwarfs the
    round-trip (1–3 ms on a LAN), so the arithmetic in §1.2 says shared-file
    shards buy roughly ×1.1 where revision 1 claimed "near-linear". **The
    unit that has to be multiplied is the SQLite writer, which means one
    state file per shard.** That also deletes revision 1's biggest new
-   mechanism: whole-file snapshots already exist (`driver.rs:2795`), so
+   mechanism: whole-file snapshots already exist (`driver.rs:3260`), so
    row-scoped snapshots are no longer needed.
 2. **Spreading leadership is the second rung, not the first.** With
    per-shard files, N shards led by *one* manager already give N
@@ -57,22 +115,25 @@ write-class sense buys nothing further; more raft groups over one SQLite
 file buys almost nothing; node-owned shards with their own files multiply
 the real serial resources; and past a point, more groups in one cluster
 cannot help and the answer becomes more clusters (federation, already
-planned).
+planned). One qualifier from the October measurements: sharding answers
+the regime where the writer binds. Where planning on the one leader binds,
+which the campaigns show at the largest fleets measured, the cheaper lever is
+spreading planning across managers (M3), with or without shards.
 
 ### 1.1 What is actually serial today
 
 1. **One raft group for all placement writes**, drained by one pipeline
-   thread (`driver.rs:3093`). AWS phase 2 measured 3.07 ms of
+   thread (`driver.rs:3561`). AWS phase 2 measured 3.07 ms of
    `pipeline_wait` per scheduler-lane op against 0.09 ms on the status lane
    ([`../aws-phase3-findings.md`](../aws-phase3-findings.md)); phase 3 put
    `apply` at 67% of plan time and throughput ~7× below planner capacity.
 2. **One active planner.** Eval workers idle on every manager that does not
-   lead the scheduler lane (`src/manager/daemon.rs:1809`).
+   lead the scheduler lane (`src/manager/daemon.rs:2522`).
 3. **One SQLite writer for every group.** `CAPTURE_MUTEX` is a
-   process-global static (`capture.rs:133`) held for the whole of every
-   capture (`:200`) and every apply (`:522`), across all lanes, because all
-   lanes write one `store.sqlite` (`src/storage/raft/state_machine.rs:42`;
-   acknowledged at `driver.rs:2750`). Lanes isolate raft logs, replication
+   process-global static (`capture.rs:163`) held for the whole of every
+   capture (`:230`) and every apply (`:760`), across all lanes, because all
+   lanes write one `store.sqlite` (`src/storage/raft/state_machine.rs:44`;
+   acknowledged at `driver.rs:3215`). Lanes isolate raft logs, replication
    pipelines, and elections — not SQLite write work.
 
 ### 1.2 The pipeline cycle, and why the file is the unit
@@ -81,7 +142,7 @@ Per group, one replicated op costs `T = W_c + R + W_a`: local capture work
 (`W_c`, under the mutex), the propose → quorum round-trip (`R`, mutex
 free), and the local apply (`W_a`, under the mutex). The two phases are
 already metered separately — `legion_raft_capture_seconds` versus
-`legion_raft_propose_apply_seconds` (`src/manager/telemetry.rs:765`) — so
+`legion_raft_propose_apply_seconds` (`src/manager/telemetry.rs:859`) — so
 the ratio is readable from any archived campaign.
 
 - A single pipeline delivers at most `B / T` batches-worth of work per
@@ -120,14 +181,23 @@ that is one file per shard.
 | 2026-08-05 (phase 4) | eval-thread sweep 4 → 32 | 177 → 252 alloc/s locally; rig found driver-bound |
 | 2026-08-06 (phase 5) | after claim/complete fusion, batched enqueue, group commit, statement cache | **≥1,323–1,625 alloc/s, driver-bound at every fill level** |
 | 2026-08-06 (storm) | internally-generated replacement (not driver-bound) | ~277 alloc/s sustained, 0.006 s placement gap |
+| 2026-10-09 (pre-fix) | `web_fleet` 5k / 10k, native submitter, 3× 4-vCPU managers | 504 / 163 alloc/s; pipeline wait 1–3 ms, write-lock wait p99 0.5 ms; leader 1.35 / 2.9 of 4 cores, followers ~0.2 ([plan-path fleet scaling](plan-path-fleet-scaling-plan.md) §1) |
+| 2026-10-10 (current) | `web_fleet` at 1k, 2k, 5k, 10k, 20k, 50k nodes | 829, 789, 905, 738, 553, 327 alloc/s; 1k–2k did not move when planning got cheaper, consistent with a commit-path bound; at 50k the plan step dominates (~45 ms/job) with the leader at ~half its cores ([docs/benchmarks.md](../../docs/benchmarks.md)) |
+| 2026-10-10 (current) | `dense_fleet` at 5k nodes, 5 → 40 allocs/node | 3,166 → 2,797 alloc/s |
 
-Two lessons. **In-group levers keep paying** — a 16–20× improvement came
-from batching and fusing rounds on the same pipeline. And **the
-post-batching ceiling is unmeasured** — every deep cell in phase 5 was
-floor-limited by the load generator. The lanes A/B (row 1) is also why
-revision 1 over-reached: that flood was *unbatched* heartbeats and submits,
-each paying a full `R`, which is the regime where overlapping round-trips
-wins big. Batching moved the regime.
+Three lessons. **In-group levers keep paying.** A 16–20× improvement came
+from batching and fusing rounds on the same pipeline, and the October fixes
+(indexes, a flat per-plan cost) doubled the 10k cell again without touching
+raft. **The ceiling depends on the regime.** Small fleets look bound by the commit path (their cells did not move when
+planning got cheaper), which is the writer this document multiplies.
+Large fleets are bound by planning on the one leader, while the commit path
+shows no contention and the followers idle. Sharding answers the first
+regime directly. In the second, it helps only as far as the per-shard
+planning universe shrinks or shard leadership spreads (rung B), and M3
+answers it without shards. The lanes A/B (row 1) is also why revision 1
+over-reached: that flood was *unbatched* heartbeats and submits, each
+paying a full `R`, which is the regime where overlapping round-trips wins
+big. Batching moved the regime.
 
 ### 1.4 The node axis is a different problem
 
@@ -137,9 +207,10 @@ cadence and per-type lost windows size the RPC load; digests decouple
 manager count from fleet size. What still grows with fleet size:
 
 - **The read model, on every manager.** `SchedulingReadModel` is an
-  unconditional full mirror (`src/storage/store.rs:227`, built by four
-  unfiltered table scans at `store.rs:2362`, refreshed on every replica
-  after every apply, `state_machine.rs:590`). No in-cluster sharding shrinks
+  unconditional full mirror (`src/storage/store.rs:385`, built by
+  unfiltered table scans at `store.rs:2995`, kept current on every replica
+  by projecting each applied changeset, `store.rs:10706`, and rebuilt
+  after a snapshot install, `state_machine.rs:605`). No in-cluster sharding shrinks
   it — every manager is a voter of every group and must be able to take any
   shard over. At a rough 1–3 KB per node and per allocation in memory, a
   100k-node / 1M-allocation cluster is a few GB per manager: feasible on a
@@ -176,7 +247,7 @@ clusters, not more groups.
 - **TiKV / CockroachDB** — true multi-raft over one shared engine, with a
   placement driver for split/merge/rebalance. *Take: many groups over one
   voter set and one transport (Legion's engine already multiplexes by
-  `group_id`, `proto/legion.proto:5918`). Reject: dynamic range management
+  `group_id`, `proto/legion.proto:9212`). Reject: dynamic range management
   in v1. And the lesson in §1.2: their sharing works because RocksDB is
   multi-writer; ours cannot.*
 - **YARN federation / Mesos** — routers over sub-schedulers owning capacity
@@ -249,19 +320,19 @@ clusters, not more groups.
 ### 5.1 The lane engine is multi-group; the lane set and layout are frozen
 
 - `Lane { Control, Scheduler, Status }` is a hard-coded enum
-  (`src/storage/raft/mod.rs:41`); `Lane::ALL` drives bring-up and the
-  exhaustiveness tests (`mod.rs:52`).
+  (`src/storage/raft/mod.rs:43`); `Lane::ALL` drives bring-up and the
+  exhaustiveness tests (`mod.rs:54`).
 - `wire_name()` strings double as gRPC `group_id`, per-lane data-dir name,
-  and `raft_applied` key — documented frozen (`mod.rs:98`). One channel pool
-  carries every group (`src/storage/raft/network.rs:270`, `driver.rs:2829`);
-  one openraft core per lane (`driver.rs:2841`); one log DB per lane
+  and `raft_applied` key — documented frozen (`mod.rs:100`). One channel pool
+  carries every group (`src/storage/raft/network.rs:304`, `driver.rs:3294`);
+  one openraft core per lane (`driver.rs:3306`); one log DB per lane
   (`src/storage/raft/log_store.rs:86`); per-lane snapshot dirs
-  (`driver.rs:2856`). **Adding groups is mechanical at this layer.**
+  (`driver.rs:3321`). **Adding groups is mechanical at this layer.**
 - Snapshot scope is chosen by group count: `WholeDb` (`VACUUM INTO`) for
-  one group, table-scoped `LaneTables` dumps otherwise (`driver.rs:2794`).
+  one group, table-scoped `LaneTables` dumps otherwise (`driver.rs:3259`).
   The whole-file path is the one a per-file shard reuses.
 - Writer-minted commutative ids are residue-partitioned: `ID_STRIDE = 8`,
-  `id % 8 == lane.id_residue()` (`mod.rs:73`). Eight residues; three taken.
+  `id % 8 == lane.id_residue()` (`mod.rs:75`). Eight residues; three taken.
 - Topology is a two-valued string fixed at first start by the
   `topology.json` stamp (`driver.rs:236`, `:437`); changing it is
   backup → fresh cluster → restore (JC-43).
@@ -273,50 +344,61 @@ clusters, not more groups.
   `ownership.rs:5`: row-changeset replication from two logs into one table
   applies in different orders on different replicas.
 - `verify_changeset_ownership` rejects a cross-lane changeset before
-  proposal, in every topology (`ownership.rs:456`, `:58`;
-  `driver.rs:1487`). Tests pin totality (`:539`) and per-lane snapshot
-  disjointness (`:620`).
+  proposal, in every topology (`ownership.rs:476`, `:58`;
+  `driver.rs:1678`). Tests pin totality (`:559`) and per-lane snapshot
+  disjointness (`:640`).
 - `scheduler_event` and `idempotency_record` are the `Commutative` class —
   insert-only, globally unique keys, writable from any lane's changeset,
-  snapshotted with control (`ownership.rs:91`, `:271`, `:325`).
-- Cross-lane **foreign keys exist**: `allocation`, `plan_submission`,
-  `rollout`, `eval`, and friends carry `REFERENCES job / job_config /
-  task_config / node … ON DELETE CASCADE` into control-lane tables
-  (`src/storage/migrations.rs:159`, `:178`, `:306`, `:346`). Under lanes a
+  snapshotted with control (`ownership.rs:91`, `:291`, `:345`).
+- Cross-lane **foreign keys exist**: `allocation`, `eval`, `rollout`,
+  `rollout_event`, `instance`, and friends carry `REFERENCES job /
+  job_config / task_config / node … ON DELETE CASCADE` into control-lane
+  tables (`src/storage/migrations.rs:224`, `:243`, `:371`, `:411`), and
+  one runs the other way: status-lane `allocation_health` references
+  scheduler-lane `allocation` (`migrations.rs:392`). Under lanes a
   cascade would be a cross-lane write inside a control changeset and the
   guard would reject it — which is why the composites delete in
   dependency order (destroy: status → scheduler → control,
-  `store.rs:8050`) so cascades find nothing. `foreign_keys = ON` is live
+  `store.rs:8964`) so cascades find nothing. `foreign_keys = ON` is live
   (the JSON-affinity rebuild had to order its table drops around it), so
   the constraints are real but latent: safety nets, not load-bearing.
 
 ### 5.3 The scheduler lane, concretely
 
-- Owned tables (`ownership.rs:185`): `allocation`, `allocation_epoch`,
+- Owned tables (`ownership.rs:195`): `allocation`, `allocation_epoch`,
   `allocation_epoch_partition`, `plan_submission`,
   `allocation_stop_notice`, `node_alloc_usage`, `instance`, `volume`,
-  `eval`, `rollout`, `rollout_event`.
+  `snapshot`, `snapshot_alias`, `eval`, `rollout`, `rollout_event`.
+- `snapshot` and `snapshot_alias` (sandbox checkpoints, added since
+  revision 2) ride the scheduler lane with `instance`, because a restore
+  writes `instance.restore_from` and reads the snapshot in one op
+  (`ownership.rs:240`). Both carry a `job_id`, so they are job-scoped rows
+  and live in the job's shard. A `local` checkpoint pins its restore to the
+  node that took it, and a `published` one restores on any compatible node
+  ([docs/suspend-and-resume.md](../../docs/suspend-and-resume.md)). Either
+  way the candidates are the job's own pools, so a restore or a spread fork
+  stays inside one shard under the same rule as any other placement.
 - The eval queue is replicated deliberately (JC-41 reversed JC-27;
   `ownership.rs:94`); every enqueue/claim/complete is a scheduler-lane
   round, now heavily batched
   ([`eval-path-raft-cost-plan.md`](eval-path-raft-cost-plan.md)).
 - Eval workers gate on per-lane leadership at loop top and mid-batch
-  (`daemon.rs:1809`, `:1912`), with an acquisition hook that recovers the
-  queue (`daemon.rs:1557`); the probe is per lane (`store.rs:1427` →
-  `driver.rs:989`).
+  (`daemon.rs:2522`, `:2662`), with an acquisition hook that recovers the
+  queue (`daemon.rs:2270`); the probe is per lane (`store.rs:1964` →
+  `driver.rs:999`).
 
 ### 5.4 The cross-cutting couplings
 
 1. **`CAPTURE_MUTEX` + one file** (§1.1–1.2).
 2. **Composites span lanes** — submit, destroy, register, remove-node,
-   mark-lost (`store.rs:8469`, `:8050`, `:6875`, `:6524`, and the
-   batched mark-lost that follows `remove_allocs_for_node`) —
+   mark-lost (`store.rs:9458`, `:8964`, `:7779`, `:7425`, and
+   `mark_node_lost` at `:7159`) —
    each half its own entry, completed under divergence by forwarding
    (`ForwardableLaneWrite`, `src/storage/raft/forward.rs:53`, including
-   `enqueue_eval`) and the lane reconcilers (`daemon.rs:1042`–`1118`).
+   `enqueue_eval`) and the lane reconcilers (`daemon.rs:1446`–`1577`).
 3. **Co-location is deliberate.** `ANCHOR_LANE = Lane::Control` and the
    convergence loop gather all leadership on one manager
-   (`driver.rs:158`, `:3083`), because composites half-fail elsewhere and
+   (`driver.rs:158`, `:3551`), because composites half-fail elsewhere and
    `legion state backup` needs one node leading every lane. A design that
    *keeps* co-location inherits all of that for free; one that spreads
    leadership must rework it.
@@ -324,19 +406,26 @@ clusters, not more groups.
 ### 5.5 The partition seams that already exist
 
 - **`allocation_epoch_partition`** — scope types `"node"` and
-  `"job_config"` (`migrations.rs:259`): the row-scope
+  `"job_config"` (`migrations.rs:324`): the row-scope
   vocabulary (node-scoped vs job-scoped state) that ownership by shard
   needs, even though today it partitions conflicts, not data.
 - **`node.pool`** (`src/structs/node.rs:16`) — the only real,
   user-visible, index-backed partition key: an implicit permit pins
   pool-less tasks to `default` (`src/constraints.rs:117`), `pool_binding()`
-  resolves a task's pool (`constraints.rs:145`), the scheduling index
-  partitions by pool (`src/scheduling_index.rs:149`), preemption and ACLs
-  are pool-scoped (`scheduler.rs:3176`, `src/structs/acl.rs:118`).
-- **Namespaces do not exist** (`acl.rs:6`).
-- **Store shape:** one `write_conn` and a read pool (`store.rs:707`), all
+  resolves a task's pool (`constraints.rs:181`), the scheduling index
+  partitions by pool (`src/scheduling_index.rs:156`), preemption and ACLs
+  are pool-scoped (`scheduler.rs:3653`, `src/structs/acl.rs:135`).
+- **Namespaces do not exist yet.** The ACL vocabulary has a `namespaces`
+  selector hardcoded to `DEFAULT_NAMESPACE` (`acl.rs:230`), and
+  [`namespaces-plan.md`](namespaces-plan.md) (PLANNED) turns it into a
+  tenancy boundary. A namespace is not a shard key: namespaces group
+  *jobs*, and two namespaces can place on the same pool, so keying shards
+  by namespace is M2's job-keyed shape with its overfill problem. A
+  namespace that owns its pools is just pool-keyed sharding with a
+  different label.
+- **Store shape:** one `write_conn` and a read pool (`store.rs:1084`), all
   over one file; `ATTACH` is mentioned only as a thing changesets cannot
-  carry (`store.rs:16375`). rusqlite is `bundled` (`Cargo.toml:20`), so
+  carry (`store.rs:18416`). rusqlite is `bundled` (`Cargo.toml:55`), so
   `SQLITE_MAX_ATTACHED` is the default 10 unless the build defines it.
 
 ## 6. The methods
@@ -368,24 +457,35 @@ arbitrates plans applying through **one** log:
   or accept-and-repair eviction, and Legion's invariant is that staleness
   costs a conflict, "never an oversubscription"
   ([docs/scheduler-and-eval-loop.md](../../docs/scheduler-and-eval-loop.md)).
+  That sentence means no overfill past a node's *schedulable* capacity.
+  The shipped oversubscription ratio raises that capacity on purpose; it
+  does not relax the check.
 
 Its parallel-planning half is M3; its sharding half, made sound, is M4.
 
-### M3. Cross-manager planning, single apply group (the Nomad shape) — keep the seam, demote
+### M3. Cross-manager planning, single apply group (the Nomad shape) — the large-fleet lever
 
 Architecture review D2 step 2: followers run eval workers in `plan_only`
 against their replicated read model, ship plan submissions to the leader,
 which applies with the unchanged epoch CAS. Scales planner CPU × managers;
-touches neither the pipeline nor the writer, so it does not address the
-measured wall. Costs a wire surface and a new class of "why didn't it
-place" across two managers.
+touches neither the pipeline nor the writer. Costs a wire surface and a new
+class of "why didn't it place" across two managers.
 
-Revision 2 demotes it further: once shards exist (M4), *spreading shard
-leadership* (rung B) also multiplies planner CPU across managers — and
-multiplies writers and fsync streams with it — using leadership the engine
-already has instead of a plan-shipping RPC. M3 is the fallback if rung B is
-blocked, or for a single shard whose leader is planner-bound with an idle
-pipeline.
+Revision 2 demoted it behind rung B, because spreading shard leadership
+also multiplies planner CPU across managers, and multiplies writers and
+fsync streams with it. That ranking assumed the writer and the planner
+would saturate together. The October campaigns say they do not (§1.3): at
+10k–50k nodes the leader is planning-bound while the commit path shows no
+contention and the followers sit near 0.2 cores. In that regime M3 buys
+the same planner multiplier as rung B without shards, without rung B's
+forwarding fast path and backup fan-in, and without any format break.
+**Revision 3 makes M3 a peer of rung A, chosen by regime in Phase 0:** rung
+A when the writer is the wall, M3 when planning on one leader is. Rung B
+remains the step for a deployment that hits both. The plan-path work in
+flight ([`plan-path-fleet-scaling-plan.md`](plan-path-fleet-scaling-plan.md))
+is still shrinking per-plan cost, so M3 should also wait for that plan's
+remaining attribution (eval time outside the plan phases) before it is
+designed.
 
 ### M4. Node-owned scheduler shards, each a state partition — the axis
 
@@ -407,16 +507,21 @@ simplifying:
   that every row's pool resolves to this shard — which is a cheap
   post-capture assertion, not a new enforcement regime.
 - **Snapshots are whole-file.** The existing `WholeDb` `VACUUM INTO` path
-  (`driver.rs:2795`) applies per shard; each file carries its own
+  (`driver.rs:3260`) applies per shard; each file carries its own
   `raft_applied` marker. No row-scoped dump/install machinery.
 - **The mutex becomes per file.** Capture and apply on shard 2 never wait
   for shard 0.
-- **Per-file backup, snapshot, and compaction sizes** divide by N.
+- **Per-file backup, snapshot, and compaction sizes** divide by N. This
+  matters for memory as well as disk now: the engine holds a snapshot
+  image in memory to build, serve, and install it, so a shard's image is
+  roughly a 1/N slice of the scheduler state rather than the whole
+  database. Builds read on their own connection and no longer block
+  writes, so N whole-file builds cost reads, not write stalls.
 
 **Why node ownership (pool-keyed).** Every replicated row keeps exactly one
 writer *and* one file: node-scoped rows belong to the node's pool's shard;
 job-scoped rows belong to the job's pool's shard; a task binds to one pool
-(`constraints.rs:145`), and v1 requires a job's tasks to resolve to pools of
+(`constraints.rs:181`), and v1 requires a job's tasks to resolve to pools of
 one shard. Capacity arithmetic is shard-local, so oversubscription stays
 impossible by construction, not by arbitration. Pools are also the only
 partition vocabulary users already have; nothing new enters the jobspec.
@@ -428,7 +533,11 @@ valuable; a deployment stops at whichever rung its wall demands.
 with the control anchor (today's convergence policy, unchanged). On that
 one manager: N pipeline threads, N write connections, N capture mutexes,
 one shared `evalThreads` pool whose workers claim per shard (the claim
-round for a batch targets one shard — deepest ready queue first). What
+round for a batch targets one shard — deepest ready queue first). The
+adaptive concurrency controller, which today tunes how many evals plan at
+once from one conflict rate, keeps a rate and a limit per shard, because
+conflicts are shard-local and one hot shard must not throttle its siblings'
+planners. What
 scales: writers × N, pipelines × N, planner universe ÷ N, blast radius per
 pool. What does not: planner CPU and fsync are still one box. What stays
 untouched: composites (the control leader leads every shard, so the
@@ -478,11 +587,20 @@ holding a job's admission), and it is deliberately last.
    `REFERENCES … ON DELETE CASCADE` constraints (§5.2) become unenforceable
    across files — the composites already delete in dependency order, so an
    audit test that no composite relies on a cascade is the deliverable;
-   `scheduler_event` rows become shard-resident (unioned for reads; the
-   event-stream cursor already tolerates per-process id ordering).
+   `allocation_health` in `store.sqlite` referencing `allocation` in a
+   shard file is the one reference that crosses files in the
+   status-to-scheduler direction, so the same audit has to cover remove-node
+   and mark-lost; `scheduler_event` rows become shard-resident (unioned for
+   reads; the event-stream cursor already tolerates per-process id
+   ordering); the read-model coherence checker
+   ([`read-model-coherence-plan.md`](read-model-coherence-plan.md)) reads
+   through the union views.
 5. **Format items** bundled into the one JC-43 break that enabling shards
    already is: shard wire names / data dirs / `raft_applied` files,
-   `topology.json` recording the shard map, widening `ID_STRIDE` 8 → 64.
+   `topology.json` recording the shard map, widening `ID_STRIDE` 8 → 64,
+   and a schema version per file, so the guard that stops a member from
+   proposing writes an older-schema peer cannot apply checks each shard's
+   file as well as `store.sqlite`.
 
 **Operator experience.** As typed:
 
@@ -562,11 +680,15 @@ because the scheduler ran out.**
 
 ### M0 (the null hypothesis). Keep exhausting the single-group levers
 
-Sequenced first: phase 5 showed in-group levers still paying and ended
-driver-bound with the ceiling unlocated. Remaining in-group headroom is
-real (native submitter, eval-thread knee above 32). Every method above is
-more valuable and more correctly designed after the post-batching wall is
-measured and attributed — Phase 0 below makes that cheap.
+Sequenced first, and still paying: phase 5 batched the pipeline, and the
+October plan-path work doubled the 10k cell with indexes and a flat
+per-plan cost, with no raft change at all. The native submitter has
+shipped, so the ceiling is now located (§1.3); what remains in-group is the
+plan-path plan's open attribution (most of the rig's eval wall time falls
+outside the plan phases) and `evalThreads`, which is still 4 by default and
+now an adaptive ceiling rather than a fixed count. Every method above is
+more valuable and more correctly designed once Phase 0 has attributed the
+wall per regime, and the plan-path plan needs the same read.
 
 ### Considered and rejected on the way
 
@@ -590,8 +712,9 @@ measured and attributed — Phase 0 below makes that cheap.
 1. **Single-writer ownership per replicated row** — table-granular today,
    file-granular under M4 — enforced at capture time in every topology,
    with exhaustiveness and disjointness tests extended, never weakened.
-2. **No oversubscription by construction.** A stale read costs a conflict
-   or a rebuild, never overfill. (Kills M2.)
+2. **No overfill by construction.** A stale read costs a conflict or a
+   rebuild, never placement past a node's schedulable capacity (which the
+   oversubscription ratio may set above physical). (Kills M2.)
 3. **The epoch fence and apply-time revalidation** survive unchanged within
    each shard.
 4. **Composites complete under whatever leadership placement the rung
@@ -618,9 +741,9 @@ measured and attributed — Phase 0 below makes that cheap.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | M1 more write-class lanes | ~none (one writer; classes exhausted) | none | worse (more composites) | yes, per lane | composite half-applies | +1 lane per feature | **refuse** |
 | M2 job-keyed shards | high on paper | none | per shard | yes | **oversubscription across shards** | reshard = re-hash jobs | **reject → M3 + M4** |
-| M3 plan shipping | planner × managers | none | none | none | staleness → conflicts | zero | seam; fallback for rung B |
+| M3 plan shipping | planner × managers | none | none | none | staleness → conflicts | zero | **peer of rung A — the large-fleet lever** |
 | M4 raft groups over one file (rev 1) | ≈ ×1.1 on LAN (§1.2) | — | per pool | yes | row-scoped snapshots | one knob | **dropped** |
-| **M4 rung A** per-file shards, co-located | writers × N, pipelines × N on one box | planning ÷ N; memory unchanged | per pool | yes (enable/resize) | routing + cross-file FK audit | one knob; N files; per-shard status | **the axis — gate on Phase 0** |
+| **M4 rung A** per-file shards, co-located | writers × N, pipelines × N on one box | planning ÷ N; memory unchanged | per pool | yes (enable/resize) | routing + cross-file FK audit | one knob; N files; per-shard status | **the axis when the writer binds — gate on Phase 0** |
 | M4 rung B spread leadership | + planner/apply/fsync × managers | — | per pool | no (policy) | forwarding as fast path; backup fan-in | leadership map to read | on one-box saturation |
 | M4 rung C online reshard / sub-shards | — | — | — | no | split-apply saga (sub-shards only) | `shard move-pool` | on demand |
 | M5 status/KV shards | n/a | transition-storm headroom | per bucket | yes | shares rung A's | near zero | hold |
@@ -628,22 +751,31 @@ measured and attributed — Phase 0 below makes that cheap.
 
 ## 9. Sequencing (each step gated)
 
-1. **Phase 0 — locate and attribute the wall.** Three parts, the first two
-   nearly free:
-   - Compute `(W_c + W_a) / T` from the archived campaigns' existing
-     `legion_raft_capture_seconds` and `legion_raft_propose_apply_seconds`
-     histograms on the scheduler lane (the split bench gives `W_a`'s share
-     of the propose-apply number). This alone decides whether shared-file
-     groups could ever pay, and it should confirm §1.2.
+1. **Phase 0 — attribute the wall per regime.** The native submitter has
+   shipped and the October campaigns measured the ceiling from 1k to 50k
+   nodes (§1.3), so what remains is attribution:
+   - Compute `(W_c + W_a) / T` from the October archives. `collect.sh` now
+     scrapes `legion_raft_capture_seconds` and
+     `legion_raft_propose_apply_seconds`, so the ratio is a read of the S3
+     archives, not a re-run (the split bench gives `W_a`'s share of the
+     propose-apply number). This decides whether shared-file groups could
+     ever pay, and it should confirm §1.2.
+   - Read `legion_eval_phase_seconds`, the coalescer wait, and the
+     read-model lock wait from the same archives, per fleet size, to say
+     which cells are writer-bound and which are planner-bound. The
+     plan-path work needs the same read
+     ([`plan-path-fleet-scaling-plan.md`](plan-path-fleet-scaling-plan.md)
+     §13.5), so do it once.
    - An in-process micro-benchmark: N pipelines over one file versus N
      files, same batch shape — the direct measurement of the per-file
      claim on the target disk.
-   - The fast native submitter (already TODO's top gate) to re-run the fill
-     ladder for the production number.
-   **Exit:** a measured post-batching ceiling with a named bottleneck, and
-   a measured per-file multiplier.
-2. **Phase 1 — graduate rung A** into an implementation plan (only if
-   Phase 0 names the writer/pipeline): multi-file Store with union views,
+   **Exit:** a named bottleneck for each fleet-size regime, and a measured
+   per-file multiplier.
+2. **Phase 1 — graduate rung A or M3, by regime.** Rung A if Phase 0 shows
+   the writer saturating at the fleet sizes operators run; M3 if the wall
+   at those sizes is planning on one leader with commit headroom. Both can
+   graduate; neither depends on the other. Rung A's implementation plan
+   covers: multi-file Store with union views,
    routing map, per-shard claims, FK/cascade audit, format bundle,
    `raft.scheduler.shards`. Headline gate: a lanes-style A/B — alloc/s at
    shards = 1/2/4 on one box, plus a one-pool storm leaving sibling shards'
@@ -653,8 +785,8 @@ measured and attributed — Phase 0 below makes that cheap.
    shard-aware `readyz`.
 4. **Phase 3 — rung C** on operator demand: `shard move-pool`, `shard add`;
    hash sub-shards last and only for a measured oversized pool.
-5. **Phase 4 — M3** only if a shard leader is planner-bound with an idle
-   pipeline and rung B is unavailable.
+5. **Phase 4 — whichever of rung A and M3 Phase 1 did not pick**, when
+   the other regime shows up in a measured deployment.
 6. **Phase 5 — M5 status shards** on transition-storm evidence.
 7. **Federation proceeds on its own plan throughout.**
 

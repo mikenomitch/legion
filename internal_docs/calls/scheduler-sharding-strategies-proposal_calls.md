@@ -7,6 +7,7 @@ recommended and how the option space is framed* — the same class of calls the
 scheduler-architecture-review doc recorded. Entries are ranked by project
 impact, most impactful first; the number is the rank. Entries 1 and 2 are
 **reversals** of revision 1's recommendations and say what the symptom was.
+Entry 3 is revision 3's re-ranking of M3 after the October campaigns.
 
 ## 1. A shard is a raft group plus its own state file — not a raft group over the shared `store.sqlite` (reversal)
 
@@ -20,9 +21,9 @@ capture mutex. Control and status stay in `store.sqlite`; read connections
 the one shared file and called the scaling "near-linear until aggregate
 local write work saturates one core", deferring per-file partitioning to a
 v2/v3 fork. Re-reading the pipeline showed the cycle is strictly serial per
-group — capture, `block_on(client_write)`, reply (`src/storage/raft/driver.rs:1499`,
-`:1535`) — with both capture and apply under the process-global mutex
-(`src/storage/raft/capture.rs:200`, `:522`). N groups over one file overlap
+group — capture, `block_on(client_write)`, reply (`src/storage/raft/driver.rs:1696`,
+`:1795`) — with both capture and apply under the process-global mutex
+(`src/storage/raft/capture.rs:230`, `:760`). N groups over one file overlap
 only the quorum round-trip, and after the batching work the local body of a
 batch (~20 ms at depth, phase 5) dwarfs a same-AZ round-trip (1–3 ms). The
 arithmetic (`N_max ≈ T / (W_c + W_a)`) comes out near **1.1** — a latency
@@ -52,7 +53,7 @@ be multiplied is the SQLite writer, and SQLite is single-writer *per file*
 (TiKV's shared-engine multi-raft scales only because RocksDB is
 multi-writer). Per-file shards also delete revision 1's biggest new
 mechanism — row-scoped snapshot dump/install — because the whole-file
-`VACUUM INTO` path already exists (`driver.rs:2795`), and they make
+`VACUUM INTO` path already exists (`driver.rs:3260`), and they make
 ownership *physical*: a shard's connection cannot reach another shard's
 rows, so the guard stays table-granular and the only new check is routing.
 Fewer new mechanisms for a real multiplier is the better trade.
@@ -79,11 +80,15 @@ cross-machine planner multiplier instead of spread (a wire surface and
 staleness handling, and it moves only planning, not apply or fsync).
 
 **Trade-off.** Rung A's ceiling is one machine; an operator whose leader box
-saturates under N shards has to wait for rung B. Accepted: the 32-thread
-local sweep was still rising, so one box has planner headroom, and every
-composite, reconciler, convergence rule, and backup precondition keeps
-working *unchanged* under co-location. What would revisit it: a rung-A
-deployment showing the leader CPU-bound with pipelines idle.
+saturates under N shards has to wait for rung B. Accepted: every composite,
+reconciler, convergence rule, and backup precondition keeps working
+*unchanged* under co-location. Revision 2 also leaned on the 32-thread local
+sweep still rising as evidence of planner headroom on one box. The October
+rig weakened that (the 10k leader averaged 2.9 of 4 cores before the
+plan-path fixes), and entry 3 is the response: the planner-bound case now
+goes to M3 rather than forcing rung B early. What would revisit it: a
+rung-A deployment showing the leader CPU-bound with pipelines idle *and*
+M3 unavailable.
 
 **Why (simplicity).** Deliberate divergence was made *survivable* by the
 standing-split work; making it the *design point* is a different, larger
@@ -91,7 +96,45 @@ change (forwarding as the fast path, backup without an all-groups leader).
 Sequencing it behind evidence keeps v1 to the one new mechanism — files —
 and inherits today's leadership model for free.
 
-## 3. Node-owned (pool-keyed) sharding, not job-keyed shared-state sharding
+## 3. M3 (plan shipping) is a peer of rung A, chosen by regime — not rung B's fallback (revision 3)
+
+**Call.** Phase 1 graduates rung A when the writer is the measured wall and
+M3 when planning on one leader is, and either can ship without the other.
+Rung B stays the step for a deployment that hits both.
+
+**What revision 2 said, and why it changed.** Revision 2 put M3 last
+("only if a shard leader is planner-bound with an idle pipeline and rung B
+is unavailable"), on the reasoning that spreading shard leadership
+multiplies planners *and* writers, so it dominates a planner-only
+multiplier. That assumed the two walls arrive together. The October
+campaigns ([`../plans/plan-path-fleet-scaling-plan.md`](../plans/plan-path-fleet-scaling-plan.md)
+§1, [docs/benchmarks.md](../../docs/benchmarks.md)) show them apart: at
+5k–10k nodes on the pre-fix binary the raft pipeline wait stayed at
+1–3 ms and write-lock wait p99 at 0.5 ms while the leader approached
+CPU-bound and the followers idled near 0.2 cores; at 50k the plan step
+dominates with the leader at about half its cores. Small fleets (1k–2k)
+look commit-bound instead.
+
+**Alternatives.** (a) Keep revision 2's order: rung A, then rung B for
+planner spread, M3 last. (b) Drop sharding and do only M3. (c) Make rung B
+part of v1 again so one design covers both walls.
+
+**Trade-off.** Two candidate Phase 1s instead of one, and a plan-shipping
+wire surface ("why didn't it place" now spans two managers) that rung B
+would have avoided. Accepted because in the planner-bound regime M3 costs
+no shards, no format break, no forwarding fast path, and no backup fan-in,
+while (a) would make an operator with a 50k-node fleet and an idle commit
+path take a JC-43 break and the rung B rework to get more planners. (b)
+leaves the small-fleet commit wall unanswered, and (c) is the revision 1
+mistake entry 2 reversed. What would revisit it: Phase 0 showing the
+writer close to saturation at the same sizes where planning binds, which
+makes rung B the shorter path after all.
+
+**Why (performance per unit of machinery, and ease for operators).** Each
+regime gets the cheapest lever that moves its wall. For the large-fleet
+case that lever needs no new operator surface at all.
+
+## 4. Node-owned (pool-keyed) sharding, not job-keyed shared-state sharding
 
 **Call.** Shards own disjoint node pools; a job lives in the shard that owns
 its pool. The Omega/Gödel shape (jobs hash to shards, any shard places on any
@@ -122,7 +165,7 @@ ownership gives the same multiplier with the invariant intact *by
 construction* — and "the batch pool has its own scheduler" is explainable
 at 3am.
 
-## 4. More write-class lanes are refused as a scaling axis, permanently
+## 5. More write-class lanes are refused as a scaling axis, permanently
 
 **Call.** M1 is marked *refuse*, not deferred; the three lanes are the
 complete vertical split.
@@ -139,33 +182,37 @@ pipeline, a reconciler set, and a permanent row in the operator's mental
 model — and over the shared file buys zero write concurrency (entry 1's
 arithmetic applies to lanes exactly as to shards). The write classes are ~4
 and enumerable; the residue ceiling (`ID_STRIDE = 8`,
-`src/storage/raft/mod.rs:73`) is 8. Horizontal shards within a class scale;
+`src/storage/raft/mod.rs:75`) is 8. Horizontal shards within a class scale;
 vertical lanes per feature only widen.
 
-## 5. Everything is sequenced behind a measured, attributed ceiling — and Phase 0 is made nearly free
+## 6. Everything is sequenced behind a measured, attributed ceiling — and Phase 0 is made nearly free
 
-**Call.** No method graduates until Phase 0 names the bottleneck. Revision 2
-makes Phase 0 cheap: the capture-vs-propose split is already metered
-(`legion_raft_capture_seconds` / `legion_raft_propose_apply_seconds`,
-`src/manager/telemetry.rs:765`) so the ratio comes from archived campaigns,
-plus one in-process micro-benchmark of N pipelines over one file versus N
-files. The native submitter remains the gate for the *production* number,
-not for the design decision.
+**Call.** No method graduates until Phase 0 names the bottleneck *per
+fleet-size regime*. Revision 2 made Phase 0 cheap: the capture-vs-propose
+split is already metered (`legion_raft_capture_seconds` /
+`legion_raft_propose_apply_seconds`, `src/manager/telemetry.rs:859`), plus
+one in-process micro-benchmark of N pipelines over one file versus N files.
+Revision 3 makes it cheaper again: the native submitter shipped, the
+October campaigns measured the ceiling from 1k to 50k nodes, and
+`collect.sh` now scrapes both raft series, so the ratio and the eval-phase
+split are reads of the S3 archives rather than a new campaign.
 
 **Alternatives.** Graduate rung A now — phase 2/3's evidence already points
 at the pipeline, and waiting costs calendar time.
 
 **Trade-off.** If Phase 0 confirms the pipeline, the wait bought only
-confidence. Accepted: the last three campaigns each overturned the previous
-session's diagnosis (conflicts → read pool → pipeline → driver), and this
-document's own revision 1 was overturned by one afternoon of arithmetic.
+confidence. Accepted: the campaigns keep overturning the previous
+diagnosis (conflicts → read pool → pipeline → driver → planning on the
+leader at large fleets), and this document's own revision 1 was overturned
+by one afternoon of arithmetic. The October result is the latest instance:
+it is what moved M3 (entry 3).
 
 **Why (performance discipline).** The repo's precedent —
 `eval-thread-default-plan.md` deliberately picks no number — and the
 adaptive-concurrency plan's warning about tuning against distributions
 that no longer exist.
 
-## 6. v1 resharding is a declared format break (JC-43); online resharding is rung C
+## 7. v1 resharding is a declared format break (JC-43); online resharding is rung C
 
 **Call.** Changing `shards` or `assignments` in v1 takes the existing
 topology-change path — backup → fresh cluster → restore — recorded in the
@@ -186,7 +233,7 @@ documented and tested, and raft-mode operators already live under it for
 topology; reusing it keeps v1's new-mechanism budget on the multi-file
 store.
 
-## 7. `shards = 1` is behaviorally identical, not byte-identical, under `lanes`
+## 8. `shards = 1` is behaviorally identical, not byte-identical, under `lanes`
 
 **Call.** Under `lanes`, scheduler state lives in `scheduler-0.sqlite` even
 at N = 1, so there is one code path; the invariant is "passes the whole
@@ -206,7 +253,7 @@ stamped, and one layout is the difference between one set of tests and two.
 accumulates bugs at the seam; the stamp makes the break loud rather than
 silent.
 
-## 8. Federation is positioned as complementary, not competing
+## 9. Federation is positioned as complementary, not competing
 
 **Call.** M6 is the *outer* axis that scales every dimension including
 per-manager memory; M4's job is raising the single-cluster ceiling so
