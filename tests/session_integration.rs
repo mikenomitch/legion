@@ -27,7 +27,6 @@ use legion::structs::config::{ManagerConfigFull, PersistenceType};
 use legion::structs::job::JobConfig;
 use legion::structs::manager_server::Manager;
 use legion::structs::worker_server::Worker;
-use legion::worker::plane::{serve_on, NodeIdentity, WorkerPlaneTls};
 use legion::structs::{
     CreateInstanceRequest, DestroyInstanceRequest, ExecClientFrame, ExecServerFrame,
     GetInstanceRequest, GetTaskLogsReply, GetTaskLogsRequest, HeartbeatReply, HeartbeatRequest,
@@ -37,6 +36,7 @@ use legion::structs::{
     StopInstanceRequest, StopSessionsReply, StopSessionsRequest, Submission,
     SuspendInstanceRequest, TaskAllocation,
 };
+use legion::worker::plane::{serve_on, NodeIdentity, WorkerPlaneTls};
 use tonic::{Code, Request, Response, Status, Streaming};
 
 const TASK: &str = "workspace";
@@ -710,8 +710,8 @@ async fn session_start_latency_measure() -> R<()> {
     let cluster = Cluster::with_sizes(
         "agents-measure",
         &names,
-        json!({ "cpu": 38000, "memory": 60000 }),
-        json!({ "cpu": 100, "memory": 128 }),
+        json!({ "cpu": 1900, "memory": 60000 }),
+        json!({ "cpu": 5, "memory": 128 }),
     )
     .await?;
     let quantile = |latencies: &mut Vec<std::time::Duration>, q: f64| {

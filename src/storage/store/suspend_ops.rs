@@ -810,7 +810,14 @@ impl Store {
                 let mut conn = s.write_connection()?;
                 let tx = Self::write_tx(&mut conn)?;
                 let envelope = &manifest.envelope;
-                let job_created_at = s.get_job(&envelope.job_id).ok().map(|job| job.created_at);
+                // Read on the transaction, not a pooled read connection,
+                // which would deadlock on a store without a read pool.
+                let job_created_at = tx
+                    .query_row(&GET_JOB, [envelope.job_id.as_str()], |row| {
+                        s.job_from_row(row)
+                    })
+                    .optional()?
+                    .map(|job| job.created_at);
                 if job_created_at != Some(envelope.job_created_at) {
                     bail!(StorageError::not_found("instance", &envelope.instance_id));
                 }

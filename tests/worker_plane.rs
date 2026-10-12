@@ -26,7 +26,7 @@ use legion::manager::{mesh_ca, worker_plane};
 use legion::storage::store::Store;
 use legion::structs::{
     config::ManagerConfigFull, worker_client::WorkerClient, ExecClientFrame, GetTaskLogsRequest,
-    NodeMsg, PostWorkRequest, RestartWorkerRequest, StartClaimRequest,
+    NodeMsg, PostWorkRequest, RestartWorkerRequest, StartClaimRequest, StopSessionsRequest,
 };
 use legion::worker::plane::{serve_on, Caller, NodeIdentity, WorkerPlaneTls, WORKER_RPC_CALLERS};
 use legion::worker::server::WorkerDaemonService;
@@ -177,6 +177,13 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Result<(), tonic
                 ticket: "not-a-ticket".into(),
                 instance_id: "i-1".into(),
                 ..Default::default()
+            })
+            .await
+            .map(|_| ()),
+        "StopSessions" => client
+            .stop_sessions(StopSessionsRequest {
+                session_ids: vec!["workspace-not-running".into()],
+                reason: "stop".into(),
             })
             .await
             .map(|_| ()),
