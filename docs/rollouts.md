@@ -203,9 +203,45 @@ seconds) recovers on the rollout's next tick.
 
 When replacements cannot place:
 
-- Rollout waits and retries.
+- Rollout waits and retries. The retry interval starts at 2s and backs off
+  to half of how long the group has been blocked, capped at 30s (and never
+  past the moment `capacityBlockTimeout` fires). The rollout's event log only
+  gets a new entry when the status or message changes, so a long block shows
+  up as one `placement blocked: ...` event rather than one per tick.
 - If `capacityBlockTimeout` is set and expires, `onCapacityTimeout` decides outcome:
 `rollback`, `fail`, or `completeIncomplete`.
+
+A replacement whose `dependsOn` is not met yet (a batch step of the new
+version that has not exited) is not capacity blocked. The group waits with
+`Group <g> waiting for dependencies of <task> to finish`, the capacity
+timeout does not run, and the dependency's exit queues the next tick.
+
+### Static ports and surge
+
+A task with a static port (`network.ports[].static`) runs once per node, so
+a replacement cannot be placed on a node where the old allocation still
+holds the port. With `createFirst`, a single-node cluster, or every node
+already running the port, the replacement could never be placed first, and
+the rollout used to wait for capacity forever with the service down.
+
+When the scheduler reports a replacement unplaceable because of a static
+port that old allocations of the same task hold, the rollout stops as many
+of those old allocations as there are blocked replacements, then places the
+replacements on the next tick: a destructive update for that step. The event
+says so:
+
+```text
+Group web cannot surge: static port 8080 is held by the version being replaced; stopped 1 old allocation(s) before placing the new one
+```
+
+Only old allocations that hold the blocking port are stopped, and old
+`batch` allocations are never stopped this way (`batchKillAfter` still
+governs them). A port held by another job is an ordinary capacity block.
+
+Known limitation: the old process gets its normal graceful stop (`stop`
+signal, then `killAfter`), and the replacement is dispatched right away. If
+the old process is still shutting down when the new one starts, the new one
+fails to bind and goes through its `restart` policy until the port is free.
 
 `completeIncomplete` behavior:
 

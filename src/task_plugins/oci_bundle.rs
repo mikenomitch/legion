@@ -8,14 +8,563 @@
 //!
 //! The conversion is deliberately self-contained (no external `umoci`/`skopeo`
 //! dependency): read the image manifest + config from the layout, extract each
-//! layer tarball into `rootfs/` (honoring overlayfs whiteouts), and synthesize
-//! a runtime spec that merges the image config (env, working dir, user) with
-//! the task's command and env.
+//! layer tarball into `rootfs/` (honoring overlayfs whiteouts, and keeping each
+//! file's owner, mode, and file capabilities), and synthesize a runtime spec
+//! that merges the image config (env, working dir, user) with the task's
+//! command and env.
+//!
+//! The spec's process privileges follow Docker's defaults, because stock
+//! images are written against them: Docker's capability set (less
+//! `CAP_NET_RAW`, see [`DEFAULT_CAPABILITIES`]) and a high `RLIMIT_NOFILE`.
+//! A container task adjusts either through its config
+//! (`security.capabilities`, `ulimits`).
 
 use crate::prelude::*;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
+
+/// The capabilities a container gets when its jobspec adjusts nothing:
+/// Docker's default set (moby `oci/caps/defaults.go`) without `CAP_NET_RAW`.
+///
+/// Stock images assume these. The official nginx and Postgres entrypoints
+/// `chown` their directories and drop to an unprivileged user with
+/// `setuid`/`setgid` (`gosu`, `su-exec`), which needs `CAP_CHOWN`,
+/// `CAP_SETUID`, and `CAP_SETGID`.
+///
+/// `CAP_NET_RAW` is the one deliberate difference. A Docker container has its
+/// own network namespace, so raw sockets there see only its own traffic. A
+/// Legion container shares the node's network namespace unless it is gated,
+/// and `CAP_NET_RAW` there means sniffing and spoofing on the node's
+/// interfaces. Nomad's Docker driver drops it from its default for the same
+/// reason. A task that needs it (`ping`, `traceroute`) adds it back with
+/// `security.capabilities.add = ["NET_RAW"]`.
+pub(crate) const DEFAULT_CAPABILITIES: &[&str] = &[
+    "CAP_AUDIT_WRITE",
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FOWNER",
+    "CAP_FSETID",
+    "CAP_KILL",
+    "CAP_MKNOD",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_SETFCAP",
+    "CAP_SETGID",
+    "CAP_SETPCAP",
+    "CAP_SETUID",
+    "CAP_SYS_CHROOT",
+];
+
+/// Every capability Linux defines, through 5.9's `CAP_CHECKPOINT_RESTORE`.
+/// The vocabulary `security.capabilities` is validated against, and what
+/// `add = ["ALL"]` expands to.
+pub(crate) const ALL_CAPABILITIES: &[&str] = &[
+    "CAP_AUDIT_CONTROL",
+    "CAP_AUDIT_READ",
+    "CAP_AUDIT_WRITE",
+    "CAP_BLOCK_SUSPEND",
+    "CAP_BPF",
+    "CAP_CHECKPOINT_RESTORE",
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_DAC_READ_SEARCH",
+    "CAP_FOWNER",
+    "CAP_FSETID",
+    "CAP_IPC_LOCK",
+    "CAP_IPC_OWNER",
+    "CAP_KILL",
+    "CAP_LEASE",
+    "CAP_LINUX_IMMUTABLE",
+    "CAP_MAC_ADMIN",
+    "CAP_MAC_OVERRIDE",
+    "CAP_MKNOD",
+    "CAP_NET_ADMIN",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_NET_BROADCAST",
+    "CAP_NET_RAW",
+    "CAP_PERFMON",
+    "CAP_SETFCAP",
+    "CAP_SETGID",
+    "CAP_SETPCAP",
+    "CAP_SETUID",
+    "CAP_SYSLOG",
+    "CAP_SYS_ADMIN",
+    "CAP_SYS_BOOT",
+    "CAP_SYS_CHROOT",
+    "CAP_SYS_MODULE",
+    "CAP_SYS_NICE",
+    "CAP_SYS_PACCT",
+    "CAP_SYS_PTRACE",
+    "CAP_SYS_RAWIO",
+    "CAP_SYS_RESOURCE",
+    "CAP_SYS_TIME",
+    "CAP_SYS_TTY_CONFIG",
+    "CAP_WAKE_ALARM",
+];
+
+/// Normalizes one capability name from a jobspec or worker config:
+/// case-insensitive, with or without the `CAP_` prefix (`net_admin`,
+/// `NET_ADMIN`, and `CAP_NET_ADMIN` are the same capability), plus the `ALL`
+/// keyword. `field` is the list's full path, for the error.
+fn normalize_capability(raw: &str, field: &str) -> R<String> {
+    let upper = raw.trim().to_ascii_uppercase();
+    if upper == "ALL" {
+        return Ok(upper);
+    }
+    let name = if upper.starts_with("CAP_") {
+        upper
+    } else {
+        format!("CAP_{upper}")
+    };
+    if ALL_CAPABILITIES.contains(&name.as_str()) {
+        Ok(name)
+    } else {
+        bail!(
+            "unknown capability {raw:?} in {field}: use a Linux capability name such as \
+             NET_ADMIN (the CAP_ prefix is optional), or ALL"
+        )
+    }
+}
+
+/// The container's capability set from the jobspec's adjustments, with
+/// Docker's `--cap-add` / `--cap-drop` semantics:
+///
+/// - `add` containing `ALL`: every capability except those `drop` names;
+/// - `drop` containing `ALL`: exactly the capabilities `add` names;
+/// - otherwise: [`DEFAULT_CAPABILITIES`], less `drop`, plus `add` (a name in
+///   both lists ends up granted, as in Docker).
+///
+/// Names are validated, so a typo fails at submit instead of starting a
+/// container that quietly lacks the capability it needs. `ALL` in both lists
+/// is rejected as contradictory.
+pub(crate) fn resolve_capabilities(add: &[String], drop: &[String]) -> R<Vec<String>> {
+    let add = add
+        .iter()
+        .map(|raw| normalize_capability(raw, "security.capabilities.add"))
+        .collect::<R<Vec<_>>>()?;
+    let drop = drop
+        .iter()
+        .map(|raw| normalize_capability(raw, "security.capabilities.drop"))
+        .collect::<R<Vec<_>>>()?;
+    let add_all = add.iter().any(|cap| cap == "ALL");
+    let drop_all = drop.iter().any(|cap| cap == "ALL");
+    let mut caps: Vec<String> = match (add_all, drop_all) {
+        (true, true) => bail!(
+            "security.capabilities lists ALL in both add and drop; keep ALL in one list and name \
+             the exceptions in the other"
+        ),
+        (true, false) => ALL_CAPABILITIES
+            .iter()
+            .filter(|cap| !drop.iter().any(|dropped| dropped == *cap))
+            .map(|cap| cap.to_string())
+            .collect(),
+        (false, true) => add,
+        (false, false) => DEFAULT_CAPABILITIES
+            .iter()
+            .filter(|cap| !drop.iter().any(|dropped| dropped == *cap))
+            .map(|cap| cap.to_string())
+            .chain(add)
+            .collect(),
+    };
+    caps.sort();
+    caps.dedup();
+    Ok(caps)
+}
+
+/// The default capability set, as owned strings.
+pub(crate) fn default_capabilities() -> Vec<String> {
+    DEFAULT_CAPABILITIES
+        .iter()
+        .map(|cap| cap.to_string())
+        .collect()
+}
+
+/// The capabilities a node lets container tasks end up with: the worker
+/// type's `container.allowCaps`, Nomad's `allow_caps` for its Docker driver.
+///
+/// A task's effective set ([`resolve_capabilities`]: the default, less
+/// `drop`, plus `add`) must fit inside it, or the start fails on that node.
+/// Dropping is therefore always allowed. The default allowlist is exactly
+/// [`DEFAULT_CAPABILITIES`], so out of the box a job can narrow its set but
+/// not widen it: granting `SYS_ADMIN` (container root becomes host root) is
+/// the node operator's decision, not the job author's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityAllowlist {
+    /// `allowCaps = ["ALL"]`: any capability.
+    All,
+    /// These capabilities (normalized, sorted, deduplicated) and no others.
+    Only(Vec<String>),
+}
+
+impl Default for CapabilityAllowlist {
+    fn default() -> Self {
+        Self::Only(default_capabilities())
+    }
+}
+
+impl CapabilityAllowlist {
+    /// The operator's `container.allowCaps`, validated: names are
+    /// normalized like a jobspec's, `ALL` anywhere in the list allows
+    /// everything, and an unknown name fails the config load. `None` (the
+    /// field is absent) is the default set; an empty list allows nothing, so
+    /// every container task there must drop every capability.
+    pub fn from_config(raw: Option<&[String]>) -> R<Self> {
+        let Some(raw) = raw else {
+            return Ok(Self::default());
+        };
+        let mut caps = raw
+            .iter()
+            .map(|name| normalize_capability(name, "container.allowCaps"))
+            .collect::<R<Vec<_>>>()?;
+        if caps.iter().any(|cap| cap == "ALL") {
+            return Ok(Self::All);
+        }
+        caps.sort();
+        caps.dedup();
+        Ok(Self::Only(caps))
+    }
+
+    /// The list as it is written back into worker config: `["ALL"]` or the
+    /// normalized names.
+    pub fn to_config(&self) -> Vec<String> {
+        match self {
+            Self::All => vec!["ALL".to_string()],
+            Self::Only(caps) => caps.clone(),
+        }
+    }
+
+    /// The value of [`crate::constants::ENV_CONTAINER_ALLOW_CAPS`], which is
+    /// how the worker hands the allowlist to its in-process runtimes.
+    pub fn to_env_value(&self) -> String {
+        self.to_config().join(",")
+    }
+
+    /// This node's allowlist, as the worker published it. Absent means the
+    /// worker was not given one (the default set). A value that does not
+    /// parse also falls back to the default set, which is the safe direction.
+    pub(crate) fn from_env() -> Self {
+        Self::from_env_value(
+            std::env::var(crate::constants::ENV_CONTAINER_ALLOW_CAPS)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// [`Self::from_env`] on a given value, so tests need not touch the
+    /// process environment.
+    fn from_env_value(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::default();
+        };
+        let names: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        Self::from_config(Some(&names)).unwrap_or_else(|err| {
+            warn!(
+                error = %format!("{err:#}"),
+                "Invalid container capability allowlist from the worker config; using the default"
+            );
+            Self::default()
+        })
+    }
+
+    /// Whether `cap` (normalized, `CAP_` prefixed) is allowed.
+    pub fn allows(&self, cap: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(caps) => caps.iter().any(|allowed| allowed == cap),
+        }
+    }
+
+    /// The capabilities in `caps` this allowlist refuses.
+    pub fn refused(&self, caps: &[String]) -> Vec<String> {
+        caps.iter()
+            .filter(|cap| !self.allows(cap))
+            .cloned()
+            .collect()
+    }
+
+    /// `caps` without what this allowlist refuses.
+    pub(crate) fn intersect(&self, caps: Vec<String>) -> Vec<String> {
+        caps.into_iter().filter(|cap| self.allows(cap)).collect()
+    }
+
+    /// The allowlist for an error message: `ALL`, `none`, or the names.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::All => "ALL".to_string(),
+            Self::Only(caps) if caps.is_empty() => "none".to_string(),
+            Self::Only(caps) => caps
+                .iter()
+                .map(|cap| cap.trim_start_matches("CAP_"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+}
+
+/// Fails when a container task's effective capability set holds anything
+/// the node's allowlist refuses, naming each such capability, the worker
+/// config field that would allow it, and the jobspec fields that would avoid
+/// it.
+pub(crate) fn check_capabilities_allowed(
+    task: &str,
+    capabilities: &[String],
+    allowlist: &CapabilityAllowlist,
+) -> R<()> {
+    let refused = allowlist.refused(capabilities);
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let short: Vec<&str> = refused
+        .iter()
+        .map(|cap| cap.trim_start_matches("CAP_"))
+        .collect();
+    let quoted: Vec<String> = short.iter().map(|cap| format!("{cap:?}")).collect();
+    bail!(
+        "task {task} would run with capabilities this node does not allow container tasks to \
+         have: {refused}. This node allows: {allowed} (the worker type's container.allowCaps). \
+         An operator can allow them by adding {quoted} to container.allowCaps in this worker \
+         type's config; otherwise take them out of the task (remove them from \
+         security.capabilities.add, or list them in security.capabilities.drop)",
+        refused = short.join(", "),
+        allowed = allowlist.describe(),
+        quoted = quoted.join(", "),
+    )
+}
+
+/// One `process.rlimits` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Rlimit {
+    /// `RLIMIT_NOFILE` and friends.
+    pub(crate) kind: String,
+    pub(crate) soft: u64,
+    pub(crate) hard: u64,
+}
+
+/// `RLIM_INFINITY`, which is what `"unlimited"` in a jobspec means.
+const RLIM_INFINITY: u64 = u64::MAX;
+
+/// The open-file limit a container gets by default: 1048576 (2^20), the
+/// value Docker containers ran with for years (containerd's systemd unit set
+/// `LimitNOFILE=infinity`, which the kernel caps at `fs.nr_open`), and what
+/// CRI-O sets, unless the worker's own hard limit is lower (see
+/// `default_nofile`). The OCI runtime's own default is a hard 1024, which
+/// servers like Redis warn about at start and which a busy proxy exhausts.
+pub(crate) const DEFAULT_NOFILE: u64 = 1_048_576;
+
+/// The rlimit names `ulimits` accepts, as `(jobspec name, OCI type)`. The
+/// same names `docker run --ulimit` and Compose's `ulimits` take.
+const RLIMIT_NAMES: &[(&str, &str)] = &[
+    ("as", "RLIMIT_AS"),
+    ("core", "RLIMIT_CORE"),
+    ("cpu", "RLIMIT_CPU"),
+    ("data", "RLIMIT_DATA"),
+    ("fsize", "RLIMIT_FSIZE"),
+    ("locks", "RLIMIT_LOCKS"),
+    ("memlock", "RLIMIT_MEMLOCK"),
+    ("msgqueue", "RLIMIT_MSGQUEUE"),
+    ("nice", "RLIMIT_NICE"),
+    ("nofile", "RLIMIT_NOFILE"),
+    ("nproc", "RLIMIT_NPROC"),
+    ("rss", "RLIMIT_RSS"),
+    ("rtprio", "RLIMIT_RTPRIO"),
+    ("rttime", "RLIMIT_RTTIME"),
+    ("sigpending", "RLIMIT_SIGPENDING"),
+    ("stack", "RLIMIT_STACK"),
+];
+
+/// The default open-file limit for this host: [`DEFAULT_NOFILE`], lowered to
+/// the kernel's `fs.nr_open` and to the worker's own hard limit when either
+/// is smaller.
+///
+/// The OCI runtime runs as the worker's child, so the worker's hard limit is
+/// what it starts from, and a container whose limit is above it only starts
+/// where the runtime may raise it. A root runtime normally may, but hosts
+/// exist where even root cannot (sandboxed or nested environments refuse
+/// raising a hard limit with `EPERM`), and there `runc` fails every start
+/// with "error setting rlimits for ready process". Starting from the worker's
+/// own limit always works, and the operator sets it in one place
+/// (`LimitNOFILE=` in the worker's systemd unit, which is 524288 by default).
+fn default_nofile() -> u64 {
+    let mut limit = DEFAULT_NOFILE;
+    if let Some(nr_open) = std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        limit = limit.min(nr_open);
+    }
+    #[cfg(unix)]
+    {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes the struct it is handed.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) } == 0 {
+            limit = limit.min(current.rlim_max);
+        }
+    }
+    limit
+}
+
+/// The rlimits a container gets when its jobspec sets no `ulimits`.
+pub(crate) fn default_rlimits() -> Vec<Rlimit> {
+    let nofile = default_nofile();
+    vec![Rlimit {
+        kind: "RLIMIT_NOFILE".to_string(),
+        soft: nofile,
+        hard: nofile,
+    }]
+}
+
+/// One `ulimits` value: a number or `"unlimited"`.
+fn rlimit_amount(name: &str, which: &str, value: &Value) -> R<u64> {
+    match value {
+        Value::Number(number) => number.as_u64().with_context(|| {
+            format!("ulimits.{name}{which} must be a non-negative whole number or \"unlimited\"")
+        }),
+        Value::String(word) if word == "unlimited" => Ok(RLIM_INFINITY),
+        _ => bail!("ulimits.{name}{which} must be a non-negative whole number or \"unlimited\""),
+    }
+}
+
+/// The container's rlimits: the defaults, with each `ulimits` entry the
+/// jobspec declares replacing the default of the same kind.
+///
+/// An entry is a number (soft and hard both), `"unlimited"`, or
+/// `{ soft, hard }`, with `soft <= hard`. Names are the lowercase rlimit
+/// names (`nofile`, `nproc`, `memlock`, ...), validated so a typo fails at
+/// submit.
+pub(crate) fn resolve_rlimits(ulimits: &BTreeMap<String, Value>) -> R<Vec<Rlimit>> {
+    let mut declared: Vec<Rlimit> = Vec::new();
+    for (name, value) in ulimits {
+        let Some((_, kind)) = RLIMIT_NAMES.iter().find(|(known, _)| known == name) else {
+            let known: Vec<&str> = RLIMIT_NAMES.iter().map(|(known, _)| *known).collect();
+            bail!(
+                "unknown ulimit {name:?}; expected one of {}",
+                known.join(", ")
+            );
+        };
+        let (soft, hard) = match value {
+            Value::Object(pair) => {
+                if let Some(extra) = pair.keys().find(|key| *key != "soft" && *key != "hard") {
+                    bail!("ulimits.{name} has an unknown field {extra:?}; use {{ soft, hard }}");
+                }
+                let soft = pair
+                    .get("soft")
+                    .with_context(|| format!("ulimits.{name} needs both soft and hard"))?;
+                let hard = pair
+                    .get("hard")
+                    .with_context(|| format!("ulimits.{name} needs both soft and hard"))?;
+                (
+                    rlimit_amount(name, ".soft", soft)?,
+                    rlimit_amount(name, ".hard", hard)?,
+                )
+            }
+            single => {
+                let amount = rlimit_amount(name, "", single)?;
+                (amount, amount)
+            }
+        };
+        if soft > hard {
+            bail!("ulimits.{name}: soft ({soft}) must not exceed hard ({hard})");
+        }
+        declared.push(Rlimit {
+            kind: kind.to_string(),
+            soft,
+            hard,
+        });
+    }
+    let mut rlimits: Vec<Rlimit> = default_rlimits()
+        .into_iter()
+        .filter(|default| !declared.iter().any(|set| set.kind == default.kind))
+        .collect();
+    rlimits.extend(declared);
+    Ok(rlimits)
+}
+
+/// The privileges and limits of the container's process: its capability set
+/// and its rlimits. [`Default`] is what a task that adjusts nothing gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessPolicy {
+    /// Granted as the bounding, effective, and permitted sets, as Docker
+    /// does. The inheritable and ambient sets stay empty, so a non-root
+    /// process keeps none of them across `execve`.
+    pub(crate) capabilities: Vec<String>,
+    pub(crate) rlimits: Vec<Rlimit>,
+}
+
+impl Default for ProcessPolicy {
+    fn default() -> Self {
+        Self {
+            capabilities: default_capabilities(),
+            rlimits: default_rlimits(),
+        }
+    }
+}
+
+/// Whether this process runs as root, which decides whether extraction can
+/// keep a layer's owners and whether the task's log files can be handed to
+/// the container's user.
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Hands the task's captured `stdout.log` / `stderr.log` to the container's
+/// user, so a non-root process can reopen its own output by path.
+///
+/// The container's stdout and stderr are these files, opened by the worker.
+/// A process that writes to them through its inherited descriptors needs
+/// nothing more, but many images reopen them: nginx symlinks
+/// `/var/log/nginx/access.log` to `/dev/stdout`, and `/dev/stdout` is
+/// `/proc/self/fd/1`. Reopening goes through the file's own permission check,
+/// so a root-owned file refuses a non-root user with `EACCES`, and nginx (or
+/// any image with a `USER`) fails to start. Docker avoids this by chowning the
+/// stdio pipes it hands the container to the container's user (moby's
+/// `IoUid`/`IoGid`).
+///
+/// The log directory itself stays owner-only (0700, root): reopening through
+/// `/proc/self/fd` does not traverse it, so the container gains access to its
+/// own two files and nothing else. Re-run at every start, because an
+/// in-place restart may run a different image user. A no-op when the worker
+/// is not root (it cannot chown), or when the task has no log directory.
+pub(crate) fn hand_task_logs_to(log_dir: Option<&Path>, uid: u32, gid: u32) {
+    let Some(log_dir) = log_dir else {
+        return;
+    };
+    if !running_as_root() {
+        return;
+    }
+    for file in [
+        crate::task_plugins::STDOUT_LOG_FILE,
+        crate::task_plugins::STDERR_LOG_FILE,
+    ] {
+        let path = log_dir.join(file);
+        #[cfg(unix)]
+        if let Err(err) = std::os::unix::fs::chown(&path, Some(uid), Some(gid)) {
+            warn!(
+                path = %path.display(),
+                uid,
+                gid,
+                error = %err,
+                "Could not hand the task log to the container user; a non-root container cannot \
+                 reopen /dev/stdout or /dev/stderr"
+            );
+        }
+    }
+}
 
 /// Image config fields we carry from the OCI layout into the runtime spec,
 /// plus the ordered layer blob paths to extract.
@@ -62,15 +611,16 @@ pub(crate) fn materialize_rootfs(oci_layout: &Path, rootfs: &Path) -> R<ImageCon
 /// [`BundleContext`]). Shared with the sandbox kind's dev mode, which runs an
 /// OCI bundle too. The bundle is rebuilt from scratch each call.
 ///
-/// Returns the image's declared `StopSignal`, when it has one, for the
-/// container runtime's stop-signal default chain.
+/// Returns what the caller needs from the image: its declared `StopSignal`
+/// (for the container runtime's stop-signal default chain) and the uid/gid
+/// the process runs as (to hand it the task's log files).
 pub(crate) fn build_bundle(
     oci_layout: &Path,
     bundle_dir: &Path,
     command: &[String],
     env: &std::collections::HashMap<String, String>,
     ctx: &BundleContext<'_>,
-) -> R<Option<String>> {
+) -> R<BuiltBundle> {
     if command.is_empty() {
         bail!("container command must include at least one entry");
     }
@@ -106,12 +656,29 @@ pub(crate) fn build_bundle(
         resolver: ctx.resolver,
         resolv_conf: resolv_conf.as_deref(),
         netns: ctx.netns,
+        policy: ctx.policy,
     };
     let spec = build_spec(command, env, &image, &user, &ctx);
     let config_path = bundle_dir.join("config.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
         .with_context(|| format!("write {}", config_path.display()))?;
-    Ok(image.stop_signal)
+    Ok(BuiltBundle {
+        stop_signal: image.stop_signal,
+        uid: user.uid,
+        gid: user.gid,
+    })
+}
+
+/// What [`build_bundle`] learned from the image that its caller acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BuiltBundle {
+    /// The image's declared `StopSignal`, when it has one.
+    pub(crate) stop_signal: Option<String>,
+    /// The uid the container's process runs as (the image's `User`,
+    /// resolved against its rootfs).
+    pub(crate) uid: u32,
+    /// The gid the container's process runs as.
+    pub(crate) gid: u32,
 }
 
 fn read_json(path: &Path) -> R<Value> {
@@ -208,7 +775,31 @@ fn safe_relative(path: &Path) -> Option<PathBuf> {
 /// Extracts one image layer over `rootfs`, applying overlayfs whiteouts:
 /// `.wh.<name>` deletes `<name>`, and `.wh..wh..opq` clears the directory's
 /// existing contents (an opaque directory) before later entries land.
+///
+/// Each entry keeps what the image recorded for it, the way Docker's
+/// extraction does:
+///
+/// - **Owner (uid/gid)**, when the worker runs as root. An image that runs as
+///   a non-root `USER` relies on it: `RUN chown nginx /var/cache/nginx` is how
+///   nginx's image lets its workers write there, and a rootfs where every
+///   file is `0:0` breaks it. A non-root worker cannot chown, so there every
+///   file belongs to the worker's user (and the container runtime runs
+///   rootless anyway).
+/// - **Mode, including setuid/setgid/sticky.** A setuid or setgid mode is
+///   re-applied after the chown, because `chown` clears those bits.
+/// - **File capabilities and other extended attributes** (PAX
+///   `SCHILY.xattr.*` records), best effort and only as root. `security.capability`
+///   is what lets an image grant `cap_net_bind_service` to one binary.
+///   `security.selinux` and `trusted.*` are skipped: labels belong to the
+///   host's policy, and `trusted.overlay.*` is overlayfs bookkeeping, not
+///   image content. A filesystem that refuses an attribute logs and moves on.
 fn extract_layer(blob: &Path, rootfs: &Path) -> R<()> {
+    extract_layer_as(blob, rootfs, running_as_root())
+}
+
+/// [`extract_layer`] with the ownership decision made by the caller, so tests
+/// can exercise both paths.
+fn extract_layer_as(blob: &Path, rootfs: &Path, preserve_owners: bool) -> R<()> {
     let mut file = std::fs::File::open(blob)?;
     let mut magic = [0u8; 4];
     let read = file.read(&mut magic)?;
@@ -225,6 +816,10 @@ fn extract_layer(blob: &Path, rootfs: &Path) -> R<()> {
     };
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
+    // Owners are applied below, not by the tar crate: it refuses an entry
+    // whose uid/gid field is empty, which Go's archive/tar (and so Docker)
+    // reads as 0.
+    archive.set_preserve_ownerships(false);
     archive.set_overwrite(true);
 
     for entry in archive.entries()? {
@@ -257,11 +852,144 @@ fn extract_layer(blob: &Path, rootfs: &Path) -> R<()> {
             continue;
         }
 
+        // Read before unpacking: the PAX records sit in the header, and the
+        // entry's data is consumed by the unpack.
+        let owner = preserve_owners.then(|| EntryOwner::of(entry.header()));
+        let xattrs = if preserve_owners {
+            entry_xattrs(&mut entry)
+        } else {
+            Vec::new()
+        };
         // `unpack_in` re-validates the path against the rootfs and resolves
-        // hardlink/symlink targets safely.
-        entry.unpack_in(rootfs)?;
+        // hardlink/symlink targets safely, and applies the mode.
+        if !entry.unpack_in(rootfs)? {
+            continue;
+        }
+        let target = rootfs.join(&rel);
+        if let Some(owner) = owner {
+            owner.apply(&target);
+        }
+        if !xattrs.is_empty() {
+            // After the chown, which would clear `security.capability`.
+            apply_xattrs(&target, &xattrs);
+        }
     }
     Ok(())
+}
+
+/// The owner and mode a layer recorded for one entry.
+struct EntryOwner {
+    uid: u32,
+    gid: u32,
+    mode: Option<u32>,
+    symlink: bool,
+}
+
+impl EntryOwner {
+    /// An empty or unparsable uid/gid field is 0, as Go's `archive/tar`
+    /// reads it; an id beyond `u32` is treated the same way.
+    fn of(header: &tar::Header) -> Self {
+        let id = |value: std::io::Result<u64>| {
+            value
+                .ok()
+                .and_then(|id| u32::try_from(id).ok())
+                .unwrap_or(0)
+        };
+        Self {
+            uid: id(header.uid()),
+            gid: id(header.gid()),
+            mode: header.mode().ok(),
+            symlink: header.entry_type().is_symlink(),
+        }
+    }
+
+    /// Chowns the extracted path (the link itself, for a symlink), then
+    /// re-applies a setuid/setgid mode, which `chown` clears on a regular
+    /// file even when root does it.
+    fn apply(&self, path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) = std::os::unix::fs::lchown(path, Some(self.uid), Some(self.gid)) {
+                debug!(
+                    path = %path.display(),
+                    uid = self.uid,
+                    gid = self.gid,
+                    error = %err,
+                    "Could not keep an image layer's file owner"
+                );
+                return;
+            }
+            if let Some(mode) = self.mode.filter(|mode| !self.symlink && mode & 0o6000 != 0) {
+                let _ =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+}
+
+/// The PAX `SCHILY.xattr.<name>` records on a tar entry, minus the ones that
+/// must not be copied onto the host: `security.selinux` (the host's policy
+/// labels files, not the image) and `trusted.*` (overlayfs bookkeeping).
+fn entry_xattrs<T: Read>(entry: &mut tar::Entry<'_, T>) -> Vec<(String, Vec<u8>)> {
+    let Ok(Some(extensions)) = entry.pax_extensions() else {
+        return Vec::new();
+    };
+    extensions
+        .filter_map(Result::ok)
+        .filter_map(|extension| {
+            let name = extension.key().ok()?.strip_prefix("SCHILY.xattr.")?;
+            if name == "security.selinux" || name.starts_with("trusted.") {
+                return None;
+            }
+            Some((name.to_string(), extension.value_bytes().to_vec()))
+        })
+        .collect()
+}
+
+/// Sets extended attributes on an extracted path, best effort: a filesystem
+/// that does not support one (or a kernel that refuses it) costs the image
+/// that attribute, not the whole start.
+fn apply_xattrs(path: &Path, xattrs: &[(String, Vec<u8>)]) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return;
+        };
+        for (name, value) in xattrs {
+            let Ok(c_name) = std::ffi::CString::new(name.as_bytes()) else {
+                continue;
+            };
+            // SAFETY: both strings are NUL-terminated and outlive the call;
+            // `value` is a valid buffer of `value.len()` bytes.
+            let rc = unsafe {
+                libc::lsetxattr(
+                    c_path.as_ptr(),
+                    c_name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            if rc != 0 {
+                debug!(
+                    path = %path.display(),
+                    xattr = %name,
+                    error = %std::io::Error::last_os_error(),
+                    "Skipping an image layer's extended attribute this host refuses"
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, xattrs);
+    }
 }
 
 /// Removes the contents of a directory (used for opaque whiteouts) without
@@ -559,6 +1287,9 @@ pub(crate) struct BundleContext<'a> {
     /// created by the worker before start and holding loopback plus the
     /// datapath's listeners only.
     pub(crate) netns: Option<&'a Path>,
+    /// The process's capability set and rlimits: the defaults, or the
+    /// container task's `security.capabilities` / `ulimits`.
+    pub(crate) policy: &'a ProcessPolicy,
 }
 
 fn build_spec(
@@ -635,6 +1366,19 @@ fn build_spec(
         }
     }
 
+    // Docker's model: one set as bounding, effective, and permitted; nothing
+    // inheritable or ambient, so a process running as a non-root user keeps
+    // no capabilities across `execve`. `noNewPrivileges` stays on: it stops
+    // setuid binaries and file capabilities from *raising* privileges at
+    // exec, and does not stop a root entrypoint from dropping to another
+    // user with setuid(2)/setgid(2) — which is all `gosu` and `su-exec` do.
+    let capabilities = &ctx.policy.capabilities;
+    let rlimits: Vec<Value> = ctx
+        .policy
+        .rlimits
+        .iter()
+        .map(|limit| json!({ "type": limit.kind, "soft": limit.soft, "hard": limit.hard }))
+        .collect();
     let mut spec = json!({
         "ociVersion": "1.0.2",
         "process": {
@@ -644,11 +1388,11 @@ fn build_spec(
             "env": env,
             "cwd": cwd,
             "capabilities": {
-                "bounding": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
-                "effective": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
-                "permitted": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"]
+                "bounding": capabilities,
+                "effective": capabilities,
+                "permitted": capabilities
             },
-            "rlimits": [{ "type": "RLIMIT_NOFILE", "hard": 1024, "soft": 1024 }],
+            "rlimits": rlimits,
             "noNewPrivileges": true
         },
         "root": { "path": "rootfs", "readonly": false },
@@ -747,6 +1491,7 @@ mod tests {
             resolver: Some("127.42.0.1"),
             resolv_conf: None,
             netns: Some(netns),
+            policy: &ProcessPolicy::default(),
         };
         let spec = build_spec(
             &["true".to_string()],
@@ -911,6 +1656,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                policy: &ProcessPolicy::default(),
             },
         );
 
@@ -976,6 +1722,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                policy: &ProcessPolicy::default(),
             },
         )
     }
@@ -1091,6 +1838,7 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                policy: &ProcessPolicy::default(),
             },
         );
 
@@ -1152,10 +1900,568 @@ mod tests {
                 resolver: None,
                 resolv_conf: None,
                 netns: None,
+                policy: &ProcessPolicy::default(),
             },
         );
         let env = spec["process"]["env"].as_array().unwrap();
         assert!(env.iter().any(|e| e == "HOME=/from-image"));
         assert!(!env.iter().any(|e| e == "HOME=/var/lib/postgresql"));
+    }
+
+    fn caps(spec: &Value, set: &str) -> Vec<String> {
+        spec["process"]["capabilities"][set]
+            .as_array()
+            .expect("capability set")
+            .iter()
+            .map(|cap| cap.as_str().expect("name").to_string())
+            .collect()
+    }
+
+    /// Stock images chown their directories and drop to a service user at
+    /// start (nginx, the Postgres entrypoint's `su-exec`/`gosu`). The default
+    /// spec must grant what that takes, as Docker does — and withhold
+    /// `CAP_NET_RAW`, because a Legion container shares the node's network.
+    #[test]
+    fn the_default_spec_grants_dockers_capabilities_without_net_raw() {
+        let spec = spec_with(None);
+        let bounding = caps(&spec, "bounding");
+        for needed in [
+            "CAP_CHOWN",
+            "CAP_DAC_OVERRIDE",
+            "CAP_FOWNER",
+            "CAP_FSETID",
+            "CAP_SETUID",
+            "CAP_SETGID",
+            "CAP_KILL",
+            "CAP_NET_BIND_SERVICE",
+            "CAP_AUDIT_WRITE",
+        ] {
+            assert!(
+                bounding.iter().any(|cap| cap == needed),
+                "{needed} in {bounding:?}"
+            );
+        }
+        assert!(!bounding.iter().any(|cap| cap == "CAP_NET_RAW"));
+        assert!(!bounding.iter().any(|cap| cap == "CAP_SYS_ADMIN"));
+        assert_eq!(bounding.len(), DEFAULT_CAPABILITIES.len());
+        // One set, applied to bounding, effective, and permitted alike;
+        // nothing inheritable or ambient.
+        assert_eq!(caps(&spec, "effective"), bounding);
+        assert_eq!(caps(&spec, "permitted"), bounding);
+        assert!(spec["process"]["capabilities"]["inheritable"].is_null());
+        assert!(spec["process"]["capabilities"]["ambient"].is_null());
+        assert_eq!(spec["process"]["noNewPrivileges"], true);
+    }
+
+    /// The open-file limit is no longer the OCI runtime's hard 1024.
+    #[test]
+    fn the_default_spec_raises_the_open_file_limit() {
+        let spec = spec_with(None);
+        let rlimits = spec["process"]["rlimits"].as_array().expect("rlimits");
+        let nofile = rlimits
+            .iter()
+            .find(|limit| limit["type"] == "RLIMIT_NOFILE")
+            .expect("RLIMIT_NOFILE set");
+        let soft = nofile["soft"].as_u64().unwrap();
+        assert_eq!(soft, nofile["hard"].as_u64().unwrap());
+        assert!(soft <= DEFAULT_NOFILE);
+        // Clamped only by the host: `fs.nr_open` and the worker's own hard
+        // limit, which the OCI runtime starts from.
+        let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_NOFILE);
+        let mut own = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes the struct it is handed.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut own) }, 0);
+        assert_eq!(soft, DEFAULT_NOFILE.min(nr_open).min(own.rlim_max));
+    }
+
+    #[test]
+    fn capability_adjustments_follow_docker_semantics() -> R<()> {
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Nothing adjusted: the default set.
+        assert_eq!(resolve_capabilities(&[], &[])?, default_capabilities());
+
+        // Names are case-insensitive and the CAP_ prefix is optional.
+        let caps =
+            resolve_capabilities(&names(&["net_raw", "CAP_SYS_PTRACE"]), &names(&["mknod"]))?;
+        assert!(caps.contains(&"CAP_NET_RAW".to_string()));
+        assert!(caps.contains(&"CAP_SYS_PTRACE".to_string()));
+        assert!(!caps.contains(&"CAP_MKNOD".to_string()));
+        assert!(caps.contains(&"CAP_CHOWN".to_string()), "defaults kept");
+
+        // drop = ALL starts from nothing.
+        assert_eq!(
+            resolve_capabilities(&names(&["NET_BIND_SERVICE"]), &names(&["all"]))?,
+            vec!["CAP_NET_BIND_SERVICE".to_string()]
+        );
+        assert!(resolve_capabilities(&[], &names(&["ALL"]))?.is_empty());
+
+        // add = ALL is every capability, less what drop names.
+        let everything = resolve_capabilities(&names(&["ALL"]), &names(&["SYS_ADMIN"]))?;
+        assert_eq!(everything.len(), ALL_CAPABILITIES.len() - 1);
+        assert!(!everything.contains(&"CAP_SYS_ADMIN".to_string()));
+
+        // A name in both lists ends up granted, as in Docker.
+        assert!(
+            resolve_capabilities(&names(&["NET_RAW"]), &names(&["NET_RAW"]))?
+                .contains(&"CAP_NET_RAW".to_string())
+        );
+
+        // Typos fail loudly, naming the list.
+        let err = resolve_capabilities(&names(&["NET_ADMINN"]), &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("security.capabilities.add"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("NET_ADMINN"), "{err}");
+        let err = resolve_capabilities(&names(&["ALL"]), &names(&["ALL"])).unwrap_err();
+        assert!(err.to_string().contains("both add and drop"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn ulimits_replace_the_matching_default_and_validate() -> R<()> {
+        let parse = |value: Value| -> R<Vec<Rlimit>> {
+            let map: BTreeMap<String, Value> = serde_json::from_value(value)?;
+            resolve_rlimits(&map)
+        };
+
+        // Nothing declared: the defaults.
+        assert_eq!(parse(json!({}))?, default_rlimits());
+
+        // A bare number sets soft and hard; the declared nofile replaces the
+        // default one instead of adding a second entry.
+        let limits = parse(json!({ "nofile": 65536, "nproc": { "soft": 1024, "hard": 4096 } }))?;
+        let nofile: Vec<&Rlimit> = limits
+            .iter()
+            .filter(|limit| limit.kind == "RLIMIT_NOFILE")
+            .collect();
+        assert_eq!(nofile.len(), 1);
+        assert_eq!((nofile[0].soft, nofile[0].hard), (65536, 65536));
+        let nproc = limits
+            .iter()
+            .find(|limit| limit.kind == "RLIMIT_NPROC")
+            .expect("nproc");
+        assert_eq!((nproc.soft, nproc.hard), (1024, 4096));
+
+        // "unlimited" is RLIM_INFINITY.
+        let limits = parse(json!({ "memlock": "unlimited" }))?;
+        let memlock = limits
+            .iter()
+            .find(|limit| limit.kind == "RLIMIT_MEMLOCK")
+            .expect("memlock");
+        assert_eq!(memlock.hard, u64::MAX);
+
+        for (bad, needle) in [
+            (json!({ "nofiles": 10 }), "unknown ulimit"),
+            (
+                json!({ "nofile": { "soft": 10, "hard": 5 } }),
+                "must not exceed",
+            ),
+            (json!({ "nofile": { "soft": 10 } }), "both soft and hard"),
+            (json!({ "nofile": -1 }), "non-negative"),
+            (json!({ "nofile": "lots" }), "unlimited"),
+            (
+                json!({ "nofile": { "soft": 1, "hard": 2, "max": 3 } }),
+                "unknown field",
+            ),
+        ] {
+            let err = parse(bad.clone()).expect_err("rejected");
+            assert!(err.to_string().contains(needle), "{bad}: {err}");
+        }
+        Ok(())
+    }
+
+    /// A jobspec's capability set and rlimits reach the generated spec.
+    #[test]
+    fn a_task_policy_lands_in_the_spec() -> R<()> {
+        let policy = ProcessPolicy {
+            capabilities: resolve_capabilities(&["NET_RAW".to_string()], &["ALL".to_string()])?,
+            rlimits: vec![Rlimit {
+                kind: "RLIMIT_NOFILE".into(),
+                soft: 4096,
+                hard: 8192,
+            }],
+        };
+        let spec = build_spec(
+            &["true".to_string()],
+            &HashMap::new(),
+            &bare_image(),
+            &ResolvedUser::default(),
+            &BundleContext {
+                hostname: "h",
+                volumes: &[],
+                task_dir: None,
+                assignment: None,
+                resolver: None,
+                resolv_conf: None,
+                netns: None,
+                policy: &policy,
+            },
+        );
+        assert_eq!(caps(&spec, "bounding"), vec!["CAP_NET_RAW".to_string()]);
+        assert_eq!(
+            spec["process"]["rlimits"],
+            json!([{ "type": "RLIMIT_NOFILE", "soft": 4096, "hard": 8192 }])
+        );
+        Ok(())
+    }
+
+    fn caps_of(add: &[&str], drop: &[&str]) -> Vec<String> {
+        let owned = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        resolve_capabilities(&owned(add), &owned(drop)).expect("valid capabilities")
+    }
+
+    fn allow(names: &[&str]) -> CapabilityAllowlist {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        CapabilityAllowlist::from_config(Some(&names)).expect("valid allowlist")
+    }
+
+    /// The operator's `container.allowCaps`: normalized like a jobspec's,
+    /// `ALL` anywhere means everything, typos fail the config load, and
+    /// absent means exactly the default set.
+    #[test]
+    fn the_allowlist_parses_like_a_jobspec_and_defaults_to_the_default_set() -> R<()> {
+        assert_eq!(
+            CapabilityAllowlist::from_config(None)?,
+            CapabilityAllowlist::Only(default_capabilities())
+        );
+        assert_eq!(
+            CapabilityAllowlist::default().to_config(),
+            default_capabilities()
+        );
+        assert_eq!(
+            allow(&["net_raw", "CAP_CHOWN", "chown"]),
+            CapabilityAllowlist::Only(vec!["CAP_CHOWN".into(), "CAP_NET_RAW".into()])
+        );
+        assert_eq!(allow(&["chown", "all"]), CapabilityAllowlist::All);
+        assert_eq!(
+            CapabilityAllowlist::All.to_config(),
+            vec!["ALL".to_string()]
+        );
+        assert_eq!(allow(&[]), CapabilityAllowlist::Only(vec![]));
+        assert_eq!(allow(&[]).describe(), "none");
+
+        let names = vec!["SYS_ADMN".to_string()];
+        let err = CapabilityAllowlist::from_config(Some(&names)).unwrap_err();
+        assert!(err.to_string().contains("container.allowCaps"), "{err}");
+        assert!(err.to_string().contains("SYS_ADMN"), "{err}");
+
+        // The worker hands it to the runtime as one env value and back.
+        let widened = allow(&["CHOWN", "NET_RAW", "SYS_ADMIN"]);
+        assert_eq!(
+            CapabilityAllowlist::from_env_value(Some(&widened.to_env_value())),
+            widened
+        );
+        assert_eq!(
+            CapabilityAllowlist::from_env_value(Some("ALL")),
+            CapabilityAllowlist::All
+        );
+        // Unset, or unreadable: the default, which is the narrow side.
+        assert_eq!(
+            CapabilityAllowlist::from_env_value(None),
+            CapabilityAllowlist::default()
+        );
+        assert_eq!(
+            CapabilityAllowlist::from_env_value(Some("CHOWN,NOT_A_CAP")),
+            CapabilityAllowlist::default()
+        );
+        Ok(())
+    }
+
+    /// Nomad's `allow_caps` model: the task's effective set (the default,
+    /// less drop, plus add) must fit inside the node's allowlist.
+    #[test]
+    fn the_allowlist_admits_what_it_lists_and_refuses_the_rest() -> R<()> {
+        let default_node = CapabilityAllowlist::default();
+
+        // Nothing adjusted: the default set fits the default allowlist.
+        check_capabilities_allowed("web", &caps_of(&[], &[]), &default_node)?;
+
+        // Dropping is always fine, down to nothing.
+        check_capabilities_allowed("web", &caps_of(&[], &["MKNOD", "CHOWN"]), &default_node)?;
+        check_capabilities_allowed("web", &caps_of(&[], &["ALL"]), &default_node)?;
+        check_capabilities_allowed("web", &caps_of(&[], &["ALL"]), &allow(&[]))?;
+        // Re-adding a default capability after dropping everything is fine.
+        check_capabilities_allowed(
+            "web",
+            &caps_of(&["NET_BIND_SERVICE"], &["ALL"]),
+            &default_node,
+        )?;
+
+        // An add inside the node's allowlist is admitted.
+        let raw_node = allow(&[
+            "AUDIT_WRITE",
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "FSETID",
+            "KILL",
+            "MKNOD",
+            "NET_BIND_SERVICE",
+            "SETFCAP",
+            "SETGID",
+            "SETPCAP",
+            "SETUID",
+            "SYS_CHROOT",
+            "NET_RAW",
+        ]);
+        check_capabilities_allowed("pinger", &caps_of(&["NET_RAW"], &[]), &raw_node)?;
+        // ...but not on a node with the default allowlist.
+        let err = check_capabilities_allowed("pinger", &caps_of(&["NET_RAW"], &[]), &default_node)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("task pinger"), "{err}");
+        assert!(err.contains("NET_RAW"), "{err}");
+
+        // SYS_ADMIN: refused by default, naming the capability and the
+        // field an operator sets...
+        let admin = caps_of(&["SYS_ADMIN"], &[]);
+        let err = check_capabilities_allowed("tool", &admin, &default_node)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SYS_ADMIN"), "{err}");
+        assert!(err.contains("container.allowCaps"), "{err}");
+        assert!(err.contains("\"SYS_ADMIN\""), "the value to add: {err}");
+        assert!(err.contains("security.capabilities.add"), "{err}");
+        // ...admitted once the operator allows it, or allows everything.
+        let mut with_admin = DEFAULT_CAPABILITIES.to_vec();
+        with_admin.push("SYS_ADMIN");
+        check_capabilities_allowed("tool", &admin, &allow(&with_admin))?;
+        check_capabilities_allowed("tool", &admin, &CapabilityAllowlist::All)?;
+        check_capabilities_allowed("tool", &caps_of(&["ALL"], &[]), &CapabilityAllowlist::All)?;
+        assert!(
+            check_capabilities_allowed("tool", &caps_of(&["ALL"], &[]), &allow(&with_admin))
+                .is_err()
+        );
+
+        // An operator who narrows the allowlist below the default makes a
+        // task that keeps those capabilities fail until it drops them.
+        let narrow = allow(&["NET_BIND_SERVICE", "KILL"]);
+        let err = check_capabilities_allowed("web", &caps_of(&[], &[]), &narrow)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CHOWN"), "{err}");
+        assert!(err.contains("security.capabilities.drop"), "{err}");
+        check_capabilities_allowed("web", &caps_of(&["KILL"], &["ALL"]), &narrow)?;
+
+        // The dev-mode sandbox, which cannot drop, is trimmed instead.
+        assert_eq!(
+            narrow.intersect(default_capabilities()),
+            vec!["CAP_KILL".to_string(), "CAP_NET_BIND_SERVICE".to_string()]
+        );
+        Ok(())
+    }
+
+    /// One PAX extended-header record: `"<len> <key>=<value>\n"`, where the
+    /// length counts the whole record including its own digits.
+    fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+        let body_len = 1 + key.len() + 1 + value.len() + 1;
+        let mut len = body_len + 1;
+        while len.to_string().len() + body_len != len {
+            len = len.to_string().len() + body_len;
+        }
+        let mut record = format!("{len} {key}=").into_bytes();
+        record.extend_from_slice(value);
+        record.push(b'\n');
+        record
+    }
+
+    /// A synthetic image layer the way `RUN chown`/`chmod u+s`/`setcap`
+    /// leave one: a directory owned by a service user, a setuid binary, and a
+    /// file carrying an extended attribute.
+    fn ownership_layer(dir: &Path) -> R<PathBuf> {
+        let blob = dir.join("layer.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&blob)?);
+
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_path("var/cache/nginx/")?;
+        header.set_mode(0o755);
+        header.set_uid(101);
+        header.set_gid(102);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, std::io::empty())?;
+
+        let mut header = tar::Header::new_ustar();
+        header.set_path("usr/bin/helper")?;
+        header.set_mode(0o4755);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_size(2);
+        header.set_cksum();
+        builder.append(&header, &b"#!"[..])?;
+
+        // A PAX header carrying an xattr for the entry that follows.
+        let records = [
+            pax_record("SCHILY.xattr.user.legion-test", b"kept"),
+            pax_record("SCHILY.xattr.trusted.overlay.opaque", b"y"),
+        ]
+        .concat();
+        let mut pax = tar::Header::new_ustar();
+        pax.set_entry_type(tar::EntryType::XHeader);
+        pax.set_path("PaxHeaders/data")?;
+        pax.set_size(records.len() as u64);
+        pax.set_mode(0o644);
+        pax.set_cksum();
+        builder.append(&pax, records.as_slice())?;
+        let mut header = tar::Header::new_ustar();
+        header.set_path("var/cache/nginx/data")?;
+        header.set_mode(0o640);
+        header.set_uid(101);
+        header.set_gid(102);
+        header.set_size(2);
+        header.set_cksum();
+        builder.append(&header, &b"ok"[..])?;
+
+        builder.finish()?;
+        Ok(blob)
+    }
+
+    /// The root cause of "a `chown nginx` in the image shows up as 0:0":
+    /// extraction dropped every owner. As root it now keeps owners, the
+    /// setuid bit (applied after the chown that would clear it), and the
+    /// layer's extended attributes.
+    #[test]
+    fn extraction_as_root_keeps_owners_setuid_bits_and_xattrs() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        if !running_as_root() {
+            // Only root can chown to another user; the non-root path is
+            // covered below.
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let blob = ownership_layer(dir.path())?;
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        extract_layer_as(&blob, &rootfs, true)?;
+
+        let cache = std::fs::metadata(rootfs.join("var/cache/nginx"))?;
+        assert_eq!((cache.uid(), cache.gid()), (101, 102));
+        let data = std::fs::metadata(rootfs.join("var/cache/nginx/data"))?;
+        assert_eq!((data.uid(), data.gid()), (101, 102));
+        assert_eq!(data.mode() & 0o7777, 0o640);
+        let helper = std::fs::metadata(rootfs.join("usr/bin/helper"))?;
+        assert_eq!(helper.mode() & 0o7777, 0o4755, "setuid bit kept");
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let read = |name: &str| -> Option<Vec<u8>> {
+                let path = std::ffi::CString::new(
+                    rootfs.join("var/cache/nginx/data").as_os_str().as_bytes(),
+                )
+                .unwrap();
+                let name = std::ffi::CString::new(name).unwrap();
+                let mut buf = [0u8; 64];
+                // SAFETY: valid NUL-terminated strings and a sized buffer.
+                let len = unsafe {
+                    libc::lgetxattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                    )
+                };
+                (len >= 0).then(|| buf[..len as usize].to_vec())
+            };
+            // Filesystems without user xattrs (some tmpfs) skip it; where the
+            // host supports it, the value arrives intact.
+            if let Some(value) = read("user.legion-test") {
+                assert_eq!(value, b"kept");
+            }
+            assert_eq!(
+                read("trusted.overlay.opaque"),
+                None,
+                "overlay bookkeeping skipped"
+            );
+        }
+        Ok(())
+    }
+
+    /// A header whose uid/gid fields are empty (some hand-built layers) is
+    /// owned by root, as Go's `archive/tar` reads it, instead of failing the
+    /// whole extraction.
+    #[test]
+    fn extraction_reads_an_empty_owner_field_as_root() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir()?;
+        let blob = dir.path().join("layer.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&blob)?);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(3);
+        header.set_mode(0o755);
+        builder.append_data(&mut header, "bin/sh", &b"#!x"[..])?;
+        builder.finish()?;
+        drop(builder);
+
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        extract_layer_as(&blob, &rootfs, running_as_root())?;
+        let meta = std::fs::metadata(rootfs.join("bin/sh"))?;
+        assert_eq!(meta.mode() & 0o777, 0o755);
+        if running_as_root() {
+            assert_eq!((meta.uid(), meta.gid()), (0, 0));
+        }
+        Ok(())
+    }
+
+    /// A worker that is not root cannot chown, so extraction must not try:
+    /// everything belongs to the worker's own user and the start succeeds.
+    #[test]
+    fn extraction_without_root_keeps_modes_and_skips_owners() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir()?;
+        let blob = ownership_layer(dir.path())?;
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        extract_layer_as(&blob, &rootfs, false)?;
+        // SAFETY: geteuid cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let data = std::fs::metadata(rootfs.join("var/cache/nginx/data"))?;
+        assert_eq!(data.uid(), me);
+        assert_eq!(data.mode() & 0o777, 0o640);
+        Ok(())
+    }
+
+    /// Non-root containers reopen `/dev/stdout` (`/proc/self/fd/1`), which
+    /// checks the log file's own permissions. The files are handed to the
+    /// container's user; the directory stays owner-only.
+    #[test]
+    fn task_logs_are_handed_to_the_container_user() -> R<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !running_as_root() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700))?;
+        for file in ["stdout.log", "stderr.log"] {
+            std::fs::write(log_dir.join(file), b"")?;
+        }
+
+        hand_task_logs_to(Some(&log_dir), 101, 101);
+        for file in ["stdout.log", "stderr.log"] {
+            let meta = std::fs::metadata(log_dir.join(file))?;
+            assert_eq!((meta.uid(), meta.gid()), (101, 101), "{file}");
+        }
+        let dir_meta = std::fs::metadata(&log_dir)?;
+        assert_eq!(dir_meta.uid(), 0, "the directory stays the worker's");
+        assert_eq!(dir_meta.mode() & 0o777, 0o700);
+
+        // A later start as root hands them back.
+        hand_task_logs_to(Some(&log_dir), 0, 0);
+        assert_eq!(std::fs::metadata(log_dir.join("stdout.log"))?.uid(), 0);
+        // No log dir: nothing to do, and no panic.
+        hand_task_logs_to(None, 101, 101);
+        Ok(())
     }
 }

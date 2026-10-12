@@ -7,6 +7,18 @@ Legion reads every configuration file as a [Nickel][nickel] program:
 | Job specs | `legion job run/plan/validate` | [`configs/jobs/maximal.ncl`](../configs/jobs/maximal.ncl) |
 | Manager config | `legion start manager -c` | [`configs/manager.ncl`](../configs/manager.ncl) |
 | Worker configs | manager startup, from `workerConfigPath` | [`configs/workers/default.ncl`](../configs/workers/default.ncl) |
+
+Both server configs are optional. `legion start manager` with no `-c` runs
+on built-in defaults and reads nothing from the working directory, so it
+starts the same way from any directory. With no `workerConfigPath` (the
+default) the manager registers one built-in worker type, `default`, in pool
+`default` with every setting at its default, which is the type
+`legion join-token create` introduces when `--type` is omitted. Set
+`workerConfigPath` to a directory of worker configs to declare your own types
+instead; a configured directory that does not exist stops the manager at
+startup with an error naming it. The repo's `configs/manager.ncl` sets
+`workerConfigPath = "./configs/workers/"`, so it is meant to be run from a
+checkout.
 | ACL policies | `legion acl policy create -f` | see [Auth & ACLs](auth-and-acls.md) |
 | Job templates | `legion template create -f` | [`configs/templates/render.ncl`](../configs/templates/render.ncl) |
 

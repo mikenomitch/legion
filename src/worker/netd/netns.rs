@@ -56,6 +56,14 @@ pub fn platform_supports_netns() -> bool {
 /// existing namespace is left alone.
 #[cfg(target_os = "linux")]
 pub fn create(allocation_id: i64) -> R<PathBuf> {
+    // Two callers race for the same namespace: the heartbeat (ahead of its
+    // reconcile) and a task start that got there first (a pushed allocation,
+    // see `task_plugins::ensure_gated_namespace`). Unserialized, both could
+    // pass the existence check and stack two bind mounts on one path.
+    static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serialized = CREATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = netns_path(allocation_id);
     if path.exists() {
         return Ok(path);

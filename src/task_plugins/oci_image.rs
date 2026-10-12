@@ -8,7 +8,9 @@
 //!    recorded on the instance by the instance's `consume_artifact`;
 //! 2. already pulled by an earlier start of the same allocation (in-place
 //!    restarts must not refetch);
-//! 3. pulled anonymously through the shared `oci://` fetcher.
+//! 3. pulled anonymously through the shared `oci://` fetcher, which serves
+//!    every blob the node content store already holds (from any earlier pull
+//!    on this node) and keeps the ones it downloads.
 //!
 //! Keeping the resolution here means a new image-backed kind gets the whole
 //! ladder — artifact pipeline included — for one function call.
@@ -67,6 +69,10 @@ pub(crate) fn record_staged_layout(
 /// (anonymous), returning the layout root. Used when no image artifact was
 /// staged for the task — neither a low-level OCI instance nor a microVM can
 /// pull an image reference itself.
+///
+/// Goes through the worker's node content store when it has one, so a
+/// second allocation of the same image on this node downloads nothing (a
+/// tag costs one `HEAD` request to check it has not moved).
 pub(crate) fn pull_layout(image: &str, dest_root: &Path) -> R<PathBuf> {
     use crate::artifacts::fetcher::{ArtifactFetcher, FetchLimits, FetchRequest, FetchedPayload};
     use crate::artifacts::fetchers::OciFetcher;
@@ -89,6 +95,9 @@ pub(crate) fn pull_layout(image: &str, dest_root: &Path) -> R<PathBuf> {
     std::fs::create_dir_all(dest_root)
         .with_context(|| format!("create image dir {}", dest_root.display()))?;
     let mut sink = ArtifactSink::new(dest_root.to_path_buf(), limits.max_bytes)?;
+    // Layers already on this node (any earlier pull, staged or not) are
+    // linked from the node content store instead of downloaded again.
+    sink.set_content_store(crate::content_store::node_store());
     let fetched = OciFetcher::new()
         .fetch(&request, &mut sink)
         .with_context(|| format!("pull container image {image}"))?;

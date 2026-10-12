@@ -498,13 +498,15 @@ impl Store {
     /// the background rewrap converges them (docs/kv-encryption.md).
     pub fn rotate_data_key(&self, reason: &str) -> R<KeyringRow> {
         if !self.keyring.enabled() {
-            bail!("KV encryption is disabled (encryption.enabled = false); nothing to rotate");
+            bail!(StorageError::failed_precondition(
+                "KV encryption is disabled (encryption.enabled = false); nothing to rotate"
+            ));
         }
         if self.list_keyring_rows()?.is_empty() {
-            bail!(
+            bail!(StorageError::failed_precondition(
                 "the KV keyring is not initialized on this cluster yet (see `legion keyring \
                  status`); there is no key to rotate"
-            );
+            ));
         }
         let now = Self::now_unix();
         let (row, key) = self.keyring.generate_data_key(now)?;
@@ -587,17 +589,17 @@ impl Store {
     pub fn rewrap_kv_batch(&self, to_plaintext: bool) -> R<RewrapBatch> {
         if !to_plaintext {
             if !self.keyring.enabled() {
-                bail!(
+                bail!(StorageError::failed_precondition(
                     "KV encryption is disabled (encryption.enabled = false); use `rewrap \
                      --plaintext` to decrypt the remaining rows, or enable encryption first"
-                );
+                ));
             }
             if self.keyring.active_key().is_none() {
                 let snapshot = self.keyring.snapshot();
-                bail!(
+                bail!(StorageError::failed_precondition(format!(
                     "no usable active data key (keyring state `{}`); see `legion keyring status`",
                     snapshot.state
-                );
+                )));
             }
         }
         let keyring = self.keyring.clone();
@@ -664,7 +666,10 @@ impl Store {
     /// once on one manager.
     pub fn run_rewrap(&self, to_plaintext: bool) -> R<RewrapRun> {
         if self.keyring.rewrap_running() {
-            bail!("a rewrap is already running on this manager (`legion keyring status` shows its progress)");
+            bail!(StorageError::failed_precondition(
+                "a rewrap is already running on this manager (`legion keyring status` shows its \
+                 progress)"
+            ));
         }
         self.keyring.set_rewrap_running(true, None);
         let started = Instant::now();
@@ -801,7 +806,9 @@ impl Store {
     /// touched. After it, root keys that wrapped nothing can be deleted.
     pub fn rewrap_root_key(&self) -> R<RootKeyRewrap> {
         if !self.keyring.enabled() {
-            bail!("KV encryption is disabled (encryption.enabled = false)");
+            bail!(StorageError::failed_precondition(
+                "KV encryption is disabled (encryption.enabled = false)"
+            ));
         }
         // Re-read the provider (a new first line in the key file) before wrapping.
         self.load_keyring()?;

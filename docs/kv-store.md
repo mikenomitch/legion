@@ -111,6 +111,24 @@ Value normalization rules:
 - `number`: must parse as JSON number
 - `json`: must parse as valid JSON
 
+### Reading a key that does not exist
+
+`legion kv get` on a missing key fails: it prints the standard error envelope
+with code `NotFound` and exits non-zero, in both output formats.
+
+```bash
+$ legion kv get app/flag -j; echo "exit=$?"
+{ "ok": false, "error": { "code": "NotFound", "message": "kv key app/flag not found",
+  "hint": "`legion kv list` shows the keys that exist; `legion kv put` creates one",
+  "retryable": false } }
+exit=1
+```
+
+So the obvious shell idiom works: `legion kv get app/flag || legion kv put
+app/flag on`. The `GetKv` RPC itself still answers a missing key with an empty
+`entry` rather than an error (see its proto comment); the CLI is what turns
+that into `NotFound`. There is no MCP tool for KV.
+
 ## Versioned Writes
 
 `expected_version` semantics:

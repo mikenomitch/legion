@@ -121,6 +121,12 @@ pub(crate) enum SnapshotScope {
 /// Manifest table names inside a `LaneTables` snapshot database.
 const LANE_SNAPSHOT_META_TABLE: &str = "legion_lane_snapshot";
 const LANE_SNAPSHOT_TABLES_TABLE: &str = "legion_lane_snapshot_tables";
+/// AUTOINCREMENT high-water marks (`sqlite_sequence` rows) of the dumped
+/// tables. A lane dump copies rows, and a row copy only re-seeds a table's
+/// sequence to its largest *surviving* id; carrying the mark keeps a replica
+/// that installs the dump (and may lead later) from handing out an id the
+/// leader already used and deleted — allocation ids are never reused.
+const LANE_SNAPSHOT_SEQUENCES_TABLE: &str = "legion_lane_snapshot_sequences";
 /// Format marker stored under `format` in [`LANE_SNAPSHOT_META_TABLE`].
 const LANE_SNAPSHOT_FORMAT: &str = "legion-lane-snapshot-v1";
 
@@ -480,6 +486,29 @@ impl StoreStateMachine {
                 );
             }
         }
+        // AUTOINCREMENT high-water marks carried by the dump (absent from a
+        // dump built before they were carried: nothing to raise then).
+        let sequences: Vec<(String, i64)> = {
+            let carried: bool = snap.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1);",
+                [LANE_SNAPSHOT_SEQUENCES_TABLE],
+                |row| row.get(0),
+            )?;
+            if carried {
+                let mut stmt = snap.prepare(&format!(
+                    "SELECT name, seq FROM {LANE_SNAPSHOT_SEQUENCES_TABLE};"
+                ))?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                Store::collect_rows(rows)?
+                    .into_iter()
+                    .filter(|(table, _)| tables.contains(table))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
         // Column lists per dumped table, read up front so the install
         // transaction below only moves rows.
         let mut columns: Vec<(String, Vec<String>)> = Vec::with_capacity(tables.len());
@@ -573,6 +602,22 @@ impl StoreStateMachine {
                             .map(|i| row.get(i))
                             .collect::<Result<_, _>>()?;
                         insert.execute(rusqlite::params_from_iter(values))?;
+                    }
+                }
+                // Raise (never lower) each table's AUTOINCREMENT mark to the
+                // leader's, so ids deleted on the leader are not reissued
+                // here. The row copies above already raised it to the
+                // largest surviving id.
+                for (table, seq) in &sequences {
+                    let updated = sp.execute(
+                        "UPDATE sqlite_sequence SET seq = MAX(seq, ?2) WHERE name = ?1;",
+                        rusqlite::params![table, seq],
+                    )?;
+                    if updated == 0 {
+                        sp.execute(
+                            "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2);",
+                            rusqlite::params![table, seq],
+                        )?;
                     }
                 }
                 // The lane's applied marker commits atomically with the rows
@@ -841,6 +886,39 @@ impl StoreSnapshotBuilder {
                     .map(|i| row.get(i))
                     .collect::<Result<_, _>>()?;
                 insert.execute(rusqlite::params_from_iter(values))?;
+            }
+        }
+        // The dumped tables' AUTOINCREMENT high-water marks (see
+        // LANE_SNAPSHOT_SEQUENCES_TABLE): sqlite_sequence is not a lane table,
+        // so it would otherwise never reach the installing replica.
+        snap.execute(
+            &format!(
+                "CREATE TABLE {LANE_SNAPSHOT_SEQUENCES_TABLE} \
+                 (name TEXT PRIMARY KEY, seq INTEGER NOT NULL);"
+            ),
+            [],
+        )?;
+        let has_sequences: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' \
+             AND name = 'sqlite_sequence');",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_sequences {
+            let mut insert = snap.prepare(&format!(
+                "INSERT INTO {LANE_SNAPSHOT_SEQUENCES_TABLE} (name, seq) VALUES (?1, ?2);"
+            ))?;
+            for table in ownership::snapshot_tables_for_lane(lane) {
+                let seq: Option<i64> = conn
+                    .query_row(
+                        "SELECT seq FROM sqlite_sequence WHERE name = ?1;",
+                        [table],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(seq) = seq {
+                    insert.execute(rusqlite::params![table, seq])?;
+                }
             }
         }
         snap.execute_batch("COMMIT;")?;
@@ -1555,6 +1633,126 @@ mod tests {
         assert_eq!(served.meta.snapshot_id, snapshot.meta.snapshot_id);
         dst.put_kv("post-install", "ok", KvValueType::String, None, None)?;
         assert_eq!(kv_value(&dst, "post-install")?.as_deref(), Some("ok"));
+        Ok(())
+    }
+
+    /// Insert one allocation row with an implicit id, returning the id the
+    /// store handed out.
+    fn insert_allocation_row(store: &Store) -> R<i64> {
+        let conn = store.write_connection()?;
+        conn.execute(
+            "INSERT INTO allocation (status, resources, node_id, job_config_id, task_config_id)
+             VALUES ('placed', '{}', 'n1', 'jc-1', 1);",
+            [],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn delete_allocation_row(store: &Store, id: i64) -> R<()> {
+        store
+            .write_connection()?
+            .execute("DELETE FROM allocation WHERE id = ?1;", [id])?;
+        Ok(())
+    }
+
+    /// P1-7 regression: allocation ids are never reused across a snapshot
+    /// install. The leader hands out 1..=3 and deletes 2 and 3; a replica
+    /// that catches up from a snapshot (and may lead next) must hand out 4,
+    /// not 2 — a reused id points a client's stale id at a different job's
+    /// task, and mixes the old allocation's output into the new one's logs
+    /// on the worker. Both snapshot scopes: whole-DB (`single`) and lane
+    /// dump (`lanes`), whose row copy alone would re-seed the sequence to
+    /// the largest surviving id.
+    #[tokio::test]
+    async fn snapshot_install_never_reissues_a_deleted_allocation_id() -> R<()> {
+        for scope in [SnapshotScope::WholeDb, SnapshotScope::LaneTables] {
+            let src = setup_store()?;
+            assert_eq!(insert_allocation_row(&src)?, 1);
+            assert_eq!(insert_allocation_row(&src)?, 2);
+            assert_eq!(insert_allocation_row(&src)?, 3);
+            delete_allocation_row(&src, 3)?;
+            delete_allocation_row(&src, 2)?;
+            // Deletes never lower the mark on the store itself.
+            assert_eq!(insert_allocation_row(&src)?, 4, "{scope:?}: local delete");
+            delete_allocation_row(&src, 4)?;
+
+            let mut src_sm =
+                StoreStateMachine::new(Lane::Scheduler, src.clone(), snapshots_dir(), scope);
+            let mut builder = src_sm.get_snapshot_builder().await;
+            let snapshot = builder.build_snapshot().await.unwrap();
+
+            let dst = setup_store()?;
+            let mut dst_sm =
+                StoreStateMachine::new(Lane::Scheduler, dst.clone(), snapshots_dir(), scope);
+            let mut receiving = dst_sm.begin_receiving_snapshot().await.unwrap();
+            *receiving = Cursor::new(snapshot.snapshot.get_ref().clone());
+            dst_sm
+                .install_snapshot(&snapshot.meta, receiving)
+                .await
+                .unwrap();
+
+            let next = insert_allocation_row(&dst)?;
+            assert_eq!(
+                next, 5,
+                "{scope:?}: the installing replica must continue after the leader's \
+                 high-water mark, not after the largest surviving id"
+            );
+            // A mark the receiver already had above the leader's is kept.
+            assert!(insert_allocation_row(&dst)? > next);
+        }
+        Ok(())
+    }
+
+    /// P1-7 regression, the log path: a follower that applied the leader's
+    /// changesets (inserts with explicit ids, then deletes of the newest
+    /// rows) and then wins an election hands out the next id after the
+    /// leader's high-water mark. Changeset inserts carry explicit ids, which
+    /// raise the follower's AUTOINCREMENT mark exactly as the leader's own
+    /// insert did; deletes never lower it.
+    #[tokio::test]
+    async fn a_new_leader_never_reissues_a_deleted_allocation_id() -> R<()> {
+        let leader = setup_store()?;
+        let follower = setup_store()?;
+        let mut leader_sm = state_machine(Lane::Scheduler, leader.clone());
+        let mut follower_sm = state_machine(Lane::Scheduler, follower.clone());
+        let mut index = 0;
+        let mut replicate = |changeset: Vec<u8>| {
+            index += 1;
+            let entry = Entry {
+                log_id: log_id(1, index),
+                payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
+                    lane: Lane::Scheduler,
+                    op: "place_alloc".to_string(),
+                    changeset,
+                }),
+            };
+            (entry.clone(), entry)
+        };
+
+        for expected in 1..=3 {
+            let (id, changeset) =
+                capture::capture_mutation(&leader, Lane::Scheduler, insert_allocation_row)?;
+            assert_eq!(id, expected);
+            let (a, b) = replicate(changeset);
+            leader_sm.apply([a]).await.unwrap();
+            follower_sm.apply([b]).await.unwrap();
+        }
+        for id in [3, 2] {
+            let ((), changeset) = capture::capture_mutation(&leader, Lane::Scheduler, |s| {
+                delete_allocation_row(s, id)
+            })?;
+            let (a, b) = replicate(changeset);
+            leader_sm.apply([a]).await.unwrap();
+            follower_sm.apply([b]).await.unwrap();
+        }
+
+        // Leadership moves: the follower proposes the next placement.
+        let (id, _) = capture::capture_mutation(&follower, Lane::Scheduler, insert_allocation_row)?;
+        assert_eq!(id, 4, "the new leader must not reissue a deleted id");
+        // And a restart of either replica keeps the mark (it lives in the
+        // state DB, in the same file as the rows).
+        let (id, _) = capture::capture_mutation(&leader, Lane::Scheduler, insert_allocation_row)?;
+        assert_eq!(id, 4);
         Ok(())
     }
 

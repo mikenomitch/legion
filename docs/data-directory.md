@@ -23,6 +23,7 @@ up, or start over without deleting your existing data.
 | Manager state store (`store.sqlite`, `keys/`, `backups/`) | `<data dir>` | `storePath` |
 | Raft log, snapshots, cluster secret | `<data dir>/raft` | `persistence.raft.dataDir` |
 | Worker state, allocation dirs, task logs | `<data dir>/workers/<worker-id>/` | `LEGION_WORKER_STATE_PATH` (state file only) |
+| Worker node certificate and its private key (`node.pem`, `node.key`, `ca.pem`, each mode `0600`) | `identity/` beside the worker state file | moves with `LEGION_WORKER_STATE_PATH` |
 | Identity token backing files | `<data dir>/identity/<alloc-id>/<name>/token` | none |
 
 `<data dir>` is `$LEGION_DATA_DIR` when it is set and non-empty, and `.legion`
@@ -48,6 +49,12 @@ LEGION_DATA_DIR=/tmp/legion-b legion start manager -c manager-b.ncl
 LEGION_DATA_DIR=/tmp/legion-b LEGION_WORKER_PORT=4858 \
   legion start worker "$TOKEN"
 ```
+
+The worker's `identity/` directory holds the private key of its node
+certificate, which is what lets a manager trust the worker plane on that
+node. Treat it like any other credential: it is owner-only on disk, and
+deleting it only makes the worker request a new certificate on its next
+start.
 
 A worker picks its ID from `<data dir>/workers/`. With one data dir per
 cluster, each worker finds only its own ID and needs no `--name`.

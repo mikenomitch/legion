@@ -156,6 +156,16 @@ impl RaftTransport for RaftTransportService {
         &self,
         request: Request<RaftLaneRequest>,
     ) -> Result<Response<RaftLaneReply>, Status> {
+        // A leader is replicating to us: a restarted member may stop holding
+        // its own elections (quiet start).
+        if let Ok(registry) = self.authenticate(&request) {
+            if let Some(seen) =
+                crate::storage::raft::Lane::from_wire_name(&request.get_ref().group_id)
+                    .and_then(|lane| registry.append_entries_seen.get(&lane))
+            {
+                seen.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         self.dispatch("AppendEntries", request, |raft, rpc| async move {
             raft.append_entries(rpc).await
         })
@@ -235,14 +245,24 @@ impl RaftTransport for RaftTransportService {
                     "undecodable ForwardLaneWrite payload (mixed manager protocol versions?): {e}"
                 ))
             })?;
-        // Sanity: the envelope's lane must be the op's own lane — a mismatch
-        // is a bug on the sending side, not a leadership question.
-        if envelope.group_id != op.lane().wire_name() {
+        // Sanity: the envelope names the raft GROUP that commits the op (the
+        // sender addresses a group active on this receiver). Compare in that
+        // same space: under `single` topology every lane rides the control
+        // group, so a status-lane heartbeat arrives as `control`. Comparing
+        // against the op's logical lane instead rejected every forwarded
+        // status-lane write in the recommended topology, which left workers
+        // that dial a follower marked lost (spot-check P0-5). A mismatch in
+        // group space is a bug on the sending side, not a leadership
+        // question.
+        let expected_group = registry.group_for(op.lane());
+        if envelope.group_id != expected_group.wire_name() {
             return Err(Status::invalid_argument(format!(
-                "ForwardLaneWrite lane mismatch: envelope says `{}`, op `{}` belongs to `{}`",
+                "ForwardLaneWrite lane mismatch: envelope says `{}`, op `{}` belongs to the \
+                 `{}` lane, which this manager commits through the `{}` group",
                 envelope.group_id,
                 op.op_name(),
-                op.lane().wire_name()
+                op.lane().wire_name(),
+                expected_group.wire_name()
             )));
         }
         // The op is blocking store work (capture + quorum commit + local
@@ -254,6 +274,23 @@ impl RaftTransport for RaftTransportService {
         let payload = serde_json::to_vec(&outcome)
             .map_err(|e| Status::internal(format!("failed encoding ForwardOutcome: {e}")))?;
         Ok(Response::new(RaftLaneReply { payload }))
+    }
+
+    /// Start an election on this manager at a peer's request — the target
+    /// half of `legion raft command transfer-leader` (openraft 0.9 has no
+    /// leader-transfer API, so the transfer is built on a remote elect).
+    async fn trigger_election(
+        &self,
+        request: Request<crate::structs::TriggerElectionRequest>,
+    ) -> Result<Response<crate::structs::TriggerElectionReply>, Status> {
+        let registry = self.authenticate(&request)?;
+        let handler = registry.join_handler.clone().ok_or_else(|| {
+            Status::unimplemented("remote elections are not available on this manager")
+        })?;
+        handler
+            .trigger_election(request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     /// Merge a peer manager's liveness digest into this manager's table

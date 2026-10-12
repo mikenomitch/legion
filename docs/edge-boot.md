@@ -62,7 +62,7 @@ platform's own API ──(user auth)──► platform control plane
                                         │
                                   signed ticket (JWT, ~minutes)
                                         ▼
-   user request ──► edge router ──► legion sandbox start --node <addr>
+   user request ──► edge router ──► legion sandbox start --node https://<addr>
                                         │ verified offline, admitted locally,
                                         │ booted to the gate level
                                         ▼
@@ -280,11 +280,23 @@ accessor. The token itself is never written anywhere.
 
 ```console
 $ legion sandbox start agent-sandboxes \
-    --id user-42 --node http://10.0.1.7:4848 --ticket "$TICKET"
+    --id user-42 --node https://10.0.1.7:4848 --ca-cert ca.pem --ticket "$TICKET"
 admitted
 booted
 ratified
 ```
+
+`--node` is the node's `workerAddress` (`legion node info` shows it), always
+`https://`: the worker plane is mutual TLS
+([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). `StartClaim` is the
+one worker RPC that needs no client certificate, because the boot ticket is
+the authorization. The caller still verifies the node: `legion sandbox start`
+checks that the node presents a node certificate from the cluster CA before
+it sends the ticket. It reads the CA from `--ca-cert <file>` (save it once
+with `legion net ca show > ca.pem`), or fetches it from the manager with your
+token when the flag is absent. A router with its own gRPC client does the
+same: trust `ca.pem`, and expect the server name `<node>.node.legion`.
+Routers must be able to reach 4848 on edge nodes.
 
 The stream reports each transition. A router may start routing at `booted`,
 but must handle `refused` at any point until `ratified`. `--dry-run` verifies
@@ -483,6 +495,12 @@ Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
 
 ## Known limitations
 
+- **The JWKS is fetched over the plaintext worker-to-manager channel** unless
+  the manager serves `server.tls`. Someone on the path between an edge node
+  and its manager could swap the keys that verify boot tickets. Keep that
+  path on a trusted network until encrypted worker connections ship
+  ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). The router-to-node
+  hop (`StartClaim` on 4848) is TLS, verified against the cluster CA.
 - **No island mode.** An unratified start that cannot reach a manager dies
   when its lease expires. Edge boot does not keep work running through a long
   control-plane outage.

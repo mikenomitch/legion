@@ -69,11 +69,11 @@ impl CliError {
     /// retryable classification derived from the status code.
     pub fn from_status(action: &str, status: &Status) -> Self {
         let code = status.code();
-        let (message, server_hint) = crate::cmd::helpers::split_hint(status.message().trim());
-        let message = if message.is_empty() {
+        let (message_text, server_hint) = crate::cmd::helpers::split_hint(status.message().trim());
+        let message = if message_text.is_empty() {
             action.to_string()
         } else {
-            format!("{action}: {message}")
+            format!("{action}: {message_text}")
         };
 
         CliError {
@@ -81,7 +81,7 @@ impl CliError {
             message,
             hint: server_hint
                 .map(str::to_string)
-                .or_else(|| hint_for(code).map(str::to_string)),
+                .or_else(|| hint_for(code, message_text).map(str::to_string)),
             retryable: is_retryable(code),
         }
     }
@@ -129,15 +129,58 @@ pub fn code_name(code: Code) -> &'static str {
     }
 }
 
-fn hint_for(code: Code) -> Option<&'static str> {
+/// The generic next step for a failure with this code. A server that knows a
+/// failure-specific fix puts it in the message as a `Hint:` line, which wins
+/// over this (see [`crate::cmd::helpers::split_hint`]). `message` lets one
+/// code carry two meanings apart: an `Unavailable` from the transport (the
+/// manager itself is unreachable) versus one the manager returned (something
+/// behind it — a worker, the raft leader — is).
+pub fn hint_for(code: Code, message: &str) -> Option<&'static str> {
+    let lower = message.to_ascii_lowercase();
     match code {
-        Code::Unavailable => Some("manager unavailable; check LEGION_ADDR or start the manager"),
-        Code::NotFound => Some("resource not found"),
+        Code::Unavailable
+            if [
+                "transport error",
+                "tcp connect",
+                "connection refused",
+                "dns error",
+                "error trying to connect",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle)) =>
+        {
+            Some("manager unavailable; check LEGION_ADDR or start the manager")
+        }
+        Code::Unavailable => Some(
+            "the manager answered, but something it depends on (a worker node, the raft \
+             leader) is unreachable; retry shortly",
+        ),
+        Code::NotFound => {
+            Some("resource not found; check the name or id (list commands show what exists)")
+        }
         Code::AlreadyExists => Some("resource already exists"),
-        Code::InvalidArgument => Some("request was invalid; check arguments"),
-        Code::FailedPrecondition => Some("request precondition failed"),
-        Code::PermissionDenied | Code::Unauthenticated => Some("authentication failed"),
+        Code::InvalidArgument => Some("request was invalid; check the arguments"),
+        Code::FailedPrecondition if lower.contains("not the raft leader") => Some(
+            "writes go to the raft leader; point LEGION_ADDR at the leader shown above and retry",
+        ),
+        Code::FailedPrecondition => Some(
+            "the request is valid, but the cluster's current state does not allow it; the \
+             message says what has to change first",
+        ),
+        Code::PermissionDenied => {
+            Some("the token lacks a policy for this; `legion acl whoami` shows what it has")
+        }
+        Code::Unauthenticated => Some("no valid ACL token; set LEGION_TOKEN or run `legion login`"),
         Code::DeadlineExceeded => Some("request timed out; retry or raise the timeout"),
+        Code::Aborted => Some("the request raced a concurrent change; retry it"),
+        Code::ResourceExhausted => Some("a limit was reached; retry later or raise the limit"),
+        Code::Unimplemented => {
+            Some("the manager does not implement this operation; is it running an older Legion?")
+        }
+        Code::Internal => Some(
+            "unexpected server error; the message carries its cause and the manager's log \
+             has the details",
+        ),
         _ => None,
     }
 }
@@ -250,5 +293,70 @@ mod tests {
             err.hint.as_deref(),
             Some("manager unavailable; check LEGION_ADDR or start the manager")
         );
+    }
+
+    #[test]
+    fn a_failed_precondition_says_what_kind_of_problem_it_is() {
+        // P2-2: `job destroy` on a running job. The envelope carries the
+        // manager's own reason and a hint that the state must change first.
+        let status = Status::failed_precondition(
+            "Error deleting job: Job web must be stopped before it can be destroyed (it is \
+             running); run `legion job stop web` first",
+        );
+        let err = CliError::from_status("failed to destroy job", &status);
+        assert_eq!(err.code, "FailedPrecondition");
+        assert!(err.message.contains("must be stopped"), "{}", err.message);
+        assert!(!err.retryable);
+        assert!(err
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("what has to change first")));
+    }
+
+    #[test]
+    fn unavailable_tells_an_unreachable_manager_from_an_unreachable_worker() {
+        let transport = Status::unavailable("tcp connect error: Connection refused (os error 111)");
+        assert_eq!(
+            CliError::from_status("x", &transport).hint.as_deref(),
+            Some("manager unavailable; check LEGION_ADDR or start the manager")
+        );
+        let worker = Status::unavailable("cannot reach node w-1 at https://10.0.0.7:4848");
+        let hint = CliError::from_status("x", &worker).hint.unwrap();
+        assert!(hint.contains("manager answered"), "{hint}");
+    }
+
+    #[test]
+    fn every_error_code_but_ok_and_unknown_carries_a_hint() {
+        for code in [
+            Code::Cancelled,
+            Code::InvalidArgument,
+            Code::DeadlineExceeded,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::PermissionDenied,
+            Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::Aborted,
+            Code::Unimplemented,
+            Code::Internal,
+            Code::Unavailable,
+            Code::Unauthenticated,
+        ] {
+            if code == Code::Cancelled {
+                continue;
+            }
+            assert!(hint_for(code, "").is_some(), "{code:?} has no hint");
+        }
+    }
+
+    #[test]
+    fn human_errors_name_the_code_like_the_envelope() {
+        let err = crate::cmd::helpers::friendly_status(
+            "failed to destroy job",
+            Status::failed_precondition("Job web must be stopped before it can be destroyed"),
+        );
+        let text = err.to_string();
+        assert!(text.ends_with("[code=FailedPrecondition]"), "{text}");
+        assert!(text.contains("must be stopped"), "{text}");
     }
 }

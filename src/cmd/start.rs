@@ -106,16 +106,7 @@ pub fn config() -> Command {
                 .requires("simulate")
                 .help("Registration ramp in nodes/second (default: 100)"),
         )
-        .arg(
-            Arg::new("advertise-host")
-                .long("advertise-host")
-                .value_name("HOST")
-                .requires("simulate")
-                .help(
-                    "Host the manager should dial for task dispatch to this fleet \
-                     (default: 127.0.0.1)",
-                ),
-        )
+        .arg(advertise_addr_arg())
         .arg(
             Arg::new("sim-no-work-stream")
                 .long("sim-no-work-stream")
@@ -156,15 +147,15 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 let opts = simulate_options(*count, arg_matches)?;
                 return run_simulated_workers(token, opts).await;
             }
+            if let Some(addr) = arg_matches.get_one::<String>("advertise-addr") {
+                crate::worker::plane::set_advertise_addr_flag(addr);
+            }
             let name = arg_matches.get_one::<String>("name").map(String::as_str);
             run_worker(token, name).await
         }
         Some(("manager", arg_matches)) => {
-            let config_path = arg_matches
-                .get_one::<String>("config")
-                .map_or(DEF_CONFIG_PATH, String::as_str);
             let run_worker = arg_matches.get_flag("run-worker");
-            let config = parse_config(config_path)?;
+            let config = load_config(arg_matches.get_one::<String>("config"))?;
             // Restore runs BEFORE the store (and any raft engine) starts:
             // the backup becomes the initial state the engine adopts (plan
             // §A5; docs/upgrades.md "Backup and restore").
@@ -186,12 +177,19 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             crate::manager::daemon::run_manager_with(config, run_worker, restore_from).await
         }
         _ => {
-            let config_path = sub_matches
-                .get_one::<String>("config")
-                .map_or(DEF_CONFIG_PATH, String::as_str);
-            let config = parse_config(config_path)?;
+            let config = load_config(sub_matches.get_one::<String>("config"))?;
             run_manager(config, false).await
         }
+    }
+}
+
+/// The manager config: the file `-c` names, or the built-in defaults when
+/// there is no `-c`. Nothing is read from the working directory implicitly,
+/// so `legion start manager` behaves the same wherever it is run.
+fn load_config(config_path: Option<&String>) -> R<ManagerConfig> {
+    match config_path {
+        Some(path) => parse_config(path),
+        None => Ok(serde_json::from_str("{}")?),
     }
 }
 
@@ -226,14 +224,27 @@ fn simulate_options(count: usize, arg_matches: &ArgMatches) -> R<SimulateOptions
             .get_one::<f64>("register-rate")
             .copied()
             .unwrap_or(defaults.register_rate),
-        advertise_host: arg_matches
-            .get_one::<String>("advertise-host")
+        advertise_addr: arg_matches
+            .get_one::<String>("advertise-addr")
             .cloned()
-            .unwrap_or(defaults.advertise_host),
+            .or(defaults.advertise_addr),
         checkpoints: arg_matches.get_flag("sim-checkpoints"),
         observer: None,
         work_stream: !arg_matches.get_flag("sim-no-work-stream"),
     })
+}
+
+/// `--advertise-addr` for `legion start worker` and `legion join`: the host
+/// (or `host:port`) managers and routers dial for this worker's plane.
+pub(crate) fn advertise_addr_arg() -> Arg {
+    Arg::new("advertise-addr")
+        .long("advertise-addr")
+        .value_name("HOST[:PORT]")
+        .help(
+            "Address managers dial for this worker's plane (mTLS, port 4848 by default). \
+             Default: LEGION_WORKER_ADVERTISE_ADDR, else the local address of the route to the \
+             manager",
+        )
 }
 
 fn config_path_arg() -> Arg {
@@ -241,6 +252,32 @@ fn config_path_arg() -> Arg {
         .short('c')
         .long("config")
         .value_name("CONFIG")
-        .help("Path to the manager configuration file")
+        .help("Path to the manager configuration file (default: built-in defaults)")
         .value_hint(ValueHint::FilePath)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P2-1: `legion start manager` with no `-c` must not read
+    /// `./configs/manager.ncl` (which only exists in a repo checkout).
+    #[test]
+    fn no_config_flag_uses_the_built_in_defaults() -> R<()> {
+        let config = load_config(None)?;
+        let full = config.with_defaults();
+        assert_eq!(full.server.port, DEF_MANAGER_SERVER_PORT);
+        assert!(
+            full.worker_config_path.is_empty(),
+            "no worker config directory unless one is configured"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_explicit_config_that_does_not_exist_is_an_error() {
+        let missing = "/nonexistent/legion/manager.ncl".to_string();
+        let err = load_config(Some(&missing)).expect_err("a named file must exist");
+        assert!(format!("{err:#}").contains("manager.ncl"), "{err:#}");
+    }
 }

@@ -141,6 +141,28 @@
         #     },
         # },
     },
+    # `container` runtime settings (docs/task-runtime-container.md,
+    # "Capabilities").
+    container = {
+        # The Linux capabilities a container task on this worker type may
+        # end up with after its security.capabilities adjustments (Nomad's
+        # allow_caps). A task whose effective set (the default, less drop,
+        # plus add) holds anything else fails at start here, naming this
+        # field. Case-insensitive, CAP_ prefix optional; ["ALL"] allows
+        # everything. Unset: the default set below, so jobs can drop
+        # capabilities but add none. Adding SYS_ADMIN, NET_ADMIN, SYS_PTRACE,
+        # SYS_MODULE, or ALL lets container root act on the host.
+        allowCaps = [
+            "AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL",
+            "MKNOD", "NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP",
+            "SETUID", "SYS_CHROOT",
+            # Not in the default set. Uncomment to let jobs opt into raw
+            # sockets (ping, traceroute) with
+            # security.capabilities.add = ["NET_RAW"]. A container on the
+            # host network can then also read the node's traffic.
+            # "NET_RAW",
+        ],
+    },
     # Whether this node serves `Worker.StartClaim` — that is, whether it will
     # start work on a boot ticket at all (docs/edge-boot.md). Off by default
     # and independent of the manager's `edgeBoot.enabled`: an operator who

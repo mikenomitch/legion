@@ -308,10 +308,18 @@ fingerprinting. The join token pins which template applies.
 
 When ACLs are enforced:
 
-- `WorkerPreRegister`/`WorkerRegister` require a valid join secret.
-- Registration mints a per-node **worker token** (returned in the reply) that
-  the worker attaches to `Heartbeat`/`HealthCheck`. Node tokens grant nothing
-  on the user-facing API.
+- `WorkerPreRegister`/`WorkerRegister` require a valid join secret, or the
+  node's own node token (see below).
+- Registration with a join secret mints a per-node **node token** (returned
+  in the reply) that the worker attaches to every worker-plane call. Node
+  tokens grant nothing on the user-facing API, and they do not expire.
+- The worker persists its node token in its state directory
+  (`$LEGION_DATA_DIR/workers/<node>/node_token`, mode `0600`, in a directory
+  only the worker's user can enter) and is never logged. A restarted worker
+  re-registers with that node token instead of its join secret, so **a join
+  token is only needed to introduce a node**: once the node has joined, its
+  join token can expire or be revoked and the node still restarts, reboots,
+  and upgrades normally.
 - A join token only admits its own worker type. Pre-registering as another
   type, or registering into a pool other than that type's pool, fails with
   `PermissionDenied`.
@@ -321,12 +329,21 @@ When ACLs are enforced:
   issuers) refuses a node id that does not match the token with
   `PermissionDenied`. A node token can re-register its own node in its current
   pool, but not any other node. Management tokens act for any node.
-- Re-registering rotates the node token. If a heartbeat comes back
-  `Unauthenticated`, the worker automatically re-registers using its join
-  secret.
+- Registering with a join secret rotates the node token (the old one stops
+  working). Re-registering with the node token keeps it: the reply carries no
+  new token, so a crash during a restart can never leave the worker holding
+  a revoked one.
+- If the manager refuses the persisted node token (the node was removed, or
+  ACL state was reset), or a heartbeat comes back `Unauthenticated`, the
+  worker discards it and registers with its join secret. If that is gone
+  too, the worker exits with `Unauthenticated: unknown or revoked join
+  token`; mint a new join token for that host and run `legion join` again.
 - A join token admits any node name, including the name of a node that is
   already registered. Treat join secrets like node credentials: give them
-  short TTLs and revoke them once the fleet has joined.
+  short TTLs (minutes to a day, long enough to bring the hosts up) and
+  revoke them once the fleet has joined. Restarts do not need them. Treat
+  the node token file like the node's private key: it lets its holder act as
+  that node.
 - In `auditOnly` mode, workers without join tokens are admitted but logged,
   and so are the worker-type, pool, and node-id mismatches above. The two
   identity-token issuers refuse a foreign node id even in audit-only mode.
@@ -339,8 +356,82 @@ and the exec WebSocket only answer loopback origins and those listed in
 [UI Architecture](ui-architecture.md#allowed-browser-origins)). With ACLs off
 this is the only thing that stops a web page from driving a local manager.
 
-The worker plane does not support mTLS yet. The listener-level TLS below
-already covers transport encryption.
+### The worker plane
+
+Every worker serves the `Worker` gRPC service (the *worker plane*) on 4848,
+and managers dial it for exec, actions, logs, restart, and push dispatch.
+It is always mutual TLS, on every platform and in every mode, including
+`--run-worker`, whether or not the cluster runs ACLs. There is no plaintext
+worker listener and no switch to turn one on. Ports, the bind and advertise
+settings, and the firewall rule are in
+[architecture-managers-workers.md](architecture-managers-workers.md#ports-and-who-dials-whom).
+
+**The certificates.** One cluster CA (the same CA `legion net ca show`
+prints, generated on first use and replicated with the control lane) signs
+two kinds of certificate. The role lives in the URI SAN:
+
+| Certificate | Held by | SANs | Issued |
+| --- | --- | --- | --- |
+| node | each worker | `<node>.node.legion`, `legion://node/<node id>` | the worker generates a key and sends a CSR (`IssueNodeCertificate`, authorized by its node token); the manager chooses the names and ignores what the CSR asks for. 24 hours, re-issued after 8. The key never leaves the worker; it is persisted with the certificate under `<state-dir>/identity/`, mode `0600`. |
+| manager | each manager | `legion://manager/<manager id>` (raft node id, or `local`) | the manager signs it for itself from the replicated CA key, on first use, and re-mints before it expires. `ClientAuth` only. |
+
+The node certificate is also the service mesh's node certificate
+([network-handlers.md](network-handlers.md#mtls)).
+
+**Caller classes.** The worker serves its node certificate and requests, but
+does not require, a client certificate that chains to the cluster CA. A
+client certificate from another CA fails the handshake. Each RPC then
+admits named caller classes, checked before the request is read:
+
+| RPC | Caller class | What it takes |
+| --- | --- | --- |
+| `PostWork`, `GetTaskLogs`, `RestartWorker`, `ExecTask` | `manager` | a client certificate from the cluster CA carrying `legion://manager/<id>` |
+| `StartClaim` | `ticket` | a boot ticket in the request ([edge-boot.md](edge-boot.md)); a client certificate is ignored |
+
+A node certificate is not a manager certificate: the CA signs both, and the
+role SAN is what the worker checks. Anything else is refused with
+`Unauthenticated`:
+
+```console
+$ grpcurl -cacert ca.pem 10.0.1.7:4848 legion.Worker/GetTaskLogs
+ERROR:
+  Code: Unauthenticated
+  Message: GetTaskLogs is a manager-only worker RPC: present a Legion manager certificate
+```
+
+So nothing but a manager can open a shell in a task, read a task's logs,
+hand a node work, or restart it, and a manager does those only after its own
+ACL checks (`exec:write`, `job:read`, `node:write`). Only managers hold
+manager certificates: their key never leaves the manager process.
+
+**The manager verifies the worker.** Every manager-to-worker call goes
+through one client that trusts only the cluster CA and checks that the
+server certificate names the node it means to reach (`<node>.node.legion`).
+A worker that registered a stale or stolen address cannot receive another
+node's work or exec sessions. The manager never dials an `http://` worker
+address: a worker older than protocol 3 keeps running work (heartbeat
+replies carry it) but exec, logs, and restart against it fail with an error
+naming its protocol version.
+
+**Known limits.**
+
+- The worker-to-manager channel (4747) is plaintext unless the manager
+  serves `server.tls`, and workers do not yet configure TLS toward a TLS
+  manager. Heartbeat replies (which can carry KV-rendered secrets),
+  registration, and the edge-boot JWKS fetch travel over it. Node private
+  keys do not: they never leave the worker. Keep 4747 on a network you
+  trust until encrypted worker connections ship.
+- Join tokens do not pin the cluster CA yet. A worker trusts whatever answers
+  at the token's address.
+- `legion net ca rotate` swaps the CA in one step; there is no overlap
+  window yet. A manager notices within 10 seconds and re-mints its
+  certificate. A node re-issues its own on the next heartbeat after a
+  manager's dial is refused for the old CA (the refused handshake signals
+  it, at most once a minute), and otherwise at its routine refresh within 8
+  hours. The first exec, logs, or restart against each node after a
+  rotation can fail; retry after a few seconds.
+- The `ticket` class on `ExecTask` (direct exec without a manager on the
+  path) is not implemented. Every exec goes through a manager.
 
 ### TLS
 

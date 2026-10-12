@@ -44,7 +44,13 @@
 
     config = {
       image = "postgres:16-alpine",
-      command = ["postgres"],
+      # Run the image's entrypoint explicitly: on Linux, `command` replaces
+      # the image's ENTRYPOINT as well as its CMD, and the entrypoint is what
+      # runs initdb and drops from root to the postgres user. Listen on the
+      # port Legion assigned: Linux containers share the host's network, so a
+      # fixed 5432 would collide with a second Postgres on the node and would
+      # not be the port the service advertises.
+      command = ["sh", "-c", "exec docker-entrypoint.sh postgres -p \"$LEGION_PORT_PG\""],
       env = {
         # PGDATA must be a SUBDIRECTORY of the mount, not the mount itself:
         # the official image refuses to initdb into a directory that already
@@ -60,17 +66,21 @@
 
     network = {
       mode = "auto",
-      ports = [{ name = "pg", to = 5432 }],
+      # No `to`: Postgres listens on the assigned port itself (see command),
+      # which is also what Apple `container` publishes on macOS.
+      ports = [{ name = "pg" }],
     },
     # Discoverable as `postgres` — clients resolve it instead of hardcoding a
     # host (see docs/service-discovery.md).
     service = { name = "postgres", port = "pg" },
 
+    # A TCP check, not `pg_isready`: exec checks run on the host, outside the
+    # container, where neither the binary nor the task's env exists.
     checks = [{
       type = "health",
       name = "ready",
-      kind = "exec",
-      command = ["pg_isready", "-U", "postgres"],
+      kind = "tcp",
+      port = "pg",
       every = "10s",
       timeout = "5s",
       # Give initdb room on a fresh volume before failing the allocation.
@@ -80,7 +90,9 @@
     # Day-2 operations, pre-baked (docs/exec-and-actions.md). Actions run
     # inside the container via the task's exec support, so `psql` is the
     # image's own binary and no client install is needed on the operator's
-    # machine:
+    # machine. They run with the task's env, so `sh -c` can pass the assigned
+    # port to the client (the param stays a positional argument, never shell
+    # text):
     #   legion action run postgres psql --tty      # interactive shell
     #   legion action run postgres sql --param query='SELECT 1'
     #   legion action run postgres dump > backup.sql
@@ -88,20 +100,26 @@
       {
         name = "psql",
         description = "Interactive psql shell inside the container",
-        command = ["psql", "-U", "postgres", "-d", "legion"],
+        command = ["sh", "-c", "exec psql -p \"$LEGION_PORT_PG\" -U postgres -d legion"],
         tty = true,
       },
       {
         name = "sql",
         description = "Run one SQL statement and print the result",
-        command = ["psql", "-U", "postgres", "-d", "legion", "-c", "${param.query}"],
+        command = [
+          "sh",
+          "-c",
+          "exec psql -p \"$LEGION_PORT_PG\" -U postgres -d legion -c \"$1\"",
+          "sql",
+          "${param.query}",
+        ],
         params = [{ name = "query", description = "SQL to execute" }],
         timeout = "60s",
       },
       {
         name = "dump",
         description = "pg_dump the database to stdout (redirect to a file)",
-        command = ["pg_dump", "-U", "postgres", "legion"],
+        command = ["sh", "-c", "exec pg_dump -p \"$LEGION_PORT_PG\" -U postgres legion"],
         timeout = "10m",
       },
     ],

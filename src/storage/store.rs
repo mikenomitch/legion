@@ -47,8 +47,8 @@ use crate::storage::queries::{
     GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS, GET_INSTANCE, GET_INSTANCES_FOR_JOB,
     GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID, GET_JOB_UPDATE_FOR_CONFIG,
     GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_SIGNING_KEYS,
-    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
-    INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
+    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, GET_WORKER_TYPES, INSERT_ALLOCATION, INSERT_EVAL,
+    INSERT_JOB, INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
     INSERT_SIGNING_KEY, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_JOINED_ATTRS,
     NODE_JOINED_FROM, SEED_NODE_HEALTH, UPDATE_SIGNING_KEY_STATE, UPSERT_INSTANCE,
     UPSERT_MANAGER_CONFIG,
@@ -867,6 +867,25 @@ pub struct StoredStopNotice {
     pub preemptor_band: String,
 }
 
+/// An allocation that was removed, remembered for
+/// [`ALLOCATION_HISTORY_RETENTION_SECS`] (`allocation_history`) so its logs
+/// stay reachable through `legion job logs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedAllocation {
+    pub allocation_id: i64,
+    pub job_id: String,
+    pub job_config_id: String,
+    pub task_config_id: i64,
+    /// Empty when the task config was already gone at removal.
+    pub task_name: String,
+    pub node_id: String,
+    /// The row's status when it was removed (`placed`, `complete`, `failed`).
+    pub status: String,
+    /// [`StopCause`] wire name; empty when the removal named none.
+    pub cause: String,
+    pub removed_at_unix: i64,
+}
+
 /// The words an instance's `last_stop` carries in place of the generic
 /// sentence for its cause: the memory pressure response's detail and hint.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1336,6 +1355,14 @@ pub struct Store {
     // is repaired within one sweep of the fleet rather than never. Shared
     // across clones so the sweep is per-process, not per-clone.
     alloc_scrub_queue: Arc<std::sync::Mutex<Vec<String>>>,
+    // Whether some plan since the last capacity pass left replicas unplaced
+    // for lack of room ([`Store::note_capacity_waiters`]). Freed capacity (an
+    // allocation finishing or being removed, a job stopping) queues a
+    // capacity pass only while this is set, so the common case of nobody
+    // waiting costs nothing. Starts set: after a restart or a leadership
+    // change nothing is known, so the first freed capacity runs one pass,
+    // which clears it if nothing waits.
+    capacity_waiters: Arc<AtomicBool>,
     // The timed read-model scrub's own rotation (`scrub_read_model_slice`):
     // nodes still to visit this sweep, refilled from committed AND cached
     // node ids so a node missing from either side is visited too.
@@ -1945,6 +1972,7 @@ impl Store {
             snapshot_warms: Arc::new(crate::storage::snapshot_warm::SnapshotWarmQueue::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
+            capacity_waiters: Arc::new(AtomicBool::new(true)),
             read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             external_write_baseline: Arc::new(std::sync::Mutex::new(None)),
             keyring,
@@ -2121,6 +2149,44 @@ impl Store {
             .as_any()
             .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
             .and_then(|driver| driver.lane_leader_addr(lane))
+    }
+
+    /// Every manager's advertised `host:port` from the replicated raft
+    /// membership, sorted. Empty outside raft mode. Served to workers on
+    /// registration and heartbeat replies so they can fail over between
+    /// managers (`HeartbeatReply.manager_addresses`).
+    pub fn raft_member_addresses(&self) -> Vec<String> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .map(|driver| driver.member_addresses())
+            .unwrap_or_default()
+    }
+
+    /// A channel to another manager's listener (`host:port`), from the raft
+    /// engine's shared pool — the same authenticated-by-network path the
+    /// raft transport and lane-write forwarding use. `None` outside raft mode
+    /// or before the engine starts. Must be called inside a tokio runtime
+    /// (building a lazy channel spawns its connection task).
+    pub(crate) fn raft_peer_channel(&self, host_port: &str) -> Option<tonic::transport::Channel> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .and_then(|driver| driver.peer_channel(host_port))
+    }
+
+    /// Whether this manager leads every raft lane (always true outside raft
+    /// mode). Cheap: one metrics borrow per lane. The leader-forward layer's
+    /// fast path — a manager that leads everything has nowhere to forward.
+    pub(crate) fn leads_every_raft_lane(&self) -> bool {
+        Lane::ALL.into_iter().all(|lane| self.is_raft_leader(lane))
+    }
+
+    /// This manager's own raft identity (`persistence.raft.nodeId`), when it
+    /// runs raft. Used to stamp requests it forwards to the leader so they
+    /// are never forwarded twice.
+    pub(crate) fn raft_node_id(&self) -> Option<String> {
+        self.raft_status().map(|status| status.node_id)
     }
 
     /// Report the nodes this manager has heard from to the status-lane leader
@@ -3321,9 +3387,7 @@ impl Store {
                                 .map(|allocations| allocations.as_slice())
                                 .unwrap_or(&[]);
                             match NodeUsage::from_rows(
-                                allocations
-                                    .iter()
-                                    .map(|allocation| (allocation.id, &allocation.resources)),
+                                crate::resources::capacity_rows(allocations),
                                 policy,
                             ) {
                                 Ok(usage) => {
@@ -3501,9 +3565,7 @@ impl Store {
             .iter()
             .map(|(node_id, allocs)| {
                 let usage = NodeUsage::from_rows(
-                    allocs
-                        .iter()
-                        .map(|allocation| (allocation.id, &allocation.resources)),
+                    crate::resources::capacity_rows(allocs),
                     &self.resource_policy,
                 )
                 .ok();
@@ -3719,9 +3781,7 @@ impl Store {
         // the write-lock hold.
         let scrubbed_usage: Option<NodeUsage> = scrubbed.as_ref().and_then(|(_, allocations)| {
             NodeUsage::from_rows(
-                allocations
-                    .iter()
-                    .map(|allocation| (allocation.id, &allocation.resources)),
+                crate::resources::capacity_rows(allocations),
                 &self.resource_policy,
             )
             .ok()
@@ -3744,7 +3804,7 @@ impl Store {
                         &mut guard,
                         &self.resource_policy,
                         node_id,
-                        Some(&removed.resources),
+                        Self::capacity_resources(&removed),
                         None,
                     ),
                     None => {
@@ -3765,7 +3825,9 @@ impl Store {
                     CachedEntry::Present
                 };
                 let node_id = allocation.node_id.clone();
-                let added_resources = allocation.resources.clone();
+                // A row that turned terminal (a batch task finished) stops
+                // holding capacity: its usage comes out and nothing goes in.
+                let added_resources = Self::capacity_resources(&allocation).cloned();
                 let (as_expected, replaced) =
                     Self::cache_splice_allocation_entry(&mut guard, allocation, expected);
                 if !as_expected {
@@ -3775,8 +3837,8 @@ impl Store {
                     &mut guard,
                     &self.resource_policy,
                     &node_id,
-                    replaced.as_ref().map(|replaced| &replaced.resources),
-                    Some(&added_resources),
+                    replaced.as_ref().and_then(Self::capacity_resources),
+                    added_resources.as_ref(),
                 );
                 touched.insert(node_id);
             }
@@ -3893,6 +3955,13 @@ impl Store {
         }
         model.index_allocation_ref(&job_id, &node_id, reference);
         (as_expected, replaced)
+    }
+
+    /// An allocation's resources when it holds node capacity, `None` when it
+    /// is terminal (see [`crate::resources::capacity_rows`]).
+    fn capacity_resources(allocation: &Allocation) -> Option<&Value> {
+        (!crate::constants::allocation_status_is_terminal(&allocation.status))
+            .then_some(&allocation.resources)
     }
 
     /// Applies one splice's effect to a node's [`NodeUsage`] memo: the
@@ -6015,7 +6084,8 @@ impl Store {
         // read must never enter the cache.
         let mut stmt = tx.prepare_cached(
             "SELECT a.id, a.resources FROM allocation a \
-             WHERE a.node_id = ?1 AND (?2 = 0 OR a.job_config_id NOT IN (\
+             WHERE a.node_id = ?1 AND a.status NOT IN ('complete', 'failed') \
+               AND (?2 = 0 OR a.job_config_id NOT IN (\
                  SELECT id FROM job_config WHERE job_id = \
                      (SELECT job_id FROM job_config WHERE id = ?3)));",
         )?;
@@ -6120,8 +6190,14 @@ impl Store {
             }
         }
 
-        let mut stmt =
-            tx.prepare_cached("SELECT a.id, a.resources FROM allocation a WHERE a.node_id = ?1;")?;
+        // Terminal rows hold no capacity (`resources::capacity_rows`). The
+        // fingerprint still sees them: a row turning terminal bumps the
+        // node's epoch (`complete_allocation_apply`), which is what
+        // invalidates an aggregate that still counted it.
+        let mut stmt = tx.prepare_cached(
+            "SELECT a.id, a.resources FROM allocation a \
+             WHERE a.node_id = ?1 AND a.status NOT IN ('complete', 'failed');",
+        )?;
         let rows = Self::collect_rows(stmt.query_map([node_id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?))
         })?)?;
@@ -6156,7 +6232,7 @@ impl Store {
     ) -> R<OwnAllocationUsage> {
         let mut stmt = tx.prepare_cached(
             "SELECT a.node_id, a.id, a.resources FROM allocation a \
-             WHERE a.job_config_id IN (\
+             WHERE a.status NOT IN ('complete', 'failed') AND a.job_config_id IN (\
                  SELECT id FROM job_config WHERE job_id = \
                      (SELECT job_id FROM job_config WHERE id = ?1));",
         )?;
@@ -6908,6 +6984,7 @@ impl Store {
             heartbeat_seconds: row.get(10)?,
             resource_enforcement: row.get(11)?,
             edge_boot: row.get(12)?,
+            container: row.get(13)?,
         })
     }
 
@@ -7233,7 +7310,11 @@ impl Store {
     // NODES
     //
 
-    #[instrument(err, skip_all)]
+    // `NotFound` is an answer here, not a failure: registration looks every
+    // joining node up first, so a fresh worker's first join always misses.
+    // Errors are recorded at debug and the caller decides what they mean
+    // (`map_store_error` logs the real ones at error).
+    #[instrument(err(level = "debug"), skip_all)]
     pub fn get_node(&self, id: &str) -> R<Node> {
         let conn = self.read_connection()?;
         let node = conn
@@ -7439,12 +7520,19 @@ impl Store {
         {
             let conn = self.write_connection()?;
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            // Leaving 'drained' also clears the drain-eviction intent flag
-            // (the sync paths never SET 'drained', only ready/lost flips).
+            // Liveness owns exactly two values: `available` and
+            // `unavailable`. `drained` is operator intent (`node cordon` /
+            // `drain`), so this sync never overwrites it: a cordoned node
+            // that goes lost stays cordoned, and therefore stays cordoned
+            // when it comes back (before this guard, loss rewrote `drained`
+            // to `unavailable` and the recovery then rewrote that to
+            // `available`, silently undoing the cordon). Leaving 'drained'
+            // also clears the drain-eviction intent flag (the sync paths
+            // never SET 'drained', only ready/lost flips).
             let sql = format!(
                 "UPDATE node SET availability = ?1,
                         drain_evict = CASE WHEN ?1 = 'drained' THEN drain_evict ELSE 0 END
-                 WHERE id IN ({placeholders});"
+                 WHERE id IN ({placeholders}) AND availability != 'drained';"
             );
             let mut params: Vec<&dyn rusqlite::ToSql> = vec![&availability];
             for id in ids {
@@ -8310,6 +8398,74 @@ impl Store {
         }
     }
 
+    /// Make every node's stored schedulability agree with its liveness, on
+    /// the manager responsible for liveness (the status-lane leader's tick).
+    ///
+    /// Node loss and recovery are each two replicated writes: the status lane
+    /// records `lost`/`active`, the control lane flips `node.availability`
+    /// between `unavailable` and `available`, and the scheduler places only
+    /// on `available`. Any path that lands one half and not the other — a
+    /// leadership change between the two writes, a forward that failed, an
+    /// older manager's re-registration that kept `unavailable` — leaves a
+    /// node `legion node list` shows as `active` while every placement says
+    /// "No nodes available" (spot-check P0-6). Liveness lives in the leader's
+    /// memory and only transitions are replicated, so nothing re-derives the
+    /// missing half on its own; this pass does, every tick:
+    ///
+    /// - **`active` + `unavailable`, and this manager has heard from the node
+    ///   since it took responsibility** → `available`. The observation
+    ///   requirement means a node is returned to the pool on evidence, not
+    ///   on a stale row.
+    /// - **`lost` + `available`, and this manager has NOT heard from it** →
+    ///   `unavailable`, so a half-applied loss cannot keep attracting
+    ///   placements.
+    ///
+    /// `drained` is never touched (operator intent; see
+    /// [`Self::sync_node_availability`]). Reads the scheduler's own read
+    /// model, so what it repairs is exactly what placement sees. Returns
+    /// `(revived, retired)` node counts.
+    #[instrument(err, skip_all)]
+    pub fn reconcile_node_availability(&self) -> R<(usize, usize)> {
+        let (revive, retire) = {
+            let guard = self.read_model_reader()?;
+            let mut revive: Vec<String> = Vec::new();
+            let mut retire: Vec<String> = Vec::new();
+            for (id, node) in guard.nodes.iter() {
+                match (node.status.as_str(), node.availability.as_str()) {
+                    ("active", "unavailable") if self.liveness.observed_since_responsible(id) => {
+                        revive.push(id.clone())
+                    }
+                    ("lost", "available") if !self.liveness.observed_since_responsible(id) => {
+                        retire.push(id.clone())
+                    }
+                    _ => {}
+                }
+            }
+            revive.sort();
+            retire.sort();
+            (revive, retire)
+        };
+        if !revive.is_empty() {
+            self.sync_node_availability(&revive, "available")?;
+            info!(
+                nodes = ?revive,
+                "Nodes reported active and heartbeating but stored as unavailable; returned \
+                 them to the scheduling pool"
+            );
+            crate::manager::telemetry::metrics()
+                .nodes_recovered_total
+                .inc_by(&["reconcile"], revive.len() as u64);
+        }
+        if !retire.is_empty() {
+            self.sync_node_availability(&retire, "unavailable")?;
+            warn!(
+                nodes = ?retire,
+                "Nodes marked lost were still schedulable; withdrew them from placement"
+            );
+        }
+        Ok((revive.len(), retire.len()))
+    }
+
     /// The liveness soft-state table (liveness plan §6.2).
     pub fn liveness(&self) -> &Arc<crate::storage::liveness::LivenessTable> {
         &self.liveness
@@ -8801,6 +8957,17 @@ impl Store {
         Ok(config)
     }
 
+    /// Every worker type the manager was configured with.
+    #[instrument(err, skip_all)]
+    pub fn list_worker_types(&self) -> R<Vec<WorkerConfig>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(&GET_WORKER_TYPES)?;
+        let types = stmt
+            .query_map([], |row| self.worker_type_from_row(row))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(types)
+    }
+
     #[instrument(err, skip_all)]
     pub fn insert_worker_type(&self, config: &WorkerConfig) -> R<WorkerConfig> {
         let config = config.clone();
@@ -8838,6 +9005,7 @@ impl Store {
             ":heartbeat_seconds": config.heartbeat_seconds,
             ":resource_enforcement": config.resource_enforcement,
             ":edge_boot": config.edge_boot,
+            ":container": config.container,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -8851,7 +9019,9 @@ impl Store {
     // JOBS
     //
 
-    #[instrument(err, skip_all)]
+    // A missing job is an answer the caller maps (NotFound), not a store
+    // failure; recorded at debug like `get_node`.
+    #[instrument(err(level = "debug"), skip_all)]
     pub fn get_job(&self, name: &str) -> R<Job> {
         let conn = self.read_connection()?;
         let job = conn
@@ -9139,7 +9309,9 @@ impl Store {
     /// children) and emits the event. Cross-op atomicity was never promised
     /// (§A2): a crash mid-sequence leaves a stopped job with some children
     /// already cleared, and re-running destroy finishes the remainder.
-    #[instrument(err, skip_all)]
+    // Refusals (the job is still running) are the caller's to act on;
+    // `map_store_error` logs the real failures at error.
+    #[instrument(err(level = "debug"), skip_all)]
     pub fn destroy_job(&self, name: &str) -> R<()> {
         // Validate first (same checks the control op re-runs in its own
         // transaction) so a bad request deletes nothing from any lane.
@@ -9148,7 +9320,11 @@ impl Store {
             conn.query_row(&GET_JOB, [name], |row| self.job_from_row(row))?
         };
         if job.status != "stopped" {
-            bail!("Job must be stopped before it can be destroyed");
+            bail!(StorageError::failed_precondition(format!(
+                "Job {name} must be stopped before it can be destroyed (it is {}); run \
+                 `legion job stop {name}` first",
+                job.status
+            )));
         }
 
         let job_id = job.id;
@@ -9222,7 +9398,11 @@ impl Store {
 
         let job = tx.query_row(&GET_JOB, [name], |row| self.job_from_row(row))?;
         if job.status != "stopped" {
-            bail!("Job must be stopped before it can be destroyed");
+            bail!(StorageError::failed_precondition(format!(
+                "Job {name} must be stopped before it can be destroyed (it is {}); run \
+                 `legion job stop {name}` first",
+                job.status
+            )));
         }
 
         let submission_hashes: Vec<String> = {
@@ -12132,6 +12312,140 @@ impl Store {
         Ok(())
     }
 
+    /// Put every task of a config back to `pending` before the job runs again
+    /// from the top (a `job_update` restart: a batch schedule's next run, a
+    /// forced reschedule, a KV restart). Without it the previous run's
+    /// `success` would satisfy this run's `dependsOn`, and every step of a
+    /// DAG would start at once.
+    ///
+    /// Only configs with a `dependsOn` edge need it, so every other job
+    /// skips the status-lane write entirely. Rows already `pending` are left
+    /// alone, so a repeat is an empty changeset.
+    pub fn reset_task_statuses(&self, job_config_id: &str) -> R<()> {
+        let has_dependencies = self
+            .shared_task_configs_for_job_config(job_config_id)?
+            .iter()
+            .any(|(_, task)| !task.depends_on.is_empty());
+        if !has_dependencies {
+            return Ok(());
+        }
+        let job_config_id = job_config_id.to_owned();
+        self.replicated(Lane::Status, "reset_task_statuses", move |s| {
+            let conn = s.write_connection()?;
+            conn.execute(
+                "UPDATE task_status SET status = ?1, updated_at = ?2 \
+                 WHERE job_config_id = ?3 AND status != ?1;",
+                params![
+                    TaskStatusState::Pending.as_str(),
+                    Self::now_rfc3339()?,
+                    job_config_id
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Queue the eval that lets a job move past a task that just reached a
+    /// terminal state (its worker reported an exit). Tasks that depend on it
+    /// with `complete` or `success` were held by the planner until now
+    /// (docs/jobs-tasks-and-scheduling.md, "Task Lists and Dependency
+    /// Readiness"); this is what places them.
+    ///
+    /// Queues nothing when no task of the config depends on this one, or
+    /// when the config is no longer wanted. A config being rolled out to
+    /// gets a `rollout_tick`, so its dependents keep the rollout's step and
+    /// health gating; any other config gets a `job_reschedule`, which places
+    /// only what is missing. Returns whether an eval was queued.
+    pub fn queue_dependency_progress(&self, allocation: &Allocation) -> R<bool> {
+        let tasks = self.shared_task_configs_for_job_config(&allocation.job_config_id)?;
+        let Some(task_name) = tasks
+            .iter()
+            .find(|(id, _)| *id == allocation.task_config_id)
+            .map(|(_, task)| task.name.as_str())
+        else {
+            return Ok(false);
+        };
+        let has_dependents = tasks.iter().any(|(_, task)| {
+            task.depends_on
+                .iter()
+                .any(|dependency| dependency.task == task_name)
+        });
+        if !has_dependents {
+            return Ok(false);
+        }
+        if self
+            .job_config_unwanted_reason(&allocation.job_config_id)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let rolling_out = self
+            .latest_rollout_for_job_config(&allocation.job_config_id)?
+            .is_some_and(|rollout| {
+                !matches!(
+                    rollout.status.as_str(),
+                    "completed" | "completed_incomplete" | "failed" | "cancelled"
+                )
+            });
+        let kind = if rolling_out {
+            "rollout_tick"
+        } else {
+            "job_reschedule"
+        };
+        self.enqueue_eval(
+            kind,
+            Some(&allocation.job_id),
+            Some(&allocation.job_config_id),
+            None,
+            None,
+        )?;
+        debug!(
+            job_id = %allocation.job_id,
+            job_config_id = %allocation.job_config_id,
+            task = %task_name,
+            kind,
+            "Queued dependency progress after a task reached a terminal state"
+        );
+        Ok(true)
+    }
+
+    /// Whether an eval of `kind` for `job_config_id` is pending with a
+    /// `ready_at` in the future: a timer, such as a batch schedule's next
+    /// `job_update`, that is already set.
+    pub fn delayed_eval_pending(&self, kind: &str, job_config_id: &str) -> R<bool> {
+        let conn = self.read_connection()?;
+        let pending: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM eval
+               WHERE type = ?1 AND job_config_id = ?2
+                 AND status = 'pending' AND ready_at > ?3);",
+            params![kind, job_config_id, Self::sortable_now()?],
+            |row| row.get(0),
+        )?;
+        Ok(pending)
+    }
+
+    /// Whether nothing of the job is running or about to run: no allocation
+    /// short of a terminal state, and no placing eval for it in flight or
+    /// due now. `RunJob` uses it to decide that re-running an unchanged spec
+    /// means "run it again" rather than "nothing to do".
+    pub fn job_is_idle(&self, job_id: &str) -> R<bool> {
+        let conn = self.read_connection()?;
+        let busy: bool = conn.query_row(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM allocation a
+                   WHERE a.job_config_id IN (SELECT id FROM job_config WHERE job_id = ?1)
+                     AND a.status NOT IN ('{ALLOCATION_STATUS_COMPLETE}', '{ALLOCATION_STATUS_FAILED}'))
+                 OR EXISTS (SELECT 1 FROM eval e
+                   WHERE e.job_id = ?1
+                     AND e.type IN ('job_submit', 'job_update', 'job_reschedule', 'rollout_tick')
+                     AND (e.status = 'in_flight' OR (e.status = 'pending' AND e.ready_at <= ?2)));"
+            ),
+            params![job_id, Self::sortable_now()?],
+            |row| row.get(0),
+        )?;
+        Ok(!busy)
+    }
+
     /// Task status to stamp when an allocation is placed.
     ///
     /// A batch task is `Running` until a worker reports that its process
@@ -12632,8 +12946,11 @@ impl Store {
 
         let mut used: HashSet<u16> = HashSet::new();
         let mut used_blocks: HashSet<String> = HashSet::new();
+        // A finished allocation's process is gone, and so is its hold on
+        // its ports: only rows that still hold capacity count.
         let mut stmt = tx.prepare_cached(
-            "SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL;",
+            "SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL \
+             AND status NOT IN ('complete', 'failed');",
         )?;
         let rows = stmt.query_map([node_id], |row| row.get::<_, Option<String>>(0))?;
         for row in rows {
@@ -13138,6 +13455,10 @@ impl Store {
         cause: StopCause,
         preemptor: Option<(&str, Band)>,
     ) -> R<()> {
+        // Every removal path comes through here, so this is also where the
+        // removed allocations are remembered for `legion job logs` — whether
+        // or not the cause is known.
+        Self::record_allocation_history_tx(tx, removed, cause)?;
         if removed.is_empty() || !cause.is_known() {
             return Ok(());
         }
@@ -13194,6 +13515,98 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Remember removed allocations — job, task, node, why — for
+    /// [`ALLOCATION_HISTORY_RETENTION_SECS`], so `legion job logs` can still
+    /// ask the right node for their output after the rows are gone
+    /// (docs/logging.md). Expires old rows in the same transaction, like the
+    /// stop notices: a table no removal writes to is not growing.
+    fn record_allocation_history_tx(
+        tx: &Connection,
+        removed: &[Allocation],
+        cause: StopCause,
+    ) -> R<()> {
+        if removed.is_empty() {
+            return Ok(());
+        }
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+        tx.execute(
+            "DELETE FROM allocation_history WHERE removed_at_unix < ?1;",
+            params![now_unix - ALLOCATION_HISTORY_RETENTION_SECS],
+        )?;
+        let cause = if cause.is_known() { cause.as_str() } else { "" };
+        for alloc in removed {
+            let task_name: String = tx
+                .query_row(
+                    "SELECT name FROM task_config WHERE id = ?1;",
+                    [alloc.task_config_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or_default();
+            // REPLACE: a second removal of the same id (a retried apply)
+            // carries the latest cause rather than failing the transaction.
+            tx.execute(
+                "INSERT OR REPLACE INTO allocation_history
+                 (allocation_id, job_id, job_config_id, task_config_id, task_name, node_id,
+                  status, cause, removed_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
+                params![
+                    alloc.id,
+                    alloc.job_id,
+                    alloc.job_config_id,
+                    alloc.task_config_id,
+                    task_name,
+                    alloc.node_id,
+                    alloc.status,
+                    cause,
+                    now_unix
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Removed allocations still within [`ALLOCATION_HISTORY_RETENTION_SECS`]:
+    /// one by id, or a job's newest first (at most `limit`). Rows past the
+    /// retention are filtered out here too, so a quiet cluster that has not
+    /// pruned yet answers the same as a busy one.
+    pub fn removed_allocations(
+        &self,
+        job_id: Option<&str>,
+        allocation_id: Option<i64>,
+        limit: usize,
+    ) -> R<Vec<RemovedAllocation>> {
+        let conn = self.read_connection()?;
+        let cutoff = OffsetDateTime::now_utc().unix_timestamp() - ALLOCATION_HISTORY_RETENTION_SECS;
+        let mut stmt = conn.prepare_cached(
+            "SELECT allocation_id, job_id, job_config_id, task_config_id, task_name, node_id,
+                    status, cause, removed_at_unix
+             FROM allocation_history
+             WHERE removed_at_unix >= ?1
+               AND (?2 IS NULL OR job_id = ?2)
+               AND (?3 IS NULL OR allocation_id = ?3)
+             ORDER BY removed_at_unix DESC, allocation_id DESC
+             LIMIT ?4;",
+        )?;
+        let rows = stmt.query_map(
+            params![cutoff, job_id, allocation_id, limit as i64],
+            |row| {
+                Ok(RemovedAllocation {
+                    allocation_id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    job_config_id: row.get(2)?,
+                    task_config_id: row.get(3)?,
+                    task_name: row.get(4)?,
+                    node_id: row.get(5)?,
+                    status: row.get(6)?,
+                    cause: row.get(7)?,
+                    removed_at_unix: row.get(8)?,
+                })
+            },
+        )?;
+        Self::collect_rows(rows)
     }
 
     /// Write an instance's `last_stop` record. A no-op for an instance id
@@ -14392,11 +14805,6 @@ impl Store {
         } else {
             ALLOCATION_STATUS_FAILED
         };
-        let task_status = if success {
-            TaskStatusState::Success
-        } else {
-            TaskStatusState::Failed
-        };
 
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
@@ -14404,15 +14812,76 @@ impl Store {
             "UPDATE allocation SET status = ? WHERE id = ?;",
             params![status, allocation_id],
         )?;
-        let mut updates = HashMap::new();
-        updates.insert(allocation.task_config_id, task_status);
-        self.apply_task_status_updates_tx(&tx, &updates)?;
+        // A terminal row stops holding node capacity and ports
+        // (`resources::capacity_rows`), so this is a capacity-bearing change
+        // like a removal: bump the node's epoch. That invalidates the node's
+        // cached usage aggregate (`node_usage_tx`) and fences any plan that
+        // sampled the node before the change.
+        self.bump_scope_epoch_tx(&tx, "node", &allocation.node_id)?;
+        // The TASK is done only when every replica is: a `success`
+        // dependent of a `count = 3` batch task must not start when the
+        // first of the three exits. One failed replica fails the task.
+        let task_status = if success {
+            Self::batch_task_outcome_tx(&tx, allocation.task_config_id)?
+        } else {
+            Some(TaskStatusState::Failed)
+        };
+        if let Some(task_status) = task_status {
+            let mut updates = HashMap::new();
+            updates.insert(allocation.task_config_id, task_status);
+            self.apply_task_status_updates_tx(&tx, &updates)?;
+        }
         tx.commit()?;
 
         Ok(Some(Allocation {
             status: status.to_string(),
             ..allocation
         }))
+    }
+
+    /// A task's status once one of its replicas exited successfully, read
+    /// inside the completing transaction: `Success` when no replica is still
+    /// live and the completed ones cover the task's count, `Failed` when an
+    /// earlier replica failed, and `None` (leave the status as it is) while
+    /// other replicas are still running or not placed yet.
+    fn batch_task_outcome_tx(tx: &Connection, task_config_id: i64) -> R<Option<TaskStatusState>> {
+        let (live, failed, complete): (i64, i64, i64) = tx.query_row(
+            &format!(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN status NOT IN ('{ALLOCATION_STATUS_COMPLETE}',
+                        '{ALLOCATION_STATUS_FAILED}') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = '{ALLOCATION_STATUS_FAILED}'
+                        THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = '{ALLOCATION_STATUS_COMPLETE}'
+                        THEN 1 ELSE 0 END), 0)
+                 FROM allocation WHERE task_config_id = ?1;"
+            ),
+            [task_config_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if live > 0 {
+            return Ok(None);
+        }
+        if failed > 0 {
+            return Ok(Some(TaskStatusState::Failed));
+        }
+        // `count.per` places `count` per attribute value, so the total is not
+        // known here: every replica that was placed has finished, which is
+        // the best available answer.
+        let (count, per): (i64, Option<String>) = tx
+            .query_row(
+                "SELECT count, count_per FROM task_config WHERE id = ?1;",
+                [task_config_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((1, None));
+        let per_attribute = per.is_some_and(|per| !per.is_empty());
+        if per_attribute || complete >= count {
+            Ok(Some(TaskStatusState::Success))
+        } else {
+            Ok(None)
+        }
     }
 
     #[instrument(err, skip_all)]
@@ -15120,9 +15589,13 @@ impl Store {
     /// a keyed task's stored `count` is always 1, so comparing allocations
     /// against it read a task with one placed instance as satisfied and
     /// left its other pending instances waiting for a resubmit or a leader
-    /// change (sandbox-scaling plan, Phase 0). Batch tasks are skipped: one
-    /// that ran to completion must not run again, and its allocation count
-    /// cannot tell finished from never placed. Jobs with a queued
+    /// change (sandbox-scaling plan, Phase 0). A batch task counts only
+    /// while its status says it has not finished (not `success`,
+    /// `complete`, or `failed`): one that ran to completion must not run
+    /// again, and a finished task's rows are kept, so a short count on an
+    /// unfinished one means replicas were never placed. A batch task held
+    /// by `dependsOn` also reads short; its plan holds it again, a no-op.
+    /// Jobs with a queued
     /// eval are skipped too, which is what keeps a burst of registrations
     /// from piling up reschedules: whatever is queued runs against the new
     /// capacity anyway.
@@ -15137,6 +15610,15 @@ impl Store {
                 (tc.count_per IS NOT NULL AND tc.count_per != '')
                 OR (
                   tc.lifecycle != 'batch'
+                  AND (SELECT COUNT(*) FROM allocation a WHERE a.task_config_id = tc.id)
+                      < COALESCE(ts.count, tc.count)
+                )
+                OR (
+                  tc.lifecycle = 'batch'
+                  AND COALESCE(
+                        (SELECT st.status FROM task_status st WHERE st.task_config_id = tc.id),
+                        'pending'
+                      ) NOT IN ('success', 'complete', 'failed')
                   AND (SELECT COUNT(*) FROM allocation a WHERE a.task_config_id = tc.id)
                       < COALESCE(ts.count, tc.count)
                 )
@@ -15185,6 +15667,34 @@ impl Store {
             }
         }
         Ok(waiting)
+    }
+
+    /// Record that a plan left replicas unplaced for lack of room, so the
+    /// next freed capacity queues a capacity pass
+    /// ([`Self::request_capacity_reconcile_if_waiting`]).
+    pub(crate) fn note_capacity_waiters(&self) {
+        self.capacity_waiters.store(true, Ordering::Relaxed);
+    }
+
+    /// The minimal form of Nomad's blocked evals: after capacity frees up (an
+    /// allocation finished or was removed, a job stopped), queue one
+    /// capacity pass, but only when some plan since the last pass left
+    /// replicas unplaced. The pass re-plans every job still short of its
+    /// count ([`Self::job_configs_waiting_on_capacity`]); a burst of frees
+    /// queues one pass, because [`Self::request_capacity_reconcile`] skips
+    /// while one is pending. Only the scheduler leader queues it, so a
+    /// follower that handles a worker report never writes. Best effort: a
+    /// failure is logged, and the next node join or freed capacity retries.
+    pub fn request_capacity_reconcile_if_waiting(&self) {
+        if !self.capacity_waiters.load(Ordering::Relaxed) || !self.is_raft_leader(Lane::Scheduler) {
+            return;
+        }
+        if let Err(error) = self.request_capacity_reconcile() {
+            debug!(
+                error = %format!("{error:#}"),
+                "Could not queue a capacity pass after capacity was freed"
+            );
+        }
     }
 
     /// Queue the capacity pass ([`Self::reschedule_allocations_for_new_node`])
@@ -15403,6 +15913,9 @@ impl Store {
     /// convergence step, so no cross-op atomicity is needed.
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_new_node(&self) -> R<()> {
+        // Cleared before the scan: a plan in this pass (or racing it) that
+        // leaves replicas unplaced sets it again.
+        self.capacity_waiters.store(false, Ordering::Relaxed);
         let mut job_config_ids = self.job_configs_waiting_on_capacity()?;
         for job_config_id in self.job_config_ids_with_incomplete_rollouts()? {
             if !job_config_ids.contains(&job_config_id) {
@@ -15541,7 +16054,7 @@ impl Store {
             },
         )?;
         if updated == 0 {
-            bail!("signing key {kid} not found");
+            bail!(StorageError::not_found("signing key", kid));
         }
         Ok(())
     }
@@ -15671,7 +16184,7 @@ impl Store {
             params![current_alloc_id, now, instance_id],
         )?;
         if updated == 0 {
-            bail!("instance {instance_id} not found");
+            bail!(StorageError::not_found("instance", instance_id));
         }
         Ok(())
     }
@@ -15693,7 +16206,7 @@ impl Store {
             params![state.as_str(), now, instance_id],
         )?;
         if updated == 0 {
-            bail!("instance {instance_id} not found");
+            bail!(StorageError::not_found("instance", instance_id));
         }
         Ok(())
     }
@@ -21092,6 +21605,7 @@ mod tests {
             host_volumes: String::new(),
             resource_enforcement: String::new(),
             edge_boot: String::new(),
+            container: String::new(),
             name: "test".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -21111,6 +21625,22 @@ mod tests {
         assert_eq!(returned_config.name, worker_config.name);
         assert_eq!(returned_config.pool, worker_config.pool);
         assert_eq!(returned_config.heartbeat_seconds, Some(5));
+        assert_eq!(returned_config.container, "");
+
+        // The `container` payload (capability allowlist) round-trips, and
+        // an update replaces it.
+        let allowing = WorkerConfig {
+            container: r#"{"allowCaps":["CAP_NET_RAW"]}"#.into(),
+            ..worker_config.clone()
+        };
+        store.insert_worker_type(&allowing)?;
+        assert_eq!(
+            store.get_worker_type("test".to_string())?.container,
+            allowing.container
+        );
+        let listed = store.list_worker_types()?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].container, allowing.container);
         let val = returned_config
             .attributes
             .get("test")
@@ -21129,6 +21659,7 @@ mod tests {
             host_volumes: String::new(),
             resource_enforcement: String::new(),
             edge_boot: String::new(),
+            container: String::new(),
             name: "empty".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -24137,7 +24668,8 @@ mod tests {
     ) -> R<ResourcePool> {
         let mut stmt = tx.prepare(
             "SELECT a.id, a.resources FROM allocation a \
-             WHERE a.node_id = ?1 AND (?2 = 0 OR a.job_config_id NOT IN (\
+             WHERE a.node_id = ?1 AND a.status NOT IN ('complete', 'failed') \
+               AND (?2 = 0 OR a.job_config_id NOT IN (\
                  SELECT id FROM job_config WHERE job_id = \
                      (SELECT job_id FROM job_config WHERE id = ?3)));",
         )?;
@@ -26861,6 +27393,127 @@ mod tests {
         Ok(())
     }
 
+    /// P1-9: a removed allocation's job, task, and node are remembered for
+    /// `ALLOCATION_HISTORY_RETENTION_SECS`, so `legion job logs` can still
+    /// ask its node for the output after the row is gone.
+    #[test]
+    fn removed_allocations_are_remembered_for_job_logs() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_config_id = submit_job(&store, "logs-web", vec![TaskConfig::new("web", "noop")])?;
+        let task_id = task_id_for(&store, "web", "logs-web")?;
+        let first = store.place_alloc("node-a", task_id)?;
+        let second = store.place_alloc("node-a", task_id)?;
+
+        store.remove_allocation_by_id(first.id)?;
+        let gone = store.removed_allocations(Some("logs-web"), None, 10)?;
+        assert_eq!(gone.len(), 1, "{gone:?}");
+        assert_eq!(gone[0].allocation_id, first.id);
+        assert_eq!(gone[0].node_id, "node-a");
+        assert_eq!(gone[0].task_name, "web");
+        assert_eq!(gone[0].job_config_id, job_config_id);
+        assert_eq!(gone[0].status, "placed");
+        // By id; a live allocation is not history.
+        assert_eq!(store.removed_allocations(None, Some(first.id), 1)?.len(), 1);
+        assert!(store
+            .removed_allocations(None, Some(second.id), 1)?
+            .is_empty());
+
+        // A job stop removes the rest, newest first, with its cause.
+        store.remove_allocs_for_job("logs-web")?;
+        let gone = store.removed_allocations(Some("logs-web"), None, 10)?;
+        assert_eq!(
+            gone.iter().map(|g| g.allocation_id).collect::<Vec<_>>(),
+            vec![second.id, first.id]
+        );
+        assert_eq!(gone[0].cause, "stop");
+        assert_eq!(
+            store.removed_allocations(Some("logs-web"), None, 1)?.len(),
+            1
+        );
+
+        // Past the retention they are no longer offered.
+        store.write_connection()?.execute(
+            "UPDATE allocation_history SET removed_at_unix = removed_at_unix - ?1;",
+            [ALLOCATION_HISTORY_RETENTION_SECS + 1],
+        )?;
+        assert!(store
+            .removed_allocations(Some("logs-web"), None, 10)?
+            .is_empty());
+        Ok(())
+    }
+
+    /// P2-6: a fresh worker's first registration looks its node up and
+    /// misses. That is the expected answer, and must not be logged as an
+    /// ERROR on every fresh start (it is still recorded, at debug).
+    #[test]
+    fn a_missing_node_lookup_is_not_logged_as_an_error() -> R<()> {
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let store = setup_store()?;
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || Capture(sink.clone()))
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(store.get_node("never-registered").is_err());
+        });
+        let logged = String::from_utf8(buffer.lock().unwrap().clone())?;
+        assert!(!logged.contains("ERROR"), "{logged}");
+        assert!(logged.contains("node not found"), "{logged}");
+        Ok(())
+    }
+
+    /// P1-7: allocation ids are never reused — not after the newest
+    /// allocation is deleted, and not after the manager restarts (the
+    /// AUTOINCREMENT mark lives in the state DB file with the rows). A
+    /// reused id let a stale client id exec into a different job's task and
+    /// mixed two allocations' output in one worker log directory.
+    #[test]
+    fn allocation_ids_are_never_reused_after_removal_or_restart() -> R<()> {
+        let store_dir = Builder::new()
+            .prefix("khepri-store-ids-")
+            .tempdir()
+            .context("Error creating temp store directory")?
+            .keep();
+        let mut config = ManagerConfigFull {
+            store_path: store_dir.to_str().context("store path")?.to_string(),
+            ..Default::default()
+        };
+        config.encryption.root_key.path =
+            Some(crate::storage::keyring::test_support::shared_root_key_path());
+        let store = Store::start_storage(&config)?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        submit_job(&store, "ids", vec![TaskConfig::new("web", "noop")])?;
+        let task_id = task_id_for(&store, "web", "ids")?;
+        let a = store.place_alloc("node-a", task_id)?;
+        let b = store.place_alloc("node-a", task_id)?;
+        store.remove_allocation_by_id(b.id)?;
+        let c = store.place_alloc("node-a", task_id)?;
+        assert!(c.id > b.id, "deleting the newest must not free its id");
+        store.remove_allocs_for_job("ids")?;
+
+        // Restart: a second Store over the same state DB file.
+        drop(store);
+        let reopened = Store::start_storage(&config)?;
+        submit_job(&reopened, "ids-2", vec![TaskConfig::new("web", "noop")])?;
+        let task_id = task_id_for(&reopened, "web", "ids-2")?;
+        let d = reopened.place_alloc("node-a", task_id)?;
+        assert!(d.id > c.id && d.id > a.id, "a restart must not rewind ids");
+        Ok(())
+    }
+
     #[test]
     fn slot_binding_prefers_slot_with_no_live_allocation_in_job() -> R<()> {
         // Sequential-rollout shape: v1 holds slots 0..2; v2 must bind the
@@ -29284,9 +29937,7 @@ mod tests {
                 .map(|allocations| allocations.as_slice())
                 .unwrap_or(&[]);
             let rebuilt = NodeUsage::from_rows(
-                allocations
-                    .iter()
-                    .map(|allocation| (allocation.id, &allocation.resources)),
+                crate::resources::capacity_rows(allocations),
                 &store.resource_policy,
             )
             .with_context(|| format!("{label}: node {node_id} memo list failed to aggregate"))?;

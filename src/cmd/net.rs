@@ -183,6 +183,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 
 /// One check of a handler probe.
 #[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ProbeCheck {
     pub name: &'static str,
     pub ok: bool,
@@ -191,6 +192,7 @@ pub(crate) struct ProbeCheck {
 
 /// What `net handler test` found.
 #[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct HandlerProbe {
     pub kind: &'static str,
     pub target: String,
@@ -927,6 +929,7 @@ async fn test(matches: &ArgMatches) -> R<()> {
 
 /// One layer of the `doctor` walk.
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DoctorStep {
     layer: &'static str,
     status: &'static str,
