@@ -6050,7 +6050,12 @@ impl Manager for ManagerDaemonService {
                 // A running session needs no start; a suspended one resumes
                 // on its own node (docs/session-mode.md).
                 return match self
-                    .start_session_instance(&identity, &inner.instance_id, inner.cold)
+                    .start_session_instance(
+                        &identity,
+                        &inner.instance_id,
+                        inner.cold,
+                        inner.force_move,
+                    )
                     .await?
                 {
                     Some(reply) => Ok(Response::new(reply)),
@@ -12041,11 +12046,12 @@ pub(crate) fn desired_payload(
     let volumes =
         store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
     let mut payload = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
-    crate::manager::dispatcher::attach_session_task_spec(
+    let session_task = crate::manager::dispatcher::attach_session_task_spec(
         &mut payload,
         task,
         tasks.iter().map(|(id, task)| (*id, task)),
     )?;
+    crate::manager::dispatcher::attach_session_seal_keys(store, &mut payload, session_task);
     // The band orders the worker's memory pressure response. Read from the
     // read model, so building a payload pays no store read for it.
     payload.priority_band = store
@@ -13791,6 +13797,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..aws_identity_task("db")
         };
@@ -14059,6 +14066,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -17572,6 +17580,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new(name, "noop")
         }

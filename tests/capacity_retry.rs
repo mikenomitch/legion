@@ -79,6 +79,7 @@ impl Cluster {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             ..TaskConfig::new(TASK, "noop")
         };

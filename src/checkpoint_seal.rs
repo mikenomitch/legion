@@ -235,6 +235,138 @@ impl PartKeys {
     }
 }
 
+const SESSION_KEY_SALT: &[u8] = b"legion-session-seal-v1";
+
+/// The id of a job's session sealing key derived from checkpoint key
+/// `checkpoint_key_id`: recorded as the `keyId` of every part sealed under
+/// it.
+pub fn session_seal_key_id(checkpoint_key_id: &str, job_id: &str) -> String {
+    format!("{checkpoint_key_id}/session/{job_id}")
+}
+
+/// Derive a job's session sealing key from a checkpoint key (the manager
+/// side; session durability plan §6.6). An unpromoted `store` session
+/// publishes with no manager on the path, so its node derives part keys
+/// from this per-job key instead of receiving one per digest: the same
+/// HKDF step the manager uses for keyed parts, one level down.
+pub fn derive_session_seal_key(
+    checkpoint_key: &[u8],
+    checkpoint_key_id: &str,
+    job_id: &str,
+) -> R<crate::structs::SessionSealKey> {
+    if checkpoint_key.len() != KEY_BYTES {
+        bail!(
+            "checkpoint key {checkpoint_key_id} is {} bytes, expected {KEY_BYTES}",
+            checkpoint_key.len()
+        );
+    }
+    let secret = hkdf(SESSION_KEY_SALT, checkpoint_key, job_id.as_bytes())?;
+    Ok(crate::structs::SessionSealKey {
+        key_id: session_seal_key_id(checkpoint_key_id, job_id),
+        key: secret.to_vec(),
+    })
+}
+
+/// The session sealing keys a node holds for one job, the current one
+/// first. Its `Debug` never shows a key.
+#[derive(Clone, Default)]
+pub struct SessionSealKeys {
+    keys: Vec<(String, Zeroizing<[u8; KEY_BYTES]>)>,
+}
+
+impl std::fmt::Debug for SessionSealKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.keys.iter().map(|(id, _)| id))
+            .finish()
+    }
+}
+
+impl SessionSealKeys {
+    /// The keys an envelope payload carried. Malformed ones are skipped.
+    pub fn from_proto(keys: &[crate::structs::SessionSealKey]) -> Self {
+        let keys = keys
+            .iter()
+            .filter(|key| key.key.len() == KEY_BYTES && !key.key_id.is_empty())
+            .map(|key| {
+                let mut secret = Zeroizing::new([0u8; KEY_BYTES]);
+                secret.copy_from_slice(&key.key);
+                (key.key_id.clone(), secret)
+            })
+            .collect();
+        SessionSealKeys { keys }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The id of the key new parts are sealed under.
+    pub fn current_key_id(&self) -> Option<&str> {
+        self.keys.first().map(|(id, _)| id.as_str())
+    }
+
+    /// The part key to seal `digest` under: derived from the current key.
+    pub fn seal_key(&self, digest: &ContentDigest) -> R<PartKey> {
+        let (key_id, secret) = self.keys.first().context(
+            "this node holds no session sealing key for the job (its envelope payload carried \
+             none: the manager's keyring has no checkpoint key, or is locked)",
+        )?;
+        PartKey::derive(secret.as_ref(), key_id, digest)
+    }
+
+    /// The part key to open a part sealed under `key_id`.
+    pub fn open_key(&self, key_id: &str, digest: &ContentDigest) -> R<PartKey> {
+        let (_, secret) = self
+            .keys
+            .iter()
+            .find(|(id, _)| id == key_id)
+            .with_context(|| {
+                format!(
+                    "this node holds no session sealing key {key_id} (the checkpoint key it \
+                     derives from left the keyring, or the job's envelope payload has not \
+                     reached this node)"
+                )
+            })?;
+        PartKey::derive(secret.as_ref(), key_id, digest)
+    }
+
+    /// The part keys that open every published memory part of `manifest`,
+    /// in the shape a restore carries, with why any is missing.
+    pub fn part_keys_for(
+        &self,
+        manifest: &crate::structs::checkpoint::SnapshotManifest,
+    ) -> (Vec<CheckpointPartKey>, String) {
+        let mut keys = Vec::new();
+        let mut errors = Vec::new();
+        for part in &manifest.memory {
+            let Some(key_id) = part.key_id.as_deref() else {
+                continue;
+            };
+            match ContentDigest::parse(&part.digest)
+                .and_then(|digest| self.open_key(key_id, &digest))
+            {
+                Ok(key) => keys.push(key.to_proto()),
+                Err(err) => errors.push(format!("{err:#}")),
+            }
+        }
+        errors.sort();
+        errors.dedup();
+        (keys, errors.join("; "))
+    }
+
+    /// Back to the wire shape.
+    pub fn to_proto(&self) -> Vec<crate::structs::SessionSealKey> {
+        self.keys
+            .iter()
+            .map(|(key_id, secret)| crate::structs::SessionSealKey {
+                key_id: key_id.clone(),
+                key: secret.to_vec(),
+            })
+            .collect()
+    }
+}
+
 /// Why a sealed object could not be opened. Each one names what happened,
 /// so an operator can tell tampering from a plaintext leftover.
 #[derive(Debug, Clone, PartialEq, Eq)]

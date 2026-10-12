@@ -2536,6 +2536,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                fence_after: None,
             }),
             config: json!({"command": ["true"]}),
             ..TaskConfig::new("db", "exec")
@@ -2657,6 +2658,7 @@ mod tests {
                     storage: None,
                     envelope: None,
                     promote: None,
+                    fence_after: None,
                 }),
                 config: json!({"command": ["true"]}),
                 ..TaskConfig::new("sandbox", "exec")
