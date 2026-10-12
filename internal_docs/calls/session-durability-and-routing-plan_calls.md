@@ -28,7 +28,7 @@ $ legion session start agents --node https://10.0.1.7:4848 --ticket "$T" -j
 **Trade-off.** The highest-rate path needs a component Legion does not
 ship, configured by the platform. Admission is only exact per node: two
 pickers can race for a node's last slot and one is refused and hops.
-A leaked session ticket starts sessions until it expires (entry 5).
+A leaked session ticket starts sessions until it expires (entry 6).
 
 **Why (performance, then simplicity).** Every manager-routed start costs a
 manager some CPU and an mTLS call, so the rate is bounded by managers
@@ -114,7 +114,8 @@ stopped by a manager that sees both.
 **Trade-off.** Moves depend on the bucket supporting conditional writes
 (S3 does, with ETag preconditions; `file://` in tests). A bucket outage
 blocks moves (plan §6.7 row 12). In a full partition two copies still run
-until the stale one next touches the bucket or a manager.
+until the stale one next touches the bucket or a manager, or fences itself
+(entry 5 bounds it).
 
 **Why (performance, correctness).** (a) keeps the stale copy after a
 move, because it has the earlier lease. (b) adds a write or a manager to
@@ -122,7 +123,41 @@ the edge resume path for every move. The manifest is already the record
 of a `store` session and already lives in the bucket, so a conditional
 write there is the cheapest authority that exists.
 
-## 5. A session ticket names no instance, prefix, or job config, and is not spent per session
+## 5. No split brain: duplicates are prevented by conditional writes where possible, and converged by four overlapping mechanisms with a stated bound
+
+**Call.** Every way two copies of a session can exist is either prevented
+(a `store` idempotent start creates the manifest with `If-None-Match: *`;
+a move or resume claims a generation with `If-Match`) or converged: the
+stale copy fails its own next conditional write, its node reads a fence
+marker from the bucket every 30 s, managers sweep newly reported derived
+ids across peers once a second in one batched call, and a node cut off
+from both managers and the bucket for `stateful.fenceAfter` suspends its
+`store` sessions. The survivor is the higher generation, then the earlier
+lease, then the lower node id, so after a move the old copy always stops.
+
+**Alternatives.**
+- (a) Strict at-most-one for every session: a raft entry (or a per-session
+  bucket lease renewed by the node) before any copy runs.
+- (b) Converge only through managers' indexes, as #30 does today.
+- (c) Self-fence every session, `local` ones included, when a node loses
+  managers.
+
+**Trade-off.** Not at-most-one at every instant: in a full partition a
+stale copy can act on the outside world for up to `fenceAfter` (or one
+fence-list interval when it can reach the bucket). An idempotent `store`
+start pays one bucket write in its latency.
+
+**Why (correctness at no per-start raft cost).** (a) is keyed mode, and a
+bucket lease per session is a renewal per session per interval, millions
+of requests a minute at the target. (b) misses duplicates whose nodes
+report to different managers and never converges while managers are down.
+The four mechanisms each end a duplicate alone and each fails
+differently, so together they leave only the "cut off from everything"
+case, which self-fencing bounds. (c) would end `local` sessions during a
+manager outage although a `local` session can never have moved, trading
+availability for nothing. Promotion stays the answer for at-most-one.
+
+## 6. A session ticket names no instance, prefix, or job config, and is not spent per session
 
 **Call.** `legion boot-ticket create <job> --task <task> --scope session`
 mints a JWT that lets its holder start sessions of that task on nodes in
@@ -146,7 +181,7 @@ deploy. The envelope already bounds what any holder can start, so the
 ticket's blast radius is the envelope's, the same trade sandbox-scaling
 calls entry 30 accepted for prefix tickets.
 
-## 6. The node is in the session id
+## 7. The node is in the session id
 
 **Call.** A minted session id carries an 8-character keyed hash of its
 start node: `workspace-q4n7c2rd.7k2qd9x4m1b8c3rj5t0v6wye2h`. Any manager
@@ -168,7 +203,7 @@ manager. A collision or stale tag costs a probe, never a wrong answer,
 because the node answers for itself. (c) goes stale on every job update
 that replaces envelopes in place.
 
-## 7. Running sessions move only after a probe; idle ones move at once
+## 8. Running sessions move only after a probe; idle ones move at once
 
 **Call.** A resume of a running session on another node first probes the
 tagged node and asks it to stop. It moves without that only when the probe
@@ -186,7 +221,31 @@ running one on a picker's connect failure turns every picker-to-node blip
 into two live copies with real side effects. The probe from a second
 vantage point, plus the managers' view, narrows that to full partitions.
 
-## 8. The node's start path is fixed first, before edge starts
+## 9. Periodic checkpoints and checkpoint-on-stop are per-job options, off by default
+
+**Call.** `suspend.checkpointEvery` (optional) and `suspend.onWorkerStop
+= "keep" | "checkpoint"` (default `"keep"`) are set in the job. Periodic
+checkpoints are staggered, skipped rather than queued when a node falls
+behind, and published with a conditional write that doubles as a fence.
+
+**Alternatives.**
+- (a) Always checkpoint periodically for `store` sessions.
+- (b) Always checkpoint on worker stop.
+
+**Trade-off.** A job that sets neither loses a running `store` session's
+state since its last suspend if its node dies, and a worker stop whose
+processes do not survive (a `KillMode=control-group` unit, a host
+shutdown) ends `"keep"` sessions.
+
+**Why (performance, then simplicity).** Until diff snapshots, a periodic
+checkpoint is a full memory image per session per interval: at 10^5
+sessions of 512 MiB every 10 minutes that is about 90 GB/s of capture and
+upload cluster-wide, which only some workloads should pay. A checkpoint
+at stop delays every worker stop by up to its timeout. Both are the right
+call for some jobs and the wrong default for disposable ones, which are
+most sessions.
+
+## 10. The node's start path is fixed first, before edge starts
 
 **Call.** Phase 1 takes the runtime launch out from under the worker's
 single task-manager lock, stops the per-start fsync of the JSON state
@@ -207,7 +266,7 @@ starts a second per node for a 30 ms launch, and the target needs the
 per-node number. Phase 1 also speeds the manager-routed path, so it pays
 off on its own.
 
-## 9. Sessions still refuse network volumes, and a volume still means promotion
+## 11. Sessions still refuse network volumes, and a volume still means promotion
 
 **Call.** Session tasks keep refusing `volumes`. A session that needs a
 network volume is promoted (one raft entry), and the keyed path moves it
@@ -226,7 +285,7 @@ first, which is the durable record sessions give up. A session's own disk
 travels in its checkpoint under `durability = "store"`, which covers the
 common case.
 
-## 10. Session tasks may suspend with `durability = "local"`
+## 12. Session tasks may suspend with `durability = "local"`
 
 **Call.** Relax the submit refusal at `src/structs/session.rs:408`: a
 session may sleep on its node only, pinned until `suspend.keepFor`
@@ -247,7 +306,7 @@ A bucket is extra infrastructure and an upload per suspend; `store`
 stays available for platforms that want node-loss survival, and the
 `evicted` answer makes the loss explicit rather than silent.
 
-## 11. Edge idempotency is node-local, and derived ids stay untagged
+## 13. Edge idempotency is node-local, and derived ids stay untagged
 
 **Call.** An edge start with an idempotency key derives the untagged
 session id on the node and dedupes against the node's own claim table.
@@ -259,15 +318,16 @@ same node.
 - (b) Record keys centrally, which needs a manager or raft per start.
 
 **Trade-off.** Idempotent sessions keep the fan-out path for `get`/`stop`
-through a manager, and a retry that crosses a ring change briefly runs a
-second copy until convergence stops it.
+through a manager. A `local` retry that crosses a ring change briefly runs
+a second copy until the managers' sweep stops it; a `store` one is
+prevented by the manifest create (entry 5).
 
 **Why (simplicity).** A tag in a derived id would differ per node, so a
 retry on another node would start a differently named duplicate that
 nothing converges. Untagged, the id is the same everywhere, and the
 existing converge-to-one rule covers the rare cross-node retry.
 
-## 12. Phase 2 group-commits the session log instead of fsyncing each start
+## 14. Phase 2 group-commits the session log instead of fsyncing each start
 
 **Call.** `sessions.db` flushes every 50 ms, and a restarted worker also
 adopts live session processes the log missed.
@@ -281,4 +341,3 @@ anyway.
 **Why (performance).** The start path is the feature's whole point
 (about 2.5 ms p50 in sandbox-scaling §16.3); a per-start fsync would
 roughly double it on ordinary disks for no durability gain.
-

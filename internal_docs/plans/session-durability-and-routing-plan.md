@@ -493,6 +493,7 @@ starts and 50,000 ends a second across 2,000 nodes and three managers
 | Heartbeat ingest | `src/storage/session_index.rs:286` | ~100k deltas/s cluster-wide, ~33k/s per manager under one `RwLock` write | fine at the target (map updates); shard the lock by node if profiling shows contention | measure in 4 |
 | Full report size | `src/manager/daemon.rs:605` (tonic's 4 MiB default decode limit) | ~200 B a session, so about 20,000 sessions per node per full report | chunk full reports across beats, or raise the limit for heartbeats | 2 |
 | Index memory | `src/storage/session_index.rs` | ~300 B a session; 10^6 running is ~300 MB across managers | none needed | — |
+| Idempotent `store` starts | §6.7 | one conditional bucket `PUT` per idempotent start (tens of ms on S3), in the start's latency | random ids skip it; only callers that ask for idempotency pay | 5 |
 | Raft | none on the path | 0 entries per session | keep it so | — |
 | Ticket verification | `docs/edge-boot.md`, "Verification" | one ES256 verify a start, ~0.1 ms of node CPU | cache verified tickets by `jti` | 4 |
 | TLS from picker to node | worker port 4848 | a handshake per new connection | pickers keep connections pooled (HTTP/2); document it | 4 |
@@ -514,14 +515,47 @@ Session tasks may suspend. The jobspec surface is today's `suspend` block,
 with the session refusals at `src/structs/session.rs:404-420` relaxed:
 
 ```nickel
-stateful = { mode = "session", envelope = { resources = { cpu = 30000, memory = 61440 } } },
+stateful = {
+  mode = "session",
+  envelope = { resources = { cpu = 30000, memory = 61440 } },
+  fenceAfter = "2m",             # new: store sessions only (§6.7)
+},
 suspend = {
   checkpoint = "memory",
-  durability = "local",          # or "store": also publish, resume anywhere
+  durability = "store",          # or "local": kept on the node only
   idle = { after = "3m" },
   keepFor = "24h",               # new: how long a node holds a local-only checkpoint
+  checkpointEvery = "10m",       # new, optional: checkpoint running sessions periodically
+  onWorkerStop = "checkpoint",   # new: 'keep' (default) | 'checkpoint'
 },
 ```
+
+- **Periodic checkpoints (`checkpointEvery`, optional, off by default).**
+  The node checkpoints each running session on that interval without
+  stopping it (a pause for the capture, then the session continues) and,
+  with `durability = "store"`, publishes it with a conditional write on
+  the manifest's ETag. That write is also a fence: a copy whose
+  generation was superseded fails it and ends itself (§6.7). Checkpoints
+  are staggered across a node's sessions so a node never captures them
+  all at once, and a node whose checkpoint backlog exceeds one interval
+  skips rounds and reports `legion_session_checkpoints_skipped_total`
+  rather than falling further behind. With `"local"`, a periodic
+  checkpoint replaces the previous local one and only helps a worker
+  that crashed with its processes (row 15). Its cost until diff
+  snapshots land (sandbox-scaling Phase 8) is a full memory image per
+  interval per session, so the public doc gives the bytes-per-hour
+  arithmetic and the default stays off.
+- **Checkpoint on worker stop (`onWorkerStop`).** `"keep"` (the default)
+  relies on Phase 2: the processes outlive the worker and are re-adopted.
+  `"checkpoint"` makes a gracefully stopping worker (SIGTERM, `legion node
+  drain`, an upgrade) checkpoint every running session first, within
+  `edgeBoot.stopCheckpointTimeout` (worker config, default 60 s, sessions
+  in order of least recently checkpointed). Sessions keep running after
+  the checkpoint; the restarted worker re-adopts the ones whose process
+  survived and restores the rest from the checkpoint on the same node.
+  With `durability = "store"` the checkpoint is published, so a node that
+  never comes back still leaves the session resumable elsewhere (row 6).
+  A drain with `"checkpoint"` suspends the sessions instead of ending them.
 
 - **Suspend is decided and done on the node.** The node's idle policy (or
   `legion instance suspend <id>`, routed by tag) captures the checkpoint,
@@ -599,19 +633,65 @@ mark the node down or unreachable in `ListSessionNodes`, or the caller
 passes `--force-move`. This narrows row 8 below to partitions where
 neither the new node nor any manager can reach the old one.
 
-#### Fencing a moved session
+#### No split brain: every duplicate converges, and the old copy stops
 
-When two copies of one session id exist, the higher generation wins, then
-the earliest lease. A losing copy is stopped by whichever party sees both:
-the manager whose index holds both (heartbeat reply), a manager answering a
-read, or the losing node itself, whose next publish or suspend fails the
-conditional write and ends its copy with `superseded`. A session that
-cannot reach the bucket to suspend keeps running and keeps retrying. Its
-node's next heartbeat to a manager that indexes the newer copy stops it.
+Two live copies of one session id can arise in exactly three ways:
+two simultaneous idempotent starts (the derived id is the same on both
+nodes), a move while the old node was alive, and two racing resumes. The
+design closes each one, preventing it where a conditional write can and
+converging it with a stated bound everywhere else. The rule for which copy
+survives is the same everywhere: **the higher generation wins, then the
+earlier lease, then the lower node id.** After a move the old copy always
+has the lower generation, so the old copy is always the one that stops.
+This replaces sandbox-scaling's earliest-lease-wins rule, which keeps
+exactly the wrong copy after a move.
 
-This replaces sandbox-scaling's earliest-lease-wins rule for any session
-with a generation above 1, because "earliest" picks exactly the wrong copy
-after a move: the stale one.
+| Source of a duplicate | `durability = "store"` | `durability = "local"` |
+| --- | --- | --- |
+| Two simultaneous idempotent starts | **Prevented.** A derived-id start creates the session manifest with `If-None-Match: *` before its gate opens; the loser aborts and answers `ALREADY_EXISTS` with the winner's node. One bucket write per *idempotent* start; random ids cannot collide and skip it | **Converged** by the manager sweep (below), within one heartbeat plus one second once both nodes report |
+| A move while the old node lives | **Prevented** where anyone can reach the old node (probe-before-move); otherwise **converged** by the fence list or self-fencing (below) | Cannot happen: a `local` session never moves |
+| Two racing resumes | **Prevented.** The generation's conditional write lets one win | Cannot happen: a `local` resume runs only on its own node, under its claim table |
+
+Four mechanisms do the converging. Each one alone ends a duplicate; they
+overlap on purpose.
+
+1. **Conditional writes stop the stale copy on its own.** A copy whose
+   generation was superseded fails its next write to the manifest (a
+   periodic checkpoint, a suspend, or a checkpoint on worker stop) and
+   ends itself with `superseded`. With `checkpointEvery` set (§6.6), this
+   bounds a stale copy's life to one checkpoint interval whenever its node
+   can reach the bucket.
+2. **The fence list tells the old node directly.** A move writes a marker
+   to `<contentStore.url>/sessions/fence/<old-node>/<id>` (the generation
+   it superseded). Every node lists its own fence prefix every
+   `sessions.fenceListEvery` (worker config, default 30 s), stops any
+   listed session at or below the fenced generation, and deletes the
+   marker. One `LIST` per node per interval, so 2,000 nodes cost about 67
+   requests a second cluster-wide, whatever the session count.
+3. **Managers sweep for duplicates, batched.** Each manager collects the
+   derived ids newly reported to it and, once a second, asks its peers
+   about all of them in one `QuerySessions` call; any id held twice is
+   resolved by the rule above and the loser is stopped through its node's
+   next heartbeat reply. A full report re-checks every derived id on that
+   node. This costs O(managers) calls a second, not one per start, and it
+   is what converges `local` duplicates.
+4. **A node cut off from everything fences itself.** A node that has
+   reached neither a manager nor the bucket for `stateful.fenceAfter`
+   (default `2m`, session tasks with `durability = "store"` only) suspends
+   its running sessions locally and stops serving them, because a newer
+   generation may exist elsewhere that it cannot see. When it reconnects
+   it asks the bucket which generations it still owns and resumes those.
+   A `local` session never fences itself: it cannot have moved, so
+   keeping it running is always safe.
+
+**The bound.** Once the network heals, or after `fenceAfter` if it does
+not, at most one copy of any session id keeps running: within
+`max(fenceListEvery, one heartbeat + 1 s)` for a node that can reach the
+bucket or a manager, and within `fenceAfter` for one that can reach
+neither. During that window a stale copy may still act on the outside
+world. That window is the price of starting with no raft entry; a session
+that needs at-most-one *at every instant* is promoted, and the keyed path
+binds its single allocation through raft.
 
 #### The failure catalog
 
@@ -619,20 +699,21 @@ after a move: the stale one.
 | --- | --- | --- | --- | --- |
 | 1 | **Nodes added to the ring** | ~1/N of keys now hash to new nodes | Nothing. Existing sessions are routed by id tag, which did not change. New starts for moved keys land on new nodes | Cache locality for moved keys' *new* sessions, once |
 | 2 | **Nodes removed or draining** | The node leaves the ring (`accepting = false`) but stays in the tag map | Draining ends or suspends its sessions on its own schedule; resumes of its `store` sessions land elsewhere (row 5) | Nothing for `store`; running `local` sessions end at drain |
-| 3 | **Idempotent retry across a ring change** | The retry hashes to a different node | Both nodes derive the same untagged id; duplicates converge on heartbeat, earliest lease wins (generation 1 on both) | A few seconds of a second copy's CPU |
+| 3 | **Idempotent retry across a ring change**, or two simultaneous idempotent starts | The retry hashes to a different node | `store`: the manifest create lets one start win; the other aborts before its gate opens and returns the winner. `local`: both start; the manager sweep stops one within a heartbeat plus a second | `store`: nothing. `local`: seconds of a second copy |
 | 4 | **Picker routes by key instead of id** (a platform bug) | The node answers `NOT_FOUND` with `wrong_node` and the id's tag | Nothing to do; the hint says to route by the id | One extra hop |
 | 5 | **Node dies; session was idle with `durability = "store"`** | Connect to the tagged node fails, or the tag map shows it down | The picker (or a manager) sends a resume to any node in its ring. That node reads the manifest at its deterministic path from the id, claims generation g+1 by conditional write, fetches parts, restores, and answers with its own node | Nothing since the checkpoint |
-| 6 | **Node dies; session was running with `durability = "store"`** | Same as 5 | Same as 5, from the last published checkpoint | Everything since the last checkpoint. `suspend.checkpointEvery` (open question) narrows the window |
+| 6 | **Node dies; session was running with `durability = "store"`** | Same as 5 | Same as 5, from the newest published checkpoint: a periodic one (`checkpointEvery`), the one taken at worker stop (`onWorkerStop`), or the last suspend | Everything since that checkpoint |
 | 7 | **Node dies; `durability = "local"`** | Tagged node down | Managers answer `node lost` once the node is marked lost; the picker can answer the same from the tag map | The session |
-| 8 | **Node unreachable from the picker but alive** (a partial partition) | Same as 5 to the picker | An idle session moves at once (safe, above). A running one moves only after the new node's probe fails and managers mark the node down; if the new node or a manager can reach it, the old copy is stopped first. In a full partition, the old copy is fenced when it next suspends or when a manager sees both, and until then **two copies run** | Side effects from the stale copy during a full partition. Documented, not prevented: at-most-one needs promotion |
-| 9 | **Node returns after a move** | Its full report lists the stale copy | The index sees two copies, keeps the higher generation, and stops the old one in the heartbeat reply | Nothing more |
+| 8 | **Node unreachable from the picker but alive** (a partial partition) | Same as 5 to the picker | An idle session moves at once (safe, above). A running one moves only after the new node's probe fails and managers mark the node down; if the new node or a manager can reach it, the old copy is stopped first. Otherwise the old copy stops through the fence list, its next checkpoint, a manager, or self-fencing, whichever comes first | Side effects from the stale copy within the bound above |
+| 9 | **Node returns after a move** | Its fence list and its full report both name the stale copy | The node stops it on its first fence listing; a manager that sees both stops it in the heartbeat reply, whichever is first | Nothing more |
 | 10 | **Two resumes race** (two pickers, or a retry) | Both nodes start restoring | One conditional write wins; the loser aborts before the gate opens and answers `ABORTED` with the winner's node | Nothing |
 | 11 | **Resume to the same node finds its envelope full** | `RESOURCE_EXHAUSTED` | `store`: resume elsewhere (row 5). `local`: refused, retryable; the checkpoint stays put | Nothing |
-| 12 | **Bucket unavailable** | Suspends still succeed locally; moves fail | Parts stay pinned locally and publish retries; rows 5 and 6 fail with `UNAVAILABLE` until it is back | Nothing, unless the node also dies (then as row 7) |
-| 13 | **Managers unavailable** | Nothing on the edge path | Edge starts, routing by tag, and moves all work without a manager while tickets and the cached JWKS last. Managers rebuild their index from full reports when back | Listings and manager-routed calls during the outage |
+| 12 | **Bucket unavailable** | Suspends still succeed locally; moves and idempotent `store` starts fail | Parts stay pinned locally and publish retries; rows 5 and 6 fail with `UNAVAILABLE` until it is back. Nodes still reach managers, so nothing self-fences | Nothing, unless the node also dies (then as row 7) |
+| 13 | **Managers unavailable** | Nothing on the edge path | Edge starts, routing by tag, and moves all work without a manager while tickets and the cached JWKS last; the fence list still converges moves. `local` idempotent duplicates wait for the managers' sweep. Managers rebuild their index from full reports when back | Listings and manager-routed calls during the outage |
 | 14 | **Stale node list at the picker** | Connect timeouts or refusals | Picker hops to the next ring node, and refreshes | Latency |
-| 15 | **Worker restart** | A brief refusal window on that node | Phase 2 re-adopts running and sleeping sessions | Nothing |
+| 15 | **Worker restart or stop** | A brief refusal window on that node | With `onWorkerStop = "checkpoint"`, the stopping worker checkpoints every running session first. Phase 2 re-adopts the processes that outlived it and restores the rest from those checkpoints on the same node | Nothing; with `"keep"`, sessions whose process did not outlive the worker are lost |
 | 16 | **Platform loses its id → node cache** | Only the session id is left | The tag routes it; a stale tag after a move falls back to the manifest (it names the current node) or a manager lookup | One extra hop |
+| 17 | **A node is cut off from managers and the bucket** | Its sessions are unreachable | After `fenceAfter`, its `store` sessions suspend locally and stop serving; on reconnect it resumes only the generations the bucket says it still owns. `local` sessions keep running | `store`: the running state since the local suspend, if the session moved meanwhile |
 
 **Where the current node is written down after a move.** The tag goes
 stale after row 5. The session keeps its id (it is the session's name to
@@ -732,10 +813,18 @@ then, every session-sized write stays off raft.
   `force_move` skips the probe. Refusals gain `wrong_node` (with the id's
   tag) and `superseded` (with the winning generation and node). The
   session manifest gains `generation` and `node`.
-- **Worker config:** `edgeBoot.launchConcurrency` (default `2 × cores`)
-  and `edgeBoot.queueTimeout` (default `1s`).
+- **Worker config:** `edgeBoot.launchConcurrency` (default `2 × cores`),
+  `edgeBoot.queueTimeout` (default `1s`),
+  `edgeBoot.stopCheckpointTimeout` (default `60s`), and
+  `sessions.fenceListEvery` (default `30s`).
+- **Bucket layout:** `sessions/fence/<node>/<id>` markers beside the
+  session manifests; manifests are created with `If-None-Match: *` for
+  idempotent `store` starts and updated with `If-Match` thereafter.
 - **Jobspec:** `suspend.keepFor` (new, default `"24h"`, session tasks
-  only), in `configs/jobs/maximal.ncl`. `durability = "local"` becomes
+  only), `suspend.checkpointEvery` (new, optional, off by default),
+  `suspend.onWorkerStop` (new, `"keep"` | `"checkpoint"`, default
+  `"keep"`), and `stateful.fenceAfter` (new, default `"2m"`, session tasks
+  with `durability = "store"`), all in `configs/jobs/maximal.ncl`. `durability = "local"` becomes
   valid on session tasks.
 - **CLI:** `legion session nodes`, `legion session start|stop|get --node`
   (the edge forms, for testing and scripts), and `legion boot-ticket
@@ -766,8 +855,10 @@ then, every session-sized write stays off raft.
 5. **Sleeping on the node, and moving.** Session suspend (`local` and
    `store`), the node's idle policy for sessions, `keepFor` and eviction
    answers, resume by tag with manifest fallback, edge resume on any node,
-   generations with conditional manifest writes, probe-before-move, and
-   generation-first duplicate resolution (§6.7). Valuable alone: idle sessions stop
+   generations with conditional manifest writes, probe-before-move,
+   generation-first duplicate resolution, the fence list, the managers'
+   batched duplicate sweep, self-fencing, `checkpointEvery`, and
+   `onWorkerStop = "checkpoint"` (§6.6, §6.7). Valuable alone: idle sessions stop
    costing envelope room. Unblocks wake-on-request Phase 3.
 6. **Replicated directory (conditional, §6.8).** Only past its trigger.
 
@@ -802,7 +893,10 @@ then, every session-sized write stays off raft.
   and a `file://` bucket that honours conditional writes. Rows 5 to 10
   kill, partition (a node the test's picker cannot reach but managers can,
   and one nobody can), and revive nodes, and assert the surviving copy,
-  its generation, and that the stale copy is stopped. Ring changes (rows
+  its generation, and that the stale copy is stopped within the stated
+  bound. A property test drives random interleavings of starts, moves,
+  partitions, and heals against the four convergence mechanisms and
+  asserts that after healing, exactly one copy of every id runs. Ring changes (rows
   1 to 3) run against a reference ring in the test harness.
 - **Phase 5:** suspend and resume round trip on the same node (`exec`
   runtime with a test checkpoint; KVM memory checkpoints in the KVM suite);
@@ -825,11 +919,6 @@ and its "What you give up" table and Limitations change with each phase.
 
 ## 11. Open questions
 
-- **Periodic checkpoints for running `store` sessions**
-  (`suspend.checkpointEvery`, rows 6 and 8 of §6.7). Without them, a
-  running session that loses its node is lost back to its last suspend.
-  Lean: offer it once diff snapshots (sandbox-scaling Phase 8) make a
-  periodic checkpoint cheap, not before.
 - **Should Legion ship a picker?** A small `legion start edge-router`
   holding the ring would make the high-rate path work out of the box.
   Lean: no in this plan; publish the list and the refusal shape, and
@@ -864,4 +953,11 @@ and its "What you give up" table and Limitations change with each phase.
   disk; an evicted one answers `evicted`; a `store` session on a fenced
   node resumes elsewhere with no manager on the path; two racing resumes
   leave exactly one copy; a revived node's stale copy is stopped within
-  one heartbeat; zero raft entries for the whole cycle.
+  one heartbeat; two simultaneous idempotent starts leave one copy
+  (`store`: before either gate opens; `local`: within one heartbeat plus a
+  second); a node partitioned from managers and the bucket stops its
+  `store` sessions within `fenceAfter`; a `checkpointEvery` session whose
+  node dies resumes elsewhere from a checkpoint no older than the
+  interval; `onWorkerStop = "checkpoint"` leaves every running session
+  restorable after a worker stop whose processes did not survive; zero
+  raft entries for the whole cycle.
