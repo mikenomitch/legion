@@ -3543,6 +3543,14 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       is scheduled. Not caused by the plan-apply work — `src/worker/task_manager.rs`
       is untouched by it. Make the assertion independent of the child actually
       having started, or gate on an observed start.
+- [ ] **`simulated_fleet_feeds_the_worker_metric_registry` asserts a
+      process-global gauge.** `tests/worker_simulation.rs` checks
+      `simulated_nodes >= 4` while the binary's other tests run fleets of
+      their own, so another fleet shutting down can pull the gauge under 4.
+      Failed once in a full local run (2026-10-12, PR #31, which does not
+      touch the simulator) and passed three reruns. Its counters are
+      already asserted as deltas; read the gauge from this fleet, or
+      serialize the tests that run fleets.
 - [ ] **`acked_write_survives_any_single_node_loss` is bimodally flaky on
       small hosts.** Seen 2026-08-07 on a 4-core shared VM, debug build:
       either the whole test completes in ~1s or a round's survivors never
