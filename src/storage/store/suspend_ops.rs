@@ -15,13 +15,13 @@
 use super::*;
 use crate::structs::snapshot::{SnapshotPurpose, SnapshotRecord, SnapshotState};
 use crate::structs::suspend::{
-    InstanceColdBoot, InstanceSuspendState, OnRestoreFailure, ResolvedSuspend, PENDING_RESUME,
-    PENDING_SUSPEND, SUSPEND_REASON_MANUAL, SUSPEND_REASON_PRESSURE,
+    ArchiveMode, InstanceColdBoot, InstanceSuspendState, OnRestoreFailure, ResolvedSuspend,
+    PENDING_RESUME, PENDING_SUSPEND, SUSPEND_REASON_MANUAL, SUSPEND_REASON_PRESSURE,
 };
 
 const SUSPEND_COLUMNS: &str = "checkpoint_id, suspend_reason, suspended_at, pending_op, \
      restored_from_snapshot_id, last_suspend_ms, last_restore_ms, resume_requested_at, \
-     lifecycle_error, cold_boot";
+     lifecycle_error, cold_boot, manifest_url";
 
 /// Work [`Store::apply_snapshot_report`] finishes after its transaction
 /// commits: publish the staged stop event and refresh the allocation cache.
@@ -53,6 +53,28 @@ pub enum ResumeOutcome {
     /// The checkpoint cannot be used and `onRestoreFailure = "fail"`: the
     /// instance stays `suspended` with `reason` in its detail.
     RestoreUnavailable { reason: String },
+}
+
+/// What a resume of an archived instance read back from its archive
+/// manifest (see [`Store::resume_archived_instance`]).
+#[derive(Debug, Clone)]
+pub enum ArchivedCheckpoint {
+    /// The manifest was read: the snapshot row to put back.
+    Read(Box<SnapshotRecord>),
+    /// It could not be read (gone, unreadable, unreachable): why.
+    Unreadable(String),
+}
+
+/// A suspended instance archived as its checkpoint was published (see
+/// [`Store::archive_suspended_instance_tx`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedInstance {
+    pub instance_id: String,
+    pub job_id: String,
+    pub snapshot_id: String,
+    pub manifest_url: String,
+    /// `archive = "manifestOnly"`: the instance row went too.
+    pub row_deleted: bool,
 }
 
 /// A resume the sweep gave up on (see [`Store::settle_stalled_resumes`]).
@@ -98,6 +120,7 @@ fn suspend_state_from_row(
         cold_boot: row
             .get::<_, Option<String>>(at + 9)?
             .and_then(|raw| serde_json::from_str(&raw).ok()),
+        manifest_url: row.get(at + 10)?,
     })
 }
 
@@ -314,7 +337,8 @@ impl Store {
         // A stop or destroy ends the run a cold boot record describes.
         tx.execute(
             "UPDATE instance SET checkpoint_id = NULL, pending_op = NULL, \
-             resume_requested_at = NULL, cold_boot = NULL WHERE instance_id = ?1;",
+             resume_requested_at = NULL, cold_boot = NULL, manifest_url = NULL \
+             WHERE instance_id = ?1;",
             [instance_id],
         )?;
         Ok(())
@@ -735,22 +759,115 @@ impl Store {
     /// so the restore lands on the capacity it held.
     #[instrument(err, skip_all, fields(instance_id))]
     pub fn resume_suspended_instance(&self, instance_id: &str, cold: bool) -> R<ResumeOutcome> {
+        self.resume_archived_instance(instance_id, cold, None)
+    }
+
+    /// [`Store::resume_suspended_instance`] for an instance that may be
+    /// archived (`suspend.archive`): `archived` is what the caller read back
+    /// from its archive manifest. A manifest that was read puts the snapshot
+    /// row back in the same transaction that starts the resume, so the
+    /// resume costs no extra raft entry. One that could not be read is an
+    /// unusable checkpoint: `onRestoreFailure` decides between a cold boot
+    /// and staying suspended (and archived, so a later start can retry).
+    #[instrument(err, skip_all, fields(instance_id))]
+    pub fn resume_archived_instance(
+        &self,
+        instance_id: &str,
+        cold: bool,
+        archived: Option<ArchivedCheckpoint>,
+    ) -> R<ResumeOutcome> {
         let instance_id = instance_id.to_owned();
         let (outcome, allocations) =
             self.replicated(Lane::Scheduler, "resume_suspended_instance", move |s| {
-                s.resume_suspended_instance_apply(&instance_id, cold)
+                let mut conn = s.write_connection()?;
+                let tx = Self::write_tx(&mut conn)?;
+                let resumed =
+                    s.resume_suspended_instance_tx(&tx, &instance_id, cold, archived.as_ref())?;
+                tx.commit()?;
+                Ok(resumed)
             })?;
         self.cache_remove_allocations(&allocations)?;
         Ok(outcome)
     }
 
-    fn resume_suspended_instance_apply(
+    /// Resume an instance archived with `archive = "manifestOnly"`, which
+    /// has no row: put the instance row back from the manifest's envelope
+    /// (`suspended`, unnamed, archived at `manifest_url`) and resume it, in
+    /// one transaction. Refuses a manifest whose job is gone or was
+    /// re-created since it was written (NotFound). When the row already
+    /// exists, a concurrent start got there first, and this resumes it the
+    /// usual way.
+    #[instrument(err, skip_all, fields(instance_id = %manifest.envelope.instance_id))]
+    pub fn resume_manifest_only_instance(
         &self,
+        manifest: crate::structs::archive::ArchiveManifest,
+        manifest_url: &str,
+        cold: bool,
+    ) -> R<ResumeOutcome> {
+        let manifest_url = manifest_url.to_owned();
+        let (outcome, allocations) =
+            self.replicated(Lane::Scheduler, "resume_manifest_only_instance", move |s| {
+                let mut conn = s.write_connection()?;
+                let tx = Self::write_tx(&mut conn)?;
+                let envelope = &manifest.envelope;
+                // Read on the transaction, not a pooled read connection,
+                // which would deadlock on a store without a read pool.
+                let job_created_at = tx
+                    .query_row(&GET_JOB, [envelope.job_id.as_str()], |row| {
+                        s.job_from_row(row)
+                    })
+                    .optional()?
+                    .map(|job| job.created_at);
+                if job_created_at != Some(envelope.job_created_at) {
+                    bail!(StorageError::not_found("instance", &envelope.instance_id));
+                }
+                if !Self::instance_id_exists_tx(&tx, &envelope.instance_id)? {
+                    let now = Self::now_rfc3339()?;
+                    tx.execute(
+                        "INSERT INTO instance (instance_id, job_id, group_name, task_name, mode, \
+                         state, created_at, updated_at, named, checkpoint_id, suspend_reason, \
+                         suspended_at, last_suspend_ms, forked_from, identity_epoch, \
+                         manifest_url) \
+                         VALUES (?1, ?2, ?3, ?4, 'keyed', 'suspended', ?5, ?6, 0, ?7, ?8, ?9, \
+                         ?10, ?11, ?12, ?13);",
+                        params![
+                            envelope.instance_id,
+                            envelope.job_id,
+                            envelope.group,
+                            envelope.task,
+                            envelope.created_at,
+                            now,
+                            envelope.snapshot.snapshot_id,
+                            envelope.suspend_reason,
+                            envelope.suspended_at,
+                            envelope.last_suspend_ms,
+                            envelope.forked_from,
+                            envelope.identity_epoch as i64,
+                            manifest_url,
+                        ],
+                    )?;
+                }
+                let archived = ArchivedCheckpoint::Read(Box::new(manifest.snapshot_record()));
+                let resumed = s.resume_suspended_instance_tx(
+                    &tx,
+                    &envelope.instance_id,
+                    cold,
+                    Some(&archived),
+                )?;
+                tx.commit()?;
+                Ok(resumed)
+            })?;
+        self.cache_remove_allocations(&allocations)?;
+        Ok(outcome)
+    }
+
+    fn resume_suspended_instance_tx(
+        &self,
+        tx: &Connection,
         instance_id: &str,
         cold: bool,
+        archived: Option<&ArchivedCheckpoint>,
     ) -> R<(ResumeOutcome, Vec<Allocation>)> {
-        let mut conn = self.write_connection()?;
-        let tx = Self::write_tx(&mut conn)?;
         let row: Option<(String, String, String)> = tx
             .query_row(
                 "SELECT state, job_id, task_name FROM instance WHERE instance_id = ?1 \
@@ -769,13 +886,38 @@ impl Store {
                 ),
             });
         }
-        let suspend = Self::instance_suspend_state_on(&tx, instance_id)?;
-        let settings = Self::latest_suspend_settings_on(&tx, &job_id, &task_name);
+        let suspend = Self::instance_suspend_state_on(tx, instance_id)?;
+        let settings = Self::latest_suspend_settings_on(tx, &job_id, &task_name);
+        // An archived instance's snapshot row lives in its manifest: put it
+        // back from what the caller read, or say why it cannot be.
+        let archive_unusable = match (suspend.manifest_url.as_deref(), archived) {
+            (None, _) => None,
+            (Some(_), Some(ArchivedCheckpoint::Read(snapshot)))
+                if suspend.checkpoint_id.as_deref() == Some(snapshot.snapshot_id.as_str()) =>
+            {
+                Self::insert_snapshot_record_tx(tx, snapshot)?;
+                None
+            }
+            (Some(url), Some(ArchivedCheckpoint::Read(snapshot))) => Some(format!(
+                "archive manifest {url} holds checkpoint {}, not {}",
+                snapshot.snapshot_id,
+                suspend.checkpoint_id.as_deref().unwrap_or("-")
+            )),
+            (Some(url), Some(ArchivedCheckpoint::Unreadable(reason))) => Some(format!(
+                "checkpoint {} is archived and its manifest {url} could not be read ({reason})",
+                suspend.checkpoint_id.as_deref().unwrap_or("-")
+            )),
+            (Some(_), None) if cold => None,
+            (Some(url), None) => Some(format!(
+                "checkpoint {} is archived at {url}, and the manifest was not read",
+                suspend.checkpoint_id.as_deref().unwrap_or("-")
+            )),
+        };
         let snapshot = match suspend.checkpoint_id.as_deref() {
-            Some(id) => Self::get_snapshot_on(&tx, id)?,
+            Some(id) => Self::get_snapshot_on(tx, id)?,
             None => None,
         };
-        let unusable = match snapshot.as_ref() {
+        let unusable = archive_unusable.or_else(|| match snapshot.as_ref() {
             None => Some(format!(
                 "checkpoint {} no longer exists",
                 suspend.checkpoint_id.as_deref().unwrap_or("-")
@@ -791,7 +933,7 @@ impl Store {
                     .map(|error| format!(" ({error})"))
                     .unwrap_or_default()
             )),
-        };
+        });
         if !cold && settings.on_restore_failure == OnRestoreFailure::Fail {
             if let Some(reason) = unusable.as_ref() {
                 let reason =
@@ -800,26 +942,25 @@ impl Store {
                     "UPDATE instance SET lifecycle_error = ?2 WHERE instance_id = ?1;",
                     params![instance_id, reason],
                 )?;
-                tx.commit()?;
                 return Ok((ResumeOutcome::RestoreUnavailable { reason }, Vec::new()));
             }
         }
 
         // A held reservation goes now: the restore is placed on its node as
         // an ordinary allocation.
-        let held = self.instance_allocations_tx(&tx, instance_id)?;
+        let held = self.instance_allocations_tx(tx, instance_id)?;
         if !held.is_empty() {
             tx.execute(
                 "DELETE FROM allocation WHERE instance_id = ?;",
                 [instance_id],
             )?;
-            self.bump_epochs_for_allocations_tx(&tx, &held)?;
+            self.bump_epochs_for_allocations_tx(tx, &held)?;
         }
         let now = Self::now_rfc3339()?;
         let outcome = if cold || unusable.is_some() {
             let discarded = suspend.checkpoint_id.clone();
             if let Some(snapshot) = snapshot {
-                Self::discard_snapshot_tx(&tx, snapshot)?;
+                Self::discard_snapshot_tx(tx, snapshot)?;
             }
             let reason = (!cold).then(|| {
                 format!(
@@ -835,7 +976,7 @@ impl Store {
                 "UPDATE instance SET state = 'pending', current_alloc_id = NULL, \
                  checkpoint_id = NULL, pending_op = NULL, restore_from = NULL, \
                  resume_requested_at = NULL, lifecycle_error = ?2, updated_at = ?3, \
-                 cold_boot = ?4 WHERE instance_id = ?1;",
+                 cold_boot = ?4, manifest_url = NULL WHERE instance_id = ?1;",
                 params![instance_id, reason, now, cold_boot],
             )?;
             ResumeOutcome::Cold { reason, discarded }
@@ -844,8 +985,8 @@ impl Store {
             tx.execute(
                 "UPDATE instance SET state = 'pending', current_alloc_id = NULL, \
                  restore_from = ?2, pending_op = ?3, resume_requested_at = ?4, \
-                 lifecycle_error = NULL, cold_boot = NULL, updated_at = ?5 \
-                 WHERE instance_id = ?1;",
+                 lifecycle_error = NULL, cold_boot = NULL, updated_at = ?5, \
+                 manifest_url = NULL WHERE instance_id = ?1;",
                 params![
                     instance_id,
                     snapshot.snapshot_id,
@@ -866,9 +1007,126 @@ impl Store {
                 node_id,
             }
         };
-        tx.commit()?;
         info!(instance_id, outcome = ?outcome, "Resuming suspended instance");
         Ok((outcome, held))
+    }
+
+    /// Put an archived checkpoint's snapshot row back, inside the caller's
+    /// transaction. A row already there (a resume retried after its first
+    /// attempt put it back) is kept.
+    fn insert_snapshot_record_tx(tx: &Connection, snapshot: &SnapshotRecord) -> R<()> {
+        tx.execute(
+            "INSERT OR IGNORE INTO snapshot (snapshot_id, job_id, task_name, \
+             origin_instance_id, name, kind, purpose, state, node_id, allocation_id, \
+             manifest_json, total_bytes, duration_ms, error, created_at, expires_at, pause_ms, \
+             durability, published_at) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, \
+             ?15, ?16, ?17);",
+            params![
+                snapshot.snapshot_id,
+                snapshot.job_id,
+                snapshot.task_name,
+                snapshot.instance_id,
+                snapshot.kind.as_str(),
+                snapshot.purpose.as_str(),
+                snapshot.state.as_str(),
+                snapshot.node_id,
+                snapshot.allocation_id,
+                snapshot.manifest_json,
+                snapshot.total_bytes as i64,
+                snapshot.duration_ms as i64,
+                snapshot.created_at,
+                snapshot.expires_at,
+                snapshot.pause_ms as i64,
+                snapshot.durability.as_str(),
+                snapshot.published_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Archive a suspended instance whose checkpoint `snapshot` was just
+    /// published with an archive manifest at `manifest_url`, inside the
+    /// transaction that marks it published (docs/suspend-and-resume.md,
+    /// "Archived instances"). The snapshot row goes; the instance row keeps
+    /// its id and records the URL (`archive = "slim"`), or goes too for an
+    /// unnamed instance that owns no volume (`"manifestOnly"`). `None`, and
+    /// nothing changed, when the instance moved on since the publish was
+    /// asked for (resumed, stopped, destroyed), still holds capacity, or its
+    /// task no longer archives.
+    pub(crate) fn archive_suspended_instance_tx(
+        &self,
+        tx: &Connection,
+        snapshot: &SnapshotRecord,
+        manifest_url: &str,
+    ) -> R<Option<ArchivedInstance>> {
+        let Some(instance_id) = snapshot.instance_id.as_deref() else {
+            return Ok(None);
+        };
+        type Row = (
+            String,
+            String,
+            String,
+            bool,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let row: Option<Row> = tx
+            .query_row(
+                "SELECT job_id, task_name, state, named, storage_handle, checkpoint_id, \
+                 pending_op FROM instance WHERE instance_id = ?1 AND mode = 'keyed';",
+                [instance_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((job_id, task_name, state, named, storage_handle, checkpoint_id, pending_op)) =
+            row
+        else {
+            return Ok(None);
+        };
+        if state != "suspended"
+            || checkpoint_id.as_deref() != Some(snapshot.snapshot_id.as_str())
+            || pending_op.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(mode) = Self::latest_suspend_settings_on(tx, &job_id, &task_name).archive else {
+            return Ok(None);
+        };
+        if !self.instance_allocations_tx(tx, instance_id)?.is_empty() {
+            return Ok(None);
+        }
+        Self::remove_snapshot_row_tx(tx, &snapshot.snapshot_id)?;
+        let row_deleted = mode == ArchiveMode::ManifestOnly && !named && storage_handle.is_none();
+        if row_deleted {
+            tx.execute(
+                "DELETE FROM instance WHERE instance_id = ?1;",
+                [instance_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE instance SET manifest_url = ?2, updated_at = ?3 WHERE instance_id = ?1;",
+                params![instance_id, manifest_url, Self::now_rfc3339()?],
+            )?;
+        }
+        Ok(Some(ArchivedInstance {
+            instance_id: instance_id.to_string(),
+            job_id,
+            snapshot_id: snapshot.snapshot_id.clone(),
+            manifest_url: manifest_url.to_string(),
+            row_deleted,
+        }))
     }
 
     /// The resume sweep, run by the manager's maintenance loop: settle every

@@ -262,6 +262,10 @@ impl Store {
     /// The cluster CA, if one has been created.
     pub fn mesh_ca(&self) -> R<Option<MeshCa>> {
         let conn = self.read_connection()?;
+        Self::mesh_ca_on(&conn)
+    }
+
+    fn mesh_ca_on(conn: &rusqlite::Connection) -> R<Option<MeshCa>> {
         conn.query_row(
             "SELECT cert_pem, key_pem, created_at, previous_cert_pem, cross_cert_pem, rotated_at
              FROM net_mesh_ca WHERE id = 1;",
@@ -312,9 +316,9 @@ impl Store {
              VALUES (1, ?1, ?2, ?3);",
             params![candidate.cert_pem, candidate.key_pem, candidate.created_at],
         )?;
-        drop(conn);
-        self.mesh_ca()?
-            .ok_or_else(|| anyhow::anyhow!("mesh CA row missing after insert"))
+        // Read back on the write connection: inside a raft apply the insert
+        // is not committed yet, so a pooled read connection cannot see it.
+        Self::mesh_ca_on(&conn)?.ok_or_else(|| anyhow::anyhow!("mesh CA row missing after insert"))
     }
 
     /// Rotate the cluster CA (`legion net ca rotate`): generate a new CA,

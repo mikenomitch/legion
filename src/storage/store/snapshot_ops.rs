@@ -89,6 +89,11 @@ pub struct SnapshotReportRecord {
     /// records forwarded by an older manager.
     #[serde(default)]
     pub pause_ms: u64,
+    /// `publish`: the archive manifest the worker wrote, when the manager
+    /// asked for one (`suspend.archive`). Empty otherwise, and in records
+    /// forwarded by an older manager.
+    #[serde(default)]
+    pub manifest_url: String,
 }
 
 impl From<&crate::structs::SnapshotReport> for SnapshotReportRecord {
@@ -104,6 +109,7 @@ impl From<&crate::structs::SnapshotReport> for SnapshotReportRecord {
             allocation_id: report.allocation_id,
             local_suspension: report.local_suspension,
             pause_ms: report.pause_ms,
+            manifest_url: report.manifest_url.clone(),
         }
     }
 }
@@ -137,6 +143,9 @@ pub enum SnapshotReportOutcome {
         /// The forks of a spread fork, released for placement now that
         /// their checkpoint can restore on any node.
         released_forks: Vec<String>,
+        /// The suspended instance archived with the publish
+        /// (`suspend.archive`), whose snapshot row is gone now.
+        archived: Option<ArchivedInstance>,
     },
     /// A publish failed. The row stays `local` with `error` set. With
     /// `retrying` the manager re-sends the publish after a backoff;
@@ -684,11 +693,21 @@ impl Store {
                     } else {
                         Vec::new()
                     };
+                    // A suspend checkpoint published with an archive
+                    // manifest archives its instance in this same entry.
+                    let archived = if snapshot.purpose == SnapshotPurpose::Suspend
+                        && !report.manifest_url.is_empty()
+                    {
+                        self.archive_suspended_instance_tx(&tx, &snapshot, &report.manifest_url)?
+                    } else {
+                        None
+                    };
                     SnapshotReportOutcome::Published {
                         snapshot,
                         uploaded_bytes: report.total_bytes,
                         duration_ms: report.duration_ms,
                         released_forks,
+                        archived,
                     }
                 } else {
                     // Retried by re-sending `op = publish` after a backoff: a
@@ -1215,6 +1234,7 @@ mod tests {
                 "bucket said 503".into()
             },
             manifest_json: "{}".into(),
+            manifest_url: String::new(),
             duration_ms: 1,
             total_bytes: 1,
             allocation_id: 7,

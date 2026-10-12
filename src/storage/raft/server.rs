@@ -341,4 +341,26 @@ impl RaftTransport for RaftTransportService {
                 .map(|interval| interval.as_secs() as u32),
         }))
     }
+
+    /// This manager's session index, for a peer answering an instance RPC
+    /// about sessions (docs/session-mode.md). Every member answers, leader
+    /// or not: each indexes the nodes that heartbeat to it.
+    async fn query_sessions(
+        &self,
+        request: Request<crate::structs::QuerySessionsRequest>,
+    ) -> Result<Response<crate::structs::QuerySessionsReply>, Status> {
+        let registry = self.authenticate(&request)?;
+        let store = registry.forward_store.clone().ok_or_else(|| {
+            Status::unimplemented("session queries are not available on this manager")
+        })?;
+        let request = request.into_inner();
+        if request.session_id.is_empty() == request.job_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "set exactly one of session_id and job_id",
+            ));
+        }
+        Ok(Response::new(
+            store.sessions().query(&request, std::time::Instant::now()),
+        ))
+    }
 }

@@ -305,7 +305,54 @@ pub enum BeginOutcome {
     /// cancelled launch). Nothing to do: if the manager still wants it once
     /// that settles, the next heartbeat's reconcile launches it.
     InFlight,
+    /// The allocation is a promoted session this node already runs
+    /// (`TaskAllocation.promoted_from_session`): the session was adopted as
+    /// the allocation in place, and nothing was started.
+    Adopted,
 }
+
+/// Why a node refused a session (docs/session-mode.md). The worker's
+/// `PostWork` maps these to the gRPC codes the manager's session router acts
+/// on: it tries the next node for either.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionRefusal {
+    /// The node runs no envelope for the session's job and task.
+    NoEnvelope { job_id: String, task_name: String },
+    /// The envelope has no room left for the session.
+    EnvelopeFull {
+        resource: String,
+        free: f64,
+        needs: f64,
+    },
+}
+
+impl std::fmt::Display for SessionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionRefusal::NoEnvelope { job_id, task_name } => write!(
+                f,
+                "node holds no envelope for {job_id}/{task_name}; sessions start only on nodes \
+                 running the task's envelope"
+            ),
+            SessionRefusal::EnvelopeFull {
+                resource,
+                free,
+                needs,
+            } => write!(
+                f,
+                "envelope full: {free} {resource} free, the session needs {needs}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionRefusal {}
+
+/// How long a session may outlive its envelope on the node before it is
+/// ended. Covers a job update replacing the envelope (stop, then start, in
+/// one reconcile, unless a slow-stopping neighbour holds the start back); a
+/// job stop ends its sessions after this.
+pub const SESSION_ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A launch whose slow half (volume mounts, the runtime's `prepare` and
 /// `start`, which for some runtimes pulls an image) runs with the
@@ -514,6 +561,9 @@ pub struct WorkerTaskManager {
     /// done, reports owed to the manager, and allocations starting from a
     /// snapshot (see `crate::worker::checkpoints`).
     checkpoints: crate::worker::checkpoints::CheckpointState,
+    /// Sessions whose envelope is gone from this node, by claim id, with
+    /// when that was first seen. Ended after [`SESSION_ORPHAN_GRACE`].
+    orphaned_sessions: HashMap<String, std::time::Instant>,
 }
 
 impl Default for WorkerTaskManager {
@@ -586,6 +636,7 @@ impl WorkerTaskManager {
             cancelled_launches: std::collections::HashSet::new(),
             next_launch_generation: 0,
             checkpoints: Default::default(),
+            orphaned_sessions: HashMap::new(),
         }
     }
 
@@ -2918,7 +2969,11 @@ impl WorkerTaskManager {
         }
 
         self.ledger.release_hold(claim_id);
-        self.ledger.commit(local_key, &claim.resources);
+        // A promoted session stays inside its envelope, whose allocation
+        // already holds the room it uses.
+        if !claim.is_session() {
+            self.ledger.commit(local_key, &claim.resources);
+        }
         let ratified = self
             .claims
             .ratify(claim_id, allocation_id)
@@ -2948,14 +3003,26 @@ impl WorkerTaskManager {
     pub fn kill_claim(&mut self, claim_id: &str, reason: &str) -> Option<ClaimRecord> {
         let claim = self.claims.remove(claim_id)?;
         self.ledger.release_hold(claim_id);
-        warn!(
-            claim_id,
-            local_key = claim.local_key,
-            instance_id = %claim.instance_id,
-            gate = %claim.gate,
-            reason,
-            "Killing provisional allocation"
-        );
+        self.orphaned_sessions.remove(claim_id);
+        if claim.is_session() {
+            // Ending a session is routine (a stop, a refused start, a
+            // duplicate), not a failure.
+            info!(
+                session_id = %claim.instance_id,
+                local_key = claim.local_key,
+                reason,
+                "Ending session"
+            );
+        } else {
+            warn!(
+                claim_id,
+                local_key = claim.local_key,
+                instance_id = %claim.instance_id,
+                gate = %claim.gate,
+                reason,
+                "Killing provisional allocation"
+            );
+        }
         let graceful = claim.on_refused == OnRefused::Stop;
         let stopped = if graceful {
             self.stop_allocation(claim.local_key)
@@ -3002,6 +3069,186 @@ impl WorkerTaskManager {
         self.claims.instance_is_claimed(instance_id)
     }
 
+    // ---------------------------------------------------------------------
+    // Sessions (docs/session-mode.md)
+    // ---------------------------------------------------------------------
+
+    /// The envelope this node runs for a session task: its local key and its
+    /// task config. The newest when a job update briefly leaves two.
+    fn envelope_for(&self, job_id: &str, task_name: &str) -> Option<(i64, &TaskConfig)> {
+        self.task_configs
+            .iter()
+            .filter(|(local, task)| {
+                crate::structs::session::envelope_serves(task) == Some(task_name)
+                    && self.instances.contains_key(local)
+                    && self
+                        .allocations
+                        .get(local)
+                        .is_some_and(|allocation| allocation.job_id == job_id)
+            })
+            .max_by_key(|(local, _)| **local)
+            .map(|(local, task)| (*local, task))
+    }
+
+    /// What a task's live sessions on this node use, promoted ones included:
+    /// a promoted session still runs inside the envelope until it stops.
+    fn session_usage(
+        &self,
+        job_id: &str,
+        task_name: &str,
+    ) -> std::collections::BTreeMap<String, f64> {
+        let mut used = std::collections::BTreeMap::new();
+        for claim in self.claims.sessions() {
+            if claim.job_id != job_id || claim.task_name != task_name {
+                continue;
+            }
+            if claim.is_ratified() && !self.instances.contains_key(&claim.local_key) {
+                continue;
+            }
+            for (name, amount) in crate::structs::session::resource_amounts(&claim.resources) {
+                *used.entry(name).or_insert(0.0) += amount;
+            }
+        }
+        used
+    }
+
+    /// Admit a session into its task's envelope on this node.
+    ///
+    /// The envelope's resources are the room; the node's free capacity is
+    /// not consulted, because the envelope allocation already reserved it.
+    /// A refusal is a [`SessionRefusal`] and holds nothing. Returns the
+    /// registered claim; the caller launches it with
+    /// [`launch_provisional_allocation`].
+    pub fn admit_session(&mut self, record: ClaimRecord) -> R<ClaimRecord> {
+        let Some((_, envelope)) = self.envelope_for(&record.job_id, &record.task_name) else {
+            return Err(SessionRefusal::NoEnvelope {
+                job_id: record.job_id.clone(),
+                task_name: record.task_name.clone(),
+            }
+            .into());
+        };
+        let room = crate::structs::session::resource_amounts(&envelope.resources);
+        let used = self.session_usage(&record.job_id, &record.task_name);
+        for (name, needs) in crate::structs::session::resource_amounts(&record.resources) {
+            // A resource the envelope does not size is not limited by it.
+            let Some(capacity) = room.get(&name) else {
+                continue;
+            };
+            let free = capacity - used.get(&name).copied().unwrap_or(0.0);
+            if needs > free + 1e-9 {
+                return Err(SessionRefusal::EnvelopeFull {
+                    resource: name,
+                    free: free.max(0.0),
+                    needs,
+                }
+                .into());
+            }
+        }
+        self.claims.insert(record)
+    }
+
+    /// The sessions this node runs, for the heartbeat's session report.
+    ///
+    /// Settles what ended first: a session whose workload is gone (it
+    /// exited, or a stop finished) is forgotten, and one whose envelope has
+    /// been gone for [`SESSION_ORPHAN_GRACE`] is ended. Promoted sessions are
+    /// allocations and are not listed.
+    pub fn session_statuses(&mut self) -> Vec<crate::structs::SessionStatus> {
+        self.settle_sessions(std::time::Instant::now());
+        self.claims
+            .sessions()
+            .into_iter()
+            .filter(|claim| !claim.is_ratified())
+            .map(|claim| {
+                let envelope = self
+                    .envelope_for(&claim.job_id, &claim.task_name)
+                    .and_then(|(local, _)| self.external_id(local))
+                    .unwrap_or(0);
+                crate::structs::SessionStatus {
+                    session_id: claim.instance_id.clone(),
+                    job_id: claim.job_id.clone(),
+                    job_config_id: claim.job_config_id.clone(),
+                    task_name: claim.task_name.clone(),
+                    envelope_allocation_id: envelope,
+                    state: match claim.stage {
+                        ClaimStage::Serving | ClaimStage::Booted => "running",
+                        _ => "starting",
+                    }
+                    .to_string(),
+                    lease_issued_at_unix_ms: claim
+                        .session
+                        .map(|session| session.lease_issued_at_unix_ms)
+                        .unwrap_or_default(),
+                    resources: claim.resources.to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn settle_sessions(&mut self, now: std::time::Instant) {
+        for claim in self.claims.sessions() {
+            let local = claim.local_key;
+            if claim.is_ratified() {
+                // Promoted: an allocation now, which the normal paths own.
+                // Forgotten once it has stopped, so the envelope gets its
+                // room back.
+                if !self.instances.contains_key(&local)
+                    && !self.terminating.contains_key(&local)
+                    && !self.draining.contains_key(&local)
+                {
+                    self.claims.remove(&claim.claim_id);
+                }
+                continue;
+            }
+            let started = claim.stage != ClaimStage::Claimed;
+            if started
+                && !self.instances.contains_key(&local)
+                && !self.launching.contains_key(&local)
+            {
+                // The workload exited, or its stop finished. Nothing to
+                // report to the manager as a failed allocation: it never had
+                // one.
+                self.claims.remove(&claim.claim_id);
+                self.orphaned_sessions.remove(&claim.claim_id);
+                self.failed.retain(|failure| failure.allocation_id != local);
+                self.terminated_reports
+                    .retain(|report| report.allocation_id != local);
+                self.allocation_health.remove(&local);
+                info!(session_id = %claim.instance_id, "Session ended");
+                continue;
+            }
+            if self.envelope_for(&claim.job_id, &claim.task_name).is_some() {
+                self.orphaned_sessions.remove(&claim.claim_id);
+                continue;
+            }
+            let since = *self
+                .orphaned_sessions
+                .entry(claim.claim_id.clone())
+                .or_insert(now);
+            if now.duration_since(since) >= SESSION_ORPHAN_GRACE {
+                self.kill_claim(&claim.claim_id, "its envelope left the node");
+            }
+        }
+    }
+
+    /// End sessions by id. Ids this node does not run as sessions (or that
+    /// were promoted, and are allocations now) are ignored. Returns the ids
+    /// it ended.
+    pub fn stop_sessions(&mut self, session_ids: &[String], reason: &str) -> Vec<String> {
+        let mut stopped = Vec::new();
+        for session_id in session_ids {
+            let claim_id = crate::structs::session::session_claim_id(session_id);
+            let is_session = self
+                .claims
+                .get(&claim_id)
+                .is_some_and(|claim| claim.is_session() && !claim.is_ratified());
+            if is_session && self.kill_claim(&claim_id, reason).is_some() {
+                stopped.push(session_id.clone());
+            }
+        }
+        stopped
+    }
+
     /// Entry point for a new allocation from the manager. Tasks without
     /// artifacts start synchronously; artifact-bearing tasks are registered
     /// as `staging artifacts` and return a [`StagingJob`] the caller runs on
@@ -3022,6 +3269,25 @@ impl WorkerTaskManager {
         allocation: &TaskAllocation,
         gate: Gate,
     ) -> R<BeginOutcome> {
+        // A promoted session this node runs becomes the allocation in place
+        // (docs/session-mode.md, "Promotion"). Every delivery path reaches
+        // here, so a push, a desired set, and the work stream all adopt.
+        if !allocation.promoted_from_session.is_empty() {
+            let claim_id =
+                crate::structs::session::session_claim_id(&allocation.promoted_from_session);
+            let adoptable = self.claims.get(&claim_id).is_some_and(|claim| {
+                claim.is_session() && !claim.is_ratified() && claim.job_id == allocation.job_id
+            });
+            if adoptable {
+                self.ratify_claim(&claim_id, allocation)?;
+                info!(
+                    allocation_id = allocation.allocation_id,
+                    session_id = %allocation.promoted_from_session,
+                    "Adopted promoted session"
+                );
+                return Ok(BeginOutcome::Adopted);
+            }
+        }
         let (alloc, task) = task_from_allocation(allocation)?;
         // A duplicate dispatch (heartbeat and push racing) of an allocation
         // whose launch is still in its runtime call. Launching it again would
@@ -3664,7 +3930,7 @@ impl WorkerTaskManager {
         let persisted = self.state_store.load()?;
         let mut active = Vec::new();
         let mut restored = Vec::new();
-        let mut restored_claims: Vec<(i64, i64, TaskConfig)> = Vec::new();
+        let mut restored_claims: Vec<(i64, i64, TaskConfig, String, bool)> = Vec::new();
         let mut resumed_stops = Vec::new();
 
         for mut record in persisted {
@@ -3792,7 +4058,13 @@ impl WorkerTaskManager {
             // would report nothing for an allocation the cluster believes is
             // running, and the manager would replace a live task.
             if let Some(external_id) = record.external_id {
-                restored_claims.push((record.allocation.id, external_id, record.task.clone()));
+                restored_claims.push((
+                    record.allocation.id,
+                    external_id,
+                    record.task.clone(),
+                    record.allocation.job_id.clone(),
+                    record.in_envelope,
+                ));
             }
             active.push(record.clone());
             restored.push((record.allocation, record.task));
@@ -3802,8 +4074,8 @@ impl WorkerTaskManager {
         // aliases, so a claim admitted after the restart cannot be handed a
         // key a running allocation is still using.
         self.claims
-            .reserve_below(restored_claims.iter().map(|(local, _, _)| *local));
-        for (local_key, external_id, task) in restored_claims {
+            .reserve_below(restored_claims.iter().map(|(local, ..)| *local));
+        for (local_key, external_id, task, job_id, in_envelope) in restored_claims {
             let record = ClaimRecord {
                 claim_id: format!("clm_restored_{}", external_id),
                 local_key,
@@ -3811,7 +4083,7 @@ impl WorkerTaskManager {
                 stage: ClaimStage::Serving,
                 lease_deadline: std::time::Instant::now(),
                 lease_deadline_unix: 0,
-                job_id: String::new(),
+                job_id,
                 job_config_id: String::new(),
                 task_name: task.name.clone(),
                 instance_id: String::new(),
@@ -3820,6 +4092,10 @@ impl WorkerTaskManager {
                 on_refused: OnRefused::Kill,
                 ticket_jti: String::new(),
                 allocation_id: Some(external_id),
+                // A promoted session keeps counting against its envelope.
+                session: in_envelope.then_some(crate::worker::claims::SessionClaim {
+                    lease_issued_at_unix_ms: 0,
+                }),
             };
             if let Err(err) = self.claims.insert(record) {
                 warn!(external_id, error = ?err, "Failed to restore provisional allocation alias");
@@ -3893,6 +4169,7 @@ impl WorkerTaskManager {
                 // else without a pid is worth a warning.
                 if self.artifact_status.snapshot(*allocation_id).is_none()
                     && !self.launching.contains_key(allocation_id)
+                    && task.runtime != crate::structs::session::ENVELOPE_RUNTIME
                 {
                     warn!(
                         allocation_id = allocation_id,
@@ -3924,6 +4201,10 @@ impl WorkerTaskManager {
                     .claims
                     .by_local_key(*allocation_id)
                     .and_then(|claim| claim.allocation_id),
+                in_envelope: self
+                    .claims
+                    .by_local_key(*allocation_id)
+                    .is_some_and(|claim| claim.is_session()),
                 stopping: None,
             });
         }
@@ -3969,6 +4250,7 @@ impl WorkerTaskManager {
                     .cloned()
                     .unwrap_or_default(),
                 external_id: None,
+                in_envelope: false,
                 stopping: Some(stop),
             });
         }
@@ -4193,7 +4475,7 @@ pub fn launch_task_allocation(
             }
             Ok(())
         }
-        BeginOutcome::Staged(_) | BeginOutcome::InFlight => Ok(()),
+        BeginOutcome::Staged(_) | BeginOutcome::InFlight | BeginOutcome::Adopted => Ok(()),
         BeginOutcome::Staging(job) => {
             spawn_staging_thread(manager.clone(), *job);
             Ok(())
@@ -4292,9 +4574,10 @@ pub fn launch_provisional_allocation(
                 .set_claim_stage(claim_id, ClaimStage::Staged);
             Ok(())
         }
-        // Neither is produced for a claim: its local key is fresh per
-        // admission (no duplicate), and claims keep the locked launch path.
-        BeginOutcome::InFlight | BeginOutcome::Launching(_) => {
+        // None is produced for a claim: its local key is fresh per
+        // admission (no duplicate), claims keep the locked launch path, and
+        // a provisional payload is never a promotion.
+        BeginOutcome::InFlight | BeginOutcome::Launching(_) | BeginOutcome::Adopted => {
             bail!("provisional start {claim_id} took the unlocked launch path")
         }
         BeginOutcome::Staging(job) => {
@@ -4728,6 +5011,7 @@ mod tests {
             task_suspend: String::new(),
             task_snapshots: String::new(),
             identity_epoch: 0,
+            promoted_from_session: String::new(),
             task_lifecycle: String::new(),
             task_restart: String::new(),
         }
@@ -5783,6 +6067,7 @@ mod tests {
             on_refused: OnRefused::Kill,
             ticket_jti: String::new(),
             allocation_id: None,
+            session: None,
         }
     }
 
@@ -5936,6 +6221,165 @@ mod tests {
         assert!(manager.drain_terminations().is_empty());
         assert!(manager.allocation_health_snapshot().is_empty());
         assert!(manager.unratified_claims().is_empty());
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Sessions (docs/session-mode.md)
+    // -----------------------------------------------------------------
+
+    /// A session task's envelope allocation: room for two 500 MHz / 256 MiB
+    /// sessions.
+    fn envelope_payload(allocation_id: i64) -> TaskAllocation {
+        TaskAllocation {
+            allocation_id,
+            task_config_id: 8,
+            task_name: "workspace-envelope".into(),
+            task_runtime: crate::structs::session::ENVELOPE_RUNTIME.into(),
+            task_config: "{}".into(),
+            task_resources: json!({ "cpu": 1000, "memory": 512 }).to_string(),
+            ..provisional_payload(allocation_id)
+        }
+    }
+
+    fn session_record(session_id: &str) -> ClaimRecord {
+        ClaimRecord {
+            claim_id: crate::structs::session::session_claim_id(session_id),
+            gate: Gate::Serve,
+            origin: "manager".into(),
+            on_refused: OnRefused::Stop,
+            resources: json!({ "cpu": 500, "memory": 256 }),
+            session: Some(crate::worker::claims::SessionClaim {
+                lease_issued_at_unix_ms: 1_000,
+            }),
+            ..claim_record("", session_id, Gate::Serve)
+        }
+    }
+
+    /// Admit and launch a session the way `edge::admit_and_launch` does.
+    fn start_session(manager: &mut WorkerTaskManager, session_id: &str) -> R<ClaimRecord> {
+        let admitted = manager.admit_session(session_record(session_id))?;
+        let mut payload = provisional_payload(admitted.local_key);
+        payload.task_resources = admitted.resources.to_string();
+        manager.begin_task_allocation_gated(&payload, Gate::Serve)?;
+        manager.set_claim_stage(&admitted.claim_id, ClaimStage::Serving);
+        Ok(admitted)
+    }
+
+    fn refusal(err: anyhow::Error) -> SessionRefusal {
+        err.downcast::<SessionRefusal>()
+            .expect("a typed session refusal")
+    }
+
+    #[test]
+    fn sessions_fill_the_envelope_and_not_the_node_ledger_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        // A node ledger with no room at all: sessions never consult it.
+        manager.configure_ledger(LocalLedger::new(&json!({ "memory": 0 }), &json!({}), None));
+        let refused = manager
+            .admit_session(session_record("workspace-a"))
+            .expect_err("no envelope yet");
+        assert!(matches!(
+            refusal(refused),
+            SessionRefusal::NoEnvelope { .. }
+        ));
+
+        manager.begin_task_allocation(&envelope_payload(100))?;
+        start_session(&mut manager, "workspace-a")?;
+        start_session(&mut manager, "workspace-b")?;
+        let full = manager
+            .admit_session(session_record("workspace-c"))
+            .expect_err("two fill the envelope");
+        match refusal(full) {
+            SessionRefusal::EnvelopeFull {
+                resource, needs, ..
+            } => {
+                assert_eq!(resource, "cpu");
+                assert_eq!(needs, 500.0);
+            }
+            other => panic!("expected EnvelopeFull, got {other}"),
+        }
+
+        let statuses = manager.session_statuses();
+        let ids: Vec<&str> = statuses.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["workspace-a", "workspace-b"]);
+        assert!(statuses.iter().all(|s| s.state == "running"));
+        assert!(statuses.iter().all(|s| s.envelope_allocation_id == 100));
+        assert!(statuses.iter().all(|s| s.lease_issued_at_unix_ms == 1_000));
+        // Never reported as allocations, and never reconciled away.
+        assert_eq!(manager.allocations_snapshot(), vec![100]);
+        manager.reconcile_allocations(&[envelope_payload(100)]);
+        assert_eq!(manager.session_statuses().len(), 2);
+
+        // Ending one gives its room back.
+        assert_eq!(
+            manager.stop_sessions(&["workspace-a".into(), "workspace-z".into()], "stop"),
+            vec!["workspace-a".to_string()]
+        );
+        start_session(&mut manager, "workspace-c")?;
+        manager.stop_sessions(&["workspace-b".into(), "workspace-c".into()], "stop");
+        Ok(())
+    }
+
+    #[test]
+    fn a_promoted_session_is_adopted_in_place_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.begin_task_allocation(&envelope_payload(100))?;
+        let session = start_session(&mut manager, "workspace-a")?;
+
+        let mut promoted = provisional_payload(9001);
+        promoted.task_resources = "{}".into();
+        promoted.promoted_from_session = "workspace-a".into();
+        let outcome = manager.begin_task_allocation(&promoted)?;
+        assert!(matches!(outcome, BeginOutcome::Adopted), "nothing restarts");
+        assert!(manager.is_allocation_active(session.local_key));
+        assert_eq!(manager.local_key(9001), session.local_key);
+        let mut allocations = manager.allocations_snapshot();
+        allocations.sort();
+        assert_eq!(allocations, vec![100, 9001]);
+        assert!(
+            manager.session_statuses().is_empty(),
+            "a promoted session is an allocation, not a session"
+        );
+        // A stop for the session id no longer reaches it.
+        assert!(manager
+            .stop_sessions(&["workspace-a".into()], "stop")
+            .is_empty());
+        // It still holds its share of the envelope until it stops.
+        assert!(manager.admit_session(session_record("workspace-b")).is_ok());
+        let full = manager
+            .admit_session(session_record("workspace-c"))
+            .expect_err("the promoted session still uses its room");
+        assert!(matches!(refusal(full), SessionRefusal::EnvelopeFull { .. }));
+
+        manager.reconcile_allocations(&[]);
+        assert!(!manager.is_allocation_active(session.local_key));
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_outliving_its_envelope_ends_after_the_grace_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.begin_task_allocation(&envelope_payload(100))?;
+        let session = start_session(&mut manager, "workspace-a")?;
+
+        // The job stopped: the envelope is no longer desired. The session,
+        // unknown to the desired set, is not reconciled away.
+        manager.reconcile_allocations(&[]);
+        assert!(manager.is_allocation_active(session.local_key));
+        let now = std::time::Instant::now();
+        manager.settle_sessions(now);
+        assert!(
+            manager.is_allocation_active(session.local_key),
+            "within the grace"
+        );
+        manager.settle_sessions(now + SESSION_ORPHAN_GRACE + Duration::from_secs(1));
+        assert!(!manager.is_allocation_active(session.local_key));
+        assert!(manager.session_statuses().is_empty());
+        assert!(manager.drain_failures().is_empty());
         Ok(())
     }
 
@@ -7240,6 +7684,7 @@ mod tests {
                     BeginOutcome::Staged(..) => "staged",
                     BeginOutcome::Launching(..) => "launching",
                     BeginOutcome::InFlight => "in flight",
+                    BeginOutcome::Adopted => "adopted",
                     BeginOutcome::Staging(..) => unreachable!(),
                 }
             ),
@@ -7543,6 +7988,7 @@ mod tests {
             self_terminate_after_secs: None,
             volumes: Vec::new(),
             external_id: None,
+            in_envelope: false,
             resource_assignment: None,
             stopping: None,
         };

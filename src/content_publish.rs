@@ -98,6 +98,12 @@ pub trait ContentPublisher: Send + Sync {
     /// upload them. Fails with [`PublishSourceMismatch`] (and publishes
     /// nothing) when they do not. Blocking: call from a blocking thread.
     fn publish_sealed(&self, key: &PartKey, path: &Path) -> R<PublishedContent>;
+
+    /// Write a small document (an archive manifest) at `object_name`,
+    /// relative to the store's root rather than under the sealed-object
+    /// prefix, replacing any earlier one, and return its URL. Readers never
+    /// see a partial document. Blocking: call from a blocking thread.
+    fn put_document(&self, object_name: &str, bytes: &[u8]) -> R<String>;
 }
 
 /// Worker config `contentStore.auth`. Absent means the node's ambient
@@ -213,6 +219,23 @@ impl FileContentPublisher {
     }
 }
 
+/// Write `bytes` to `dest` atomically: beside it, then renamed over it.
+fn write_file_atomically(dest: &Path, bytes: &[u8]) -> R<()> {
+    let dir = dest.parent().context("document path has no parent")?;
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document");
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow!(err).context(format!("publish to {}", dest.display())));
+    }
+    Ok(())
+}
+
 impl ContentPublisher for FileContentPublisher {
     fn url_for(&self, object_name: &str) -> String {
         let path = self.path_for(object_name);
@@ -271,6 +294,14 @@ impl ContentPublisher for FileContentPublisher {
         fs::rename(&tmp, &dest).with_context(|| format!("publish to {}", dest.display()))?;
         Ok(published(true))
     }
+
+    fn put_document(&self, object_name: &str, bytes: &[u8]) -> R<String> {
+        let dest = self.root.join(object_name);
+        write_file_atomically(&dest, bytes)?;
+        Ok(Url::from_file_path(&dest)
+            .map(|url| url.to_string())
+            .unwrap_or_else(|_| format!("file://{}", dest.display())))
+    }
 }
 
 /// Publishes to an S3-compatible bucket. The URL takes the same `region` and
@@ -302,12 +333,6 @@ impl S3ContentPublisher {
     }
 
     fn client(&self) -> R<object_store::aws::AmazonS3> {
-        let bucket = self
-            .url
-            .host_str()
-            .context("contentStore.url has no bucket")?;
-        let mut region: Option<String> = None;
-        let mut endpoint: Option<String> = None;
         let credential = match self.kv.as_deref() {
             Some(path) => Some(
                 self.credentials
@@ -316,50 +341,95 @@ impl S3ContentPublisher {
             ),
             None => None,
         };
-        if let Some(Credential::Aws {
-            region: r,
-            endpoint: e,
+        s3_client(&self.url, credential)
+    }
+}
+
+/// An S3 client for the bucket an `s3://bucket/prefix?region=…&endpoint=…`
+/// URL names. The URL's `region` and `endpoint` win over the credential's;
+/// with no credential the client uses the ambient chain (the AWS_*
+/// variables, web identity, then the instance profile). Shared by the
+/// worker's publisher and the manager's archive reads.
+pub fn s3_client(url: &Url, credential: Option<Credential>) -> R<object_store::aws::AmazonS3> {
+    let bucket = url.host_str().context("contentStore.url has no bucket")?;
+    let mut region: Option<String> = None;
+    let mut endpoint: Option<String> = None;
+    if let Some(Credential::Aws {
+        region: r,
+        endpoint: e,
+        ..
+    }) = &credential
+    {
+        region = r.clone();
+        endpoint = e.clone();
+    }
+    for (name, value) in url.query_pairs() {
+        match name.as_ref() {
+            "region" => region = Some(value.into_owned()),
+            "endpoint" => endpoint = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    // `from_env` is the ambient chain: AWS_* variables, then the instance
+    // profile, when no explicit keys are set below.
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    if let Some(region) = region {
+        builder = builder.with_region(region);
+    }
+    if let Some(endpoint) = endpoint {
+        let allow_http = endpoint.starts_with("http://");
+        builder = builder.with_endpoint(endpoint).with_allow_http(allow_http);
+    }
+    match credential {
+        Some(Credential::Aws {
+            access_key_id,
+            secret_access_key,
+            session_token,
             ..
-        }) = &credential
-        {
-            region = r.clone();
-            endpoint = e.clone();
-        }
-        for (name, value) in self.url.query_pairs() {
-            match name.as_ref() {
-                "region" => region = Some(value.into_owned()),
-                "endpoint" => endpoint = Some(value.into_owned()),
-                _ => {}
+        }) => {
+            builder = builder
+                .with_access_key_id(access_key_id)
+                .with_secret_access_key(secret_access_key);
+            if let Some(token) = session_token {
+                builder = builder.with_token(token);
             }
         }
-        // `from_env` is the ambient chain: AWS_* variables, then the instance
-        // profile, when no explicit keys are set below.
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-        if let Some(region) = region {
-            builder = builder.with_region(region);
+        Some(other) => bail!("contentStore needs an aws credential, got {other:?}"),
+        None => {}
+    }
+    builder.build().context("build s3 client for contentStore")
+}
+
+/// The object key of `object_name` under an `s3://bucket/prefix` URL's
+/// prefix.
+pub fn s3_key(url: &Url, object_name: &str) -> String {
+    let prefix = url.path().trim_matches('/');
+    if prefix.is_empty() {
+        object_name.to_string()
+    } else {
+        format!("{prefix}/{object_name}")
+    }
+}
+
+/// The URL of `object_name` under a `contentStore.url` root, keeping an
+/// `s3://` root's query (`region`, `endpoint`) so readers reach the same
+/// endpoint.
+pub fn document_url(root: &Url, object_name: &str) -> String {
+    match root.scheme() {
+        "file" => {
+            let path = root
+                .to_file_path()
+                .map(|path| path.join(object_name))
+                .unwrap_or_else(|_| PathBuf::from(object_name));
+            Url::from_file_path(&path)
+                .map(|url| url.to_string())
+                .unwrap_or_else(|_| format!("file://{}", path.display()))
         }
-        if let Some(endpoint) = endpoint {
-            let allow_http = endpoint.starts_with("http://");
-            builder = builder.with_endpoint(endpoint).with_allow_http(allow_http);
+        _ => {
+            let mut url = root.clone();
+            url.set_path(&format!("/{}", s3_key(root, object_name)));
+            url.to_string()
         }
-        match credential {
-            Some(Credential::Aws {
-                access_key_id,
-                secret_access_key,
-                session_token,
-                ..
-            }) => {
-                builder = builder
-                    .with_access_key_id(access_key_id)
-                    .with_secret_access_key(secret_access_key);
-                if let Some(token) = session_token {
-                    builder = builder.with_token(token);
-                }
-            }
-            Some(other) => bail!("contentStore needs an aws credential, got {other:?}"),
-            None => {}
-        }
-        builder.build().context("build s3 client for contentStore")
     }
 }
 
@@ -443,6 +513,22 @@ impl ContentPublisher for S3ContentPublisher {
             uploaded,
         })
     }
+
+    fn put_document(&self, object_name: &str, bytes: &[u8]) -> R<String> {
+        let client = self.client()?;
+        let object = ObjectPath::from(s3_key(&self.url, object_name));
+        let url = document_url(&self.url, object_name);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build content publish runtime")?;
+        // A single PUT replaces the object atomically: readers see the old
+        // document or the new one, never a mix.
+        runtime
+            .block_on(client.put(&object, bytes.to_vec().into()))
+            .with_context(|| format!("write {url}"))?;
+        Ok(url)
+    }
 }
 
 /// The node-side publishing service: the node content store plus the
@@ -462,6 +548,12 @@ impl std::fmt::Debug for ContentPublishing {
 impl ContentPublishing {
     pub fn new(store: Arc<ContentStore>, publisher: Arc<dyn ContentPublisher>) -> Self {
         Self { store, publisher }
+    }
+
+    /// Write a document beside the published content (see
+    /// [`ContentPublisher::put_document`]).
+    pub fn put_document(&self, object_name: &str, bytes: &[u8]) -> R<String> {
+        self.publisher.put_document(object_name, bytes)
     }
 
     pub fn store(&self) -> &Arc<ContentStore> {

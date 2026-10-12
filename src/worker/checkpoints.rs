@@ -146,6 +146,7 @@ impl CheckpointState {
             allocation_id,
             local_suspension: false,
             pause_ms: 0,
+            manifest_url: String::new(),
         };
         self.restore_outcomes.insert(allocation_id, report.clone());
         self.outbox.push(report);
@@ -231,6 +232,7 @@ pub fn run_capture(
         allocation_id: request.allocation_id,
         local_suspension: false,
         pause_ms: 0,
+        manifest_url: String::new(),
     };
     match outcome {
         Ok((manifest, pause_ms)) => {
@@ -456,6 +458,7 @@ pub fn run_local_suspension(
                 // A suspend kills the guest after the capture, so there is
                 // no running workload whose pause matters.
                 pause_ms: 0,
+                manifest_url: String::new(),
             };
             info!(
                 snapshot_id = %request.snapshot_id,
@@ -646,6 +649,7 @@ pub fn run_delete(
         allocation_id: 0,
         local_suspension: false,
         pause_ms: 0,
+        manifest_url: String::new(),
     }
 }
 
@@ -663,7 +667,13 @@ pub fn run_publish(
 ) -> SnapshotReport {
     let started = Instant::now();
     let publishing = manager.lock().expect("task manager").content_publishing();
-    let outcome = publish(publishing.as_deref(), request);
+    // The archive manifest goes last, and before the pins are released: a
+    // failed write fails the publish, and the retry finds the parts still
+    // pinned here.
+    let outcome = publish(publishing.as_deref(), request).and_then(|(manifest, uploaded)| {
+        let manifest_url = write_archive_manifest(publishing.as_deref(), request, &manifest)?;
+        Ok((manifest, uploaded, manifest_url))
+    });
     if outcome.is_ok() {
         release_published_pins(publishing.as_deref(), &request.snapshot_id);
     }
@@ -678,12 +688,14 @@ pub fn run_publish(
         allocation_id: 0,
         local_suspension: false,
         pause_ms: 0,
+        manifest_url: String::new(),
     };
     match outcome {
-        Ok((manifest, uploaded)) => {
+        Ok((manifest, uploaded, manifest_url)) => {
             report.ok = true;
             report.total_bytes = uploaded;
             report.manifest_json = serde_json::to_string(&manifest).unwrap_or_default();
+            report.manifest_url = manifest_url.unwrap_or_default();
             info!(
                 snapshot_id = %request.snapshot_id,
                 parts = manifest.memory.len(),
@@ -702,6 +714,35 @@ pub fn run_publish(
         }
     }
     report
+}
+
+/// Write the archive manifest the manager asked for with the publish
+/// (`CheckpointRequest.manifest_object`): the envelope it sent, beside the
+/// manifest just published (docs/suspend-and-resume.md, "Archived
+/// instances"). `None` when it asked for none.
+fn write_archive_manifest(
+    publishing: Option<&crate::content_publish::ContentPublishing>,
+    request: &CheckpointRequest,
+    manifest: &SnapshotManifest,
+) -> R<Option<String>> {
+    if request.manifest_object.trim().is_empty() {
+        return Ok(None);
+    }
+    let publishing = publishing.context("this worker has no contentStore configured")?;
+    let document = crate::structs::archive::ArchiveManifest::render(
+        &request.manifest_envelope,
+        &serde_json::to_string(manifest)?,
+    )?;
+    let url = publishing
+        .put_document(&request.manifest_object, &document)
+        .with_context(|| {
+            format!(
+                "writing the archive manifest of snapshot {}",
+                request.snapshot_id
+            )
+        })?;
+    debug!(snapshot_id = %request.snapshot_id, url = %url, "Archive manifest written");
+    Ok(Some(url))
 }
 
 /// Unpin a published snapshot's parts on this node, keeping the bytes. They
@@ -840,6 +881,7 @@ pub fn run_warm(
         allocation_id: 0,
         local_suspension: false,
         pause_ms: 0,
+        manifest_url: String::new(),
     };
     match outcome {
         Ok(fetched) => {
@@ -957,6 +999,7 @@ pub fn run_request(manager: &Arc<Mutex<WorkerTaskManager>>, request: &Checkpoint
             allocation_id: request.allocation_id,
             local_suspension: false,
             pause_ms: 0,
+            manifest_url: String::new(),
         },
     };
     manager

@@ -60,8 +60,8 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_job_validate` | no | Validate a rendered jobspec (JSON). |
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
-| `legion_instance_list` | no | List a job's stateful instances (slot + keyed). |
-| `legion_instance_get` | no | Inspect one stateful instance, including a live unratified claim when one exists ([edge-boot.md](edge-boot.md)). |
+| `legion_instance_list` | no | List a job's stateful instances (slot + keyed), then its running [sessions](session-mode.md) (`mode: "session"`, `durable: false`) from the session index. The reply is `{ instances, nextIdlePageToken, complete, asOf }`: `complete: false` means some node that runs the job's sessions has not reported yet, so sessions may be missing. `include_idle: true` also lists instances [archived](suspend-and-resume.md#archiving-idle-instances) with `manifestOnly`, which have no row, from the bucket a page at a time (`idle_page_token`, `idle_page_size`); page until the token is empty, since a page can come back short. |
+| `legion_instance_get` | no | Inspect one stateful instance, including a live unratified claim when one exists ([edge-boot.md](edge-boot.md)), or a running session by its id. |
 | `legion_volume_list` | no | List volumes, the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
 | `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |
 | `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Use it to find out why a job was rejected for plugin X. |
@@ -105,8 +105,9 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key`). |
 | `legion_template_upsert` | **yes** | Store Nickel as the next immutable version of a template. |
 | `legion_template_delete` | **yes** | Delete a template and all of its versions (running jobs are unaffected). |
-| `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id, supports `idempotency_key`). `from_snapshot` restores the new instance(s) from a snapshot of the job (an id or a name), on the snapshot's node, at most 64 per call. Needs `snapshot:read` too. |
-| `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, and drop its storage (supports `idempotency_key`). |
+| `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id, supports `idempotency_key`). `from_snapshot` restores the new instance(s) from a snapshot of the job (an id or a name), on the snapshot's node, at most 64 per call. Needs `snapshot:read` too. On a [session task](session-mode.md), omitting `instance_id` starts an unnamed session with no raft write: the reply has `mode: "session"`, `durable: false`, and `nodeId`. Always pass `idempotency_key` there: the session id is derived from it, so a retry finds the same session. |
+| `legion_instance_promote` | **yes** | [Promote](session-mode.md#promotion) a running session to a keyed instance in place (one raft entry, nothing restarts), keeping its id or naming it with `new_id`. A repeat reports the same instance with `deduplicated: true`. Supports `idempotency_key`. |
+| `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, and drop its storage (supports `idempotency_key`). On a running session it ends the session, the same as `legion_instance_stop`. |
 | `legion_instance_suspend` | **yes** | [Suspend](suspend-and-resume.md) a keyed instance: its node checkpoints it (`checkpoint = "memory"` or `"disk"`, default the best it can take), stops it, and frees its reservation. Returns at once, so poll `legion_instance_get` until `state` is `suspended`, or until `pendingOp` clears with the reason in `detail` (a failed capture leaves the instance running). A memory checkpoint needs `snapshot:write`. Supports `idempotency_key`. |
 | `legion_instance_start` | **yes** | Start a stopped keyed instance, or resume a suspended one from its checkpoint (`cold = true` boots fresh instead). Returns at once with `resumingFrom`. Poll `legion_instance_get` until `state` is `active` with no `pendingOp`, or read `instance.resumed` / `instance.restore_failed`. Then check `coldBoot`: when set, the restore failed and the instance booted fresh on its volume (`onRestoreFailure = "cold"`), so its running processes are gone. Supports `idempotency_key`. |
 | `legion_instance_fork` | **yes** | [Fork](suspend-and-resume.md#fork) a running keyed instance into `count` new instances (`<id>-f<n>`), each with its own cloned volume and identity, on the origin's node, or with `spread: true` each on its own node from a published checkpoint. The origin keeps running. Returns the fork ids at once. Poll `legion_snapshot_get` on the returned `snapshot` until `local` (forks being placed, or `published` for a spread fork) or `failed` (origin unaffected, forks terminated). Needs `job:write` and `snapshot:write`. Supports `idempotency_key`, and a retry returns the same forks. |
@@ -435,6 +436,14 @@ message with `deduplicated: true`. Known limitation: the other mutating RPCs
 (`job stop`, `job destroy`, `job scale`, the `instance` verbs) still report
 `deduplicated: false` to both sides of such a race. Sequential retries, the main
 use for the key, work correctly on all of them.
+
+[Sessions](session-mode.md) keep no record. A create on a session task with
+a key derives the session id from it, so a retry on any manager finds the
+running session and answers `deduplicated: true`, with no 24-hour limit while
+the session runs. Stopping or destroying a session records nothing either: a
+repeat on the manager that ended it, within ten minutes, answers "already
+ended", and a repeat elsewhere answers `NOT_FOUND`, which a retrying agent
+should read as done.
 
 ## 6. Closing the loop: waiting for convergence
 

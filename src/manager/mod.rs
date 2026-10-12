@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod archive;
 pub mod auth_method;
 pub mod blocked;
 pub mod bootstrap_token;
@@ -18,6 +19,7 @@ pub mod rollout;
 pub mod rollout_strategy;
 pub mod scheduler;
 pub mod server;
+pub mod sessions;
 pub mod telemetry;
 pub mod usage;
 pub mod worker_plane;

@@ -202,7 +202,8 @@ pub fn catalog() -> Vec<Capability> {
             name: "instance.list",
             cli: "legion instance list <JOB>",
             grpc: Some("Manager/ListInstances"),
-            summary: "List a job's stateful instances (slot and keyed, incl. tombstones).",
+            summary: "List a job's stateful instances (slot and keyed, incl. tombstones), then \
+                 its running sessions from the session index, with `complete` and `asOf`.",
             mutates: false,
             read_only_safe: true,
         },
@@ -219,7 +220,9 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion instance create <JOB> [--id <KEY>] [--from-snapshot <NAME|ID>]",
             grpc: Some("Manager/CreateInstance"),
             summary: "Create a keyed-mode instance (never-recycled id), optionally restored from \
-                 a snapshot of the job (needs snapshot:read). Supports --idempotency-key.",
+                 a snapshot of the job (needs snapshot:read). On a session task without --id, \
+                 start an unnamed session with no raft write (durable false). Supports \
+                 --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },
@@ -280,6 +283,16 @@ pub fn catalog() -> Vec<Capability> {
             grpc: Some("Manager/DestroyInstance"),
             summary:
                 "Destroy a keyed-mode instance and drop its storage. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "instance.promote",
+            cli: "legion instance promote <SESSION> [--id <KEY>]",
+            grpc: Some("Manager/PromoteInstance"),
+            summary: "Turn a running session into a keyed instance in place (one raft entry; \
+                 nothing restarts), keeping its id or naming it with --id. Supports \
+                 --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },

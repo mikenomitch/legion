@@ -72,6 +72,8 @@ fn sandbox_task() -> TaskConfig {
             initial_instances: None,
             on_lost: None,
             storage: None,
+            envelope: None,
+            promote: None,
         }),
         speculative_start: Some(legion::structs::edge_boot::SpeculativeStartConfig {
             mode: Some("boot".into()),

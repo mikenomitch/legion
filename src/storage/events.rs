@@ -1630,6 +1630,59 @@ pub mod drafts {
         )
     }
 
+    /// `instance.archived` — a suspended instance's checkpoint was
+    /// published and its snapshot row moved to an archive manifest in the
+    /// `contentStore` (`suspend.archive`).
+    pub fn instance_archived(archived: &crate::storage::store::ArchivedInstance) -> EventDraft {
+        EventDraft::info(
+            "instance.archived",
+            format!(
+                "Instance {} archived its checkpoint {} to {}{}",
+                archived.instance_id,
+                archived.snapshot_id,
+                archived.manifest_url,
+                if archived.row_deleted {
+                    " and keeps no row (manifestOnly)"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .job(&archived.job_id)
+        .meta(json!({
+            "instanceId": archived.instance_id,
+            "snapshotId": archived.snapshot_id,
+            "manifestUrl": archived.manifest_url,
+            "manifestOnly": archived.row_deleted,
+        }))
+    }
+
+    /// `instance.promoted` — a running session became a keyed instance
+    /// (PromoteInstance, docs/session-mode.md). The node adopts the session
+    /// as `allocation_id` in place.
+    pub fn instance_promoted(
+        job_id: &str,
+        instance_id: &str,
+        session_id: &str,
+        node_id: &str,
+        allocation_id: i64,
+    ) -> EventDraft {
+        EventDraft::info(
+            "instance.promoted",
+            format!(
+                "Session {session_id} promoted to instance {instance_id} as allocation \
+                 {allocation_id} on {node_id}"
+            ),
+        )
+        .job(job_id)
+        .node(node_id)
+        .allocation(allocation_id)
+        .meta(json!({
+            "instanceId": instance_id,
+            "promotedFrom": session_id,
+        }))
+    }
+
     /// `instance.resumed` — a suspended instance restored from its
     /// checkpoint as a new allocation.
     pub fn instance_resumed(
@@ -2369,6 +2422,27 @@ impl EventRecorder<'_> {
 
     pub fn instance_suspend_failed(self, snapshot: &crate::structs::snapshot::SnapshotRecord) {
         self.emit(drafts::instance_suspend_failed(snapshot));
+    }
+
+    pub fn instance_archived(self, archived: &crate::storage::store::ArchivedInstance) {
+        self.emit(drafts::instance_archived(archived));
+    }
+
+    pub fn instance_promoted(
+        self,
+        job_id: &str,
+        instance_id: &str,
+        session_id: &str,
+        node_id: &str,
+        allocation_id: i64,
+    ) {
+        self.emit(drafts::instance_promoted(
+            job_id,
+            instance_id,
+            session_id,
+            node_id,
+            allocation_id,
+        ));
     }
 
     pub fn instance_resumed(

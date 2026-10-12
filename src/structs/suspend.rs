@@ -10,6 +10,8 @@
 //!     resumeTimeout = "30s",        # how long a resume waits for its node before booting cold
 //!     onResume = ["/usr/local/bin/reconnect"],  # run in the guest after every restore
 //!     durability = "local",         # "local" | "store" (publish to the worker's contentStore)
+//!     archive = "slim",             # "slim" | "manifestOnly": once published, keep the
+//!                                   # checkpoint's manifest in the bucket, not the store
 //!     idle = {                      # automatic suspend when quiet
 //!         after = "3m",
 //!         signals = ["network", "cpu", "exec"],
@@ -416,6 +418,30 @@ impl OnRestoreFailure {
     }
 }
 
+/// `suspend.archive`: what a suspended instance keeps in the manager's
+/// store once its checkpoint is published (docs/suspend-and-resume.md,
+/// "Archived instances").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveMode {
+    /// Keep the instance row, which still reserves a named id, and drop the
+    /// snapshot row: the checkpoint's manifest lives in the `contentStore`.
+    Slim,
+    /// Keep nothing for an unnamed instance: its id is unique by 130
+    /// random bits, so the manifest in the `contentStore` is the whole
+    /// record. A named instance, or one that owns a volume, is archived
+    /// `Slim` instead.
+    ManifestOnly,
+}
+
+impl ArchiveMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ArchiveMode::Slim => "slim",
+            ArchiveMode::ManifestOnly => "manifestOnly",
+        }
+    }
+}
+
 /// The task-level `suspend` block, as written.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -445,6 +471,13 @@ pub struct SuspendConfig {
     /// resumes on any compatible node and survives the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durability: Option<String>,
+    /// Archive the instance once its checkpoint is published: `slim` keeps
+    /// only the instance row and moves the checkpoint's manifest to the
+    /// `contentStore`; `manifestOnly` keeps no row at all for an unnamed
+    /// instance. Unset: a suspended instance keeps its snapshot row.
+    /// Needs `durability = "store"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<String>,
     /// Automatic suspend when quiet. Unset: never suspended for idleness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle: Option<IdleConfig>,
@@ -473,6 +506,8 @@ pub struct ResolvedSuspend {
     /// `suspend.onPressure`.
     pub on_pressure: bool,
     pub durability: SnapshotDurability,
+    /// `suspend.archive`, when set.
+    pub archive: Option<ArchiveMode>,
     /// `suspend.wake`, when the task accepts wake on request.
     pub wake: Option<ResolvedWake>,
 }
@@ -488,6 +523,7 @@ impl Default for ResolvedSuspend {
             idle: None,
             on_pressure: false,
             durability: SnapshotDurability::Local,
+            archive: None,
             wake: None,
         }
     }
@@ -546,6 +582,17 @@ impl SuspendConfig {
                 timeout
             }
         };
+        let archive = match self.archive.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some("slim") => Some(ArchiveMode::Slim),
+            Some("manifestOnly") => Some(ArchiveMode::ManifestOnly),
+            Some(other) => {
+                return Err(format!(
+                    "suspend.archive {other:?} is not valid (expected \"slim\" or \
+                     \"manifestOnly\")"
+                ))
+            }
+        };
         let on_resume = self.on_resume.clone().unwrap_or_default();
         if self.on_resume.is_some() && on_resume.iter().all(|arg| arg.trim().is_empty()) {
             return Err(
@@ -562,6 +609,7 @@ impl SuspendConfig {
             idle,
             on_pressure: self.on_pressure.unwrap_or(false),
             durability,
+            archive,
             wake,
         })
     }
@@ -650,6 +698,9 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
     if resolved.durability == SnapshotDurability::Store {
         crate::structs::snapshot::validate_store_durability_storage(task, "suspend.durability")?;
     }
+    if let Some(archive) = resolved.archive {
+        validate_archive(task, &resolved, archive)?;
+    }
     if resolved.checkpoint == Some(SnapshotKind::Memory) && task.runtime != "sandbox" {
         return Err(disk_only_runtime_error(
             &format!("task {:?}", task.name),
@@ -677,6 +728,43 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
             } else {
                 "disk-only"
             }
+        ));
+    }
+    Ok(())
+}
+
+/// `suspend.archive` needs a checkpoint that lives in the `contentStore`
+/// (`durability = "store"` and a memory checkpoint, since a disk checkpoint
+/// stays in the node's volume), and holds no capacity: an archived instance
+/// keeps no allocation row, so `reserve` would have nothing to hold.
+fn validate_archive(
+    task: &crate::structs::TaskConfig,
+    resolved: &ResolvedSuspend,
+    archive: ArchiveMode,
+) -> Result<(), String> {
+    let mode = archive.as_str();
+    if resolved.durability != SnapshotDurability::Store {
+        return Err(format!(
+            "task {:?} sets suspend.archive = {mode:?}, but its checkpoints stay on the node \
+             that took them (durability = \"local\")\nHint: set suspend.durability = \"store\" \
+             so the checkpoint is published to the worker's contentStore before it is archived",
+            task.name
+        ));
+    }
+    if default_checkpoint_kind(task) != SnapshotKind::Memory {
+        return Err(format!(
+            "task {:?} sets suspend.archive = {mode:?}, but it suspends with a disk checkpoint, \
+             which stays in the node's volume and is never published\nHint: archive needs \
+             suspend.checkpoint = \"memory\" (runtime = \"sandbox\")",
+            task.name
+        ));
+    }
+    if resolved.reserve != SuspendReserve::NONE {
+        return Err(format!(
+            "task {:?} sets suspend.archive = {mode:?} and suspend.reserve; an archived \
+             instance holds no capacity on any node, so there is nothing to reserve\nHint: \
+             remove suspend.reserve, or remove archive to keep resumes on held capacity",
+            task.name
         ));
     }
     Ok(())
@@ -885,6 +973,10 @@ pub struct InstanceSuspendState {
     /// failed restore (`instance.cold_boot`, JSON), until the next resume
     /// or restore starts. Served as `InstanceInfo.cold_boot`.
     pub cold_boot: Option<InstanceColdBoot>,
+    /// Set while the instance is archived (`suspend.archive`): the URL of
+    /// the archive manifest in the `contentStore`, which holds the
+    /// checkpoint a resume restores. The snapshot row is gone until then.
+    pub manifest_url: Option<String>,
 }
 
 /// A cold boot that replaced a failed restore under `onRestoreFailure =
@@ -935,6 +1027,40 @@ mod tests {
         assert_eq!(resolved, ResolvedSuspend::default());
         assert_eq!(resolved.resume_timeout, Duration::from_secs(30));
         assert_eq!(resolved.on_restore_failure, OnRestoreFailure::Cold);
+    }
+
+    #[test]
+    fn archive_needs_a_published_memory_checkpoint_and_no_reserve_test() {
+        let archived =
+            |suspend: serde_json::Value| validate_suspend(&task("sandbox", true, suspend));
+        assert!(archived(serde_json::json!({ "durability": "store", "archive": "slim" })).is_ok());
+        let resolved = SuspendConfig {
+            durability: Some("store".into()),
+            archive: Some("manifestOnly".into()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        assert_eq!(resolved.archive, Some(ArchiveMode::ManifestOnly));
+
+        let err = archived(serde_json::json!({ "archive": "slim" })).unwrap_err();
+        assert!(err.contains("durability = \"local\""), "{err}");
+        let err = archived(serde_json::json!({
+            "durability": "store", "archive": "slim", "checkpoint": "disk",
+        }))
+        .unwrap_err();
+        assert!(err.contains("disk checkpoint"), "{err}");
+        let err = archived(serde_json::json!({
+            "durability": "store", "archive": "slim", "reserve": 0.5,
+        }))
+        .unwrap_err();
+        assert!(err.contains("nothing to reserve"), "{err}");
+        let err =
+            archived(serde_json::json!({ "durability": "store", "archive": "cold" })).unwrap_err();
+        assert!(
+            err.contains("suspend.archive \"cold\" is not valid"),
+            "{err}"
+        );
     }
 
     #[test]

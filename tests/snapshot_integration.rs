@@ -198,6 +198,8 @@ fn workspace_job(
                 retain_on_scale_in: None,
                 retain_on_stop: None,
             }),
+            envelope: None,
+            promote: None,
         }),
         snapshots,
         ..TaskConfig::new(TASK, runtime)

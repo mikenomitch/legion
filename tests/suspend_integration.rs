@@ -292,6 +292,8 @@ fn job(runtime: &str, suspend: Option<SuspendConfig>) -> JobConfig {
                 retain_on_scale_in: None,
                 retain_on_stop: None,
             }),
+            envelope: None,
+            promote: None,
         }),
         suspend,
         ..TaskConfig::new(TASK, runtime)
@@ -1314,6 +1316,7 @@ async fn an_instance_records_its_last_stop_and_its_checkpoint_support() -> R<()>
         .list_instances(Request::new(legion::structs::ListInstancesRequest {
             job_id: JOB.into(),
             group: None,
+            ..Default::default()
         }))
         .await?
         .into_inner()

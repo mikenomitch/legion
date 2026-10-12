@@ -16,7 +16,7 @@
 //! By default only read-only / introspection tools are exposed. Mutating tools
 //! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`,
 //! `legion_job_destroy`, `legion_instance_create`, `legion_instance_stop`,
-//! `legion_instance_start`,
+//! `legion_instance_start`, `legion_instance_promote`,
 //! `legion_instance_destroy`) are gated behind `--allow-write`, mirroring the
 //! `read_only_safe` flag in the capabilities catalog. Even with
 //! `--allow-write`, `legion_state_query` always runs in read-only mode (no SQL
@@ -42,6 +42,8 @@ use crate::structs::{
 };
 // Phase 6 (fork and named snapshots).
 use crate::structs::{ForkInstanceRequest, SetSnapshotAliasRequest};
+// Sandbox-scaling Phase 6 (session mode).
+use crate::structs::PromoteInstanceRequest;
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -193,12 +195,15 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_list",
-            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `coldBoot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`coldBoot.reason` says why).",
+            description: "List a job's stateful instances (slot and keyed, including terminated tombstones). An instance with `coldBoot` set lost its running processes: its last resume or restore failed and it booted fresh on its volume (`coldBoot.reason` says why). An `archived` instance is suspended with its checkpoint moved to an archive manifest (`manifestUrl`); start it as usual. With `include_idle`, archived instances that have no row (suspend.archive = \"manifestOnly\") are listed from the bucket after the rows, one page at a time: pass `nextIdlePageToken` back as `idle_page_token`. A session task's running sessions are listed too, with `durable: false`; `complete: false` means some node's sessions could not be read, so the list may be missing some.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "string", "description": "Job name." },
-                    "group": { "type": "string", "description": "Optional task-group filter." }
+                    "group": { "type": "string", "description": "Optional task-group filter." },
+                    "include_idle": { "type": "boolean", "description": "Also list archived instances with no row, from the contentStore. Default false." },
+                    "idle_page_token": { "type": "string", "description": "With include_idle: the previous reply's nextIdlePageToken." },
+                    "idle_page_size": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "With include_idle: the most bucket-listed instances to return (default 1000)." }
                 },
                 "required": ["job_id"],
                 "additionalProperties": false
@@ -843,7 +848,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_create",
-            description: "Create keyed-mode stateful instance(s) for a job's keyed task (never-recycled ids). A single instance_id (or neither instance_ids nor count) uses CreateInstance; instance_ids and/or count use the atomic all-or-nothing batch CreateInstances. Mutating.",
+            description: "Create keyed-mode stateful instance(s) for a job's keyed task (never-recycled ids). A single instance_id (or neither instance_ids nor count) uses CreateInstance; instance_ids and/or count use the atomic all-or-nothing batch CreateInstances. On a session task (stateful.mode = \"session\"), omitting instance_id starts an unnamed session on a node with envelope room and no raft write: the reply has mode=session, durable=false, and nodeId; pass idempotency_key so a retry finds the same session, and call legion_instance_promote to keep it. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -857,6 +862,21 @@ fn tool_defs() -> Vec<ToolDef> {
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["job_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_instance_promote",
+            description: "Promote a running session (mode=session, durable=false) to a keyed instance in place: one raft entry writes its row and an allocation the node adopts it as, so nothing restarts. From then on it is listed exactly, rescheduled on node loss, and can be suspended or forked. new_id names it (refused when the task sets stateful.promote.onName = false); omit it to keep the session id. A repeat reports the same instance with deduplicated=true. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Id of the running session to promote." },
+                    "new_id": { "type": "string", "description": "Name for the promoted instance ([A-Za-z0-9._-]{1,128}, never used before). Keeps the session id when omitted." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["instance_id"],
                 "additionalProperties": false
             }),
             mutates: true,
@@ -1505,8 +1525,25 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_instance_list" => {
             let job_id = str_arg(&args, "job_id")?;
             let group = opt_str_arg(&args, "group");
+            let include_idle = args
+                .get("include_idle")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let idle_page_token = opt_str_arg(&args, "idle_page_token").unwrap_or_default();
+            let idle_page_size = args
+                .get("idle_page_size")
+                .and_then(Value::as_u64)
+                .map(|size| size.min(u64::from(u32::MAX)) as u32)
+                .unwrap_or(0);
             let mut client = connect().await?;
-            grpc(client.list_instances(ListInstancesRequest { job_id, group })).await
+            grpc(client.list_instances(ListInstancesRequest {
+                job_id,
+                group,
+                include_idle,
+                idle_page_token,
+                idle_page_size,
+            }))
+            .await
         }
         "legion_instance_get" => {
             let instance_id = str_arg(&args, "instance_id")?;
@@ -1677,6 +1714,18 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 }))
                 .await
             }
+        }
+        "legion_instance_promote" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let new_id = opt_str_arg(&args, "new_id").unwrap_or_default();
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.promote_instance(PromoteInstanceRequest {
+                instance_id,
+                new_id,
+                idempotency_key,
+            }))
+            .await
         }
         "legion_instance_stop" => {
             let instance_id = str_arg(&args, "instance_id")?;
@@ -2274,6 +2323,7 @@ mod tests {
         assert!(!names.contains(&"legion_instance_create"));
         assert!(!names.contains(&"legion_instance_stop"));
         assert!(!names.contains(&"legion_instance_start"));
+        assert!(!names.contains(&"legion_instance_promote"));
         assert!(!names.contains(&"legion_instance_destroy"));
     }
 
@@ -2323,6 +2373,7 @@ mod tests {
         assert!(names.contains(&"legion_instance_create"));
         assert!(names.contains(&"legion_instance_stop"));
         assert!(names.contains(&"legion_instance_start"));
+        assert!(names.contains(&"legion_instance_promote"));
         assert!(names.contains(&"legion_instance_destroy"));
     }
 

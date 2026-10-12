@@ -10,6 +10,12 @@
 //! `stop`, `start`, and `destroy` only apply to keyed mode (slot lifecycles
 //! are owned by the scheduler via `count.num`).
 //!
+//! On a session task (`stateful.mode = "session"`, docs/session-mode.md),
+//! `create` without `--id` starts an unnamed session that has no row,
+//! `list`/`get` read running sessions from the managers' session index, `stop`
+//! and `destroy` end one, and `promote` turns one into a keyed instance in
+//! place.
+//!
 //! `create` speaks two RPCs: a request for exactly one instance uses the
 //! single `CreateInstance`; repeated `--id` flags and/or `--count` switch to
 //! the atomic batch `CreateInstances` (all-or-nothing).
@@ -21,8 +27,8 @@ use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
     CreateInstanceRequest, CreateInstancesRequest, DestroyInstanceRequest, ForkInstanceRequest,
-    GetInstanceRequest, InstanceInfo, ListInstancesRequest, ReplaceInstanceRequest,
-    StartInstanceRequest, StopInstanceRequest, SuspendInstanceRequest,
+    GetInstanceRequest, InstanceInfo, ListInstancesRequest, PromoteInstanceRequest,
+    ReplaceInstanceRequest, StartInstanceRequest, StopInstanceRequest, SuspendInstanceRequest,
 };
 
 /// Default `--timeout` for `suspend --wait` and `start --wait`, in seconds.
@@ -70,13 +76,22 @@ pub fn config() -> Command {
             otherwise the server mints one) and may repeat; --count N asks the\n\
             server to mint N additional ids. Requests for more than one instance\n\
             are atomic (all-or-nothing): any collision or invalid id creates\n\
-            nothing. Ids are never recycled: a destroyed id can never be created\n\
-            again, and a stopped instance still owns its id.\n\
+            nothing. Ids are never recycled: a destroyed --id can never be created\n\
+            again, and a stopped instance still owns its id. A minted id\n\
+            (<task>-<26 base32>) is unique by randomness and leaves no tombstone;\n\
+            --id may not take that shape.\n\
             \n\
             --from-snapshot restores every new instance from a snapshot of the\n\
             job (an id or a name; see `legion snapshot alias`) instead of booting\n\
             it empty: each gets its own copy of the snapshot's volume and its own\n\
             identity, on the node holding the snapshot (at most 64 per call).\n\
+            \n\
+            On a session task (stateful.mode = \"session\"), a create without --id\n\
+            starts an unnamed session straight on a node with envelope room and\n\
+            writes nothing to the replicated store (mode session, durable false).\n\
+            With --idempotency-key, a retry finds the same session. --id creates\n\
+            an ordinary keyed instance; `legion instance promote` turns a running\n\
+            session into one.\n\
             \n\
             Examples:\n\
               legion instance create sandbox-demo --id user-42\n\
@@ -271,8 +286,9 @@ pub fn config() -> Command {
             "\
             Destroy a keyed-mode instance\n\
             \n\
-            Stops its allocation, drops its storage handle, and tombstones the id\n\
-            forever (never recycled). Destroying an already-terminated instance\n\
+            Stops its allocation, drops its storage handle, and tombstones a\n\
+            named id for the life of the job (never recycled). A server-minted\n\
+            id leaves no row at all. Destroying an already-terminated instance\n\
             succeeds as a no-op.\
             ",
         )
@@ -281,6 +297,41 @@ pub fn config() -> Command {
                 .value_name("ID")
                 .help("Instance id to destroy")
                 .required(true),
+        )
+        .arg(idempotency_arg())
+        .arg(json_flag());
+
+    let promote_cmd = Command::new("promote")
+        .about(
+            "\
+            Promote a running session to a keyed instance, in place\n\
+            \n\
+            A session (stateful.mode = \"session\") has no row: it is lost with\n\
+            its node and listed from the managers' session index. Promotion\n\
+            writes one raft entry, an instance row and an allocation the node\n\
+            adopts the running session as, so nothing restarts. From then on it\n\
+            is an ordinary keyed instance: listed exactly, rescheduled on node\n\
+            loss, suspendable and forkable. --id names it (a keyed id no\n\
+            instance has ever had; refused when stateful.promote.onName =\n\
+            false); without --id it keeps the session id. Promoting again\n\
+            reports the same instance as deduplicated.\n\
+            \n\
+            Examples:\n\
+              legion instance promote workspace-7k2qd9x4m1b8c3rj5t0v6wye2h\n\
+              legion instance promote workspace-7k2qd9x4m1b8c3rj5t0v6wye2h --id user-42\
+            ",
+        )
+        .arg(
+            Arg::new("session")
+                .value_name("SESSION")
+                .help("Id of the running session to promote")
+                .required(true),
+        )
+        .arg(
+            Arg::new("id")
+                .long("id")
+                .value_name("KEY")
+                .help("Name for the promoted instance ([A-Za-z0-9._-]{1,128}); keeps the session id when omitted"),
         )
         .arg(idempotency_arg())
         .arg(json_flag());
@@ -326,6 +377,31 @@ pub fn config() -> Command {
                 .value_name("GROUP")
                 .help("Only show instances in this task group"),
         )
+        .arg(
+            Arg::new("include-idle")
+                .long("include-idle")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Also list archived instances that have no row in the store \
+                     (suspend.archive = \"manifestOnly\"), read from the job's archive \
+                     manifests in the contentStore, one page at a time",
+                ),
+        )
+        .arg(
+            Arg::new("idle-page-token")
+                .long("idle-page-token")
+                .value_name("TOKEN")
+                .requires("include-idle")
+                .help("With --include-idle: resume the bucket listing at this token"),
+        )
+        .arg(
+            Arg::new("idle-page-size")
+                .long("idle-page-size")
+                .value_name("N")
+                .value_parser(clap::value_parser!(u32))
+                .requires("include-idle")
+                .help("With --include-idle: the most archived instances to list (default 1000)"),
+        )
         .arg(json_flag());
 
     let get_cmd = Command::new("get")
@@ -348,6 +424,7 @@ pub fn config() -> Command {
         .subcommand(suspend_cmd)
         .subcommand(fork_cmd)
         .subcommand(destroy_cmd)
+        .subcommand(promote_cmd)
         .subcommand(replace_cmd)
         .subcommand(list_cmd)
         .subcommand(get_cmd)
@@ -362,6 +439,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("suspend", arg_matches)) => suspend_instance(arg_matches).await,
         Some(("fork", arg_matches)) => fork_instance(arg_matches).await,
         Some(("destroy", arg_matches)) => destroy_instance(arg_matches).await,
+        Some(("promote", arg_matches)) => promote_instance(arg_matches).await,
         Some(("replace", arg_matches)) => replace_instance(arg_matches).await,
         Some(("list", arg_matches)) => list_instances(arg_matches).await,
         Some(("get", arg_matches)) => get_instance(arg_matches).await,
@@ -411,8 +489,24 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
             output::print_success(&json!({
                 "instanceIds": [reply.instance_id],
                 "restoringFrom": (!reply.restoring_from.is_empty()).then_some(&reply.restoring_from),
+                "mode": reply.mode,
+                "durable": reply.durable,
+                "node": (!reply.node_id.is_empty()).then_some(&reply.node_id),
+                "state": (!reply.state.is_empty()).then_some(&reply.state),
                 "deduplicated": reply.deduplicated,
             }));
+        } else if !reply.durable {
+            println!(
+                "{} session {} on {} (not durable; `legion instance promote {}` keeps it)",
+                if reply.deduplicated {
+                    "Found"
+                } else {
+                    "Started"
+                },
+                reply.instance_id,
+                reply.node_id,
+                reply.instance_id
+            );
         } else if reply.restoring_from.is_empty() {
             println!("Created instance {}", reply.instance_id);
         } else {
@@ -564,6 +658,56 @@ async fn fork_instance(arg_matches: &ArgMatches) -> R<()> {
                 reply.origin
             ),
         }
+    }
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn promote_instance(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let session = arg_matches
+        .get_one::<String>("session")
+        .context("Must provide a session id")?
+        .clone();
+    let request = tonic::Request::new(PromoteInstanceRequest {
+        instance_id: session,
+        new_id: arg_matches
+            .get_one::<String>("id")
+            .cloned()
+            .unwrap_or_default(),
+        idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
+    });
+
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "failed to promote session",
+        client.promote_instance(request).await,
+    )?
+    .into_inner();
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "instanceId": reply.instance_id,
+            "promotedFrom": reply.promoted_from,
+            "node": reply.node_id,
+            "allocationId": reply.allocation_id,
+            "durable": reply.durable,
+            "deduplicated": reply.deduplicated,
+        }));
+    } else {
+        println!(
+            "{} session {} as instance {} (allocation {} on {})",
+            if reply.deduplicated {
+                "Already promoted"
+            } else {
+                "Promoted"
+            },
+            reply.promoted_from,
+            reply.instance_id,
+            reply.allocation_id,
+            reply.node_id
+        );
     }
     Ok(())
 }
@@ -909,9 +1053,19 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<String>("job")
         .context("Must provide job")?
         .clone();
+    let include_idle = arg_matches.get_flag("include-idle");
     let request = tonic::Request::new(ListInstancesRequest {
         job_id: job,
         group: arg_matches.get_one::<String>("group").cloned(),
+        include_idle,
+        idle_page_token: arg_matches
+            .get_one::<String>("idle-page-token")
+            .cloned()
+            .unwrap_or_default(),
+        idle_page_size: arg_matches
+            .get_one::<u32>("idle-page-size")
+            .copied()
+            .unwrap_or_default(),
     });
 
     let mut client = connect_manager_client().await?;
@@ -923,10 +1077,28 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
     .into_inner();
 
     if format.is_json() {
-        output::print_success(&reply.instances);
+        output::print_success(&json!({
+            "instances": reply.instances,
+            "nextIdlePageToken": reply.next_idle_page_token,
+            "complete": reply.complete,
+            "asOf": (!reply.as_of.is_empty()).then_some(&reply.as_of),
+        }));
     } else {
         let rows: Vec<InstanceRow> = reply.instances.iter().map(InstanceRow::from).collect();
         print_table(rows);
+        if !reply.next_idle_page_token.is_empty() {
+            println!(
+                "\nmore archived instances: --include-idle --idle-page-token {}",
+                reply.next_idle_page_token
+            );
+        }
+        if !reply.complete {
+            println!(
+                "\nincomplete: some nodes that run this job's sessions have not reported to \
+                 any manager yet (as of {}); their sessions are missing above",
+                reply.as_of
+            );
+        }
     }
     Ok(())
 }
@@ -971,6 +1143,9 @@ async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
         match reply.instance {
             Some(instance) => {
                 print_table(vec![InstanceRow::from(&instance)]);
+                if let Some(line) = session_line(&instance) {
+                    println!("\n{line}");
+                }
                 if let Some(address) = address_line(&instance) {
                     println!("\n{address}");
                 }
@@ -1066,6 +1241,12 @@ impl From<&InstanceInfo> for InstanceRow {
 /// `snap-77e0 (memory, local w-03)`, `snap-5b10 (memory, published)`,
 /// `snap-1a4d (disk)`, or `-`.
 fn checkpoint_column(instance: &InstanceInfo) -> String {
+    if instance.archived {
+        return match instance.checkpoint_id.as_deref() {
+            Some(id) => format!("{id} (archived)"),
+            None => "archived".into(),
+        };
+    }
     let Some(id) = instance.checkpoint_id.as_deref() else {
         return "-".into();
     };
@@ -1083,6 +1264,27 @@ fn checkpoint_column(instance: &InstanceInfo) -> String {
         (Some(kind), _) => format!("{id} ({kind})"),
         (None, _) => id.to_string(),
     }
+}
+
+/// Where a session runs and how to keep it, or where a promoted instance
+/// came from, for `instance get`.
+fn session_line(instance: &InstanceInfo) -> Option<String> {
+    if instance.mode == "session" {
+        return Some(format!(
+            "session: on {} inside envelope allocation {}, not durable (`legion instance \
+             promote {}` gives it a row)",
+            instance.node_id.as_deref().unwrap_or("-"),
+            instance
+                .envelope_alloc_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".into()),
+            instance.instance_id
+        ));
+    }
+    instance
+        .promoted_from
+        .as_deref()
+        .map(|from| format!("promoted from session {from}"))
 }
 
 /// A TAP sandbox's leased guest address, for `instance get`
@@ -1123,7 +1325,13 @@ fn endpoint_lines(instance: &InstanceInfo) -> Vec<String> {
 /// The last suspend and restore, for `instance get`.
 fn suspend_lines(instance: &InstanceInfo) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(checkpoint) = instance.checkpoint_id.as_deref() {
+    if instance.archived {
+        lines.push(format!(
+            "\narchived: {} (the checkpoint's snapshot row lives in this manifest; `instance \
+             start` reads it back)",
+            instance.manifest_url.as_deref().unwrap_or("-")
+        ));
+    } else if let Some(checkpoint) = instance.checkpoint_id.as_deref() {
         lines.push(format!(
             "\ncheckpoint: {checkpoint} ({}, {} on {}, {} bytes, durability {})",
             instance.checkpoint_kind.as_deref().unwrap_or("-"),
@@ -1233,6 +1441,32 @@ mod tests {
             args.get_one::<String>("idempotency-key")
                 .map(String::as_str),
             Some("k1")
+        );
+        assert!(args.get_flag("json"));
+        Ok(())
+    }
+
+    #[test]
+    fn instance_promote_command_parses_test() -> R<()> {
+        let matches = config().try_get_matches_from([
+            "instance",
+            "promote",
+            "workspace-7k2qd9x4m1b8c3rj5t0v6wye2h",
+            "--id",
+            "user-42",
+            "--idempotency-key",
+            "k1",
+            "-j",
+        ])?;
+        let (subcommand, args) = matches.subcommand().context("Missing subcommand")?;
+        assert_eq!(subcommand, "promote");
+        assert_eq!(
+            args.get_one::<String>("session").map(String::as_str),
+            Some("workspace-7k2qd9x4m1b8c3rj5t0v6wye2h")
+        );
+        assert_eq!(
+            args.get_one::<String>("id").map(String::as_str),
+            Some("user-42")
         );
         assert!(args.get_flag("json"));
         Ok(())
