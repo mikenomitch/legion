@@ -19,7 +19,6 @@ import {
   Tabs,
   cx,
   linkClass,
-  selectClass,
   tableClass,
   tdClass,
   thClass,
@@ -31,7 +30,7 @@ import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
 import { EffectivePolicyView, parseEffectivePolicy } from '../../components/NetPolicyView'
-import AllocationExecPanel from '../../components/AllocationExecPanel'
+import TaskActions, { SHELL_ENTRY, type ActionTarget } from '../../components/TaskActions'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
 import {
   allocationHealthLabel,
@@ -78,10 +77,12 @@ const artifactProgressLabel = (row: ArtifactStateRow): string | undefined => {
 
 const formatDurationMs = (ms: number): string => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`)
 
-const TASK_TABS = ['overview', 'logs', 'exec', 'spec'] as const
+const TASK_TABS = ['overview', 'logs', 'actions', 'spec'] as const
 type TaskTab = (typeof TASK_TABS)[number]
 const isTaskTab = (value: unknown): value is TaskTab =>
   typeof value === 'string' && (TASK_TABS as readonly string[]).includes(value)
+// `exec` was this tab's id before it became Actions; old links keep working.
+const parseTab = (value: unknown): TaskTab => (value === 'exec' ? 'actions' : isTaskTab(value) ? value : 'overview')
 
 // The events card and the failure count read the job's most recent events;
 // a busy job can push a day's worth past this window.
@@ -244,14 +245,15 @@ function TaskDetailContent() {
   const jobName = createMemo(() => decodeURIComponent(params.id))
   const taskName = createMemo(() => decodeURIComponent(params.taskName))
 
-  // Tabs live in the URL so a link can land on one (`?tab=logs`), and
-  // `?alloc=` carries the instance a row's Logs/Shell button picked. Replace,
-  // not push: flipping tabs should not fill the back button.
+  // Tabs live in the URL so a link can land on one (`?tab=logs`), `?alloc=`
+  // carries the instance a row's Logs/Shell button picked, and `?action=`
+  // the Actions tab's list entry (an action name, or `shell`). Replace, not
+  // push: flipping tabs should not fill the back button.
   const [searchParams, setSearchParams] = useSearchParams()
-  const activeTab = createMemo<TaskTab>(() => (isTaskTab(searchParams.tab) ? searchParams.tab : 'overview'))
+  const activeTab = createMemo<TaskTab>(() => parseTab(searchParams.tab))
   const selectTab = (tab: string) => setSearchParams({ tab: tab === 'overview' ? undefined : tab }, { replace: true })
-  const openTab = (tab: TaskTab, allocation?: string) =>
-    setSearchParams({ tab: tab === 'overview' ? undefined : tab, alloc: allocation }, { replace: true })
+  const openTab = (tab: TaskTab, allocation?: string, action?: string) =>
+    setSearchParams({ tab: tab === 'overview' ? undefined : tab, alloc: allocation, action }, { replace: true })
 
   // Keyed on the route params so task→task navigation refetches, and polled
   // at the slow cadence so health, endpoints and allocations stay current.
@@ -385,25 +387,6 @@ function TaskDetailContent() {
   // picker's options must survive a poll for the selection to hold.
   const execTargetIds = createMemo(() => execAllocations().map((alloc) => String(alloc.id)))
 
-  // The exec target: the URL's pick while it is still running, else whatever
-  // was already showing (a poll must never swap the terminal out from under
-  // someone), else the first unhealthy allocation — the likeliest reason to
-  // open a shell — else the first.
-  const execTarget = createMemo<string | undefined>((previous) => {
-    const ids = execTargetIds()
-    const wanted = searchParams.alloc
-    if (wanted && ids.includes(wanted)) return wanted
-    if (previous && ids.includes(previous)) return previous
-    const unhealthy = execAllocations().find((alloc) => data()?.allocationHealth.get(Number(alloc.id))?.healthy === false)
-    return unhealthy ? String(unhealthy.id) : ids[0]
-  })
-
-  const execOptionLabel = (id: string): string => {
-    const alloc = execAllocations().find((candidate) => String(candidate.id) === id)
-    const health = allocationHealthLabel(data()?.allocationHealth.get(Number(id)))
-    return [`#${id}`, alloc?.nodeId, health].filter(Boolean).join(' · ')
-  }
-
   // One row per allocation: the old "reported health", "runtime allocations"
   // and per-allocation exec lists were the same set three times.
   const instanceRows = createMemo((): InstanceRow[] => {
@@ -507,8 +490,31 @@ function TaskDetailContent() {
     }
   })
 
-  // Sticky: once the exec tab has been shown it stays mounted (see below).
-  const execOpened = createMemo((opened: boolean) => opened || activeTab() === 'exec', false)
+  // Sticky: once the Actions tab has been shown it stays mounted (see below).
+  const actionsOpened = createMemo((opened: boolean) => opened || activeTab() === 'actions', false)
+
+  // Polls rebuild every object below; comparing by content keeps the Actions
+  // tab's list, form and running sessions from re-rendering every 5 seconds.
+  const sameContent = <T,>(left: T, right: T) => JSON.stringify(left) === JSON.stringify(right)
+  const taskActions = createMemo(() => data()?.actions ?? [], undefined, { equals: sameContent })
+  const specActions = createMemo(() => data()?.taskSpec?.actions ?? [], undefined, { equals: sameContent })
+  const actionTargets = createMemo(
+    (): ActionTarget[] =>
+      execAllocations().map((alloc) => ({
+        id: String(alloc.id),
+        nodeId: alloc.nodeId,
+        healthy: data()?.allocationHealth.get(Number(alloc.id))?.healthy,
+      })),
+    undefined,
+    { equals: sameContent },
+  )
+  // The list entry: the URL's when it names an action (or the shell), else the
+  // first action, else the shell for a task that declares none.
+  const selectedAction = createMemo(() => {
+    const wanted = searchParams.action
+    if (wanted === SHELL_ENTRY || taskActions().some((action) => action.name === wanted)) return wanted!
+    return taskActions()[0]?.name ?? SHELL_ENTRY
+  })
 
   // A memo on the count alone, so a poll does not rebuild the tab bar (and
   // drop keyboard focus) unless the count actually changed.
@@ -516,7 +522,7 @@ function TaskDetailContent() {
   const tabs = createMemo((): TabItem[] => [
     { id: 'overview', label: 'Overview' },
     { id: 'logs', label: 'Logs' },
-    { id: 'exec', label: 'Exec & actions', count: actionCount() > 0 ? actionCount() : undefined },
+    { id: 'actions', label: 'Actions', count: actionCount() > 0 ? actionCount() : undefined },
     { id: 'spec', label: 'Spec' },
   ])
 
@@ -562,7 +568,7 @@ function TaskDetailContent() {
             actions={
               <>
                 <Button onClick={() => openTab('logs')}>Logs</Button>
-                <Button variant="primary" icon="terminal" onClick={() => openTab('exec')}>
+                <Button variant="primary" icon="terminal" onClick={() => openTab('actions', undefined, SHELL_ENTRY)}>
                   Open shell
                 </Button>
               </>
@@ -728,7 +734,7 @@ function TaskDetailContent() {
                                       variant="ghost"
                                       size="xs"
                                       icon="terminal"
-                                      onClick={() => openTab('exec', row().key)}
+                                      onClick={() => openTab('actions', row().key, SHELL_ENTRY)}
                                       aria-label={`Open a shell in allocation #${row().key}`}
                                     >
                                       Shell
@@ -1101,34 +1107,20 @@ function TaskDetailContent() {
           </Switch>
 
           {/* Mounted on first visit and only hidden after that, unlike the
-              other tabs: a shell session should survive a look at the logs. */}
-          <Show when={execOpened()}>
-            <div role="tabpanel" aria-label="Exec & actions" hidden={activeTab() !== 'exec'}>
-              <SectionCard title="Exec & actions" description="Run commands or declared actions inside one running allocation of this task.">
-                <Show
-                  when={execTargetIds().length > 0}
-                  fallback={<EmptyState icon="terminal" title="No running allocations" body="Once an allocation is running you can open a shell or trigger actions here." />}
-                >
-                  <label class="flex flex-wrap items-center gap-2 text-xs font-medium text-muted">
-                    Target allocation
-                    <select
-                      class={selectClass}
-                      value={execTarget() ?? ''}
-                      onChange={(event) => openTab('exec', event.currentTarget.value)}
-                    >
-                      <For each={execTargetIds()}>{(id) => <option value={id}>{execOptionLabel(id)}</option>}</For>
-                    </select>
-                  </label>
-                  {/* Keyed on the id string: switching target remounts the
-                      panel (a fresh terminal for the new allocation), while
-                      a poll, which rebuilds every ledger row, does not. */}
-                  <Show when={execTarget()} keyed>
-                    {(id) => (
-                      <AllocationExecPanel allocationId={BigInt(id)} jobName={jobName()} taskName={taskName()} defaultOpen />
-                    )}
-                  </Show>
-                </Show>
-              </SectionCard>
+              other tabs: a shell or a running action should survive a look
+              at the logs. */}
+          <Show when={actionsOpened()}>
+            <div role="tabpanel" aria-label="Actions" hidden={activeTab() !== 'actions'}>
+              <TaskActions
+                jobName={jobName()}
+                taskName={taskName()}
+                actions={taskActions()}
+                specActions={specActions()}
+                targets={actionTargets()}
+                selected={selectedAction()}
+                onSelect={(entry) => openTab('actions', searchParams.alloc, entry)}
+                preferredTarget={searchParams.alloc}
+              />
             </div>
           </Show>
         </div>

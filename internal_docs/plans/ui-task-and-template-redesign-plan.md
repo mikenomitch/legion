@@ -2,10 +2,9 @@
 
 > **Judgement calls:** [`../calls/ui-task-and-template-redesign-plan_calls.md`](../calls/ui-task-and-template-redesign-plan_calls.md)
 
-**Status: IN EXECUTION.** Phase 1 (task page tabs) and phase 2 (guided
-template launch) are built on branch `claude/peaceful-mendel-4rirac`. Phase 3
-(the actions panel) waits on a layout choice between five variations of one
-design (§5). Deliberately deferred: per-check, per-instance health results;
+**Status: SHIPPED** on branch `claude/peaceful-mendel-4rirac` (2026-10-12):
+phase 1 (task page tabs), phase 2 (guided template launch) and phase 3 (the
+Actions tab, layout "list + detail", §3). Deliberately deferred: per-check, per-instance health results;
 server-side run history for actions; a server-side plan/diff RPC for template
 runs; the template catalog view. See "Deferred" at the end.
 
@@ -186,7 +185,27 @@ preview-env  v12                                        [New version] [Delete]
 - **Source** tab — source of the selected version, the version list, and the
   publish-new-version editor for `template:write`.
 
-### 3. Actions panel (phase 3 — layout pending)
+### 3. Actions tab (phase 3)
+
+**Chosen: list + detail, named "Actions".** The Exec & actions tab becomes
+**Actions** (`?tab=actions`; `?tab=exec` still opens it), with a list of the
+task's actions on the left — name, `tty` badge, description, parameter names
+— and **Open a shell** as its last entry; `?action=<name>|shell` selects the
+entry. The header's **Open shell** and a row's **Shell** open the shell entry.
+
+```
+ Overview │ Logs │ Actions (6) │ Spec
+
+ ┌ Filter actions… ┐   reindex-search                       timeout 30m
+ │ set-log-level   │   index       required  [orders-v2        ]
+ │ flush-cache     │   batch_size  default 1000 [50] Between 100 and 10000
+ │▌reindex-search  │   dry_run     default true  (●) true
+ │ rotate-api-key  │   RUNS  sh -c ‹echo reindex orders-v2 batch=50 …›
+ │ dump-heap       │   RUN ON  (●) One instance #8  ( ) All running  ( ) Unhealthy only
+ │ debug-shell tty │   [▶ Run reindex-search on #8]   1 field needs attention
+ │ ┄ Open a shell ┄│   $ legion action run actdemo reindex-search --alloc 8 --param …
+ └─────────────────┘   RESULT  exit 0 #8 …   exit 1 #9 …
+```
 
 The chosen direction keeps one shape: pick an action, fill its typed form,
 see the exact argv it will run, choose the target (one instance, all running,
@@ -205,9 +224,10 @@ controls are common to all of them:
 | `sensitive` string | masked input; masked in the argv preview and CLI line |
 | `bool` | switch |
 
-The tab's name is open too (Actions / Operations / Controls / Commands /
-Toolbox); the lean is **Actions**, the word the jobspec (`actions = [...]`),
-the CLI (`legion action run`) and the ACL resource (`action`) already use.
+Five layouts of this shape were reviewed (list + detail, expand in place,
+cards + side panel, command builder, action × instance grid), each under a
+different tab name (Actions / Operations / Controls / Commands / Toolbox).
+List + detail and **Actions** won; see the calls doc.
 
 ## Proto, struct, config, and persistence changes
 
@@ -219,11 +239,12 @@ allocation from the browser. The deferred items below each need one.
 ## Implementation phases
 
 1. **Task page tabs** — `TaskDetail.tsx` restructure; `LogViewer`
-   `initialAllocation` prop; `AllocationExecPanel` `defaultOpen` prop.
+   `initialAllocation` prop; one exec panel behind a target picker.
 2. **Guided template launch** — `TemplateDetail.tsx` stepper; a small
    dependency-free line diff in `ui/src/utils/diff.ts`.
-3. **Actions panel** — replace the exec tab's body with the chosen layout;
-   rename the tab.
+3. **Actions tab** — new `ui/src/components/TaskActions.tsx` replaces
+   `AllocationExecPanel` (deleted); `JobTask.actions` (name, `command`,
+   `timeout`) parsed from the jobspec for the argv preview.
 
 Each phase ships alone: phase 1 keeps today's exec panel inside its tab, and
 phase 2 touches only the template page.
@@ -249,8 +270,19 @@ spec and reports that new jobs have no rollout; a re-launch with
 `replicas = 2` reviews as "Updates the running job" with `was 1` and a
 `count 1 → 2` diff, then follows the rollout to completion. The store returned
 `template.variables.json` before `job.rendered.json` for that job, confirming
-[calls entry 3](../calls/ui-task-and-template-redesign-plan_calls.md); with the
+[calls entry 5](../calls/ui-task-and-template-redesign-plan_calls.md); with the
 fix its job and task pages list the task. No page errors in the console.
+
+**Run 2026-10-12** (phase 3, a job whose task declares one action of each
+kind: a 5-value enum + bounded int, a 3-value enum, a patterned string +
+int + bool, a required sensitive string + bool, no parameters, tty): the list
+and the default entry render; `Orders v2` and a batch size of 50 show "Must
+match …" / "Between 100 and 10000" and disable Run; a corrected run on one
+instance prints its output; flush-cache with `scope=assets` on all running
+instances reports `exit 1` and stderr for each; the required secret blocks
+Run until filled and shows masked; the tty action opens a live terminal in
+the chosen instance; `?tab=exec` lands on Actions, and the shell entry runs
+`ls /` non-interactively to `[exited 0]`. No page errors.
 
 ## Rollout and backward compatibility
 
@@ -259,7 +291,6 @@ CLI, MCP, or the API.
 
 ## Open questions
 
-- Phase 3 layout and tab name — waiting on the review (§3).
 - Should the template page also offer the Review step's diff for a *raw*
   `legion job run` job (no template provenance)? Lean: yes when the current
   spec has a JSON submission; otherwise show the full spec, as built.
@@ -273,7 +304,7 @@ CLI, MCP, or the API.
 - Phase 2: launching a template whose job exists says "Updates the running job"
   and shows changed values and a diff before anything is submitted; a new job
   says "Creates"; after launching, rollout progress shows and settles.
-- Phase 3: an action runs on one, all, or unhealthy instances with a result per
+- Phase 3 (met 2026-10-12): an action runs on one, all, or unhealthy instances with a result per
   instance; invalid parameters block the run with the reason shown.
 
 ## Deferred

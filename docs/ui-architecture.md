@@ -325,14 +325,16 @@ buttons.
 | --- | --- |
 | **Overview** | Tiles for instances (running, or running / desired when the task has a plain count — a `job scale` override wins over the spec), health, endpoints (when the task declares a service), and failures in the last 24h. One **Instances** table: allocation, node, status, health with the reported reason, ports, artifact progress, and per-row **Logs** / **Shell** buttons; unhealthy rows sort first. **Health checks** (declared) beside **Recent events**. |
 | **Logs** | The live log viewer for this task's allocations. With more than one allocation in view it has an allocation picker. |
-| **Exec & actions** | One target picker for this task's running allocations (default: the URL's `alloc`, else the first unhealthy one) and one exec/actions panel for it. The tab stays mounted once opened, so a shell survives switching to Logs and back. |
+| **Actions** | The task's declared actions as a list, the chosen one as a typed form with the argv it will run, a target (one instance, all running, or only the unhealthy ones), and an exit code and output per instance. **Open a shell** is the last list entry. The tab stays mounted once opened, so a shell or a running action survives switching to Logs and back. See [Exec & Actions](#exec--actions-interactive-terminal). |
 | **Spec** | Definition, service & ports with live endpoints, volumes, declared artifacts, and the effective network policy. |
 
-The tab is in the URL: `?tab=overview|logs|exec|spec` (default `overview`;
-an unknown value falls back to it) and `?alloc=<allocation id>` picks the
-allocation the Logs and Exec tabs start on. A row's **Logs** / **Shell**
-buttons set both, so a link can land on one allocation's logs:
-`/jobs/web/tasks/api?tab=logs&alloc=4219`. Tab changes replace the history
+The tab is in the URL: `?tab=overview|logs|actions|spec` (default
+`overview`; an unknown value falls back to it, and `exec`, the tab's former
+id, opens Actions). `?alloc=<allocation id>` picks the allocation the Logs and
+Actions tabs start on, and `?action=<name>|shell` picks the Actions list
+entry. A row's **Logs** / **Shell** buttons set them, so a link can land on
+one allocation's logs (`/jobs/web/tasks/api?tab=logs&alloc=4219`) or a shell
+in it (`?tab=actions&action=shell&alloc=4219`). Tab changes replace the history
 entry rather than adding one.
 
 The page degrades per permission rather than failing: events (and the
@@ -497,17 +499,42 @@ committed files differ, so a proto change cannot merge without its client.
 ## Exec & Actions (interactive terminal)
 
 The task detail page (`pages/details/JobDetail.tsx` → `TaskDetail.tsx`) has an
-**Exec & actions** tab with a target picker over this task's running
-allocations. These are the job's allocations from `GetLedger`, narrowed to the
-ones that run the page's task. The ledger carries only `task_config_id`, so the
-task name comes from the state-store lookup that also carries allocation
-health. A token without `state:read` cannot make that mapping. In that case the
-picker lists every running allocation of the job (the manager still rejects an
-exec whose allocation runs a different task). The chosen allocation gets one
-`AllocationExecPanel` with a command launcher (interactive-tty toggle). For
-tasks that declare actions, it also shows action forms generated from the
-parameter schema (`ListJobActions`, filtered to this task). The panel is keyed
-on the allocation id, so a poll never remounts an open terminal.
+**Actions** tab (`components/TaskActions.tsx`). Its targets are the job's
+allocations from `GetLedger`, narrowed to the ones that run the page's task.
+The ledger carries only `task_config_id`, so the task name comes from the
+state-store lookup that also carries allocation health. A token without
+`state:read` cannot make that mapping. In that case every running allocation
+of the job is offered (the manager still rejects an exec whose allocation runs
+a different task).
+
+The left list is the task's actions (`ListJobActions`, filtered to this task)
+plus **Open a shell**. The chosen action shows:
+
+- **Parameters**, one control per declared type: an `enum` of up to four
+  values is a segmented control, five or more a chip group; `int` and
+  `string` are text inputs checked as you type against `min`/`max` and
+  `pattern` (the same rules as `ActionParam::validate_value`); a `sensitive`
+  string is masked; `bool` is a switch. A required empty value, or any value
+  that fails its check, disables **Run** with the reason under the field.
+  Empty optional values are left out, so the manager applies the default.
+- **Runs**: the action's `command` from the jobspec with the current values
+  substituted for `${param.<name>}` (sensitive values masked). The manager
+  still renders the real argv; this is a preview.
+- **Run on**: one instance (chips with health dots; default the URL's
+  `alloc`, else the first unhealthy, else the first), all running, or only the
+  unhealthy ones. A `tty` action runs in one instance only.
+- **Run**, and under it the equivalent `legion action run <job> <action>
+  --alloc <id> --param k=v` line (`***` for sensitive values).
+- **Result**: one row per instance with its exit code, duration, last line,
+  and output (stderr tinted), opened automatically for a failure or a single
+  target.
+
+Running on several instances opens one exec session per allocation, all at
+once; there is no multi-allocation RPC. A `tty` action, and the shell entry
+(command plus an *Interactive (tty)* toggle), open an xterm.js terminal. The
+action list, form values, and results are kept while you switch actions, and
+open sessions close when you leave the page. There is no run history: results
+live in the page.
 
 Exec is the one part of the UI that does not use gRPC-Web, because browsers
 cannot do bidirectional streaming over it. `ui/src/lib/execSocket.ts` opens a

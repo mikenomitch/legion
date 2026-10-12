@@ -39,11 +39,12 @@ legion exec --job web -it -- /bin/sh
 Flags match docker and kubectl: `-i/--stdin` forwards local stdin, `-t/--tty`
 allocates a pseudo-terminal, and everything after `--` is the remote argv.
 
-In the UI, open a task (Jobs → a job → a task) and go to its **Exec &
-actions** tab, or press **Shell** on an instance's row in the Overview. Pick
-the running allocation, type a command, and toggle *Interactive (tty)* if you
-want a shell. An embedded terminal (xterm.js) streams the session. A link
-can open the tab on one allocation: `/jobs/web/tasks/api?tab=exec&alloc=4217`.
+In the UI, open a task (Jobs → a job → a task), go to its **Actions** tab
+and pick **Open a shell** at the bottom of the list, or press **Open shell** in
+the header or **Shell** on an instance's row in the Overview. Pick the
+instance, type a command, and toggle *Interactive (tty)* if you want a shell.
+An embedded terminal (xterm.js) streams the session. A link can open it on one
+allocation: `/jobs/web/tasks/api?tab=actions&action=shell&alloc=4217`.
 
 ## Actions
 
@@ -117,9 +118,16 @@ legion action run web tail-slowlog --alloc 4217 --param lines=500
 legion action run web debug-shell --alloc 4217 -it       # a tty action
 ```
 
-In the UI, the task page's **Exec & actions** tab shows each action with a form
-built from its parameter schema (enum → dropdown, int/string → validated
-input). *Run* streams output into the terminal and shows the exit code.
+In the UI, the task page's **Actions** tab lists the task's actions. The
+chosen one gets a form built from its parameter schema — a segmented control
+or chips for `enum`, a switch for `bool`, inputs checked against `min`/`max`
+and `pattern` as you type, a masked input for `sensitive` — plus a preview of
+the argv it will run and the equivalent `legion action run` command. You can
+run it on one instance, on all running instances, or only on the unhealthy
+ones; each instance gets its own exit code and output. Running on several
+instances opens one session per allocation from the browser, so each is
+audited separately. A `tty` action opens a terminal in one instance.
+`?tab=actions&action=<name>` links straight to an action.
 
 ## Which task runtimes support exec
 

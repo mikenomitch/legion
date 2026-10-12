@@ -2278,19 +2278,18 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
       that caused it; every message so far is an inline `Note`
 
 From [ui-task-and-template-redesign-plan.md](plans/ui-task-and-template-redesign-plan.md)
-(task tabs and guided launch are built; see Done):
+(shipped; see Done):
 
-- [ ] Phase 3: the actions panel. Five layouts of one design (typed form,
-      argv preview, run on one / all / unhealthy instances, per-instance exit
-      code) are under review, along with the tab's name; the Exec tab keeps
-      today's panel behind a single target picker until then
-      ([plan §3](plans/ui-task-and-template-redesign-plan.md#3-actions-panel-phase-3--layout-pending))
+- [ ] A server-side action fan-out (an allocation list or selector on the
+      action RPC, one audit record, bounded concurrency). The Actions tab runs
+      on several instances as one browser session per allocation today
+      ([calls entry 3](calls/ui-task-and-template-redesign-plan_calls.md))
 - [ ] Per-check, per-instance health results. `allocation_health` keeps one
       healthy flag and status string per allocation, so the task Overview
       can only show declared checks plus each instance's overall verdict
 - [ ] A restart counter per allocation. The task Overview counts
       `allocation.failed` events from the job's last 200 instead, a floor on
-      a busy job ([calls entry 4](calls/ui-task-and-template-redesign-plan_calls.md))
+      a busy job ([calls entry 6](calls/ui-task-and-template-redesign-plan_calls.md))
 - [ ] Queryable action/exec run history ("last run 3h ago by dana", re-run).
       `exec_audit` is a tracing target today, not state
 - [ ] `PlanJobTemplate` — the template analogue of `legion job plan` — so the
@@ -2299,14 +2298,14 @@ From [ui-task-and-template-redesign-plan.md](plans/ui-task-and-template-redesign
       ([calls entry 1](calls/ui-task-and-template-redesign-plan_calls.md))
 - [ ] A structured outcome on `RunJobTemplateReply` (created / updated with
       rollout / unchanged); the Launch step reads it from the message text
-      today ([calls entry 6](calls/ui-task-and-template-redesign-plan_calls.md))
+      today ([calls entry 8](calls/ui-task-and-template-redesign-plan_calls.md))
 - [ ] Template-only tokens are denied `GetJobInfo` for a job that does not
       exist yet (the request carries no template attribute), so their Review
       cannot tell "creates" from "updates" and cannot follow the rollout
-      ([calls entry 8](calls/ui-task-and-template-redesign-plan_calls.md))
+      ([calls entry 10](calls/ui-task-and-template-redesign-plan_calls.md))
 - [ ] `Store::get_submissions_for_config` has no `ORDER BY`; the UI now finds
       the spec by name, but any other "first JSON submission" consumer has the
-      same latent bug ([calls entry 3](calls/ui-task-and-template-redesign-plan_calls.md))
+      same latent bug ([calls entry 5](calls/ui-task-and-template-redesign-plan_calls.md))
 - [ ] Template catalog and authoring views: usage counts, jobs behind the
       latest version, version-to-version source diff
 
@@ -3151,8 +3150,18 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       one exec panel behind a target picker instead of one per allocation
       ([plan](plans/ui-task-and-template-redesign-plan.md),
       [calls](calls/ui-task-and-template-redesign-plan_calls.md),
-      [docs](../docs/ui-architecture.md#task-page)). The actions-panel
-      redesign and the deferrals are open items above.
+      [docs](../docs/ui-architecture.md#task-page)). The deferrals are open
+      items above.
+- [x] Actions tab on the task page (replaces "Exec & actions"): the task's
+      actions as a list with **Open a shell** last; the chosen one as a typed
+      form (segmented / chips for enums, bounded ints, patterned and masked
+      strings, switches), the argv it renders to, run on one / all running /
+      unhealthy instances, and an exit code and output per instance, with the
+      equivalent `legion action run` line. `?tab=actions&action=<name>|shell`;
+      `?tab=exec` still works
+      ([plan §3](plans/ui-task-and-template-redesign-plan.md#3-actions-tab-phase-3),
+      [calls](calls/ui-task-and-template-redesign-plan_calls.md),
+      [docs](../docs/exec-and-actions.md)).
 - [x] Guided template launch: Variables → Review (creates vs updates, changed
       values, rendered-spec diff against the running job) → Launch (rollout
       progress, Copy as CLI); source and versions on their own tab
@@ -3162,7 +3171,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Template-launched jobs listed no tasks on the job and task pages: the
       UI took the first JSON submission as the spec, which for a template run
       can be `template.variables.json`. It now prefers `job.rendered.json`
-      ([calls entry 3](calls/ui-task-and-template-redesign-plan_calls.md)).
+      ([calls entry 5](calls/ui-task-and-template-redesign-plan_calls.md)).
 
 ## AWS rig: mitigations in place for the node-deregistration and plugin-build gaps
 

@@ -90,6 +90,16 @@ export type JobTask = {
   networkMode?: string
   ports: JobTaskPort[]
   service?: JobTaskService
+  actions: JobTaskAction[]
+}
+
+// What the jobspec declares about an action beyond `ListJobActions`: the argv
+// template the manager renders (`${param.<name>}` placeholders) and the
+// optional wall-clock cap. Shown as a preview; the manager does the rendering.
+export type JobTaskAction = {
+  name: string
+  command: string[]
+  timeout?: string
 }
 
 export type JobSpecData = {
@@ -286,6 +296,18 @@ const normalizeCount = (value: unknown): JobTaskCount | undefined => {
   return { num: raw.num, per: readTaskString(raw.per) || undefined }
 }
 
+const normalizeAction = (value: unknown): JobTaskAction | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const name = readTaskString(raw.name)
+  if (!name || !Array.isArray(raw.command)) return null
+  return {
+    name,
+    command: raw.command.map((part) => String(part)),
+    timeout: readTaskString(raw.timeout) || undefined,
+  }
+}
+
 const normalizeTask = (value: unknown): JobTask | null => {
   if (!value || typeof value !== 'object') return null
   const raw = value as Record<string, unknown>
@@ -327,6 +349,9 @@ const normalizeTask = (value: unknown): JobTask | null => {
     networkMode: network ? readTaskString(network.mode) || undefined : undefined,
     ports,
     service: normalizeService(raw.service),
+    actions: (Array.isArray(raw.actions) ? raw.actions : [])
+      .map((action) => normalizeAction(action))
+      .filter((action): action is JobTaskAction => Boolean(action)),
   }
 }
 

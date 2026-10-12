@@ -53,7 +53,54 @@ keeps working unchanged. Replacing rather than pushing history is deliberate:
 flipping between Logs and Overview while debugging should not take five back
 presses to leave.
 
-## 3. The spec is found by name (`job.rendered.json`), not by position
+## 3. Running an action on several instances is one session per allocation, from the browser
+
+**Call.** **Run on: All running / Unhealthy only** opens one exec WebSocket
+session per target allocation, all at once, and shows each one's exit code
+and output in its own row. The CLI line for a multi-target run says
+`# once per instance, with --alloc`.
+
+**Alternatives.** A server-side fan-out — an `allocation_ids` list (or a
+selector) on the action RPC that runs the action everywhere and streams
+tagged results, as Rundeck and SSM Run Command do.
+
+**Trade-off.** N sockets from one browser tab; no single audit record for "ran
+X on all instances" (there are N, one per session); closing the tab mid-run
+abandons the sessions; nothing coordinates rate or concurrency for a large
+task.
+
+**Why (simplicity).** No new RPC, ACL shape or audit format — each session is
+exactly what `legion action run --alloc` already is, so the authorization and
+audit story stays the one that exists. A server-side fan-out is the right
+answer for tasks with dozens of instances and is cheap to add later behind
+the same UI.
+
+## 4. The tab is named "Actions", and the shell is the last entry in its list
+
+**Call.** The tab is **Actions**, not "Exec & actions", "Runbook",
+"Operations", "Controls", "Commands" or "Toolbox" (all mocked). The raw shell
+is a dashed **Open a shell** entry at the bottom of the action list, plus the
+header's **Open shell**.
+
+```
+/jobs/web/tasks/api?tab=actions&action=flush-cache
+/jobs/web/tasks/api?tab=actions&action=shell&alloc=4217
+```
+
+**Alternatives.** Keep "Exec & actions" with the shell as a peer section; a
+separate Shell tab.
+
+**Trade-off.** A shell-first user takes one more click inside the tab (the
+header button covers the common case), and "Actions" reads as if the shell
+were not there.
+
+**Why (simplicity).** One word across every surface: the jobspec block
+(`actions = [...]`), the CLI (`legion action run`), the ACL resource
+(`action`) and now the UI. Putting the shell last nudges people toward the
+curated, typed, audit-friendly path — the reason actions exist — without
+hiding the escape hatch. `?tab=exec` still opens the tab, so old links work.
+
+## 5. The spec is found by name (`job.rendered.json`), not by position
 
 **Call.** `extractJobSpecData` now prefers the `job.rendered.json` submission
 and otherwise takes the first JSON submission that has a `tasks` array. JSON
@@ -74,7 +121,7 @@ page listed no tasks and its task pages said "Task not present in the current
 job spec". Matching by name fixes it for any row order, without a server
 change.
 
-## 4. "Failures · 24h" counts `allocation.failed` events, matched by task config
+## 6. "Failures · 24h" counts `allocation.failed` events, matched by task config
 
 **Call.** The Overview tile counts `allocation.failed` events in the last 24h
 whose metadata names one of this task's `task_config` ids (read from the state
@@ -95,7 +142,11 @@ emitting its `allocation.failed` event, so a failed allocation's id is never in
 any list the page has. The task config id survives in the event metadata. A
 real restart counter is deferred in the plan.
 
-## 5. The Exec tab keeps today's panel, with one target picker, until phase 3
+## 7. The Exec tab keeps today's panel, with one target picker, until phase 3
+
+*Superseded 2026-10-12 by phase 3 (entries 3 and 4): the Actions tab replaced
+this interim panel. Kept as the record of the phase-1 state; the keying fix it
+describes carried over.*
 
 **Call.** The Exec & actions tab shows a single target `<select>` (default:
 `?alloc`, else the current selection, else the first unhealthy allocation,
@@ -113,7 +164,7 @@ committing to either. Keying the panel on the id also fixes an old bug: the
 previous page rebuilt every exec panel on each 5s poll, killing any open
 terminal.
 
-## 6. A launch's outcome is read from the reply message
+## 8. A launch's outcome is read from the reply message
 
 **Call.** After `RunJobTemplate`, the Launch step decides between "follow the
 rollout", "new job — no rollout", and "unchanged" by matching the reply's
@@ -130,7 +181,7 @@ degrades to a neutral note, not an error).
 is a small follow-up; matching on `jobConfigId` keeps the rollout choice
 correct even when someone else's rollout is newer.
 
-## 7. "was …" badges only when the job's current config came from this template
+## 9. "was …" badges only when the job's current config came from this template
 
 **Call.** The Review's values table compares with the job's recorded
 `template.variables.json` only when `GetJobInfo.template.name` is this
@@ -145,7 +196,7 @@ history.
 else; a "was 1" next to an unrelated `replicas` would mislead exactly the
 cautious updater the step exists for.
 
-## 8. Template-scoped tokens get "can't tell", not "creates"
+## 10. Template-scoped tokens get "can't tell", not "creates"
 
 **Call.** When `GetJobInfo` is denied, Review says the token cannot tell
 whether the job exists, and shows the full rendered spec.
@@ -159,7 +210,7 @@ denied even for a job that does not exist. It also cannot follow the rollout.
 **Why.** A denial is not evidence of absence; guessing "new" is the one
 answer that could hide an overwrite.
 
-## 9. Source moves to its own tab on the template page
+## 11. Source moves to its own tab on the template page
 
 **Call.** The template page has **Launch** and **Source** tabs; the source,
 version list and publish editor live under Source, and the header's New

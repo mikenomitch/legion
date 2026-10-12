@@ -137,7 +137,7 @@ When one is required and what goes in it:
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
 | [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md) | shipped |
 | [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md) | shipped (2026-09-02; embedding the UI in the binary deliberately left open) |
-| [ui-task-and-template-redesign-plan.md](plans/ui-task-and-template-redesign-plan.md) | in execution (task page tabs + guided template launch built; actions panel layout pending review) |
+| [ui-task-and-template-redesign-plan.md](plans/ui-task-and-template-redesign-plan.md) | shipped 2026-10-12 (task page tabs, guided template launch, Actions tab; run history, server-side fan-out and a template plan RPC deferred) |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
 | [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
 | [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | superseded in part by suspend-resume-and-oversubscription (§0 convergence shipped; mechanics still the reference) |
