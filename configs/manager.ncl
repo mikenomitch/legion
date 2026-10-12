@@ -250,6 +250,18 @@
     streaming = {
       replicaUrl = "",
       syncInterval = "1s",
+      # Object-storage credentials for the replica, the takeover restore and
+      # the lease, all three. Leave unset (the default) to use the manager's
+      # platform identity: AWS_* keys, then web identity (EKS IRSA, SPIRE,
+      # Vault via AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE), then an ECS
+      # task role, then EC2 instance metadata. Set it for stores that only
+      # issue keys (R2, MinIO), imported from an uncommitted file
+      # (docs/persistence-streaming.md#credentials).
+      # credentials = {
+      #   accessKeyId = secrets.accessKeyId,
+      #   secretAccessKey = secrets.secretAccessKey,
+      #   sessionToken = secrets.sessionToken, # temporary keys only
+      # },
       lease = {
         provider = "none",
         key = "leases/default/primary.json",

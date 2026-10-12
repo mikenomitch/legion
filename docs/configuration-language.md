@@ -264,9 +264,10 @@ Get secrets and per-host values from one of these instead:
 
 ```nickel
 let secrets = import "secrets.ncl" in
-{ persistence = { streaming = { lease = { objectStorage = {
+{ persistence = { streaming = { credentials = {
   accessKeyId = secrets.accessKeyId,
-} } } } }
+  secretAccessKey = secrets.secretAccessKey,
+} } } }
 ```
 
 A job's runtime environment is a separate thing. `config.env` is passed to the

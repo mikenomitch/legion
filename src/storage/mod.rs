@@ -11,6 +11,7 @@ pub mod netpolicy_store;
 pub mod persistence;
 pub mod queries;
 pub mod raft;
+pub(crate) mod s3_credentials;
 pub mod snapshot_warm;
 pub mod store;
 
