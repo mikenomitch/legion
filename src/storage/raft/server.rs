@@ -156,6 +156,16 @@ impl RaftTransport for RaftTransportService {
         &self,
         request: Request<RaftLaneRequest>,
     ) -> Result<Response<RaftLaneReply>, Status> {
+        // A leader is replicating to us: a restarted member may stop holding
+        // its own elections (quiet start).
+        if let Ok(registry) = self.authenticate(&request) {
+            if let Some(seen) =
+                crate::storage::raft::Lane::from_wire_name(&request.get_ref().group_id)
+                    .and_then(|lane| registry.append_entries_seen.get(&lane))
+            {
+                seen.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         self.dispatch("AppendEntries", request, |raft, rpc| async move {
             raft.append_entries(rpc).await
         })

@@ -1508,6 +1508,17 @@ impl WorkerTaskManager {
         self.task_configs.get(&allocation_id)
     }
 
+    /// The last lines the allocation's current process has written to
+    /// stderr (bounded like [`TaskExit::stderr_tail`]), for a failure reason
+    /// decided while the process is still running — a health check that
+    /// gave up on a task still stuck pulling its image, say. `None` when it
+    /// wrote nothing or its runtime captures no logs.
+    pub fn recent_stderr(&self, allocation_id: i64) -> Option<String> {
+        let log_dir = self.instances.get(&allocation_id)?.log_dir.as_deref()?;
+        let from = self.stderr_marks.get(&allocation_id).copied().unwrap_or(0);
+        stderr_tail(log_dir, from)
+    }
+
     /// The exit an allocation's process made, while it is down: between the
     /// supervisor noticing the exit and the relaunch (or for good, once the
     /// allocation is terminal). `None` while the process runs.
@@ -3634,10 +3645,15 @@ impl WorkerTaskManager {
             let started = match persisted_process_identity(&record, pid) {
                 PersistedProcess::Live { started } => started,
                 PersistedProcess::Dead => {
+                    // The tracked leader is gone, but its children may not
+                    // be: kill the rest of the task's process group so
+                    // nothing unmanaged keeps its ports (spot-check P1-5).
+                    let killed = crate::worker::state::kill_orphaned_task_group(pid);
                     warn!(
                         allocation_id = record.allocation.id,
                         task_name = %record.task.name,
                         pid,
+                        killed_orphans = killed,
                         "Skipping persisted allocation with dead pid"
                     );
                     continue;
@@ -7976,5 +7992,248 @@ mod tests {
             can_enforce
         );
         assert_eq!(manager.resource_enforcement_enabled(), can_enforce);
+    }
+
+    /// P1-4: an allocation pushed straight to the worker (no heartbeat has
+    /// listed it, so no heartbeat created its gated namespace) starts in a
+    /// namespace its start creates, instead of failing with "namespace is
+    /// not ready"; and a failure releases the namespace the start made.
+    #[test]
+    fn pushed_gated_allocation_creates_its_namespace_at_start() -> R<()> {
+        if !crate::worker::netd::netns::can_manage_netns() {
+            eprintln!("skipping: needs root on Linux");
+            return Ok(());
+        }
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let allocation = Allocation {
+            id: 910_000 + i64::from(std::process::id() % 10_000),
+            network: Some(crate::structs::AllocNetwork {
+                mode: Some(crate::structs::netpolicy::MODE_GATED.to_string()),
+                ..Default::default()
+            }),
+            ..alloc()
+        };
+        let path = crate::worker::netd::netns::netns_path(allocation.id);
+        let _ = crate::worker::netd::netns::destroy(allocation.id);
+        assert!(!path.exists());
+
+        let task = TaskConfig {
+            config: json!({ "command": ["sleep", "30"] }),
+            ..TaskConfig::new("gated", "exec")
+        };
+        if let Err(err) = manager.run_allocation(&allocation, &task) {
+            // Root without CAP_SYS_ADMIN (an unprivileged container) cannot
+            // unshare; the start must say so rather than fall back.
+            let message = format!("{err:#}");
+            assert!(message.contains("could not be created"), "{message}");
+            return Ok(());
+        }
+        assert!(path.exists(), "the start created the namespace");
+
+        manager.record_failure(allocation.id, "test teardown");
+        assert!(!path.exists(), "a failed allocation releases its namespace");
+        Ok(())
+    }
+
+    /// Non-gated allocations never touch `/var/run/netns`.
+    #[test]
+    fn ensure_gated_namespace_ignores_ungated_allocations() -> R<()> {
+        assert_eq!(crate::task_plugins::ensure_gated_namespace(&alloc())?, None);
+        let host = Allocation {
+            network: Some(crate::structs::AllocNetwork {
+                mode: Some("host".into()),
+                ..Default::default()
+            }),
+            ..alloc()
+        };
+        assert_eq!(crate::task_plugins::ensure_gated_namespace(&host)?, None);
+        Ok(())
+    }
+
+    /// P2-8: `legion exec` into an `exec` task gets the task's environment,
+    /// Legion's allocation env included — the same env an action gets, since
+    /// both open the same session.
+    #[test]
+    fn exec_session_into_an_exec_task_gets_the_task_env() -> R<()> {
+        use std::io::Read;
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let allocation = Allocation {
+            network: Some(crate::structs::AllocNetwork {
+                address: Some("10.0.0.7".into()),
+                ports: vec![crate::structs::AllocPort {
+                    name: "http".into(),
+                    host_port: 23456,
+                    to: None,
+                    private_port: None,
+                }],
+                ..Default::default()
+            }),
+            ..alloc()
+        };
+        let task = TaskConfig {
+            config: json!({ "command": ["sleep", "30"], "env": { "GREETING": "hi" } }),
+            ..TaskConfig::new("web", "exec")
+        };
+        manager.run_allocation(&allocation, &task)?;
+
+        let mut session = manager.open_exec_session(
+            allocation.id,
+            None,
+            crate::task_plugins::ExecOptions::new(
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "echo \"$LEGION_PORT_HTTP $LEGION_ADDR_HTTP $LEGION_ALLOC_ID $GREETING\""
+                        .into(),
+                ],
+                false,
+            ),
+        )?;
+        let mut output = String::new();
+        session.take_output()?.stdout.read_to_string(&mut output)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while session.try_wait()?.is_none() {
+            assert!(std::time::Instant::now() < deadline, "exec never exited");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            output.trim(),
+            format!("23456 10.0.0.7:23456 {} hi", allocation.id)
+        );
+        manager.stop_allocation(allocation.id)?;
+        Ok(())
+    }
+
+    /// P1-9: a health check that gives up on a task still stuck before its
+    /// port opens (an image pull a registry refused) reports what the task
+    /// said, not only `Connection refused`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_failure_reason_carries_the_tasks_stderr() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        // A port nothing listens on.
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        let mut task = TaskConfig {
+            config: json!({
+                "command": ["sh", "-c",
+                    "echo 'Error: pull failed: 429 Too Many Requests' >&2; sleep 30"],
+            }),
+            checks: vec![TaskCheck {
+                check_type: TaskCheckType::Health,
+                name: Some("port".into()),
+                kind: TaskCheckKind::Tcp,
+                command: None,
+                path: None,
+                port: Some(crate::structs::network::CheckPort::Number(closed_port)),
+                every: Duration::from_millis(100),
+                timeout: Duration::from_millis(100),
+                unhealthy_after_count: 2,
+                boot_grace_time: Some(Duration::from_millis(300)),
+                unhealthy_after_count_timespan: None,
+            }],
+            ..TaskConfig::new("puller", "exec")
+        };
+        task.on_unhealthy.restart_count = 0;
+        let payload =
+            crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+        let launcher = manager.clone();
+        tokio::task::spawn_blocking(move || launch_task_allocation(&launcher, &payload)).await??;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let failure = loop {
+            if let Some(failure) = manager.lock().unwrap().drain_failures().pop() {
+                break failure;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the check never failed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            failure
+                .reason
+                .starts_with("health check failed: tcp check failed"),
+            "{}",
+            failure.reason
+        );
+        assert!(
+            failure
+                .reason
+                .ends_with("; last stderr: Error: pull failed: 429 Too Many Requests"),
+            "{}",
+            failure.reason
+        );
+        Ok(())
+    }
+
+    /// P1-9: while the process is down, failed checks are not counted — the
+    /// supervisor's verdict (exit status and stderr) is what the allocation
+    /// reports, never `Connection refused`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_checks_stand_aside_while_the_process_is_down() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        let mut task = TaskConfig {
+            config: json!({
+                "command": ["sh", "-c", "echo 'cannot read config' >&2; exit 2"],
+            }),
+            checks: vec![TaskCheck {
+                check_type: TaskCheckType::Health,
+                name: Some("port".into()),
+                kind: TaskCheckKind::Tcp,
+                command: None,
+                path: None,
+                port: Some(crate::structs::network::CheckPort::Number(closed_port)),
+                every: Duration::from_millis(50),
+                timeout: Duration::from_millis(50),
+                unhealthy_after_count: 1,
+                // Past the exit, so every counted check would be against a
+                // dead process.
+                boot_grace_time: Some(Duration::from_millis(400)),
+                unhealthy_after_count_timespan: None,
+            }],
+            ..TaskConfig::new("crasher", "exec")
+        };
+        task.on_unhealthy.restart_count = 0;
+        let payload =
+            crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+        let launcher = manager.clone();
+        tokio::task::spawn_blocking(move || launch_task_allocation(&launcher, &payload)).await??;
+
+        // The supervisor notices the exit (one tick of it, by hand).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let exit = loop {
+            if let Some(exit) = manager.lock().unwrap().poll_task_exits().pop() {
+                break exit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the task never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        // Well past the boot grace: the checks keep failing, and must not
+        // fail the allocation behind the supervisor's back.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            manager.lock().unwrap().drain_failures().is_empty(),
+            "health checks failed an allocation whose process was down"
+        );
+        crate::worker::task_supervisor::handle_exit(&manager, exit).await;
+        let failures = manager.lock().unwrap().drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].reason,
+            "exited with status 2; last stderr: cannot read config"
+        );
+        Ok(())
     }
 }

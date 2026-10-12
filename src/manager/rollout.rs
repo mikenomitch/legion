@@ -2261,6 +2261,22 @@ mod tests {
         assert_eq!(slots.slot_for_step(5), 2);
     }
 
+    /// A blocked rollout backs off instead of re-ticking every 2s forever
+    /// (the spot check saw 500+ tick events for one stuck rollout), and never
+    /// sleeps past its capacity timeout.
+    #[test]
+    fn blocked_rollouts_back_off_up_to_thirty_seconds() {
+        let secs = time::Duration::seconds;
+        assert_eq!(placement_wait_delay(secs(0), None), Duration::from_secs(2));
+        assert_eq!(placement_wait_delay(secs(3), None), Duration::from_secs(2));
+        assert_eq!(placement_wait_delay(secs(20), None), Duration::from_secs(10));
+        assert_eq!(placement_wait_delay(secs(600), None), Duration::from_secs(30));
+        assert_eq!(
+            placement_wait_delay(secs(600), Some(secs(5))),
+            Duration::from_secs(5)
+        );
+    }
+
     #[test]
     fn step_operation_order_matches_replacement_mode() {
         assert_eq!(

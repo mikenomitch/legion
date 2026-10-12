@@ -293,7 +293,10 @@ instrument.
   `legion_nodes{status="lost"}` tells you nodes are currently away.
 - **`legion_nodes_recovered_total{path}`** (counter): lost nodes that came
   back. `path="heartbeat"` means the node resumed beating.
-  `path="reregistration"` means the worker re-registered. `marked_lost` minus
+  `path="reregistration"` means the worker re-registered.
+  `path="reconcile"` means the liveness owner found a node it is hearing
+  from still stored `unavailable` and returned it to the scheduling pool
+  (a half-applied recovery; see docs/node-liveness.md). `marked_lost` minus
   this is the fleet's net loss. A flapping fleet moves both.
 
 ### Node usage

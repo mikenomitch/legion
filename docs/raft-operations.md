@@ -6,8 +6,9 @@ committed by a quorum before it is acknowledged or visible, so losing any
 minority of managers loses no committed write.
 
 > Current scope: write replication, leader election, membership (join
-> tokens and operator commands), non-leader write rejection with a leader
-> hint, snapshots and log compaction, crash/restart recovery (log replay or
+> tokens and operator commands), leadership transfer, writes on any manager
+> (followers forward them to the leader), worker failover between managers,
+> snapshots and log compaction, crash/restart recovery (log replay or
 > snapshot install), and `legion state backup` / `--restore-from` are all
 > enabled. For the engine-level reference, see `docs/multi-raft.md`.
 
@@ -22,10 +23,11 @@ minority of managers loses no committed write.
 - Nothing is visible anywhere, even on the leader, before quorum commit.
   Callers get their reply only after the local apply, so read-your-writes
   holds on the leader.
-- Mutations sent to a **non-leader** are rejected with
-  `FAILED_PRECONDITION`. The message includes the current leader's name and
-  address, and the CLI shows this hint. Point clients (`LEGION_ADDR`) at the
-  leader. Every manager serves reads from its local replica.
+- **Any manager accepts any request.** Every manager serves reads from its
+  local replica. A write that reaches a follower is forwarded by that
+  follower to the leader, and the leader's reply comes back unchanged, so
+  `LEGION_ADDR` can point at any manager. See [Writes on any
+  manager](#writes-on-any-manager).
 - **Scheduling is leader-only.** Every manager replicates eval-queue and
   scheduler state, but only the leader's eval workers and node status
   checker act on it. After a leadership change, the new leader's loops take
@@ -205,7 +207,7 @@ loudly and blocks rarely:
 **Decommissioning the current leader** takes two steps:
 
 ```bash
-legion raft command trigger-election --target <another-manager>
+legion raft command transfer-leader --target <another-manager>
 ```
 
 Then, once `legion raft status` shows that manager leading every lane:
@@ -214,10 +216,32 @@ Then, once `legion raft status` shows that manager leading every lane:
 legion raft command remove-member --target <old-leader>
 ```
 
-The current engine does **not support** `step-down` or `transfer-leader`
-(openraft 0.9 has no leader-transfer API). Both return an error that says
-so. To move leadership, run `trigger-election` against the manager you want
-as the new leader.
+### Moving leadership
+
+```bash
+legion raft command transfer-leader --target mgr-b
+legion raft command step-down
+```
+
+`transfer-leader` makes the named voter the leader. `step-down` hands
+leadership to the most caught-up other voter. openraft 0.9 has no
+leader-transfer API, so both are built on elections: the manager you ask
+asks the target (over the authenticated raft transport) to campaign,
+re-asks no faster than one election timeout, and stops campaigning itself
+while it hands leadership away. The command returns when the target leads
+the control group, or after its deadline (ten election timeouts, at least
+10s) with a `⚠` warning that leadership has not moved yet; check
+`legion raft status` and re-run it. A deliberate move raises the term by a
+few, because voters that still hold the old leader's lease refuse the first
+campaign.
+
+Both work from any manager: `step-down` runs on the leader (only the leader
+knows how far each follower has replicated), and a follower you ask forwards
+it there (see [Writes on any manager](#writes-on-any-manager)). A target that
+is not a member, or is a learner,
+fails with `INVALID_ARGUMENT` naming the members. A target running a release
+without remote elections fails with a message saying to upgrade it.
+`trigger-election` still exists and campaigns on the manager you ask.
 
 ### Join token
 
@@ -227,6 +251,34 @@ legion raft join-token
 
 Any running member can issue a join token. The embedded leader address
 always points at the current leader.
+
+## Writes on any manager
+
+Only the leader commits writes, but you do not have to find it. A write that
+reaches a follower is rejected there before any work is done, and the
+follower then replays the request to the leader itself, over the same
+manager-to-manager path the raft transport uses, and returns the leader's
+reply. This covers every unary Manager RPC: the CLI and UI, `legion job run`,
+worker registration (a worker whose join token names a follower registers
+normally), and anything else that writes. Reads never leave the manager you
+asked.
+
+- **Authorization is the leader's.** The request travels with your bearer
+  token, idempotency key, and deadline, and the leader runs the same ACL
+  check. Retrying a forwarded write is as safe as retrying it against the
+  leader directly.
+- **One hop.** The forwarded request is marked (`x-legion-forwarded-by`);
+  the leader answers it itself and never forwards it again.
+- **When the leader cannot be reached** from the follower (mid-election, or
+  a partition), you get the original `FAILED_PRECONDITION`, which names the
+  leader and its *raft advertise address* and says forwarding failed. That
+  address is what peers dial; it may not be reachable from your machine.
+  Retry once a leader is elected, or set `LEGION_ADDR` to an API address of
+  the leader that you can reach.
+- `ExecAllocation` (`legion exec`) is not forwarded: it is a stream, and it
+  does not write raft state, so any manager serves it.
+- The forward uses plaintext HTTP/2 between managers, like the raft
+  transport.
 
 ## UI operations
 
@@ -246,10 +298,19 @@ backed by the same engine state as the CLI.
   leader is known and continue without one. It catches up as soon as its
   listener is up and peers reconnect.
 - **Stopping a member:** send SIGTERM. The manager drains its API and shuts
-  each lane's raft core down cleanly. Leadership is not transferred first
-  (openraft 0.9 has no API for it), so stopping a leader pauses writes on its
-  lanes until the others elect a new leader. Restart one member at a time.
-  See [Stopping a manager](upgrades.md#stopping-a-manager).
+  each lane's raft core down cleanly. Stopping does not transfer leadership,
+  so stopping the leader pauses writes until the others elect a new one (about
+  one election timeout plus the leader lease). To avoid the pause, run
+  `legion raft command step-down` on the leader first. Restart one member at
+  a time. See [Stopping a manager](upgrades.md#stopping-a-manager).
+- **Restarting a member is quiet.** A restarted member that belongs to a
+  multi-voter cluster does not campaign until a leader replicates to it, or
+  until its quiet window passes (five election timeouts, at least 3s), which
+  covers a whole-cluster restart. Before, it campaigned on its first election
+  tick, before its own listener was up, and its higher term then deposed the
+  healthy leader: every restart cost an election and several terms. A term
+  that still climbs on a steady cluster means elections are failing: check
+  the election timings below and whether the hosts stall.
 - **Observability:** `legion raft status` and `history`, the UI Raft page,
   and `/readyz` all report raft state. In raft mode, `/readyz` requires a
   known leader. While the voter count is even, it also includes the
@@ -269,14 +330,19 @@ backed by the same engine state as the CLI.
   live under `raft.dataDir` (per lane). Both must survive restarts
   together. See `forceNewCluster` in `docs/multi-raft.md` for what happens
   when they get out of sync.
-- **Workers and failover:** each worker dials one fixed manager. Sometimes
-  that manager cannot propose a worker's write, because it is a follower
-  after a failover or does not lead the owning lane under
-  `topology = "lanes"`. In that case it forwards the write to the leader
-  over the authenticated raft transport and answers the worker after the
-  forwarded write commits. Failure reports, health reports, and volume
-  reports keep working without the worker redialing. See
-  `docs/multi-raft.md`, "Non-leader write redirects and forwarding".
+- **Workers and failover:** a worker learns every manager's address from
+  its registration and heartbeat replies (`manager_addresses`, from the raft
+  membership), persists them, and moves to the next manager after two
+  heartbeats that cannot reach its current one. So losing a manager does not
+  strand the workers that were talking to it, and a restarted worker comes up
+  even when the manager in its join token is down. The addresses are the
+  members' `advertiseAddr`, so workers must be able to reach them. Whichever
+  manager a worker reaches, a write it cannot propose (it is a follower, or
+  does not lead the owning lane under `topology = "lanes"`) is forwarded to
+  the leader over the authenticated raft transport, and the worker is
+  answered after the forwarded write commits. See
+  [Managers a worker can reach](architecture-managers-workers.md#managers-a-worker-can-reach)
+  and `docs/multi-raft.md`, "Non-leader write redirects and forwarding".
 - **Heartbeats do not go through raft.** A steady-state heartbeat is one
   write into the memory of the manager that owns node status. A manager
   that does not own node status sends one digest RPC per second, regardless
@@ -317,12 +383,12 @@ lines.
 
 ## Not yet done
 
-- Automatic forwarding of **client** writes from followers. Today, followers
-  reject client writes with a leader hint. The worker plane and internal
-  lane halves do forward (see above).
+- Pre-vote. A member that is partitioned (not restarted) still campaigns
+  when its election timeout passes, and its higher term deposes the leader
+  when the partition heals. openraft 0.9 does not implement pre-vote; the
+  quiet restart above covers the common case.
 - `topology = "lanes"` is runnable and measured but stays opt-in. See
   `docs/multi-raft.md` ("Topology: `single` vs `lanes`").
-- `step-down` / `transfer-leader` (openraft 0.9 has no leader-transfer API).
 - Transport mTLS. A shared cluster secret secures the raft transport.
 
 For the full list of limitations, see `docs/multi-raft.md` ("Limitations

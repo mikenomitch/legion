@@ -2920,8 +2920,10 @@ mod tests {
             &SandboxTaskConfig::from_value(&json!({ "image": "a", "command": ["x"], "memory_mib": 256 }))?,
         )?;
 
-        // Not pinned to macOS: 128 MiB is a valid microVM guest.
+        // Not pinned to macOS: 128 MiB is a valid microVM guest (sized by
+        // `resources`, so no memory_mib mismatch warning either).
         let mut task = task_with(small);
+        task.resources = json!({ "memory": 128 });
         assert!(SandboxTaskPlugin.check_resources(&task)?.is_empty());
         // Pinned to macOS: rejected at submit, naming the floor.
         task.constraints = json!({ "os": "macos" });

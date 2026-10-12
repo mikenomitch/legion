@@ -367,10 +367,15 @@ async fn handle_unhealthy(
         }
     }
 
-    manager
-        .lock()
-        .expect("task manager")
-        .record_failure(allocation.id, format!("health check failed: {reason}"));
+    let mut guard = manager.lock().expect("task manager");
+    // What the task itself last said is often the real story behind a check
+    // that never passed (an image pull the registry refused, a missing
+    // config file), so it rides along in the reason the user reads.
+    let reason = match guard.recent_stderr(allocation.id) {
+        Some(stderr) => format!("health check failed: {reason}; last stderr: {stderr}"),
+        None => format!("health check failed: {reason}"),
+    };
+    guard.record_failure(allocation.id, reason);
     Ok(())
 }
 

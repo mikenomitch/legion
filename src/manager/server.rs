@@ -27,25 +27,25 @@ use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
 // KV encryption keyring surface (docs/kv-encryption.md).
 use crate::structs::{
-    validate_keyed_instance_id, AcquireKvLockReply,
-    AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
-    AllocationLog, BootTicket, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
-    CreateInstancesRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteKvReply,
-    DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply,
-    DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
-    DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
-    GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
-    GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply,
-    GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply,
-    GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest,
-    GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
-    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
-    GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest,
-    GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodeUsageReply,
-    GetNodeUsageRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
+    validate_keyed_instance_id, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
+    AdvanceRolloutRequest, AllocationHealth, AllocationLog, BootTicket, CreateInstanceReply,
+    CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, DeleteJobTemplateReply,
+    DeleteJobTemplateRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply,
+    DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply,
+    DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, FailedAllocation,
+    GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply,
+    GetArtifactCredentialRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest,
+    GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply,
+    GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply,
+    GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest,
+    GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply,
+    GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
+    GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNodeContentReply,
+    GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodeUsageReply, GetNodeUsageRequest,
+    GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest,
+    GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest,
+    GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest,
+    GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
     GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
     HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IngressCertificate,
     Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
@@ -124,8 +124,24 @@ pub use snapshot_rpcs::{
 pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, IdleSweeper};
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
-    error!("{action}: {:?}", err);
+    let status = store_error_status(action, &err);
+    // Log by what the error means for the server. A refused or missing-thing
+    // answer (NotFound, FailedPrecondition, a non-leader redirect, ...) is
+    // the caller's to act on and is returned to it in full, so it is not a
+    // server error: an ERROR line for every `legion job info typo` or every
+    // heartbeat that races its node's registration buried the real ones.
+    match status.code() {
+        tonic::Code::Internal | tonic::Code::DataLoss | tonic::Code::Unknown => {
+            error!("{action}: {:?}", err)
+        }
+        tonic::Code::Unavailable => warn!("{action}: {err:#}"),
+        _ => debug!("{action}: {err:#}"),
+    }
+    status
+}
 
+/// The gRPC status for a store error (see [`map_store_error`]).
+fn store_error_status(action: &str, err: &anyhow::Error) -> Status {
     // A write proposed on a raft non-leader: FAILED_PRECONDITION with the
     // leader name+address in the message so callers can redial (plan §A4,
     // JC-4). Checked before the storage-error classes because the raft
@@ -151,7 +167,7 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
         return status;
     }
 
-    let Some(storage_error) = StorageError::from_anyhow(&err) else {
+    let Some(storage_error) = StorageError::from_anyhow(err) else {
         // An untyped error is a bug or an unexpected failure, not a caller
         // mistake, so INTERNAL — but with its cause: the caller gets the same
         // sentence the server just logged rather than a bare "Internal
@@ -7544,10 +7560,20 @@ impl Manager for ManagerDaemonService {
         )?;
         let req = request.into_inner();
         let actor = req.actor.unwrap_or_else(|| "api".to_string());
-        let outcome = self
-            .store
-            .issue_raft_command(&req.command, req.target_node_id.as_deref(), &actor)
-            .map_err(|e| map_store_error("Error issuing raft command", e))?;
+        // Off the async workers: `transfer-leader` / `step-down` wait (up to
+        // their deadline) for leadership to move, and membership changes
+        // wait for commits.
+        let outcome = {
+            let store = self.store.clone();
+            let command = req.command.clone();
+            let target = req.target_node_id.clone();
+            tokio::task::spawn_blocking(move || {
+                store.issue_raft_command(&command, target.as_deref(), &actor)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft command task failed: {e}")))?
+            .map_err(|e| map_store_error("Error issuing raft command", e))?
+        };
         let status = self
             .store
             .raft_status()
@@ -9866,8 +9892,19 @@ async fn fetch_allocation_logs(
         })
         .await
         .map_err(|status| {
+            // A failure to reach the worker at all is explained in full (node,
+            // address, port); an answer from the worker is relayed by message.
+            let reached = std::error::Error::source(&status).is_none();
             let status = target.explain(status);
-            format!("worker on {} returned {}", allocation.node_id, status.message())
+            if reached {
+                format!(
+                    "worker on {} returned {}",
+                    allocation.node_id,
+                    status.message()
+                )
+            } else {
+                status.message().to_string()
+            }
         })?;
 
     Ok(reply.into_inner().streams)
@@ -12528,10 +12565,7 @@ mod tests {
             }))
             .await?;
         assert_eq!(response.into_inner().message, "ok");
-        assert_eq!(
-            called.lock().expect("mutex").as_deref(),
-            Some("node-1")
-        );
+        assert_eq!(called.lock().expect("mutex").as_deref(), Some("node-1"));
 
         let refused = manager
             .restart_worker(Request::new(RestartWorkerRequest {
@@ -14875,6 +14909,151 @@ mod tests {
             "complete"
         );
 
+        Ok(())
+    }
+
+    /// A terminal report for a task other tasks depend on queues the eval
+    /// that places them (they were held until it exited); a report for a
+    /// task nothing depends on queues nothing.
+    #[test]
+    fn a_terminal_report_queues_the_dependents_eval() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "dag-report".into(),
+            tasks: vec![
+                TaskConfig {
+                    lifecycle: crate::structs::TaskLifecycle::Batch,
+                    group: "prep".into(),
+                    ..TaskConfig::new("prep", "noop")
+                },
+                TaskConfig {
+                    group: "api".into(),
+                    depends_on: vec![crate::structs::TaskDependency {
+                        task: "prep".into(),
+                        condition: crate::structs::TaskDependencyCondition::Success,
+                    }],
+                    ..TaskConfig::new("api", "noop")
+                },
+            ],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let placed = crate::manager::scheduler::Scheduler::new(&store)?
+            .plan_and_apply(&job_config_id, crate::manager::scheduler::PlanMode::Fresh)?;
+        assert_eq!(placed.allocations.len(), 1, "api waits for prep");
+        assert_eq!(evals_of_kind(&store, "dag-report", "job_reschedule")?, 0);
+
+        handle_terminated_allocations(
+            &store,
+            "node-a",
+            &[crate::structs::TerminatedAllocation {
+                allocation_id: placed.allocations[0].id,
+                success: true,
+                exit_code: Some(0),
+                signal: None,
+                message: "exited with status 0".into(),
+            }],
+        )?;
+        assert_eq!(evals_of_kind(&store, "dag-report", "job_reschedule")?, 1);
+        Ok(())
+    }
+
+    /// Re-running the unchanged spec of a stopped job starts it again (it
+    /// used to reply "no update needed" and place nothing). A job that is
+    /// running keeps the old answer.
+    #[tokio::test]
+    async fn rerunning_an_unchanged_stopped_job_starts_it_again() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        insert_node(&store, "node-a")?;
+        let jobspec = json!({
+            "name": "revive",
+            "task": { "runtime": "noop", "config": {} }
+        })
+        .to_string();
+        let run = || {
+            manager.run_job(Request::new(RunJobRequest {
+                parsed_jobspec: jobspec.clone(),
+                submissions: vec![submission()],
+                priority: None,
+                force_reschedule: false,
+                idempotency_key: None,
+            }))
+        };
+
+        run().await?;
+        let job_config_id = store.get_job_config("revive")?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        store.place_alloc("node-a", task_id)?;
+        let running = run().await?.into_inner();
+        assert!(
+            running.message.contains("no update needed"),
+            "{}",
+            running.message
+        );
+        assert_eq!(evals_of_kind(&store, "revive", "job_update")?, 0);
+
+        store.stop_job("revive")?;
+        store.remove_allocs_for_job("revive")?;
+        let revived = run().await?.into_inner();
+        assert!(
+            revived.message.contains("starting it again"),
+            "{}",
+            revived.message
+        );
+        assert_eq!(store.get_job("revive")?.status, "done");
+        assert_eq!(evals_of_kind(&store, "revive", "job_update")?, 1);
+        Ok(())
+    }
+
+    /// GetJobInfo reports what the job is doing, not the stored `done`.
+    #[tokio::test]
+    async fn job_info_reports_the_derived_status() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "status-job".into(),
+            tasks: vec![TaskConfig::new("api", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        async fn status_of(manager: &ManagerDaemonService) -> R<String> {
+            let reply = manager
+                .get_job_info(Request::new(GetJobInfoRequest {
+                    name: "status-job".into(),
+                }))
+                .await?;
+            Ok(reply.into_inner().job.expect("job").status)
+        }
+        assert_eq!(
+            status_of(&manager).await?,
+            "pending",
+            "accepted, nothing placed yet"
+        );
+
+        let job_config_id = store.get_job_config("status-job")?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        store.place_alloc("node-a", task_id)?;
+        assert_eq!(status_of(&manager).await?, "running");
+
+        let listed = manager
+            .list_jobs(Request::new(ListJobsRequest::default()))
+            .await?
+            .into_inner();
+        assert_eq!(listed.jobs[0].status, "running");
+        assert_eq!(listed.status_counts.get("running"), Some(&1));
+
+        store.stop_job("status-job")?;
+        assert_eq!(status_of(&manager).await?, "stopped");
         Ok(())
     }
 

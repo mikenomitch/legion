@@ -165,7 +165,10 @@ pub fn split_hint(message: &str) -> (&str, Option<&str>) {
 }
 
 pub fn friendly_status(action: &str, status: Status) -> anyhow::Error {
-    let code = status.code();
+    let code_raw = status.code();
+    // The stable name (`FailedPrecondition`), the same `code` the JSON
+    // envelope carries — tonic's `Display` for a code is a prose sentence.
+    let code = crate::cmd::output::code_name(code_raw);
     let (message, server_hint) = split_hint(status.message().trim());
     let mut description = if message.is_empty() {
         action.to_string()
@@ -176,7 +179,7 @@ pub fn friendly_status(action: &str, status: Status) -> anyhow::Error {
         return anyhow!("{description} [code={code}]\nHint: {hint}");
     }
 
-    let hint = crate::cmd::output::hint_for(code, message);
+    let hint = crate::cmd::output::hint_for(code_raw, message);
 
     if let Some(hint) = hint {
         description.push_str(&format!(" ({hint})"));

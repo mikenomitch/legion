@@ -7056,7 +7056,11 @@ impl Store {
     // NODES
     //
 
-    #[instrument(err, skip_all)]
+    // `NotFound` is an answer here, not a failure: registration looks every
+    // joining node up first, so a fresh worker's first join always misses.
+    // Errors are recorded at debug and the caller decides what they mean
+    // (`map_store_error` logs the real ones at error).
+    #[instrument(err(level = "debug"), skip_all)]
     pub fn get_node(&self, id: &str) -> R<Node> {
         let conn = self.read_connection()?;
         let node = conn
@@ -8749,7 +8753,9 @@ impl Store {
     // JOBS
     //
 
-    #[instrument(err, skip_all)]
+    // A missing job is an answer the caller maps (NotFound), not a store
+    // failure; recorded at debug like `get_node`.
+    #[instrument(err(level = "debug"), skip_all)]
     pub fn get_job(&self, name: &str) -> R<Job> {
         let conn = self.read_connection()?;
         let job = conn
@@ -9037,7 +9043,9 @@ impl Store {
     /// children) and emits the event. Cross-op atomicity was never promised
     /// (§A2): a crash mid-sequence leaves a stopped job with some children
     /// already cleared, and re-running destroy finishes the remainder.
-    #[instrument(err, skip_all)]
+    // Refusals (the job is still running) are the caller's to act on;
+    // `map_store_error` logs the real failures at error.
+    #[instrument(err(level = "debug"), skip_all)]
     pub fn destroy_job(&self, name: &str) -> R<()> {
         // Validate first (same checks the control op re-runs in its own
         // transaction) so a bad request deletes nothing from any lane.
@@ -11936,10 +11944,11 @@ impl Store {
     ///
     /// - `running`: at least one allocation that has not reached a terminal
     ///   state;
+    /// - `failed`: nothing live, and a task of the latest config failed for
+    ///   good (exited non-zero with no restart left, or its reschedule
+    ///   budget ran out), so nothing more will run;
     /// - `complete`: nothing live, and every task of the latest config
     ///   finished successfully (a batch job that ran to completion);
-    /// - `failed`: nothing live, and every task of the latest config
-    ///   finished with at least one failure;
     /// - `pending`: anything else: nothing placed yet, nothing that fits,
     ///   or tasks waiting on a dependency.
     pub fn derived_job_statuses(&self, job_id: Option<&str>) -> R<HashMap<String, String>> {
@@ -11996,12 +12005,10 @@ impl Store {
     fn derive_job_status(live: i64, tasks: i64, succeeded: i64, failed: i64) -> &'static str {
         if live > 0 {
             "running"
-        } else if tasks > 0 && succeeded + failed == tasks {
-            if failed > 0 {
-                "failed"
-            } else {
-                "complete"
-            }
+        } else if failed > 0 {
+            "failed"
+        } else if tasks > 0 && succeeded == tasks {
+            "complete"
         } else {
             "pending"
         }
@@ -12028,6 +12035,21 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Whether an eval of `kind` for `job_config_id` is pending with a
+    /// `ready_at` in the future: a timer, such as a batch schedule's next
+    /// `job_update`, that is already set.
+    pub fn delayed_eval_pending(&self, kind: &str, job_config_id: &str) -> R<bool> {
+        let conn = self.read_connection()?;
+        let pending: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM eval
+               WHERE type = ?1 AND job_config_id = ?2
+                 AND status = 'pending' AND ready_at > ?3);",
+            params![kind, job_config_id, Self::now_rfc3339()?],
+            |row| row.get(0),
+        )?;
+        Ok(pending)
     }
 
     /// Whether nothing of the job is running or about to run: no allocation
@@ -26619,6 +26641,38 @@ mod tests {
         assert!(store
             .removed_allocations(Some("logs-web"), None, 10)?
             .is_empty());
+        Ok(())
+    }
+
+    /// P2-6: a fresh worker's first registration looks its node up and
+    /// misses. That is the expected answer, and must not be logged as an
+    /// ERROR on every fresh start (it is still recorded, at debug).
+    #[test]
+    fn a_missing_node_lookup_is_not_logged_as_an_error() -> R<()> {
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let store = setup_store()?;
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || Capture(sink.clone()))
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(store.get_node("never-registered").is_err());
+        });
+        let logged = String::from_utf8(buffer.lock().unwrap().clone())?;
+        assert!(!logged.contains("ERROR"), "{logged}");
+        assert!(logged.contains("node not found"), "{logged}");
         Ok(())
     }
 

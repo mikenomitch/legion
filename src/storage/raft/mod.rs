@@ -168,6 +168,12 @@ pub(crate) struct RaftTransportRegistry {
     /// `Store::raft_set_advertised_schema_version` to stand in for an older
     /// build.
     pub(crate) schema_version: Arc<std::sync::atomic::AtomicU32>,
+    /// Per lane: set the first time an AppendEntries (a leader's
+    /// replication or heartbeat) reaches this manager. A restarted member
+    /// holds its own elections until this flips or its quiet window passes,
+    /// so it rejoins as a follower instead of deposing a healthy leader
+    /// with a higher term (see `driver::quiet_start`).
+    pub(crate) append_entries_seen: HashMap<Lane, Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RaftTransportRegistry {

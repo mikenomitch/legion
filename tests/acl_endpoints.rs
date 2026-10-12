@@ -1743,6 +1743,45 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
         .await
         .expect_err("revoked join token must be rejected");
     assert_eq!(closed.code(), Code::Unauthenticated);
+
+    // ...but the fleet that already joined is unaffected: a worker that
+    // restarts after its join token was revoked (or expired) comes back on
+    // its persisted node token alone (spot-check P0-8).
+    svc.worker_pre_register(req(
+        WorkerPreRegisterRequest {
+            worker_type: "default".into(),
+            join_token: None,
+        },
+        Some(&rotated),
+    ))
+    .await
+    .expect("a node token pre-registers its node after the join token is gone");
+    let restarted = svc
+        .worker_register(req(
+            WorkerRegisterRequest {
+                name: "joined-worker".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token: None,
+                ..Default::default()
+            },
+            Some(&rotated),
+        ))
+        .await
+        .expect("a node token re-registers its node after the join token is gone")
+        .into_inner();
+    assert_eq!(restarted.node_token, None, "the presented token is kept");
+    svc.heartbeat(req(
+        HeartbeatRequest {
+            id: "joined-worker".into(),
+            ..Default::default()
+        },
+        Some(&rotated),
+    ))
+    .await
+    .expect("the kept node token still heartbeats");
     Ok(())
 }
 
@@ -1859,18 +1898,25 @@ async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
         "{}",
         status.message()
     );
-    let rotated = svc
+    // Re-registering with the node token itself (what a restarted worker
+    // does, from its persisted token) keeps that token: the reply mints
+    // none, and the presented token stays valid. That is what lets a worker
+    // restart after its join token expired (spot-check P0-8).
+    let kept = svc
         .worker_register(register("intruder", "default", None, Some(&intruder)))
         .await?
         .into_inner()
-        .node_token
-        .expect("re-registration rotates the node token");
+        .node_token;
+    assert_eq!(
+        kept, None,
+        "a node-token re-registration keeps the presented token"
+    );
     svc.heartbeat(req(
         HeartbeatRequest {
             id: "intruder".into(),
             ..Default::default()
         },
-        Some(&rotated),
+        Some(&intruder),
     ))
     .await
     .expect("a node token heartbeats for its own node");

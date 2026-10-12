@@ -194,7 +194,20 @@ pub fn explain_failure(node_id: &str, address: &str, status: Status) -> Status {
         if let Some(rustls_error) = err.downcast_ref::<rustls::Error>() {
             tls = Some(rustls_error.to_string());
         }
+        // `io::Error::source` skips the error it wraps, so look inside it:
+        // tokio-rustls reports handshake failures as an io::Error around a
+        // rustls::Error.
+        if let Some(rustls_error) = err
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        {
+            tls = Some(rustls_error.to_string());
+        }
         next = err.source();
+    }
+    if tls.is_none() && cause.contains("certificate") {
+        tls = Some(cause.clone());
     }
     let port = address
         .rsplit_once(':')

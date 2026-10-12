@@ -82,15 +82,67 @@ Scheduling uses dependency-aware readiness:
 
 - The DAG is topologically sorted.
 - Cycles are rejected.
-- Dependencies evaluate against current task statuses and already-planned tasks.
+- Dependencies evaluate against the task statuses workers report. A task
+  whose dependencies are not met yet is **held**: it is not placed, and it
+  does not count as short of capacity.
 
 Dependency conditions:
 
-- `start`: the dependency has started or is being placed now.
-- `complete`: the dependency is complete or successful (or is a batch task being placed now).
-- `success`: the dependency must not have failed and must be successful (or is a batch task being placed now).
+| Condition | Met when the dependency… | Typical use |
+| --- | --- | --- |
+| `start` | has started, or is being placed in the same pass | a sidecar beside its primary |
+| `complete` | has finished, whether it exited 0 or not | a cleanup step that runs either way |
+| `success` | has finished with a successful exit (`successExitCodes`, default `0`) | the next step of a pipeline |
 
-Only ready tasks enter the current planning pass.
+`complete` and `success` are met only by a reported exit. A batch dependency
+that has merely been placed, or is still running, holds its dependents. A
+batch task with several replicas finishes when every replica has: it is
+`success` once all of them exited successfully, and `failed` as soon as one
+fails for good.
+
+Held tasks move on their own. When a worker reports that a task with
+dependents reached a terminal state, the manager queues an eval for the job:
+a `job_reschedule`, or a `rollout_tick` when the config is being rolled out
+to, so the rollout's step and health gating still apply. That eval places
+whatever the exit made ready. A three-step pipeline therefore runs one step
+at a time:
+
+```nickel
+tasks = [
+  { name = "fetch",    lifecycle = "batch", ... },
+  { name = "validate", lifecycle = "batch",
+    dependsOn = [{ task = "fetch", condition = "success" }], ... },
+  { name = "serve",    lifecycle = "service",
+    dependsOn = [{ task = "validate", condition = "success" }], ... },
+]
+```
+
+`validate` is placed only after `fetch` exits 0, and `serve` only after
+`validate` does. If `validate` fails for good (it exits unsuccessfully under
+`restart = { policy = "never" }`, or its reschedule budget runs out), `serve`
+never starts and the job reads `failed`.
+
+A restart of the whole job (a batch `schedule`'s next run,
+`legion job run --force-reschedule`, a KV `restart`) resets every task to
+`pending` first, so the previous run's results never satisfy the new run's
+conditions.
+
+`legion job plan` is a dry run and shows where every task would eventually
+land: it treats batch dependencies as if they will succeed.
+
+Diagnostics: an eval that leaves tasks held says so in its outcome
+(`legion events list --job <job>`, the `eval.completed` message ends with
+`waiting on dependencies: validate, serve`).
+
+Known limitations:
+
+- A runtime that cannot report exits (`noop`, or a third-party plugin that
+  does not supervise a process) reports a batch task complete as soon as it
+  starts, so its dependents follow right away (see
+  [Task Supervision](task-supervision.md)).
+- A completed batch allocation keeps its row, and with it its share of the
+  node's resources, until the job is stopped or restarted. A pipeline whose
+  steps together need more than a node has free can hold its last step.
 
 Lifecycle rules, enforced at submit and by `legion job validate`:
 
@@ -324,6 +376,26 @@ placement, decides a batch task's `Success`, so
 including the version-skew rule for workers that predate exit reporting, are in
 [Task Supervision](task-supervision.md).
 
+The worker never sees the jobspec, so the manager sends each task's
+`lifecycle` and `restart` block with every dispatch
+(`TaskAllocation.task_lifecycle` / `task_restart`). With no `restart` block,
+or one that leaves out `policy`, the policy follows the lifecycle:
+
+| Lifecycle | Policy | Exit 0 (or another `successExitCodes` entry) | Any other exit |
+| --- | --- | --- | --- |
+| `batch` | `onFailure` | allocation `complete`, task `success`; not restarted | restarted in place while the restart budget lasts, then failed and rescheduled |
+| `service`, `sidecar` | `always` | restarted in place | restarted in place, then failed and rescheduled |
+
+A batch task's terminal exit reaches the manager on the worker's next
+heartbeat (`HeartbeatRequest.terminated_allocations`), which is what moves its
+task status from `running` to `success` (or `failed` for a `never`-policy task
+that exited unsuccessfully), the status `dependsOn` conditions read. The
+completed allocation keeps its row and is never dispatched again. In
+`legion job events`, a finished batch task appears as `allocation.terminated`;
+a task that failed for good appears as `allocation.failed` with the exit
+status and the last lines the task wrote to stderr (for example `exited with
+status 1; last stderr: Error: ... 429 Too Many Requests`).
+
 ### Worker-side health loop
 
 For each allocation with checks:
@@ -336,6 +408,17 @@ When the unhealthy threshold is reached:
 1. Restart locally if `on_unhealthy.restart_count/restart_period/restart_delay` allows it.
 2. If restarts are exhausted, record an allocation failure.
 
+Health checks start when the task starts, including tasks that stage
+artifacts first (every container image when `containerImageDesugar` is on).
+They never start for a task whose staging failed: that allocation fails with
+`artifact staging failed: ...` and an `artifact.failed` event per artifact.
+
+While the task's process is down (it exited and the supervisor is about to
+restart it, or it has finished), failed checks are not counted. A check
+against a dead process can only fail, and the exit is the real cause, so the
+supervisor's verdict is the one the allocation reports. After the supervisor
+relaunches the task, the checks start over with a fresh boot grace window.
+
 ### Manager-side move logic
 
 The worker reports failed allocations in its heartbeat (from a failed health
@@ -344,14 +427,21 @@ The manager then:
 
 1. removes the failed allocation row
 2. checks move history per `(job_config_id, task_config_id)`
-3. if `move_count` is exceeded within `move_period`, marks the job failed
+3. if `move_count` is exceeded within `move_period`, marks the job failed and
+   the task's status `failed`
 4. otherwise, enqueues a delayed `job_reschedule` after `move_delay`
 
 So failures escalate in order:
 
 - local restarts first,
-- then a reschedule to another node,
+- then a reschedule, preferably to another node,
 - then job failure once the move budget is used up.
+
+The reschedule **avoids** the node the allocation failed on rather than
+excluding it. It first plans without that node; whatever that pass cannot
+place is planned again with the node allowed. On a one-node cluster, or when
+the failed node is the only one with room, the replacement goes back to the
+same node instead of failing with `No nodes available to place allocations`.
 
 ## Batch Scheduling Notes
 
@@ -361,6 +451,47 @@ Batch tasks can set `schedule` (`every` or cron). After a submit, update, or res
 - it enqueues a delayed `job_update` eval for the next run.
 
 `task.schedule` is rejected for any lifecycle other than `batch`.
+
+## Job Status
+
+`legion job list`, `legion job info`, the UI, MCP, and the `GetJobInfo` /
+`ListJobs` RPCs report one status per job. It says what the job is doing, not
+only what was decided about it:
+
+| Status | Meaning |
+| --- | --- |
+| `running` | At least one allocation has not reached a terminal state. A service job that is up, a batch step in progress, or a job running short of its count (some replicas could not be placed) all read `running`. |
+| `pending` | Nothing is running yet: the job was just accepted, nothing could be placed (no node has room, a static port is taken everywhere), or its remaining tasks wait on a dependency. |
+| `complete` | Nothing is running and every task of the latest version finished successfully: a batch job that ran to completion. |
+| `failed` | The manager failed the job (a task's reschedule budget ran out, or a KV dependency the job requires was deleted), or nothing is running and a task failed for good. |
+| `stopped` | `legion job stop`. |
+
+`ListJobs` filters (`--status`) and counts (`status_counts`) use the same
+values. The reason a job is `pending` is on the event stream: the eval that
+tried to place it ends `eval.failed` (nothing fit) or `eval.completed` with
+`N unplaced (...)` or `waiting on dependencies: ...`
+(`legion events list --job <job>`).
+
+The state store's `job` table keeps the stored status the derived one starts
+from: `done` (accepted, not stopped or failed), `stopped`, or `failed`.
+`legion state query` shows that stored value.
+
+### Re-running a job
+
+`legion job run` with a spec identical to the job's latest version normally
+changes nothing. When nothing of the job is running, it starts the job again
+instead (a `job_update` eval runs it from the top) and says why:
+
+```text
+Job config unchanged; job was stopped, starting it again
+Job config unchanged; job had failed, starting it again
+Job config unchanged; job was not running, starting it again
+Job config unchanged; no update needed (the job is running; use --force-reschedule to restart it)
+```
+
+"Not running" means no live allocation and no placing eval queued for the
+job, so a finished batch job runs again and a job that could not be placed
+gets another attempt.
 
 ## Job Timestamps: `created_at` and `updated_at`
 
@@ -388,7 +519,7 @@ The mtime tracks changes to the job record. It does not track the workload runni
 | A byte-identical spec is resubmitted | no (nothing changed) |
 | `legion job stop` (status → `stopped`) | yes |
 | Job marked `failed`, including a failed KV dependency | yes |
-| Job recovered to `done` from `stopped` or `failed` | yes |
+| Job revived from `stopped` or `failed` (a resubmit, or a KV recovery) | yes |
 | A restart request is acknowledged | yes |
 | An allocation is placed, replaced, or removed | **no** |
 | Health checks, task-status writes, node heartbeats | **no** |

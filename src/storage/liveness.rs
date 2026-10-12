@@ -540,7 +540,10 @@ mod liveness_table_test {
         // A beat from before responsibility began, and the seed itself, are
         // not evidence the node is talking to THIS leader.
         table.observe_at("early", start, 0);
-        assert!(!table.observed_since_responsible("early"), "not responsible yet");
+        assert!(
+            !table.observed_since_responsible("early"),
+            "not responsible yet"
+        );
         let since = start + Duration::from_secs(1);
         table.become_responsible_at(&["early".into(), "seeded".into()], since, 1);
         assert!(!table.observed_since_responsible("early"));
@@ -550,7 +553,12 @@ mod liveness_table_test {
         table.observe_at("seeded", since + Duration::from_millis(10), 2);
         assert!(table.observed_since_responsible("seeded"));
         // A peer manager's digest counts too: that node dials a follower.
-        table.observe_peer_at("mgr-b", vec!["via-peer".into()], since + Duration::from_secs(1), 3);
+        table.observe_peer_at(
+            "mgr-b",
+            vec!["via-peer".into()],
+            since + Duration::from_secs(1),
+            3,
+        );
         assert!(table.observed_since_responsible("via-peer"));
 
         table.relinquish();

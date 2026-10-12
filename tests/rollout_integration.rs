@@ -703,3 +703,59 @@ fn rollout_destroy_first_progresses_through_multiple_stages() -> R<()> {
 
     Ok(())
 }
+
+/// Spot-check P1-2: updating a single-replica static-port service on a
+/// one-node cluster. A create-first rollout cannot surge (the new allocation
+/// needs the port the old one holds), so it used to sit at "waiting for
+/// placement capacity" forever with the service down. Now it stops the old
+/// allocation, places the new one, and completes.
+#[test]
+fn static_port_service_rollout_replaces_instead_of_waiting_forever() -> R<()> {
+    let store = setup_store()?;
+    insert_node(&store, "node-a")?;
+    let manager = ManagerDaemonService::new(store.clone());
+    let runtime = Runtime::new()?;
+
+    let spec = |version: u32| {
+        json!({
+            "name": "static-svc",
+            "tasks": {
+                "web": {
+                    "group": "web",
+                    "runtime": "exec",
+                    "count": 1,
+                    "config": { "command": ["true"], "version": version },
+                    "resources": { "memory": 64 },
+                    "network": { "ports": [ { "name": "http", "static": 18080 } ] }
+                }
+            },
+            "rollout": {
+                "replacement": "createFirst",
+                "allocationStagger": "0s",
+                "minHealthyTime": "0s"
+            }
+        })
+        .to_string()
+    };
+    runtime.block_on(manager.run_job(Request::new(run_request(spec(1), "static-svc-v1"))))?;
+    drain_eval_queue_with_rollout_health(&store, "static-svc", 20)?;
+    let v1_id = store.get_job_config("static-svc")?.id();
+    assert_eq!(store.allocs_for_job_config(&v1_id)?.len(), 1);
+
+    runtime.block_on(manager.run_job(Request::new(run_request(spec(2), "static-svc-v2"))))?;
+    drain_eval_queue_with_rollout_health(&store, "static-svc", 40)?;
+
+    let rollout = latest_rollout_for_job(&store, "static-svc")?;
+    assert_eq!(rollout.status, "completed", "message: {}", rollout.message);
+    assert_eq!(store.allocs_for_job_config(&rollout.to_job_config_id)?.len(), 1);
+    assert!(store.allocs_for_job_config(&v1_id)?.is_empty());
+    let events = store.list_rollout_events(rollout.id, Some(200))?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message.contains("cannot surge")),
+        "expected a destructive-update event, got {:?}",
+        events.iter().map(|event| &event.message).collect::<Vec<_>>()
+    );
+    Ok(())
+}

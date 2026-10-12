@@ -505,9 +505,12 @@ without a manager on the request path, using a boot ticket
 legion boot-ticket create agent-sandboxes \
     --task workspace --id user-42 --pool edge-eu --gate boot --ttl 5m -j
 
-# On the request path, against the node itself:
+# Once: the cluster CA the node's certificate must chain to.
+legion net ca show > ca.pem
+
+# On the request path, against the node itself (mTLS; no manager call):
 legion sandbox start agent-sandboxes \
-    --id user-42 --node http://10.0.1.7:4848 --ticket "$TICKET" -j
+    --id user-42 --node https://10.0.1.7:4848 --ca-cert ca.pem --ticket "$TICKET" -j
 ```
 
 The command streams one frame per transition (`admitted`, `staged`/`booted`,

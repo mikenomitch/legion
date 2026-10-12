@@ -3420,6 +3420,119 @@ mod tests {
         Ok(())
     }
 
+    /// Spot-check P0-8: a restarted worker registers with the node token it
+    /// persisted, so it comes back after its join token is gone; a refused
+    /// node token falls back to the join token; and the secret on disk is
+    /// owner-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_worker_rejoins_on_its_persisted_node_token() -> R<()> {
+        let dir = TempDir::new()?;
+        let store = crate::storage::store::Store::start_storage(
+            &crate::structs::config::ManagerConfigFull {
+                store_path: dir.path().join("store").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        )?;
+        store.insert_worker_type(&WorkerConfig {
+            name: "default".into(),
+            pool: "default".into(),
+            ..Default::default()
+        })?;
+        let auth = Arc::new(crate::manager::acl::Authenticator::from_config(
+            &crate::structs::config::AclConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }
+            .with_defaults(),
+        )?);
+        let (_, composite) = auth
+            .mint_join_token(
+                &store,
+                "http://127.0.0.1:4747",
+                "default",
+                Some(Duration::from_secs(3600)),
+                "restart test",
+            )
+            .map_err(|status| anyhow!("{status}"))?;
+        let join_secret = JoinToken::decode(&composite)?.secret;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+        let service = crate::structs::manager_server::ManagerServer::new(
+            crate::manager::server::ManagerDaemonService::with_acl(store, auth),
+        );
+        tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let _ = tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        let client = ManagerClient::new(Channel::from_shared(addr)?.connect_lazy());
+        let state = WorkerStateStore::new(dir.path().join("w1").join("worker_state.json"));
+        let payload = RegistrationPayload {
+            name: "w1".into(),
+            pool: "default".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            health_checks: "[]".into(),
+            capabilities: Vec::new(),
+        };
+
+        // First join: the join token mints a node token, persisted at once.
+        let first = Arc::new(WorkerCredentials::with_join_secret(Some(join_secret.clone())));
+        first.persist_to(state.clone());
+        pre_register_self(client.clone(), "default".into(), &first).await?;
+        register_self(client.clone(), &payload, &first).await?;
+        let token = state.load_node_token().context("node token persisted")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(state.node_token_path())?
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Restart after the join token stopped working: the persisted node
+        // token alone pre-registers and registers, and is kept.
+        let restarted = Arc::new(WorkerCredentials::with_join_secret(Some(
+            "lgnjoin_expired".into(),
+        )));
+        assert!(restarted.restore_from(&state));
+        restarted.persist_to(state.clone());
+        pre_register_self(client.clone(), "default".into(), &restarted).await?;
+        register_self(client.clone(), &payload, &restarted).await?;
+        assert_eq!(state.load_node_token().as_deref(), Some(token.as_str()));
+
+        // A refused node token falls back to a valid join token, which
+        // mints and persists a replacement.
+        state.save_node_token("lgn_not_a_real_token")?;
+        let fallback = Arc::new(WorkerCredentials::with_join_secret(Some(join_secret)));
+        assert!(fallback.restore_from(&state));
+        fallback.persist_to(state.clone());
+        pre_register_self(client.clone(), "default".into(), &fallback).await?;
+        register_self(client.clone(), &payload, &fallback).await?;
+        let replaced = state.load_node_token().context("replacement persisted")?;
+        assert_ne!(replaced, "lgn_not_a_real_token");
+
+        // Neither credential valid: the refusal surfaces.
+        state.save_node_token("lgn_not_a_real_token")?;
+        let stranded = Arc::new(WorkerCredentials::with_join_secret(Some(
+            "lgnjoin_expired".into(),
+        )));
+        assert!(stranded.restore_from(&state));
+        let err = register_self(client.clone(), &payload, &stranded)
+            .await
+            .expect_err("no valid credential");
+        assert!(
+            err.downcast_ref::<tonic::Status>()
+                .is_some_and(|status| status.code() == tonic::Code::Unauthenticated),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
     /// Serve a real manager on an ephemeral loopback port, with one active
     /// node and no allocations, so every heartbeat reply carries an empty
     /// desired set.

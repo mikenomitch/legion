@@ -324,6 +324,41 @@ fn write_owner_only(path: &Path, contents: &[u8], sync: bool) -> R<()> {
     Ok(())
 }
 
+/// SIGKILL what is left of a restored task's process group when the
+/// tracked process itself is gone. Returns whether anything was signalled.
+///
+/// Every task is spawned as its own session and process-group leader
+/// (`setsid` in `spawn_task_process`), so `pid` is also the group id. When
+/// the leader dies while the worker is down — a `sh -c` wrapper killed by a
+/// service manager, say — its children keep the group alive: still running,
+/// still holding the task's ports and volumes, and no longer in any record
+/// once restore skips the dead pid. That is how a re-joined worker ended up
+/// next to unmanaged processes that collided with the replacements the
+/// manager placed (spot-check P1-5). Linux never hands out a pid that is in
+/// use as a process-group id, so a live group with this id can only be the
+/// task's own descendants.
+pub fn kill_orphaned_task_group(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // `kill(-1, ...)` would signal every process we may signal. Never.
+        if pid <= 1 || pid > i32::MAX as u32 {
+            return false;
+        }
+        let group = -(pid as i32);
+        // Signal 0 only checks that the group still has a member.
+        // SAFETY: plain libc calls with a validated negative group id.
+        if unsafe { libc::kill(group, 0) } != 0 {
+            return false;
+        }
+        unsafe { libc::kill(group, libc::SIGKILL) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Whether `pid` names a live (non-zombie) process.
 ///
 /// Called once per restored allocation per supervisor tick, under the
@@ -412,6 +447,45 @@ mod tests {
         assert_eq!(store.load_node_token(), None);
         // Clearing twice is fine.
         store.clear_node_token()?;
+        Ok(())
+    }
+
+    /// A task whose tracked leader died while the worker was down must not
+    /// leave its children running unmanaged (spot-check P1-5).
+    #[cfg(unix)]
+    #[test]
+    fn an_orphaned_task_group_is_killed() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let child_path = temp_dir.path().join("child");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sleep 1000 & echo $! > {}; exit 0",
+            child_path.display()
+        ));
+        let mut leader = crate::task_plugins::spawn_task_process(&mut cmd)?;
+        let leader_pid = leader.id();
+        leader.wait()?;
+        for _ in 0..40 {
+            if fs::read_to_string(&child_path).is_ok_and(|raw| !raw.trim().is_empty()) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let child: u32 = fs::read_to_string(&child_path)?.trim().parse()?;
+        assert!(!pid_is_running(leader_pid), "the leader exited");
+        assert!(pid_is_running(child), "its child outlived it");
+
+        assert!(kill_orphaned_task_group(leader_pid));
+        for _ in 0..40 {
+            if !pid_is_running(child) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!pid_is_running(child), "the orphaned child was killed");
+        assert!(!kill_orphaned_task_group(leader_pid), "nothing left to kill");
+        assert!(!kill_orphaned_task_group(1), "never signal every process");
+        assert!(!kill_orphaned_task_group(0));
         Ok(())
     }
 

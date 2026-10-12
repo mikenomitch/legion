@@ -67,10 +67,34 @@ A heartbeat will not un-cordon a node. It clears only
 `availability: "unavailable"`, the value node loss sets. A node an operator
 drained with `legion node cordon` or `legion node drain` stays drained when it
 comes back. That was a person's decision, and a heartbeat does not overrule it.
+Loss does not overwrite a cordon either: a drained node that goes lost keeps
+`drained`, so the cordon is still there after it returns.
+
+A worker that **re-registers** (a restart) instead of resuming comes back
+schedulable the same way: registration keeps `drained` and turns
+`unavailable` back into `available`, because a registering worker is alive.
+
+**The two halves are reconciled.** Loss and recovery are each two replicated
+writes, and liveness itself lives only in the owning manager's memory, so
+nothing re-derives a missing half by itself: a leadership change between the
+writes, or a forward that failed, could leave a node `active` in
+`legion node list` and `unavailable` to the scheduler indefinitely, with
+every placement failing `No nodes available to place allocations`. On every
+tick the liveness owner compares the two and repairs a disagreement:
+
+- `active` and `unavailable`, and this manager has **heard from the node
+  since it took responsibility** (a beat, or a peer's digest naming it; the
+  acquisition seed does not count): back to `available`.
+- `lost` and `available`, and this manager has not heard from it: to
+  `unavailable`.
+
+It never touches `drained`. Each repair is logged, and the first counts in
+`legion_nodes_recovered_total{path="reconcile"}`.
 
 Legion counts recoveries in `legion_nodes_recovered_total{path}`. It uses
-`path="heartbeat"` for the heartbeat path above and `path="reregistration"`
-when a worker re-registers instead of resuming.
+`path="heartbeat"` for the heartbeat path above, `path="reregistration"`
+when a worker re-registers instead of resuming, and `path="reconcile"` when
+the reconcile pass below returns a node to the pool.
 `legion_nodes_marked_lost_total` minus this counter is the fleet's net loss. A
 flapping fleet shows both counters climbing.
 
@@ -136,7 +160,9 @@ see a recent takeover on a dashboard.
 ## Managers that do not own liveness
 
 Under `lanes` topology, the status-lane leader and the scheduler-lane leader
-can be different managers indefinitely. Each worker dials one fixed manager,
+can be different managers indefinitely, and in any topology a worker talks to
+whichever manager it last reached (it fails over between managers; see
+[Managers and workers](architecture-managers-workers.md#managers-a-worker-can-reach)),
 so a manager that leads nothing still receives heartbeats.
 
 **The digest.** Every `liveness.digestInterval` (1 second), each manager that
@@ -167,9 +193,10 @@ The scheduler never reads liveness. Placement gates on `node.availability`, a
 control-lane column. Marking a node lost already flips it as a replicated
 write, so the scheduler never needs to read across lanes.
 
-**Single-manager clusters and `single` topology need none of this.** There is
-no peer and no digest path. Liveness is process-local memory and the RPC is
-never used.
+**Single-manager clusters need none of this.** There is no peer and no digest
+path. Liveness is process-local memory and the RPC is never used. A
+multi-manager `single`-topology cluster does use it: there the one raft leader
+owns liveness, and every follower a worker talks to sends it digests.
 
 ### Peer-gap suppression
 
@@ -290,7 +317,7 @@ The manager refuses to start, naming the offending values, if:
 | `legion_liveness_peer_stale{peer}` | Alert on this for a quiet peer manager. |
 | `legion_liveness_loss_suppressed_total{reason}` | `failover_grace` / `peer_digest_gap` / `mass_disruption`. |
 | `legion_liveness_checkpoint_seconds` | Wall-clock of one checkpoint commit. |
-| `legion_nodes_recovered_total{path}` | Lost nodes that came back: `heartbeat` / `reregistration`. Read beside `legion_nodes_marked_lost_total` for net loss. |
+| `legion_nodes_recovered_total{path}` | Lost nodes that came back: `heartbeat` / `reregistration` / `reconcile`. Read beside `legion_nodes_marked_lost_total` for net loss. |
 
 On a steady-state fleet, `legion_raft_pipeline_depth{lane="status"}` should
 sit near zero between checkpoints. If it doesn't, heartbeats are still

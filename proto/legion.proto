@@ -1066,7 +1066,16 @@ service Manager {
   // - PermissionDenied: the caller lacks node:read on the node's pool.
   rpc GetNodeContent (GetNodeContentRequest) returns (GetNodeContentReply);
 
-  // Proxies a restart request to a worker node.
+  // Proxies a restart request to a worker node, over the mTLS worker plane
+  // (the manager's own certificate; the node's name verified).
+  //
+  // Errors:
+  // - PermissionDenied: caller lacks `node:write` on the node's pool.
+  // - NotFound: no such node.
+  // - FailedPrecondition: the node registered no worker address, or runs
+  //   worker protocol 2 or older (a plaintext address managers never dial).
+  // - Unavailable: the worker could not be reached or failed TLS
+  //   verification; the message names the node, address, and port.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 
   // Sets a node's scheduling availability: cordon, drain, or uncordon.
@@ -1122,7 +1131,11 @@ service Manager {
   //
   // A node that is gone, unreachable, or has pruned the files fills that
   // allocation's `error` instead of failing the whole request. A worker's
-  // own error is relayed by its message (never as raw transport output).
+  // own error is relayed by its message (never as raw transport output). A
+  // worker the manager cannot reach over the mTLS worker plane gets an
+  // `error` that names the node, its address, and the port managers dial
+  // (4848 by default); a worker on protocol 2 or older (plaintext address)
+  // gets one naming its version.
   //
   // Errors:
   // - InvalidArgument: neither `job` nor `allocation_id` is set.
@@ -1146,6 +1159,21 @@ service Manager {
   // revoked or expired, or its policies no longer grant the session, the
   // stream ends with that auth error (`UNAUTHENTICATED` or
   // `PERMISSION_DENIED`) and the worker-side process is cancelled.
+  //
+  // The manager dials the worker over the mTLS worker plane
+  // (docs/auth-and-acls.md, "The worker plane"): its own manager certificate,
+  // the cluster CA as the only root, the node's name verified. An error the
+  // worker returns (no such allocation, a refused command) is relayed with
+  // its own code.
+  //
+  // Worker-plane errors:
+  // - Unavailable: the worker could not be reached or failed TLS
+  //   verification. The message names the node, its address, and the port
+  //   managers dial (4848 by default), and how to fix it. Retryable.
+  // - FailedPrecondition: the node registered no worker address, or
+  //   advertises a plaintext `http://` address because it runs worker
+  //   protocol 2 or older (the message names the version); upgrade the
+  //   worker.
   rpc ExecAllocation (stream ExecClientFrame) returns (stream ExecServerFrame);
 
   // Lists the actions declared on a job's tasks (for CLI + UI discovery).
@@ -1933,8 +1961,15 @@ message RunJobReply {
   // - `"Job submit success"`
   // - `"Rollout started"`
   // - `"Rollout created; waiting for manual start"`
-  // - `"Job config unchanged; no update needed"`
+  // - `"Job config unchanged; no update needed (the job is running; use
+  //   --force-reschedule to restart it)"`
   // - `"Job config unchanged; forced reschedule queued"`
+  // - `"Job config unchanged; job was stopped, starting it again"`
+  // - `"Job config unchanged; job had failed, starting it again"`
+  // - `"Job config unchanged; job was not running, starting it again"`
+  //
+  // An unchanged spec restarts the job (a `job_update` eval) when the job was
+  // stopped or failed, or when nothing of it is running or queued to run.
   string message = 1;
 
   // True when this reply carries a previously recorded result for the request's
@@ -4175,7 +4210,9 @@ message ListJobsRequest {
   optional uint32 page_size = 5;
 
   // Keep only jobs whose status equals this value (case-insensitive, exact —
-  // `run` does not match `running`; use `query` for substring search).
+  // `run` does not match `running`; use `query` for substring search). The
+  // values are `Job.status`'s: `running`, `pending`, `complete`, `failed`,
+  // `stopped`.
   // Applied after `query` and before paging, so `total_count` reflects the
   // filtered set. Omit or leave empty to return every status.
   optional string status = 6;
@@ -4189,9 +4226,24 @@ message Job {
   // Job name.
   string name = 2;
 
-  // Job status string.
+  // What the job is doing, derived when the job is read
+  // (docs/jobs-tasks-and-scheduling.md, "Job Status"):
   //
-  // Current values written by manager include: done, stopped, failed.
+  // - `running`: at least one allocation has not reached a terminal state
+  //   (including a job running short of its count).
+  // - `pending`: nothing is running yet: just accepted, nothing could be
+  //   placed, or the remaining tasks wait on a `dependsOn`.
+  // - `complete`: nothing is running and every task of the latest version
+  //   finished successfully (a batch job that ran to completion).
+  // - `failed`: the manager failed the job (reschedule budget exhausted, a
+  //   required KV key deleted), or nothing is running and a task failed for
+  //   good.
+  // - `stopped`: `legion job stop`.
+  //
+  // `GetJobInfo` and `ListJobs` (including its `status` filter and
+  // `status_counts`) report these values. The state store's `job` table keeps
+  // the stored status they are derived from (`done` = accepted, `stopped`,
+  // `failed`).
   string status = 3;
 
   // Unix timestamp (seconds) when job was created. Immutable for the life of

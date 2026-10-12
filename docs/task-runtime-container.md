@@ -41,11 +41,26 @@ A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
    artifact pipeline (`artifacts.containerImageDesugar`), Legion uses that
    layout. Otherwise it pulls the image anonymously through the shared `oci://`
    fetcher. A layout pulled by an earlier start of the same allocation is
-   reused, so in-place restarts don't refetch from the registry.
+   reused, so in-place restarts don't refetch from the registry. Either way,
+   layers the node already holds come from the
+   [image cache](#image-cache), not the registry.
 2. **Build a bundle.** Extract each image layer into `rootfs/`, honoring
    overlayfs whiteouts. Gzip and uncompressed layers work. Zstd layers are
-   rejected with an explicit error. Then generate an OCI runtime `config.json`
-   with:
+   rejected with an explicit error. Each file keeps what the image recorded
+   for it, as Docker's extraction does:
+   - its **owner** (uid and gid), when the worker runs as root. An image that
+     runs as a non-root `USER` depends on this: `RUN chown nginx
+     /var/cache/nginx` is how such an image lets its own user write there. A
+     worker that is not root can't chown, so its extracted files all belong
+     to the worker's user.
+   - its **mode**, including setuid, setgid, and sticky bits.
+   - its **extended attributes**, best effort and only as root. This carries
+     file capabilities (`security.capability`, e.g. `setcap
+     cap_net_bind_service+ep` on a binary). `security.selinux` and
+     `trusted.*` are skipped, and an attribute the host filesystem refuses is
+     skipped with a debug log.
+
+   Then generate an OCI runtime `config.json` with:
    - the task `command`/`env` merged over the image config's env (the task
      wins, and `PATH` gets a default if it's missing),
    - the image's working dir and user. Named users and groups resolve against
@@ -58,8 +73,15 @@ A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
      it instead. With `network.mode = "gated"`, the bundle joins the
      allocation's network namespace (see
      [Networking: `host` and `gated`](#networking-host-and-gated)),
-   - a writable root filesystem.
-3. **Run it:** `<runtime> run --bundle <dir> legion-<alloc>`.
+   - a writable root filesystem,
+   - Docker's default capabilities without `NET_RAW`, adjustable with
+     [`security.capabilities`](#capabilities-security),
+   - `RLIMIT_NOFILE` at 1048576, adjustable with
+     [`ulimits`](#resource-limits-ulimits),
+   - `noNewPrivileges`.
+3. **Run it:** `<runtime> run --bundle <dir> legion-<alloc>`, with the task's
+   log files as its stdout and stderr (see
+   [Stdout and stderr](#stdout-and-stderr)).
 
 The image and bundle scratch space lives under the allocation's private
 directory and is removed on destroy.
@@ -78,6 +100,17 @@ Optional:
   starts (`[{ path, mode, content }]`), readable inside at
   `/legion/task/<path>`. This is the shape `kvInjections.files` renders into.
   See [The task directory](#the-task-directory-legiontask).
+- `security.capabilities`: `{ add = [...], drop = [...] }` adjustments to the
+  default Linux capability set. See
+  [Capabilities](#capabilities-security).
+- `ulimits`: per-process resource limits (`setrlimit`), such as
+  `{ nofile = 65536 }`. See [Resource limits](#resource-limits-ulimits).
+
+`security` and `ulimits` apply on Linux. Apple `container` runs each container
+in its own VM with the runtime's defaults, so on macOS they are accepted and
+ignored (the start logs that once). Both are validated at submit: an unknown
+capability, an unknown limit name, or `soft` above `hard` fails `job run` and
+`job validate`.
 
 The task-level `stop` block also applies here. It sits next to `resources`,
 not inside the runtime config. See [Graceful stop](#graceful-stop).
@@ -85,6 +118,188 @@ not inside the runtime config. See [Graceful stop](#graceful-stop).
 Put the command directly after the image reference, flags included. Don't add
 a `--` separator. Apple's argument parser reads `--` as the target executable,
 and the container fails to start with "failed to find target executable --".
+
+On Linux, `command` is the container's whole argv: the image's `ENTRYPOINT`
+and `CMD` are not used. Apple `container` follows Docker's rule instead, where
+`command` replaces `CMD` and the image's `ENTRYPOINT` still runs. To run an
+image's entrypoint on both, name it in `command`. For the official Postgres
+image, `command = ["docker-entrypoint.sh", "postgres"]` works everywhere: the
+entrypoint passes a command it does not recognize straight through.
+
+## Capabilities (`security`)
+
+A Linux container's process gets Docker's default capability set, less
+`CAP_NET_RAW`:
+
+```text
+AUDIT_WRITE  CHOWN  DAC_OVERRIDE  FOWNER  FSETID  KILL  MKNOD
+NET_BIND_SERVICE  SETFCAP  SETGID  SETPCAP  SETUID  SYS_CHROOT
+```
+
+Stock images assume these. The official nginx image's master process
+`chown`s its cache directories and runs workers as the `nginx` user, and the
+Postgres entrypoint `chown`s its data directory and drops to `postgres` with
+`su-exec` (or `gosu`). Without `CHOWN`, `SETUID`, and `SETGID` they fail with
+`Operation not permitted`.
+
+`CAP_NET_RAW` is withheld because a Legion container shares the node's network
+namespace unless it is `gated`. Raw sockets there could sniff and spoof traffic
+on the node's own interfaces, not just the container's. Nomad's Docker driver
+leaves it out of its default for the same reason.
+
+The set is granted as the bounding, effective, and permitted sets. Nothing is
+inheritable or ambient, so a process running as a non-root user keeps no
+capabilities across `execve`, exactly as under Docker.
+
+Adjust it with `security.capabilities`, which has the semantics of
+`docker run --cap-add` / `--cap-drop`:
+
+```nickel
+config = {
+  image = "alpine:3.20",
+  command = ["ping", "-c", "3", "1.1.1.1"],
+  security = {
+    capabilities = {
+      add = ["NET_RAW"],    # on top of the defaults
+      drop = ["MKNOD"],     # removed from the defaults
+    },
+  },
+},
+```
+
+- Names are case-insensitive, with or without the `CAP_` prefix
+  (`net_raw`, `NET_RAW`, and `CAP_NET_RAW` are the same).
+- `drop = ["ALL"]` starts from nothing, so the container gets exactly `add`.
+  That is the least-privilege form: `drop = ["ALL"], add = ["NET_BIND_SERVICE"]`.
+- `add = ["ALL"]` grants every capability except the ones `drop` names.
+- A name in both `add` and `drop` ends up granted, as in Docker. `ALL` in
+  both lists is rejected.
+- An unknown name fails at submit:
+  `unknown capability "NET_RAWW" in security.capabilities.add: use a Linux
+  capability name such as NET_ADMIN (the CAP_ prefix is optional), or ALL`.
+
+Without a user namespace, container root is host root with these
+capabilities. Adding `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYS_MODULE`, or
+`ALL` gives the container enough to act on the host, so add them only for
+workloads you trust as much as an `exec` task.
+
+**`noNewPrivileges` stays on.** It stops a setuid binary or a file
+capability from *raising* privileges at `execve`. It does not stop a root
+process from dropping to another user with `setuid(2)`/`setgid(2)`, which is
+all `gosu` and `su-exec` do, so root entrypoints that step down work. What it
+does block: an image whose `USER` is non-root and that relies on `sudo`, or on
+a file capability (`setcap cap_net_bind_service+ep`) to bind a low port, does
+not get that privilege. Bind a port above 1024, or run the process as root and
+let it drop privileges itself.
+
+## Resource limits (`ulimits`)
+
+The container's process gets `RLIMIT_NOFILE` soft and hard at 1048576. That is
+the value Docker containers ran with for years and the one CRI-O sets. The OCI
+runtimes' own default is a hard 1024, which Redis warns about at start and a
+busy proxy exhausts. On a host whose `fs.nr_open` is lower, the default drops
+to it, and on a worker that is not root, to the worker's own hard limit (raising
+a hard limit needs root).
+
+Set limits per task with `ulimits`, keyed by the lowercase name `docker run
+--ulimit` uses (`as`, `core`, `cpu`, `data`, `fsize`, `locks`, `memlock`,
+`msgqueue`, `nice`, `nofile`, `nproc`, `rss`, `rtprio`, `rttime`,
+`sigpending`, `stack`):
+
+```nickel
+config = {
+  image = "redis:7-alpine",
+  command = ["redis-server"],
+  ulimits = {
+    nofile = 65536,                       # soft and hard
+    nproc = { soft = 4096, hard = 8192 },
+    memlock = "unlimited",
+  },
+},
+```
+
+A declared limit replaces the default of the same name; the others keep
+theirs. `soft` may not exceed `hard`. A hard limit above the node's
+`fs.nr_open` makes the OCI runtime fail the start, with its own error in the
+task's stderr.
+
+## Stdout and stderr
+
+The container's stdout and stderr are the allocation's `stdout.log` and
+`stderr.log`, opened by the worker and handed to the runtime. Writing to them
+through the inherited descriptors always works. Many images also *reopen*
+them by path: nginx symlinks `/var/log/nginx/access.log` to `/dev/stdout`, and
+`/dev/stdout` is `/proc/self/fd/1`. A reopen checks the file's own
+permissions, so the worker hands both files to the container's user (the
+image's `USER`, resolved against its rootfs) at every start. That is what
+Docker does with the pipes it gives a container. The log directory itself
+stays owner-only on the host (`0700`, the worker's user); a reopen through
+`/proc/self/fd` does not traverse it, so the container reaches its own two
+files and nothing else.
+
+Two consequences to know about:
+
+- A process that switches to a *different* user inside the container (`su`,
+  `gosu`, `su-exec`) and then reopens `/dev/stdout` by path gets `EACCES`, as
+  it would under Docker. Entry points that step down keep writing through the
+  descriptors they inherited, which works. In a script, write `>&2`, not
+  `> /dev/stderr`.
+- Reopening with truncation (`echo x > /dev/stdout` in a shell, which opens
+  with `O_TRUNC`) truncates the captured log, because it is a file rather than
+  a pipe. Append (`>>`) or write to the descriptor (`>&1`) instead.
+
+A worker that is not root cannot chown, so there the files stay the worker's,
+and only an image running as the worker's own user can reopen them.
+
+## Image cache
+
+Each worker keeps the images it pulls in its
+[node content store](artifacts.md#the-node-content-store)
+(`<worker state dir>/content/`), one blob per manifest, config, and layer,
+named by its digest. Both pull paths use it: the anonymous pull a `container`
+or `sandbox` task makes on its own, and an image staged through the artifact
+pipeline with `containerImageDesugar`.
+
+- **A digest reference the node holds** (`alpine@sha256:…`) starts with no
+  registry request at all.
+- **A tag** (`nginx:1.27-alpine`) costs one `HEAD` request per start, to learn
+  which digest the tag names now. A `HEAD` downloads nothing, and Docker Hub
+  does not count it toward the anonymous pull limit. If the digest is one the
+  node holds, nothing else is fetched. If the tag moved, the new manifest and
+  only the layers the node doesn't hold yet are downloaded, so a rebuilt image
+  that shares its base layers costs its changed layers.
+- **When the registry doesn't answer** (rate limited with `429`, down, or the
+  node is offline), a tag starts from the digest it last resolved to on this
+  node, with a warning in the worker log: `Registry did not answer for this
+  tag; using the digest it last resolved to on this node`. A tag the node has
+  never resolved still fails with the registry's error.
+- **Concurrent starts of one image share a pull.** A second allocation of the
+  same reference waits for the first and then reads its layers from the cache.
+
+Layers are hard-linked from the cache into each allocation's image layout, so
+a cached image costs its disk once per node. Each allocation still extracts
+its own root filesystem.
+
+**Eviction.** Images share the content store's `artifacts` budget (by default
+10% of the disk, between 1 GiB and 20 GiB), with LRU eviction when a new blob
+would exceed it, and a TTL: an entry unused for `content.ttl` (default `72h`)
+is removed by the store's GC, which runs every 10 minutes. An image in use by
+a running allocation is safe from eviction, because its layout holds hard
+links to the blobs. Configure both in the worker's `content` block (see
+[docs/artifacts.md](artifacts.md#the-node-content-store)).
+`content.enabled = false` turns the cache off, and every start pulls in full.
+
+**Forcing a fresh pull.** A moved tag is picked up on the next start without
+doing anything. To throw away everything a node has cached, stop the worker,
+delete `<worker state dir>/content/`, and start it again (always safe; the
+next start of each image pulls it in full). A cached manifest is rehashed
+each time it is read, and one that no longer matches its digest is dropped and
+fetched again. Layers are checked for their recorded size only; a layer
+damaged in place fails extraction, and deleting the cache directory clears it.
+
+On macOS without `containerImageDesugar`, Apple `container` pulls the image
+itself and keeps it in its own image store (`container image ls`), so this
+cache does not apply there.
 
 ## Resources and Ports
 
@@ -100,6 +315,18 @@ only being used for scheduling. Both travel in the allocation payload
   Scheduler defaults aren't folded in, so a job that declares nothing keeps the
   runtime's defaults. The guest reports one more CPU than requested (its own
   housekeeping core) and rounds memory up.
+  Apple `container` refuses a VM smaller than **200 MiB**. A task whose
+  constraints pin it to macOS (`constraints = { os = "macos" }`) and sizes its
+  guest below that (`resources.memoryMax`, else `resources.memory`) is
+  rejected at submit. Any other task that lands on a macOS worker with less
+  fails at start, with the reason in the allocation's events instead of only
+  in the task's stderr:
+
+  ```text
+  task web sizes its macOS VM at 128 MiB (resources.memoryMax, else resources.memory), below the 200 MiB Apple `container` requires; raise it to at least 200, or constrain the task to Linux nodes
+  ```
+
+  Linux has no such floor: there `memory` is a cgroup limit.
   On macOS, `resources.cpu` (MHz) has no runtime equivalent and is used only
   for scheduling. `cores` sets the guest size rather than reserving exclusive
   cores, because Apple `container` has no CPU weight or pinning to map them
@@ -157,7 +384,7 @@ set both the signal and the wait per task, next to `resources`:
 task = {
   name = "db",
   runtime = "container",
-  config = { image = "postgres:16", command = ["postgres"] },
+  config = { image = "postgres:16", command = ["docker-entrypoint.sh", "postgres"] },
   stop = { signal = "SIGINT", killAfter = "90s" },   # defaults: SIGTERM, 30s
 }
 ```
@@ -272,7 +499,7 @@ its host-absolute destinations stay valid and aren't rewritten.
 Only the allocation's own private task directory is exposed. The log directory
 isn't mounted, because captured stdout and stderr can contain secrets and stay
 owner-restricted on the host. `noNewPrivileges`, masked paths, and the
-capability set are unchanged.
+capability set don't depend on the mount.
 
 ## Artifacts Support
 
@@ -299,13 +526,12 @@ directly (see [docs/artifacts.md](artifacts.md)):
     resolves multi-platform indexes against `linux/<arch>` instead of the
     host platform. On macOS the host platform (`darwin/arm64`) wouldn't match
     anything in an image index.
-  - The flag defaults to **off**. Legion has no artifact cache, so with the
-    flag on, every allocation would re-download its image, a step backward
-    for runtimes that cache images themselves. With it off,
-    macOS lets Apple `container` pull the image itself. Linux falls back to an
-    anonymous pull through the shared `oci://` fetcher, so the OCI runtime
-    (which can't pull) still gets its rootfs. Private-registry auth and digest
-    pinning require the artifact pipeline (flag on).
+  - The flag defaults to **off**. With it off, macOS lets Apple `container`
+    pull the image itself. Linux falls back to an anonymous pull through the
+    shared `oci://` fetcher, so the OCI runtime (which can't pull) still gets
+    its rootfs. Both Linux paths go through the node's
+    [image cache](#image-cache). Private-registry auth and digest pinning
+    require the artifact pipeline (flag on).
 - **File and tree artifacts work.** They're staged into the host task
   directory, which is mounted at `/legion/task`. Both `LEGION_ARTIFACT_<NAME>`
   and `${artifact.<name>}` hold the in-container path. See
@@ -344,6 +570,9 @@ bypass egress policy. The full model, the fail-closed rules, and the limits
 | Volumes (`volumes[]`, `stateful.storage`) | ✅ bind-mounted at the declared `path`. See [docs/volumes.md](volumes.md) |
 | Artifacts | ✅ image (staged via `containerImageDesugar`, or pulled by the runtime) and file/tree (readable under `/legion/task`) |
 | Exec / interactive PTY | ✅ / ✅ on both Apple `container` and the Linux OCI runtimes (sandboxed). See [docs/exec-and-actions.md](exec-and-actions.md) |
+| Capability adjustments (`security.capabilities`) | ✅ Linux. Ignored on macOS (VM boundary, runtime defaults) |
+| Resource limits (`ulimits`) | ✅ Linux. Ignored on macOS |
+| Image layer cache | ✅ Linux, per node, in the content store. macOS: Apple `container`'s own image store |
 
 Container exec runs inside the container's namespaces, so it is sandboxed
 (`host = false`). An `exec:write` rule without `host` is enough.
@@ -365,6 +594,9 @@ the batch jobspec is portable.
 
 Unit tests cover launch argv construction (no `--` separator, progress
 suppression, resource mapping, port publishing, pinned-reference launch), the
+default and adjusted capability sets and rlimits, layer extraction with owners,
+setuid bits, and extended attributes, handing the log files to the image's
+user, the macOS memory floor, the
 exec and signal argv formats per runtime, the stop-signal default chain, the
 generated `linux.resources`/`cgroupsPath`, the `/legion/task` mount ordering,
 env rewriting, and the runtime preflight check. End-to-end tests are marked
@@ -378,6 +610,18 @@ cargo test --lib apple_container -- --ignored --nocapture
 # Linux, with an OCI runtime installed
 LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime -- --ignored --nocapture
 ```
+
+Three of the Linux tests run stock images as they ship (nginx, the Postgres
+entrypoint, and an image whose `USER` is `nobody`) and assert the
+capabilities, ownership, `/dev/stdout`, and `nofile` behavior above. Where
+anonymous pulls are rate-limited, point `LEGION_OCI_TEST_LAYOUT_DIR` at a
+directory holding pre-fetched OCI layouts named `nginx`, `postgres`, and
+`exporter`.
+
+The image cache has unit tests against an in-process fake registry that
+count requests: a repeated tag costs one `HEAD`, a held digest costs nothing,
+a registry answering `503` still starts a cached tag, and a moved tag pulls
+only its changed layers.
 
 ## Current Scope and Limitations
 
@@ -406,7 +650,20 @@ LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime -- --ignored --nocapture
   (`containerImageDesugar`). The runtime's own fallback pull is anonymous.
 - Zstd-compressed image layers are rejected. Gzip and uncompressed layers are
   supported.
-- There is no artifact cache, so a Linux pull outside the pipeline fetches
-  once per allocation. In-place restarts reuse the pulled layout, and moves
-  refetch.
+- Images are cached per node, by layer ([Image cache](#image-cache)). The
+  extracted root filesystem is not: every new allocation extracts its image's
+  layers again, which costs CPU and disk time on a large image but no
+  network.
+- On Linux, `command` replaces the image's `ENTRYPOINT` and `CMD`; on macOS
+  only `CMD`. Name the entrypoint in `command` for a jobspec that runs the
+  same on both.
+- There is no user namespace yet, so container root is host root, limited
+  by the capability set, `noNewPrivileges`, and the mount namespace. Adding
+  privileged capabilities removes most of that limit (see
+  [Capabilities](#capabilities-security)). There is no seccomp profile.
+- Only the image's `USER` can reopen `/dev/stdout` and `/dev/stderr` by path;
+  a process that switched to another user inside the container gets `EACCES`
+  (see [Stdout and stderr](#stdout-and-stderr)).
+- Supplementary groups from the image's `/etc/group` are not applied to the
+  process; it runs with the resolved uid and gid only.
 - Health checks still run through the worker health monitor.

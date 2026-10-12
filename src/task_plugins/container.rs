@@ -2339,6 +2339,190 @@ mod tests {
         Ok(())
     }
 
+    /// An instance for a stock-image end-to-end test. With
+    /// `LEGION_OCI_TEST_LAYOUT_DIR` set, a pre-fetched OCI layout at
+    /// `<dir>/<name>` stands in for the registry (useful where anonymous
+    /// pulls are rate-limited); otherwise `start` pulls `image` as usual.
+    fn stock_image_instance(name: &str, image: &str, root: &std::path::Path) -> TaskInstance {
+        let mut instance = TaskInstance {
+            alloc_dir: Some(root.to_path_buf()),
+            log_dir: Some(root.join("logs")),
+            ..TaskInstance::default()
+        };
+        if let Ok(dir) = std::env::var("LEGION_OCI_TEST_LAYOUT_DIR") {
+            let layout = std::path::Path::new(&dir).join(name);
+            if layout.join("index.json").is_file() {
+                oci_image::record_staged_layout(&mut instance, &layout, image, None);
+            }
+        }
+        instance
+    }
+
+    fn wait_for_log(instance: &TaskInstance, file: &str, needle: &str, secs: u64) -> String {
+        let path = instance.log_dir.as_ref().expect("log dir").join(file);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.contains(needle) || std::time::Instant::now() > deadline {
+                return text;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// P0-7 end to end, with the official nginx image as it ships: the
+    /// default capabilities let its root master `chown` its cache and run
+    /// workers as `nginx`; extraction kept the image's `chown nginx`
+    /// (uid 101); its `access.log -> /dev/stdout` symlink reaches the task's
+    /// log; and the open-file limit is no longer 1024.
+    ///
+    /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_runs_stock_nginx -- --ignored`
+    #[test]
+    #[ignore = "requires an OCI runtime (youki/runc/crun), root, and the nginx image"]
+    fn oci_runtime_runs_stock_nginx() -> R<()> {
+        use std::io::{Read as _, Write as _};
+        let plugin = ContainerTaskPlugin;
+        let allocation = alloc_with_id(9012);
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let task: TaskConfig = serde_json::from_value(json!({
+            "name": "nginx",
+            "runtime": "container",
+            "config": {
+                "image": "nginx:1.27-alpine",
+                "command": ["sh", "-c", format!(
+                    "stat -c 'cache-owner=%u' /var/cache/nginx; \
+                     echo \"nofile=$(ulimit -n)\"; \
+                     sed -i 's/listen  *80;/listen {port};/' /etc/nginx/conf.d/default.conf && \
+                     exec nginx -g 'daemon off;'"
+                )],
+            },
+        }))?;
+        let tmp = tempfile::tempdir()?;
+        let mut instance = stock_image_instance("nginx", "nginx:1.27-alpine", tmp.path());
+        plugin.start(&allocation, &task, &mut instance)?;
+
+        let stdout = wait_for_log(&instance, "stdout.log", "nofile=", 30);
+        let mut response = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                stream.write_all(b"GET / HTTP/1.0\r\n\r\n")?;
+                stream.read_to_string(&mut response)?;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let access = wait_for_log(&instance, "stdout.log", "\"GET / HTTP/1.0\"", 10);
+        plugin.stop(&allocation, &task, &mut instance)?;
+        let stderr = std::fs::read_to_string(instance.log_dir.as_ref().unwrap().join("stderr.log"))
+            .unwrap_or_default();
+
+        assert!(stdout.contains("cache-owner=101"), "layer ownership kept: {stdout}");
+        assert!(stdout.contains("nofile=1048576") || !oci_bundle_root(), "{stdout}");
+        assert!(response.starts_with("HTTP/1.1 200"), "nginx serves: {response:?} {stderr}");
+        assert!(
+            !stderr.contains("Operation not permitted"),
+            "no capability failures: {stderr}"
+        );
+        assert!(access.contains("\"GET / HTTP/1.0\""), "access log via /dev/stdout: {access}");
+        Ok(())
+    }
+
+    fn oci_bundle_root() -> bool {
+        // SAFETY: geteuid cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// The official Postgres entrypoint as `configs/jobs/postgres.ncl` runs
+    /// it: as root it creates and `chown`s PGDATA, `su-exec`s to `postgres`
+    /// (a setuid/setgid drop that `noNewPrivileges` allows), runs initdb, and
+    /// starts the server on the assigned port.
+    ///
+    /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_runs_the_postgres_entrypoint -- --ignored`
+    #[test]
+    #[ignore = "requires an OCI runtime (youki/runc/crun), root, and the postgres image"]
+    fn oci_runtime_runs_the_postgres_entrypoint() -> R<()> {
+        let plugin = ContainerTaskPlugin;
+        let allocation = alloc_with_id(9013);
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let tmp = tempfile::tempdir()?;
+        let data = tmp.path().join("volume");
+        std::fs::create_dir_all(&data)?;
+        let task: TaskConfig = serde_json::from_value(json!({
+            "name": "postgres",
+            "runtime": "container",
+            "config": {
+                "image": "postgres:16-alpine",
+                "command": ["sh", "-c", "exec docker-entrypoint.sh postgres -p \"$PG_PORT\""],
+                "env": {
+                    "PG_PORT": port.to_string(),
+                    "PGDATA": "/var/lib/postgresql/data/pgdata",
+                    "POSTGRES_PASSWORD": "legion-demo",
+                },
+            },
+        }))?;
+        let mut instance = stock_image_instance("postgres", "postgres:16-alpine", tmp.path());
+        instance.volumes = vec![crate::task_plugins::MountedVolume {
+            name: "data".into(),
+            mode: crate::volumes::VolumeMode::Filesystem,
+            host_path: data.clone(),
+            path: Some("/var/lib/postgresql/data".into()),
+            fs: None,
+            fresh: true,
+            read_only: false,
+        }];
+        plugin.start(&allocation, &task, &mut instance)?;
+        let ready = "database system is ready to accept connections";
+        let stderr = wait_for_log(&instance, "stderr.log", ready, 120);
+        let listening = std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+        plugin.stop(&allocation, &task, &mut instance)?;
+        let stdout = std::fs::read_to_string(instance.log_dir.as_ref().unwrap().join("stdout.log"))
+            .unwrap_or_default();
+
+        assert!(stderr.contains(ready), "postgres came up:\n{stdout}\n{stderr}");
+        assert!(listening, "listening on the assigned port");
+        assert!(!stderr.contains("Operation not permitted"), "{stderr}");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(data.join("pgdata"))?.uid(),
+            70,
+            "PGDATA chowned to the image's postgres user"
+        );
+        Ok(())
+    }
+
+    /// An image whose `USER` is not root (the Prometheus exporter runs as
+    /// `nobody`) can reopen its own stdout and stderr by path.
+    ///
+    /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_lets_a_non_root_image -- --ignored`
+    #[test]
+    #[ignore = "requires an OCI runtime (youki/runc/crun), root, and the exporter image"]
+    fn oci_runtime_lets_a_non_root_image_reopen_its_stdio() -> R<()> {
+        let plugin = ContainerTaskPlugin;
+        let allocation = alloc_with_id(9014);
+        let image = "quay.io/prometheuscommunity/postgres-exporter:v0.15.0";
+        let task: TaskConfig = serde_json::from_value(json!({
+            "name": "exporter",
+            "runtime": "container",
+            "config": {
+                "image": image,
+                "command": ["sh", "-c", "echo uid=$(id -u) > /dev/stdout; echo to-stderr > /dev/stderr"],
+            },
+        }))?;
+        let tmp = tempfile::tempdir()?;
+        let mut instance = stock_image_instance("exporter", image, tmp.path());
+        plugin.start(&allocation, &task, &mut instance)?;
+        let status = instance.child.take().expect("child").wait()?;
+        let logs = instance.log_dir.clone().unwrap();
+        let stdout = std::fs::read_to_string(logs.join("stdout.log"))?;
+        let stderr = std::fs::read_to_string(logs.join("stderr.log"))?;
+        plugin.stop(&allocation, &task, &mut instance)?;
+        assert!(status.success(), "{status:?}: {stdout} {stderr}");
+        assert!(stdout.contains("uid=65534"), "{stdout}");
+        assert!(stderr.contains("to-stderr"), "{stderr}");
+        Ok(())
+    }
+
     /// End-to-end: a file rendered on the host is readable inside at its
     /// `/legion/task` path, and a host-side atomic rewrite is visible without
     /// restarting the container — the property that makes KV re-render and

@@ -55,18 +55,36 @@ psql "postgres://postgres:legion-demo@10.0.0.4:29315/legion"
 
     config = {
       image = "postgres:16-alpine",
-      command = ["postgres"],
+      command = ["sh", "-c", "exec docker-entrypoint.sh postgres -p \"$LEGION_PORT_PG\""],
       env = {
         PGDATA = "/var/lib/postgresql/data/pgdata",
         POSTGRES_PASSWORD = "legion-demo",
         POSTGRES_DB = "legion",
       },
     },
-    network = { mode = "auto", ports = [{ name = "pg", to = 5432 }] },
+    network = { mode = "auto", ports = [{ name = "pg" }] },
     service = { name = "postgres", port = "pg" },
+    checks = [{ type = "health", kind = "tcp", port = "pg", every = "10s", timeout = "5s", boot_grace_time = "60s" }],
   }],
 }
 ```
+
+**The command runs the image's entrypoint itself.** On Linux, a container
+task's `command` replaces the image's `ENTRYPOINT` as well as its `CMD`, and
+`docker-entrypoint.sh` is what runs `initdb` on a fresh volume and drops from
+root to the `postgres` user. It does that with `chown` and `su-exec`, which
+need the `CHOWN`, `SETUID`, and `SETGID` capabilities that container tasks get
+by default (see
+[Capabilities](../task-runtime-container.md#capabilities-security)).
+
+**Postgres listens on the port Legion assigned**, `$LEGION_PORT_PG`, not 5432.
+Linux containers share the node's network, so a fixed port would collide with
+a second Postgres on the node and would not be the port the service
+advertises. The same command works on macOS, where Apple `container` publishes
+the assigned port to the same port inside the VM.
+
+**The health check is TCP.** Exec checks run on the worker host, outside the
+container, where `pg_isready` and the task's env do not exist.
 
 **`stateful.mode = "slot"`** gives the task a stable instance whose id and
 storage survive reschedules. It also gives Postgres the guarantee it needs: at

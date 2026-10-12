@@ -28,17 +28,18 @@ pub fn config() -> Command {
         .subcommand(
             Command::new("command")
                 .about("Issue a raft command")
-                .arg(
-                    Arg::new("name")
-                        .required(true)
-                        .value_name("COMMAND")
-                        .help("Command name (for example trigger-election, transfer-leader)"),
-                )
+                .arg(Arg::new("name").required(true).value_name("COMMAND").help(
+                    "Command: trigger-election, transfer-leader (needs --target), \
+                             step-down, add-learner, add-voter, remove-member",
+                ))
                 .arg(
                     Arg::new("target")
                         .long("target")
                         .value_name("NODE_ID")
-                        .help("Optional target node id"),
+                        .help(
+                            "Target manager: its raft node id, or name@host:port \
+                             (transfer-leader, add-learner, add-voter, remove-member)",
+                        ),
                 )
                 .arg(
                     Arg::new("actor")

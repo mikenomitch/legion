@@ -28,9 +28,7 @@ use legion::structs::{
     config::ManagerConfigFull, worker_client::WorkerClient, ExecClientFrame, GetTaskLogsRequest,
     NodeMsg, PostWorkRequest, RestartWorkerRequest, StartClaimRequest,
 };
-use legion::worker::plane::{
-    serve_on, Caller, NodeIdentity, WorkerPlaneTls, WORKER_RPC_CALLERS,
-};
+use legion::worker::plane::{serve_on, Caller, NodeIdentity, WorkerPlaneTls, WORKER_RPC_CALLERS};
 use legion::worker::server::WorkerDaemonService;
 use legion::worker::state::WorkerStateStore;
 use legion::worker::task_manager::WorkerTaskManager;
@@ -49,7 +47,9 @@ fn every_worker_rpc_is_classified() -> R<()> {
         .find("service Worker {")
         .context("service Worker not found in proto")?;
     let body = &proto[start..];
-    let body = &body[..body.find("\n}").context("end of service Worker not found")?];
+    let body = &body[..body
+        .find("\n}")
+        .context("end of service Worker not found")?];
     let rpc = regex::Regex::new(r"rpc\s+(\w+)\s*\(")?;
     let proto_rpcs: BTreeSet<String> = rpc
         .captures_iter(body)
@@ -104,7 +104,11 @@ fn node_cert(ca: &Ca, node_id: &str) -> R<(String, String)> {
 async fn serve_worker(
     dir: &TempDir,
     identity: NodeIdentity,
-) -> R<(SocketAddr, Arc<WorkerPlaneTls>, tokio::task::JoinHandle<R<()>>)> {
+) -> R<(
+    SocketAddr,
+    Arc<WorkerPlaneTls>,
+    tokio::task::JoinHandle<R<()>>,
+)> {
     let task_manager = WorkerTaskManager::with_state_store(WorkerStateStore::new(
         dir.path().join("worker_state.json"),
     ));
@@ -194,7 +198,10 @@ async fn caller_classes_match_the_handlers() -> R<()> {
     for (rpc, callers) in WORKER_RPC_CALLERS {
         let manager_only = !callers.contains(&Caller::Ticket);
 
-        for (who, identity) in [("no certificate", None), ("a node certificate", Some(&other_node))] {
+        for (who, identity) in [
+            ("no certificate", None),
+            ("a node certificate", Some(&other_node)),
+        ] {
             let result = call(&mut client(addr, &ca, "wkr-1", identity)?, rpc).await;
             if manager_only {
                 let status = result.expect_err(&format!("{rpc} must refuse {who}"));
@@ -240,7 +247,12 @@ async fn caller_classes_match_the_handlers() -> R<()> {
     let status = call(&mut client(addr, &ca, "wkr-1", None)?, "StartClaim")
         .await
         .expect_err("edge boot is off on this node");
-    assert_eq!(status.code(), Code::FailedPrecondition, "{}", status.message());
+    assert_eq!(
+        status.code(),
+        Code::FailedPrecondition,
+        "{}",
+        status.message()
+    );
 
     server.abort();
     Ok(())

@@ -52,6 +52,24 @@ Value normalization rules:
 - `number`: must parse as JSON number
 - `json`: must parse as valid JSON
 
+### Reading a key that does not exist
+
+`legion kv get` on a missing key fails: it prints the standard error envelope
+with code `NotFound` and exits non-zero, in both output formats.
+
+```bash
+$ legion kv get app/flag -j; echo "exit=$?"
+{ "ok": false, "error": { "code": "NotFound", "message": "kv key app/flag not found",
+  "hint": "`legion kv list` shows the keys that exist; `legion kv put` creates one",
+  "retryable": false } }
+exit=1
+```
+
+So the obvious shell idiom works: `legion kv get app/flag || legion kv put
+app/flag on`. The `GetKv` RPC itself still answers a missing key with an empty
+`entry` rather than an error (see its proto comment); the CLI is what turns
+that into `NotFound`. There is no MCP tool for KV.
+
 ## Versioned Writes
 
 `expected_version` semantics:
@@ -309,8 +327,9 @@ Recovery paths:
 
 - Put the missing key back. The put resolves through the edge's `onChange`.
   A `restart` or `rollout` action re-renders the config, clears the
-  `failed:missing_kv_dependency` stamps, flips the job status back to `done`,
-  and replaces the failed allocations.
+  `failed:missing_kv_dependency` stamps, clears the job's `failed` status
+  (it reads `running` again once its allocations are back), and replaces the
+  failed allocations.
 - `onChange = "none"` doesn't recover on its own. A put re-renders and stores
   the desired config but schedules nothing, so the job stays `failed` with its
   marked allocations until you act.
@@ -396,5 +415,5 @@ Recover by putting the key back:
 
 ```sh
 cargo run -- kv put demo/banner back
-cargo run -- job list -j        # status: done; task restarted with BANNER=back
+cargo run -- job list -j        # status: running; task restarted with BANNER=back
 ```

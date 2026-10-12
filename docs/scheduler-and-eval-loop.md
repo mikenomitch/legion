@@ -147,6 +147,15 @@ config fresh. Two guards keep that from leaving a job at zero:
   it. A rollback that cannot place the previous version back queues the same
   retry for that version.
 
+A `job_update` also resets the config's task statuses to `pending` (only for
+a config with `dependsOn` edges), so a restarted DAG runs from its first
+step instead of finding the previous run's `success` statuses.
+
+A `job_reschedule` that carries a node (queued after an allocation failed
+there) **avoids** that node: it plans without it first, then plans whatever
+that pass could not place with the node allowed. On a cluster where the
+failed node is the only one with room, the replacement returns to it.
+
 ## Scheduler Entry Points
 
 Main paths in `Scheduler`:
@@ -447,6 +456,60 @@ whether a contended placement lands. Port assignments are re-read in the
 apply transaction too, so availability, constraints, resources, and ports
 all get the same apply-time check.
 
+### Partial placement
+
+A plan places what fits. When no node has room for a replica (capacity, a
+static port, a `distinct` rule, a stateful instance's pinned node), the
+planner stops placing that task and reports the remaining replicas as
+**unplaced**, with the reason, instead of failing the whole plan. The other
+tasks of the job, and the replicas of this task that did fit, are applied.
+
+- The eval succeeds and says what it left undone:
+  `Job web rescheduled with 1 placements; 1 unplaced (Failed to place task
+  web: static port 8080 is already in use on every node it is allowed on that
+  has room for it. ...)`. A plan log line at `warn` carries the same reasons.
+- A plan that can place **nothing** fails as before, with the same message,
+  as a typed placement error (`PlacementBlocked`). It is not a plan conflict,
+  so the eval is not requeued in a loop.
+- The unplaced remainder is placed by the next pass that has room. A node
+  registering or being uncordoned queues one for every job short of its
+  count (see [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md)).
+
+Tasks in a multi-task group (co-placed on one node) stay all-or-nothing: a
+member that cannot fit fails the plan. `legion job plan` also keeps
+all-or-nothing, so a dry run reports the first replica that would not fit as
+its error.
+
+### Static ports
+
+A task that declares a static port (`network.ports[].static`, or an upstream
+`localPort`) can run once per node. The planner reads the host ports each
+node's allocations already hold, plus the ports this plan has claimed so
+far, and a node where one of the task's static ports is taken is not a
+candidate for it. The apply transaction makes the same check, so the planner
+no longer builds plans the apply has to reject.
+
+What this means in practice:
+
+- `count = 2` with a static port on a one-node cluster places one replica
+  and reports the other unplaced, naming the port. It used to reject the
+  whole plan, requeue the eval about twice a second, and place nothing.
+- A replica on a node that is already running the port (another job's, or
+  another replica's) is placed on a node where the port is free, or not at
+  all.
+- Preemption never targets a port-blocked node: evicting work frees
+  capacity, not a port.
+- A rollout that cannot place a replacement because the version it replaces
+  holds the port stops the old allocation first (see
+  [rollouts.md](rollouts.md#static-ports-and-surge)).
+
+Ports a Fresh plan's own previous allocations hold count as taken until the
+handler removes those rows, matching what the apply sees. Ports assigned
+dynamically by this same plan are not known until apply, so a static port
+inside the dynamic range can still collide at apply time with a dynamic port
+handed out in the same plan; the candidate walk then falls back to the next
+candidate.
+
 ### Conflict handling
 
 A rejected plan raises a conflict error, which the eval handler retries
@@ -509,10 +572,10 @@ node changed while it was being built. `legion_scheduler_node_list_rebuilds_tota
 counts rebuilds ([metrics.md](metrics.md)). It should sit near zero while the
 fleet is stable.
 
-A plan that excludes nodes (a reschedule away from a failed node) shares the
-cached set unless an excluded node is actually in it. Only then does it build a
-filtered copy, which costs O(fleet). In practice the excluded node is usually
-already unavailable.
+A plan that excludes nodes (the first pass of a reschedule away from a failed
+node, or a rollout's in-place pass) shares the cached set unless an excluded
+node is actually in it. Only then does it build a filtered copy, which costs
+O(fleet).
 
 The read model also keeps a per-job index of allocations by node,
 maintained by the same writes that maintain the per-node allocation lists.
@@ -635,15 +698,27 @@ heard from score `0`, which costs placement quality and never correctness.
 
 ## Dependency-Aware Task Readiness
 
-Before placement, tasks are filtered via dependency graph and current task-status map:
+Before placement, tasks are filtered via the dependency graph and the task
+statuses workers reported:
 
 - topological ordering rejects cycles
 - dependency conditions:
-  - `start`
-  - `complete`
-  - `success`
+  - `start`: the dependency started, or is placed in this pass
+  - `complete`: the dependency's worker reported it finished, either way
+  - `success`: the dependency's worker reported a successful exit
 
-Only ready tasks are considered in that scheduler pass.
+Only ready tasks are considered in that scheduler pass. The others are
+**held**: reported on the plan outcome (`waiting on dependencies: ...` in the
+eval's outcome), not counted as unplaced, and not a capacity block for a
+rollout. A batch dependency that is merely placed in the same pass does not
+satisfy `complete` or `success`; only a reported exit does. The dry run
+(`legion job plan`) is the exception: it treats batch dependencies as
+satisfied so it can show the whole job.
+
+When a worker reports a terminal exit for a task that other tasks depend on,
+the manager queues an eval for the job (a `rollout_tick` while a rollout
+targets the config, a `job_reschedule` otherwise), which places what the exit
+made ready. See [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#task-lists-and-dependency-readiness).
 
 ## Eval Triggers into Scheduling
 
@@ -651,6 +726,8 @@ Typical triggers:
 
 - `run_job` -> enqueue `job_submit` / `job_update` / `rollout_tick`.
 - Worker failure heartbeat -> enqueue delayed `job_reschedule`.
+- Worker terminal report for a task with dependents -> enqueue
+  `job_reschedule` (or `rollout_tick` during a rollout).
 - Dynamic node updates -> enqueue `job_update` for affected jobs.
 - Rollout engine -> enqueue delayed `rollout_tick` while active.
 

@@ -695,6 +695,14 @@ impl Eval {
         }
 
         if let Some(delay) = min_delay {
+            // One timer per config. Every placing eval passes through here,
+            // and a DAG's steps each queue a `job_reschedule` as they finish
+            // (`Store::queue_dependency_progress`); without this check each
+            // of them would add another delayed `job_update`, and the job
+            // would re-run once per step at the next schedule tick.
+            if store.delayed_eval_pending("job_update", &self.job_config_id)? {
+                return Ok(());
+            }
             store.enqueue_eval_after_delay(
                 "job_update",
                 Some(&self.job_id),

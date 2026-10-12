@@ -127,7 +127,7 @@ doesn't, `legion exec` fails fast with a clear error.
 
 | Kind | Exec | Interactive (tty) | Notes |
 | --- | --- | --- | --- |
-| `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. Host-level, so it requires the `host` ACL grant. |
+| `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. Host-level, so it requires the `host` ACL grant. The env is the task's own, built the same way: Legion's allocation env (`LEGION_ALLOC_ID`, `LEGION_JOB_ID`, `LEGION_TASK_NAME`, `LEGION_PORT_*` / `LEGION_ADDR_*`, `LEGION_UPSTREAM_*`), then worker-injected env (`LEGION_TASK_DIR`, artifacts, volumes, identities), then the task's `env`. `TERM` is set for tty sessions unless the task sets it. Raw exec and actions get the same env. The process stays in the host's network namespace, also for a `network.mode = "gated"` task. |
 | `container` (Apple `container`) | ✅ | ✅ | `container exec` inside the container's namespaces (sandboxed). |
 | `container` (youki / runc / crun) | ✅ | ✅ | `<runtime> exec` inside the container's namespaces (sandboxed). The process spec comes from the bundle Legion generated, so env, cwd, and user match the task. Only argv is replaced, and the exit status is the process's own. |
 | `sandbox` (microVM) | ❌ | ❌ | Not yet supported, because exec into a guest needs a vsock agent. Reports unsupported up front instead of failing at session open. |

@@ -20,7 +20,7 @@ legion start worker $TOKEN --simulate 1000 \
   --name-prefix sim-a \
   --ready-after 500ms \
   --register-rate 100 \
-  --advertise-host 10.0.1.17
+  --advertise-addr 10.0.1.17
 ```
 
 `$TOKEN` is an ordinary join token (`legion join-token create`). All
@@ -33,7 +33,7 @@ flags except `--simulate` are optional:
 | `--name-prefix <P>` | `sim` | Node ids are `<prefix>-<profile>-<idx>`. |
 | `--ready-after <DUR>` | `0s` | Delay before a dispatched allocation is reported running (models task-start latency). |
 | `--register-rate <N/s>` | `100` | Registration ramp, so a large fleet doesn't stampede a fresh manager. |
-| `--advertise-host <HOST>` | `127.0.0.1` | Host the manager dials for task dispatch to this fleet. Set it to the machine's reachable address when the manager runs elsewhere. |
+| `--advertise-addr <HOST[:PORT]>` | detected | Host the manager dials for task dispatch to this fleet. Same default as a real worker: `LEGION_WORKER_ADVERTISE_ADDR`, else the local address of the route to the manager (`127.0.0.1` when the manager is on the same machine). |
 
 ### Profiles
 
@@ -98,6 +98,15 @@ constraint (for example `constraints = { simulated = { operator = "is_not_set" }
   the manager's push dispatch (`PostWork`) gets exercised. Dispatched
   allocations are acknowledged after `--ready-after` and echoed in
   heartbeats. No process is spawned and no runtime plugin loads.
+- **One fleet identity.** The stub endpoint is a real mTLS worker plane
+  with the same caller classes as a real worker
+  ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). One listener
+  serves one certificate for thousands of nodes, so the fleet's first node
+  (by name) requests a node certificate after it registers, and every node
+  in the process registers that node's id as `workerPlaneName`. Managers
+  verify that name, instead of each node's own, only for nodes that also
+  report `simulated: true`. Push dispatch starts once that certificate is
+  issued; until then heartbeat replies deliver allocations as usual.
 - **Restart-safe by naming.** There is no state directory. Node ids are
   deterministic, so a restarted process re-registers the same nodes
   (registration is an upsert). The manager sees a restart as a brief

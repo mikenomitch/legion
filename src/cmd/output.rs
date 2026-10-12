@@ -348,4 +348,15 @@ mod tests {
             assert!(hint_for(code, "").is_some(), "{code:?} has no hint");
         }
     }
+
+    #[test]
+    fn human_errors_name_the_code_like_the_envelope() {
+        let err = crate::cmd::helpers::friendly_status(
+            "failed to destroy job",
+            Status::failed_precondition("Job web must be stopped before it can be destroyed"),
+        );
+        let text = err.to_string();
+        assert!(text.ends_with("[code=FailedPrecondition]"), "{text}");
+        assert!(text.contains("must be stopped"), "{text}");
+    }
 }

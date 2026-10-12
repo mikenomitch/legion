@@ -232,6 +232,20 @@ async fn forward(
     let channel = store
         .raft_peer_channel(leader)
         .with_context(|| format!("no channel to the leader at {leader}"))?;
+    // Connection-scoped headers belong to the caller's hop (a browser's
+    // HTTP/1.1 gRPC-Web request arrives with some); HTTP/2 refuses them.
+    for hop in [
+        http::header::CONNECTION,
+        http::header::HOST,
+        http::header::TRANSFER_ENCODING,
+        http::header::UPGRADE,
+        http::header::CONTENT_LENGTH,
+    ] {
+        headers.remove(hop);
+    }
+    headers.remove("keep-alive");
+    headers.remove("proxy-connection");
+    headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
     headers.insert(
         FORWARDED_BY_HEADER,
         HeaderValue::from_str(node_id).unwrap_or_else(|_| HeaderValue::from_static("manager")),

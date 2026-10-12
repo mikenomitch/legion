@@ -518,9 +518,10 @@ show you this.
 
 ## Symptom: nothing is running and nothing reports an error
 
-**Decision: don't trust `legion job info`'s status field or
-`evals_processed_total{status="error"}`.** Neither one reports placement
-failure. Count allocations instead.
+**Decision: read `legion job info`'s status, and don't trust
+`evals_processed_total{status="error"}`.** A job nothing could be placed for
+reads `pending`; the counter does not report placement failure. Count
+allocations to see how far short a job is.
 
 **Worked example**
 
@@ -530,12 +531,14 @@ task had failed to place reported `status: done`.
 
 Two separate gaps caused that:
 
-1. **The job `status` field is a lifecycle flag.** It doesn't tell you whether
-   placement worked. A job row is inserted with `status = "done"` at submit
-   time, and only the KV reactive-update failure path ever writes `failed`. A
-   job whose placements all failed keeps the status it was created with.
-   `GetJobInfo` returns the job row and nothing about its allocations, so
-   `legion job info` can't tell you whether a job placed.
+1. **The job `status` field was a lifecycle flag.** It said `done` for every
+   accepted job, placed or not. The reported status is now derived from the
+   job's allocations and task statuses (`running`, `pending`, `complete`,
+   `failed`, `stopped`; see
+   [Job Status](jobs-tasks-and-scheduling.md#job-status)), so a job whose
+   placements all failed reads `pending`. The `job` table's own `status`
+   column, which `legion state query` shows, is still the stored flag
+   (`done`, `stopped`, `failed`).
 2. **Terminal eval failures don't reliably reach the counter.**
    `legion_evals_processed_total{status="error"}` is recorded from the eval
    worker's return value. The two retry outcomes (not-leader and

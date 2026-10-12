@@ -298,7 +298,9 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
     loop {
         match worker.post_work(push.clone()).await {
             Ok(_) => break,
-            Err(status) if status.code() == tonic::Code::Unavailable && Instant::now() < deadline => {
+            Err(status)
+                if status.code() == tonic::Code::Unavailable && Instant::now() < deadline =>
+            {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(status) => {
@@ -336,7 +338,9 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
 
     // The stub enforces the same caller classes as a real worker: a client
     // that trusts the CA but presents no manager certificate is refused.
-    let ca = store.mesh_ca()?.context("the fleet's certificate created the CA")?;
+    let ca = store
+        .mesh_ca()?
+        .context("the fleet's certificate created the CA")?;
     let tls = tonic::transport::ClientTlsConfig::new()
         .ca_certificate(tonic::transport::Certificate::from_pem(&ca.cert_pem))
         .domain_name(legion::manager::mesh_ca::node_dns_name("sim-it-util-0"));

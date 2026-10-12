@@ -2,8 +2,12 @@
 
 > **Judgement calls:** [worker-plane-auth-plan_calls.md](../calls/worker-plane-auth-plan_calls.md)
 
-**Status: PLANNED.** Nothing here is built. The plan has two halves that
-share one threat: something reaching a node's control plane that shouldn't.
+**Status: IN EXECUTION.** Phase 1 shipped on 2026-10-12, except the CA pin
+(§6.5), two-step CA rotation (§6.9), and the `ticket` class on `ExecTask`,
+which are deferred (see [Phase 1 as shipped](#phase-1-as-shipped) and calls
+entries 10, 11, and 15). Phases 0 and 2 through 8 are planned. The plan has
+two halves that share one threat: something reaching a node's control plane
+that shouldn't.
 
 - **The worker plane** (Phases 1, 4, and 8): mutual TLS on the worker
   listener, a reachable advertised address, an encrypted worker-to-manager
@@ -140,6 +144,14 @@ youki (the default), runc, and crun:
 - It keeps only `CAP_AUDIT_WRITE`, `CAP_KILL`, and `CAP_NET_BIND_SERVICE`, with
   `noNewPrivileges` (`oci_bundle.rs:646-652`). That is tighter than Docker's
   default of 14 capabilities, so capabilities need no work.
+  > **Update (spot-check fixes, 2026-10):** three capabilities broke stock
+  > images (nginx, the Postgres entrypoint), so containers now get Docker's
+  > default set less `CAP_NET_RAW`, adjustable per task with
+  > `security.capabilities = { add, drop }`. `noNewPrivileges` is unchanged.
+  > The `security` block §6.14 proposes now exists and holds `capabilities`;
+  > `userNamespace` and `seccomp` join it in Phase 6, and a capability `add`
+  > beyond the default is a candidate for the `host` grant (§6.16). See
+  > `docs/task-runtime-container.md` ("Capabilities").
 - It has **no seccomp profile** (no `linux.seccomp` in the spec, and OCI runtimes
   apply only what the spec asks for), no AppArmor or SELinux label, and no
   cgroup namespace.
@@ -576,7 +588,7 @@ owns the rules the listener applies:
   ```
 
   This makes direct exec depend on Phase 4 as well as Phase 1 (calls entry
-  13). Edge boot keeps today's exposure until Phase 4 lands, and its public
+  16). Edge boot keeps today's exposure until Phase 4 lands, and its public
   doc says so.
 
 A direct call without a manager cert:
@@ -636,7 +648,7 @@ All seven call sites go through one `WorkerPlane::client(node)` factory that:
   work payloads
 - caches channels per node, as the dispatcher does per address today
 - refuses an `http://` address with an error naming the worker's protocol
-  version. There is no plaintext path (calls entry 16).
+  version. There is no plaintext path (calls entry 19).
 
 The CLI's edge-boot path (`legion sandbox start --node https://...`) verifies
 the node cert the same way. It fetches the CA with the caller's token through
@@ -860,7 +872,7 @@ address against the host guard and the allocation's CIDR rules, and dial
 only an address that passed. A name rule still matches on the name. This
 closes the hostname, `localhost`, decimal-literal, and DNS-rebinding bypasses
 in §1.2, because there is no second resolution between the verdict and the
-dial (calls entry 14).
+dial (calls entry 17).
 
 **Order of checks** in `judge`: the boot gate, then the host guard, then
 pending policy, then the egress chain. A host-guard denial is final.
@@ -1047,7 +1059,8 @@ container:
   - Volumes mount with idmapped mounts, so a volume reattached to a new
     allocation (with a new range) keeps working. A node or runtime that
     can't do idmapped mounts fails a volume-backed start with a named reason.
-  - The three capabilities and `noNewPrivileges` stay as they are. Inside a
+  - The capability set and `noNewPrivileges` stay as they are (the set is
+    now Docker's default less `CAP_NET_RAW`; see the update above). Inside a
     user namespace they apply to that namespace only.
 
 The surface is a `security` block on the container config, shown with its
@@ -1242,6 +1255,55 @@ Closes: any task, on any node, owning the cluster through the manager API.
 Closes: the multi-host launch blocker, and any process on a node driving
 `ExecTask`, `GetTaskLogs`, `PostWork`, or `RestartWorker`.
 
+#### Phase 1 as shipped
+
+Shipped 2026-10-12 (pre-launch spot-check finding P0-1):
+
+- [x] Bind and advertise (§6.6): `0.0.0.0:4848` by default,
+  `LEGION_WORKER_HOST`, `LEGION_WORKER_PORT`, `LEGION_WORKER_ADVERTISE_ADDR`,
+  `--advertise-addr` on `legion join` and `legion start worker` (the
+  simulator's `--advertise-host` is gone, calls entry 25), route-based
+  detection, the startup log line, and an `https://` `workerAddress`.
+  Service discovery and the mesh take the host from it unchanged
+  (`worker_address_host` already stripped the scheme).
+  Code: `src/worker/plane.rs`.
+- [x] The mTLS listener with per-RPC caller classes (§6.1): a hot-swappable
+  rustls config over `serve_with_incoming`, client certificate requested
+  but optional, `authorize()` first in every handler of the real worker and
+  the simulator, refusal messages as written in §6.1. A handshake that fails
+  for an unknown CA asks the node to re-issue (calls entry 11).
+- [x] Manager certificates (§6.2), minted on first dial rather than at
+  startup (calls entry 24), and the one `WorkerPlane` factory (§6.3) used
+  by dispatch, speculative dispatch, ratification, exec and actions, logs,
+  and restart: CA-only roots, the manager certificate as client identity,
+  the node's name verified, channels cached per (name, address) (calls
+  entry 20), `http://` refused with the worker's protocol version. Code:
+  `src/manager/worker_plane.rs`. `legion sandbox start` verifies the node
+  against the cluster CA (`--ca-cert`, or fetched from the manager).
+- [x] CSR issuance, eager at registration, persisted under
+  `<state-dir>/identity/` mode `0600` (§6.4). `IssueNodeCertificateRequest`
+  gained a required `csr_pem`, and `key_pem` is removed from the reply. The
+  mesh uses the same identity.
+- [x] `every_worker_rpc_is_classified` plus a request per class against the
+  real handlers, and the factory's wrong-node, closed-port, and plaintext
+  tests (`tests/worker_plane.rs`).
+- [x] The simulator serves one fleet certificate named by `workerPlaneName`,
+  honored only for `simulated: true` nodes (open question 4, calls entry
+  21).
+- [x] `PROTOCOL_VERSION = 3`.
+- [x] Exec, logs, and restart failures that never reach the worker name the
+  node, address, and port, with a 5-second connect timeout (a stand-in for
+  Phase 8, calls entry 22).
+- [ ] The CA pin in join tokens (§6.5): moved to Phase 4, calls entry 10.
+- [ ] Two-step CA rotation (§6.9): deferred, calls entry 11.
+- [ ] The `ticket` class on `ExecTask`, `exec.direct`, and the JWKS verifier
+  on ticket-accepting workers: wait for the sandbox-exec plan, calls entry
+  15. The table and refusal text for two-class RPCs are in place.
+- [ ] Two workers on `127.0.0.2`/`127.0.0.3` in one test process, the CA
+  rotation integration test, and the AWS 1,000-node throughput comparison
+  (§9). The factory and listener are covered by `tests/worker_plane.rs`,
+  `tests/worker_simulation.rs`, and unit tests.
+
 **Phase 2: the host guard in the datapath.** §6.11.
 
 - The guard's address classes, refreshed node addresses, and the worker's
@@ -1276,7 +1338,8 @@ rules.
 Closes: host-network containers reaching anything on the host or the
 metadata service by default.
 
-**Phase 4: an encrypted worker-to-manager channel.** §6.8.
+**Phase 4: an encrypted worker-to-manager channel.** §6.8, and the CA pin
+(§6.5), which moved here from Phase 1 (calls entry 10).
 
 - Workers honor operator `server.tls`.
 - TLS detection on 4747 with cluster-CA certs when no operator cert is set.

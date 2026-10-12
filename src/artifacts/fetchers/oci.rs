@@ -290,10 +290,15 @@ struct ImageBlobCache<'a> {
 }
 
 impl ImageBlobCache<'_> {
-    /// A cached blob's bytes, for manifests and indexes (small JSON).
+    /// A cached blob's bytes, for manifests and indexes (small JSON, so they
+    /// are rehashed on every read: one that no longer matches its digest is
+    /// dropped from the store and fetched again).
     fn read(&self, digest: &str) -> Option<Vec<u8>> {
         let digest = ContentDigest::parse(digest).ok()?;
-        let entry = self.store.get(&digest).ok()??;
+        if !self.store.contains(&digest).ok()? {
+            return None;
+        }
+        let entry = self.store.verify(&digest).ok()?;
         std::fs::read(&entry.path).ok()
     }
 

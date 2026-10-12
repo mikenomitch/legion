@@ -12,6 +12,7 @@ This document covers:
 - [The log "plugins" (sinks)](#the-log-plugins-sinks)
 - [Rotation & retention (and how to configure it)](#rotation--retention)
 - [Reading & tailing logs (CLI, MCP, UI)](#reading--tailing-logs)
+- [Logs of removed allocations](#logs-of-removed-allocations)
 - [Shipping logs to an external system](#shipping-logs-externally)
 - [OpenTelemetry traces for Legion itself](#opentelemetry-traces-for-legion-itself)
 
@@ -29,12 +30,33 @@ two append-mode files in a per-allocation directory:
 ├── stdout.log.1       # rotated generations (newest = .1)
 ├── stderr.log.1
 ├── …
+├── owner.json         # which allocation owns the directory (below)
 └── meta.json          # resource manifest for log shippers
 ```
 
 The state dir defaults to `.legion/workers/<worker-id>/`. Move the whole tree
 with `LEGION_DATA_DIR` (see [data-directory.md](data-directory.md)), or just the
 worker state path with `LEGION_WORKER_STATE_PATH`.
+
+Before a task starts, the worker writes `owner.json` naming the allocation
+that owns the directory: its id, job, job config, task config, and task
+name. Allocation ids are never reused within a cluster, but a worker can
+outlive its cluster's state. Rebuild the managers or wipe their data dir and
+ids start from 1 again, while the worker still holds `logs/1/` from before.
+So when a new allocation starts and its directory already holds output that
+belongs to a different allocation (or has output and no `owner.json`), the
+worker renames the old directory to `<id>.replaced-<unix seconds>` and starts
+the new task in an empty one, logging `Log directory held output from a
+different allocation with the same id; moved it aside`. The same allocation
+starting again (re-dispatched after a worker restart, say) matches its own
+`owner.json` and keeps appending. The moved-aside directory is pruned like
+any inactive one ([retention](#rotation--retention)).
+
+Known limitation: the worker can only tell allocations apart by what it is
+told about them. A rebuilt cluster that runs the identical job (same name,
+version, task, and task config id) and hands it the same allocation id looks
+like the same allocation, so its output is appended to the old file. Within
+one cluster this cannot happen.
 
 The per-allocation log directory is owner-only (`0700` on Unix). Captured
 output can contain secrets, so other tasks and local users on the node can't
@@ -122,6 +144,18 @@ lost offset, and no need to signal the task.
 Rotated generations beyond `maxFiles`, or older than `retentionDays`, are
 deleted.
 
+The sweep runs every 10 seconds over every allocation the worker has
+registered, including one that failed before its runtime opened its log
+files and so has no directory yet: that allocation has nothing to rotate,
+which is not an error.
+
+A whole allocation directory outlives its allocation, so its output can still
+be read after the allocation is removed
+([below](#logs-of-removed-allocations)). Once nothing has been written to the
+directory of an allocation the worker no longer runs for `retentionDays`, the
+worker deletes the directory. It checks every five minutes. Directories of
+allocations it still runs are never deleted, however old.
+
 ### Configuration
 
 Tune rotation with environment variables on the worker (like
@@ -131,7 +165,7 @@ Tune rotation with environment variables on the worker (like
 | --- | --- | --- |
 | `LEGION_LOG_MAX_FILE_BYTES` | `10485760` (10 MiB) | Rotate a stream once its active file exceeds this. |
 | `LEGION_LOG_MAX_FILES` | `5` | Rotated generations to keep per stream. |
-| `LEGION_LOG_RETENTION_DAYS` | `7` | Delete rotated files older than this. |
+| `LEGION_LOG_RETENTION_DAYS` | `7` | Delete rotated files older than this, and the directories of allocations no longer running here once they have been idle this long. |
 
 For example, a worker that keeps less on disk:
 
@@ -168,7 +202,9 @@ legion job logs web --json
 
 Flags: `--allocation <ID>`, `--stream stdout|stderr|all` (default `all`),
 `--max-bytes <N>` (`0` = the worker's 256 KiB default window), `--tail` (trailing
-bytes), `--follow`/`-f` (stream until interrupted).
+bytes), `--follow`/`-f` (stream until interrupted), `--include-removed` (also
+show the job's recently removed allocations; see
+[below](#logs-of-removed-allocations)).
 
 `--follow` polls and prints only newly written bytes. It tracks a byte offset
 per (allocation, stream), so it stays efficient on chatty tasks and recovers
@@ -181,6 +217,9 @@ The `legion_job_logs` tool exposes the same capability to agents (read-only):
 ```json
 { "name": "web", "stream": "stderr", "tail": true, "max_bytes": 8192 }
 ```
+
+It takes `include_removed` too, and reads removed allocations the same way
+the CLI does.
 
 ### Web UI
 
@@ -203,8 +242,61 @@ per-stream `nextOffset`. This is the same incremental tail the CLI uses.
 1. Workers capture stdout/stderr to per-allocation files (above).
 2. `Worker.GetTaskLogs` reads those files on the node (byte cap, tail, offset).
 3. `Manager.GetAllocationLogs` resolves a job (or allocation id) to its
-   allocations, locates each host node, and proxies the read.
+   allocations, live or recently removed, locates each host node, and proxies
+   the read.
 4. `legion job logs`, the `legion_job_logs` MCP tool, and the UI surface it.
+
+A node that is unreachable fills that allocation's `error` in the reply
+instead of failing the whole read. The error says which node, at which
+address, and why (for example `cannot reach node w-2 at https://10.0.1.7:4848
+(Connection refused)`); an error the worker itself returned is passed through
+by its message.
+
+---
+
+## Logs of removed allocations
+
+Output matters most when something went wrong, and that is usually when the
+allocation is gone: it failed and was rescheduled, the job was stopped, a
+rollout replaced it, or the job was destroyed. So removed allocations stay
+readable:
+
+- The manager remembers every removed allocation (its job, task, node, status,
+  and why it was removed) for **24 hours**, in the `allocation_history` table.
+- The worker keeps the files until the allocation's directory has been idle
+  for `LEGION_LOG_RETENTION_DAYS` (7 days by default).
+
+```bash
+# A job with no live allocation (failed, finished, stopped, or destroyed)
+# shows its most recently removed allocations instead, newest first, at most 10:
+legion job logs web
+== allocation 31 (task web) on w-1 [removed, stop at 2026-10-12T01:49:13Z] ==
+--- stdout ---
+…
+
+# A job that is running shows only its live allocations; add the removed ones:
+legion job logs web --include-removed
+
+# Any one allocation, live or removed in the last 24 hours:
+legion job logs --allocation 31
+```
+
+In `--json` output each allocation carries `removed`, `removalCause` (the stop
+cause: `stop`, `update`, `reschedule`, `node_lost`, `preempted`, `destroy`,
+`scale_in`, …), `removedAtUnix`, and `status` (`placed`, `complete`, or
+`failed` at removal).
+
+Limits:
+
+- After 24 hours the manager no longer knows where a removed allocation ran,
+  so `legion job logs` stops offering it. The files are still on the node
+  until the worker's retention expires; read them there
+  (`<worker-state-dir>/logs/<allocation-id>/`) or ship them with a collector
+  ([below](#shipping-logs-externally)).
+- A removed allocation whose node is gone, or whose files the worker already
+  pruned, comes back with an `error` or with no streams.
+- `--follow` on a job with no live allocation tails its removed allocations,
+  whose output does not grow.
 
 ---
 
