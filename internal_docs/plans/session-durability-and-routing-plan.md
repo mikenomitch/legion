@@ -2,7 +2,7 @@
 
 > **Judgement calls:** [`calls/session-durability-and-routing-plan_calls.md`](../calls/session-durability-and-routing-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-12). Builds on session mode from
+**Status: IN EXECUTION** (written 2026-10-12; Phase 5a, sessions sleeping on their own node, is built: [session-mode.md](../../docs/session-mode.md#idle-sessions)). Builds on session mode from
 [sandbox-scaling-plan.md](sandbox-scaling-plan.md) Phase 6, shipped in
 [#30](https://github.com/mikenomitch/legion/pull/30); `src/` citations
 are at `main` after that merge (`4a2fee3`). This

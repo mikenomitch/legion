@@ -2829,7 +2829,7 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
       finding one fans out to every manager, and every start goes through
       a manager. Plan:
       [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md)
-      (PLANNED) · calls:
+      (IN EXECUTION) · calls:
       [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md).
   - [ ] Phase 1: the node starts sessions concurrently (launch out from
         under the task-manager lock, no state-file fsync per session start,
@@ -2841,15 +2841,32 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
         (`ListSessionNodes` for an outside consistent-hash picker, session
         tickets, `Worker.StartSession`), and the manager-routed path
         measured across three managers.
-  - [ ] Phase 5: session suspend on the node (`durability = "local"` or
-        `"store"`), `suspend.keepFor`, `evicted` answers, resume by tag with
-        manifest fallback, edge resume on any node, and moves fenced by a
-        generation claimed with a conditional manifest write (plan §6.7).
+  - [x] Phase 5a: sessions sleep on their own node with `durability =
+        "local"`: `suspend.keepFor`, idle suspend, `Worker.SuspendSessions`
+        / `Worker.ResumeSession` routed by tag from `instance suspend` /
+        `instance start`, eviction (keepFor, envelope gone, minFreeDisk)
+        with the `evicted` answer, UNAVAILABLE naming a silent node
+        ([docs](../docs/session-mode.md#idle-sessions), calls #13, #14,
+        #17-#21).
+  - [ ] Phase 5b: `durability = "store"` for sessions (a node refuses it
+        today with FAILED_PRECONDITION, calls #17), resume by manifest
+        fallback, edge resume on any node, and moves fenced by a generation
+        claimed with a conditional manifest write (plan §6.7).
+  - [ ] Evicted and unreachable session answers are given before the job's
+        ACL scope is known; have the node return the job id with them so
+        the precise scope is enforced first (calls #13).
+  - [ ] Memory checkpoints of sessions (`sandbox` runtime) are not covered
+        by a test: the unit tests run `exec` sessions, whose checkpoint is
+        a disk one (`a_session_suspends_and_resumes_on_its_node_test`).
   - [ ] No split brain (plan §6.7): manifest create for idempotent `store`
         starts, the fence list, the managers' batched duplicate sweep, and
         self-fencing after `stateful.fenceAfter`.
-  - [ ] Optional `suspend.checkpointEvery` and `suspend.onWorkerStop =
-        "checkpoint"` (plan §6.6).
+  - [x] Optional `suspend.checkpointEvery` (memory checkpoints only,
+        staggered, skipped past one interval and counted in
+        `legion_session_checkpoints_skipped_total`) and
+        `suspend.onWorkerStop = "checkpoint"` (a SIGTERM/SIGINT handler in
+        the worker, restore on restart) (plan §6.6,
+        [docs](../docs/session-mode.md#idle-sessions)).
   - [ ] Phase 6 (conditional, plan §6.8): batched raft session directory,
         only past its trigger.
 
@@ -4626,6 +4643,14 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       node-local pinning, `legion volume` CLI + MCP tools, UI, and the
       [Postgres](../docs/guides/postgres.md) / [Redis](../docs/guides/redis.md) guides
 - [x] Block-mode volumes, consumed directly by the sandbox runtime
+- [x] **Idle sessions sleep on their node** (session durability plan Phase
+      5a): `suspend.durability = "local"` on session tasks, `keepFor`,
+      `checkpointEvery`, `onWorkerStop`, suspend and resume routed by the
+      id's node tag, eviction with an explicit `evicted` answer, and no raft
+      entry for any of it ([plan](plans/session-durability-and-routing-plan.md)
+      §6.6 · [docs](../docs/session-mode.md#idle-sessions) ·
+      [calls](calls/session-durability-and-routing-plan_calls.md) #13, #14,
+      #17-#21). Store durability for sessions is open above (Phase 5b).
 - [x] **Edge boot: provisional allocations, gate levels, and boot tickets** —
       a node reaches a declared execution stage (`stage`/`boot`/`serve`) before
       the placement is durable, and an edge node authorizes a start itself from
