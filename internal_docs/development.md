@@ -43,10 +43,11 @@ LEGION_ADDR=http://127.0.0.1:4747 cargo run -- ledger
 
 ### Running a second cluster on one machine
 
-A worker serves its own gRPC endpoint on port 4848 and advertises that address
-to the manager, so two workers on one host collide (the manager dispatches both
-allocations to whichever process owns the port). Set `LEGION_WORKER_PORT` to
-give a second worker its own. Point the manager at a free port, and give both
+A worker serves its worker plane (mTLS gRPC) on `0.0.0.0:4848` and advertises
+that port to the manager, so two workers on one host collide: the second one
+cannot bind it, and its exec, logs, and push dispatch fail (the manager
+verifies each node's name, so nothing is misrouted). Set `LEGION_WORKER_PORT`
+to give a second worker its own. Point the manager at a free port, and give both
 processes their own `LEGION_DATA_DIR` so they share no state with your main
 cluster (see `docs/data-directory.md`):
 

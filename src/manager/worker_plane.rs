@@ -639,8 +639,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn https_targets_share_channels_per_name_and_address() {
+    // `connect_lazy` builds the channel on the ambient runtime, as the
+    // manager's dispatch and RPC paths always have one.
+    #[tokio::test]
+    async fn https_targets_share_channels_per_name_and_address() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::start_storage(&crate::structs::ManagerConfigFull {
             store_path: dir.path().join("store").to_string_lossy().into_owned(),

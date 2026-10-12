@@ -938,9 +938,10 @@ fn batch_task_completes_through_heartbeats_and_is_not_restarted() -> R<()> {
     let worker = worker_manager(&temp_dir);
     {
         let worker = worker.clone();
-        runtime.block_on(tokio::task::spawn_blocking(move || {
-            launch_task_allocation(&worker, &payload)
-        }))??;
+        // Off the async threads but inside the runtime, as the worker's
+        // reconcile launches.
+        let launch = runtime.spawn_blocking(move || launch_task_allocation(&worker, &payload));
+        runtime.block_on(launch)??;
     }
 
     // The supervisor loop, one tick at a time.

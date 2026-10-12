@@ -627,7 +627,9 @@ impl IdentityStore {
 /// Write `contents` to `path` with mode `0600`, via a temp file and rename.
 fn write_private(path: &Path, contents: &str) -> R<()> {
     use std::io::Write;
-    let tmp = path.with_extension("tmp");
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -1155,11 +1157,14 @@ mod tests {
             detect_advertise_ip("127.0.0.1:4747").await,
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
         );
+        // Hosts without an IPv6 loopback route detect nothing (and fall
+        // back); where there is one, it is loopback.
+        if let Some(ip) = detect_advertise_ip("http://[::1]:4747").await {
+            assert!(ip.is_loopback(), "{ip}");
+        }
         assert_eq!(
-            detect_advertise_ip("http://[::1]:4747")
-                .await
-                .map(|ip| ip.is_loopback()),
-            Some(true)
+            detect_advertise_ip("http://no-such-host.invalid:4747").await,
+            None
         );
     }
 

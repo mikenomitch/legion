@@ -124,7 +124,17 @@ Main tables (see migrations):
   [node-liveness.md](node-liveness.md)).
 - `worker_type`
 - `job`, `job_config`, `task_config`, `task_status`, `job_update`
-- `allocation`
+- `allocation`. Ids are AUTOINCREMENT and never reused: not after the
+  newest allocation is deleted, not after a restart, and not on a replica
+  that caught up from a raft snapshot (a lane snapshot carries each table's
+  `sqlite_sequence` high-water mark with its rows) or that wins an election.
+  A stale id held by a script or a client therefore names nothing rather than
+  another job's task.
+- `allocation_history`: removed allocations (job, job config, task, node,
+  status, stop cause, removal time), kept for 24 hours so `legion job logs`
+  can still read their output from the node
+  ([logging.md](logging.md#logs-of-removed-allocations)). Written in the same
+  transaction as the removal, and expired by later removals.
 - `eval`
 - `manager_config`
 - `kv_entry`, `kv_lock`, `job_kv_reference`

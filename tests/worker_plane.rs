@@ -361,6 +361,7 @@ async fn the_factory_verifies_the_node_it_dials() -> R<()> {
         .await
         .expect_err("a server certificate for wkr-1 is not wkr-2");
     let explained = target.explain(status);
+    eprintln!("wrong node: {}", explained.message());
     assert_eq!(explained.code(), Code::Unavailable);
     assert!(
         explained.message().contains("node wkr-2") && explained.message().contains("TLS"),
@@ -381,6 +382,7 @@ async fn the_factory_verifies_the_node_it_dials() -> R<()> {
     let explained = target.explain(status);
     assert_eq!(explained.code(), Code::Unavailable);
     let message = explained.message();
+    eprintln!("unreachable worker: {message}");
     assert!(
         message.contains(&format!("cannot reach node wkr-3 at https://{closed}"))
             && message.contains(&format!("port {}", closed.port()))

@@ -96,6 +96,8 @@ pub fn config() -> Command {
 
     Command::new("boot-ticket")
         .about("Mint and inspect boot tickets for edge starts")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
         .subcommand(create_cmd)
         .subcommand(list_cmd)
 }

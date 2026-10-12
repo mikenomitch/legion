@@ -76,7 +76,7 @@ Preview it, run it, and watch it come up:
 ```bash
 legion job plan hello.ncl       # what would change, without changing anything
 legion job run hello.ncl
-legion job info hello           # status, versions, and allocations
+legion job info hello           # the job and its status
 legion job logs hello
 ```
 

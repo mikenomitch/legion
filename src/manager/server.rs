@@ -12606,6 +12606,68 @@ mod tests {
         Ok(())
     }
 
+    /// P1-9: once an allocation is removed, `legion job logs` still finds
+    /// it (job, task, node from the allocation history) and asks its node.
+    /// Here the node has no worker address, so the entry carries an error
+    /// rather than streams — but it is there, marked removed, with its cause,
+    /// instead of "No allocations found". A destroyed job's logs too.
+    #[tokio::test]
+    async fn get_allocation_logs_reaches_removed_allocations() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let alloc =
+            submit_and_place_identity_task(&store, "gone", TaskConfig::new("fetch", "noop"))?;
+        store.remove_allocs_for_job("gone")?;
+        assert!(store.allocs_for_job("gone")?.is_empty());
+
+        let request = |job: &str, allocation_id: Option<i64>| {
+            Request::new(GetAllocationLogsRequest {
+                job: job.into(),
+                allocation_id,
+                stream: "all".into(),
+                ..Default::default()
+            })
+        };
+        let reply = manager
+            .get_allocation_logs(request("gone", None))
+            .await?
+            .into_inner();
+        assert_eq!(reply.allocations.len(), 1, "{reply:?}");
+        let entry = &reply.allocations[0];
+        assert_eq!(entry.allocation_id, alloc.id);
+        assert!(entry.removed);
+        assert_eq!(entry.removal_cause, "stop");
+        assert_eq!(entry.task_name, "fetch");
+        assert_eq!(entry.node_id, "node-1");
+        assert!(entry.removed_at_unix > 0);
+        assert!(!entry.error.is_empty(), "node-1 has no worker address");
+
+        // By id.
+        let reply = manager
+            .get_allocation_logs(request("", Some(alloc.id)))
+            .await?
+            .into_inner();
+        assert_eq!(reply.allocations.len(), 1);
+        assert!(reply.allocations[0].removed);
+
+        // An id that never existed is still NotFound.
+        let status = manager
+            .get_allocation_logs(request("", Some(alloc.id + 1000)))
+            .await
+            .expect_err("unknown allocation");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+
+        // The job is destroyed; its removed allocations stay readable.
+        store.stop_job("gone")?;
+        store.destroy_job("gone")?;
+        let reply = manager
+            .get_allocation_logs(request("gone", None))
+            .await?
+            .into_inner();
+        assert_eq!(reply.allocations.len(), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn get_allocation_logs_unknown_job_is_not_found() -> R<()> {
         let store = setup_store()?;
@@ -14973,7 +15035,7 @@ mod tests {
         insert_node(&store, "node-a")?;
         let jobspec = json!({
             "name": "revive",
-            "task": { "runtime": "noop", "config": {} }
+            "task": { "runtime": "exec", "config": { "command": ["true"] } }
         })
         .to_string();
         let run = || {

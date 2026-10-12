@@ -70,7 +70,7 @@ replies carry its allocations), but exec, logs, and restart fail with a
 message that names the node, the address, and the port:
 
 ```text
-cannot reach node wkr-1 at https://10.0.1.7:4848 (tcp connect error: Connection refused (os error 111)).
+cannot reach node wkr-1 at https://10.0.1.7:4848 (Connection refused (os error 111)).
 Managers dial workers on port 4848: allow it from every manager, or set
 LEGION_WORKER_ADVERTISE_ADDR on the worker if this address is wrong
 ```

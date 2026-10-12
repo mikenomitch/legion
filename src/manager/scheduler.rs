@@ -7116,10 +7116,20 @@ mod tests {
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
 
-        let err = scheduler
-            .plan_and_apply(&job_config_id, PlanMode::Fresh)
-            .expect_err("expected resource scheduling failure");
+        // The node holds two: those are placed, the third is reported
+        // unplaced instead of failing the whole plan, and nothing overcommits.
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+        assert_eq!(outcome.unplaced.len(), 1);
+        assert_eq!(outcome.unplaced[0].count, 1);
+        assert!(outcome.unplaced[0]
+            .reason
+            .contains("no available nodes matching constraints, permit, or resources"));
 
+        // With the node full, the next pass places nothing and fails.
+        let err = scheduler
+            .plan_and_apply(&job_config_id, PlanMode::Reschedule)
+            .expect_err("expected resource scheduling failure");
         assert!(err
             .to_string()
             .contains("no available nodes matching constraints, permit, or resources"));
@@ -7275,12 +7285,11 @@ mod tests {
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
 
-        let err = scheduler
-            .plan_and_apply(&job_config_id, PlanMode::Fresh)
-            .expect_err("expected max allocations failure");
-
-        assert!(err
-            .to_string()
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1, "maxAllocations = 1");
+        assert_eq!(outcome.unplaced.len(), 1);
+        assert!(outcome.unplaced[0]
+            .reason
             .contains("no available nodes matching constraints, permit, or resources"));
 
         Ok(())
@@ -8333,9 +8342,11 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
-        let result = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh);
-        assert!(
-            result.is_err(),
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(
+            outcome.unplaced.len(),
+            1,
             "second allocation cannot claim an already-consumed gpu item"
         );
 
@@ -9620,19 +9631,31 @@ mod tests {
         scheduler.plan_and_apply(&tool, PlanMode::Fresh)?;
         age_allocations(&store)?;
 
-        // One slot is available by eviction; two are not.
+        // One slot is available by eviction; two are not. The plan places
+        // the replica that fits (evicting one tool allocation) and reports
+        // the other unplaced, naming the floor.
         let api = submit_banded(&store, "api", Band::High, 2, None)?;
-        let err = scheduler
-            .plan_and_apply(&api, PlanMode::Fresh)
-            .expect_err("the floor must bind the second placement");
+        let outcome = scheduler.plan_and_apply(&api, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.unplaced.len(), 1);
         assert!(
-            err.to_string().contains("disruption.minAvailable"),
-            "the error names the floor: {err}"
+            outcome.unplaced[0].reason.contains("disruption.minAvailable"),
+            "the reason names the floor: {}",
+            outcome.unplaced[0].reason
         );
 
-        // And the floor is a HARD rule, not a score: nothing was evicted at
-        // all, because the plan that would have crossed it failed whole.
-        assert_eq!(store.allocs_for_node("node-a")?.len(), 2);
+        // And the floor is a HARD rule, not a score: exactly one tool
+        // allocation was taken, never the second.
+        assert_eq!(outcome.evictions.len(), 1);
+        let remaining = store.allocs_for_node("node-a")?;
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|allocation| allocation.job_id == "internal-tool")
+                .count(),
+            1
+        );
         Ok(())
     }
 

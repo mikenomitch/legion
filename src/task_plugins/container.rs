@@ -46,8 +46,8 @@ struct ContainerTaskConfig {
     /// lowercase name: `nofile`, `nproc`, `memlock`, `core`, `stack`, ...
     /// Each value is a number (soft and hard alike), `"unlimited"`, or
     /// `{ soft, hard }`. Each declared limit replaces the default of the same
-    /// name; the only default is `nofile = 1048576` (lowered to the host's
-    /// `fs.nr_open` when that is smaller).
+    /// name; the only default is `nofile = 1048576`, lowered to the worker's
+    /// own hard limit or the host's `fs.nr_open` when either is smaller.
     #[serde(default)]
     ulimits: std::collections::BTreeMap<String, Value>,
 
@@ -2423,10 +2423,13 @@ mod tests {
             stdout.contains("cache-owner=101"),
             "layer ownership kept: {stdout}"
         );
-        assert!(
-            stdout.contains("nofile=1048576") || !oci_bundle_root(),
-            "{stdout}"
-        );
+        let nofile = oci_bundle::default_rlimits()
+            .into_iter()
+            .find(|limit| limit.kind == "RLIMIT_NOFILE")
+            .expect("nofile default")
+            .soft;
+        assert!(nofile > 1024, "no longer the runtime's 1024");
+        assert!(stdout.contains(&format!("nofile={nofile}")), "{stdout}");
         assert!(
             response.starts_with("HTTP/1.1 200"),
             "nginx serves: {response:?} {stderr}"
@@ -2440,11 +2443,6 @@ mod tests {
             "access log via /dev/stdout: {access}"
         );
         Ok(())
-    }
-
-    fn oci_bundle_root() -> bool {
-        // SAFETY: geteuid cannot fail.
-        unsafe { libc::geteuid() == 0 }
     }
 
     /// The official Postgres entrypoint as `configs/jobs/postgres.ncl` runs

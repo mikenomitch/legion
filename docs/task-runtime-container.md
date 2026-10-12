@@ -194,12 +194,24 @@ let it drop privileges itself.
 
 ## Resource limits (`ulimits`)
 
-The container's process gets `RLIMIT_NOFILE` soft and hard at 1048576. That is
-the value Docker containers ran with for years and the one CRI-O sets. The OCI
-runtimes' own default is a hard 1024, which Redis warns about at start and a
-busy proxy exhausts. On a host whose `fs.nr_open` is lower, the default drops
-to it, and on a worker that is not root, to the worker's own hard limit (raising
-a hard limit needs root).
+The container's process gets `RLIMIT_NOFILE` soft and hard at 1048576, or at
+the worker's own hard limit if that is lower (and never above the host's
+`fs.nr_open`). 1048576 is the value Docker containers ran with for years and
+the one CRI-O sets. The OCI runtimes' own default is a hard 1024, which Redis
+warns about at start and a busy proxy exhausts.
+
+The worker's limit is the ceiling because the OCI runtime starts from it, and
+some hosts refuse to raise a hard limit even for root (nested and sandboxed
+environments); there, a higher default would make `runc` fail every start
+with `error setting rlimits for ready process: ... operation not permitted`.
+Under systemd the worker's hard limit is the unit's `LimitNOFILE=` (524288 by
+default), so that is the knob for the whole node:
+
+```ini
+# /etc/systemd/system/legion-worker.service.d/limits.conf
+[Service]
+LimitNOFILE=1048576
+```
 
 Set limits per task with `ulimits`, keyed by the lowercase name `docker run
 --ulimit` uses (`as`, `core`, `cpu`, `data`, `fsize`, `locks`, `memlock`,
@@ -220,7 +232,8 @@ config = {
 
 A declared limit replaces the default of the same name; the others keep
 theirs. `soft` may not exceed `hard`. A hard limit above the node's
-`fs.nr_open` makes the OCI runtime fail the start, with its own error in the
+`fs.nr_open`, or above the worker's own hard limit on a host that refuses to
+raise it, makes the OCI runtime fail the start, with its own error in the
 task's stderr.
 
 ## Stdout and stderr

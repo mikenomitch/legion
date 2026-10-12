@@ -910,7 +910,8 @@
                 },
                 # setrlimit for the container's process. A number sets soft
                 # and hard alike; also "unlimited" or { soft, hard }. The
-                # only default is nofile = 1048576.
+                # only default is nofile = 1048576 (or the worker's own hard
+                # limit, if lower).
                 ulimits = {
                     nofile = 65536,
                     nproc = { soft = 4096, hard = 8192 },

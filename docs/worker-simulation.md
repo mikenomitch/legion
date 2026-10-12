@@ -68,7 +68,7 @@ match real node attributes.
 Every simulated node carries `"simulated": true` in its attributes:
 
 ```bash
-legion node list -j | jq '[.data[] | select(.config_attrs.simulated)] | length'
+legion node list -j | jq '[.data[] | select(.configAttrs.simulated)] | length'
 ```
 
 Simulated nodes add no usable capacity. Keep simulated fleets out of

@@ -109,8 +109,13 @@ impl TestNode {
         self.store = None;
     }
 
-    fn restart(&mut self) -> R<()> {
+    /// Restart the manager, bringing its listener up `listener_delay` after
+    /// the raft engine — the window a real manager spends between starting
+    /// its engine and binding its API (keyring, auth-method JWKS fetches,
+    /// read-model load), during which no leader can reach it.
+    fn restart(&mut self, listener_delay: Duration) -> R<()> {
         self.store = Some(Store::start_storage(&self.config)?);
+        std::thread::sleep(listener_delay);
         self.serve();
         Ok(())
     }
@@ -130,7 +135,9 @@ impl TestNode {
     }
 
     fn leader(&self) -> Option<String> {
-        self.store().raft_status().and_then(|status| status.leader_id)
+        self.store()
+            .raft_status()
+            .and_then(|status| status.leader_id)
     }
 }
 
@@ -393,14 +400,20 @@ fn transfer_leader_moves_leadership_to_the_target() -> R<()> {
         })?
         .expect_err("an unknown target is refused");
     assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
-    assert!(status.message().contains("mgr-nope"), "{}", status.message());
+    assert!(
+        status.message().contains("mgr-nope"),
+        "{}",
+        status.message()
+    );
     Ok(())
 }
 
-/// P2-10: a restarted follower rejoins as a follower. It used to campaign on
-/// its first election tick — before its listener was even up — and its
-/// higher term then deposed the healthy leader: every manager restart cost
-/// an election and a few terms.
+/// P2-10: a restarted follower rejoins as a follower. A member whose
+/// listener came up later than one leader lease plus its election timeout
+/// after its engine started (so the leader could not reach it in time)
+/// campaigned, kept campaigning while unreachable, and its higher term then
+/// deposed the healthy leader the moment the leader's heartbeat arrived:
+/// such a restart cost an election and several terms.
 #[test]
 fn a_restarted_follower_does_not_depose_the_leader() -> R<()> {
     let _serial = cluster_gate();
@@ -415,7 +428,8 @@ fn a_restarted_follower_does_not_depose_the_leader() -> R<()> {
 
     nodes[follower].kill();
     std::thread::sleep(Duration::from_secs(3));
-    nodes[follower].restart()?;
+    // Longer than lease + election timeout (2000 + up to 2000 ms here).
+    nodes[follower].restart(Duration::from_secs(6))?;
     wait_for(
         Duration::from_secs(60),
         "the restarted follower hears from the leader",

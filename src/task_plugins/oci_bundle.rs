@@ -194,8 +194,9 @@ const RLIM_INFINITY: u64 = u64::MAX;
 /// The open-file limit a container gets by default: 1048576 (2^20), the
 /// value Docker containers ran with for years (containerd's systemd unit set
 /// `LimitNOFILE=infinity`, which the kernel caps at `fs.nr_open`), and what
-/// CRI-O sets. The OCI runtime's own default is a hard 1024, which servers
-/// like Redis warn about at start and which a busy proxy exhausts.
+/// CRI-O sets, unless the worker's own hard limit is lower (see
+/// `default_nofile`). The OCI runtime's own default is a hard 1024, which
+/// servers like Redis warn about at start and which a busy proxy exhausts.
 pub(crate) const DEFAULT_NOFILE: u64 = 1_048_576;
 
 /// The rlimit names `ulimits` accepts, as `(jobspec name, OCI type)`. The
@@ -220,10 +221,17 @@ const RLIMIT_NAMES: &[(&str, &str)] = &[
 ];
 
 /// The default open-file limit for this host: [`DEFAULT_NOFILE`], lowered to
-/// the kernel's `fs.nr_open` when that is smaller (a hard limit above it
-/// fails `setrlimit` and the container with it), and to this process's own
-/// hard limit when the worker is not root (raising a hard limit needs
-/// `CAP_SYS_RESOURCE`).
+/// the kernel's `fs.nr_open` and to the worker's own hard limit when either
+/// is smaller.
+///
+/// The OCI runtime runs as the worker's child, so the worker's hard limit is
+/// what it starts from, and a container whose limit is above it only starts
+/// where the runtime may raise it. A root runtime normally may, but hosts
+/// exist where even root cannot (sandboxed or nested environments refuse
+/// raising a hard limit with `EPERM`), and there `runc` fails every start
+/// with "error setting rlimits for ready process". Starting from the worker's
+/// own limit always works, and the operator sets it in one place
+/// (`LimitNOFILE=` in the worker's systemd unit, which is 524288 by default).
 fn default_nofile() -> u64 {
     let mut limit = DEFAULT_NOFILE;
     if let Some(nr_open) = std::fs::read_to_string("/proc/sys/fs/nr_open")
@@ -233,14 +241,14 @@ fn default_nofile() -> u64 {
         limit = limit.min(nr_open);
     }
     #[cfg(unix)]
-    if !running_as_root() {
+    {
         let mut current = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
         // SAFETY: getrlimit only writes the struct it is handed.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) } == 0 {
-            limit = limit.min(current.rlim_max as u64);
+            limit = limit.min(current.rlim_max);
         }
     }
     limit
@@ -620,8 +628,8 @@ fn safe_relative(path: &Path) -> Option<PathBuf> {
 ///   file is `0:0` breaks it. A non-root worker cannot chown, so there every
 ///   file belongs to the worker's user (and the container runtime runs
 ///   rootless anyway).
-/// - **Mode, including setuid/setgid/sticky.** Ownership is applied before
-///   the mode, because `chown` clears the setuid bits.
+/// - **Mode, including setuid/setgid/sticky.** A setuid or setgid mode is
+///   re-applied after the chown, because `chown` clears those bits.
 /// - **File capabilities and other extended attributes** (PAX
 ///   `SCHILY.xattr.*` records), best effort and only as root. `security.capability`
 ///   is what lets an image grant `cap_net_bind_service` to one binary.
@@ -651,7 +659,10 @@ fn extract_layer_as(blob: &Path, rootfs: &Path, preserve_owners: bool) -> R<()> 
     };
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
-    archive.set_preserve_ownerships(preserve_owners);
+    // Owners are applied below, not by the tar crate: it refuses an entry
+    // whose uid/gid field is empty, which Go's archive/tar (and so Docker)
+    // reads as 0.
+    archive.set_preserve_ownerships(false);
     archive.set_overwrite(true);
 
     for entry in archive.entries()? {
@@ -686,20 +697,82 @@ fn extract_layer_as(blob: &Path, rootfs: &Path, preserve_owners: bool) -> R<()> 
 
         // Read before unpacking: the PAX records sit in the header, and the
         // entry's data is consumed by the unpack.
+        let owner = preserve_owners.then(|| EntryOwner::of(entry.header()));
         let xattrs = if preserve_owners {
             entry_xattrs(&mut entry)
         } else {
             Vec::new()
         };
         // `unpack_in` re-validates the path against the rootfs and resolves
-        // hardlink/symlink targets safely. It applies the owner, then the
-        // mode, so setuid bits survive.
-        if entry.unpack_in(rootfs)? && !xattrs.is_empty() {
+        // hardlink/symlink targets safely, and applies the mode.
+        if !entry.unpack_in(rootfs)? {
+            continue;
+        }
+        let target = rootfs.join(&rel);
+        if let Some(owner) = owner {
+            owner.apply(&target);
+        }
+        if !xattrs.is_empty() {
             // After the chown, which would clear `security.capability`.
-            apply_xattrs(&rootfs.join(&rel), &xattrs);
+            apply_xattrs(&target, &xattrs);
         }
     }
     Ok(())
+}
+
+/// The owner and mode a layer recorded for one entry.
+struct EntryOwner {
+    uid: u32,
+    gid: u32,
+    mode: Option<u32>,
+    symlink: bool,
+}
+
+impl EntryOwner {
+    /// An empty or unparsable uid/gid field is 0, as Go's `archive/tar`
+    /// reads it; an id beyond `u32` is treated the same way.
+    fn of(header: &tar::Header) -> Self {
+        let id = |value: std::io::Result<u64>| {
+            value
+                .ok()
+                .and_then(|id| u32::try_from(id).ok())
+                .unwrap_or(0)
+        };
+        Self {
+            uid: id(header.uid()),
+            gid: id(header.gid()),
+            mode: header.mode().ok(),
+            symlink: header.entry_type().is_symlink(),
+        }
+    }
+
+    /// Chowns the extracted path (the link itself, for a symlink), then
+    /// re-applies a setuid/setgid mode, which `chown` clears on a regular
+    /// file even when root does it.
+    fn apply(&self, path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) = std::os::unix::fs::lchown(path, Some(self.uid), Some(self.gid)) {
+                debug!(
+                    path = %path.display(),
+                    uid = self.uid,
+                    gid = self.gid,
+                    error = %err,
+                    "Could not keep an image layer's file owner"
+                );
+                return;
+            }
+            if let Some(mode) = self.mode.filter(|mode| !self.symlink && mode & 0o6000 != 0) {
+                let _ =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
 }
 
 /// The PAX `SCHILY.xattr.<name>` records on a tar entry, minus the ones that
@@ -1735,14 +1808,19 @@ mod tests {
         let soft = nofile["soft"].as_u64().unwrap();
         assert_eq!(soft, nofile["hard"].as_u64().unwrap());
         assert!(soft <= DEFAULT_NOFILE);
-        // Only a host whose own limits are lower than that clamps it.
-        if running_as_root() {
-            let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
-                .ok()
-                .and_then(|raw| raw.trim().parse::<u64>().ok())
-                .unwrap_or(DEFAULT_NOFILE);
-            assert_eq!(soft, DEFAULT_NOFILE.min(nr_open));
-        }
+        // Clamped only by the host: `fs.nr_open` and the worker's own hard
+        // limit, which the OCI runtime starts from.
+        let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_NOFILE);
+        let mut own = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes the struct it is handed.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut own) }, 0);
+        assert_eq!(soft, DEFAULT_NOFILE.min(nr_open).min(own.rlim_max));
     }
 
     #[test]
@@ -2001,6 +2079,33 @@ mod tests {
                 None,
                 "overlay bookkeeping skipped"
             );
+        }
+        Ok(())
+    }
+
+    /// A header whose uid/gid fields are empty (some hand-built layers) is
+    /// owned by root, as Go's `archive/tar` reads it, instead of failing the
+    /// whole extraction.
+    #[test]
+    fn extraction_reads_an_empty_owner_field_as_root() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir()?;
+        let blob = dir.path().join("layer.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&blob)?);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(3);
+        header.set_mode(0o755);
+        builder.append_data(&mut header, "bin/sh", &b"#!x"[..])?;
+        builder.finish()?;
+        drop(builder);
+
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        extract_layer_as(&blob, &rootfs, running_as_root())?;
+        let meta = std::fs::metadata(rootfs.join("bin/sh"))?;
+        assert_eq!(meta.mode() & 0o777, 0o755);
+        if running_as_root() {
+            assert_eq!((meta.uid(), meta.gid()), (0, 0));
         }
         Ok(())
     }
