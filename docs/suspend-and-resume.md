@@ -296,7 +296,7 @@ sandbox differently from an `exec` or `container` task:
 | `network` | Bytes the guest sends on its TAP device, read from `/sys/class/net/<tap>/statistics/rx_bytes`. Nothing on `none` | Bytes through the egress proxy (and any ingress), as they move | Bytes the container sends, from `container stats` |
 | `connections` | **Refused at submit.** No datapath sees the guest's connections | Every open connection through the egress proxy, so a quiet model call keeps the sandbox awake | **Refused at submit** |
 | `cpu` | The VMM's CPU, which is the guest's | The same | The container VM's CPU, from `container stats` |
-| `exec` | Never fires: a microVM takes no exec sessions | The same | `legion alloc exec` sessions |
+| `exec` | Open `legion exec` and action sessions over the guest agent's vsock listener | The same | `legion exec` sessions |
 
 Only bytes the guest *sends* count on a TAP or an Apple container. What
 arrives includes broadcast and multicast noise on the bridge, which a quiet
@@ -319,20 +319,10 @@ Two rules follow, both checked at submit:
   platform, which knows when a call is in flight) [code=InvalidArgument]
   ```
 
-- `exec` listed explicitly on a sandbox pinned to a VMM (`hypervisor =
-  "firecracker"` or `"cloud-hypervisor"`) is refused, since it can never
-  fire. On `hypervisor = "auto"` the same sandbox may run in dev mode on a
-  Mac, where `exec` works, so `exec` (including the default list) is a
-  warning on `job run` and `job validate` instead:
-
-  ```text
-  warning: task workspace: suspend.idle counts "exec", which never fires while the sandbox runs
-  as a microVM (firecracker and cloud-hypervisor take no exec sessions). ...
-  List signals explicitly, such as ["network", "cpu"], to drop it
-  ```
-
-On a TAP-wired microVM, `network` and `cpu` decide. On `none`, only `cpu`
-does.
+On a TAP-wired microVM, `network`, `cpu`, and `exec` decide. On `none`,
+`cpu` and `exec` do: an open shell keeps the sandbox awake however quiet it
+is, because every microVM takes exec sessions through its guest agent
+([Exec & Actions](exec-and-actions.md#which-task-runtimes-support-exec)).
 
 The idle policy needs the node to measure activity, which it does only with
 `resourceEnforcement.enabled` on the worker type (see
@@ -1866,8 +1856,6 @@ See [metrics](metrics.md#suspend-and-resume).
 | `legion_idle_sweep_suspends_total{outcome="skipped"}` rising | The sweep found idle instances it could not suspend | The manager's debug log names why (a worker without the `checkpoint` capability, a memory checkpoint the node cannot take) |
 | Submit: `suspend.idle.signals "hint" is not implemented yet` | The workload's own idle signal is not available | Remove `hint`. Add `connections` to keep quiet datapath connections awake (ingress on any runtime, and egress on gated tasks, sandboxes included) |
 | Submit: `"connections" counts open connections through the node datapath, and this sandbox's traffic never crosses it` | A sandbox that is not gated has no datapath connections | Remove `connections`, or run the sandbox gated. Otherwise raise `after` or suspend from your platform |
-| Submit: `lists "exec", but this sandbox always runs as a microVM` | A microVM takes no exec sessions | Remove `exec` |
-| Warning: `suspend.idle counts "exec", which never fires while the sandbox runs as a microVM` | The default signals on a sandbox that may run as a microVM | List signals explicitly, or ignore it for a dev-mode-only job |
 | A TAP-wired sandbox never suspends | The guest keeps sending on its TAP (NTP, ARP, a chatty agent) | Compare `node usage`'s IDLE column with the guest's traffic, or drop `network` from `signals` |
 | Allocation fails: `sandbox needs TAP device lgf... on bridge br0: it exists and another process holds it` | The instance already runs a guest on this node | Stop the other allocation first |
 | Allocation fails: `bridge br0's sandbox range ... is full (N addresses leased on node w-03)` | Every address in the node's `sandbox.bridges.br0.range` is leased | Widen `range` in the worker config, or stop sandboxes on that node. See [Addressing](task-runtime-sandbox.md#addressing) |

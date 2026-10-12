@@ -285,6 +285,41 @@ impl Denials {
         method: &str,
         path: &str,
     ) {
+        self.record_count(
+            allocation_id,
+            who,
+            direction,
+            protocol,
+            destination,
+            source,
+            reason,
+            identity,
+            method,
+            path,
+            1,
+        );
+    }
+
+    /// [`Self::record`] for `count` identical denials at once: the kernel
+    /// host guard reports packet counters, not one call per drop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_count(
+        &self,
+        allocation_id: i64,
+        who: Option<&AllocIdentity>,
+        direction: &str,
+        protocol: &str,
+        destination: &str,
+        source: &str,
+        reason: Option<&str>,
+        identity: Option<&str>,
+        method: &str,
+        path: &str,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
         let key = DenialKey {
             allocation_id,
             direction: direction.to_string(),
@@ -313,7 +348,7 @@ impl Denials {
                 source: "truncated".to_string(),
                 ..Default::default()
             });
-            entry.count = entry.count.saturating_add(1);
+            entry.count = entry.count.saturating_add(count);
             return;
         }
         let entry = pending.entry(key).or_insert_with(|| NetDenial {
@@ -333,7 +368,7 @@ impl Denials {
             method: method.to_string(),
             path: path.to_string(),
         });
-        entry.count = entry.count.saturating_add(1);
+        entry.count = entry.count.saturating_add(count);
     }
 
     /// Take everything recorded so far, for the next heartbeat.

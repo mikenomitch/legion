@@ -20,6 +20,10 @@
   # still per-caller default-deny once ACLs are on. Set `enabled = false` to turn
   # off ExecAllocation and the exec WebSocket bridge entirely.
   # exec = { enabled = true },
+  # Direct exec tickets (`legion exec --direct`, `MintExecTicket`): how long a
+  # ticket can be redeemed and how long its session may run. Signed with the
+  # workload-identity key, so `workloadIdentity.enabled` must be true to mint.
+  # exec = { tickets = { defaultTtl = "60s", maxTtl = "10m", maxSession = "1h" } },
   # Telemetry: Prometheus /metrics plus /healthz + /readyz probes
   # (docs/metrics.md). Enabled by default; binds server.port + 2 (4749 here)
   # unless `port` is set. Set `enabled = false` to turn the listener off.
@@ -352,12 +356,16 @@
     # the mixed-version forwarding fallback.
     # batchWindow = "0ms",
   },
-  # Auth & ACLs (off by default; see docs/auth-and-acls.md).
-  # When enabled, run `legion acl bootstrap` once to mint the initial
-  # management token, then create policies/tokens with `legion acl ...` and
-  # introduce workers with `legion join-token create`.
+  # Auth & ACLs (on by default; see docs/auth-and-acls.md). At first start
+  # the manager mints the initial management token itself and writes it to
+  # <dataDir>/bootstrap-token and, when absent, ~/.legion/token (mode 0600),
+  # so the CLI on this machine works with nothing to set up. Create
+  # policies/tokens with `legion acl ...` and introduce workers with
+  # `legion join-token create`. `enabled = false` is for throwaway clusters
+  # only: every caller, including any task, then controls the cluster.
   acl = {
-    enabled = false,
+    enabled = true,
+    # bootstrapSecretFile = "/etc/legion/bootstrap-secret",  # IaC pre-seed (>= 24 chars), read at first start
     # auditOnly = true,        # log denials without enforcing (migration mode)
     # loginTtl = "24h",        # lifetime of tokens minted via `legion login`
     # tokenMaxTtl = "720h",    # upper bound for client-token lifetimes

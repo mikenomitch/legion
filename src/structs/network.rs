@@ -36,6 +36,16 @@ pub const VIP_FIRST_HOST: u8 = 2;
 pub const GATED_PROXY_ADDR: &str = "127.0.0.1";
 pub const GATED_PROXY_PORT: u16 = 1080;
 
+/// Where a gated `container` or `exec` allocation's resolver listens inside
+/// its namespace when it has no VIP block (worker-plane-auth plan §6.12). A
+/// fixed address costs no VIP block, and it is the address systemd-resolved
+/// hosts already name in `/etc/resolv.conf`, so a gated `exec` task that
+/// keeps the host's file reaches its own resolver.
+pub const GATED_RESOLVER_ADDR: &str = "127.0.0.53";
+
+/// The node fingerprint attribute naming its OS (`std::env::consts::OS`).
+pub const ATTR_NODE_OS: &str = "os";
+
 /// Resolve a task's declared `network.mode` without node facts: an explicit
 /// value is itself, and `auto` is `host`. Placement resolves `auto` with the
 /// node in hand ([`resolve_network_mode_with`]); submit-time checks that need
@@ -89,6 +99,10 @@ pub struct AutoModeFacts<'a> {
     /// (a submit-time check), which reads as a microVM node, the case the
     /// default exists for.
     pub node_vmm: Option<&'a str>,
+    /// The node's `os` fingerprint. A `container` on `linux` is gated by
+    /// default. `None` (no node yet, or a node that did not report it) reads
+    /// as not Linux, so a submit-time check never assumes a namespace.
+    pub node_os: Option<&'a str>,
 }
 
 impl<'a> AutoModeFacts<'a> {
@@ -110,6 +124,7 @@ impl<'a> AutoModeFacts<'a> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty()),
             node_vmm: None,
+            node_os: None,
         }
     }
 
@@ -143,6 +158,15 @@ pub fn resolve_network_mode_with(
     if !declared.is_empty() && declared != crate::structs::netpolicy::MODE_AUTO {
         return declared;
     }
+    // Worker-plane-auth plan §6.12: a Linux container is gated unless it
+    // says otherwise. macOS runs each container in its own VM already.
+    if runtime == "container"
+        && facts
+            .node_os
+            .is_some_and(|os| os.eq_ignore_ascii_case("linux"))
+    {
+        return crate::structs::netpolicy::MODE_GATED.to_string();
+    }
     if sandbox_gated_default
         && runtime == "sandbox"
         && !facts.sandbox_config_network
@@ -152,6 +176,47 @@ pub fn resolve_network_mode_with(
     } else {
         crate::structs::netpolicy::MODE_HOST.to_string()
     }
+}
+
+/// Warnings for tasks that would run gated with nothing allowing their
+/// egress, so an author and an agent see it before the first `403`
+/// (worker-plane-auth plan §6.12). `covered` says whether a stored policy
+/// object could supply the egress chain; the CLI, which cannot see stored
+/// policies, passes `|_| false`. A `container` that leaves the mode unset is
+/// gated on Linux nodes, which is what the warning assumes: on macOS nodes it
+/// runs on host networking and the warning does not apply.
+pub fn gated_egress_warnings(
+    config: &crate::structs::JobConfig,
+    covered: impl Fn(&crate::structs::TaskConfig) -> bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for task in &config.tasks {
+        let network = task.network.as_ref();
+        if network.is_some_and(|network| network.egress.is_some()) {
+            continue;
+        }
+        let declared = network
+            .map(|network| network.mode.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let auto = declared.is_empty() || declared == crate::structs::netpolicy::MODE_AUTO;
+        let why = match (task.runtime.as_str(), auto) {
+            ("container", true) => "gated (the default for containers on Linux)",
+            ("container" | "exec", false) if declared == crate::structs::netpolicy::MODE_GATED => {
+                "gated"
+            }
+            _ => continue,
+        };
+        if covered(task) {
+            continue;
+        }
+        warnings.push(format!(
+            "task {:?} is {why} and allows no egress. Outbound connections will be refused \
+             with `gated-default`.\nhint: add hosts to network.egress.allow, apply a policy \
+             object, or set network.mode = \"host\"",
+            task.name
+        ));
+    }
+    warnings
 }
 
 /// Whether a task's own spec puts it on gated networking on a microVM node:
@@ -795,6 +860,11 @@ pub struct AllocNetwork {
     /// is loopback there with no configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vip_block: Option<String>,
+    /// The resolver address of a gated allocation without a VIP block
+    /// ([`GATED_RESOLVER_ADDR`], inside its namespace). Absent otherwise: a
+    /// VIP block's resolver is its `.1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver: Option<String>,
     /// The effective `network.mode` resolved at placement: the task's own
     /// (`auto` resolved per runtime) unless a matching `require` policy
     /// imposes one. `gated` means the workload's namespace holds loopback and
@@ -897,7 +967,10 @@ impl AllocNetwork {
     /// The allocation's resolver address (`127.a.b.1`), when a VIP block was
     /// assigned.
     pub fn resolver_address(&self) -> Option<String> {
-        self.vip_block.as_ref().map(|block| format!("{block}.1"))
+        self.vip_block
+            .as_ref()
+            .map(|block| format!("{block}.1"))
+            .or_else(|| self.resolver.clone())
     }
 
     /// `<key>` → `(vip, canonical port)` for every upstream with a VIP: what
@@ -1075,7 +1148,15 @@ pub fn assign_allocation_ports_with_vips(
     service_ports: &HashMap<String, u16>,
     vip_block: Option<&str>,
 ) -> R<(Vec<AllocPort>, Vec<AllocUpstream>)> {
-    assign_allocation_ports_full(network, connect, used, service_ports, vip_block, false)
+    assign_allocation_ports_full(
+        network,
+        connect,
+        used,
+        service_ports,
+        vip_block,
+        false,
+        false,
+    )
 }
 
 /// [`assign_allocation_ports_with_vips`] plus, when `ingress` is set, a
@@ -1088,6 +1169,7 @@ pub fn assign_allocation_ports_full(
     service_ports: &HashMap<String, u16>,
     vip_block: Option<&str>,
     ingress: bool,
+    gated: bool,
 ) -> R<(Vec<AllocPort>, Vec<AllocUpstream>)> {
     const NO_PORTS: &[PortConfig] = &[];
     const NO_UPSTREAMS: &[UpstreamConfig] = &[];
@@ -1166,15 +1248,22 @@ pub fn assign_allocation_ports_full(
         });
     }
 
-    // Ingress: every advertised port gets a private twin from the same
-    // dynamic range; the datapath owns the advertised one.
+    // Ingress: every advertised port gets a private twin; the datapath owns
+    // the advertised one. Inside a gated namespace the twin is the port's
+    // `to`, else the advertised number itself: the namespace has its own
+    // ports, so an image that listens on a fixed port needs no change. On
+    // the host it comes from the same dynamic range.
     if ingress {
         for port in assigned.iter_mut() {
-            let private = next_dynamic_port(
-                &mut cursor,
-                &mut taken,
-                &format!("port '{}' private (ingress) port", port.name),
-            )?;
+            let private = if gated {
+                port.to.unwrap_or(port.host_port)
+            } else {
+                next_dynamic_port(
+                    &mut cursor,
+                    &mut taken,
+                    &format!("port '{}' private (ingress) port", port.name),
+                )?
+            };
             port.private_port = Some(private);
         }
     }
@@ -1635,6 +1724,94 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn on(os: &str) -> AutoModeFacts<'_> {
+        AutoModeFacts {
+            node_os: Some(os),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn auto_is_gated_for_containers_on_linux_only_test() {
+        let resolve = |declared: &str, runtime: &str, os: &str| {
+            resolve_network_mode_with(declared, runtime, &on(os), false)
+        };
+        assert_eq!(resolve("auto", "container", "linux"), "gated");
+        assert_eq!(resolve("", "container", "linux"), "gated");
+        assert_eq!(resolve("auto", "container", "macos"), "host");
+        assert_eq!(resolve("auto", "exec", "linux"), "host");
+        assert_eq!(resolve("host", "container", "linux"), "host");
+        assert_eq!(resolve("gated", "exec", "macos"), "gated");
+        // No node yet (a submit-time check) never assumes a namespace.
+        assert_eq!(
+            resolve_network_mode_with("auto", "container", &AutoModeFacts::default(), false),
+            "host"
+        );
+    }
+
+    #[test]
+    fn gated_twins_are_to_or_the_advertised_port_test() {
+        let network: NetworkConfig = serde_json::from_value(json!({
+            "ports": [{ "name": "http", "to": 80 }, { "name": "admin", "static": 9000 }],
+        }))
+        .unwrap();
+        let (ports, _) = assign_allocation_ports_full(
+            Some(&network),
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ports[0].name, "admin");
+        assert_eq!(ports[0].private_port, Some(9000));
+        assert_eq!(ports[1].private_port, Some(80));
+        // On the host a twin is a fresh dynamic port.
+        let (ports, _) = assign_allocation_ports_full(
+            Some(&network),
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(ports.iter().all(|port| port
+            .private_port
+            .is_some_and(|p| p != port.host_port && p != 80)));
+    }
+
+    #[test]
+    fn gated_egress_warnings_name_the_task_and_the_fix_test() {
+        let job: crate::structs::JobConfig = serde_json::from_value(json!({
+            "name": "web",
+            "tasks": [
+                { "name": "default", "runtime": "container", "config": { "image": "nginx" } },
+                { "name": "allowed", "runtime": "container", "config": { "image": "nginx" },
+                  "network": { "egress": { "allow": ["api.stripe.com:443"] } } },
+                { "name": "host", "runtime": "container", "config": { "image": "nginx" },
+                  "network": { "mode": "host" } },
+                { "name": "gated-exec", "runtime": "exec", "config": { "command": ["true"] },
+                  "network": { "mode": "gated" } },
+                { "name": "plain-exec", "runtime": "exec", "config": { "command": ["true"] } },
+            ],
+        }))
+        .unwrap();
+        let warnings = gated_egress_warnings(&job, |_| false);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with(
+            "task \"default\" is gated (the default for containers on Linux) and allows no egress"
+        ));
+        assert!(warnings[0].contains("`gated-default`"));
+        assert!(warnings[0].contains("\nhint: add hosts to network.egress.allow"));
+        assert!(warnings[1].starts_with("task \"gated-exec\" is gated and allows no egress"));
+        // A stored policy object that covers the task silences it.
+        assert!(gated_egress_warnings(&job, |_| true).is_empty());
+    }
+
     fn service(port: Value) -> ServiceConfig {
         serde_json::from_value(json!({ "port": port })).expect("service config")
     }
@@ -1763,6 +1940,7 @@ mod tests {
             }],
             upstreams: Vec::new(),
             vip_block: None,
+            resolver: None,
             mode: None,
             ingress_tls: None,
         };
@@ -2037,6 +2215,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
+            false,
         )?;
         assert_eq!(ports.len(), 2);
         assert_eq!(ports[0].host_port, 8080, "the advertised port is untouched");
@@ -2152,6 +2331,7 @@ mod tests {
                 canonical_port: None,
             }],
             vip_block: None,
+            resolver: None,
             mode: None,
             ingress_tls: None,
         };
@@ -2356,6 +2536,7 @@ mod tests {
         let network = AllocNetwork {
             upstreams: upstreams.clone(),
             vip_block: Some("127.42.7".into()),
+            resolver: None,
             ..Default::default()
         };
         let env = network.env_pairs();

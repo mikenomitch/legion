@@ -7,9 +7,8 @@ use crate::structs::{
 };
 use crate::worker::boot_ticket::BootTicketVerifier;
 use crate::worker::edge;
-use crate::worker::exec::{handle_exec_task, ExecTaskStream};
+use crate::worker::exec::{handle_exec_task, Admission, ExecTaskStream};
 use crate::worker::identity::WorkerIdentityManager;
-use crate::worker::plane::authorize;
 use crate::worker::task_manager::{launch_task_allocation, WorkerTaskManager};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -43,12 +42,17 @@ pub trait ClaimRatifier: Send + Sync {
 }
 
 pub struct WorkerDaemonService {
+    /// This worker's node id, checked against requests that name a node.
+    pub node_id: String,
     pub task_manager: Arc<Mutex<WorkerTaskManager>>,
     /// Workload-identity delivery/refresh; `None` when this worker runs
     /// without a manager identity client (tests).
     pub identity: Option<Arc<WorkerIdentityManager>>,
     /// Edge boot support; `None` unless `edgeBoot.acceptClaims` is true.
     pub edge_boot: Option<Arc<EdgeBootRuntime>>,
+    /// Direct exec: the exec ticket verifier, `None` unless the worker
+    /// config sets `exec = { direct = true }`.
+    pub direct_exec: Option<Arc<crate::worker::direct_exec::ExecTicketVerifier>>,
 }
 #[tonic::async_trait]
 impl Worker for WorkerDaemonService {
@@ -57,9 +61,9 @@ impl Worker for WorkerDaemonService {
         &self,
         request: Request<PostWorkRequest>,
     ) -> Result<Response<PostWorkReply>, Status> {
-        // Caller class `manager` (crate::worker::plane::WORKER_RPC_CALLERS).
-        let caller = authorize(&request, "PostWork")?;
-        debug!(remote = ?request.remote_addr(), %caller, "PostWork");
+        // Caller class: manager only.
+        let manager = crate::worker::plane::require_manager(&request, "PostWork")?;
+        debug!(manager = %manager, "PostWork from manager");
         let mut allocation = request
             .into_inner()
             .allocation
@@ -165,8 +169,8 @@ impl Worker for WorkerDaemonService {
         &self,
         request: Request<GetTaskLogsRequest>,
     ) -> Result<Response<GetTaskLogsReply>, Status> {
-        // Caller class `manager`.
-        authorize(&request, "GetTaskLogs")?;
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "GetTaskLogs")?;
         let req = request.into_inner();
         let streams = {
             let manager = self
@@ -206,9 +210,16 @@ impl Worker for WorkerDaemonService {
         &self,
         request: Request<Streaming<ExecClientFrame>>,
     ) -> Result<Response<Self::ExecTaskStream>, Status> {
-        // Caller class `manager`; checked before the first frame is read.
-        authorize(&request, "ExecTask")?;
-        let stream = handle_exec_task(self.task_manager.clone(), request.into_inner()).await?;
+        // Caller classes: a manager, or (where the worker opts in with
+        // `exec.direct`) an exec ticket in the first frame. A certificate
+        // that is not a manager's is refused, never downgraded to the ticket
+        // path.
+        let admission = match crate::worker::plane::caller_of(&request, "ExecTask")? {
+            crate::worker::plane::Caller::Manager(_) => Admission::Manager,
+            crate::worker::plane::Caller::Ticket => Admission::Ticket(self.direct_exec.clone()),
+        };
+        let stream =
+            handle_exec_task(self.task_manager.clone(), request.into_inner(), admission).await?;
         Ok(Response::new(stream))
     }
 
@@ -223,9 +234,8 @@ impl Worker for WorkerDaemonService {
         &self,
         request: Request<StartClaimRequest>,
     ) -> Result<Response<Self::StartClaimStream>, Status> {
-        // Caller class `ticket`: the boot ticket below is the authorization;
-        // a client certificate is neither needed nor consulted.
-        authorize(&request, "StartClaim")?;
+        // Caller class: ticket. The boot ticket below is the only credential;
+        // a client certificate, if any, is ignored.
         let Some(edge_boot) = self.edge_boot.clone() else {
             return Err(Status::failed_precondition(
                 "this node does not accept edge starts \
@@ -242,11 +252,20 @@ impl Worker for WorkerDaemonService {
         // Every check below is local. A node cut off from every manager can
         // still get all the way to `booted`; only the ratification needs the
         // control plane, and it runs in parallel with the boot.
+        // Off the async runtime: a verification can refresh the JWKS, which
+        // blocks.
         let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-        let claims = edge_boot
-            .verifier
-            .verify(&req.ticket, &req.instance_id, now_unix)
-            .map_err(|err| Status::permission_denied(format!("boot ticket rejected: {err:#}")))?;
+        let claims = {
+            let verifier = edge_boot.verifier.clone();
+            let ticket = req.ticket.clone();
+            let instance_id = req.instance_id.clone();
+            tokio::task::spawn_blocking(move || verifier.verify(&ticket, &instance_id, now_unix))
+                .await
+                .map_err(|e| Status::internal(format!("ticket verification panicked: {e}")))?
+                .map_err(|err| {
+                    Status::permission_denied(format!("boot ticket rejected: {err:#}"))
+                })?
+        };
 
         let task = {
             let cache = edge_boot.spec_cache.lock().expect("spec cache");
@@ -380,10 +399,18 @@ impl Worker for WorkerDaemonService {
         &self,
         request: Request<RestartWorkerRequest>,
     ) -> Result<Response<RestartWorkerReply>, Status> {
-        // Caller class `manager`.
-        let caller = authorize(&request, "RestartWorker")?;
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "RestartWorker")?;
         let node_id = request.into_inner().node_id;
-        info!(node_id = %node_id, %caller, "Received worker restart request");
+        // A manager holding a stale address must not restart whatever node
+        // now answers there.
+        if !node_id.is_empty() && node_id != self.node_id {
+            return Err(Status::failed_precondition(format!(
+                "this worker is node {:?}, not {node_id:?}",
+                self.node_id
+            )));
+        }
+        info!(node_id = %node_id, "Received worker restart request");
 
         let reply = RestartWorkerReply {
             message: "Worker restarting".into(),
@@ -395,6 +422,19 @@ impl Worker for WorkerDaemonService {
         });
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(err, skip_all)]
+    async fn probe(
+        &self,
+        request: Request<crate::structs::ProbeRequest>,
+    ) -> Result<Response<crate::structs::ProbeReply>, Status> {
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "Probe")?;
+        Ok(Response::new(crate::structs::ProbeReply {
+            node_id: self.node_id.clone(),
+            protocol_version: u64::from(crate::constants::PROTOCOL_VERSION),
+        }))
     }
 }
 

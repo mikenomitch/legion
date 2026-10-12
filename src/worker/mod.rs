@@ -5,6 +5,7 @@ pub mod checkpoints;
 pub mod claims;
 pub mod content_report;
 pub mod daemon;
+pub mod direct_exec;
 pub mod edge;
 pub mod exec;
 pub mod forwarder;

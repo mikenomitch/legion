@@ -76,8 +76,15 @@ impl CliError {
             format!("{action}: {message_text}")
         };
 
+        // A server-assigned code (`WORKER_UNREACHABLE`) is more useful to an
+        // agent than the gRPC code it rides on.
+        let legion_code = status
+            .metadata()
+            .get(crate::manager::worker_plane::ERROR_CODE_METADATA)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         CliError {
-            code: code_name(code).to_string(),
+            code: legion_code.unwrap_or_else(|| code_name(code).to_string()),
             message,
             hint: server_hint
                 .map(str::to_string)
@@ -262,6 +269,25 @@ mod tests {
         );
         assert!(!err.message.contains("Hint:"), "{}", err.message);
         assert!(err.message.ends_with("1.16.1 or later)"), "{}", err.message);
+    }
+
+    #[test]
+    fn worker_unreachable_carries_its_own_code_and_hint_test() {
+        let status = crate::manager::worker_plane::unreachable_status(
+            "wkr-1",
+            "https://10.0.1.7:4848",
+            "connection timed out",
+        );
+        let err = CliError::from_status("exec failed", &status);
+        assert_eq!(err.code, "WORKER_UNREACHABLE");
+        assert!(err.retryable);
+        assert!(err
+            .message
+            .contains("cannot reach node wkr-1 at https://10.0.1.7:4848 (connection timed out)"));
+        assert_eq!(
+            err.hint.as_deref(),
+            Some("managers dial workers on port 4848; see `legion node info wkr-1`")
+        );
     }
 
     #[test]

@@ -159,14 +159,23 @@
                 # Datapath: auto | host | gated (docs/network-handlers.md).
                 # `gated` (Linux, container and exec) gives the task an empty
                 # network namespace holding loopback and the datapath only —
-                # upstream ports, VIPs, its resolver, and an egress proxy at
-                # 127.0.0.1:1080 exported as HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
-                # — so egress policy is unbypassable. `auto` is host today. A
-                # `require` policy can impose a mode for a pool. `bridge` /
-                # `cni/<name>` are reserved for the datapath plugin.
+                # upstream ports, VIPs, its resolver (127.0.0.53 when it has
+                # no VIP block), and an egress proxy at 127.0.0.1:1080
+                # exported as HTTP_PROXY/HTTPS_PROXY/ALL_PROXY (and lower
+                # case). Egress nothing allows is denied (`gated-default`),
+                # and the host guard refuses the node and cloud metadata
+                # whatever policy says. `auto` (the default) is `gated` for a
+                # `container` on a Linux node and `host` everywhere else
+                # (exec, macOS; sandboxes per docs/task-runtime-sandbox.md).
+                # `host` opts a container out. A `require` policy can impose
+                # a mode for a pool. `bridge` / `cni/<name>` are reserved for
+                # the datapath plugin.
                 mode = "auto",
                 ports = [
-                    { name = "http", to = 8080 },      # dynamic host port -> task 8080
+                    # Gated: the datapath owns the host port and forwards to
+                    # 8080 inside the task's namespace. Host: dynamic host
+                    # port (macOS publishes it to 8080).
+                    { name = "http", to = 8080 },
                     { name = "metrics", static = 9090 },  # fixed host port
                 ],
                 # Attribution keys carried on every net.denied event and
@@ -900,9 +909,19 @@
                 env = {
                     LEGION_TASK = "container",
                 },
+                # The Linux privilege floor (docs/task-runtime-container.md,
+                # "Security"), shown with its defaults. Either opt-out makes
+                # the task host-level (it needs the `host` grant on job:write).
                 # Linux only (Apple `container` runs each container in its
-                # own VM with its own defaults; see docs/task-runtime-container.md).
+                # own VM with its own defaults).
                 security = {
+                    # Container ids 0-65535 map to a 65,536-id host range of
+                    # this allocation's own. false runs container root as
+                    # host root.
+                    userNamespace = true,
+                    # "default" refuses mounts, namespaces, kernel modules,
+                    # bpf, the keyring, ... "unconfined" removes the filter.
+                    seccomp = "default",
                     # Adjust the default capability set (Docker's defaults
                     # without NET_RAW). Case-insensitive, CAP_ prefix
                     # optional; ALL means every capability. `drop = ["ALL"]`

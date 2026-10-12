@@ -204,10 +204,8 @@ async fn run_instances(matches: &clap::ArgMatches) -> Result<()> {
             .as_ref()
             .map(|token| token.worker_type.clone())
             .unwrap_or_else(|| matches.get_one::<String>("worker-type").unwrap().clone()),
-        join_secret: token
-            .as_ref()
-            .map(|token| token.secret.clone())
-            .or_else(|| matches.get_one::<String>("join-secret").cloned()),
+        join_secret: token.as_ref().map(|token| token.secret.clone()),
+        ca_pin: token.as_ref().map(|token| token.ca_hash.clone()),
         hold: duration("hold-ms"),
         ready_after: duration("ready-after-ms"),
         stage_timeout: duration("stage-timeout-ms"),
@@ -303,20 +301,15 @@ fn cli() -> Command {
                 .default_value("default")
                 .help("instances mode: worker type the simulated nodes register as"),
         )
-        .arg(
-            Arg::new("join-secret")
-                .long("join-secret")
-                .help("instances mode: join token secret, when the cluster enforces ACLs"),
-        )
         .arg(Arg::new("join-token").long("join-token").help(
-            "instances mode: a `legion join-token create` token for the embedded \
-                     fleet (sets its worker type and secret; overrides --worker-type and \
-                     --join-secret)",
+            "instances mode, required with --simulate: a `legion join-token create` \
+                     token for the embedded fleet (sets its worker type and secret, \
+                     overriding --worker-type, and pins the cluster CA)",
         ))
         .arg(Arg::new("advertise-addr").long("advertise-addr").help(
-            "instances mode: address (host or host:port) the manager dials to push \
-                     work to the embedded fleet, auto-detected when unset (only used for a \
-                     node whose work stream is down)",
+            "instances mode: host the manager dials to push work to the embedded \
+                     fleet, auto-detected when unset (only used for a node whose work \
+                     stream is down)",
         ))
         .arg(Arg::new("sim-name-prefix").long("sim-name-prefix").help(
             "instances mode: node-id prefix for the embedded fleet (default \

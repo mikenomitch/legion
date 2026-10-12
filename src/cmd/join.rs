@@ -40,7 +40,18 @@ pub fn config() -> Command {
                 .value_name("NAME")
                 .help("Override the worker name/ID"),
         )
-        .arg(crate::cmd::start::advertise_addr_arg())
+        .arg(advertise_addr_arg())
+}
+
+/// `--advertise-addr`, shared by `legion join` and `legion start worker`.
+pub fn advertise_addr_arg() -> Arg {
+    Arg::new("advertise-addr")
+        .long("advertise-addr")
+        .value_name("HOST[:PORT]")
+        .help(
+            "Address managers and routers dial to reach this worker (default: this host's \
+             address on the route to the manager; also LEGION_WORKER_ADVERTISE_ADDR)",
+        )
 }
 
 #[instrument(err, skip_all)]
@@ -63,10 +74,10 @@ pub async fn handle(arg_matches: &ArgMatches) -> R<()> {
     };
 
     let name = arg_matches.get_one::<String>("name").map(String::as_str);
-    if let Some(addr) = arg_matches.get_one::<String>("advertise-addr") {
-        crate::worker::plane::set_advertise_addr_flag(addr);
-    }
-    run_worker(&token, name).await
+    let advertise = arg_matches
+        .get_one::<String>("advertise-addr")
+        .map(String::as_str);
+    run_worker(&token, name, advertise).await
 }
 
 /// `--auto` convenience: mint a join token through the normal authenticated

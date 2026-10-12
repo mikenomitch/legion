@@ -2499,7 +2499,10 @@ mod tests {
             scratch.join("vsock.sock").display().to_string(),
             "cloud-hypervisor restores onto the new allocation's socket"
         );
-        assert!(wait_for_datapath(&scratch.join("vsock.sock"), Duration::ZERO) == false);
+        assert!(!wait_for_datapath(
+            &scratch.join("vsock.sock"),
+            Duration::ZERO
+        ));
         std::fs::write(scratch.join("vsock.sock_1080"), b"bound")?;
         assert!(wait_for_datapath(
             &scratch.join("vsock.sock"),

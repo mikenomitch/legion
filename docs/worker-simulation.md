@@ -33,7 +33,7 @@ flags except `--simulate` are optional:
 | `--name-prefix <P>` | `sim` | Node ids are `<prefix>-<profile>-<idx>`. |
 | `--ready-after <DUR>` | `0s` | Delay before a dispatched allocation is reported running (models task-start latency). |
 | `--register-rate <N/s>` | `100` | Registration ramp, so a large fleet doesn't stampede a fresh manager. |
-| `--advertise-addr <HOST[:PORT]>` | detected | Host the manager dials for task dispatch to this fleet. Same default as a real worker: `LEGION_WORKER_ADVERTISE_ADDR`, else the local address of the route to the manager (`127.0.0.1` when the manager is on the same machine). |
+| `--advertise-addr <HOST>` | detected | Host the manager dials for task dispatch to this fleet (the port is the fleet listener's own). Same default as a real worker: the local address of the route to the manager (`127.0.0.1` when the manager is on the same machine). |
 | `--sim-checkpoints` | off | Fake the checkpoint channel: advertise `checkpoint`, fingerprint as a sandbox host, and answer every capture, delete, and restore as done, so suspend, resume, and fork can be load tested (`legion-loadgen --mode instances` uses it). |
 | `--sim-no-work-stream` | off | Take work from the heartbeat's desired set and `PostWork` pushes instead of `Manager.StreamWork`, the delivery a worker without the work stream gets. |
 
@@ -106,15 +106,14 @@ constraint (for example `constraints = { simulated = { operator = "is_not_set" }
   (`PostWork`) gets exercised for nodes that do not stream. Delivered
   allocations are acknowledged after `--ready-after` and echoed in
   heartbeats. No process is spawned and no runtime plugin loads.
-- **One fleet identity.** The stub endpoint is a real mTLS worker plane
-  with the same caller classes as a real worker
-  ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). One listener
-  serves one certificate for thousands of nodes, so the fleet's first node
-  (by name) requests a node certificate after it registers, and every node
-  in the process registers that node's id as `workerPlaneName`. Managers
-  verify that name, instead of each node's own, only for nodes that also
-  report `simulated: true`. Push dispatch starts once that certificate is
-  issued; until then heartbeat replies deliver allocations as usual.
+- **One fleet certificate.** The stub endpoint is the real worker plane:
+  mutual TLS, manager certificates required. One listener can't hold a
+  certificate per node, so the fleet uses one fleet certificate
+  (`<prefix>.fleet.legion`), signed from a CSR sent through the first node
+  to register. Every node carries `workerFleet = "<prefix>"`, and the
+  manager verifies the fleet's name for them. The listener starts once that
+  certificate is issued, a moment after the first registration; a push
+  before then waits for the next heartbeat.
 - **Allocation health, as a real worker reports it.** Every acknowledged
   allocation reports healthy (`running`). Off the stream that is every
   allocation on every beat, which is what a dense real node costs; on the
@@ -122,10 +121,11 @@ constraint (for example `constraints = { simulated = { operator = "is_not_set" }
   acknowledged yet, so a steady beat carries none. Earlier releases sent no
   allocation health at all, so heartbeat-path load in scale runs from before
   this change is not comparable with runs after it.
-- **Restart-safe by naming.** There is no state directory. Node ids are
-  deterministic, so a restarted process re-registers the same nodes
-  (registration is an upsert). The manager sees a restart as a brief
-  fleet blip, the same as a rebooted worker host.
+- **Restart-safe by naming.** Node ids are deterministic, so a restarted
+  process re-registers the same nodes (registration is an upsert). The
+  manager sees a restart as a brief fleet blip, the same as a rebooted
+  worker host. The only state is the fleet's key and certificate, under
+  `<data dir>/sim/<prefix>/identity/`.
 - **Status line.** Every 30s the process logs `Simulated fleet
   status` with nodes registered, achieved vs. expected heartbeat rate,
   cumulative failures, and acked allocations. Scripts can watch this to

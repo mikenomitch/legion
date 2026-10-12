@@ -67,13 +67,16 @@ A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
      the extracted rootfs's `/etc/passwd` and `/etc/group`, and `HOME` comes
      from the passwd entry when the env doesn't set it. Names that can't be
      resolved fall back to root with a warning.
-   - host networking by default, with the host's `/etc/resolv.conf` and
-     `/etc/hosts` bind-mounted read-only so DNS works. When the allocation has
-     its own resolver, the bundle mounts a generated `resolv.conf` pointing at
-     it instead. With `network.mode = "gated"`, the bundle joins the
-     allocation's network namespace (see
-     [Networking: `host` and `gated`](#networking-host-and-gated)),
+   - the allocation's network namespace when it runs gated (the default; see
+     [Networking](#networking-gated-by-default-on-linux)), with a generated
+     `resolv.conf` pointing at its resolver. With `network.mode = "host"`, the
+     host's network, with the host's `/etc/resolv.conf` and `/etc/hosts`
+     bind-mounted read-only so DNS works (or a generated `resolv.conf` when
+     the allocation has its own resolver),
    - a writable root filesystem,
+   - the [privilege floor](#security): a user namespace mapping container
+     root to an unprivileged host range, the default seccomp profile, and a
+     cgroup namespace,
    - Docker's default capabilities without `NET_RAW`, adjustable with
      [`security.capabilities`](#capabilities-security),
    - `RLIMIT_NOFILE` at 1048576, adjustable with
@@ -142,14 +145,21 @@ Postgres entrypoint `chown`s its data directory and drops to `postgres` with
 `su-exec` (or `gosu`). Without `CHOWN`, `SETUID`, and `SETGID` they fail with
 `Operation not permitted`.
 
-`CAP_NET_RAW` is withheld because a Legion container shares the node's network
-namespace unless it is `gated`. Raw sockets there could sniff and spoof traffic
-on the node's own interfaces, not just the container's. Nomad's Docker driver
-leaves it out of its default for the same reason.
+`CAP_NET_RAW` is withheld because a container with `network.mode = "host"`
+shares the node's network namespace. Raw sockets there could sniff and spoof
+traffic on the node's own interfaces, not just the container's. Nomad's
+Docker driver leaves it out of its default for the same reason.
 
 The set is granted as the bounding, effective, and permitted sets. Nothing is
 inheritable or ambient, so a process running as a non-root user keeps no
 capabilities across `execve`, exactly as under Docker.
+
+Under the [privilege floor](#security), the set applies inside the
+allocation's user namespace: it governs the container's own namespaces,
+never the host's. That is why an `add` does not make a task host-level and
+needs no `host` grant; the node's allowlist below is its only gate. A task
+that turns the floor off, or runs on the host network, is host-level
+whatever its capabilities.
 
 Adjust it with `security.capabilities`, which has the semantics of
 `docker run --cap-add` / `--cap-drop`. A job can always drop capabilities.
@@ -422,9 +432,12 @@ only being used for scheduling. Both travel in the allocation payload
   Two validation rules apply on both Linux and macOS: `cores` must be a
   **whole number** (a cpuset can't hold a fraction of a CPU), and a task
   declares `cores` **or** `cpu`, never both.
-- **Linux port mapping is not applied.** In the default `host` mode, assigned
-  ports reach the container directly. In `gated` mode, inbound traffic only
-  arrives through the datapath's ingress listeners
+- **Linux: ports arrive through the datapath.** In the default `gated` mode
+  the datapath owns each assigned host port and forwards it into the
+  container's namespace, to `to` when the port declares it and to the same
+  port number otherwise, so `{ name = "pg", to = 5432 }` reaches a server
+  listening on 5432. In `host` mode, assigned ports reach the container
+  directly and `to` is not applied
   ([Network Handlers](network-handlers.md#gated-mode)).
 
 ## Runtime Behavior
@@ -610,23 +623,149 @@ directly (see [docs/artifacts.md](artifacts.md)):
   and `${artifact.<name>}` hold the in-container path. See
   [The task directory](#the-task-directory-legiontask).
 
-## Networking: `host` and `gated`
+## Networking: gated by default on Linux
 
-By default a `container` task shares the host's network (`network.mode =
-"host"`). Declared ports are host ports, and `connect.upstreams` are loopback
-ports owned by the node datapath. Egress policy applies to traffic through
-those upstreams and to names resolved through the allocation's resolver
-(`LEGION_DNS`). In this mode, enforcement depends on the workload using them.
+On a Linux node a `container` task runs **gated** unless it says otherwise:
+`network.mode = "auto"`, the default, resolves to `gated` at placement. The
+worker creates an empty network namespace for the allocation before it
+starts, and the container joins it by path through an OCI `network`
+namespace entry. The namespace holds loopback and the datapath's listeners,
+nothing else:
 
-With `network.mode = "gated"` (Linux), the worker creates an empty network
-namespace for the allocation before it starts. The container joins it by path
-through an OCI `network` namespace entry. The namespace holds only loopback and
-the datapath's listeners: upstream ports, VIPs, the resolver, and an egress
-proxy at `127.0.0.1:1080` exported as `HTTP_PROXY` / `HTTPS_PROXY` /
-`ALL_PROXY`. A tool that ignores the proxy has no route out, so it can't
-bypass egress policy. The full model, the fail-closed rules, and the limits
-(no raw UDP, no ICMP, no inbound to undeclared ports, Linux only) are in
+| Inside the namespace | What it is |
+| --- | --- |
+| `127.0.0.1:1080` | the egress proxy, exported as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (and lower case) and `LEGION_EGRESS_PROXY` |
+| `127.0.0.53:53` | the allocation's resolver, in `/etc/resolv.conf` and `LEGION_DNS`. A task with upstreams gets its VIP block's `.1` instead |
+| `LEGION_UPSTREAM_<KEY>`, `<key>.svc.legion` | upstreams and their VIPs |
+| each declared port | the port the task listens on: `to` when the port sets it, else the host port. The datapath owns the host port on the node and forwards to it |
+
+**Egress is denied unless something allows it.** A gated container that no
+task block and no policy object covers is refused every destination with the
+`gated-default` source. Opening a host is one line:
+
+```nickel
+network = { egress = { allow = ["api.stripe.com:443"] } },
+```
+
+Observing everything and blocking nothing is also one line, and the
+[host guard](network-handlers.md#the-host-guard) still applies under it:
+
+```nickel
+network = { egress = { policy = "allow", accessLog = true } },
+```
+
+`legion job validate`, `legion job run`, and `legion job plan` warn when a
+container on a Linux node would run gated with nothing allowed:
+
+```text
+warning: task "web" is gated (the default for containers on Linux) and allows no
+egress. Outbound connections will be refused with `gated-default`.
+hint: add hosts to network.egress.allow, or set network.mode = "host"
+```
+
+A tool that ignores the proxy variables has no route out, so its only way
+off the namespace is a connection the datapath judges. Every destination the
+proxy dials is checked against the host guard first: the node itself
+(loopback and its own addresses), link-local (the cloud metadata service),
+and other allocations' listeners are refused whatever the job's policy says,
+and a hostname is judged by the address it resolves to.
+
+**Inbound.** Every declared port gets an ingress listener on its host port,
+with or without an ingress chain, so the service is reachable from other
+nodes, from service consumers, and from its own health checks. Without a
+chain the listener allows every peer. The task sees the datapath as its peer,
+not the original client.
+
+**What gated costs a container.** No raw UDP (DNS goes through the resolver),
+no ICMP, IPv4 only inside the namespace, and no route for tools that ignore
+the proxy variables. That includes Java's default HTTP client and most
+database drivers. Reach a database outside the cluster through an external
+upstream (`connect.upstreams` with `to = "tcp://db.example.com:5432"`), which
+needs no proxy support. Each start also pays for the namespace and its
+listeners, a few milliseconds (see [Testing](#testing) for the numbers).
+
+**Opting out.** `network.mode = "host"` shares the host's network, as every
+container did before gated became the default. Declared ports are host
+ports, and egress policy applies only to traffic through upstreams and the
+resolver. A host-mode container can reach the node, other allocations'
+listeners, and the cloud metadata service, so keep it for trusted images.
+
+On macOS, `auto` stays `host`: Apple `container` already runs each container
+in its own VM on its own network, and macOS has no network namespaces. The
+full model, the fail-closed rules, and the limits are in
 [Network Handlers](network-handlers.md#gated-mode).
+
+## Security
+
+On Linux, every container gets a privilege floor on top of its namespaces
+and its three capabilities (`CAP_AUDIT_WRITE`, `CAP_KILL`,
+`CAP_NET_BIND_SERVICE`, with `noNewPrivileges`). It is on by default:
+
+```nickel
+config = {
+  image = "postgres:17",
+  command = ["postgres"],
+  security = {
+    userNamespace = true,   # false runs container root as host root
+    seccomp = "default",    # "unconfined" removes the filter
+  },
+},
+```
+
+- **A user namespace per allocation.** Container ids `0-65535` map to a
+  65,536-id range on the host that belongs to this allocation alone, so
+  container root is an unprivileged host id no other allocation or host user
+  shares. The worker owns the pool (host ids from `1048576`, 4,096 ranges
+  per node; don't hand those ids to anything else) and records each
+  allocation's range in its private directory, so an in-place restart keeps
+  it. Image layers are extracted with their owners already shifted into the
+  range. The task directory and every volume are **idmapped mounts**: on
+  disk they keep host ownership, inside they belong to container root, so a
+  volume reattached to an allocation with a different range keeps working,
+  and files the worker rewrites later (KV files, templates) stay readable.
+  Inside a user namespace `/sys` is a read-only bind of the host's, not a
+  fresh `sysfs`, because a gated or host network namespace does not belong
+  to the container's user namespace.
+- **A default seccomp profile.** It refuses, with `EPERM`, the syscalls
+  Docker's default profile refuses: `mount` and the new mount API,
+  `unshare`, `setns`, and `clone` with a namespace flag, kernel modules and
+  `kexec`, `bpf`, `perf_event_open`, `userfaultfd`, the kernel keyring,
+  clock and time setting, `reboot`, swap, `acct`, `quotactl`, `pivot_root`,
+  cross-process memory access, handle-based opens, NUMA policy, and legacy
+  syscalls. `clone3` answers `ENOSYS`, so libc falls back to `clone`, whose
+  flags the filter can see. Docker's profile is an allowlist; Legion's is a
+  denylist over the same calls, so a syscall a future kernel adds is allowed
+  until the list names it.
+- **A cgroup namespace**, so the container sees its own cgroup as the root
+  and not the host's tree.
+
+**Opting out** of either is per task. `userNamespace = false` runs container
+root as host root, and `seccomp = "unconfined"` removes the filter. Each
+makes the task host-level, and `job validate`, `job run`, and `job plan`
+say so:
+
+```text
+warning: task "db" sets security.userNamespace = false: on Linux nodes its root is host
+root, so a container escape owns the node. The task is host-level (it needs the host
+grant on job:write)
+```
+
+**Requirements and failure modes.**
+
+- Idmapped mounts need Linux 5.12 or later and a filesystem that supports
+  them (ext4, xfs, btrfs; tmpfs from 6.3). Without them, a start with a task
+  directory or volume fails with the runtime's error naming the mount; set
+  `userNamespace = false` on that node's jobs, or move them to a newer
+  kernel.
+- An image whose files are owned by ids above `65535` cannot be extracted
+  into a range; the start fails naming the file.
+- More than 4,096 containers with a user namespace on one node at once fail
+  to start with `no free user namespace range on this node`.
+- macOS needs none of this: Apple `container` runs each container in its own
+  VM with its own kernel, and `security` is ignored there.
+- Verified with `runc` 1.5 (`oci_runtime_security_*` tests below). `youki`
+  and `crun` take the same OCI fields, but the floor has not been run on them
+  in this repository.
 
 ## Capability Summary
 
@@ -639,7 +778,7 @@ bypass egress policy. The full model, the fail-closed rules, and the limits
 | Graceful stop (`stop { signal, killAfter }`) | ✅ both platforms |
 | Memory / CPU limits | ✅ macOS (guest sizing). ✅ Linux with `resourceEnforcement.enabled` (cgroup v2). See [docs/resource-enforcement.md](resource-enforcement.md) |
 | Exclusive cores (`resources.cores`) | ✅ Linux (cpuset pinning). macOS sizes the guest instead |
-| Port publishing | ✅ macOS. n/a on Linux (host networking, or ingress listeners in `gated` mode) |
+| Port publishing | ✅ macOS (`--publish`). Linux: ingress listeners forward each host port into the gated namespace (`to`, or the same port); not applied in `host` mode |
 | Volumes (`volumes[]`, `stateful.storage`) | ✅ bind-mounted at the declared `path`. See [docs/volumes.md](volumes.md) |
 | Artifacts | ✅ image (staged via `containerImageDesugar`, or pulled by the runtime) and file/tree (readable under `/legion/task`) |
 | Exec / interactive PTY | ✅ / ✅ on both Apple `container` and the Linux OCI runtimes (sandboxed). See [docs/exec-and-actions.md](exec-and-actions.md) |
@@ -684,6 +823,28 @@ cargo test --lib apple_container -- --ignored --nocapture
 LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime -- --ignored --nocapture
 ```
 
+**What gated costs at start.** Two ignored benchmarks measure it on a Linux
+node, as root:
+
+```bash
+# the namespace and its listeners alone, 200 runs
+cargo test --lib gated_start_overhead -- --ignored --nocapture
+# a whole container start, host vs gated, 20 runs each
+LEGION_OCI_RUNTIME=runc cargo test --lib container_start_latency -- --ignored --nocapture
+# the privilege floor: container root's host id, seccomp refusing a new user
+# namespace, the cgroup namespace, and a volume across two id ranges
+LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_security -- --ignored --nocapture
+```
+
+On a 4-core Linux 6.18 VM with `runc` and an unoptimized build, the
+namespace and listeners added p50 1.0 ms and p99 3.9 ms (teardown p50
+0.1 ms). A whole `alpine` container start that runs `/bin/true` took p50
+354 ms and p99 414 ms on host networking, and p50 360 ms and p99 506 ms
+gated. With the [privilege floor](#security) on as well (user namespace,
+seccomp, cgroup namespace), a rerun measured p50 396 ms and p99 497 ms on
+host networking and p50 376 ms and p99 482 ms gated: at 20 runs, the floor's
+cost is inside the run-to-run noise.
+
 Three of the Linux tests run stock images as they ship (nginx, the Postgres
 entrypoint, and an image whose `USER` is `nobody`) and assert the
 capabilities, ownership, `/dev/stdout`, and `nofile` behavior above. Where
@@ -706,10 +867,10 @@ only its changed layers.
 - File-delivery destinations must resolve under `/legion/task`. Per-file bind
   mounts and K8s-style projected volumes were rejected as designs because they
   break atomic refresh. They aren't planned.
-- Linux containers share host networking by default. A private network
-  namespace is available only through `network.mode = "gated"`, which has its
-  own limits ([Network Handlers](network-handlers.md#gated-mode)). Port
-  mapping is not implemented.
+- Linux containers are gated by default, with the costs listed under
+  [Networking](#networking-gated-by-default-on-linux): no raw UDP or ICMP,
+  IPv4 only, and no route for tools that ignore the proxy variables.
+  `network.mode = "host"` opts out.
 - Linux resource enforcement requires the cgroup v2 unified hierarchy, a
   worker that can create the `legion/` subtree at the cgroup root, and
   `resourceEnforcement.enabled` in the worker config. Without it, `resources`
@@ -730,11 +891,12 @@ only its changed layers.
 - On Linux, `command` replaces the image's `ENTRYPOINT` and `CMD`; on macOS
   only `CMD`. Name the entrypoint in `command` for a jobspec that runs the
   same on both.
-- There is no user namespace yet, so container root is host root, limited
-  by the capability set, `noNewPrivileges`, and the mount namespace. A node
+- A container that opts out of the [privilege floor](#security)
+  (`userNamespace = false`) runs container root as host root, limited only by
+  the capability set, `noNewPrivileges`, and the mount namespace. A node
   whose `container.allowCaps` admits privileged capabilities removes most of
-  that limit for the jobs that add them (see
-  [Capabilities](#capabilities-security)). There is no seccomp profile.
+  that limit for such a task (see [Capabilities](#capabilities-security)).
+  Opting out makes the task host-level, so it needs the `host` grant.
 - The scheduler does not know which nodes allow which capabilities: a task
   that adds one places like any other, and fails at start on a node that
   refuses it. Pin it to the worker types that allow it.

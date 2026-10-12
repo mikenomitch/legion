@@ -1,5 +1,6 @@
-//! `legion acl` — administer the ACL system: bootstrap, policies, tokens,
-//! and username/password users.
+//! `legion acl` — administer the ACL system: policies, tokens, and
+//! username/password users. The initial management token is minted by the
+//! manager at first start (docs/auth-and-acls.md, "Quick start").
 //!
 //! See docs/auth-and-acls.md for the policy schema and workflows.
 
@@ -7,24 +8,14 @@ use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
-    AclPolicy, AclTokenInfo, AclUser, BootstrapAclRequest, CreateAclTokenRequest,
-    DeleteAclPolicyRequest, DeleteAclTokenRequest, DeleteAclUserRequest, GetAclPolicyRequest,
-    ListAclPoliciesRequest, ListAclTokensRequest, ListAclUsersRequest, UpsertAclPolicyRequest,
-    UpsertAclUserRequest, WhoAmIRequest,
+    AclPolicy, AclTokenInfo, AclUser, CreateAclTokenRequest, DeleteAclPolicyRequest,
+    DeleteAclTokenRequest, DeleteAclUserRequest, GetAclPolicyRequest, ListAclPoliciesRequest,
+    ListAclTokensRequest, ListAclUsersRequest, UpsertAclPolicyRequest, UpsertAclUserRequest,
+    WhoAmIRequest,
 };
 use tabled::Tabled;
 
 pub fn config() -> Command {
-    let bootstrap_cmd = Command::new("bootstrap")
-        .about("Create the one-time initial management token")
-        .arg(
-            Arg::new("secret")
-                .long("secret")
-                .value_name("SECRET")
-                .help("Pre-seed the management token secret (min 24 chars; for IaC)"),
-        )
-        .arg(json_flag());
-
     let whoami_cmd = Command::new("whoami")
         .about("Show how the manager authenticates you and which policies apply")
         .arg(json_flag());
@@ -161,7 +152,6 @@ pub fn config() -> Command {
         .about("Administer authentication and ACLs")
         .subcommand_required(true)
         .arg_required_else_help(true)
-        .subcommand(bootstrap_cmd)
         .subcommand(whoami_cmd)
         .subcommand(policy_cmd)
         .subcommand(token_cmd)
@@ -171,7 +161,6 @@ pub fn config() -> Command {
 #[instrument(err, skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
-        Some(("bootstrap", arg_matches)) => bootstrap(arg_matches).await,
         Some(("whoami", arg_matches)) => whoami(OutputFormat::from_matches(arg_matches)).await,
         Some(("policy", policy_matches)) => match policy_matches.subcommand() {
             Some(("apply", arg_matches)) => policy_apply(arg_matches).await,
@@ -220,36 +209,6 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     }
 }
 
-async fn bootstrap(arg_matches: &ArgMatches) -> R<()> {
-    let format = OutputFormat::from_matches(arg_matches);
-    let secret = arg_matches.get_one::<String>("secret").cloned();
-    let mut client = connect_manager_client().await?;
-    let response = output::resolve(
-        format,
-        "Failed to bootstrap ACLs",
-        client
-            .bootstrap_acl(tonic::Request::new(BootstrapAclRequest { secret }))
-            .await,
-    )?;
-    let reply = response.into_inner();
-    let token = reply.token.unwrap_or_default();
-
-    if format.is_json() {
-        output::print_success(&json!({
-            "accessorId": token.accessor_id,
-            "secret": reply.secret,
-            "name": token.name,
-            "tokenType": token.token_type,
-        }));
-    } else {
-        println!("ACL bootstrap complete. Store this token securely; it is shown only once.\n");
-        println!("  Accessor ID: {}", token.accessor_id);
-        println!("  Secret:      {}", reply.secret);
-        println!("\nUse it via:  export LEGION_TOKEN={}", reply.secret);
-    }
-    Ok(())
-}
-
 async fn whoami(format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let response = output::resolve(
@@ -271,7 +230,10 @@ async fn whoami(format: OutputFormat) -> R<()> {
             "accessorId": reply.accessor_id,
         }));
     } else if !reply.acl_enabled {
-        println!("ACLs: disabled (every caller has full access)");
+        println!(
+            "ACLs: disabled by the manager config (acl.enabled = false); every caller, \
+             including any workload that can reach the manager, has full access"
+        );
     } else {
         println!(
             "ACLs:       enabled{}",

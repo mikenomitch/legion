@@ -23,7 +23,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
@@ -108,6 +108,11 @@ pub async fn run_manager_with(
 ) -> R<()> {
     info!("Starting manager node");
 
+    // `exec.tickets` resolves leniently in `with_defaults`; a typo there
+    // should stop the manager instead.
+    if let Some(tickets) = config.exec.as_ref().and_then(|exec| exec.tickets.as_ref()) {
+        tickets.with_defaults()?;
+    }
     let full_config = config.with_defaults();
     // Fail fast on malformed artifact/auth/node-identity config: a bad
     // matcher or unknown nodeIdentity reference should stop the manager at
@@ -147,6 +152,7 @@ pub async fn run_manager_with(
         )?;
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
+    let store_for_api = store.clone();
     // A restore is an explicit operator action with the operator present:
     // fail fast, naming the missing root key, rather than serve a cluster
     // whose secrets are unreadable.
@@ -315,8 +321,51 @@ pub async fn run_manager_with(
         info!(
             audit_only = authenticator.audit_only,
             auth_methods = ?authenticator.method_names(),
-            "ACLs enabled; run `legion acl bootstrap` once to mint the initial management token"
+            "ACLs enabled"
         );
+        // The initial management token is minted here, not by an RPC: an
+        // open "bootstrap while none exists" endpoint is a race any workload
+        // that reaches the manager could win (docs/auth-and-acls.md). The
+        // mint is a replicated control-lane write, so in raft mode only the
+        // control-lane leader does it, now or when it later wins leadership.
+        let bootstrap_paths =
+            crate::manager::bootstrap_token::BootstrapTokenPaths::for_this_process();
+        let secret_file = full_config.acl.bootstrap_secret_file.clone();
+        if is_control_leader {
+            let outcome = crate::manager::bootstrap_token::ensure_initial_management_token(
+                &authenticator,
+                &store,
+                secret_file.as_deref(),
+                &bootstrap_paths,
+            )?;
+            crate::manager::bootstrap_token::log_outcome(&outcome);
+        }
+        if store.raft_status().is_some() || store.persistence_status().backend == "streaming" {
+            let watch_store = store.clone();
+            let watch_auth = authenticator.clone();
+            let mut was_control_leader = is_control_leader;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(LEADER_POLL_INTERVAL).await;
+                    let control_leader = watch_store.is_raft_leader(crate::storage::Lane::Control);
+                    if leadership_acquired(was_control_leader, control_leader) {
+                        match crate::manager::bootstrap_token::ensure_initial_management_token(
+                            &watch_auth,
+                            &watch_store,
+                            secret_file.as_deref(),
+                            &bootstrap_paths,
+                        ) {
+                            Ok(outcome) => crate::manager::bootstrap_token::log_outcome(&outcome),
+                            Err(err) => warn!(
+                                error = ?err,
+                                "Failed minting the initial management token after leadership acquisition"
+                            ),
+                        }
+                    }
+                    was_control_leader = control_leader;
+                }
+            });
+        }
         // Prime remote JWKS documents, then keep them fresh in the background.
         authenticator.refresh_auth_methods().await;
         let refresh_authenticator = authenticator.clone();
@@ -342,7 +391,11 @@ pub async fn run_manager_with(
             }
         });
     } else {
-        warn!("ACLs are disabled; every API caller has full access (set acl.enabled to true to enforce)");
+        warn!(
+            "ACLs are disabled (acl.enabled = false): every API caller, including any \
+             workload that can reach this manager, has full control of the cluster. \
+             Remove acl.enabled = false to turn them back on"
+        );
     }
 
     // Idempotency records only need to outlive a client's retry window;
@@ -367,6 +420,25 @@ pub async fn run_manager_with(
 
     // The in-process worker (--run-worker) registers like any external
     // worker; with ACLs enforced the manager self-issues its join token.
+    // Certificates name this manager by its raft node id, or `local`.
+    let manager_cert_id = store
+        .raft_status()
+        .map(|status| status.node_id)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "local".to_string());
+    crate::manager::worker_plane::WorkerPlane::global().set_manager_id(&manager_cert_id);
+    // The in-process worker pins the cluster CA like any joining worker.
+    let local_worker_ca_pin = if run_worker {
+        match store.ensure_mesh_ca().and_then(|ca| ca.pin()) {
+            Ok(pin) => Some(pin),
+            Err(err) => {
+                warn!(error = ?err, "Cluster CA unavailable for the in-process worker's pin");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let local_worker_join_secret = if run_worker && authenticator.enabled {
         let (_, composite) = authenticator
             .mint_join_token(
@@ -510,17 +582,22 @@ pub async fn run_manager_with(
     // do-nothing RPC slow?" comes from here.
     crate::manager::telemetry::start_runtime_probe();
 
-    let tls_identity = load_server_tls_identity(&full_config.server.tls)?;
-    let server_builder = match tls_identity {
-        Some(identity) => {
-            info!("Starting manager with TLS enabled");
-            Server::builder().tls_config(ServerTlsConfig::new().identity(identity))?
-        }
-        None => {
-            info!("Starting manager without TLS");
-            Server::builder()
-        }
-    };
+    // One port, TLS for workers always (worker-plane-auth plan §6.8): the
+    // cluster certificate for `manager.legion`, the operator's for every
+    // other name, and plaintext for the CLI and UI unless `server.tls` is on.
+    let operator_tls = load_operator_tls(&full_config.server.tls)?;
+    if operator_tls.is_some() {
+        info!("Starting manager with TLS enabled (operator certificate; workers use the cluster certificate)");
+    } else {
+        info!(
+            "Starting manager: TLS for workers (cluster certificate), plaintext for the CLI and UI"
+        );
+    }
+    let api_listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("manager gRPC server on {addr} failed to bind"))?;
+    let api_incoming = manager_incoming(&store_for_api, api_listener, operator_tls)?;
+    let server_builder = Server::builder();
 
     // The idle sweep reads the usage table heartbeats fill, so it shares
     // the service's handle.
@@ -568,7 +645,7 @@ pub async fn run_manager_with(
         .layer(leader_forward)
         .add_service(manager_service)
         .add_service(raft_transport_service)
-        .serve_with_shutdown(addr, async move {
+        .serve_with_incoming_shutdown(api_incoming, async move {
             // A dropped sender also stops the server; both mean "shut down".
             let _ = stop_serving_rx.await;
         });
@@ -599,23 +676,28 @@ pub async fn run_manager_with(
     // 127.0.0.1, which no OTHER manager can reach. When this manager has a
     // non-loopback advertised address, the co-located worker advertises the
     // same host. An explicit LEGION_WORKER_ADVERTISE_ADDR still wins.
-    if run_worker && std::env::var_os(crate::worker::plane::ENV_WORKER_ADVERTISE_ADDR).is_none() {
-        if let Some(host) = in_process_worker_advertise_host(
-            full_config.server.advertise_addr.as_deref(),
-            full_config.persistence.raft.advertise_addr.as_deref(),
-        ) {
-            info!(%host, "In-process worker advertises this manager's host");
-            crate::worker::plane::set_advertise_addr_flag(&host);
-        }
-    }
+    let local_worker_advertise =
+        if run_worker && std::env::var_os(crate::worker::plane::WORKER_ADVERTISE_ENV).is_none() {
+            in_process_worker_advertise_host(
+                full_config.server.advertise_addr.as_deref(),
+                full_config.persistence.raft.advertise_addr.as_deref(),
+            )
+            .inspect(|host| info!(%host, "In-process worker advertises this manager's host"))
+        } else {
+            None
+        };
     let worker_fut = async move {
         if run_worker {
             info!(%manager_addr, "Starting in-process worker");
             run_worker_local(
-                manager_addr,
-                "default".to_string(),
+                crate::worker::daemon::WorkerJoin {
+                    manager_addr,
+                    worker_type: "default".to_string(),
+                    join_secret: local_worker_join_secret,
+                    ca_pin: local_worker_ca_pin,
+                    advertise_addr: local_worker_advertise,
+                },
                 None,
-                local_worker_join_secret,
             )
             .await?;
         }
@@ -1158,11 +1240,11 @@ fn resolve_manager_host(host: &str) -> String {
     }
 }
 
-/// Loads the manager's TLS identity when `server.tls.enabled` is set.
-///
-/// TLS is opt-in (never inferred from files on disk) so a stray dev cert
-/// cannot flip the listener to https and strand http clients.
-fn load_server_tls_identity(tls: &TlsConfigFull) -> R<Option<Identity>> {
+/// The operator's `server.tls` certificate as a rustls key, when
+/// `server.tls.enabled` is set. TLS for the CLI and UI is opt-in (never
+/// inferred from files on disk) so a stray dev cert cannot strand http
+/// clients.
+fn load_operator_tls(tls: &TlsConfigFull) -> R<Option<Arc<rustls::sign::CertifiedKey>>> {
     if !tls.enabled {
         return Ok(None);
     }
@@ -1173,7 +1255,82 @@ fn load_server_tls_identity(tls: &TlsConfigFull) -> R<Option<Identity>> {
         .with_context(|| format!("failed to read TLS certificate {}", tls.cert_path))?;
     let key = std::fs::read_to_string(&tls.key_path)
         .with_context(|| format!("failed to read TLS key {}", tls.key_path))?;
-    Ok(Some(Identity::from_pem(cert, key)))
+    Ok(Some(
+        crate::cluster_tls::certified_key(&cert, &key).with_context(|| {
+            format!(
+                "invalid TLS certificate or key ({}, {})",
+                tls.cert_path, tls.key_path
+            )
+        })?,
+    ))
+}
+
+/// The certificate a manager presents to workers on its API port
+/// (`manager.legion`, worker-plane-auth plan §6.8), kept current: minted
+/// from the cluster CA as soon as one exists, re-minted before it expires,
+/// and re-issued under the new CA after a rotation. Polls every few seconds
+/// until the CA exists (a follower waits for the leader to create it), then
+/// every minute.
+pub fn keep_manager_server_cert(
+    store: Store,
+    identity: Arc<crate::cluster_tls::SwappableIdentity>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let store_for_mint = store.clone();
+            let minted = tokio::task::spawn_blocking(move || {
+                crate::manager::worker_plane::WorkerPlane::global().materials(&store_for_mint)
+            })
+            .await;
+            let delay = match minted {
+                Ok(Ok(materials)) => match materials.server_identity.current() {
+                    Some(key) => {
+                        identity.set(key);
+                        Duration::from_secs(60)
+                    }
+                    None => Duration::from_secs(2),
+                },
+                Ok(Err(err)) => {
+                    debug!(error = %err, "Cluster server certificate not available yet");
+                    Duration::from_secs(2)
+                }
+                Err(_) => Duration::from_secs(2),
+            };
+            tokio::time::sleep(delay).await;
+        }
+    });
+}
+
+/// The manager's API listener as a connection stream for
+/// `serve_with_incoming`: TLS for workers (the cluster certificate for
+/// `manager.legion`, the operator's for every other name) and, unless the
+/// operator turned `server.tls` on, plaintext for the CLI and UI on the same
+/// port, told apart by the first byte (docs/auth-and-acls.md, "Workers
+/// reach managers over TLS"). Tests serve a manager with it too.
+pub fn manager_incoming(
+    store: &Store,
+    listener: tokio::net::TcpListener,
+    operator: Option<Arc<rustls::sign::CertifiedKey>>,
+) -> R<tokio_stream::wrappers::ReceiverStream<std::io::Result<crate::cluster_tls::MaybeTlsStream>>>
+{
+    let cluster = crate::cluster_tls::SwappableIdentity::new();
+    // Mint now when the CA exists, so the first worker connection does not
+    // race the refresher.
+    if let Ok(materials) = crate::manager::worker_plane::WorkerPlane::global().materials(store) {
+        if let Some(key) = materials.server_identity.current() {
+            cluster.set(key);
+        }
+    }
+    keep_manager_server_cert(store.clone(), cluster.clone());
+    let tls_only = operator.is_some();
+    let config = crate::cluster_tls::server_config(
+        Arc::new(crate::cluster_tls::ManagerServerCerts { cluster, operator }),
+        None,
+        true,
+    )?;
+    Ok(crate::cluster_tls::sniffing_incoming(
+        listener, config, tls_only,
+    ))
 }
 
 /// Everything the status checker needs from the manager config, resolved once
@@ -3442,6 +3599,23 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             Some(block) => serde_json::to_string(&block.with_defaults())?,
         };
 
+        // Security blocks (`hostGuard`, ...) ride as one JSON payload. They
+        // are validated here so a bad entry (an `allow` without a port) stops
+        // the manager at startup, not the worker at its first connection.
+        let security_payload = crate::structs::WorkerSecurityConfig {
+            host_guard: wcp.host_guard.clone(),
+            exec: wcp.exec.clone().filter(|exec| exec.direct),
+        };
+        if let Some(host_guard) = &security_payload.host_guard {
+            crate::structs::host_guard::HostGuard::new(host_guard)
+                .with_context(|| format!("invalid hostGuard in worker config {path_str}"))?;
+        }
+        let security = if security_payload == crate::structs::WorkerSecurityConfig::default() {
+            String::new()
+        } else {
+            serde_json::to_string(&security_payload)?
+        };
+
         // `container` settings ride as JSON with the capability names
         // normalized, so a typo in `allowCaps` fails here instead of on the
         // node, and the worker and the submit check read one spelling.
@@ -3518,6 +3692,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             heartbeat_seconds: wcp.heartbeat_seconds,
             resource_enforcement,
             edge_boot,
+            security,
             container,
         };
 

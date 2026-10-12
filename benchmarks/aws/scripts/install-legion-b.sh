@@ -83,5 +83,7 @@ while [ -z "$PRIMARY" ]; do
         sleep 5
     }
 done
+log "installing the management token the primary minted at first start"
+rig_install_cli_token
 log "Legion B is up; primary: $PRIMARY"
 log "Next: start-sim-fleet.sh legion <nodes> (point it at the primary)"
