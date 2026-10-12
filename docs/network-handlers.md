@@ -246,6 +246,146 @@ The `http` block on an upstream (`timeout`, `retries`, `split`, `outlier`)
 turns on HTTP mode with traffic management. Per-upstream `handlers` run
 there too. See [What the datapath does today](#what-the-datapath-does-today).
 
+### Credential injection
+
+An external `https://` upstream can carry the API key itself, so the task
+never holds it. The node's forwarder sets the header on every request it
+sends to the destination, with a value it fetched from KV:
+
+```nickel
+connect = {
+  upstreams = [{
+    name = "anthropic",
+    to = "https://api.anthropic.com",
+    credentials = [
+      { header = "x-api-key", from = { kv = "secrets/anthropic" } },
+    ],
+  }, {
+    name = "openai",
+    to = "https://api.openai.com",
+    credentials = [
+      { header = "Authorization", prefix = "Bearer ", from = { kv = "secrets/openai" } },
+    ],
+  }],
+},
+```
+
+```bash
+legion kv put secrets/openai "sk-..."
+```
+
+Point the client at the upstream, as for any external upstream. An SDK that
+refuses to start without a key gets a placeholder:
+
+```sh
+export OPENAI_BASE_URL="http://$LEGION_UPSTREAM_OPENAI/v1"
+export OPENAI_API_KEY=placeholder          # replaced on the way out
+export ANTHROPIC_BASE_URL="http://$LEGION_UPSTREAM_ANTHROPIC"
+export ANTHROPIC_API_KEY=placeholder
+```
+
+**How it works without intercepting TLS.** With an `https://` upstream the
+task already speaks plain HTTP to its loopback port, and the node opens TLS to
+the destination (see the table above). So the node reads the request head
+anyway; injecting a credential is setting one more header on the request it
+builds for the origin. Legion holds no certificate authority, terminates no
+TLS the task opened, and never sees inside a `CONNECT` tunnel.
+
+**Where the secret is, and is not.** The value lives in the worker's memory
+and on the TLS connection from the node to the origin. It is never in the
+task's environment, files, or memory, so it is never in a `sandbox`'s
+memory checkpoints, forks, or published snapshots either. The worker never
+writes it to disk (including `netd_state.json`) or to a log line; the access
+log records no headers. After a worker restart, the node fetches it again on
+its first heartbeat, and until then requests on that upstream get a `503`.
+
+**Semantics.**
+
+- **Overwrite.** Whatever the task sent for the header (any case, any number
+  of times) is dropped, and the header is set to `prefix` + the value. A
+  placeholder is harmless; so is no header at all.
+- **Every request.** The value is read once per request and sent on every
+  attempt of it: retries, and a [`proxy` handler](#proxy--bring-your-own-proxy)
+  hand-off. A proxy hop sees the credential, because it has to reach the
+  origin with it. The hand-off is plain HTTP to the proxy (it opens TLS to
+  the origin), so a proxy on another node receives the key over the network
+  unencrypted: prefer a `node`- or `port`-local proxy target, and run only
+  proxies you would trust with the key.
+- **`authz` hops never see it.** They run before injection, and they receive
+  the task's own headers (minus `authorization`, `cookie`, and
+  `proxy-authorization`, as always), so a placeholder at most.
+- **Fail closed.** A request whose credential the node does not hold (never
+  fetched, or the key was deleted) is answered locally, without dialing:
+
+  ```http
+  HTTP/1.1 503 Service Unavailable
+  Legion-Denied-By: credential-unavailable
+  Legion-Denied-Reason: credential-unavailable: upstream openai header authorization: kv secrets/openai not found
+
+  {"legion":{"error":"credential-unavailable: upstream openai header authorization: kv secrets/openai not found","source":"credential-unavailable","upstream":"openai"}}
+  ```
+
+  An unauthenticated request never leaves, so a missing key cannot turn
+  into a burst of `401`s, or into requests that succeed against an origin
+  that allows anonymous access.
+- **Rotation.** `legion kv put secrets/openai ...` reaches every node on its
+  next heartbeat (`GetUpstreamCredentials`, asked only for versions newer
+  than the one held). Requests already in flight keep the old value. Nothing
+  restarts. Deleting the key revokes it on the next heartbeat.
+- **Fail-static.** An unreachable manager, or a KV read error, keeps the
+  last good value. A value no header can carry (a line break or NUL inside
+  it; one trailing newline is trimmed) is rejected and the previous value
+  stays.
+- **Status.** Problems are reported per allocation, and `legion net doctor`
+  shows them on the datapath layer:
+  `upstream openai credential authorization: kv secrets/openai not found (requests on this upstream get 503)`,
+  or `... injecting the previous value; kv secrets/openai could not be read`.
+
+**Validation.** Submit refuses credentials that could not work, or would
+leak:
+
+| Declaration | Result |
+| --- | --- |
+| `to = "http://..."` | refused: the secret would cross the network in the clear. Use `https://` |
+| `to = "tcp://..."` or `"tls://..."` | refused: there is no request head to put a header in. Deliver the secret to the task instead |
+| a catalog `service` upstream | refused: credentials are for external destinations |
+| `header` = `host`, `content-length`, `transfer-encoding`, or a hop-by-hop header | refused: the datapath owns these |
+| the same header twice on one upstream | refused |
+| `from = { kv = "" }`, or no provider | refused |
+
+Header names are case-insensitive and stored lower-cased.
+
+**Access.** Naming a key in `credentials` sends its value to a host the job
+author chose, so it needs the right to read it: `RunJob` and template runs
+require `kv:read` on every credential path, in addition to `job:write`.
+Without it the submit fails with `PermissionDenied`:
+`... (connect.upstreams[openai].credentials names kv secrets/openai; the submitter needs kv read on it)`.
+A node can only fetch a credential that an allocation placed on it declares.
+It names (allocation, upstream, header), and the manager derives each path
+from the allocation's own declaration.
+
+**Gated tasks.** A gated `container` or `exec` task reaches its upstreams
+inside its namespace, and declared upstreams are an explicit allowance, so
+[default deny](#default-deny) does not block them. HTTPS a client sends
+through the egress proxy (`HTTPS_PROXY`, `CONNECT`) is an opaque tunnel, so
+**no credential is ever injected on proxy traffic**. Set the client's base
+URL to the upstream instead, as above.
+
+**Limits.**
+
+- Only `kv` is a provider today. There is no workload-identity token or
+  webhook provider, and a credential can only be a request header: not a
+  query parameter or basic-auth pair.
+- HTTP/1.1 only, like the rest of HTTP mode. A client that needs HTTP/2 to
+  the origin cannot use an upstream.
+- A `sandbox` guest cannot reach its upstreams yet. A gated guest's only
+  ways out are the vsock egress proxy and resolver, and a TAP or
+  loopback-only guest cannot reach the node's loopback listeners. Credential
+  injection therefore works for `exec` and `container` tasks today, not for
+  `sandbox` tasks.
+- There is no per-request audit event for an injected credential; the
+  access log (if on) records the request, not which credential it carried.
+
 ## Name-is-config: `<key>.svc.legion`
 
 On Linux, every allocation that declares upstreams gets its own loopback /24
@@ -615,6 +755,11 @@ The proxy supports three protocols:
 - Absolute-URI plain HTTP, also checked by the request head and forwarded in
   origin form, one request per connection.
 - SOCKS5 `CONNECT`, with domain-name targets checked by name.
+
+Nothing is added to traffic through the proxy. In particular, a
+[credential](#credential-injection) is only injected on a declared
+`https://` upstream, never into a `CONNECT` tunnel, which the node cannot
+read. Point a client that needs one at its upstream, not the proxy.
 
 Every denial is a `403` with `Legion-Denied-By` (or a SOCKS "connection not
 allowed") and a `net.denied` event. **A tool that ignores the proxy
@@ -1006,6 +1151,13 @@ A cluster-wide policy (no pools in its selector) and `ca rotate` need
 unscoped `net:write`. `IssueNodeCertificate` is worker-plane, and a node may
 only mint its own certificate.
 
+Naming a KV key in a job needs `kv:read` on it, because the datapath hands
+the value out: `certFrom = { kv }` on an ingress chain
+([Certificates from KV](#certificates-from-kv)) and
+`connect.upstreams[].credentials` ([Credential injection](#credential-injection)).
+`GetIngressCertificates` and `GetUpstreamCredentials` are worker-plane, and a
+node only receives values that allocations placed on it declare.
+
 ## Current scope and limitations
 
 What ships now is the **policy and upstream layer on the connect datapath**.
@@ -1044,6 +1196,9 @@ This section lists what that covers and what it does not.
   gated task's private port.
 - **No HTTP/2 or HTTP/3** (`protocol = "h2"` is rejected with that reason),
   no UDP, no WASM handlers, and no TLS interception. Legion will not add TLS
-  interception. Use external upstreams when policy needs to see the body.
+  interception. Use external upstreams when policy needs to see the body,
+  or when the node should add a credential the task never holds
+  ([Credential injection](#credential-injection)): both work because the
+  task speaks plaintext to the node and the node opens TLS itself.
 - **Legion has no job namespaces.** Every job is in `default`, so
   `selector.namespaces` either matches every job or none.

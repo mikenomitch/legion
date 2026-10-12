@@ -2831,6 +2831,41 @@ Still unplanned, and not covered by the plan:
       Only worth it once the cluster edge above exists. Until then, the
       renewer job in `configs/jobs/cert-renewer.ncl` covers it.
 
+Credential injection: [egress-credential-injection-plan.md](plans/egress-credential-injection-plan.md)
+· calls: [egress-credential-injection-plan_calls.md](calls/egress-credential-injection-plan_calls.md)
+· docs: [network-handlers.md#credential-injection](../docs/network-handlers.md#credential-injection).
+Phase 1 shipped (see Done, KV & secrets).
+
+- [ ] **Reach `connect.upstreams` from a `sandbox` guest.** No sandbox shape
+      can reach its upstream listeners today: they bind on the node's
+      loopback (or inside a gated namespace a sandbox does not have,
+      `upstream_specs` in `src/worker/daemon.rs`), and a gated guest's only
+      ways out are the vsock proxy and resolver (`guest/src/agent.rs`). So
+      credential injection, whose point is keeping API keys out of sandbox
+      memory checkpoints, serves `exec` and `container` only. Likely shape:
+      guest-agent relays from guest loopback ports to host vsock ports bound
+      as the upstream listeners, counted in gated readiness. A gated sandbox
+      with upstreams probably also reports `capture_ready = false` today
+      (its upstream listeners never bind); confirm with a test
+      ([calls #8](calls/egress-credential-injection-plan_calls.md)).
+- [ ] Credential injection Phase 2: workload-identity provider,
+      `from = { identity = { audience } }`, minted and refreshed on the node
+      ([plan §8](plans/egress-credential-injection-plan.md#8-phases)).
+- [ ] Credential injection Phase 3: webhook provider
+      (`from = { handler = "<name>" }`) and non-header placements (query
+      parameter, basic auth).
+- [ ] Credential injection Phase 4: opt-in per-request
+      `net.credential_used` audit events.
+- [ ] **HTTP `proxy` hand-offs travel in plaintext.** A request handed to a
+      `service =` proxy on another node goes as plain HTTP in absolute form
+      (`attempt_request` in `src/worker/netd/http.rs` skips TLS and the mesh
+      when `hand_off` is set), so an injected credential crosses the network
+      unencrypted. Send hand-offs over the mesh when the proxy endpoint is
+      remote ([calls #7](calls/egress-credential-injection-plan_calls.md)).
+- [ ] Credentials on policy objects (one key for every sandbox on a pool),
+      with `UpsertNetPolicy` enforcing `kv:read` as it does for `certFrom`
+      (plan §11).
+
 ## Persistence & cluster operations
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
@@ -4132,6 +4167,22 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       path needs `kv:read` on it.
 - [x] Example renewer and consumer jobs: `configs/jobs/cert-renewer.ncl`
       (lego, DNS-01, KV as the only state) and `configs/jobs/tls-edge.ncl`.
+
+[plan](plans/egress-credential-injection-plan.md) ·
+[calls](calls/egress-credential-injection-plan_calls.md) ·
+[docs](../docs/network-handlers.md#credential-injection)
+
+- [x] **Credential injection on egress, Phase 1** (2026-10-12):
+      `connect.upstreams[].credentials = [{ header, prefix?, from = { kv } }]`
+      on external `https://` upstreams. The node's forwarder replaces the
+      task's header with the KV value on every request (retries and `proxy`
+      hand-offs included), so the key never enters the workload. No TLS
+      interception. A worker-plane `GetUpstreamCredentials` RPC derives the
+      path from the allocation's own declaration and sends each value once
+      per version; values stay in worker memory. A missing value answers a
+      local `503 credential-unavailable` without dialing; deleting the key
+      revokes it. Naming a path needs `kv:read`. Sandbox guests are not
+      covered yet (open item under Networking).
 
 [encryption plan](plans/kv-encryption-plan.md) · [docs](../docs/kv-encryption.md)
 

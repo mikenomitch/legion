@@ -47,39 +47,40 @@ use crate::structs::{
     GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest,
     GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetStateBackupReply,
     GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, IngressCertificate, Instance, InstanceInfo, InstanceMode,
-    InstanceState, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply,
-    IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest,
-    IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
-    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, JobTemplate,
-    JobTemplateProvenance, JobTemplateSummary, JobTemplateVariable, JobTemplateVersionInfo,
-    KvEntry, KvInjectionAction, KvJobReference, KvValueType, LedgerNode, ListBootTicketsReply,
-    ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply,
-    ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply,
-    ListJobSpecHistoryRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply,
-    ListJobsRequest, ListKvReply, ListKvRequest, ListNodeUsageReply, ListNodeUsageRequest,
-    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest,
-    ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
-    ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
-    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
-    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
-    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
-    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
-    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
-    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
-    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
-    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
-    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
-    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    GetTaskLogsRequest, GetUpstreamCredentialsReply, GetUpstreamCredentialsRequest, GetVolumeReply,
+    GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
+    IngressCertificate, Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
+    IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest,
+    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
+    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
+    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
+    JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvJobReference,
+    KvValueType, LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply,
+    ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply,
+    ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
+    ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply,
+    ListKvRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply,
+    ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
+    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
+    ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest,
+    ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node,
+    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
+    PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent,
+    RaftStatus, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest,
+    RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest,
+    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
+    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
+    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RotateMeshCaReply,
+    RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest,
+    SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, ServiceEdge,
+    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
+    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
+    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
+    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, UpstreamCredentialValue,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
+    WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
@@ -1819,6 +1820,10 @@ impl ManagerDaemonService {
             .map(|task| task.network.as_ref().and_then(|n| n.ingress.as_ref()))
             .collect();
         enforce_kv_cert_read(identity, &ingress_chains)?;
+        enforce_kv_credential_read(
+            identity,
+            config.tasks.iter().filter_map(|task| task.connect.as_ref()),
+        )?;
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
@@ -8684,6 +8689,106 @@ impl Manager for ManagerDaemonService {
         Ok(Response::new(GetIngressCertificatesReply { certificates }))
     }
 
+    #[instrument(skip_all, fields(node_id = %request.get_ref().node_id, credentials = request.get_ref().known.len()))]
+    async fn get_upstream_credentials(
+        &self,
+        request: Request<GetUpstreamCredentialsRequest>,
+    ) -> Result<Response<GetUpstreamCredentialsReply>, Status> {
+        // ACL: worker-plane endpoint (nodes fetch the KV secrets behind
+        // `connect.upstreams[].credentials` of allocations placed on them).
+        // The node never names a KV path: each one is derived below from the
+        // allocation's own connect declaration, which only a submitter
+        // holding `kv:read` on the path could have written.
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let req = request.into_inner();
+        acl::enforce_node_binding(&identity, &req.node_id)?;
+
+        let desired = build_desired_allocations(&self.store, &req.node_id, &[])
+            .map_err(|e| map_store_error("Error building desired allocations", e))?;
+        let declared: HashMap<i64, crate::structs::ConnectConfig> = desired
+            .iter()
+            .filter(|allocation| !allocation.task_connect.trim().is_empty())
+            .filter_map(|allocation| {
+                serde_json::from_str(&allocation.task_connect)
+                    .ok()
+                    .map(|connect| (allocation.allocation_id, connect))
+            })
+            .collect();
+
+        let credentials = req
+            .known
+            .iter()
+            .map(|known| {
+                let header = known.header.trim().to_ascii_lowercase();
+                let mut out = UpstreamCredentialValue {
+                    allocation_id: known.allocation_id,
+                    upstream: known.upstream.clone(),
+                    header: known.header.clone(),
+                    ..Default::default()
+                };
+                let path = declared
+                    .get(&known.allocation_id)
+                    .and_then(|connect| {
+                        connect
+                            .upstreams
+                            .iter()
+                            .find(|upstream| upstream.key() == known.upstream)
+                    })
+                    .and_then(|upstream| {
+                        upstream
+                            .credentials
+                            .iter()
+                            .find(|credential| credential.header.eq_ignore_ascii_case(&header))
+                    })
+                    .and_then(|credential| credential.kv_path())
+                    .map(str::to_string);
+                let Some(path) = path else {
+                    out.error = format!(
+                        "allocation is not placed on this node or upstream {} declares no \
+                         credential for header {header}",
+                        known.upstream
+                    );
+                    out.absent = true;
+                    return out;
+                };
+                out.kv_path = path.clone();
+                match self.store.get_kv(&path) {
+                    Ok(Some(entry)) => {
+                        out.version = entry.version;
+                        if entry.version == known.version {
+                            out.unchanged = true;
+                        } else {
+                            // One trailing line ending (a value put from a
+                            // file) is not part of the secret.
+                            let value = entry.value.trim_end_matches(['\r', '\n']);
+                            if value.contains(['\r', '\n', '\0']) || value.is_empty() {
+                                // A header value cannot carry these; sending
+                                // it would split the request.
+                                out.error = format!(
+                                    "kv {path} is empty or holds a line break or NUL, which \
+                                     an HTTP header cannot carry"
+                                );
+                            } else {
+                                out.value = value.to_string();
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        out.error = format!("kv {path} not found");
+                        out.absent = true;
+                    }
+                    Err(err) => {
+                        warn!(kv_path = %path, error = ?err, "Failed reading upstream credential");
+                        out.error = format!("kv {path} could not be read");
+                    }
+                }
+                out
+            })
+            .collect();
+        Ok(Response::new(GetUpstreamCredentialsReply { credentials }))
+    }
+
     #[instrument(skip_all)]
     async fn list_service_edges(
         &self,
@@ -11627,6 +11732,41 @@ fn enforce_kv_cert_read(
     Ok(())
 }
 
+/// `connect.upstreams[].credentials` hands a KV value to the datapath, which
+/// sends it to the upstream's origin, so naming one needs the same right as
+/// reading it: `kv:read` on the path. Without this, job submit access would
+/// be a way to exfiltrate any secret in KV to a host of the submitter's
+/// choosing. Applied to RunJob and template runs.
+fn enforce_kv_credential_read<'a>(
+    identity: &crate::structs::AclIdentity,
+    connects: impl Iterator<Item = &'a crate::structs::ConnectConfig>,
+) -> Result<(), Status> {
+    for connect in connects {
+        for upstream in &connect.upstreams {
+            for path in upstream.credentials.iter().filter_map(|c| c.kv_path()) {
+                acl::enforce(
+                    identity,
+                    AclResource::Kv,
+                    AclAction::Read,
+                    &AclScope::path(path),
+                )
+                .map_err(|status| {
+                    Status::new(
+                        status.code(),
+                        format!(
+                            "{} (connect.upstreams[{}].credentials names kv {path}; the \
+                             submitter needs kv read on it)",
+                            status.message(),
+                            upstream.key()
+                        ),
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn enforce_net_policy_scope(
     identity: &crate::structs::AclIdentity,
     action: AclAction,
@@ -14409,6 +14549,134 @@ mod tests {
         let bad = fetch(vec![(alloc.id, first[0].version)]).await?;
         assert!(bad[0].bundle_pem.is_empty());
         assert!(bad[0].error.contains("no private key"), "{}", bad[0].error);
+        Ok(())
+    }
+
+    /// The node names (allocation, upstream, header), never paths: the
+    /// manager derives the KV path from the allocation's own connect
+    /// declaration, sends the value once per version, and marks a deleted
+    /// key or an undeclared header `absent` so the node drops what it holds.
+    #[tokio::test]
+    async fn get_upstream_credentials_derives_the_path_and_skips_unchanged_test() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        put_kv_entry(&manager, "secrets/openai", "sk-live-1\n").await?;
+        run_jobspec(
+            &manager,
+            json!({
+                "name": "agent",
+                "task": {
+                    "runtime": "exec",
+                    "config": { "command": ["sleep", "30"] },
+                    "connect": {
+                        "upstreams": [{
+                            "name": "openai",
+                            "to": "https://api.openai.com",
+                            "credentials": [{
+                                "header": "Authorization",
+                                "prefix": "Bearer ",
+                                "from": { "kv": "secrets/openai" },
+                            }],
+                        }],
+                    },
+                },
+            }),
+        )
+        .await?;
+        insert_node(&store, "node-1")?;
+        let job_config_id = store.get_job_config("agent")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&job_config_id)?
+            .into_iter()
+            .next()
+            .context("task config")?;
+        let alloc = store.place_alloc("node-1", task_id)?;
+
+        let fetch = |known: Vec<(i64, &'static str, &'static str, i64)>| {
+            let manager = &manager;
+            async move {
+                manager
+                    .get_upstream_credentials(Request::new(GetUpstreamCredentialsRequest {
+                        node_id: "node-1".into(),
+                        known: known
+                            .into_iter()
+                            .map(|(allocation_id, upstream, header, version)| {
+                                crate::structs::UpstreamCredentialKnown {
+                                    allocation_id,
+                                    upstream: upstream.into(),
+                                    header: header.into(),
+                                    version,
+                                }
+                            })
+                            .collect(),
+                    }))
+                    .await
+                    .map(|reply| reply.into_inner().credentials)
+            }
+        };
+
+        let first = fetch(vec![
+            (alloc.id, "openai", "authorization", 0),
+            (alloc.id, "openai", "x-api-key", 0),
+            (alloc.id + 999, "openai", "authorization", 0),
+        ])
+        .await?;
+        assert_eq!(first[0].kv_path, "secrets/openai");
+        assert_eq!(
+            first[0].value, "sk-live-1",
+            "one trailing newline is trimmed"
+        );
+        assert!(first[0].error.is_empty(), "{}", first[0].error);
+        assert!(
+            first[1].absent && first[1].value.is_empty(),
+            "{:?}",
+            first[1]
+        );
+        assert!(first[2].absent, "an allocation on another node is absent");
+        assert!(
+            first[2].error.contains("not placed on this node"),
+            "{}",
+            first[2].error
+        );
+
+        let again = fetch(vec![(
+            alloc.id,
+            "openai",
+            "authorization",
+            first[0].version,
+        )])
+        .await?;
+        assert!(again[0].unchanged);
+        assert!(
+            again[0].value.is_empty(),
+            "no material for an unchanged version"
+        );
+
+        // A value no header can carry is reported, not sent, and is not
+        // authoritative (the node keeps its last good value).
+        put_kv_entry(&manager, "secrets/openai", "a\r\nInjected: yes").await?;
+        let bad = fetch(vec![(
+            alloc.id,
+            "openai",
+            "authorization",
+            first[0].version,
+        )])
+        .await?;
+        assert!(bad[0].value.is_empty());
+        assert!(!bad[0].absent);
+        assert!(bad[0].error.contains("line break"), "{}", bad[0].error);
+
+        // Deleting the key revokes it.
+        delete_kv_entry(&manager, "secrets/openai").await?;
+        let gone = fetch(vec![(
+            alloc.id,
+            "openai",
+            "authorization",
+            first[0].version,
+        )])
+        .await?;
+        assert!(gone[0].absent);
+        assert_eq!(gone[0].error, "kv secrets/openai not found");
         Ok(())
     }
 

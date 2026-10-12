@@ -1728,6 +1728,15 @@ entries.
   expires. Keep TTLs short on tasks you fork. Secrets the origin loaded, ACL
   tokens it logged in for, open connections, and leases are copied too. Use
   `suspend.onResume` to drop them.
+- **Keep API keys out of the guest entirely.** A key the workload never
+  holds cannot be captured, forked, or published. For HTTP APIs, declare it
+  on an `https://` upstream with
+  [credential injection](network-handlers.md#credential-injection): the
+  node sets the header on the way out, from KV, and the value lives only in
+  the worker's memory and on the TLS connection to the origin. Rotation is a
+  `legion kv put`, and no checkpoint taken before or after it contains the
+  key. Today this reaches `exec` and `container` tasks; a `sandbox` guest
+  cannot reach its upstreams yet (see that page's limits).
 
 ## Published checkpoint encryption
 

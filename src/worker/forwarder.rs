@@ -29,8 +29,8 @@
 use crate::prelude::*;
 use crate::structs::netpolicy::HandlerConfig;
 use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
-use crate::structs::UpstreamHttpConfig;
 use crate::structs::{parse_upstream_target, UpstreamTarget, UPSTREAM_LOOPBACK_ADDR};
+use crate::structs::{UpstreamCredential, UpstreamHttpConfig};
 use crate::worker::balance::{balancer, default_balancer, Balancer, Endpoint};
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::http::HttpSettings;
@@ -83,6 +83,9 @@ pub struct UpstreamSpec {
     pub http: Option<UpstreamHttpConfig>,
     /// `connect.upstreams[].handlers` — run in HTTP mode.
     pub handlers: Vec<HandlerConfig>,
+    /// `connect.upstreams[].credentials` — headers injected in HTTP mode,
+    /// with values from [`ForwarderContext`]'s credential store.
+    pub credentials: Vec<UpstreamCredential>,
     /// Name-is-config: the VIP (`127.42.b.n`) and canonical port this
     /// upstream is also served on, so `<key>.svc.legion:<port>` reaches the
     /// same listener state. `None` on platforms without 127/8 routing.
@@ -116,9 +119,10 @@ struct UpstreamShared {
     target: Option<UpstreamTarget>,
     /// Policy, denial ledger, and TLS shared by every listener.
     context: Arc<ForwarderContext>,
-    /// The upstream's `http` block and handlers, as declared.
+    /// The upstream's `http` block, handlers, and credentials, as declared.
     http_config: Option<UpstreamHttpConfig>,
     handlers: Vec<HandlerConfig>,
+    credentials: Vec<UpstreamCredential>,
     /// HTTP-mode state, built on first use (an upstream can enter HTTP mode
     /// through its own declaration or through the effective policy's
     /// `protocol = "http"`, which is only known once policy arrives).
@@ -139,6 +143,43 @@ type IngressTlsConfigs =
 #[derive(Debug, Default, Clone)]
 pub struct KvCertState {
     pub cert: Option<Arc<crate::worker::netd::tls::KvCertificate>>,
+    pub error: Option<String>,
+}
+
+/// A secret value held for credential injection. Debug never prints it, so
+/// a stray `{:?}` on a containing struct cannot leak it into a log.
+#[derive(Clone)]
+pub struct SecretValue(Arc<str>);
+
+impl SecretValue {
+    pub fn new(value: impl Into<Arc<str>>) -> Self {
+        SecretValue(value.into())
+    }
+
+    /// The secret itself. Only the request builder should call this.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretValue(<redacted>)")
+    }
+}
+
+/// Identifies one injected header: (allocation, upstream key, header,
+/// lower-cased).
+pub type CredentialKey = (i64, String, String);
+
+/// One injected header's state: the last good value (kept through a failed
+/// fetch or a rejected value, dropped when the manager says the key is
+/// gone) and the latest fetch problem.
+#[derive(Debug, Default, Clone)]
+pub struct CredentialState {
+    pub kv_path: String,
+    pub version: i64,
+    pub value: Option<SecretValue>,
     pub error: Option<String>,
 }
 
@@ -180,6 +221,10 @@ pub struct ForwarderContext {
     /// `certFrom = { kv }` material per allocation, from
     /// `GetIngressCertificates`. In memory only.
     kv_certs: Mutex<HashMap<i64, KvCertState>>,
+    /// `connect.upstreams[].credentials` values, from
+    /// `GetUpstreamCredentials`. In memory only: never persisted, never
+    /// logged, never handed to the task.
+    credentials: Mutex<HashMap<CredentialKey, CredentialState>>,
     /// Service-graph samples since the last heartbeat.
     edges: Arc<crate::worker::netd::graph::EdgeLedger>,
     /// Ingress connections and bytes per allocation, for the idle policy.
@@ -227,6 +272,7 @@ impl ForwarderContext {
             mesh_wanted: AtomicBool::new(false),
             ingress_tls: Mutex::new(HashMap::new()),
             kv_certs: Mutex::new(HashMap::new()),
+            credentials: Mutex::new(HashMap::new()),
             edges: Arc::new(crate::worker::netd::graph::EdgeLedger::new()),
             activity: Arc::new(crate::worker::netd::activity::ActivityLedger::new()),
         }
@@ -283,6 +329,130 @@ impl ForwarderContext {
         lock(&self.handler_health).retain(|(id, _), _| live.contains(id));
         lock(&self.ingress_tls).retain(|(id, _), _| live.contains(id));
         lock(&self.kv_certs).retain(|id, _| live.contains(id));
+        lock(&self.credentials).retain(|(id, _, _), _| live.contains(id));
+    }
+
+    // ----- credential injection -----------------------------------------
+
+    /// The KV version of the credential held for a header (0 for none), what
+    /// `GetUpstreamCredentials` compares against.
+    pub fn credential_version(&self, allocation_id: i64, upstream: &str, header: &str) -> i64 {
+        lock(&self.credentials)
+            .get(&(allocation_id, upstream.to_string(), header.to_string()))
+            .filter(|state| state.value.is_some())
+            .map(|state| state.version)
+            .unwrap_or(0)
+    }
+
+    /// Install a freshly fetched value. Requests that start after this use
+    /// it; requests in flight (and their retries) keep the one they read.
+    pub fn set_credential(
+        &self,
+        allocation_id: i64,
+        upstream: &str,
+        header: &str,
+        kv_path: &str,
+        version: i64,
+        value: SecretValue,
+    ) {
+        lock(&self.credentials).insert(
+            (allocation_id, upstream.to_string(), header.to_string()),
+            CredentialState {
+                kv_path: kv_path.to_string(),
+                version,
+                value: Some(value),
+                error: None,
+            },
+        );
+    }
+
+    /// Record a fetch problem. `absent` (the key is gone, or the
+    /// allocation no longer declares it) drops the value, so a deleted key
+    /// revokes the credential; anything else keeps the last good value.
+    pub fn set_credential_error(
+        &self,
+        allocation_id: i64,
+        upstream: &str,
+        header: &str,
+        kv_path: &str,
+        error: String,
+        absent: bool,
+    ) {
+        let mut credentials = lock(&self.credentials);
+        let state = credentials
+            .entry((allocation_id, upstream.to_string(), header.to_string()))
+            .or_default();
+        if !kv_path.is_empty() {
+            state.kv_path = kv_path.to_string();
+        }
+        state.error = Some(error);
+        if absent {
+            state.value = None;
+            state.version = 0;
+        }
+    }
+
+    /// Clear a fetch problem after an `unchanged` reply.
+    pub fn clear_credential_error(&self, allocation_id: i64, upstream: &str, header: &str) {
+        if let Some(state) = lock(&self.credentials).get_mut(&(
+            allocation_id,
+            upstream.to_string(),
+            header.to_string(),
+        )) {
+            state.error = None;
+        }
+    }
+
+    /// Forget credentials no desired allocation declares any more.
+    pub fn retain_credentials(&self, declared: &std::collections::HashSet<CredentialKey>) {
+        lock(&self.credentials).retain(|key, _| declared.contains(key));
+    }
+
+    /// The value to inject for one header, or why there is none. A header
+    /// that was never fetched is "not fetched yet", never an empty value:
+    /// the forwarder fails the request closed rather than sending it
+    /// without the credential.
+    pub fn credential_value(
+        &self,
+        allocation_id: i64,
+        upstream: &str,
+        credential: &UpstreamCredential,
+    ) -> Result<SecretValue, String> {
+        let header = credential.header.to_ascii_lowercase();
+        let path = credential.kv_path().unwrap_or_default();
+        match lock(&self.credentials).get(&(allocation_id, upstream.to_string(), header)) {
+            Some(CredentialState {
+                value: Some(value), ..
+            }) => Ok(value.clone()),
+            Some(CredentialState {
+                error: Some(error), ..
+            }) => Err(error.clone()),
+            _ => Err(format!("kv {path} not fetched yet")),
+        }
+    }
+
+    /// Human-readable credential problems for one allocation, for the
+    /// datapath status (`problems`): a missing value (requests fail with
+    /// `503`), or a fetch error while the previous value still serves.
+    pub fn credential_problems(&self, allocation_id: i64) -> Vec<String> {
+        let mut problems: Vec<String> = lock(&self.credentials)
+            .iter()
+            .filter(|((id, _, _), _)| *id == allocation_id)
+            .filter_map(|((_, upstream, header), state)| {
+                let error = state.error.as_deref()?;
+                Some(if state.value.is_some() {
+                    format!(
+                        "upstream {upstream} credential {header}: injecting the previous value; {error}"
+                    )
+                } else {
+                    format!(
+                        "upstream {upstream} credential {header}: {error} (requests on this upstream get 503)"
+                    )
+                })
+            })
+            .collect();
+        problems.sort();
+        problems
     }
 
     /// The KV version of the certificate held for an allocation (0 for none),
@@ -728,15 +898,19 @@ impl UpstreamShared {
             context,
             http_config: spec.http.clone(),
             handlers: spec.handlers.clone(),
+            credentials: spec.credentials.clone(),
             http: OnceLock::new(),
             gated: spec.netns.is_some(),
         }
     }
 
     /// Whether this upstream declares HTTP itself (an `http` block, an
-    /// `http://`/`https://` target, or handlers that need bodies).
+    /// `http://`/`https://` target, handlers that need bodies, or
+    /// credentials, which need a request head to go in: an upstream with
+    /// credentials is never spliced).
     fn declares_http(&self) -> bool {
         self.http_config.is_some()
+            || !self.credentials.is_empty()
             || self.target.as_ref().is_some_and(|t| t.http)
             || self
                 .handlers
@@ -759,7 +933,7 @@ impl UpstreamShared {
         Some(
             self.http
                 .get_or_init(|| {
-                    Arc::new(HttpSettings::new(
+                    let mut settings = HttpSettings::new(
                         self.allocation_id,
                         self.service.clone(),
                         self.target.clone(),
@@ -770,7 +944,9 @@ impl UpstreamShared {
                         self.endpoints.clone(),
                         self.inflight.clone(),
                         self.context.log_dir_for(self.allocation_id),
-                    ))
+                    );
+                    settings.credentials = self.credentials.clone();
+                    Arc::new(settings)
                 })
                 .clone(),
         )
@@ -1754,6 +1930,7 @@ mod tests {
             to: None,
             http: None,
             handlers: Vec::new(),
+            credentials: Vec::new(),
             vip: None,
             canonical_port: None,
             netns: None,

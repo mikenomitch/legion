@@ -291,6 +291,17 @@
                                 onError = "deny",
                             },
                         ],
+                        # Credential injection (docs/network-handlers.md,
+                        # "Credential injection"): the node sets these headers
+                        # on every request to the origin, replacing whatever
+                        # the task sent, with values fetched from KV. The task
+                        # never holds the key (give its SDK a placeholder).
+                        # https:// external upstreams only; the submitter
+                        # needs kv:read on each path.
+                        credentials = [
+                            { header = "Authorization", prefix = "Bearer ", from = { kv = "secrets/openai" } },
+                            { header = "OpenAI-Organization", from = { kv = "secrets/openai-org" } },
+                        ],
                     },
                 ],
                 # Config files rendered from the upstreams and their live

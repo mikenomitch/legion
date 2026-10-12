@@ -1701,6 +1701,9 @@ async fn heartbeat_tick(
         apply_net_policies(forwarder, &mut client_clone, credentials, name, &reply).await;
         apply_mesh_identity(forwarder, &mut client_clone, credentials, name).await;
         apply_ingress_certificates(forwarder, &mut client_clone, credentials, name, &reply).await;
+        // Upstream credentials, from the same desired set (the reply's, or
+        // the StreamWork mirror's when the work arrives over the stream).
+        apply_upstream_credentials(forwarder, &mut client_clone, credentials, name, &reply).await;
         *LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner()) = reply.desired_allocations.clone();
         persist_datapath(forwarder, &reply);
         // Allocations whose launch was dispatched this tick. Their refresh
@@ -2378,6 +2381,134 @@ async fn apply_ingress_certificates(
     }
 }
 
+/// Every credential header the desired set declares, as
+/// (allocation, upstream key, lower-cased header): what the node fetches
+/// and what its credential store may keep.
+fn declared_credentials(
+    desired: &[TaskAllocation],
+) -> Vec<crate::worker::forwarder::CredentialKey> {
+    let mut keys = Vec::new();
+    for allocation in desired {
+        if allocation.task_connect.trim().is_empty() {
+            continue;
+        }
+        let Ok(connect) =
+            serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
+        else {
+            continue;
+        };
+        for upstream in &connect.upstreams {
+            for credential in &upstream.credentials {
+                keys.push((
+                    allocation.allocation_id,
+                    upstream.key().to_string(),
+                    credential.header.trim().to_ascii_lowercase(),
+                ));
+            }
+        }
+    }
+    keys
+}
+
+/// Keep `connect.upstreams[].credentials` current (docs/network-handlers.md,
+/// "Credential injection"): one `GetUpstreamCredentials` call per heartbeat,
+/// only while an allocation on the node declares credentials, carrying the
+/// KV version already held so an unchanged secret costs nothing on the
+/// wire. Values live in the forwarder's memory only — never in
+/// `netd_state.json`, never in a log line. Fail-static: a failed call or a
+/// transient error keeps the value in hand; an `absent` answer (the key was
+/// deleted, or the declaration is gone) drops it, so requests on that
+/// upstream fail closed with a `503`.
+async fn apply_upstream_credentials(
+    forwarder: &UpstreamForwarder,
+    client: &mut ManagerClient<Channel>,
+    worker_credentials: &Arc<WorkerCredentials>,
+    node_id: &str,
+    reply: &HeartbeatReply,
+) {
+    let context = forwarder.context();
+    let declared = declared_credentials(&reply.desired_allocations);
+    // Credentials for allocations that left, or that no longer declare a
+    // header, are forgotten before anything else.
+    context.retain_credentials(&declared.iter().cloned().collect());
+    if declared.is_empty() {
+        return;
+    }
+    let known: Vec<crate::structs::UpstreamCredentialKnown> = declared
+        .iter()
+        .map(
+            |(allocation_id, upstream, header)| crate::structs::UpstreamCredentialKnown {
+                allocation_id: *allocation_id,
+                upstream: upstream.clone(),
+                header: header.clone(),
+                version: context.credential_version(*allocation_id, upstream, header),
+            },
+        )
+        .collect();
+    let request = worker_credentials.attach(tonic::Request::new(
+        crate::structs::GetUpstreamCredentialsRequest {
+            node_id: node_id.to_string(),
+            known,
+        },
+    ));
+    let values = match client.get_upstream_credentials(request).await {
+        Ok(response) => response.into_inner().credentials,
+        Err(status) => {
+            warn!(
+                code = ?status.code(),
+                message = status.message(),
+                "Failed to fetch upstream credentials; keeping the current ones"
+            );
+            return;
+        }
+    };
+    for value in values {
+        let header = value.header.trim().to_ascii_lowercase();
+        if !value.error.is_empty() {
+            if value.absent {
+                warn!(
+                    allocation_id = value.allocation_id,
+                    upstream = %value.upstream,
+                    header = %header,
+                    kv_path = %value.kv_path,
+                    error = %value.error,
+                    "Upstream credential is gone; requests on this upstream fail closed"
+                );
+            }
+            context.set_credential_error(
+                value.allocation_id,
+                &value.upstream,
+                &header,
+                &value.kv_path,
+                value.error,
+                value.absent,
+            );
+            continue;
+        }
+        if value.unchanged {
+            context.clear_credential_error(value.allocation_id, &value.upstream, &header);
+            continue;
+        }
+        context.set_credential(
+            value.allocation_id,
+            &value.upstream,
+            &header,
+            &value.kv_path,
+            value.version,
+            crate::worker::forwarder::SecretValue::new(value.value),
+        );
+        // The path and version only: never the value.
+        info!(
+            allocation_id = value.allocation_id,
+            upstream = %value.upstream,
+            header = %header,
+            kv_path = %value.kv_path,
+            version = value.version,
+            "Installed upstream credential from KV"
+        );
+    }
+}
+
 /// Apply the reply's network-policy assignments to the datapath's cache and
 /// fetch any body the node has not seen. Fail-static: a fetch that fails
 /// leaves the allocation on whatever policy it had (or none, in which case a
@@ -2476,6 +2607,9 @@ fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
                 to: upstream.to.clone(),
                 http: declaration.and_then(|d| d.http.clone()),
                 handlers: declaration.map(|d| d.handlers.clone()).unwrap_or_default(),
+                credentials: declaration
+                    .map(|d| d.credentials.clone())
+                    .unwrap_or_default(),
                 vip: upstream.vip.clone(),
                 canonical_port: upstream.canonical_port,
                 netns: netns.clone(),
@@ -2965,6 +3099,10 @@ fn net_status(
             ));
         }
         problems.extend(TEMPLATES.problems(id));
+        // Credential injection: a header with no value fails its upstream's
+        // requests with a 503; one whose refresh failed still injects the
+        // previous value.
+        problems.extend(forwarder.context().credential_problems(id));
         if network.ingress_tls.as_deref() == Some("legion")
             && forwarder.context().mesh_identity().is_none()
         {
@@ -4157,11 +4295,49 @@ mod tests {
                 to: None,
                 http: None,
                 handlers: Vec::new(),
+                credentials: Vec::new(),
                 vip: None,
                 canonical_port: None,
                 netns: None,
             }]
         );
+    }
+
+    /// The node fetches exactly the headers its desired set declares, and the
+    /// forwarder's upstream spec carries them so HTTP mode injects them.
+    #[test]
+    fn declared_credentials_follow_the_desired_set_test() {
+        let connect = json!({ "upstreams": [
+            { "service": "db" },
+            { "name": "openai", "to": "https://api.openai.com", "credentials": [
+                { "header": "authorization", "prefix": "Bearer ", "from": { "kv": "secrets/openai" } },
+                { "header": "openai-organization", "from": { "kv": "secrets/org" } },
+            ] },
+        ] })
+        .to_string();
+        let with = TaskAllocation {
+            provisional: None,
+            allocation_id: 21,
+            task_connect: connect,
+            network: json!({ "upstreams": [
+                { "service": "openai", "localPort": 20010, "balance": "round_robin", "to": "https://api.openai.com" },
+            ] })
+            .to_string(),
+            ..TaskAllocation::default()
+        };
+        let without = connect_allocation(22, "db", 20011);
+        assert_eq!(
+            declared_credentials(&[with.clone(), without.clone()]),
+            vec![
+                (21, "openai".to_string(), "authorization".to_string()),
+                (21, "openai".to_string(), "openai-organization".to_string()),
+            ]
+        );
+        assert!(declared_credentials(&[without]).is_empty());
+        let specs = upstream_specs(&[with]);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].credentials.len(), 2);
+        assert_eq!(specs[0].credentials[0].prefix.as_deref(), Some("Bearer "));
     }
 
     #[test]
@@ -4280,6 +4456,7 @@ mod tests {
                 to: None,
                 http: None,
                 handlers: Vec::new(),
+                credentials: Vec::new(),
                 vip: None,
                 canonical_port: None,
                 netns: None,

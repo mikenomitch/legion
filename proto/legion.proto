@@ -957,6 +957,42 @@ service Manager {
   rpc GetIngressCertificates (GetIngressCertificatesRequest)
       returns (GetIngressCertificatesReply);
 
+  // Fetch the KV-held secrets behind `connect.upstreams[].credentials`
+  // (docs/network-handlers.md, "Credential injection"): headers the node's
+  // forwarder sets on every request it sends to an external `https://`
+  // upstream, so the task (and anything captured from it: a sandbox's
+  // memory checkpoints, forks, published snapshots) never holds the secret.
+  //
+  // The worker names (allocation, upstream, header) triples, never KV paths.
+  // For each one the manager checks that the allocation is placed on the
+  // calling node, reads the allocation's own task `connect` declaration,
+  // finds the upstream and the credential for that header, and takes the KV
+  // path from it. So a node can only ever read a secret that a job placed on
+  // it declares, and a job can only declare one its submitter could read
+  // (RunJob and template runs require `kv:read` on every credential path).
+  //
+  // Workers call it on their heartbeat loop, only while some allocation on
+  // the node declares credentials, passing the KV version they already hold
+  // so an unchanged secret costs no material on the wire. The worker keeps
+  // values in memory only: never in its state files, never in a log line.
+  //
+  // Per-entry problems (not placed here, no such credential, key missing)
+  // come back in that entry's `error` rather than failing the call, so one
+  // missing secret never blocks the others. `absent` marks the problems that
+  // are authoritative (the key or the declaration is gone): the worker drops
+  // any value it holds and fails requests on that upstream closed. Any other
+  // error, and a failed call, keeps the last good value.
+  //
+  // Called by the worker for its own node: the caller's authenticated
+  // per-node principal (`node:<node_id>`) must match the request's
+  // `node_id`.
+  //
+  // Errors:
+  // - PermissionDenied: `node_id` does not match the caller's credential.
+  // - Internal: the node's allocations could not be loaded.
+  rpc GetUpstreamCredentials (GetUpstreamCredentialsRequest)
+      returns (GetUpstreamCredentialsReply);
+
   // Worker heartbeat endpoint.
   //
   // Workers send runtime state, failures, and allocation health snapshots.
@@ -4685,6 +4721,80 @@ message IngressCertificate {
 message GetIngressCertificatesReply {
   // One entry per requested allocation, in request order.
   repeated IngressCertificate certificates = 1;
+}
+
+// One injected header in a GetUpstreamCredentials request: an allocation on
+// the calling node, one of its upstreams, and one credential header on it.
+message UpstreamCredentialKnown {
+  // The allocation (manager-facing id) whose credential to fetch.
+  int64 allocation_id = 1;
+
+  // The upstream's key: the `name` of an external upstream
+  // (`connect.upstreams[].name`), as in `LEGION_UPSTREAM_<NAME>`.
+  string upstream = 2;
+
+  // The injected header, lower-cased (`x-api-key`, `authorization`).
+  string header = 3;
+
+  // The KV version of the secret the worker already holds, or 0 for none.
+  // When it matches the current version the reply is `unchanged`.
+  int64 version = 4;
+}
+
+// Request payload for GetUpstreamCredentials.
+message GetUpstreamCredentialsRequest {
+  // The worker node asking. Must match the caller's authenticated per-node
+  // credential.
+  string node_id = 1;
+
+  // Every credential header declared by an allocation on this node.
+  repeated UpstreamCredentialKnown known = 2;
+}
+
+// One credential in a GetUpstreamCredentials reply.
+message UpstreamCredentialValue {
+  // The allocation this credential is for.
+  int64 allocation_id = 1;
+
+  // The upstream key, echoed from the request.
+  string upstream = 2;
+
+  // The header, echoed from the request.
+  string header = 3;
+
+  // The KV path the allocation's declaration names for this header. Set
+  // even when `error` is, so the worker can report which key is at fault.
+  string kv_path = 4;
+
+  // The KV entry's version. The worker re-fetches when it moves.
+  int64 version = 5;
+
+  // True when `version` equals the version the worker sent. No value is
+  // returned.
+  bool unchanged = 6;
+
+  // The secret: the raw KV value, which the forwarder sends as the header
+  // value after the declared `prefix`. Treat as a secret: never log it,
+  // never write it to disk.
+  string value = 7;
+
+  // Why no value was returned, e.g. "kv secrets/openai not found". Empty on
+  // success.
+  string error = 8;
+
+  // True when `error` is authoritative rather than transient: the KV key
+  // does not exist, or the allocation is not on this node or no longer
+  // declares this credential. The worker drops any value it holds, so
+  // deleting the key revokes the credential on the next heartbeat. False
+  // for transient problems (a KV read failure), where the worker keeps the
+  // last good value.
+  bool absent = 9;
+}
+
+// Reply payload for GetUpstreamCredentials.
+message GetUpstreamCredentialsReply {
+  // One entry per requested credential, in request order.
+  repeated UpstreamCredentialValue credentials = 1;
 }
 
 // Request payload for Heartbeat.

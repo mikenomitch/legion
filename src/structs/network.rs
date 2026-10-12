@@ -528,6 +528,167 @@ pub struct UpstreamConfig {
     /// policy and before the dial.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handlers: Vec<crate::structs::netpolicy::HandlerConfig>,
+    /// Credential injection (docs/network-handlers.md, "Credential
+    /// injection"): headers the node sets on every request it sends to an
+    /// external `https://` upstream, with values the task never sees.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<UpstreamCredential>,
+}
+
+/// One injected header on an external `https://` upstream. Whatever value
+/// the task sent for `header` is dropped and replaced with `prefix` + the
+/// secret, so a placeholder the task's SDK insists on is harmless.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpstreamCredential {
+    /// The request header to set (`x-api-key`, `Authorization`). Stored
+    /// lower-cased; HTTP header names are case-insensitive.
+    pub header: String,
+    /// Text placed before the secret (`"Bearer "`). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Where the secret comes from.
+    pub from: CredentialFrom,
+}
+
+/// The provider behind one credential. Exactly one field is set. Only `kv`
+/// exists today; the struct is the seam later providers (a workload-identity
+/// token, a webhook) slot into as sibling fields.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialFrom {
+    /// A KV path whose value is the secret. The node fetches it with
+    /// `GetUpstreamCredentials` and keeps it in memory only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv: Option<String>,
+}
+
+impl UpstreamCredential {
+    /// The KV path this credential reads, when it is KV-backed.
+    pub fn kv_path(&self) -> Option<&str> {
+        self.from
+            .kv
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    }
+}
+
+/// Headers a credential may not name: hop-by-hop headers are stripped
+/// between hops, and `host` (plus the framing headers) is the datapath's to
+/// set. Injecting any of them would either vanish or corrupt the request.
+const CREDENTIAL_RESERVED_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+];
+
+/// Whether `name` is a syntactically valid HTTP header name (RFC 9110
+/// token characters).
+fn is_header_token(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Validate one upstream's `credentials`: only on an external `https://`
+/// upstream, a valid non-reserved header named at most once, a provider.
+fn validate_upstream_credentials(task_name: &str, upstream: &UpstreamConfig) -> R<()> {
+    if upstream.credentials.is_empty() {
+        return Ok(());
+    }
+    let key = upstream.key();
+    let what = format!("task {task_name} connect.upstreams entry '{key}' credentials");
+    if !upstream.is_external() {
+        bail!(
+            "{what}: credentials need an external https:// upstream (name + to); a catalog \
+             service upstream is reached over the mesh, not the public internet. Hint: declare \
+             {{ name = \"{key}\", to = \"https://<host>\", credentials = [...] }}, or have the \
+             service read the secret itself"
+        );
+    }
+    let to = upstream.to.as_deref().unwrap_or_default();
+    let scheme = to
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .unwrap_or_default();
+    match scheme.as_str() {
+        "https" => {}
+        "http" => bail!(
+            "{what}: to = '{to}' is plaintext, so the injected secret would cross the network \
+             in the clear. Hint: use https:// (the node originates TLS; the task still speaks \
+             plain HTTP to its loopback port)"
+        ),
+        _ => bail!(
+            "{what}: to = '{to}' is not HTTP, so there is no request head to put a header in. \
+             Hint: credentials need an https:// upstream; for a tcp:// or tls:// destination, \
+             deliver the secret to the task (env or a KV file) instead"
+        ),
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    for (index, credential) in upstream.credentials.iter().enumerate() {
+        let header = credential.header.trim().to_ascii_lowercase();
+        let at = format!("{what}[{index}]");
+        if header.is_empty() {
+            bail!("{at}: header is required (e.g. header = \"x-api-key\")");
+        }
+        if !is_header_token(&header) {
+            bail!(
+                "{at}: '{}' is not a valid HTTP header name",
+                credential.header
+            );
+        }
+        if CREDENTIAL_RESERVED_HEADERS.contains(&header.as_str()) {
+            bail!(
+                "{at}: header '{}' is a hop-by-hop or framing header the datapath owns and \
+                 cannot be injected",
+                credential.header
+            );
+        }
+        if !seen.insert(header.clone()) {
+            bail!("{what}: header '{header}' is injected more than once");
+        }
+        if let Some(prefix) = credential.prefix.as_deref() {
+            if prefix.chars().any(|c| c == '\r' || c == '\n' || c == '\0') {
+                bail!("{at}: prefix must not contain CR, LF, or NUL");
+            }
+        }
+        match credential.from.kv.as_deref() {
+            Some(path) if !path.trim().is_empty() => {}
+            Some(_) => bail!("{at}: from.kv must name a KV path"),
+            None => bail!(
+                "{at}: from needs a provider; today that is {{ kv = \"<path>\" }}, e.g. \
+                 from = {{ kv = \"secrets/{key}\" }}"
+            ),
+        }
+    }
+    Ok(())
 }
 
 impl UpstreamConfig {
@@ -1439,6 +1600,7 @@ pub fn validate_task_connect(
         if let Some(http) = upstream.http.as_ref() {
             validate_upstream_http(task_name, upstream.key(), http)?;
         }
+        validate_upstream_credentials(task_name, upstream)?;
         for (index, handler) in upstream.handlers.iter().enumerate() {
             let mut handler = handler.clone();
             crate::structs::netpolicy::normalize_handler(
@@ -1562,6 +1724,12 @@ pub fn normalize_task_connect(task_name: &str, connect: &mut Option<ConnectConfi
         }
         if let Some(to) = upstream.to.as_mut() {
             *to = to.trim().to_string();
+        }
+        for credential in upstream.credentials.iter_mut() {
+            credential.header = credential.header.trim().to_ascii_lowercase();
+            if let Some(path) = credential.from.kv.as_mut() {
+                *path = path.trim().to_string();
+            }
         }
         let is_http = upstream.is_http();
         let key = upstream.key().to_string();
@@ -2300,6 +2468,80 @@ mod tests {
             json!([{ "service": "api", "http": { "timeout": "3s", "retries": { "attempts": 2, "budget": "20%" }, "outlier": { "consecutive5xx": 5, "ejectFor": "30s" } } }]),
         );
         validate_task_connect("api", None, Some(&ok), None).unwrap();
+    }
+
+    #[test]
+    fn upstream_credentials_validate_test() {
+        let check = |upstreams: Value| -> Result<(), String> {
+            let mut config = Some(connect(upstreams));
+            normalize_task_connect("api", &mut config).map_err(|e| e.to_string())?;
+            validate_task_connect("api", None, config.as_ref(), None).map_err(|e| e.to_string())
+        };
+        let cred = |header: &str| json!({ "header": header, "from": { "kv": "secrets/openai" } });
+
+        // An external https:// upstream takes credentials, normalized.
+        check(json!([{
+            "name": "openai", "to": "https://api.openai.com",
+            "credentials": [
+                { "header": "Authorization", "prefix": "Bearer ", "from": { "kv": "secrets/openai" } },
+                cred("x-org"),
+            ],
+        }]))
+        .unwrap();
+        let mut normalized = Some(connect(
+            json!([{ "name": "a", "to": "https://x", "credentials": [{ "header": " X-Api-Key ", "from": { "kv": " secrets/a " } }] }]),
+        ));
+        normalize_task_connect("api", &mut normalized).unwrap();
+        let credential = &normalized.unwrap().upstreams[0].credentials[0];
+        assert_eq!(credential.header, "x-api-key");
+        assert_eq!(credential.kv_path(), Some("secrets/a"));
+
+        // Plaintext, non-HTTP, and catalog-service upstreams are refused.
+        let err = check(json!([{ "name": "o", "to": "http://api.openai.com", "credentials": [cred("x-api-key")] }])).unwrap_err();
+        assert!(
+            err.contains("in the clear") && err.contains("Hint"),
+            "{err}"
+        );
+        for to in ["tcp://db:5432", "tls://db:5432"] {
+            let err = check(json!([{ "name": "o", "to": to, "credentials": [cred("x-api-key")] }]))
+                .unwrap_err();
+            assert!(err.contains("no request head"), "{err}");
+        }
+        let err =
+            check(json!([{ "service": "db", "credentials": [cred("x-api-key")] }])).unwrap_err();
+        assert!(err.contains("external https://"), "{err}");
+
+        // Header names: valid, not hop-by-hop or host, at most once.
+        for header in [
+            "connection",
+            "Host",
+            "proxy-authorization",
+            "transfer-encoding",
+        ] {
+            let err =
+                check(json!([{ "name": "o", "to": "https://x", "credentials": [cred(header)] }]))
+                    .unwrap_err();
+            assert!(err.contains("cannot be injected"), "{header}: {err}");
+        }
+        let err =
+            check(json!([{ "name": "o", "to": "https://x", "credentials": [cred("bad header")] }]))
+                .unwrap_err();
+        assert!(err.contains("not a valid HTTP header name"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [cred("")] }]))
+            .unwrap_err();
+        assert!(err.contains("header is required"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [cred("X-Api-Key"), cred("x-api-key")] }])).unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
+
+        // A provider is required, and its path non-empty.
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "kv": "  " } }] }])).unwrap_err();
+        assert!(err.contains("must name a KV path"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": {} }] }])).unwrap_err();
+        assert!(err.contains("needs a provider"), "{err}");
+        // Unknown providers are a parse error, not silently ignored.
+        assert!(serde_json::from_value::<ConnectConfig>(json!({ "upstreams": [{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "vault": "a" } }] }] })).is_err());
+        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "prefix": "a\r\nb", "from": { "kv": "k" } }] }])).unwrap_err();
+        assert!(err.contains("CR, LF"), "{err}");
     }
 
     #[test]

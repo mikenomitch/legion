@@ -558,6 +558,15 @@ Firecracker this needs 1.16.1 or later. A memory checkpoint closes the
 guest's open connections. See
 [suspend-and-resume.md](suspend-and-resume.md#gated-sandboxes).
 
+**Upstreams and credentials.** A guest cannot reach `connect.upstreams` yet,
+in any of the three shapes: the upstream listeners are on the node's
+loopback (or inside a namespace a sandbox does not have), and a gated
+guest's only ways out are the vsock proxy and resolver. So
+[credential injection](network-handlers.md#credential-injection), which keeps
+an API key out of the guest and out of every memory checkpoint, works for
+`exec` and `container` tasks but not for sandboxes today. HTTPS through the
+gated proxy is a `CONNECT` tunnel, and no credential is injected into it.
+
 ## Artifacts Support
 
 `sandbox` reports `supports_artifacts()`. Unlike `container`, file and tree
