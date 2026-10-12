@@ -133,8 +133,32 @@ impl Node {
                 .map(str::to_string)
         };
         let mut lines = Vec::new();
-        if let Some(address) = attr("workerAddress") {
-            lines.push(format!("Worker plane   {address}"));
+        let probe = self.dynamic_attrs.get("workerPlane");
+        match (attr("workerAddress"), probe) {
+            (Some(address), Some(probe)) if probe["reachable"] == true => lines.push(format!(
+                "Worker plane   {address}   reachable from {}",
+                probe["from"].as_str().unwrap_or("a manager")
+            )),
+            (Some(address), Some(probe)) => {
+                lines.push(format!(
+                    "Worker plane   {address}   unreachable from {}: {}",
+                    probe["from"].as_str().unwrap_or("a manager"),
+                    probe["error"].as_str().unwrap_or("no answer")
+                ));
+                lines.push(
+                    "               Managers dial workers on this address. Allow it from the \
+                     managers, or set"
+                        .to_string(),
+                );
+                lines.push(
+                    "               LEGION_WORKER_ADVERTISE_ADDR if this address is wrong."
+                        .to_string(),
+                );
+            }
+            (Some(address), None) => {
+                lines.push(format!("Worker plane   {address}   not probed yet"))
+            }
+            (None, _) => {}
         }
         lines.push(format!(
             "Host guard     {}",
@@ -178,5 +202,58 @@ impl From<Node> for NodePrint {
             availability: node.availability,
             last_heartbeat,
         }
+    }
+}
+
+#[cfg(test)]
+mod node_test {
+    use super::*;
+    use serde_json::json;
+
+    fn node(dynamic: serde_json::Value) -> Node {
+        Node {
+            id: "wkr-1".into(),
+            status: "active".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
+            config_attrs: json!({
+                "workerAddress": "https://10.0.1.7:4848",
+                "hostGuard": "active (nftables)",
+            }),
+            fingerprint_attrs: json!({}),
+            dynamic_attrs: dynamic,
+            health_checks: json!({}),
+        }
+    }
+
+    #[test]
+    fn node_info_says_whether_managers_reach_the_worker_test() {
+        let lines = node(json!({})).security_lines();
+        assert_eq!(
+            lines[0],
+            "Worker plane   https://10.0.1.7:4848   not probed yet"
+        );
+        assert_eq!(lines[1], "Host guard     active (nftables)");
+
+        let lines = node(json!({ "workerPlane": {
+            "reachable": true, "from": "mgr-a", "address": "https://10.0.1.7:4848",
+        }}))
+        .security_lines();
+        assert_eq!(
+            lines[0],
+            "Worker plane   https://10.0.1.7:4848   reachable from mgr-a"
+        );
+
+        let lines = node(json!({ "workerPlane": {
+            "reachable": false, "from": "mgr-b", "error": "connection timed out",
+        }}))
+        .security_lines();
+        assert_eq!(
+            lines[0],
+            "Worker plane   https://10.0.1.7:4848   unreachable from mgr-b: connection timed out"
+        );
+        assert!(lines[2].contains("LEGION_WORKER_ADVERTISE_ADDR"));
     }
 }

@@ -279,7 +279,17 @@ pub async fn run_exec_session(
     let worker_stream = worker
         .exec_task(ReceiverStream::new(fwd_rx))
         .await
-        .map_err(|e| Status::internal(format!("worker exec failed: {e}")))?
+        .map_err(|status| {
+            if crate::manager::worker_plane::is_unreachable(&status) {
+                crate::manager::worker_plane::worker_call_error(
+                    &resolved.node_id,
+                    &resolved.target.address,
+                    status,
+                )
+            } else {
+                Status::internal(format!("worker exec failed: {status}"))
+            }
+        })?
         .into_inner();
 
     // Pump the worker's server frames back to the caller, logging the exit.

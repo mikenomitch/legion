@@ -371,6 +371,8 @@ impl SimFleet {
 /// has no logs, no exec, and restarting one node of N makes no sense.
 struct SimWorkerService {
     fleet: Arc<SimFleet>,
+    /// The fleet's name, which its `Probe` answers with.
+    fleet_name: String,
 }
 
 #[tonic::async_trait]
@@ -450,6 +452,17 @@ impl Worker for SimWorkerService {
         Err(Status::unimplemented(
             "restarting a simulated node would restart the whole fleet process",
         ))
+    }
+
+    async fn probe(
+        &self,
+        request: Request<crate::structs::ProbeRequest>,
+    ) -> Result<Response<crate::structs::ProbeReply>, Status> {
+        crate::worker::plane::require_manager(&request, "Probe")?;
+        Ok(Response::new(crate::structs::ProbeReply {
+            node_id: self.fleet_name.clone(),
+            protocol_version: u64::from(crate::constants::PROTOCOL_VERSION),
+        }))
     }
 }
 
@@ -665,6 +678,7 @@ pub async fn launch_simulated_fleet(
         crate::worker::plane::trust_manager_bundle(&manager_addr, roots);
     }
     let server_fleet = fleet.clone();
+    let server_fleet_name = fleet_name.clone();
     let issuer_client = clients[0].clone();
     let issuer_manager = manager_addr.clone();
     let server_task = tokio::spawn(async move {
@@ -678,6 +692,7 @@ pub async fn launch_simulated_fleet(
         let router =
             tonic::transport::Server::builder().add_service(WorkerServer::new(SimWorkerService {
                 fleet: server_fleet,
+                fleet_name: server_fleet_name,
             }));
         let roots = fleet_identity
             .roots()

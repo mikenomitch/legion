@@ -5,8 +5,10 @@
 **Status: IN EXECUTION.** Phases 0 (ACLs on by default), 1 (the mTLS worker
 plane), 2 (the host guard in the datapath), 3 (Linux containers gated by
 default), 4 (the encrypted worker-to-manager channel), 5 (the host guard in
-the kernel), 6 (the container privilege floor), and 7 (exec trust and the
-`host` grant) shipped. The plan
+the kernel), 6 (the container privilege floor), 7 (exec trust and the
+`host` grant), and 8 (reachability diagnostics) shipped; what remains is
+verification on hardware this was not built on (see "Verification record").
+The plan
 has two halves that share one threat: something reaching a node's control
 plane that shouldn't.
 
@@ -1526,6 +1528,13 @@ item in `internal_docs/TODO.md`.
   and the unit tests for the spec, the pool, and the profile. Not run: youki
   and crun. Five older ignored runc tests fail here with and without the
   floor (listed in TODO.md).
+- **Phase 7** ran as unit and integration tests: the host-grant matrix in
+  `tests/acl_endpoints.rs` (an exec task, a host-network container, and a
+  floor-less container refused without `host` and admitted with it), the
+  gated-root refusal, and the classification table.
+- **Phase 8** ran end to end in `worker_plane_e2e` (the in-process worker is
+  probed reachable and `legion node info -j` shows it), plus the class table
+  and the error envelope. Not run: an unreachable worker on another host.
 
 ## 10. Rollout and backward compatibility
 

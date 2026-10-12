@@ -1006,3 +1006,41 @@ someone with the grant deployed.
 Gating scale would make every operator who resizes jobs a host administrator,
 the same over-broad grant the plan avoided for bands. **The narrow grant
 won.**
+
+## 43. The probe runs once per registration and lands in the node's dynamic attributes
+
+Made while implementing Phase 8. The manager that accepts a registration
+waits for the worker plane to come up, probes it (retrying at 2, 5, 10, and
+20 seconds), and writes `workerPlane = {reachable, address, from, checkedAt,
+error?}` into the node's dynamic attributes with the existing
+`update_node_dyamic` write. No new column, no periodic probing.
+
+**Alternative.** A dedicated node field (a proto change on `Node`), or every
+manager probing every node on a timer.
+
+**Trade-off.** The record says what one manager saw at join time; a worker
+that becomes unreachable later, or that only some managers can't reach, is
+reported when a call to it fails (`WORKER_UNREACHABLE`), not on the node page.
+
+**Why.** The plan's goal is the 3am surprise at join time, which one probe
+covers. Periodic probes from every manager are N×M connections for a fact the
+next exec call reports anyway. Dynamic attributes already flow to the CLI, the
+UI, and `node list -j`. **The smallest thing that answers the question won.**
+
+## 44. `WORKER_UNREACHABLE` rides a status metadata key
+
+Made while implementing Phase 8. A gRPC status carries a code from a fixed
+set. The manager returns `Unavailable` with the metadata key
+`legion-error-code: WORKER_UNREACHABLE`, and the CLI and MCP envelopes use that
+key as `error.code` when present, the gRPC code name otherwise.
+
+**Alternative.** Encode the code in the message text, or define a richer
+error detail type (`google.rpc.Status` details).
+
+**Trade-off.** A raw gRPC client sees `Unavailable` unless it reads the
+metadata.
+
+**Why.** Message parsing is the scraping the envelope exists to avoid, and a
+details type means a new dependency on every client. A metadata key is one
+line on each side and extends to the next server-named code. **Simplicity
+won.**

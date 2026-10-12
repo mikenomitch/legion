@@ -1547,7 +1547,7 @@ pub fn validate_gated_exec_user(task: &crate::structs::TaskConfig) -> R<()> {
     if user.is_empty() || user == "root" || user == "0" {
         bail!(
             "task {:?} sets network.mode = \"gated\" but runs as root. A root exec task can \
-             leave its network namespace, so gated would not hold. Hint: set user = \"nobody\" \
+             leave its network namespace, so gated would not hold.\nHint: set user = \"nobody\" \
              (or another unprivileged user), or use runtime = \"container\"",
             task.name
         );

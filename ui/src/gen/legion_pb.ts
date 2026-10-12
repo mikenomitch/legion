@@ -19945,6 +19945,91 @@ export class Eval extends Message<Eval> {
 }
 
 /**
+ * Request payload for Worker.Probe. Empty: the TLS handshake and the
+ * manager-class check are the probe.
+ *
+ * @generated from message legion.ProbeRequest
+ */
+export class ProbeRequest extends Message<ProbeRequest> {
+  constructor(data?: PartialMessage<ProbeRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ProbeRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ProbeRequest {
+    return new ProbeRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ProbeRequest {
+    return new ProbeRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ProbeRequest {
+    return new ProbeRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ProbeRequest | PlainMessage<ProbeRequest> | undefined, b: ProbeRequest | PlainMessage<ProbeRequest> | undefined): boolean {
+    return proto3.util.equals(ProbeRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for Worker.Probe.
+ *
+ * @generated from message legion.ProbeReply
+ */
+export class ProbeReply extends Message<ProbeReply> {
+  /**
+   * The node id this worker serves, so a manager that dialed a stale or
+   * reused address learns it reached a different node. A simulated fleet
+   * answers with its fleet name.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * The worker's protocol version (`PROTOCOL_VERSION`, docs/upgrades.md).
+   *
+   * @generated from field: uint64 protocol_version = 2;
+   */
+  protocolVersion = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ProbeReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ProbeReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "protocol_version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ProbeReply {
+    return new ProbeReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ProbeReply {
+    return new ProbeReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ProbeReply {
+    return new ProbeReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ProbeReply | PlainMessage<ProbeReply> | undefined, b: ProbeReply | PlainMessage<ProbeReply> | undefined): boolean {
+    return proto3.util.equals(ProbeReply, a, b);
+  }
+}
+
+/**
  * Frames sent from the initiator (CLI, UI, or manager proxy) toward the
  * process. The first frame on a stream must carry `start`.
  *

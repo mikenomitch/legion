@@ -60,6 +60,7 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         ("GetTaskLogs", &[Caller::Manager]),
         ("ExecTask", &[Caller::Manager]),
         ("StartClaim", &[Caller::Ticket]),
+        ("Probe", &[Caller::Manager]),
     ]
 }
 
@@ -204,6 +205,10 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
                 instance_id: "i-1".into(),
                 ..Default::default()
             })
+            .await
+            .map(|_| ()),
+        "Probe" => client
+            .probe(legion::structs::ProbeRequest {})
             .await
             .map(|_| ()),
         other => panic!("no request builder for Worker RPC {other}"),

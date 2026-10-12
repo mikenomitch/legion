@@ -415,6 +415,19 @@ impl Worker for WorkerDaemonService {
 
         Ok(Response::new(reply))
     }
+
+    #[instrument(err, skip_all)]
+    async fn probe(
+        &self,
+        request: Request<crate::structs::ProbeRequest>,
+    ) -> Result<Response<crate::structs::ProbeReply>, Status> {
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "Probe")?;
+        Ok(Response::new(crate::structs::ProbeReply {
+            node_id: self.node_id.clone(),
+            protocol_version: u64::from(crate::constants::PROTOCOL_VERSION),
+        }))
+    }
 }
 
 /// Drive one edge-initiated claim: stream its stages to the caller, ratify it

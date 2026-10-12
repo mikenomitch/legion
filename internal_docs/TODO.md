@@ -16,7 +16,9 @@ How to use it:
 ---
 
 - [ ] **Launch blocker: workers on another host lose exec, logs, and the
-      mesh, and any task can take over the cluster.** The worker binds
+      mesh, and any task can take over the cluster.** Phases 0 to 8 are
+      built (PR in flight); what is left is verification on real hardware,
+      listed below. The worker binds
       `127.0.0.1:4848` and always advertises `http://127.0.0.1:4848`
       (`src/worker/daemon.rs:155`, `:376-379`). Opening the port is not the
       fix, because `PostWork`, `ExecTask`, `GetTaskLogs`, and `RestartWorker`
@@ -114,8 +116,13 @@ How to use it:
         task (plan §6.15, §6.16; calls 40 to 42). Docs:
         [task-runtime-exec.md](../docs/task-runtime-exec.md#trust),
         [auth-and-acls.md](../docs/auth-and-acls.md#host-level-jobs).
-  - [ ] Phase 8: reachability diagnostics: `Worker/Probe`,
-        `WORKER_UNREACHABLE` (plan §6.7).
+  - [x] Phase 8: reachability diagnostics: `Worker/Probe` from the
+        manager that accepts a registration, the outcome on the node
+        (`workerPlane`, shown by `legion node info` and the UI node page),
+        and `WORKER_UNREACHABLE` on exec, logs, and restart in the CLI and MCP
+        envelopes (plan §6.7; calls 43, 44). Docs:
+        [architecture-managers-workers.md](../docs/architecture-managers-workers.md#reachability),
+        [agent-readiness.md](../docs/agent-readiness.md).
   - [x] Fix the public docs' "cannot be bypassed" claims for gated
         `container` and `exec`: they now describe the host guard, and that a
         root `exec` task can `setns` back out.

@@ -180,6 +180,23 @@ fn logs_exec_and_ca_rotation_work_over_the_mtls_worker_plane_test() {
     // was issued its certificate through that channel.
     assert!(log.contains("Node certificate issued"), "{log}");
 
+    // The manager probed the worker plane back and recorded it on the node
+    // (`legion node info`, worker-plane-auth plan §6.7).
+    cluster.wait_for("the worker plane probe to land on the node", || {
+        let nodes = cluster.cli_json(&["node", "list"]);
+        let Some(id) = nodes["data"]
+            .as_array()
+            .or_else(|| nodes["data"]["nodes"].as_array())
+            .and_then(|nodes| nodes.first())
+            .and_then(|node| node["id"].as_str())
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let info = cluster.cli_json(&["node", "info", &id]);
+        info["data"]["dynamicAttrs"]["workerPlane"]["reachable"] == true
+    });
+
     let job = cluster.dir.path().join("e2e.json");
     std::fs::write(
         &job,

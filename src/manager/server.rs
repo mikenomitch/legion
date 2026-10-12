@@ -7008,6 +7008,12 @@ impl Manager for ManagerDaemonService {
             worker_protocol_version = request.protocol_version,
             "Worker registered"
         );
+        // Tell the operator now, not at 3am, when this manager can't dial
+        // the worker back (worker-plane-auth plan §6.7).
+        crate::manager::worker_plane::spawn_probe_after_registration(
+            self.store.clone(),
+            node_id.clone(),
+        );
         // Easter egg: every join is announced the same way on both sides.
         info!(node_id = %node_id, "We are Legion. {node_id} has joined");
 
@@ -7153,12 +7159,15 @@ impl Manager for ManagerDaemonService {
 
         let mut client =
             crate::manager::worker_plane::WorkerPlane::global().client(&self.store, &node)?;
+        let address = crate::manager::worker_plane::worker_address(&node).unwrap_or_default();
         let response = client
             .restart_worker(tonic::Request::new(RestartWorkerRequest {
                 node_id: node_id.clone(),
             }))
             .await
-            .map_err(|e| Status::unavailable(format!("Worker restart failed: {e}")))?;
+            .map_err(|status| {
+                crate::manager::worker_plane::worker_call_error(&node_id, &address, status)
+            })?;
 
         let reply = RestartWorkerReply {
             message: response.into_inner().message,
@@ -10100,7 +10109,18 @@ async fn fetch_allocation_logs(
             offset: req.offset,
         })
         .await
-        .map_err(|status| format!("worker on {} returned {}", allocation.node_id, status))?;
+        .map_err(|status| {
+            let status = crate::manager::worker_plane::worker_call_error(
+                &allocation.node_id,
+                &target.address,
+                status,
+            );
+            if crate::manager::worker_plane::is_unreachable(&status) {
+                status.message().to_string()
+            } else {
+                format!("worker on {} returned {}", allocation.node_id, status)
+            }
+        })?;
 
     Ok(reply.into_inner().streams)
 }
@@ -12778,6 +12798,16 @@ mod tests {
             *guard = Some(node_id);
             Ok(Response::new(RestartWorkerReply {
                 message: "ok".into(),
+            }))
+        }
+
+        async fn probe(
+            &self,
+            _request: Request<crate::structs::ProbeRequest>,
+        ) -> Result<Response<crate::structs::ProbeReply>, Status> {
+            Ok(Response::new(crate::structs::ProbeReply {
+                node_id: "node-1".into(),
+                protocol_version: u64::from(crate::constants::PROTOCOL_VERSION),
             }))
         }
 

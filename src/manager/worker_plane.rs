@@ -308,6 +308,152 @@ impl WorkerPlane {
     }
 }
 
+/// The metadata key a status carries its stable error code in. The CLI and
+/// MCP error envelopes use it as `error.code` instead of the gRPC code name.
+pub const ERROR_CODE_METADATA: &str = "legion-error-code";
+
+/// The error code for "a manager could not reach this worker".
+pub const WORKER_UNREACHABLE: &str = "WORKER_UNREACHABLE";
+
+/// The node attribute (in its dynamic attributes) a probe's outcome lands
+/// in.
+pub const WORKER_PLANE_ATTR: &str = "workerPlane";
+
+/// Whether a failed worker-plane call means the worker was never reached
+/// (connection refused or timed out, TLS failed) rather than that it
+/// answered with an error.
+pub fn is_unreachable(status: &Status) -> bool {
+    status.code() == tonic::Code::Unavailable
+        || (status.code() == tonic::Code::Unknown && status.message().contains("transport error"))
+}
+
+/// The port of a worker address, for the hint (`4848` when it has none).
+fn worker_port(address: &str) -> String {
+    crate::cluster_tls::host_port(address)
+        .ok()
+        .and_then(|host_port| host_port.rsplit(':').next().map(str::to_string))
+        .unwrap_or_else(|| "4848".to_string())
+}
+
+/// The error exec, logs, and restart return when this manager cannot reach
+/// a worker (worker-plane-auth plan §6.7): `Unavailable`, tagged
+/// [`WORKER_UNREACHABLE`], naming the node, its address, and the cause, with
+/// the fix as a hint.
+pub fn unreachable_status(node_id: &str, address: &str, cause: &str) -> Status {
+    let cause = if cause.trim().is_empty() {
+        "connection failed"
+    } else {
+        cause.trim()
+    };
+    let mut status = Status::unavailable(format!(
+        "cannot reach node {node_id} at {address} ({cause})\nHint: managers dial workers on \
+         port {}; see `legion node info {node_id}`",
+        worker_port(address)
+    ));
+    status.metadata_mut().insert(
+        ERROR_CODE_METADATA,
+        tonic::metadata::MetadataValue::from_static(WORKER_UNREACHABLE),
+    );
+    status
+}
+
+/// [`unreachable_status`] when `status` says the worker was never reached;
+/// the worker's own answer otherwise.
+pub fn worker_call_error(node_id: &str, address: &str, status: Status) -> Status {
+    if is_unreachable(&status) {
+        let cause = match std::error::Error::source(&status) {
+            Some(source) => format!("{}: {source}", status.message()),
+            None => status.message().to_string(),
+        };
+        unreachable_status(node_id, address, &cause)
+    } else {
+        status
+    }
+}
+
+/// Probes one node's worker plane from this manager and returns what lands
+/// on the node record: `{reachable, address, from, checkedAt, error?}`. A
+/// reply naming another node counts as unreachable: the address is stale.
+pub async fn probe_node(store: &Store, node: &Node) -> Value {
+    let manager = WorkerPlane::global().manager_id();
+    let address = worker_address(node).unwrap_or_default();
+    let checked_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let outcome: Result<(), String> = async {
+        let mut client = WorkerPlane::global()
+            .client(store, node)
+            .map_err(|status| status.message().to_string())?;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.probe(tonic::Request::new(crate::structs::ProbeRequest {})),
+        )
+        .await
+        .map_err(|_| "connection timed out".to_string())?
+        .map_err(|status| {
+            worker_call_error(&node.id, &address, status)
+                .message()
+                .split("\nHint:")
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })?
+        .into_inner();
+        let fleet_reply = worker_fleet(node).is_some_and(|fleet| fleet == reply.node_id);
+        if reply.node_id != node.id && !fleet_reply {
+            return Err(format!(
+                "{address} answers as node {:?}, not {:?}; the advertised address is stale",
+                reply.node_id, node.id
+            ));
+        }
+        Ok(())
+    }
+    .await;
+    let mut record = serde_json::json!({
+        "reachable": outcome.is_ok(),
+        "address": address,
+        "from": manager,
+        "checkedAt": checked_at,
+    });
+    if let Err(error) = outcome {
+        record["error"] = Value::String(error);
+    }
+    record
+}
+
+/// After a registration: waits for the worker's plane to come up (it starts
+/// once the node certificate is issued, a moment after registering), probes
+/// it, retrying a few times, and records the outcome on the node.
+pub fn spawn_probe_after_registration(store: Store, node_id: String) {
+    tokio::spawn(async move {
+        let mut record = Value::Null;
+        for delay in [2u64, 5, 10, 20] {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            let Ok(node) = store.get_node(&node_id) else {
+                return;
+            };
+            record = probe_node(&store, &node).await;
+            if record["reachable"] == true {
+                break;
+            }
+        }
+        if record["reachable"] != true {
+            warn!(
+                node_id = %node_id,
+                address = %record["address"].as_str().unwrap_or_default(),
+                error = %record["error"].as_str().unwrap_or_default(),
+                "This manager cannot reach the worker plane; exec, logs, and restart will fail \
+                 for this node (see `legion node info`)"
+            );
+        }
+        let mut diff = serde_json::Map::new();
+        diff.insert(WORKER_PLANE_ATTR.to_string(), record);
+        if let Err(err) = store.update_node_dyamic(&node_id, &diff) {
+            debug!(node_id = %node_id, error = ?err, "Could not record the worker plane probe");
+        }
+    });
+}
+
 #[cfg(test)]
 mod worker_plane_test {
     use super::*;

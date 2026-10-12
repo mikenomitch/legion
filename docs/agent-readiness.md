@@ -158,7 +158,11 @@ take `--json` and are not part of the agent surface.
 ```
 
 An agent checks `ok` once and never has to scrape prose. The error `code`
-mirrors the gRPC status code (`NotFound`, `Unavailable`, `InvalidArgument`, …).
+mirrors the gRPC status code (`NotFound`, `Unavailable`, `InvalidArgument`, …),
+except where the server names a more specific one: `WORKER_UNREACHABLE`
+(retryable) when a manager can't dial the worker running the target of an
+exec, logs, or restart call. Its hint points at `legion node info <node>`,
+which shows the manager's reachability probe for that node.
 `retryable` tells the agent whether retrying the same request may succeed. It is
 true for `Unavailable`, `DeadlineExceeded`, `Aborted`, and `ResourceExhausted`.
 Commands exit non-zero on failure.

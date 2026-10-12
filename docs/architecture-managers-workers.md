@@ -273,6 +273,42 @@ fleet from one listener with one fleet certificate
 register. Its nodes carry the `workerFleet` attribute, and managers verify
 the fleet's name for them.
 
+### Reachability
+
+Dispatch survives a worker the managers can't dial (heartbeat replies carry
+the work), so a firewalled worker looks healthy until someone needs its logs.
+To surface that at join time, the manager that accepts a registration probes
+the worker plane back (`Worker/Probe`, manager class) once the worker's
+listener is up, retrying for about half a minute, and records the outcome on
+the node (`workerPlane` in its dynamic attributes):
+
+```console
+$ legion node info wkr-1
+Node ID: wkr-1
+Worker plane   https://10.0.1.7:4848   unreachable from mgr-b: connection timed out
+               Managers dial workers on this address. Allow it from the managers, or set
+               LEGION_WORKER_ADVERTISE_ADDR if this address is wrong.
+Host guard     active (nftables)
+```
+
+The UI node page shows the same line. A reply that names another node
+counts as unreachable: the advertised address is stale. The probe is
+informational and does not feed node readiness, because the node still runs
+work. It runs once per registration, from one manager; a worker that becomes
+unreachable later is reported when a call to it fails.
+
+Exec, logs, and restart fail the same way when a manager can't reach a
+worker:
+
+```console
+$ legion exec 412 -it -- sh
+error: exec failed: cannot reach node wkr-1 at https://10.0.1.7:4848 (connection timed out)
+hint: managers dial workers on port 4848; see `legion node info wkr-1`
+```
+
+In `--json` output and MCP tool errors this is the standard envelope with
+`code: "WORKER_UNREACHABLE"` and `retryable: true`.
+
 ### Allocation reconciliation model
 
 - Manager is source of truth for desired allocations (`allocation` table).

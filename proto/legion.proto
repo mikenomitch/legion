@@ -7816,6 +7816,30 @@ service Worker {
   // alone; a client certificate, if presented, is ignored, and the worker
   // holds no user credentials.
   rpc StartClaim (StartClaimRequest) returns (stream StartClaimReply);
+
+  // Answers a manager's reachability check (docs/architecture-managers-
+  // workers.md, "Reachability"). The manager that accepts a registration
+  // probes the worker's advertised address once its worker plane is up, and
+  // records the outcome on the node (`workerPlane` in its dynamic
+  // attributes, shown by `legion node info`). Informational only: it does
+  // not feed node readiness. Caller class: manager. Errors: Unauthenticated
+  // without a manager certificate.
+  rpc Probe (ProbeRequest) returns (ProbeReply);
+}
+
+// Request payload for Worker.Probe. Empty: the TLS handshake and the
+// manager-class check are the probe.
+message ProbeRequest {}
+
+// Reply payload for Worker.Probe.
+message ProbeReply {
+  // The node id this worker serves, so a manager that dialed a stale or
+  // reused address learns it reached a different node. A simulated fleet
+  // answers with its fleet name.
+  string node_id = 1;
+
+  // The worker's protocol version (`PROTOCOL_VERSION`, docs/upgrades.md).
+  uint64 protocol_version = 2;
 }
 
 // === EXEC / ACTIONS ===
