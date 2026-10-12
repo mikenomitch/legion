@@ -119,6 +119,7 @@ mod node_content_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
+pub(crate) use snapshot_rpcs::snapshot_restore_payload;
 pub use snapshot_rpcs::{
     checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
 };
@@ -4956,53 +4957,63 @@ impl Manager for ManagerDaemonService {
             .filter(|from| !from.is_empty())
             .map(|from| self.resolve_seed_snapshot(&identity, &inner.job_id, task, from, 1))
             .transpose()?;
-        let instance_id = match seed.as_ref() {
-            Some(seed) => {
-                let requested: Vec<String> = requested_id.map(str::to_string).into_iter().collect();
-                let mint = u32::from(requested.is_empty());
-                self.store
-                    .create_keyed_instances_from_snapshot(
-                        &inner.job_id,
-                        &task.group,
-                        &task.name,
-                        &requested,
-                        mint,
-                        &seed.snapshot_id,
-                    )
-                    .map_err(|e| map_store_error("Error creating instance", e))?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| Status::internal("create from snapshot created nothing"))?
-            }
-            None => {
-                self.store
-                    .create_keyed_instance(&inner.job_id, &task.group, &task.name, requested_id)
-                    .map_err(|e| map_store_error("Error creating instance", e))?
-                    .instance_id
-            }
-        };
-        let restoring_from = seed.map(|seed| seed.snapshot_id).unwrap_or_default();
-
-        // Place promptly: a reschedule plan adds exactly the missing keyed
-        // allocations without disturbing live ones.
-        self.store
-            .enqueue_eval(
-                "job_reschedule",
-                Some(&inner.job_id),
-                Some(&config.id()),
-                None,
-                Some(self.store.default_eval_priority),
-            )
-            .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
-
-        let recorded = if restoring_from.is_empty() {
-            instance_id.clone()
-        } else {
-            format!("{instance_id} {restoring_from}")
-        };
-        self.store
-            .idempotency_record(&idempotency_key, "create_instance", &recorded)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let restoring_from = seed
+            .as_ref()
+            .map(|seed| seed.snapshot_id.clone())
+            .unwrap_or_default();
+        // One scheduler-lane entry for the whole create: the row, the
+        // placement eval (a reschedule plan adds exactly the missing keyed
+        // allocations without disturbing live ones), and the idempotency
+        // record, group-committed with whatever other instance writes are
+        // in flight (sandbox-scaling plan, Phase 1). It used to be three
+        // entries, one of them on the control lane.
+        let job_id = inner.job_id.clone();
+        let group = task.group.clone();
+        let task_name = task.name.clone();
+        let requested = requested_id.map(str::to_string);
+        let config_id = config.id();
+        let priority = self.store.default_eval_priority;
+        let seed_snapshot = seed.map(|seed| seed.snapshot_id);
+        let key = idempotency_key.clone();
+        let instance_id = self
+            .store
+            .scheduler_group_commit("create_instance", move |s| {
+                let instance_id = match seed_snapshot.as_deref() {
+                    Some(snapshot_id) => {
+                        let requested: Vec<String> = requested.into_iter().collect();
+                        let mint = u32::from(requested.is_empty());
+                        s.create_keyed_instances_from_snapshot(
+                            &job_id,
+                            &group,
+                            &task_name,
+                            &requested,
+                            mint,
+                            snapshot_id,
+                        )?
+                        .into_iter()
+                        .next()
+                        .context("create from snapshot created nothing")?
+                    }
+                    None => {
+                        s.create_keyed_instance(&job_id, &group, &task_name, requested.as_deref())?
+                            .instance_id
+                    }
+                };
+                s.enqueue_eval(
+                    "job_reschedule",
+                    Some(&job_id),
+                    Some(&config_id),
+                    None,
+                    Some(priority),
+                )?;
+                let recorded = match seed_snapshot.as_deref() {
+                    Some(snapshot_id) => format!("{instance_id} {snapshot_id}"),
+                    None => instance_id.clone(),
+                };
+                s.idempotency_record(&key, "create_instance", &recorded)?;
+                Ok(instance_id)
+            })
+            .map_err(|e| map_store_error("Error creating instance", e))?;
 
         Ok(Response::new(CreateInstanceReply {
             instance_id,
@@ -5120,46 +5131,54 @@ impl Manager for ManagerDaemonService {
                 )
             })
             .transpose()?;
-        let created = match seed.as_ref() {
-            Some(seed) => self.store.create_keyed_instances_from_snapshot(
-                &inner.job_id,
-                &task.group,
-                &task.name,
-                &inner.instance_ids,
-                inner.count,
-                &seed.snapshot_id,
-            ),
-            None => self.store.create_keyed_instances(
-                &inner.job_id,
-                &task.group,
-                &task.name,
-                &inner.instance_ids,
-                inner.count,
-            ),
-        }
-        .map_err(|e| map_store_error("Error creating instances", e))?;
-        let restoring_from = seed.map(|seed| seed.snapshot_id).unwrap_or_default();
-
-        // One placement eval covers the whole batch: a reschedule plan adds
-        // exactly the missing keyed allocations without disturbing live ones.
-        self.store
-            .enqueue_eval(
-                "job_reschedule",
-                Some(&inner.job_id),
-                Some(&config.id()),
-                None,
-                Some(self.store.default_eval_priority),
-            )
-            .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
-
-        let recorded = if restoring_from.is_empty() {
-            created.join(",")
-        } else {
-            format!("{} {restoring_from}", created.join(","))
-        };
-        self.store
-            .idempotency_record(&idempotency_key, "create_instances", &recorded)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let restoring_from = seed
+            .as_ref()
+            .map(|seed| seed.snapshot_id.clone())
+            .unwrap_or_default();
+        // One scheduler-lane entry for the rows, the placement eval (one
+        // covers the whole batch: a reschedule plan adds exactly the missing
+        // keyed allocations without disturbing live ones), and the
+        // idempotency record, as in `create_instance`.
+        let job_id = inner.job_id.clone();
+        let group = task.group.clone();
+        let task_name = task.name.clone();
+        let requested = inner.instance_ids.clone();
+        let count = inner.count;
+        let config_id = config.id();
+        let priority = self.store.default_eval_priority;
+        let seed_snapshot = seed.map(|seed| seed.snapshot_id);
+        let key = idempotency_key.clone();
+        let created = self
+            .store
+            .scheduler_group_commit("create_instances", move |s| {
+                let created = match seed_snapshot.as_deref() {
+                    Some(snapshot_id) => s.create_keyed_instances_from_snapshot(
+                        &job_id,
+                        &group,
+                        &task_name,
+                        &requested,
+                        count,
+                        snapshot_id,
+                    )?,
+                    None => {
+                        s.create_keyed_instances(&job_id, &group, &task_name, &requested, count)?
+                    }
+                };
+                s.enqueue_eval(
+                    "job_reschedule",
+                    Some(&job_id),
+                    Some(&config_id),
+                    None,
+                    Some(priority),
+                )?;
+                let recorded = match seed_snapshot.as_deref() {
+                    Some(snapshot_id) => format!("{} {snapshot_id}", created.join(",")),
+                    None => created.join(","),
+                };
+                s.idempotency_record(&key, "create_instances", &recorded)?;
+                Ok(created)
+            })
+            .map_err(|e| map_store_error("Error creating instances", e))?;
 
         Ok(Response::new(CreateInstancesReply {
             instance_ids: created,
@@ -5225,37 +5244,29 @@ impl Manager for ManagerDaemonService {
             )));
         }
 
-        let outcome = self
+        // One scheduler-lane entry: the stop and its idempotency record.
+        // No eval follows. The stop already removed the allocation rows
+        // (workers stop on their next heartbeat), so there is nothing to
+        // place, and work waiting for the room it frees is woken by the
+        // blocked-eval index, not by a reschedule pass over this job
+        // (sandbox-scaling plan, Phases 1 and 3).
+        let instance_id = inner.instance_id.clone();
+        let key = idempotency_key.clone();
+        let message = self
             .store
-            .stop_keyed_instance(&inner.instance_id)
+            .scheduler_group_commit("stop_instance", move |s| {
+                let message = match s.stop_keyed_instance(&instance_id)? {
+                    StopInstanceOutcome::Stopped { .. } => {
+                        format!("Stopped instance {instance_id}")
+                    }
+                    StopInstanceOutcome::AlreadyStopped => {
+                        format!("Instance {instance_id} already stopped")
+                    }
+                };
+                s.idempotency_record(&key, "stop_instance", &message)?;
+                Ok(message)
+            })
             .map_err(|e| map_store_error("Error stopping instance", e))?;
-
-        let message = match outcome {
-            StopInstanceOutcome::Stopped { .. } => {
-                // Reconcile promptly. The stop itself already removed the
-                // allocation rows (workers stop on their next heartbeat); the
-                // eval just confirms nothing else needs (re)placement.
-                if let Ok(config) = self.store.get_job_config(&instance.job_id) {
-                    self.store
-                        .enqueue_eval(
-                            "job_reschedule",
-                            Some(&instance.job_id),
-                            Some(&config.id()),
-                            None,
-                            Some(self.store.default_eval_priority),
-                        )
-                        .map_err(|e| map_store_error("Error scheduling reconcile", e))?;
-                }
-                format!("Stopped instance {}", inner.instance_id)
-            }
-            StopInstanceOutcome::AlreadyStopped => {
-                format!("Instance {} already stopped", inner.instance_id)
-            }
-        };
-
-        self.store
-            .idempotency_record(&idempotency_key, "stop_instance", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
 
         Ok(Response::new(StopInstanceReply {
             message,
@@ -5339,48 +5350,43 @@ impl Manager for ManagerDaemonService {
 
         // A suspended instance resumes from its checkpoint (or boots cold).
         if instance.state == InstanceState::Suspended {
-            let recorded = self.resume_instance(&instance, inner.cold)?;
-            self.store
-                .idempotency_record(
-                    &idempotency_key,
-                    "start_instance",
-                    &serde_json::to_string(&recorded).unwrap_or_default(),
-                )
-                .map_err(|e| map_store_error("Error recording idempotency", e))?;
+            let recorded = self.resume_instance(&instance, inner.cold, &idempotency_key)?;
             return Ok(Response::new(recorded.into_reply(false)));
         }
 
-        let outcome = self
+        // One scheduler-lane entry: the start, its placement eval (placed
+        // promptly, exactly like CreateInstance), and the idempotency record.
+        let config_id = self
             .store
-            .start_keyed_instance(&inner.instance_id)
+            .get_job_config(&instance.job_id)
+            .map_err(|e| map_store_error("Error loading job config", e))?
+            .id();
+        let instance_id = inner.instance_id.clone();
+        let job_id = instance.job_id.clone();
+        let priority = self.store.default_eval_priority;
+        let key = idempotency_key.clone();
+        let message = self
+            .store
+            .scheduler_group_commit("start_instance", move |s| {
+                let message = match s.start_keyed_instance(&instance_id)? {
+                    StartInstanceOutcome::Started => {
+                        s.enqueue_eval(
+                            "job_reschedule",
+                            Some(&job_id),
+                            Some(&config_id),
+                            None,
+                            Some(priority),
+                        )?;
+                        format!("Started instance {instance_id}")
+                    }
+                    StartInstanceOutcome::AlreadyRunning => {
+                        format!("Instance {instance_id} already running")
+                    }
+                };
+                s.idempotency_record(&key, "start_instance", &message)?;
+                Ok(message)
+            })
             .map_err(|e| map_store_error("Error starting instance", e))?;
-
-        let message = match outcome {
-            StartInstanceOutcome::Started => {
-                // Place promptly, exactly like CreateInstance does.
-                let config = self
-                    .store
-                    .get_job_config(&instance.job_id)
-                    .map_err(|e| map_store_error("Error loading job config", e))?;
-                self.store
-                    .enqueue_eval(
-                        "job_reschedule",
-                        Some(&instance.job_id),
-                        Some(&config.id()),
-                        None,
-                        Some(self.store.default_eval_priority),
-                    )
-                    .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
-                format!("Started instance {}", inner.instance_id)
-            }
-            StartInstanceOutcome::AlreadyRunning => {
-                format!("Instance {} already running", inner.instance_id)
-            }
-        };
-
-        self.store
-            .idempotency_record(&idempotency_key, "start_instance", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
 
         Ok(Response::new(StartInstanceReply {
             message,
@@ -5436,37 +5442,27 @@ impl Manager for ManagerDaemonService {
             &AclScope::job(&instance.job_id),
         )?;
 
-        let outcome = self
+        // One scheduler-lane entry: the destroy and its idempotency record.
+        // No eval follows, for the reason `stop_instance` gives: the destroy
+        // already removed the allocation rows, and waiting work wakes from
+        // the blocked-eval index (sandbox-scaling plan, Phases 1 and 3).
+        let instance_id = inner.instance_id.clone();
+        let key = idempotency_key.clone();
+        let message = self
             .store
-            .destroy_keyed_instance(&inner.instance_id)
+            .scheduler_group_commit("destroy_instance", move |s| {
+                let message = match s.destroy_keyed_instance(&instance_id)? {
+                    DestroyInstanceOutcome::Destroyed { .. } => {
+                        format!("Destroyed instance {instance_id}")
+                    }
+                    DestroyInstanceOutcome::AlreadyTerminated => {
+                        format!("Instance {instance_id} already terminated")
+                    }
+                };
+                s.idempotency_record(&key, "destroy_instance", &message)?;
+                Ok(message)
+            })
             .map_err(|e| map_store_error("Error destroying instance", e))?;
-
-        let message = match outcome {
-            DestroyInstanceOutcome::Destroyed { .. } => {
-                // Reconcile promptly. The destroy itself already removed the
-                // allocation rows (workers stop on their next heartbeat); the
-                // eval just confirms nothing else needs (re)placement.
-                if let Ok(config) = self.store.get_job_config(&instance.job_id) {
-                    self.store
-                        .enqueue_eval(
-                            "job_reschedule",
-                            Some(&instance.job_id),
-                            Some(&config.id()),
-                            None,
-                            Some(self.store.default_eval_priority),
-                        )
-                        .map_err(|e| map_store_error("Error scheduling reconcile", e))?;
-                }
-                format!("Destroyed instance {}", inner.instance_id)
-            }
-            DestroyInstanceOutcome::AlreadyTerminated => {
-                format!("Instance {} already terminated", inner.instance_id)
-            }
-        };
-
-        self.store
-            .idempotency_record(&idempotency_key, "destroy_instance", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
 
         Ok(Response::new(DestroyInstanceReply {
             message,
@@ -9416,7 +9412,9 @@ impl Manager for ManagerDaemonService {
             }))
         };
 
-        // An edge-originated claim carries the ticket that authorized it.
+        // An edge-originated claim carries the ticket that authorized it,
+        // spent inside the ratification's own entry.
+        let mut spend = None;
         if !req.ticket.trim().is_empty() {
             if !self.edge_boot.enabled {
                 return refuse(
@@ -9434,19 +9432,24 @@ impl Manager for ManagerDaemonService {
                 .store
                 .get_node(&req.node_id)
                 .map_err(|e| map_store_error("Error loading node", e))?;
-            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-            if let Err(err) = crate::manager::edge_boot::verify_and_spend(
-                &self.store,
+            match crate::manager::edge_boot::verify_ticket(
                 state,
                 &req.ticket,
                 &req.instance_id,
                 &node.pool,
-                now_unix,
             ) {
-                return refuse(
-                    crate::structs::edge_boot::RefusalReason::TicketInvalid,
-                    format!("{err:#}"),
-                );
+                Ok(claims) => {
+                    spend = Some(crate::manager::edge_boot::TicketSpend {
+                        jti: claims.jti,
+                        now_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+                    });
+                }
+                Err(err) => {
+                    return refuse(
+                        crate::structs::edge_boot::RefusalReason::TicketInvalid,
+                        format!("{err:#}"),
+                    );
+                }
             }
         }
 
@@ -9459,7 +9462,7 @@ impl Manager for ManagerDaemonService {
             instance_id: &req.instance_id,
             gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
         };
-        let verdict = crate::manager::edge_boot::ratify(&self.store, &claim)
+        let verdict = crate::manager::edge_boot::ratify(&self.store, &claim, spend, started)
             .map_err(|e| Status::internal(format!("ratification failed: {e:#}")))?;
 
         let job_id = self
@@ -9469,20 +9472,12 @@ impl Manager for ManagerDaemonService {
             .unwrap_or_default();
         match verdict {
             crate::manager::edge_boot::Verdict::Confirmed { allocation_id } => {
-                let latency_ms = started.elapsed().as_millis() as u64;
                 tracing::Span::current().record("verdict", "confirmed");
                 crate::manager::telemetry::worker_metrics()
                     .provisional_ratify_seconds
                     .observe(started.elapsed().as_secs_f64());
-                self.store.events().provisional_ratified(
-                    &req.claim_id,
-                    allocation_id,
-                    &req.node_id,
-                    &job_id,
-                    &req.instance_id,
-                    crate::structs::edge_boot::Gate::from_wire(req.gate).as_str(),
-                    latency_ms,
-                );
+                // `alloc.ratified` was recorded inside the ratification's
+                // own entry.
                 // The committed payload rides back with the verdict: the
                 // node booted from one that could not name assigned ports,
                 // the bound instance, or resolved mounts, and must replace it
@@ -10356,7 +10351,7 @@ fn build_desired_allocations(
         return Ok(Vec::new());
     }
 
-    let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
+    let mut task_cache = DesiredTaskCache::default();
     let mut allocations = Vec::new();
 
     for allocation in desired {
@@ -10368,44 +10363,60 @@ fn build_desired_allocations(
         if !crate::constants::allocation_status_is_dispatchable(&allocation.status) {
             continue;
         }
-        let tasks = task_cache
-            .entry(allocation.job_config_id.clone())
-            .or_default();
-        if tasks.is_empty() {
-            // The cached accessor, deliberately: this runs once per
-            // distinct job config per node per heartbeat, so on a 5,000-node
-            // fleet at a 2s cadence it was ~10k read-connection acquisitions
-            // per second for rows the read model already holds. Task configs
-            // are immutable per `job_config_id` — a change mints a new
-            // config id — which is why the scheduler already reads them this
-            // way and why the cache needs no invalidation.
-            let task_configs =
-                store.cached_task_configs_for_job_config(&allocation.job_config_id)?;
-            for (id, config) in task_configs {
-                tasks.insert(id, config);
-            }
-        }
-        let task = tasks
-            .get(&allocation.task_config_id)
-            .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
-        let instance = match allocation.instance_id.as_deref() {
-            Some(instance_id) => store.get_instance(instance_id)?,
-            None => None,
-        };
-        let volumes =
-            store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
-        let mut payload = build_task_allocation(task, &allocation, instance.as_ref(), &volumes)?;
-        // The band orders the worker's memory pressure response. Read from
-        // the read model, so steady-state heartbeats pay no store read.
-        payload.priority_band = store
-            .cached_band_for_job_config(&allocation.job_config_id)?
-            .as_str()
-            .to_string();
-        payload.restore = snapshot_rpcs::snapshot_restore_payload(store, instance.as_ref());
-        allocations.push(payload);
+        allocations.push(desired_payload(store, &allocation, &mut task_cache)?);
     }
 
     Ok(allocations)
+}
+
+/// Task configs by job config, for building many payloads.
+#[derive(Default)]
+pub(crate) struct DesiredTaskCache(HashMap<String, HashMap<i64, TaskConfig>>);
+
+/// The payload a worker runs one allocation from: the same
+/// `TaskAllocation` whichever path delivers it — the heartbeat's desired
+/// set, a `StreamWork` message, or the `PostWork` push — so a worker that
+/// launches from whichever copy reaches it first launches the same thing.
+pub(crate) fn desired_payload(
+    store: &Store,
+    allocation: &crate::structs::Allocation,
+    task_cache: &mut DesiredTaskCache,
+) -> R<crate::structs::TaskAllocation> {
+    let tasks = task_cache
+        .0
+        .entry(allocation.job_config_id.clone())
+        .or_default();
+    if tasks.is_empty() {
+        // The cached accessor, deliberately: this runs once per distinct job
+        // config per node per heartbeat, so on a 5,000-node fleet at a 2s
+        // cadence it was ~10k read-connection acquisitions per second for
+        // rows the read model already holds. Task configs are immutable per
+        // `job_config_id` — a change mints a new config id — which is why the
+        // scheduler already reads them this way and why the cache needs no
+        // invalidation.
+        let task_configs = store.cached_task_configs_for_job_config(&allocation.job_config_id)?;
+        for (id, config) in task_configs {
+            tasks.insert(id, config);
+        }
+    }
+    let task = tasks
+        .get(&allocation.task_config_id)
+        .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
+    let instance = match allocation.instance_id.as_deref() {
+        Some(instance_id) => store.get_instance(instance_id)?,
+        None => None,
+    };
+    let volumes =
+        store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
+    let mut payload = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+    // The band orders the worker's memory pressure response. Read from the
+    // read model, so building a payload pays no store read for it.
+    payload.priority_band = store
+        .cached_band_for_job_config(&allocation.job_config_id)?
+        .as_str()
+        .to_string();
+    payload.restore = snapshot_rpcs::snapshot_restore_payload(store, instance.as_ref());
+    Ok(payload)
 }
 
 /// Resolve the current endpoint set for every upstream declared by this node's

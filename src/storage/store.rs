@@ -18,7 +18,9 @@ use crate::storage::migrations::get_migrations;
 mod keyring_ops;
 mod read_model_check;
 // Phase 6: fork, create-from-snapshot, and snapshot names.
+mod eval_claims;
 mod fork_ops;
+mod group_commit;
 mod snapshot_ops;
 mod suspend_ops;
 use crate::storage::persistence::{
@@ -140,6 +142,10 @@ pub enum EvalCompletion {
         delay: Duration,
         event: Option<EventDraft>,
     },
+    /// Already written: the plan that finished the eval deleted its row
+    /// and recorded `eval.completed` in its own entry
+    /// ([`with_eval_settle_scope`]). Nothing left to write.
+    Settled,
 }
 
 /// How many evals one worker may take through the loop together
@@ -882,6 +888,98 @@ struct PlanApplyRequest {
     /// Bind exactly this keyed instance (docs/edge-boot.md). Empty for every
     /// ordinary plan, which keeps the "any unbound instance" binding.
     target_instance: String,
+    /// The eval this plan finishes, when its handler declared the plan its
+    /// last write (see [`arm_eval_settle`]). An applied plan deletes the
+    /// eval row and records `eval.completed` in its own transaction, so the
+    /// eval costs no separate settle entry. `None` for every other plan.
+    settle: Option<FusedEvalSettle>,
+}
+
+/// An eval completion carried by the plan that finishes it.
+#[derive(Debug, Clone)]
+pub(crate) struct FusedEvalSettle {
+    eval_id: String,
+    /// The pending duplicates the eval's claim subsumed, deleted with it.
+    subsumed: Vec<String>,
+    event: EventDraft,
+}
+
+/// The eval a worker thread is handling right now, so the plan its handler
+/// applies can settle it (sandbox-scaling plan, Phase 1).
+struct EvalSettleScope {
+    eval: Eval,
+    started: Instant,
+    armed: bool,
+    settled: bool,
+}
+
+thread_local! {
+    static EVAL_SETTLE_SCOPE: std::cell::RefCell<Option<EvalSettleScope>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `handle` as the handler of `eval`. Returns its result and whether a
+/// plan it applied already settled the eval (deleted its row and recorded
+/// `eval.completed`), in which case the caller must write no completion.
+///
+/// An eval settles with its plan only when the handler asks, through
+/// [`arm_eval_settle`], because only the handler knows the plan is its last
+/// write: a write after a settled plan would be lost if the manager died
+/// between the two, since nothing would re-run the eval.
+pub fn with_eval_settle_scope<T>(eval: &Eval, handle: impl FnOnce() -> T) -> (T, bool) {
+    EVAL_SETTLE_SCOPE.with(|scope| {
+        *scope.borrow_mut() = Some(EvalSettleScope {
+            eval: eval.clone(),
+            started: Instant::now(),
+            armed: false,
+            settled: false,
+        });
+    });
+    let result = handle();
+    let settled = EVAL_SETTLE_SCOPE
+        .with(|scope| scope.borrow_mut().take().is_some_and(|scope| scope.settled));
+    (result, settled)
+}
+
+/// Declare that the next plan this eval handler applies is its last write,
+/// so an applied plan may settle the eval in the same entry. A no-op
+/// outside [`with_eval_settle_scope`].
+pub fn arm_eval_settle() {
+    EVAL_SETTLE_SCOPE.with(|scope| {
+        if let Some(scope) = scope.borrow_mut().as_mut() {
+            scope.armed = true;
+        }
+    });
+}
+
+/// The settle the current handler's next plan should carry, if it armed one
+/// and nothing has settled the eval yet.
+fn armed_eval_settle() -> Option<FusedEvalSettle> {
+    EVAL_SETTLE_SCOPE.with(|scope| {
+        let scope = scope.borrow();
+        let scope = scope.as_ref()?;
+        if !scope.armed || scope.settled {
+            return None;
+        }
+        Some(FusedEvalSettle {
+            eval_id: scope.eval.id.clone(),
+            subsumed: Vec::new(),
+            event: crate::storage::events::drafts::eval_completed(
+                &scope.eval,
+                "settled with its plan",
+                scope.started.elapsed(),
+            ),
+        })
+    })
+}
+
+/// Record that the current handler's eval is settled.
+fn mark_eval_settled() {
+    EVAL_SETTLE_SCOPE.with(|scope| {
+        if let Some(scope) = scope.borrow_mut().as_mut() {
+            scope.settled = true;
+        }
+    });
 }
 
 /// One allocation a plan will evict, as it rides the `plan_submission` row.
@@ -1143,6 +1241,19 @@ pub struct Store {
     task_status_seed_coalescer: Arc<crate::storage::coalesce::Coalescer<String, ()>>,
     job_submit_coalescer:
         Arc<crate::storage::coalesce::Coalescer<JobSubmitRequest, JobSubmitOutcome>>,
+    // Eval claims as leader memory (sandbox-scaling plan, Phase 1): which
+    // evals this manager's eval workers hold. A claim writes nothing; see
+    // `store/eval_claims.rs`.
+    eval_claims: Arc<std::sync::Mutex<eval_claims::EvalClaims>>,
+    // Scheduler-lane group commit for instance-lifecycle writes and
+    // snapshot reports (sandbox-scaling plan, Phase 1): concurrent creates,
+    // suspends, resumes, destroys, and report batches share one entry.
+    group_commit_coalescer: Arc<
+        crate::storage::coalesce::Coalescer<
+            group_commit::GroupCommitRequest,
+            group_commit::GroupCommitResult,
+        >,
+    >,
     // Node liveness as leader-local soft state (liveness plan §6.2). A
     // steady-state heartbeat is one write into this table: no raft commit,
     // no fsync, no pipeline-thread hop. Shared across clones so the gRPC
@@ -1759,6 +1870,11 @@ impl Store {
             task_status_seed_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
                 "task_status_seed",
                 TASK_STATUS_SEED_BATCH_MAX,
+            )),
+            eval_claims: Arc::new(std::sync::Mutex::new(eval_claims::EvalClaims::default())),
+            group_commit_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                "instance_group_commit",
+                group_commit::GROUP_COMMIT_BATCH_MAX,
             )),
             liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
             content_locations: Arc::new(crate::storage::content_index::ContentLocationIndex::new()),
@@ -4594,6 +4710,7 @@ impl Store {
             expected_versions: expected_versions.clone(),
             evictions: evictions.to_vec(),
             target_instance: target_instance.to_owned(),
+            settle: None,
         };
         self.submit_and_apply_plan_coalesced(request)
     }
@@ -4703,7 +4820,15 @@ impl Store {
             &request.evictions,
             &request.target_instance,
         )?;
-        let (outcome, effects) = self.apply_plan_submission_on(tx, &submission)?;
+        let (outcome, mut effects) = self.apply_plan_submission_on(tx, &submission)?;
+        if let (Some(settle), PlanApplyOutcome::Applied(_)) = (&request.settle, &outcome) {
+            tx.prepare_cached("DELETE FROM eval WHERE id = ?;")?
+                .execute([settle.eval_id.as_str()])?;
+            Self::delete_subsumed_evals_tx(tx, &settle.subsumed)?;
+            if let Some(staged) = self.stage_event_locked(tx, settle.event.clone()) {
+                effects.events.push(staged);
+            }
+        }
         Ok(((submission, outcome), effects))
     }
 
@@ -4857,6 +4982,7 @@ impl Store {
             // Candidate lists are the scheduler's shape; ratification names
             // its keyed instance through the single-node entry point.
             target_instance: String::new(),
+            settle: None,
         };
         self.submit_and_apply_plan_coalesced(request)
     }
@@ -4864,13 +4990,34 @@ impl Store {
     /// Submit one plan through the group commit (or straight to the
     /// single-plan op when coalescing is off), then run whatever
     /// post-apply bookkeeping the batch leader did not already do for it.
-    fn submit_and_apply_plan_coalesced(&self, request: PlanApplyRequest) -> R<PlanApplyReply> {
+    fn submit_and_apply_plan_coalesced(&self, mut request: PlanApplyRequest) -> R<PlanApplyReply> {
+        request.settle = armed_eval_settle().map(|mut settle| {
+            settle.subsumed = self.subsumed_by_claim(&settle.eval_id);
+            settle
+        });
+        let settles = request.settle.is_some();
+        if capture::in_mutation_body() {
+            // Nested inside another op's body (a ratification's entry). The
+            // coalescer is off-limits: its batch leader may be another
+            // thread waiting on the very pipeline this one is running. So is
+            // the bookkeeping: its status-lane projection cannot ride a
+            // scheduler-lane entry, and the outer op's caller runs
+            // `plan_apply_bookkeeping` once its entry commits.
+            let reply = self.submit_and_apply_plan_replicated(request)?;
+            if settles && matches!(reply.1, PlanApplyOutcome::Applied(_)) {
+                mark_eval_settled();
+            }
+            return Ok(reply);
+        }
         let slot = if self.plan_apply_coalescing_enabled() {
             let coalescer = Arc::clone(&self.plan_coalescer);
             coalescer.submit(request, |batch| self.run_plan_apply_batch(batch))?
         } else {
             PlanApplySlot::unbooked(self.submit_and_apply_plan_replicated(request)?)
         };
+        if settles && matches!(slot.reply.1, PlanApplyOutcome::Applied(_)) {
+            mark_eval_settled();
+        }
         if !slot.bookkeeping_done {
             self.plan_apply_bookkeeping(&slot.reply.1)?;
         }
@@ -4889,7 +5036,7 @@ impl Store {
     /// Post-apply bookkeeping shared by `apply_plan_submission` and
     /// `submit_and_apply_plan`: epoch-mirror self-heal on rejection,
     /// status-lane task_status projection on success.
-    fn plan_apply_bookkeeping(&self, outcome: &PlanApplyOutcome) -> R<()> {
+    pub(crate) fn plan_apply_bookkeeping(&self, outcome: &PlanApplyOutcome) -> R<()> {
         let mut rejected_nodes = BTreeSet::new();
         let mut rejected_job_configs = BTreeSet::new();
         let mut placed: &[Allocation] = &[];
@@ -11742,8 +11889,15 @@ impl Store {
         }
 
         let now = Self::now_rfc3339()?;
+        // Only a status that changes is written. Every plan apply projects
+        // the statuses of the tasks it placed, and the second placement of
+        // a task that is already running used to rewrite the row anyway for
+        // a fresh `updated_at`: one status-lane entry per placement that
+        // changed nothing (sandbox-scaling plan, Phase 1). `updated_at` is
+        // now when the status last changed.
         let mut update_stmt = tx.prepare(
-            "UPDATE task_status SET status = ?1, updated_at = ?2 WHERE task_config_id = ?3;",
+            "UPDATE task_status SET status = ?1, updated_at = ?2 \
+             WHERE task_config_id = ?3 AND status IS NOT ?1;",
         )?;
         for (task_config_id, status) in updates {
             update_stmt.execute(params![status.as_str(), now, task_config_id])?;
@@ -13230,9 +13384,19 @@ impl Store {
         node_id: &str,
         snapshots: &[AllocationHealth],
     ) -> R<()> {
-        if snapshots.is_empty() {
+        // A worker re-reports every allocation's health on every beat, and
+        // almost all of it is unchanged. Each report used to be a status-lane
+        // entry rewriting every row with a fresh `updated_at`, so a node
+        // running 10,000 sandboxes made a 10,000-row changeset per beat
+        // (sandbox-scaling plan §5.1). Only what changed is written now, the
+        // same rule node health checks follow, and a steady beat writes
+        // nothing. `updated_at` therefore records the last change, not the
+        // last report. Comparing first costs one read-connection query.
+        let changed = self.changed_allocation_health(node_id, snapshots)?;
+        if changed.is_empty() {
             return Ok(());
         }
+        let snapshots = changed.as_slice();
         match self.upsert_allocation_health_snapshots_local(node_id, snapshots) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
@@ -13244,6 +13408,35 @@ impl Store {
             ),
             other => other,
         }
+    }
+
+    /// The snapshots that differ from what `allocation_health` holds for
+    /// this node: a missing row, or a different health, status, or artifact
+    /// state. Rows for allocations that are not this node's still count as
+    /// changed, so the apply's own guard decides what to drop.
+    fn changed_allocation_health(
+        &self,
+        node_id: &str,
+        snapshots: &[AllocationHealth],
+    ) -> R<Vec<AllocationHealth>> {
+        if snapshots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = snapshots.iter().map(|s| s.allocation_id).collect();
+        let current = self.allocation_health_for_allocations(&ids)?;
+        Ok(snapshots
+            .iter()
+            .filter(|snapshot| match current.get(&snapshot.allocation_id) {
+                Some(stored) => {
+                    stored.node_id != node_id
+                        || stored.healthy != snapshot.healthy
+                        || stored.status != snapshot.status
+                        || stored.artifact_states != snapshot.artifact_states
+                }
+                None => true,
+            })
+            .cloned()
+            .collect())
     }
 
     pub(crate) fn upsert_allocation_health_snapshots_local(
@@ -13306,7 +13499,11 @@ impl Store {
                     healthy = excluded.healthy,
                     status = excluded.status,
                     updated_at = excluded.updated_at,
-                    artifact_states = excluded.artifact_states;",
+                    artifact_states = excluded.artifact_states
+                WHERE allocation_health.node_id IS NOT excluded.node_id
+                   OR allocation_health.healthy IS NOT excluded.healthy
+                   OR allocation_health.status IS NOT excluded.status
+                   OR allocation_health.artifact_states IS NOT excluded.artifact_states;",
                 params![
                     snapshot.allocation_id,
                     node_id,
@@ -14548,11 +14745,15 @@ impl Store {
     /// `count.per` task (one more node may want one more replica) or a
     /// service task with fewer allocations than its effective count.
     ///
-    /// The count check is deliberately loose: keyed and staged-slot tasks
-    /// can read short when they are not, and that only costs a no-op
-    /// reschedule plan. Batch tasks are skipped: one that ran to
-    /// completion must not run again, and its allocation count cannot tell
-    /// finished from never placed. Jobs with a queued
+    /// The count check is deliberately loose: staged-slot tasks can read
+    /// short when they are not, and that only costs a no-op reschedule
+    /// plan. Keyed tasks are judged by their instances, not their `count`:
+    /// a keyed task's stored `count` is always 1, so comparing allocations
+    /// against it read a task with one placed instance as satisfied and
+    /// left its other pending instances waiting for a resubmit or a leader
+    /// change (sandbox-scaling plan, Phase 0). Batch tasks are skipped: one
+    /// that ran to completion must not run again, and its allocation count
+    /// cannot tell finished from never placed. Jobs with a queued
     /// eval are skipped too, which is what keeps a burst of registrations
     /// from piling up reschedules: whatever is queued runs against the new
     /// capacity anyway.
@@ -14569,6 +14770,14 @@ impl Store {
                   tc.lifecycle != 'batch'
                   AND (SELECT COUNT(*) FROM allocation a WHERE a.task_config_id = tc.id)
                       < COALESCE(ts.count, tc.count)
+                )
+                OR EXISTS (
+                  SELECT 1 FROM instance i
+                  WHERE i.job_id = tc.job_id AND i.group_name = tc.group_name
+                    AND i.task_name = tc.name AND i.mode = 'keyed'
+                    AND i.current_alloc_id IS NULL
+                    AND i.state NOT IN ('terminated', 'stopped', 'suspended')
+                    AND COALESCE(i.pending_op, '') != 'fork'
                 )
               )
         )";
@@ -15920,11 +16129,13 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn set_eval_status(&self, id: &str, status: &str) -> R<()> {
-        let id = id.to_owned();
+        let eval_id = id.to_owned();
         let status = status.to_owned();
         self.replicated(Lane::Scheduler, "set_eval_status", move |s| {
-            s.set_eval_status_apply(&id, &status)
-        })
+            s.set_eval_status_apply(&eval_id, &status)
+        })?;
+        self.release_eval_claims([id]);
+        Ok(())
     }
 
     fn set_eval_status_apply(&self, id: &str, status: &str) -> R<()> {
@@ -15940,7 +16151,15 @@ impl Store {
         let mut stmt = conn.prepare(&GET_EVALS)?;
         let rows = stmt.query_map([], |row| self.eval_from_row(row))?;
 
-        Self::collect_rows(rows)
+        // A claim is leader memory, so a claimed eval's row still reads
+        // `pending`: show the work in progress as such.
+        let mut evals = Self::collect_rows(rows)?;
+        for eval in &mut evals {
+            if eval.status == "pending" && self.eval_is_claimed(&eval.id) {
+                eval.status = "in_flight".to_string();
+            }
+        }
+        Ok(evals)
     }
 
     // #[instrument(err, skip_all)]
@@ -15956,165 +16175,89 @@ impl Store {
         }
     }
 
-    #[instrument(err, skip_all)]
-    pub fn claim_eval(&self) -> R<Option<Eval>> {
-        self.replicated(Lane::Scheduler, "claim_eval", move |s| s.claim_eval_apply())
-    }
-
-    /// Claim a whole batch of evals in ONE scheduler-lane op.
-    ///
-    /// The claim round is a FIXED cost per round, not per eval, so taking N
-    /// evals through it together divides it by N. The AWS phase-3/4 data is
-    /// what makes this worth doing: at 5,000 nodes `web_fleet` (6
-    /// allocations per eval) sustained 219 alloc/s while `dense_fleet` (44
-    /// per eval) sustained 736 — 7x the work per eval bought 3.4x the
-    /// throughput on the same cluster and the same thread count, which is
-    /// the signature of a per-eval cost dominating.
-    ///
-    /// Batch size is a fair share of what is *actually* queued
-    /// ([`EvalBatchLimits`]) and the loop never waits for the batch to
-    /// fill, so an idle cluster still claims exactly one eval and pays
-    /// exactly what it pays today.
-    ///
-    /// Ordering is preserved ACROSS the batch: each pass reuses
-    /// `claim_eval_apply`, which takes the head of `priority DESC, id ASC`,
-    /// so a lower-priority eval is only ever reached after every
-    /// higher-priority one — batching changes how many rounds the queue
-    /// costs, not which eval runs next.
-    #[instrument(err, skip_all)]
-    pub fn claim_evals(&self, limits: EvalBatchLimits) -> R<Vec<Eval>> {
-        self.replicated(Lane::Scheduler, "claim_evals", move |s| {
-            s.claim_evals_apply(limits)
-        })
-    }
-
-    fn claim_evals_apply(&self, limits: EvalBatchLimits) -> R<Vec<Eval>> {
-        let take = {
-            // The WRITE connection, not a read one: inside a capture the
-            // completions this op already applied live in an uncommitted
-            // savepoint that only this connection can see, so a read
-            // connection would size the batch off the previous round's
-            // queue depth.
-            let conn = self.write_connection()?;
-            limits.share_of(Self::pending_eval_count_tx(&conn)?)
-        };
-
-        let mut claimed = Vec::with_capacity(take);
-        for _ in 0..take {
-            // Reused verbatim so a batched claim can never drift from a
-            // single one: same ordering, same superseded-eval sweep, same
-            // queue-depth gauge.
-            match self.claim_eval_apply()? {
-                Some(eval) => claimed.push(eval),
-                // Dry queue. Return what we have instead of waiting for
-                // the batch to fill — this cluster is idle far more often
-                // than it is saturated, and lingering would trade idle
-                // latency for throughput that is not being asked for.
-                None => break,
-            }
-        }
-
-        if claimed.len() > 1 {
-            debug!(
-                claimed = claimed.len(),
-                requested = take,
-                "Claimed a batch of evals in one scheduler-lane op"
-            );
-        }
-        Ok(claimed)
-    }
-
-    /// Settle a whole batch of handled evals AND claim the next batch, in
-    /// ONE scheduler-lane op — the batched form of
-    /// [`Self::complete_and_claim_next`].
+    /// Settle a whole batch of handled evals AND claim the next batch.
     ///
     /// `completions` holds an entry for exactly the evals whose outcome the
     /// caller **observed**. An eval the caller claimed but whose handler
     /// panicked, was cancelled, or was never reached (leadership moved
-    /// mid-batch) must simply be OMITTED: its row stays `in_flight` and
-    /// `requeue_in_flight_evals` recovers it, which is the same contract
-    /// the single-eval loop has always had. Omission is the only safe
-    /// answer for an unknown outcome — a failed eval is never retried, so
-    /// inventing a failure is how acknowledged work vanishes.
+    /// mid-batch) must simply be OMITTED: it stays claimed until the worker
+    /// releases it or the claims are cleared, and its row stays `pending`
+    /// for whichever leader runs it next. Omission is the only safe answer
+    /// for an unknown outcome — a failed eval is never retried, so inventing
+    /// a failure is how acknowledged work vanishes.
     ///
-    /// The op is all-or-nothing by construction (`replicated`
-    /// short-circuits inside a capture, so every write lands in one
-    /// changeset). That is deliberate for the *terminal writes*: if the op
-    /// is rejected — a lost leadership, a write error — nothing is written
-    /// and every member of the batch stays `in_flight` for recovery. No
-    /// eval can be half-completed, and none can be completed twice. It is
-    /// NOT plan-apply: the per-plan savepoint isolation that lets one
-    /// rejected plan spare its neighbours lives in `submit_and_apply_plans`
-    /// and is untouched here, because each eval still applies its own plan
-    /// in its own op.
+    /// The terminal writes are ONE scheduler-lane op, all-or-nothing: if it
+    /// is rejected — a lost leadership, a write error — nothing is written,
+    /// every member stays claimed, and the caller retries or releases them.
+    /// Completions already written by the plan that finished them
+    /// ([`EvalCompletion::Settled`]) write nothing, so a batch of settled
+    /// evals costs no entry at all. The next claim is leader memory
+    /// ([`Self::claim_evals`]) and writes nothing either.
     #[instrument(err, skip_all)]
     pub fn complete_evals_and_claim_next(
         &self,
         completions: Vec<(String, EvalCompletion)>,
         limits: EvalBatchLimits,
     ) -> R<Vec<Eval>> {
-        self.replicated(Lane::Scheduler, "complete_evals_and_claim_next", move |s| {
-            for (eval_id, completion) in completions {
-                s.apply_eval_completion(&eval_id, completion)?;
-            }
-            s.claim_evals_apply(limits)
-        })
+        self.write_eval_completions(completions)?;
+        self.claim_evals(limits)
     }
 
-    /// Finish the eval a worker just handled AND claim its next one, in a
-    /// single scheduler-lane op.
-    ///
-    /// The eval worker loop uses the batched
-    /// [`Self::complete_evals_and_claim_next`] instead; this single-eval
-    /// form is the one-at-a-time semantics the batch must preserve, and is
-    /// what the one-shot callers (and the tests that pin those semantics)
-    /// use.
-    ///
-    /// Every eval used to cost two quorum rounds on this lane that had
-    /// nothing to do with the work itself: one to claim it and one to
-    /// finish it. They bracket a loop in which the same worker immediately
-    /// claims again, so the pair is pure queue overhead — and the AWS
-    /// phase-3 campaign put the scheduler lane, not the planner, at the
-    /// throughput ceiling (each eval spent ~86% of its wall time outside
-    /// the measured plan phases). Fusing them halves the lane's
-    /// per-eval round count.
-    ///
-    /// This is sound for the same reason the pieces are: `replicated`
-    /// short-circuits when it is already inside a capture
-    /// ([`Self::replicated`]), so the two writes land in one changeset and
-    /// commit or roll back together. A worker that dies between them
-    /// leaves the current eval `in_flight`, which is exactly the state
-    /// `requeue_in_flight_evals` already recovers — the same window the
-    /// unfused pair had, not a new one.
-    ///
-    /// Returns the next claimable eval, or `None` when the queue is empty
-    /// (or holds only delayed work), in which case the caller parks.
+    /// Finish one handled eval AND claim its next one: the single-eval form
+    /// of [`Self::complete_evals_and_claim_next`], for one-shot callers and
+    /// the tests that pin the one-at-a-time semantics.
     #[instrument(err, skip(self, completion))]
     pub fn complete_and_claim_next(
         &self,
         eval_id: &str,
         completion: EvalCompletion,
     ) -> R<Option<Eval>> {
-        let eval_id = eval_id.to_owned();
-        self.replicated(Lane::Scheduler, "complete_and_claim_next", move |s| {
-            s.apply_eval_completion(&eval_id, completion)?;
-            s.claim_eval_apply()
-        })
+        self.write_eval_completions(vec![(eval_id.to_owned(), completion)])?;
+        self.claim_eval()
     }
 
-    /// Write a handled eval's outcome as its own scheduler-lane op, for
-    /// callers with no following claim to fuse it with (see
-    /// [`Self::complete_and_claim_next`], which is what the eval worker
-    /// loop uses).
+    /// Write a handled eval's outcome as its own scheduler-lane op (see
+    /// [`Self::complete_and_claim_next`], which is what one-shot callers
+    /// with a following claim use).
     pub fn apply_eval_completion_standalone(
         &self,
         eval_id: &str,
         completion: EvalCompletion,
     ) -> R<()> {
-        let eval_id = eval_id.to_owned();
-        self.replicated(Lane::Scheduler, "complete_eval", move |s| {
-            s.apply_eval_completion(&eval_id, completion)
-        })
+        self.write_eval_completions(vec![(eval_id.to_owned(), completion)])
+    }
+
+    /// The terminal writes for handled evals, then the release of their
+    /// claims. Each completion also deletes the duplicates its claim
+    /// subsumed. Nothing is proposed when every completion is already
+    /// written and subsumed nothing.
+    fn write_eval_completions(&self, completions: Vec<(String, EvalCompletion)>) -> R<()> {
+        if completions.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = completions.iter().map(|(id, _)| id.clone()).collect();
+        let writes: Vec<(String, EvalCompletion, Vec<String>)> = completions
+            .into_iter()
+            .map(|(id, completion)| {
+                let subsumed = self.subsumed_by_claim(&id);
+                (id, completion, subsumed)
+            })
+            .filter(|(_, completion, subsumed)| {
+                !matches!(completion, EvalCompletion::Settled) || !subsumed.is_empty()
+            })
+            .collect();
+        if !writes.is_empty() {
+            self.replicated(Lane::Scheduler, "complete_evals", move |s| {
+                for (eval_id, completion, subsumed) in writes {
+                    s.apply_eval_completion(&eval_id, completion)?;
+                    let conn = s.write_connection()?;
+                    Self::delete_subsumed_evals_tx(&conn, &subsumed)?;
+                }
+                Ok(())
+            })?;
+        }
+        self.release_eval_claims(ids.iter().map(String::as_str));
+        Ok(())
     }
 
     /// The terminal write for a handled eval, shared by the fused and
@@ -16131,103 +16274,8 @@ impl Store {
             EvalCompletion::Released { delay, event: None } => {
                 self.release_eval_for_retry_apply(eval_id, delay)
             }
+            EvalCompletion::Settled => Ok(()),
         }
-    }
-
-    fn claim_eval_apply(&self) -> R<Option<Eval>> {
-        let tx_started = Instant::now();
-        let mut conn = self.write_connection()?;
-        let tx = Self::write_tx(&mut conn)?;
-
-        let eval = tx
-            .prepare_cached(
-                "UPDATE eval
-                SET status = 'in_flight'
-                WHERE id = (
-                    SELECT id
-                    FROM eval
-                    WHERE status = 'pending' AND ready_at <= :now
-                    ORDER BY priority DESC, id ASC
-                    LIMIT 1
-                )
-                RETURNING id, status, type, job_id, job_config_id, node_id, priority, ready_at;",
-            )?
-            .query_row(named_params! {":now": Self::sortable_now()?}, |row| {
-                self.eval_from_row(row)
-            })
-            .optional()?;
-
-        let Some(mut eval) = eval else {
-            tx.commit()?;
-            debug!(
-                duration_ms = tx_started.elapsed().as_millis() as u64,
-                "No claimable eval was found"
-            );
-            return Ok(None);
-        };
-
-        let eval_id = eval.id.clone();
-        // Collapse only work this claim genuinely subsumes: same kind, same
-        // scope, and already claimable.
-        //
-        // "Same scope" means the whole (job, job config, node) triple, with
-        // NULL and '' treated alike. Matching on job OR node used to sweep
-        // unrelated work: reschedule evals for jobs A, B and C that shared a
-        // node collapsed into A's, leaving B and C under-count, and a stale
-        // v2 `rollout_tick` swept the v3 tick that was driving the new
-        // rollout. Node-scoped kinds (`node_drain`, `node_lost_reschedule`)
-        // carry no job, so they still collapse per node; job-scoped kinds
-        // collapse per job config (and per excluded node for reschedules,
-        // whose node is the one the replacement must avoid); the
-        // cluster-wide capacity pass (a `node_join` with neither) collapses
-        // with its own kind.
-        //
-        // Matching on kind matters because different kinds are not
-        // interchangeable — dropping a job's `rollout_tick` because a
-        // `job_reschedule` for it was claimed stalls the rollout forever
-        // (ticks are self-perpetuating, nothing re-drives them), and dropping
-        // a `job_stop` the same way loses an operator's request outright.
-        //
-        // Matching on `ready_at` matters because a delayed eval is a timer,
-        // not a queued duplicate: a batch task's next scheduled `job_update`
-        // must survive an unrelated `job_update` running now.
-        tx.prepare_cached(
-            "DELETE FROM eval
-            WHERE status = 'pending'
-              AND id != :id
-              AND type = :type
-              AND ready_at <= :now
-              AND COALESCE(job_id, '') = :job_id
-              AND COALESCE(job_config_id, '') = :job_config_id
-              AND COALESCE(node_id, '') = :node_id;",
-        )?
-        .execute(named_params! {
-            ":id": eval_id,
-            ":type": eval.kind,
-            ":now": Self::sortable_now()?,
-            ":job_id": eval.job_id.trim(),
-            ":job_config_id": eval.job_config_id.trim(),
-            ":node_id": eval.node_name.trim(),
-        })?;
-
-        // Cheapest accurate point for the queue-depth gauge: the claim (and
-        // its superseded-eval sweep) just changed the pending count, and the
-        // eval table is small enough that COUNT inside the open tx is cheap.
-        let pending = Self::pending_eval_count_tx(&tx)?;
-        tx.commit()?;
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(pending);
-        info!(
-            eval_id = eval.id,
-            eval_kind = %eval.kind,
-            eval_priority = eval.priority,
-            duration_ms = tx_started.elapsed().as_millis(),
-            "Claimed eval transaction"
-        );
-        eval.status = "in_flight".to_string();
-
-        Ok(Some(eval))
     }
 
     // Expose a clone so runtime worker tasks can await wake notifications.
@@ -16279,15 +16327,24 @@ impl Store {
     // Returns how long until the earliest pending eval becomes claimable.
     // None means there is no pending eval row at all.
     pub fn next_pending_eval_delay(&self) -> R<Option<Duration>> {
+        // Evals this manager has claimed are still `pending` rows; they are
+        // being handled, not waiting, so they must not read as ready work.
+        let held = self.held_eval_ids();
         let conn = self.read_connection()?;
 
-        let next_ready_at: Option<String> = conn
-            .query_row(
-                "SELECT ready_at FROM eval WHERE status = 'pending' ORDER BY ready_at ASC LIMIT 1;",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let next_ready_at: Option<String> = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, ready_at FROM eval WHERE status = 'pending' \
+                 ORDER BY ready_at ASC LIMIT ?1;",
+            )?;
+            let rows = stmt.query_map([(held.len() + 1) as i64], |row| {
+                Ok((row.get::<_, i64>(0)?.to_string(), row.get::<_, String>(1)?))
+            })?;
+            Self::collect_rows(rows)?
+                .into_iter()
+                .find(|(id, _)| !held.contains(id))
+                .map(|(_, ready_at)| ready_at)
+        };
 
         let Some(next_ready_at) = next_ready_at else {
             return Ok(None);
@@ -16304,6 +16361,9 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn requeue_in_flight_evals(&self) -> R<u64> {
+        // Runs at startup and on gaining scheduler-lane leadership: nothing
+        // this manager claimed before is still being handled.
+        self.clear_eval_claims();
         self.replicated(Lane::Scheduler, "requeue_in_flight_evals", move |s| {
             s.requeue_in_flight_evals_apply()
         })
@@ -16693,10 +16753,15 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn complete_eval(&self, eval_id: &str, succeeded: bool) -> R<()> {
-        let eval_id = eval_id.to_owned();
+        let id = eval_id.to_owned();
+        let subsumed = self.subsumed_by_claim(eval_id);
         self.replicated(Lane::Scheduler, "complete_eval", move |s| {
-            s.complete_eval_impl(&eval_id, succeeded, None)
-        })
+            s.complete_eval_impl(&id, succeeded, None)?;
+            let conn = s.write_connection()?;
+            Self::delete_subsumed_evals_tx(&conn, &subsumed)
+        })?;
+        self.release_eval_claims([eval_id]);
+        Ok(())
     }
 
     /// Complete an eval and record its lifecycle event (`eval.completed` /
@@ -16713,10 +16778,15 @@ impl Store {
         succeeded: bool,
         event: EventDraft,
     ) -> R<()> {
-        let eval_id = eval_id.to_owned();
+        let id = eval_id.to_owned();
+        let subsumed = self.subsumed_by_claim(eval_id);
         self.replicated(Lane::Scheduler, "complete_eval_with_event", move |s| {
-            s.complete_eval_impl(&eval_id, succeeded, Some(event))
-        })
+            s.complete_eval_impl(&id, succeeded, Some(event))?;
+            let conn = s.write_connection()?;
+            Self::delete_subsumed_evals_tx(&conn, &subsumed)
+        })?;
+        self.release_eval_claims([eval_id]);
+        Ok(())
     }
 
     /// Put a claimed (in-flight) eval back on the pending queue with a
@@ -16735,10 +16805,15 @@ impl Store {
     /// recovers.
     #[instrument(err, skip(self))]
     pub fn release_eval_for_retry(&self, eval_id: &str, delay: Duration) -> R<()> {
-        let eval_id = eval_id.to_owned();
+        let id = eval_id.to_owned();
+        let subsumed = self.subsumed_by_claim(eval_id);
         self.replicated(Lane::Scheduler, "release_eval_for_retry", move |s| {
-            s.release_eval_for_retry_apply(&eval_id, delay)
-        })
+            s.release_eval_for_retry_apply(&id, delay)?;
+            let conn = s.write_connection()?;
+            Self::delete_subsumed_evals_tx(&conn, &subsumed)
+        })?;
+        self.release_eval_claims([eval_id]);
+        Ok(())
     }
 
     fn release_eval_for_retry_apply(&self, eval_id: &str, delay: Duration) -> R<()> {
@@ -16766,12 +16841,19 @@ impl Store {
         delay: Duration,
         event: EventDraft,
     ) -> R<()> {
-        let eval_id = eval_id.to_owned();
+        let id = eval_id.to_owned();
+        let subsumed = self.subsumed_by_claim(eval_id);
         self.replicated(
             Lane::Scheduler,
             "release_eval_for_retry_with_event",
-            move |s| s.release_eval_for_retry_with_event_apply(&eval_id, delay, event),
-        )
+            move |s| {
+                s.release_eval_for_retry_with_event_apply(&id, delay, event)?;
+                let conn = s.write_connection()?;
+                Self::delete_subsumed_evals_tx(&conn, &subsumed)
+            },
+        )?;
+        self.release_eval_claims([eval_id]);
+        Ok(())
     }
 
     fn release_eval_for_retry_with_event_apply(
@@ -22666,6 +22748,7 @@ mod tests {
                 expected_versions: versions_a,
                 evictions: Vec::new(),
                 target_instance: String::new(),
+                settle: None,
             },
             PlanApplyRequest {
                 job_config_id: job_b.clone(),
@@ -22674,6 +22757,7 @@ mod tests {
                 expected_versions: versions_b,
                 evictions: Vec::new(),
                 target_instance: String::new(),
+                settle: None,
             },
             PlanApplyRequest {
                 job_config_id: job_c.clone(),
@@ -22682,6 +22766,7 @@ mod tests {
                 expected_versions: versions_c,
                 evictions: Vec::new(),
                 target_instance: String::new(),
+                settle: None,
             },
         ]);
 
@@ -22740,6 +22825,7 @@ mod tests {
                 expected_versions: stale,
                 evictions: Vec::new(),
                 target_instance: String::new(),
+                settle: None,
             },
             PlanApplyRequest {
                 job_config_id: job_b.clone(),
@@ -22748,6 +22834,7 @@ mod tests {
                 expected_versions: fresh,
                 evictions: Vec::new(),
                 target_instance: String::new(),
+                settle: None,
             },
         ]);
         assert!(
@@ -22809,6 +22896,7 @@ mod tests {
                 expected_versions: versions,
                 evictions: Vec::new(),
                 target_instance: String::new(),
+                settle: None,
             });
         }
 
@@ -22909,6 +22997,7 @@ mod tests {
                 expected_versions,
                 evictions: Vec::new(),
                 target_instance: String::new(),
+                settle: None,
             });
         }
         Ok(requests)
@@ -24224,6 +24313,7 @@ mod tests {
                     expected_versions,
                     evictions: Vec::new(),
                     target_instance: String::new(),
+                    settle: None,
                 });
             }
             let started = Instant::now();
@@ -24351,6 +24441,7 @@ mod tests {
                     expected_versions,
                     evictions: Vec::new(),
                     target_instance: String::new(),
+                    settle: None,
                 });
             }
             Ok((store, batch))

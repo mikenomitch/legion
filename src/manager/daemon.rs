@@ -2306,6 +2306,9 @@ async fn eval_worker_loop(
                     "Not the raft leader; eval worker idling until elected"
                 );
                 was_leader = false;
+                // Claims are leader memory: whatever this manager held is
+                // the new leader's to run (store/eval_claims.rs).
+                store.clear_eval_claims();
             }
             tokio::time::sleep(LEADER_POLL_INTERVAL).await;
             continue;
@@ -2517,11 +2520,19 @@ async fn eval_worker_loop(
                     if settle_attempts >= EVAL_SETTLE_MAX_ATTEMPTS
                         || crate::storage::raft::driver::NotRaftLeader::in_chain(&e)
                     {
+                        // Nothing was written, so every member is still a
+                        // `pending` row. Drop the claims so it runs again
+                        // rather than sitting held forever.
+                        store.release_eval_claims(batch.iter().map(|eval| eval.id.as_str()));
                         break;
                     }
                 }
             }
         }
+        // A member whose handler panicked has no observed outcome and was
+        // left out of the settle; releasing its claim lets it run again
+        // instead of staying held (settled members are already released).
+        store.release_eval_claims(batch.iter().map(|eval| eval.id.as_str()));
     }
 }
 
@@ -2643,11 +2654,25 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
         kind = %eval.kind,
         "Dispatching claimed eval"
     );
-    let result = eval.handle(store);
+    let (result, settled) =
+        crate::storage::store::with_eval_settle_scope(eval, || eval.handle(store));
     crate::manager::telemetry::metrics()
         .evals_processed_total
         .inc(&[&eval.kind, if result.is_ok() { "ok" } else { "error" }]);
     match result {
+        // The plan that finished the eval already deleted its row and
+        // recorded `eval.completed` (sandbox-scaling plan, Phase 1).
+        Ok(message) if settled => {
+            info!(
+                worker_id,
+                eval_id = %eval.id,
+                kind = %eval.kind,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Eval {} handled and settled with its plan: {}", eval.id, message
+            );
+            clear_not_leader_attempts(&eval.id);
+            EvalCompletion::Settled
+        }
         Ok(message) => {
             info!(
                 worker_id,

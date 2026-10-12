@@ -399,45 +399,51 @@ impl ManagerDaemonService {
             SnapshotDurability::Local
         };
 
-        let created = self
-            .store
-            .begin_fork(
-                NewSnapshot {
-                    snapshot_id: crate::structs::snapshot::new_snapshot_id(),
-                    job_id: instance.job_id.clone(),
-                    task_name: task.name.clone(),
-                    instance_id: instance.instance_id.clone(),
-                    name: None,
-                    kind,
-                    purpose: SnapshotPurpose::Fork,
-                    node_id: node.id.clone(),
-                    allocation_id: allocation.id,
-                    // Spent once its forks restore: never subject to ttl.
-                    expires_at: None,
-                    suspend_reason: None,
-                    durability,
-                },
-                count,
-                task.stateful
-                    .as_ref()
-                    .is_some_and(|stateful| stateful.require_id),
-            )
-            .map_err(|e| map_store_error("Error forking instance", e))?;
-        let recorded = RecordedFork {
-            origin: instance.instance_id.clone(),
-            snapshot: created.snapshot.snapshot_id.clone(),
-            kind: kind.as_str().to_string(),
+        let new = NewSnapshot {
+            snapshot_id: crate::structs::snapshot::new_snapshot_id(),
+            job_id: instance.job_id.clone(),
+            task_name: task.name.clone(),
+            instance_id: instance.instance_id.clone(),
+            name: None,
+            kind,
+            purpose: SnapshotPurpose::Fork,
             node_id: node.id.clone(),
-            instances: created.instances.clone(),
-            durability: durability.as_str().to_string(),
+            allocation_id: allocation.id,
+            // Spent once its forks restore: never subject to ttl.
+            expires_at: None,
+            suspend_reason: None,
+            durability,
         };
-        self.store
-            .idempotency_record(
-                &idempotency_key,
-                "fork_instance",
-                &serde_json::to_string(&recorded).unwrap_or_default(),
-            )
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let require_id = task
+            .stateful
+            .as_ref()
+            .is_some_and(|stateful| stateful.require_id);
+        // One scheduler-lane entry for the fork and its idempotency record,
+        // group-committed with other instance writes (sandbox-scaling plan,
+        // Phase 1).
+        let origin = instance.instance_id.clone();
+        let node_id = node.id.clone();
+        let key = idempotency_key.clone();
+        let recorded = self
+            .store
+            .scheduler_group_commit("fork_instance", move |s| {
+                let created = s.begin_fork(new, count, require_id)?;
+                let recorded = RecordedFork {
+                    origin,
+                    snapshot: created.snapshot.snapshot_id.clone(),
+                    kind: kind.as_str().to_string(),
+                    node_id,
+                    instances: created.instances,
+                    durability: durability.as_str().to_string(),
+                };
+                s.idempotency_record(
+                    &key,
+                    "fork_instance",
+                    &serde_json::to_string(&recorded).unwrap_or_default(),
+                )?;
+                Ok(recorded)
+            })
+            .map_err(|e| map_store_error("Error forking instance", e))?;
         Ok(Response::new(ForkInstanceReply {
             origin: recorded.origin,
             snapshot: recorded.snapshot,
