@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 
 use crate::manager::dispatcher::dispatch_allocations;
 use crate::manager::rollout_strategy;
-use crate::manager::scheduler::{PlanMode, Scheduler};
+use crate::manager::scheduler::{PlacementBlocked, PlanMode, Scheduler};
 use crate::prelude::{bail, debug, instrument, warn, Context, R};
 use crate::storage::store::{AllocationHealthSnapshot, Store};
 use crate::structs::{
@@ -22,6 +22,13 @@ use crate::structs::{
 };
 
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Upper bound on a capacity-blocked group's re-tick interval (see
+/// `placement_wait_delay`).
+const MAX_PLACEMENT_WAIT_DELAY: Duration = Duration::from_secs(30);
+/// How often a group whose replacements wait on a `dependsOn` re-checks. The
+/// re-check is a backstop: the dependency reaching a terminal state queues a
+/// tick of its own (`Store::queue_dependency_progress`).
+const DEPENDENCY_WAIT_DELAY: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -1025,6 +1032,26 @@ fn try_place_for_group(
                 });
             }
 
+            // Replacements held by `dependsOn` (a batch step of the new
+            // version that has not exited yet) are not short of capacity:
+            // wait for the dependency without arming capacityBlockTimeout.
+            let held_here: Vec<&str> = outcome
+                .held_tasks
+                .iter()
+                .map(String::as_str)
+                .filter(|held| plan.tasks.iter().any(|task| task.name == *held))
+                .collect();
+            if !held_here.is_empty() {
+                return Ok(GroupAction::Wait {
+                    delay: DEPENDENCY_WAIT_DELAY,
+                    message: format!(
+                        "Group {} waiting for dependencies of {} to finish",
+                        plan.name,
+                        held_here.join(", ")
+                    ),
+                });
+            }
+
             on_placement_wait(
                 store,
                 scheduler,
@@ -1043,25 +1070,99 @@ fn try_place_for_group(
                 ),
             )
         }
-        Err(err) => on_placement_wait(
-            store,
-            scheduler,
-            rollout,
-            to_config,
-            plan,
-            state,
-            now,
-            format!(
-                "Group {} placement blocked: {}{}",
-                plan.name,
-                err,
-                placement_note
-                    .as_ref()
-                    .map(|note| format!(" ({note})"))
-                    .unwrap_or_default()
-            ),
-        ),
+        Err(err) => {
+            // A replacement that cannot coexist with the allocation it
+            // replaces, because both need the same static port and the old
+            // one still holds it, can never be placed first. Stop the old
+            // allocation(s) and place on the next tick (a destructive update)
+            // instead of waiting for capacity that cannot appear.
+            if let Some(blocked) = err.downcast_ref::<PlacementBlocked>() {
+                let retired = retire_static_port_holders(store, plan, blocked)?;
+                if retired > 0 {
+                    state.blocked_since = None;
+                    return Ok(GroupAction::Mutated {
+                        delay: plan.config.allocation_stagger,
+                        message: format!(
+                            "Group {} cannot surge: static port {} is held by the version \
+                             being replaced; stopped {} old allocation(s) before placing \
+                             the new one",
+                            plan.name,
+                            blocked.static_port().unwrap_or_default(),
+                            retired
+                        ),
+                    });
+                }
+            }
+            on_placement_wait(
+                store,
+                scheduler,
+                rollout,
+                to_config,
+                plan,
+                state,
+                now,
+                format!(
+                    "Group {} placement blocked: {}{}",
+                    plan.name,
+                    err,
+                    placement_note
+                        .as_ref()
+                        .map(|note| format!(" ({note})"))
+                        .unwrap_or_default()
+                ),
+            )
+        }
     }
+}
+
+/// Stop the old allocations whose static port blocks this group's
+/// replacements: for each task the plan could not place because of a static
+/// port, up to as many old allocations of the same task as replacements are
+/// blocked, choosing only old allocations that hold that port (stopping any
+/// other would not help). Batch tasks are left alone; old batch work is only
+/// ever retired by `batchKillAfter`. Returns how many were stopped.
+fn retire_static_port_holders(
+    store: &Store,
+    plan: &GroupPlan,
+    blocked: &PlacementBlocked,
+) -> R<usize> {
+    let mut retire: Vec<Allocation> = Vec::new();
+    for unplaced in &blocked.unplaced {
+        let Some(port) = unplaced.static_port else {
+            continue;
+        };
+        let Some(task) = plan
+            .tasks
+            .iter()
+            .find(|task| task.name == unplaced.task_name)
+        else {
+            continue;
+        };
+        if matches!(task.lifecycle, TaskLifecycle::Batch) {
+            continue;
+        }
+        let mut holders = task
+            .current_old_allocs
+            .iter()
+            .filter(|allocation| {
+                allocation.network.as_ref().is_some_and(|network| {
+                    network.ports.iter().any(|held| held.host_port == port)
+                        || network
+                            .upstreams
+                            .iter()
+                            .any(|upstream| upstream.local_port == port)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        holders.sort_by_key(|allocation| allocation.id);
+        retire.extend(holders.into_iter().take(unplaced.count as usize));
+    }
+    if retire.is_empty() {
+        return Ok(0);
+    }
+    store.remove_allocations(&retire, StopCause::Update)?;
+    Ok(retire.len())
 }
 
 fn on_placement_wait(
@@ -1090,13 +1191,15 @@ fn on_placement_wait(
         );
     }
 
+    let elapsed = now - blocked_since;
+    let mut remaining: Option<time::Duration> = None;
     if let Some(timeout) = plan.config.capacity_block_timeout {
-        let elapsed = now - blocked_since;
-        if elapsed >= time::Duration::try_from(timeout)? {
+        let timeout = time::Duration::try_from(timeout)?;
+        if elapsed >= timeout {
             warn!(
                 rollout_id = rollout.id,
                 group = %plan.name,
-                timeout_secs = timeout.as_secs(),
+                timeout_secs = timeout.whole_seconds(),
                 action = ?timeout_action,
                 "Capacity block timeout reached"
             );
@@ -1109,12 +1212,34 @@ fn on_placement_wait(
                 plan.config.rollback_on_failure.unwrap_or(false),
             );
         }
+        remaining = Some(timeout - elapsed);
     }
 
     Ok(GroupAction::Wait {
-        delay: DEFAULT_RETRY_DELAY,
+        delay: placement_wait_delay(elapsed, remaining),
         message,
     })
+}
+
+/// How long a capacity-blocked group waits before its next tick: 2s at
+/// first, then half of how long it has been blocked, capped at 30s, and
+/// never past the moment `capacityBlockTimeout` would fire.
+///
+/// A blocked rollout used to re-tick every 2s however long it waited, which
+/// put two eval events (and often a rejected plan) on the event stream every
+/// two seconds — hundreds of identical events for one stuck rollout. Capacity
+/// that does show up is still found within a tick of at most 30s.
+fn placement_wait_delay(
+    blocked_for: time::Duration,
+    until_timeout: Option<time::Duration>,
+) -> Duration {
+    let backoff = Duration::try_from(blocked_for / 2)
+        .unwrap_or_default()
+        .clamp(DEFAULT_RETRY_DELAY, MAX_PLACEMENT_WAIT_DELAY);
+    match until_timeout.and_then(|left| Duration::try_from(left).ok()) {
+        Some(left) => backoff.min(left.max(Duration::from_millis(100))),
+        None => backoff,
+    }
 }
 
 fn build_in_place_exclusions(
@@ -2187,6 +2312,28 @@ mod tests {
         assert_eq!(slots.slot_for_step(1), 2);
         // Clamped at the staged floor even for out-of-range steps.
         assert_eq!(slots.slot_for_step(5), 2);
+    }
+
+    /// A blocked rollout backs off instead of re-ticking every 2s forever
+    /// (the spot check saw 500+ tick events for one stuck rollout), and never
+    /// sleeps past its capacity timeout.
+    #[test]
+    fn blocked_rollouts_back_off_up_to_thirty_seconds() {
+        let secs = time::Duration::seconds;
+        assert_eq!(placement_wait_delay(secs(0), None), Duration::from_secs(2));
+        assert_eq!(placement_wait_delay(secs(3), None), Duration::from_secs(2));
+        assert_eq!(
+            placement_wait_delay(secs(20), None),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            placement_wait_delay(secs(600), None),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            placement_wait_delay(secs(600), Some(secs(5))),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]

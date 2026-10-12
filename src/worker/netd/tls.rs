@@ -10,8 +10,10 @@
 //!   URI SAN, else the first DNS SAN, else the CN — feeds `identity` rules
 //!   and `requireIdentity`.
 //! - **the mesh** — `certFrom = "legion"` (and `clientCa = "legion"`): the
-//!   node's own certificate from `IssueNodeCertificate`, kept in memory and
-//!   refreshed on the heartbeat loop. Node-to-node hops are mTLS on node
+//!   node's own certificate from `IssueNodeCertificate` — the same one its
+//!   worker plane serves (`crate::worker::plane`), issued at registration
+//!   from a key the node generated, persisted under `<state-dir>/identity/`,
+//!   and refreshed on the heartbeat loop. Node-to-node hops are mTLS on node
 //!   certificates; the *workload* on each end is named by a PROXY v2 TLV
 //!   inside the session, trusted because the peer proved it is a node.
 

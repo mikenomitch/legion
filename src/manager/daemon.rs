@@ -441,6 +441,9 @@ pub async fn run_manager_with(
         diverged_since_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
     };
 
+    // Follower-side forwarding of rejected writes to the raft leader
+    // (docs/raft-operations.md, "Writes on any manager").
+    let leader_forward = crate::manager::leader_forward::LeaderForwardLayer::new(store.clone());
     let manager_node = ManagerDaemonService::with_manager_config(store, &full_config)
         .with_workload_identity(workload_identity_state.clone())
         .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
@@ -559,6 +562,10 @@ pub async fn run_manager_with(
         .layer(cors)
         .layer(GrpcWebLayer::new())
         .layer(crate::manager::telemetry::GrpcMetricsLayer)
+        // Innermost, on native gRPC: a write a follower rejects as
+        // not-the-leader is replayed to the leader and the leader's reply
+        // returned, so every manager accepts every request.
+        .layer(leader_forward)
         .add_service(manager_service)
         .add_service(raft_transport_service)
         .serve_with_shutdown(addr, async move {
@@ -587,6 +594,20 @@ pub async fn run_manager_with(
     let eval_loop_fut = start_eval_loop(store_copy_b, full_config.eval_threads);
     let manager_host = resolve_manager_host(&full_config.server.host);
     let manager_addr = format!("http://{}:{}", manager_host, full_config.server.port);
+    // The in-process worker dials its manager over loopback, so the worker
+    // plane's auto-detection (the route toward the manager) would advertise
+    // 127.0.0.1, which no OTHER manager can reach. When this manager has a
+    // non-loopback advertised address, the co-located worker advertises the
+    // same host. An explicit LEGION_WORKER_ADVERTISE_ADDR still wins.
+    if run_worker && std::env::var_os(crate::worker::plane::ENV_WORKER_ADVERTISE_ADDR).is_none() {
+        if let Some(host) = in_process_worker_advertise_host(
+            full_config.server.advertise_addr.as_deref(),
+            full_config.persistence.raft.advertise_addr.as_deref(),
+        ) {
+            info!(%host, "In-process worker advertises this manager's host");
+            crate::worker::plane::set_advertise_addr_flag(&host);
+        }
+    }
     let worker_fut = async move {
         if run_worker {
             info!(%manager_addr, "Starting in-process worker");
@@ -673,6 +694,38 @@ pub async fn run_manager_with(
     shutdown_persistence(&store_for_shutdown).await;
     info!("Manager stopped");
     Ok(())
+}
+
+/// The host an in-process worker (`--run-worker`) should advertise for its
+/// worker plane: the host of this manager's advertised API address
+/// (`server.advertiseAddr`), else of its raft `advertiseAddr`, when that is
+/// a routable (non-loopback, non-wildcard) host. `None` leaves the worker's
+/// own detection in charge, which is right for a single-host setup.
+fn in_process_worker_advertise_host(
+    server_advertise: Option<&str>,
+    raft_advertise: Option<&str>,
+) -> Option<String> {
+    fn host_of(addr: &str) -> Option<String> {
+        let addr = addr.trim();
+        let addr = addr.split_once("://").map_or(addr, |(_, rest)| rest);
+        let authority = addr.split('/').next()?.trim();
+        let host = if let Some(rest) = authority.strip_prefix('[') {
+            rest.split_once(']')?.0.to_string()
+        } else {
+            match authority.rsplit_once(':') {
+                Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host.to_string(),
+                _ => authority.to_string(),
+            }
+        };
+        let routable = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+            Err(_) => !host.is_empty() && !host.eq_ignore_ascii_case("localhost"),
+        };
+        routable.then_some(host)
+    }
+    server_advertise
+        .and_then(host_of)
+        .or_else(|| raft_advertise.and_then(host_of))
 }
 
 /// How long a graceful shutdown waits for in-flight RPCs and open streams
@@ -1324,6 +1377,29 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                     .add(node_ids_to_update.len() as u64);
                 for id in &node_ids_to_update {
                     store.liveness().forget(id);
+                }
+            }
+            // Availability reconcile: liveness lives here, in memory, and
+            // only transitions are replicated, so a node whose loss or
+            // recovery landed only one of its two halves (status vs.
+            // `node.availability`) would otherwise stay that way — active in
+            // `legion node list`, invisible to the scheduler (spot-check
+            // P0-6). One read-model scan in steady state; it proposes only
+            // when it finds a disagreement.
+            {
+                let store_for_reconcile = store.clone();
+                match tokio::task::spawn_blocking(move || {
+                    store_for_reconcile.reconcile_node_availability()
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        warn!(error = ?err, "Failed reconciling node availability; will retry next tick")
+                    }
+                    Err(join_error) => {
+                        warn!("Node availability reconcile task failed: {join_error:?}")
+                    }
                 }
             }
 
@@ -3198,19 +3274,47 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
 #[instrument(err, skip_all)]
 async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
     let worker_conf_path = config.with_defaults().worker_config_path.clone();
-    let sub_paths = fs::read_dir(worker_conf_path)?;
-
-    for path in sub_paths {
-        let path = path.unwrap().path();
-        // Only the two configuration extensions. The directory is a normal
-        // one an operator edits, so it collects `README.md` files and editor
-        // swap files, and neither should be fed to a config parser.
-        if !crate::config_lang::is_config_file(&path) {
-            debug!(path = %path.display(), "skipping non-config file in worker config directory");
-            continue;
+    // No worker config directory configured (the default): register the
+    // built-in `default` worker type, so `legion join` works with zero
+    // configuration wherever the manager runs. A configured directory
+    // declares the types instead, and must exist.
+    let worker_configs: Vec<(String, WorkerConfigAlt)> = if worker_conf_path.trim().is_empty() {
+        vec![(
+            "<built-in default worker type>".to_string(),
+            serde_json::from_value(json!({
+                "workerType": DEF_WORKER_TYPE,
+                "pool": "default",
+            }))?,
+        )]
+    } else {
+        let mut configs = Vec::new();
+        let entries = fs::read_dir(&worker_conf_path).with_context(|| {
+            format!(
+                "failed to read the worker config directory {worker_conf_path} (workerConfigPath)"
+            )
+        })?;
+        for path in entries {
+            let path = path?.path();
+            // Only the two configuration extensions. The directory is a
+            // normal one an operator edits, so it collects `README.md`
+            // files and editor swap files, and neither should be fed to a
+            // config parser.
+            if !crate::config_lang::is_config_file(&path) {
+                debug!(path = %path.display(), "skipping non-config file in worker config directory");
+                continue;
+            }
+            let path_str = path
+                .to_str()
+                .with_context(|| format!("worker config path {} is not utf-8", path.display()))?
+                .to_string();
+            let wcp = parse_worker_config(&path_str)?;
+            configs.push((path_str, wcp));
         }
-        let path_str = path.to_str().unwrap();
-        let wcp = parse_worker_config(path_str)?;
+        configs
+    };
+
+    for (path_str, wcp) in worker_configs {
+        let path_str = path_str.as_str();
 
         let af = wcp.additional_node_checks.unwrap_or([].to_vec());
         let attrs = wcp.attributes.unwrap_or(HashMap::new());
@@ -3338,6 +3442,22 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             Some(block) => serde_json::to_string(&block.with_defaults())?,
         };
 
+        // `container` settings ride as JSON with the capability names
+        // normalized, so a typo in `allowCaps` fails here instead of on the
+        // node, and the worker and the submit check read one spelling.
+        let container = match wcp.container.as_ref() {
+            None => String::new(),
+            Some(block) => {
+                let allowlist = crate::task_plugins::CapabilityAllowlist::from_config(
+                    block.allow_caps.as_deref(),
+                )
+                .with_context(|| format!("invalid worker config {path_str}"))?;
+                serde_json::to_string(&crate::structs::WorkerContainerConfig {
+                    allow_caps: Some(allowlist.to_config()),
+                })?
+            }
+        };
+
         if let Some(seconds) = wcp.heartbeat_seconds {
             // The clamp widened from 1..=30 the moment the lost window began
             // moving with the cadence (heartbeat-cadence plan §7). Under the
@@ -3398,6 +3518,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             heartbeat_seconds: wcp.heartbeat_seconds,
             resource_enforcement,
             edge_boot,
+            container,
         };
 
         store.insert_worker_type(&wc)?;
@@ -3442,6 +3563,44 @@ mod tests {
         Ok(())
     }
 
+    /// The shipped worker config's `container.allowCaps` parses, keeps the
+    /// whole default set (so default jobs still start), and adds NET_RAW.
+    /// A misspelled name fails the load, naming the field.
+    #[test]
+    fn the_default_worker_config_allow_caps_are_the_default_set_test() -> R<()> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/configs/workers/default.ncl");
+        let config = parse_worker_config(path)?;
+        let container = config.container.context("container block")?;
+        let allowlist =
+            crate::task_plugins::CapabilityAllowlist::from_config(container.allow_caps.as_deref())?;
+        let defaults = crate::task_plugins::CapabilityAllowlist::default().to_config();
+        assert!(allowlist.refused(&defaults).is_empty(), "{allowlist:?}");
+        // The shipped config is exactly the default set: raw sockets and
+        // anything beyond are an operator's explicit opt-in.
+        assert!(!allowlist.allows("CAP_NET_RAW"));
+        assert!(!allowlist.allows("CAP_SYS_ADMIN"));
+
+        let typo: WorkerConfigAlt = serde_json::from_value(json!({
+            "workerType": "bad",
+            "container": { "allowCaps": ["SYS_ADMN"] },
+        }))?;
+        let err = crate::task_plugins::CapabilityAllowlist::from_config(
+            typo.container
+                .context("container block")?
+                .allow_caps
+                .as_deref(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("container.allowCaps"), "{err}");
+        // Unknown keys in the block are refused too.
+        assert!(serde_json::from_value::<WorkerConfigAlt>(json!({
+            "workerType": "bad",
+            "container": { "allow_caps": ["NET_RAW"] },
+        }))
+        .is_err());
+        Ok(())
+    }
+
     /// M2 regression: a manager whose gRPC listener cannot bind must exit
     /// with an error instead of running its eval loop and node checker
     /// headless, with no API and no raft transport.
@@ -3469,6 +3628,39 @@ mod tests {
     /// boots as follower (or leaderless after a full-cluster restart) and
     /// wins an election later would otherwise never requeue in-flight evals
     /// or load config data.
+    /// `--run-worker` on a manager in a multi-manager cluster must not
+    /// advertise its worker plane as loopback (other managers dial it).
+    #[test]
+    fn in_process_worker_advertises_the_managers_routable_host_test() {
+        assert_eq!(
+            in_process_worker_advertise_host(Some("http://10.0.1.7:4747"), None).as_deref(),
+            Some("10.0.1.7")
+        );
+        assert_eq!(
+            in_process_worker_advertise_host(Some("https://mgr-a.internal:4747/"), None).as_deref(),
+            Some("mgr-a.internal")
+        );
+        assert_eq!(
+            in_process_worker_advertise_host(None, Some("[fd00::7]:4747")).as_deref(),
+            Some("fd00::7")
+        );
+        // The raft address is the fallback, and loopback never qualifies.
+        assert_eq!(
+            in_process_worker_advertise_host(Some("http://127.0.0.1:4747"), Some("10.0.0.2:4747"))
+                .as_deref(),
+            Some("10.0.0.2")
+        );
+        assert_eq!(
+            in_process_worker_advertise_host(Some("http://localhost:4747"), None),
+            None
+        );
+        assert_eq!(
+            in_process_worker_advertise_host(None, Some("0.0.0.0:4747")),
+            None
+        );
+        assert_eq!(in_process_worker_advertise_host(None, None), None);
+    }
+
     #[test]
     fn leadership_acquired_fires_only_on_false_to_true() {
         assert!(leadership_acquired(false, true));

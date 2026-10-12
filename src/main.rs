@@ -2,49 +2,9 @@ use legion::cmd;
 use legion::prelude::*;
 use legion::tracing_util::init_tracing_with_options;
 
-fn cli() -> Command {
-    Command::new("legion")
-        .about("A simple, exensible, fast orchestrator")
-        .bin_name("legion")
-        .version(env!("CARGO_PKG_VERSION"))
-        .propagate_version(true)
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .subcommand(cmd::capabilities::config())
-        .subcommand(cmd::mcp::config())
-        .subcommand(cmd::docs::config())
-        .subcommand(cmd::job::config())
-        .subcommand(cmd::template::config())
-        .subcommand(cmd::instance::config())
-        .subcommand(cmd::node::config())
-        .subcommand(cmd::start::config())
-        .subcommand(cmd::join_token::config())
-        .subcommand(cmd::boot_ticket::config())
-        .subcommand(cmd::sandbox::config())
-        .subcommand(cmd::join::config())
-        .subcommand(cmd::ledger::config())
-        .subcommand(cmd::events::config())
-        .subcommand(cmd::kv::config())
-        .subcommand(cmd::keyring::config())
-        .subcommand(cmd::service::config())
-        .subcommand(cmd::net::config())
-        .subcommand(cmd::guest_agent::config())
-        .subcommand(cmd::guest_resume::config())
-        .subcommand(cmd::volume::config())
-        .subcommand(cmd::snapshot::config())
-        .subcommand(cmd::state::config())
-        .subcommand(cmd::raft::config())
-        .subcommand(cmd::scheduler::config())
-        .subcommand(cmd::acl::config())
-        .subcommand(cmd::exec::config())
-        .subcommand(cmd::action::config())
-        .subcommand(cmd::login::login_config())
-        .subcommand(cmd::login::logout_config())
-}
-
 #[tokio::main]
 async fn main() -> R<()> {
-    let matches = cli().get_matches();
+    let matches = cmd::cli().get_matches();
     let enable_o11y = matches!(
         matches.subcommand(),
         Some(("start", sub_matches))

@@ -348,7 +348,7 @@ ceiling, latencies, raft entries and manager CPU per lifecycle, manager
 memory per resident sandbox, and labelled projections. See
 `benchmarks/aws/README.md`, "Sandbox-scaling campaign". Rig flags the
 campaign uses: `--join-token` (the fleet's worker type and secret),
-`--advertise-host`, `--sim-name-prefix` (a fixed prefix so successive runs
+`--advertise-addr`, `--sim-name-prefix` (a fixed prefix so successive runs
 re-register the same nodes), and `--sim-profiles` (the node shape).
 Use isolated ports for a local manager: never the defaults another cluster
 on the machine may be using.

@@ -197,15 +197,15 @@ lazy_static! {
 //
 
 pub const WORKER_TYPE_ATTRS: &str = r#"
-name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts, host_volumes, heartbeat_seconds, resource_enforcement, edge_boot
+name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts, host_volumes, heartbeat_seconds, resource_enforcement, edge_boot, container
 "#;
 
 pub const WORKER_TYPE_PARAM_SET: &str = r#"
-pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations, artifacts = :artifacts, host_volumes = :host_volumes, heartbeat_seconds = :heartbeat_seconds, resource_enforcement = :resource_enforcement, edge_boot = :edge_boot
+pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations, artifacts = :artifacts, host_volumes = :host_volumes, heartbeat_seconds = :heartbeat_seconds, resource_enforcement = :resource_enforcement, edge_boot = :edge_boot, container = :container
 "#;
 
 pub const WORKER_TYPE_ATTRS_VALS: &str = r#"
-:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations, :artifacts, :host_volumes, :heartbeat_seconds, :resource_enforcement, :edge_boot
+:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations, :artifacts, :host_volumes, :heartbeat_seconds, :resource_enforcement, :edge_boot, :container
 "#;
 
 lazy_static! {

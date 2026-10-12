@@ -2,9 +2,9 @@ use crate::prelude::*;
 
 use crate::structs::token::JoinToken;
 use crate::structs::{
-    manager_client::ManagerClient, worker_server::WorkerServer, AllocNetwork, AllocationHealth,
-    HealthCheckRequest, HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterRequest,
+    manager_client::ManagerClient, AllocNetwork, AllocationHealth, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints, WorkerConfig,
+    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterRequest,
 };
 use crate::util::random_string;
 use crate::worker::{
@@ -26,17 +26,27 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::time::Duration;
-use tonic::{transport::Channel, transport::Server, Response};
+use tonic::{transport::Channel, Response};
 
 /// The worker's manager-issued credentials: the join secret it was started
-/// with (used to register and re-register) and the node token returned by
-/// registration (attached to every worker-plane RPC: heartbeats, health
-/// checks, identity-token issuance, artifact-credential fetches). Empty when
-/// the cluster runs without ACLs.
+/// with and the node token returned by registration (attached to every
+/// worker-plane RPC: heartbeats, health checks, identity-token issuance,
+/// artifact-credential fetches). Empty when the cluster runs without ACLs.
+///
+/// The node token is persisted (mode 0600) in the worker's state directory
+/// and is what a restarted worker registers with first: a join token is for
+/// introducing a node, and operators are told to give it a short TTL and
+/// revoke it once the fleet has joined (docs/auth-and-acls.md). Re-registering
+/// on the join secret at every start made each restart after that TTL fatal
+/// (`Unauthenticated: unknown or revoked join token`, spot-check P0-8). The
+/// join secret is the fallback when the manager refuses the node token.
 #[derive(Debug, Default)]
 pub struct WorkerCredentials {
     join_secret: Option<String>,
     node_token: RwLock<Option<String>>,
+    /// Where the node token is persisted, once the worker knows its state
+    /// directory.
+    persist: RwLock<Option<WorkerStateStore>>,
 }
 
 impl WorkerCredentials {
@@ -44,6 +54,7 @@ impl WorkerCredentials {
         WorkerCredentials {
             join_secret,
             node_token: RwLock::new(None),
+            persist: RwLock::new(None),
         }
     }
 
@@ -57,27 +68,74 @@ impl WorkerCredentials {
         request
     }
 
+    /// Adopt the node token a registration reply carried. `None` keeps the
+    /// current token: a manager answers a node-token re-registration without
+    /// minting a new one ("keep the one you presented"), and a cluster
+    /// without ACLs mints none at all. A new token is persisted at once.
     pub(crate) fn store_node_token(&self, token: Option<String>) {
+        let Some(token) = token else {
+            return;
+        };
+        if let Some(store) = self.persist.read().ok().and_then(|s| s.clone()) {
+            if let Err(err) = store.save_node_token(&token) {
+                // The secret itself is never logged; the path is.
+                warn!(
+                    path = %store.node_token_path().display(),
+                    error = ?err,
+                    "Failed to persist the node token; a restart will fall back to the join token"
+                );
+            }
+        }
         if let Ok(mut current) = self.node_token.write() {
-            *current = token;
+            *current = Some(token);
+        }
+    }
+
+    /// Whether a node token is held (persisted or freshly issued).
+    pub(crate) fn has_node_token(&self) -> bool {
+        self.node_token.read().map(|t| t.is_some()).unwrap_or(false)
+    }
+
+    /// Drop the node token, in memory and on disk: the manager refused it.
+    pub(crate) fn clear_node_token(&self) {
+        if let Ok(mut current) = self.node_token.write() {
+            *current = None;
+        }
+        if let Some(store) = self.persist.read().ok().and_then(|s| s.clone()) {
+            if let Err(err) = store.clear_node_token() {
+                debug!(error = ?err, "Failed to remove the persisted node token");
+            }
+        }
+    }
+
+    /// Load the node token a previous worker process persisted in `store`.
+    /// Returns whether one was found.
+    pub(crate) fn restore_from(&self, store: &WorkerStateStore) -> bool {
+        let Some(token) = store.load_node_token() else {
+            return false;
+        };
+        if let Ok(mut current) = self.node_token.write() {
+            *current = Some(token);
+        }
+        true
+    }
+
+    /// Persist the node token into this worker's state directory from now
+    /// on, writing the current one (if any) immediately.
+    pub(crate) fn persist_to(&self, store: WorkerStateStore) {
+        if let Some(token) = self.node_token.read().ok().and_then(|t| t.clone()) {
+            if let Err(err) = store.save_node_token(&token) {
+                warn!(error = ?err, "Failed to persist the node token");
+            }
+        }
+        if let Ok(mut persist) = self.persist.write() {
+            *persist = Some(store);
         }
     }
 
     pub(crate) fn join_secret(&self) -> Option<&String> {
         self.join_secret.as_ref()
     }
-}
-
-/// Port the worker's own gRPC server listens on, and the port it advertises to
-/// the manager as its `workerAddress`. Overridable via `LEGION_WORKER_PORT` so
-/// several workers can run on one host (local multi-node testing); the manager
-/// dispatches to the advertised address, so both uses must agree.
-fn worker_server_port() -> u64 {
-    std::env::var("LEGION_WORKER_PORT")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|port| *port > 0)
-        .unwrap_or(DEF_WORKER_SERVER_PORT)
 }
 
 /// Address clients outside the cluster's private network reach this node at,
@@ -177,8 +235,11 @@ async fn run_worker_with_manager(
     name_override: Option<&str>,
     join_secret: Option<String>,
 ) -> R<()> {
-    let server_port = worker_server_port();
-    let addr = format!("{DEF_MANAGER_HOSTNAME}:{server_port}").parse()?;
+    // Where the worker plane binds and what it advertises: LEGION_WORKER_HOST
+    // (0.0.0.0), LEGION_WORKER_PORT (4848), and --advertise-addr /
+    // LEGION_WORKER_ADVERTISE_ADDR or the route to the manager
+    // (docs/architecture-managers-workers.md, "Ports and who dials whom").
+    let plane_addrs = crate::worker::plane::PlaneAddrs::resolve(&manager_addr).await?;
 
     info!(%manager_addr, %worker_type, "Worker connecting to manager");
 
@@ -187,13 +248,33 @@ async fn run_worker_with_manager(
     // against the contact time a previous process persisted, so a worker
     // restarted (or crash-looping) during a partition cannot keep them
     // running past their window.
-    let boot_fence =
-        boot_state_store(name_override).map(|store| tokio::spawn(run_boot_fence(store)));
+    let boot_store = boot_state_store(name_override);
+    let boot_fence = boot_store
+        .clone()
+        .map(|store| tokio::spawn(run_boot_fence(store)));
 
-    let client: ManagerClient<Channel> = connect_manager_with_retry(&manager_addr).await?;
+    // Every manager this worker knows, not just the token's: a restarted
+    // worker starts from the set it persisted, so it comes up even when the
+    // manager its token names is down (spot-check P0-5).
+    let managers = crate::worker::managers::ManagerEndpoints::new(
+        &manager_addr,
+        boot_store
+            .as_ref()
+            .map(WorkerStateStore::load_known_managers)
+            .unwrap_or_default(),
+    )?;
+    let client: ManagerClient<Channel> = ManagerClient::new(managers.channel());
     let credentials = Arc::new(WorkerCredentials::with_join_secret(join_secret));
+    // A restarted worker re-registers with the node token it persisted, so
+    // it does not depend on its join token still being valid (P0-8).
+    if let Some(store) = &boot_store {
+        if credentials.restore_from(store) {
+            info!("Found a persisted node token; re-registering with it");
+        }
+    }
 
-    let pre_register_res = pre_register_self(client.clone(), worker_type, &credentials).await?;
+    let pre_register_res =
+        pre_register_until_reachable(&client, &managers, worker_type, &credentials).await?;
     // The manager answered, so restore (below) and then the in-process
     // watchdog take over. Stopped before the restore so the two never act on
     // the same process at once.
@@ -207,6 +288,17 @@ async fn run_worker_with_manager(
 
     let name = resolve_worker_name(name_override, config.name_prefix.clone())?;
     let state_path = WorkerStateStore::path_for_worker(&name);
+    info!(
+        worker_name = %name,
+        state_path = %state_path.display(),
+        "Worker state directory (keep it stable across restarts: it is how a \
+         restarted worker re-adopts its running tasks)"
+    );
+    credentials.persist_to(WorkerStateStore::new(state_path.clone()));
+    managers.persist_to(WorkerStateStore::new(state_path.clone()));
+    // The node certificate the worker plane serves, reloaded from
+    // `<state-dir>/identity/` so a restart can serve before a manager answers.
+    let node_plane = crate::worker::plane::NodePlane::start(&name, &state_path);
     // The datapath's persisted inputs, replayed before the first heartbeat
     // (docs/network-handlers.md, "The datapath across worker restarts").
     let _ = NETD_STATE.set(crate::worker::netd::state::NetdStateStore::beside(
@@ -235,7 +327,7 @@ async fn run_worker_with_manager(
         content_store.clone(),
         content_store_target.as_ref(),
         Arc::new(ManagerCredentialSource::new(
-            manager_addr.clone(),
+            managers.clone(),
             name.clone(),
             credentials.clone(),
         )),
@@ -250,10 +342,17 @@ async fn run_worker_with_manager(
     let enforcement_config =
         usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
     apply_resource_enforcement_env(&enforcement_config);
+    apply_container_env(&config.container);
     let sandbox_bridges = apply_sandbox_bridges_env(enforcement_config.sandbox.as_ref());
     crate::task_plugins::warn_if_no_static_guest_binary();
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
+        // Worker core's own governor takes the config directly, before any
+        // allocation is restored or started. It used to read the env above
+        // from the task manager's constructor, which ran before the env was
+        // set, so enforcement never turned on. The governor logs whether it
+        // really enforces (and why not, when it cannot).
+        manager.configure_resource_enforcement(&enforcement_config);
         manager.load_builtin_plugins();
         manager.configure_volumes(&name, host_volumes);
         // Before `configure_artifacts`, which hands the store to the stager.
@@ -262,7 +361,7 @@ async fn run_worker_with_manager(
         manager.configure_artifacts(
             artifact_fetch_config,
             Box::new(ManagerCredentialSource::new(
-                manager_addr.clone(),
+                managers.clone(),
                 name.clone(),
                 credentials.clone(),
             )),
@@ -343,9 +442,9 @@ async fn run_worker_with_manager(
         identity: Some(identity_manager.clone()),
         edge_boot: edge_boot.clone(),
     };
-    let worker_server_fut = Server::builder()
-        .add_service(WorkerServer::new(worker_node))
-        .serve(addr);
+    // mTLS only; it starts listening once the node holds a certificate.
+    let worker_server_fut =
+        crate::worker::plane::serve(plane_addrs.clone(), node_plane.tls.clone(), worker_node);
 
     let mut fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
     // The manager loads no storage drivers of its own, so this is its only
@@ -412,7 +511,7 @@ async fn run_worker_with_manager(
     }
     config_attrs.insert(
         "workerAddress".into(),
-        Value::String(format!("http://{}:{}", DEF_MANAGER_HOSTNAME, server_port)),
+        Value::String(plane_addrs.worker_address()),
     );
     if let Some(public_address) = worker_public_address() {
         config_attrs.insert("publicAddress".into(), Value::String(public_address));
@@ -442,8 +541,14 @@ async fn run_worker_with_manager(
                 .is_some(),
         ),
     };
-    register_self(client.clone(), &registration, &credentials).await?;
+    let reported_managers = register_self(client.clone(), &registration, &credentials).await?;
+    managers.learn(&reported_managers);
     info!(worker_name = %name, "Worker registered with manager");
+    // Eager node certificate: the worker plane listens only once it holds
+    // one. A failure here is retried on every heartbeat.
+    node_plane
+        .issue_after_registration(&mut client.clone(), &credentials)
+        .await;
     record_manager_contact(task_manager.lock().expect("task manager").state_store());
     // Easter egg, mirrored by the manager's log line for the same join.
     info!(worker_name = %name, "We are Legion. {name} has joined");
@@ -485,6 +590,8 @@ async fn run_worker_with_manager(
             .with_proxies(net_proxies)
             .with_ingress(net_ingress),
     );
+    // The mesh's node certificate is the worker plane's.
+    node_plane.share_with_mesh(forwarder.context());
     // Restored tasks are still running: give them their network back now,
     // not on the first successful heartbeat.
     restore_datapath(&forwarder, &task_manager).await;
@@ -519,6 +626,7 @@ async fn run_worker_with_manager(
         forwarder,
         heartbeat_interval,
         edge_boot.as_ref().map(|runtime| runtime.spec_cache.clone()),
+        Some(managers.clone()),
     );
     let self_fence_fut = start_self_fence_watchdog(task_manager.clone(), last_successful_heartbeat);
     let checks_fut = start_node_checks(
@@ -660,12 +768,10 @@ fn usable_resource_enforcement(
 /// the task runtimes read (see `docs/resource-enforcement.md`).
 fn apply_resource_enforcement_env(config: &crate::structs::WorkerResourceEnforcementConfig) {
     if config.enabled {
-        if cfg!(target_os = "linux") {
-            info!(
-                cgroup_parent = %config.cgroup_parent,
-                "Resource enforcement enabled: exec and sandbox tasks run in worker-owned cgroups"
-            );
-        } else {
+        // On Linux the governor logs "enabled" once it really is
+        // (`NodeResourceGovernor::from_settings`), so this function does not
+        // claim it on the governor's behalf.
+        if !cfg!(target_os = "linux") {
             // No cgroups here: the switch measures (Apple container sandboxes,
             // through `container stats`) and enforces nothing.
             info!(
@@ -688,6 +794,38 @@ fn apply_resource_enforcement_env(config: &crate::structs::WorkerResourceEnforce
         std::env::remove_var(crate::constants::ENV_RESOURCE_ENFORCEMENT);
         std::env::remove_var(crate::constants::ENV_CGROUP_PARENT);
         std::env::remove_var(crate::constants::ENV_SANDBOX_VMM_OVERHEAD_MIB);
+    }
+}
+
+/// Publishes the worker type's `container.allowCaps` into the environment the
+/// `container` runtime reads at each start. An empty payload (no `container`
+/// block) clears it, which is the default allowlist. A payload that does not
+/// parse also falls back to the default, with a warning: the default is the
+/// narrow side, so a bad config never grants more than it meant to.
+fn apply_container_env(raw: &str) {
+    let allowlist = crate::structs::WorkerContainerConfig::from_payload(raw)
+        .and_then(|config| {
+            crate::task_plugins::CapabilityAllowlist::from_config(config.allow_caps.as_deref())
+        })
+        .unwrap_or_else(|err| {
+            warn!(
+                error = %format!("{err:#}"),
+                "Invalid worker container config; container tasks get the default capability \
+                 allowlist"
+            );
+            crate::task_plugins::CapabilityAllowlist::default()
+        });
+    if allowlist == crate::task_plugins::CapabilityAllowlist::default() {
+        std::env::remove_var(crate::constants::ENV_CONTAINER_ALLOW_CAPS);
+    } else {
+        info!(
+            allow_caps = %allowlist.describe(),
+            "Container capability allowlist set by the worker type (container.allowCaps)"
+        );
+        std::env::set_var(
+            crate::constants::ENV_CONTAINER_ALLOW_CAPS,
+            allowlist.to_env_value(),
+        );
     }
 }
 
@@ -809,6 +947,9 @@ fn open_content_store(
         }
     };
     info!(dir = %dir.display(), "Node content store open");
+    // Image pulls outside the staging pipeline (a `container` task without
+    // `containerImageDesugar`) cache their layers here too.
+    crate::content_store::set_node_store(Some(store.clone()));
     let gc_store = store.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(CONTENT_GC_INTERVAL);
@@ -1033,6 +1174,9 @@ async fn start_heartbeats(
     // Edge-boot spec cache to keep warm from the desired set; `None` on a
     // node that does not accept edge starts.
     spec_cache: Option<crate::worker::edge::SpecCache>,
+    // The manager set this worker fails over across (spot-check P0-5).
+    // `None` pins the worker to `client`'s one manager (tests).
+    managers: Option<Arc<crate::worker::managers::ManagerEndpoints>>,
 ) -> R<()> {
     let mut backoff = HEARTBEAT_RETRY_MIN;
     let contact_store = task_manager
@@ -1059,8 +1203,22 @@ async fn start_heartbeats(
             &credentials,
             &forwarder,
             spec_cache.as_ref(),
+            managers.as_ref(),
         )
         .await;
+        // Failover bookkeeping: a manager that answered (with anything) is
+        // reachable; consecutive transport failures move the worker to the
+        // next known manager, and the retry below goes there.
+        if let Some(managers) = &managers {
+            match &tick_result {
+                Ok(_) => managers.record_success(),
+                Err(err) => {
+                    if let Some(status) = err.downcast_ref::<tonic::Status>() {
+                        managers.record_failure(status);
+                    }
+                }
+            }
+        }
         let worker_metrics = crate::manager::telemetry::worker_metrics();
         worker_metrics
             .heartbeat_duration_seconds
@@ -1103,17 +1261,27 @@ async fn start_heartbeats(
                     }
                 }
             }
-            // The node token can be revoked/rotated (for example ACLs were
-            // just enabled, or the manager state was reset). Re-register with
-            // the join secret to obtain a fresh credential, then carry on.
+            // The node token can be revoked (for example ACLs were just
+            // enabled, the node was removed, or the manager state was reset).
+            // A token the manager refuses is useless for re-registration
+            // too, so drop it and re-register with the join secret to obtain
+            // a fresh credential, then carry on.
             Err(err)
                 if err
                     .downcast_ref::<tonic::Status>()
                     .is_some_and(|status| status.code() == tonic::Code::Unauthenticated) =>
             {
                 warn!(worker = %name, "Heartbeat rejected as unauthenticated; re-registering");
-                if let Err(err) = register_self(client.clone(), &registration, &credentials).await {
-                    warn!(worker = %name, error = ?err, "Re-registration failed; will retry");
+                credentials.clear_node_token();
+                match register_self(client.clone(), &registration, &credentials).await {
+                    Ok(reported) => {
+                        if let Some(managers) = &managers {
+                            managers.learn(&reported);
+                        }
+                    }
+                    Err(err) => {
+                        warn!(worker = %name, error = ?err, "Re-registration failed; will retry")
+                    }
                 }
                 tokio::time::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, HEARTBEAT_RETRY_MAX);
@@ -1134,6 +1302,9 @@ async fn start_heartbeats(
 
 /// One heartbeat round-trip: report running/failed allocations, then
 /// reconcile against the manager's desired set.
+// Same reason as `start_heartbeats`: each per-heartbeat subsystem is threaded
+// by parameter so its lifetime stays visible at the call site.
+#[allow(clippy::too_many_arguments)]
 async fn heartbeat_tick(
     name: &str,
     client: &ManagerClient<Channel>,
@@ -1142,6 +1313,7 @@ async fn heartbeat_tick(
     credentials: &Arc<WorkerCredentials>,
     forwarder: &Arc<UpstreamForwarder>,
     spec_cache: Option<&crate::worker::edge::SpecCache>,
+    managers: Option<&Arc<crate::worker::managers::ManagerEndpoints>>,
 ) -> R<Option<u32>> {
     let mut client_clone = client.clone();
     // The cadence the manager wants, when it dictates one. `None` (the
@@ -1430,6 +1602,11 @@ async fn heartbeat_tick(
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let mut reply = response.into_inner();
         served_interval = reply.next_interval_seconds;
+        // The cluster's manager set, refreshed every beat and persisted when
+        // it changes, so failover (and a restart) can reach any manager.
+        if let Some(managers) = managers {
+            managers.learn(&reply.manager_addresses);
+        }
         // The manager acknowledged this health. Off the stream (or when the
         // manager did not recognize the stream) the next beat starts from a
         // full report again.
@@ -2096,9 +2273,11 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
     }
 }
 
-/// Keep the node's mesh certificate current (docs/network-handlers.md,
-/// "mTLS"): issued on the first heartbeat after anything on the node needs
-/// it, re-issued after a third of its lifetime. Fail-static: an issuance
+/// Keep the node certificate current (docs/auth-and-acls.md, "The worker
+/// plane"). It serves the worker plane and is the mesh's node certificate
+/// (docs/network-handlers.md, "mTLS"). Issued eagerly at registration,
+/// re-issued after a third of its lifetime, and early when a worker-plane
+/// handshake suggests the cluster CA was rotated. Fail-static: an issuance
 /// that fails keeps the certificate the node has, and a node without one
 /// refuses mesh flows rather than sending them in the clear.
 async fn apply_mesh_identity(
@@ -2107,44 +2286,14 @@ async fn apply_mesh_identity(
     credentials: &Arc<WorkerCredentials>,
     node_id: &str,
 ) {
-    let context = forwarder.context();
-    if !context.mesh_needs_refresh() {
+    let Some(plane) = crate::worker::plane::NodePlane::current() else {
+        return;
+    };
+    if plane.node_id != node_id {
         return;
     }
-    let request = credentials.attach(tonic::Request::new(
-        crate::structs::IssueNodeCertificateRequest {
-            node_id: node_id.to_string(),
-        },
-    ));
-    match client.issue_node_certificate(request).await {
-        Ok(response) => {
-            let reply = response.into_inner();
-            match crate::worker::netd::tls::MeshIdentity::from_pem(
-                node_id,
-                &reply.cert_pem,
-                &reply.key_pem,
-                &reply.ca_pem,
-                reply.expires_at,
-            )
-            .and_then(|identity| context.set_mesh_identity(identity))
-            {
-                Ok(()) => info!(
-                    node_id,
-                    expires_at = reply.expires_at,
-                    "Mesh node certificate issued"
-                ),
-                Err(err) => warn!(error = ?err, "Rejected mesh node certificate"),
-            }
-        }
-        Err(status) if status.code() == tonic::Code::Unimplemented => {
-            debug!("Manager predates mesh certificates; mesh TLS stays unavailable")
-        }
-        Err(status) => warn!(
-            code = ?status.code(),
-            message = status.message(),
-            "Failed to issue the mesh node certificate; keeping the current one"
-        ),
-    }
+    plane.refresh_if_needed(client, credentials).await;
+    plane.share_with_mesh(forwarder.context());
 }
 
 /// Keep `certFrom = { kv }` ingress certificates current
@@ -3113,28 +3262,73 @@ async fn start_node_checks(
     }
 }
 
+/// Whether a registration-time refusal means "this credential is not good
+/// for this node", so the next credential should be tried: the node token
+/// was revoked or belongs to another node or pool.
+fn credential_refused(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+    )
+}
+
+/// Register (or re-register) this node and return the manager addresses the
+/// reply carried (`WorkerRegisterReply.manager_addresses`).
+///
+/// Credential order: the node token first, when one is held — a restarted
+/// worker persisted it, and it does not expire — presented as the bearer
+/// credential with no join secret, which the manager accepts for this node
+/// in its current pool and answers without rotating. If the manager refuses
+/// it, the token is dropped and the join secret is used, as on first join.
+/// This is what makes short-lived join tokens safe (spot-check P0-8).
 #[instrument(err, skip_all)]
 async fn register_self(
     client: ManagerClient<Channel>,
     registration: &RegistrationPayload,
     credentials: &Arc<WorkerCredentials>,
-) -> R<()> {
+) -> R<Vec<String>> {
     let mut c2 = client.clone();
 
     let build_version = env!("CARGO_PKG_VERSION");
-    let req = tonic::Request::new(WorkerRegisterRequest {
+    let request = |join_token: Option<String>| WorkerRegisterRequest {
         name: registration.name.clone(),
         config_attrs: registration.config_attrs.clone(),
         fingerprint_attrs: registration.fingerprint_attrs.clone(),
         health_checks: registration.health_checks.clone(),
         pool: registration.pool.clone(),
-        join_token: credentials.join_secret.clone(),
+        join_token,
         build_version: build_version.to_string(),
         protocol_version: PROTOCOL_VERSION,
         capabilities: registration.capabilities.clone(),
-    });
+    };
 
-    let response = c2.worker_register(req).await?;
+    let response = if credentials.has_node_token() {
+        match c2
+            .worker_register(credentials.attach(tonic::Request::new(request(None))))
+            .await
+        {
+            Ok(response) => response,
+            Err(status) if credential_refused(&status) && credentials.join_secret().is_some() => {
+                warn!(
+                    worker = %registration.name,
+                    code = %status.code(),
+                    reason = %status.message(),
+                    "The manager refused this node's persisted node token; registering with                      the join token instead"
+                );
+                credentials.clear_node_token();
+                c2.worker_register(tonic::Request::new(request(
+                    credentials.join_secret().cloned(),
+                )))
+                .await?
+            }
+            Err(status) => return Err(status.into()),
+        }
+    } else {
+        c2.worker_register(tonic::Request::new(request(
+            credentials.join_secret().cloned(),
+        )))
+        .await?
+    };
     let reply = response.into_inner();
     if reply.node_token.is_some() {
         info!(worker = %registration.name, "Received node token from manager");
@@ -3159,25 +3353,79 @@ async fn register_self(
         );
     }
 
-    Ok(())
+    Ok(reply.manager_addresses)
 }
 
+/// Fetch this worker's typed config, with the same credential order as
+/// [`register_self`]: the persisted node token first, then the join secret.
 #[instrument(err, skip_all)]
 async fn pre_register_self(
     client: ManagerClient<Channel>,
     worker_type: String,
     credentials: &Arc<WorkerCredentials>,
-) -> R<Response<WorkerPreRegisterReply>> {
+) -> Result<Response<WorkerPreRegisterReply>, tonic::Status> {
     let mut c2 = client.clone();
+
+    if credentials.has_node_token() {
+        let req = credentials.attach(tonic::Request::new(WorkerPreRegisterRequest {
+            worker_type: worker_type.clone(),
+            join_token: None,
+        }));
+        match c2.worker_pre_register(req).await {
+            Ok(response) => return Ok(response),
+            Err(status) if credential_refused(&status) && credentials.join_secret().is_some() => {
+                warn!(
+                    code = %status.code(),
+                    reason = %status.message(),
+                    "The manager refused this node's persisted node token; using the join \
+                     token instead"
+                );
+                credentials.clear_node_token();
+            }
+            Err(status) => return Err(status),
+        }
+    }
 
     let req = tonic::Request::new(WorkerPreRegisterRequest {
         worker_type,
-        join_token: credentials.join_secret.clone(),
+        join_token: credentials.join_secret().cloned(),
     });
+    c2.worker_pre_register(req).await
+}
 
-    let response = c2.worker_pre_register(req).await?;
-
-    Ok(response)
+/// Pre-register against whichever known manager answers. A manager that
+/// cannot be reached moves the worker to the next known address (the
+/// persisted set from a previous run, plus the token's); the loop retries
+/// forever with backoff, as the single-manager connect did. A manager that
+/// answers with an error ends the loop with that error.
+async fn pre_register_until_reachable(
+    client: &ManagerClient<Channel>,
+    managers: &Arc<crate::worker::managers::ManagerEndpoints>,
+    worker_type: String,
+    credentials: &Arc<WorkerCredentials>,
+) -> R<Response<WorkerPreRegisterReply>> {
+    let mut backoff = Duration::from_millis(500);
+    loop {
+        match pre_register_self(client.clone(), worker_type.clone(), credentials).await {
+            Ok(response) => {
+                managers.record_success();
+                return Ok(response);
+            }
+            Err(status) if crate::worker::managers::is_unreachable(&status) => {
+                let manager = managers.active();
+                warn!(
+                    %manager,
+                    error = %status.message(),
+                    retry_in_ms = backoff.as_millis() as u64,
+                    "Failed to reach manager; trying the next known manager"
+                );
+                managers.fail_over();
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, Duration::from_secs(10));
+            }
+            Err(status) => return Err(status.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3445,6 +3693,7 @@ mod tests {
             Arc::new(UpstreamForwarder::new()),
             Duration::from_secs(WORKER_HEARTBEAT_DURATION_SEC),
             None,
+            None,
         ));
 
         // Long enough for several failed attempts (first retry after 500ms).
@@ -3462,6 +3711,121 @@ mod tests {
         );
 
         heartbeats.abort();
+        Ok(())
+    }
+
+    /// Spot-check P0-8: a restarted worker registers with the node token it
+    /// persisted, so it comes back after its join token is gone; a refused
+    /// node token falls back to the join token; and the secret on disk is
+    /// owner-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_worker_rejoins_on_its_persisted_node_token() -> R<()> {
+        let dir = TempDir::new()?;
+        let store = crate::storage::store::Store::start_storage(
+            &crate::structs::config::ManagerConfigFull {
+                store_path: dir.path().join("store").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        )?;
+        store.insert_worker_type(&WorkerConfig {
+            name: "default".into(),
+            pool: "default".into(),
+            ..Default::default()
+        })?;
+        let auth = Arc::new(crate::manager::acl::Authenticator::from_config(
+            &crate::structs::config::AclConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }
+            .with_defaults(),
+        )?);
+        let (_, composite) = auth
+            .mint_join_token(
+                &store,
+                "http://127.0.0.1:4747",
+                "default",
+                Some(Duration::from_secs(3600)),
+                "restart test",
+            )
+            .map_err(|status| anyhow!("{status}"))?;
+        let join_secret = JoinToken::decode(&composite)?.secret;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+        let service = crate::structs::manager_server::ManagerServer::new(
+            crate::manager::server::ManagerDaemonService::with_acl(store, auth),
+        );
+        tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let _ = tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        let client = ManagerClient::new(Channel::from_shared(addr)?.connect_lazy());
+        let state = WorkerStateStore::new(dir.path().join("w1").join("worker_state.json"));
+        let payload = RegistrationPayload {
+            name: "w1".into(),
+            pool: "default".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            health_checks: "[]".into(),
+            capabilities: Vec::new(),
+        };
+
+        // First join: the join token mints a node token, persisted at once.
+        let first = Arc::new(WorkerCredentials::with_join_secret(Some(
+            join_secret.clone(),
+        )));
+        first.persist_to(state.clone());
+        pre_register_self(client.clone(), "default".into(), &first).await?;
+        register_self(client.clone(), &payload, &first).await?;
+        let token = state.load_node_token().context("node token persisted")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(state.node_token_path())?
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Restart after the join token stopped working: the persisted node
+        // token alone pre-registers and registers, and is kept.
+        let restarted = Arc::new(WorkerCredentials::with_join_secret(Some(
+            "lgnjoin_expired".into(),
+        )));
+        assert!(restarted.restore_from(&state));
+        restarted.persist_to(state.clone());
+        pre_register_self(client.clone(), "default".into(), &restarted).await?;
+        register_self(client.clone(), &payload, &restarted).await?;
+        assert_eq!(state.load_node_token().as_deref(), Some(token.as_str()));
+
+        // A refused node token falls back to a valid join token, which
+        // mints and persists a replacement.
+        state.save_node_token("lgn_not_a_real_token")?;
+        let fallback = Arc::new(WorkerCredentials::with_join_secret(Some(join_secret)));
+        assert!(fallback.restore_from(&state));
+        fallback.persist_to(state.clone());
+        pre_register_self(client.clone(), "default".into(), &fallback).await?;
+        register_self(client.clone(), &payload, &fallback).await?;
+        let replaced = state.load_node_token().context("replacement persisted")?;
+        assert_ne!(replaced, "lgn_not_a_real_token");
+
+        // Neither credential valid: the refusal surfaces.
+        state.save_node_token("lgn_not_a_real_token")?;
+        let stranded = Arc::new(WorkerCredentials::with_join_secret(Some(
+            "lgnjoin_expired".into(),
+        )));
+        assert!(stranded.restore_from(&state));
+        let err = register_self(client.clone(), &payload, &stranded)
+            .await
+            .expect_err("no valid credential");
+        assert!(
+            err.downcast_ref::<tonic::Status>()
+                .is_some_and(|status| status.code() == tonic::Code::Unauthenticated),
+            "{err:#}"
+        );
         Ok(())
     }
 
@@ -3552,6 +3916,7 @@ mod tests {
             &identity_manager,
             &credentials,
             &Arc::new(UpstreamForwarder::new()),
+            None,
             None,
         )
         .await?;
@@ -3901,6 +4266,7 @@ mod tests {
                     ..crate::structs::ServiceEndpoint::default()
                 }],
             }],
+            manager_addresses: Vec::new(),
         };
 
         apply_upstreams(&forwarder, &reply, std::path::Path::new("/tmp")).await;

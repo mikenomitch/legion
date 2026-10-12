@@ -58,6 +58,100 @@ pub struct PlannedAllocation {
     pub instance_id: Option<String>,
 }
 
+/// Replicas a plan wanted to place but could not, because no node had room
+/// for them (capacity, a static port, a `distinct` rule).
+///
+/// A plan places what fits and reports the rest here instead of failing as
+/// a whole: one replica that cannot fit no longer keeps every other replica
+/// of the job from running (docs/scheduler-and-eval-loop.md, "Partial
+/// placement"). The remainder is placed by the next pass that has room — a
+/// node joining or being uncordoned queues one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnplacedTask {
+    pub task_config_id: i64,
+    pub task_name: String,
+    /// How many replicas of the task this plan left unplaced.
+    pub count: u32,
+    /// Why, in the same words a plan that placed nothing fails with.
+    pub reason: String,
+    /// The static port that kept the task off every node it is otherwise
+    /// allowed on, when a port was the cause.
+    pub static_port: Option<u16>,
+    /// What the eval blocks under when nothing of the plan could place
+    /// (docs/scheduler-and-eval-loop.md, "Blocked evals"): the task's class
+    /// key, or the node a pinned instance must return to.
+    pub blocked: crate::manager::blocked::PlacementBlocked,
+}
+
+/// The error a plan returns when it could place nothing at all because no
+/// node has room for any of its placements. Typed so callers can tell a
+/// placement that is blocked (retry when the cluster changes) from a broken
+/// job, and so a rollout can see that a static port is what blocks it.
+#[derive(Debug, Clone)]
+pub struct PlacementBlocked {
+    pub unplaced: Vec<UnplacedTask>,
+}
+
+impl PlacementBlocked {
+    /// The error for a plan that placed nothing. It carries the first
+    /// unplaced task's [`crate::manager::blocked::PlacementBlocked`] as its
+    /// source, so the eval worker blocks the eval under that key instead of
+    /// failing it, while callers that want the unplaced list (a rollout
+    /// looking for a static port) still downcast to this type.
+    pub fn nothing_placed(unplaced: Vec<UnplacedTask>) -> anyhow::Error {
+        let blocked = unplaced
+            .first()
+            .map(|task| task.blocked.clone())
+            .unwrap_or_else(|| {
+                crate::manager::blocked::PlacementBlocked::escaped(
+                    "No placements could be made".to_string(),
+                )
+            });
+        anyhow::Error::new(blocked).context(PlacementBlocked { unplaced })
+    }
+
+    /// The static port that blocked the plan, if any task was blocked by one.
+    pub fn static_port(&self) -> Option<u16> {
+        self.unplaced.iter().find_map(|task| task.static_port)
+    }
+}
+
+impl std::fmt::Display for PlacementBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut reasons = self.unplaced.iter().map(|task| task.reason.as_str());
+        match reasons.next() {
+            Some(first) => formatter.write_str(first)?,
+            None => formatter.write_str("No placements could be made")?,
+        }
+        for reason in reasons {
+            write!(formatter, "; {reason}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PlacementBlocked {}
+
+/// How the planner judges a task's `dependsOn` conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyGate {
+    /// Real placement. A `complete` or `success` dependency is met only by
+    /// the status a worker reported for the dependency's task: the task is
+    /// held (not placed) until its dependency has actually exited, and the
+    /// job is re-evaluated when it does (`Store::queue_dependency_progress`).
+    Live,
+    /// A dry run (`job plan`). A batch dependency planned in the same pass
+    /// counts as met, so the preview shows where every task of the job would
+    /// eventually run rather than only the first step of a DAG.
+    Preview,
+}
+
+/// The tasks a pass may place, and the ones still waiting on a dependency.
+struct ReadyTasks {
+    ready: Vec<(i64, TaskConfig, u32)>,
+    held: Vec<String>,
+}
+
 /// Parsed `schedulerSettings.plan_candidates`: how many ranked candidates
 /// each placement carries into the apply walk, and the score band the
 /// fallback tail is sampled from. `count: 0` disables candidate lists and
@@ -120,6 +214,13 @@ pub struct PlanOutcome {
     /// and aggregated by the benchmark runners
     /// (docs/testing-and-benchmarks.md).
     pub timings: PlanTimings,
+    /// Replicas this plan wanted but could not place (see
+    /// [`UnplacedTask`]). Empty when everything it wanted fit.
+    pub unplaced: Vec<UnplacedTask>,
+    /// Tasks this pass did not consider because a `dependsOn` condition is
+    /// not met yet (a batch dependency that has not exited). They are placed
+    /// by the eval queued when the dependency reaches a terminal state.
+    pub held_tasks: Vec<String>,
 }
 
 impl PlanOutcome {
@@ -130,7 +231,32 @@ impl PlanOutcome {
             deltas: Vec::new(),
             evictions: Vec::new(),
             timings,
+            unplaced: Vec::new(),
+            held_tasks: Vec::new(),
         }
+    }
+
+    /// One-line summary of what the plan left undone, for eval outcomes:
+    /// empty when it placed everything it was asked to.
+    pub fn shortfall_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.unplaced.is_empty() {
+            let count: u32 = self.unplaced.iter().map(|task| task.count).sum();
+            let reasons = self
+                .unplaced
+                .iter()
+                .map(|task| task.reason.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            parts.push(format!("{count} unplaced ({reasons})"));
+        }
+        if !self.held_tasks.is_empty() {
+            parts.push(format!(
+                "waiting on dependencies: {}",
+                self.held_tasks.join(", ")
+            ));
+        }
+        parts.join("; ")
     }
 }
 
@@ -250,6 +376,9 @@ struct BuiltPlan {
     /// Victims `observe` mode identified and did not take. Never committed;
     /// reported through `allocation.preempt_planned` and `job plan`.
     observed_preemptions: Vec<PlannedPreemption>,
+    /// Replicas no node had room for (only when the plan allows partial
+    /// placement; otherwise the first such replica fails the plan).
+    unplaced: Vec<UnplacedTask>,
 }
 
 /// The planned config's own allocations, indexed by node: every node that
@@ -317,6 +446,10 @@ struct CapacitySnapshot {
     /// The planned config's surviving allocations, by node (see
     /// [`OwnAllocationsByNode`]).
     own_by_node: OwnAllocationsByNode,
+    /// Host ports held by the rows this snapshot dropped, by node. The
+    /// capacity math ignores those rows, but the apply transaction's port
+    /// check still sees them until the handler removes them.
+    dropped_ports: HashMap<String, HashSet<u16>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -607,6 +740,113 @@ impl PreemptionPass {
             )
         }
     }
+}
+
+/// Plan-time view of the host ports in use on each node, so the planner only
+/// offers a static-port task nodes where its ports are free — the check the
+/// apply transaction makes (`Store::assign_allocation_network`), made before
+/// the plan is built instead of after it is rejected.
+///
+/// Lazy: a node's set is read from the snapshot the first time a static-port
+/// task asks about it, so a plan with no static ports pays nothing.
+#[derive(Debug, Default)]
+struct PortLedger {
+    /// Ports in use per node: the snapshot's allocations, plus ports this
+    /// plan already claimed. Built on first use per node.
+    used: HashMap<String, HashSet<u16>>,
+    /// Ports held by rows the snapshot dropped but the apply still sees (a
+    /// Fresh plan's own previous allocations), merged in on first use.
+    dropped: HashMap<String, HashSet<u16>>,
+}
+
+impl PortLedger {
+    fn new(dropped: HashMap<String, HashSet<u16>>) -> Self {
+        Self {
+            used: HashMap::new(),
+            dropped,
+        }
+    }
+
+    fn used_on(
+        &mut self,
+        node_id: &str,
+        allocations_by_node: &SharedNodeAllocations,
+    ) -> &mut HashSet<u16> {
+        if !self.used.contains_key(node_id) {
+            let mut used: HashSet<u16> = allocations_by_node
+                .get(node_id)
+                .map(|allocations| {
+                    allocations
+                        .iter()
+                        .flat_map(allocation_host_ports)
+                        .collect::<HashSet<u16>>()
+                })
+                .unwrap_or_default();
+            if let Some(dropped) = self.dropped.get(node_id) {
+                used.extend(dropped.iter().copied());
+            }
+            self.used.insert(node_id.to_string(), used);
+        }
+        self.used.get_mut(node_id).expect("inserted above")
+    }
+
+    /// The first of `ports` already in use on `node_id`, if any.
+    fn conflict(
+        &mut self,
+        node_id: &str,
+        ports: &[u16],
+        allocations_by_node: &SharedNodeAllocations,
+    ) -> Option<u16> {
+        let used = self.used_on(node_id, allocations_by_node);
+        ports.iter().copied().find(|port| used.contains(port))
+    }
+
+    /// Record that this plan placed a task holding `ports` on `node_id`.
+    /// Only called after [`Self::conflict`] has loaded the node's set.
+    fn claim(&mut self, node_id: &str, ports: &[u16]) {
+        self.used
+            .entry(node_id.to_string())
+            .or_default()
+            .extend(ports.iter().copied());
+    }
+}
+
+/// The host ports an allocation holds on its node: its assigned task ports
+/// and its upstream loopback ports. The same set the apply transaction
+/// treats as taken. A terminal allocation (its process exited) holds none.
+fn allocation_host_ports(allocation: &Allocation) -> impl Iterator<Item = u16> + '_ {
+    let holds = !crate::constants::allocation_status_is_terminal(&allocation.status);
+    allocation
+        .network
+        .iter()
+        .filter(move |_| holds)
+        .flat_map(|network| {
+            network
+                .ports
+                .iter()
+                .map(|port| port.host_port)
+                .chain(network.upstreams.iter().map(|upstream| upstream.local_port))
+        })
+}
+
+/// The static host ports a task claims wherever it lands: `network.ports`
+/// entries with a `static` port and `connect.upstreams` with a fixed
+/// `localPort`. Empty for the common all-dynamic task.
+fn task_static_ports(task: &TaskConfig) -> Vec<u16> {
+    let mut ports: Vec<u16> = task
+        .network
+        .iter()
+        .flat_map(|network| network.ports.iter().filter_map(|port| port.static_port))
+        .chain(task.connect.iter().flat_map(|connect| {
+            connect
+                .upstreams
+                .iter()
+                .filter_map(|upstream| upstream.local_port)
+        }))
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// Plan-time free-capacity ledger. Pools are `Arc`'d straight off the
@@ -1198,7 +1438,9 @@ impl<'a> Scheduler<'a> {
         let all_tasks = self
             .store
             .cached_task_configs_for_job_config(job_config_id)?;
-        let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
+        let mut tasks = self
+            .tasks_for_plan_from_store(job_config_id, DependencyGate::Preview)?
+            .ready;
         if matches!(mode, PlanMode::Reschedule) {
             if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
                 Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
@@ -1225,6 +1467,7 @@ impl<'a> Scheduler<'a> {
             index_report,
             evictions,
             observed_preemptions,
+            unplaced: _,
         } = self.build_plan(
             job_config_id,
             nodes,
@@ -1234,6 +1477,9 @@ impl<'a> Scheduler<'a> {
             snapshot,
             mode,
             None,
+            // A preview keeps all-or-nothing: it reports the first replica
+            // that would not fit as the plan's error.
+            false,
             PreemptorContext {
                 job: &preemptor.0,
                 band: preemptor.1,
@@ -1271,7 +1517,7 @@ impl<'a> Scheduler<'a> {
     ) -> R<CapacitySnapshot> {
         let (mut allocations_by_node, pools, _generation, job_allocations, scope_epochs) =
             self.store.plan_capacity_snapshot(job_id)?;
-        let (own_by_node, freed_nodes) = Self::index_own_allocations(
+        let (own_by_node, freed_nodes, dropped_ports) = Self::index_own_allocations(
             job_config_id,
             job_id,
             &job_allocations,
@@ -1284,6 +1530,7 @@ impl<'a> Scheduler<'a> {
             freed_nodes,
             scope_epochs,
             own_by_node,
+            dropped_ports,
         })
     }
 
@@ -1308,9 +1555,14 @@ impl<'a> Scheduler<'a> {
         job_allocations: &JobAllocationsByNode,
         allocations_by_node: &mut SharedNodeAllocations,
         drop: SnapshotDrop<'_>,
-    ) -> (OwnAllocationsByNode, HashSet<String>) {
+    ) -> (
+        OwnAllocationsByNode,
+        HashSet<String>,
+        HashMap<String, HashSet<u16>>,
+    ) {
         let mut own_by_node = OwnAllocationsByNode::new();
         let mut freed_nodes = HashSet::new();
+        let mut dropped_ports: HashMap<String, HashSet<u16>> = HashMap::new();
         for (node_id, references) in job_allocations {
             let mut drops = false;
             let mut own: Vec<i64> = Vec::new();
@@ -1325,6 +1577,14 @@ impl<'a> Scheduler<'a> {
             }
             if drops {
                 if let Some(allocations) = allocations_by_node.get_mut(node_id) {
+                    let ports: HashSet<u16> = allocations
+                        .iter()
+                        .filter(|allocation| drop.matches(allocation))
+                        .flat_map(allocation_host_ports)
+                        .collect();
+                    if !ports.is_empty() {
+                        dropped_ports.insert(node_id.clone(), ports);
+                    }
                     // `Arc::make_mut` copies the vector, so only a node
                     // that actually loses a row pays for one.
                     Arc::make_mut(allocations).retain(|allocation| !drop.matches(allocation));
@@ -1335,7 +1595,7 @@ impl<'a> Scheduler<'a> {
                 own_by_node.insert(node_id.clone(), own);
             }
         }
-        (own_by_node, freed_nodes)
+        (own_by_node, freed_nodes, dropped_ports)
     }
 
     #[instrument(skip_all)]
@@ -1355,8 +1615,7 @@ impl<'a> Scheduler<'a> {
             .into());
         }
 
-        let status_map = HashMap::new();
-        let mut tasks = Self::tasks_for_plan(job_config, &status_map)?;
+        let mut tasks = Self::tasks_for_plan(job_config)?;
         // Count overrides apply to dry-run plans too, so `job plan` previews
         // what a submit would actually converge to (job id == job name).
         Self::apply_count_overrides(self.store, &job_config.name, &mut tasks)?;
@@ -1403,6 +1662,7 @@ impl<'a> Scheduler<'a> {
             index_report,
             evictions,
             observed_preemptions,
+            unplaced: _,
         } = self.build_plan(
             &job_config.id(),
             nodes,
@@ -1412,6 +1672,7 @@ impl<'a> Scheduler<'a> {
             snapshot,
             mode,
             None,
+            false,
             PreemptorContext {
                 job: &job_config.name,
                 band: job_config.priority,
@@ -1542,7 +1803,10 @@ impl<'a> Scheduler<'a> {
         let all_tasks = self
             .store
             .cached_task_configs_for_job_config(job_config_id)?;
-        let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
+        let ReadyTasks {
+            ready: mut tasks,
+            held: held_tasks,
+        } = self.tasks_for_plan_from_store(job_config_id, DependencyGate::Live)?;
         if task_targets.is_none() && matches!(mode, PlanMode::Reschedule) {
             if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
                 Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
@@ -1598,6 +1862,7 @@ impl<'a> Scheduler<'a> {
             index_report,
             evictions,
             observed_preemptions,
+            unplaced,
         } = self.build_plan(
             job_config_id,
             nodes,
@@ -1607,6 +1872,7 @@ impl<'a> Scheduler<'a> {
             snapshot,
             mode.clone(),
             task_targets,
+            true,
             PreemptorContext {
                 job: &preemptor_job,
                 band: preemptor_band,
@@ -1614,6 +1880,43 @@ impl<'a> Scheduler<'a> {
             },
         )?;
         timings.build_plan_us = build_started.elapsed().as_micros() as u64;
+        if !held_tasks.is_empty() {
+            info!(
+                %job_config_id,
+                held = %held_tasks.join(", "),
+                "Tasks held until their dependencies reach a terminal state"
+            );
+        }
+        if !unplaced.is_empty() {
+            // Freed capacity (an allocation finishing or removed, a job
+            // stopping) now queues a capacity pass that retries this job.
+            self.store.note_capacity_waiters();
+            let unplaced_count: u32 = unplaced.iter().map(|task| task.count).sum();
+            if placements.is_empty() {
+                // Nothing fits anywhere: the plan fails as it always has, but
+                // with a typed error a caller can inspect. Not a conflict, so
+                // the eval is not requeued in a hot loop.
+                timings.total_us = started.elapsed().as_micros() as u64;
+                timings.observe();
+                warn!(
+                    %job_config_id,
+                    unplaced = unplaced_count,
+                    "Plan could not place any allocation"
+                );
+                return Err(PlacementBlocked::nothing_placed(unplaced));
+            }
+            warn!(
+                %job_config_id,
+                unplaced = unplaced_count,
+                placing = placements.len(),
+                reasons = %unplaced
+                    .iter()
+                    .map(|task| task.reason.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                "Plan places what fits; the rest stays unplaced"
+            );
+        }
         let indexed_tasks = index_report
             .iter()
             .filter(|usage| usage.index.is_some())
@@ -1637,6 +1940,8 @@ impl<'a> Scheduler<'a> {
                 deltas: Vec::new(),
                 evictions: Vec::new(),
                 timings,
+                unplaced,
+                held_tasks,
             });
         }
 
@@ -1798,6 +2103,8 @@ impl<'a> Scheduler<'a> {
             deltas,
             evictions: plan_evictions,
             timings,
+            unplaced,
+            held_tasks,
         };
         info!(
             %job_config_id,
@@ -1889,6 +2196,11 @@ impl<'a> Scheduler<'a> {
         self.store.available_nodes()
     }
 
+    /// `applying` is true for a plan that will be applied (as opposed to a
+    /// `job plan` preview). Such a plan places what fits and reports the rest
+    /// as [`UnplacedTask`]s, and it treats the static ports of the rows a
+    /// Fresh plan dropped as still taken, because the apply transaction
+    /// still sees those rows (`Store::assign_allocation_network`).
     fn build_plan(
         &self,
         job_config_id: &str,
@@ -1899,9 +2211,11 @@ impl<'a> Scheduler<'a> {
         capacity: CapacitySnapshot,
         mode: PlanMode,
         task_targets: Option<&HashMap<i64, u32>>,
+        applying: bool,
         preemptor: PreemptorContext<'_>,
     ) -> R<BuiltPlan> {
         tasks.sort_by_key(|a| a.0);
+        let mut unplaced: Vec<UnplacedTask> = Vec::new();
         // Preemption state for the whole plan: floors bind across placements,
         // and the victim index loads at most once (and only if a placement
         // actually fails for capacity).
@@ -1919,10 +2233,19 @@ impl<'a> Scheduler<'a> {
             freed_nodes,
             scope_epochs: _,
             own_by_node,
+            dropped_ports,
         } = capacity;
         // The body reads allocations by reference throughout (the owned map
         // outlives the plan); the pools move into the ledger below.
         let allocations_by_node = &allocations_by_node;
+        // Static host ports: what the snapshot's allocations hold per node,
+        // plus what this plan has claimed so far. Empty (and never filled)
+        // for a plan whose tasks declare no static port.
+        let mut port_ledger = PortLedger::new(if applying {
+            dropped_ports
+        } else {
+            HashMap::new()
+        });
         let mut placements = Vec::new();
         let mut index_report: Vec<TaskIndexUsage> = Vec::new();
         // Indexes arm only above the configured node threshold; below it the
@@ -2207,6 +2530,8 @@ impl<'a> Scheduler<'a> {
                         &mut group_assignments,
                         candidates_setting,
                         &mut preemption_pass,
+                        &mut port_ledger,
+                        applying.then_some(&mut unplaced),
                     )?;
                 }
             } else {
@@ -2257,6 +2582,8 @@ impl<'a> Scheduler<'a> {
                     &mut group_assignments,
                     candidates_setting,
                     &mut preemption_pass,
+                    &mut port_ledger,
+                    applying.then_some(&mut unplaced),
                 )?;
             }
             index_report.push(plan.index_usage.clone());
@@ -2274,6 +2601,7 @@ impl<'a> Scheduler<'a> {
             index_report,
             evictions: preemption_pass.victims,
             observed_preemptions: preemption_pass.observed,
+            unplaced,
         })
     }
 
@@ -2790,7 +3118,19 @@ impl<'a> Scheduler<'a> {
         group_assignments: &mut HashMap<GroupKey, String>,
         candidates_setting: PlanCandidatesSetting,
         preemption: &mut PreemptionPass,
+        port_ledger: &mut PortLedger,
+        mut unplaced: Option<&mut Vec<UnplacedTask>>,
     ) -> R<()> {
+        // Static host ports this task claims on its node. A node already
+        // holding one of them (in the snapshot, or claimed earlier in this
+        // plan) is not a candidate: the apply transaction would refuse the
+        // placement there, and before this check the planner kept choosing
+        // it, so the plan was rejected and the eval requeued forever.
+        let static_ports = task_static_ports(task_config);
+        // A placement no node can take is recorded here (when the plan may
+        // place partially and the task is not part of a co-placed group)
+        // instead of failing the whole plan.
+        let partial = group_key.is_none() && unplaced.is_some();
         // Owned so the truncated-index refill below can widen it mid-task.
         let mut candidates: Vec<&'b Node> = candidates.to_vec();
         let mut scoring_cache = PlanScoringCache::from_plan(
@@ -2908,7 +3248,7 @@ impl<'a> Scheduler<'a> {
         // first use, so a plan with no spread fork never reads it.
         let mut spread_nodes: HashMap<String, HashSet<String>> = HashMap::new();
 
-        for _ in 0..count {
+        for placement_index in 0..count {
             let mut eligible = Self::eligible_nodes(
                 &candidates,
                 plan.constraint_set(),
@@ -2968,6 +3308,23 @@ impl<'a> Scheduler<'a> {
                 );
             }
 
+            // Static ports: drop every node where one of this task's static
+            // ports is already held. Remember the first port that excluded a
+            // node, so a failure below can name it.
+            let mut port_conflict: Option<u16> = None;
+            if !static_ports.is_empty() {
+                eligible.retain(|node| {
+                    match port_ledger.conflict(node.id.as_str(), &static_ports, allocations_by_node)
+                    {
+                        Some(port) => {
+                            port_conflict.get_or_insert(port);
+                            false
+                        }
+                        None => true,
+                    }
+                });
+            }
+
             // Preemption: the fleet has nodes this task is *allowed* on, they
             // are simply full. Ask whether displacing lower-band work would
             // open one. Runs only here — after normal feasibility has already
@@ -2975,12 +3332,21 @@ impl<'a> Scheduler<'a> {
             // never use it.
             let mut preempted_node: Option<String> = None;
             if eligible.is_empty() {
-                let full_but_allowed = Self::preemption_candidate_nodes(
+                let mut full_but_allowed = Self::preemption_candidate_nodes(
                     &candidates,
                     plan.constraint_set(),
                     plan.permit_set(),
                     plan.distinct_tracker.as_ref(),
                 );
+                // Evicting work frees capacity, not a port another job holds:
+                // a port-blocked node is no preemption target.
+                if !static_ports.is_empty() {
+                    full_but_allowed.retain(|node| {
+                        port_ledger
+                            .conflict(node.id.as_str(), &static_ports, allocations_by_node)
+                            .is_none()
+                    });
+                }
                 if let Some(chosen) = self.plan_preemption_for_placement(
                     &full_but_allowed,
                     task_config,
@@ -3051,22 +3417,43 @@ impl<'a> Scheduler<'a> {
             }
 
             if eligible.is_empty() {
-                // No room anywhere this task may run: the eval blocks under
-                // the task's class (or the node a restore is pinned to) and
-                // waits for capacity, instead of failing (sandbox-scaling
-                // plan §6.15).
+                // No room anywhere this task may run. A partial plan places
+                // what fits and reports the rest; a plan that places nothing
+                // blocks the eval under the task's class (or the node a
+                // restore is pinned to) until capacity that could help
+                // appears (docs/scheduler-and-eval-loop.md, "Blocked evals").
+                let reason = match port_conflict {
+                    Some(port) => format!(
+                        "Failed to place task {}: static port {port} is already in use on every \
+                         node it is allowed on that has room for it. A static port fits one \
+                         allocation per node: add nodes, lower the count, or use a dynamic port",
+                        task_config.name
+                    ),
+                    None => preemption.no_placement_error(task_config),
+                };
                 let pinned_node = if hard_restore_pins > 0 || floating_restores.is_empty() {
                     pins.front().map(|(_, node_id)| node_id.as_str())
                 } else {
                     None
                 };
-                return Err(crate::manager::blocked::PlacementBlocked::for_task(
+                let blocked = crate::manager::blocked::PlacementBlocked::for_task(
                     task_config,
                     task_id,
                     pinned_node,
-                    preemption.no_placement_error(task_config),
-                )
-                .into());
+                    reason.clone(),
+                );
+                return Self::record_unplaced(
+                    partial,
+                    &mut unplaced,
+                    UnplacedTask {
+                        task_config_id: task_id,
+                        task_name: task_config.name.clone(),
+                        count: count - placement_index,
+                        reason,
+                        static_port: port_conflict,
+                        blocked,
+                    },
+                );
             }
 
             // Disk fit: drop nodes whose remaining free disk (minus what this
@@ -3237,19 +3624,62 @@ impl<'a> Scheduler<'a> {
                         .filter(|node| node.id.as_str() == node_id.as_str())
                         .collect::<Vec<_>>();
                     if pinned.is_empty() {
-                        return Err(crate::manager::blocked::PlacementBlocked::for_task(
+                        // Say why the pinned node cannot take it. Only a node
+                        // that is really gone gets the "abandon the data"
+                        // advice; a healthy node that is full, port-blocked,
+                        // or excluded from this pass must never prompt anyone
+                        // to delete data they have not lost.
+                        let why = if node_lookup.get(node_id.as_str()).is_none() {
+                            self.pinned_node_absent_reason(node_id)
+                        } else if !candidates.iter().any(|node| node.id == *node_id) {
+                            "which is healthy but no longer satisfies the task's constraints, \
+                             permit, or volume drivers. Its data is intact; restore the node's \
+                             attributes to place it there again"
+                                .to_string()
+                        } else if let Some(port) = (!static_ports.is_empty())
+                            .then(|| {
+                                port_ledger.conflict(
+                                    node_id.as_str(),
+                                    &static_ports,
+                                    allocations_by_node,
+                                )
+                            })
+                            .flatten()
+                        {
+                            format!(
+                                "which is healthy but has static port {port} in use by another \
+                                 allocation. Its data is intact; it is placed there once the \
+                                 port is free"
+                            )
+                        } else {
+                            "which is healthy but has no room for it right now (CPU, memory, \
+                             disk, or a `distinct` rule). Its data is intact; it is placed \
+                             there once the node has room"
+                                .to_string()
+                        };
+                        let reason = format!(
+                            "Failed to place task {}: instance {instance_id} holds \
+                             node-local storage on node {node_id}, {why}",
+                            task_config.name
+                        );
+                        let blocked = crate::manager::blocked::PlacementBlocked::for_task(
                             task_config,
                             task_id,
                             Some(node_id.as_str()),
-                            format!(
-                                "Failed to place task {}: instance {instance_id} holds \
-                                 node-local storage on node {node_id}, which is unavailable. \
-                                 Waiting for that node to return; use `legion volume delete \
-                                 --force <id>` to abandon the data if it never will",
-                                task_config.name
-                            ),
-                        )
-                        .into());
+                            reason.clone(),
+                        );
+                        return Self::record_unplaced(
+                            partial,
+                            &mut unplaced,
+                            UnplacedTask {
+                                task_config_id: task_id,
+                                task_name: task_config.name.clone(),
+                                count: count - placement_index,
+                                reason,
+                                static_port: None,
+                                blocked,
+                            },
+                        );
                     }
                     pinned
                 }
@@ -3261,11 +3691,44 @@ impl<'a> Scheduler<'a> {
                         .iter()
                         .any(|node| node.id.as_str() == existing.as_str());
                     if !is_eligible {
-                        bail!(
-                            "Failed to place task {} in group {}: assigned node {} is not eligible",
-                            task_config.name,
-                            group_key.name,
-                            existing
+                        let port = (!static_ports.is_empty())
+                            .then(|| {
+                                port_ledger.conflict(
+                                    existing.as_str(),
+                                    &static_ports,
+                                    allocations_by_node,
+                                )
+                            })
+                            .flatten();
+                        let reason = match port {
+                            Some(port) => format!(
+                                "Failed to place task {} in group {}: assigned node {} has \
+                                 static port {port} in use",
+                                task_config.name, group_key.name, existing
+                            ),
+                            None => format!(
+                                "Failed to place task {} in group {}: assigned node {} is not \
+                                 eligible",
+                                task_config.name, group_key.name, existing
+                            ),
+                        };
+                        let blocked = crate::manager::blocked::PlacementBlocked::for_task(
+                            task_config,
+                            task_id,
+                            None,
+                            reason.clone(),
+                        );
+                        return Self::record_unplaced(
+                            partial,
+                            &mut unplaced,
+                            UnplacedTask {
+                                task_config_id: task_id,
+                                task_name: task_config.name.clone(),
+                                count: count - placement_index,
+                                reason,
+                                static_port: port,
+                                blocked,
+                            },
                         );
                     }
                     (existing.clone(), vec![existing.clone()])
@@ -3355,6 +3818,9 @@ impl<'a> Scheduler<'a> {
                 }
             }
             resource_ledger.consume(&node_id, &plan.task_request)?;
+            if !static_ports.is_empty() {
+                port_ledger.claim(&node_id, &static_ports);
+            }
             if let Some(node) = placed_node {
                 scoring_cache.update_after_placement(
                     node,
@@ -3373,6 +3839,48 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(())
+    }
+
+    /// Give up on the rest of a task's placements: record them as unplaced
+    /// when the plan may place partially, or fail the plan with a typed
+    /// [`PlacementBlocked`] when it may not.
+    fn record_unplaced(
+        partial: bool,
+        unplaced: &mut Option<&mut Vec<UnplacedTask>>,
+        task: UnplacedTask,
+    ) -> R<()> {
+        match unplaced.as_deref_mut() {
+            Some(list) if partial => {
+                list.push(task);
+                Ok(())
+            }
+            _ => Err(PlacementBlocked::nothing_placed(vec![task])),
+        }
+    }
+
+    /// Why a stateful instance's pinned node is not in this plan's node set
+    /// at all, worded as the tail of "holds node-local storage on node X, …".
+    /// Only a node that is lost or gone is called unavailable, and only then
+    /// does the message mention abandoning the data.
+    fn pinned_node_absent_reason(&self, node_id: &str) -> String {
+        match self.store.get_node(node_id) {
+            Ok(node) if node.status == "lost" || node.availability == "unavailable" => {
+                "which is unavailable. Waiting for that node to return; use `legion volume \
+                 delete --force <id>` to abandon the data if it never will"
+                    .to_string()
+            }
+            Ok(node) if node.availability != "available" => format!(
+                "which is cordoned or drained (availability {}). Its data is intact; \
+                 `legion node uncordon {node_id}` lets the instance return to it",
+                node.availability
+            ),
+            Ok(_) => "which is healthy but was excluded from this placement pass (a \
+                      reschedule tries the other nodes first). Its data is intact"
+                .to_string(),
+            Err(_) => "which is no longer registered. Use `legion volume delete --force <id>` \
+                       to abandon the data if the node will not rejoin"
+                .to_string(),
+        }
     }
 
     /// Select the ranked candidate list for one placement. The returned
@@ -3876,7 +4384,17 @@ impl<'a> Scheduler<'a> {
             .collect()
     }
 
-    fn tasks_for_plan_from_store(&self, job_config_id: &str) -> R<Vec<(i64, TaskConfig, u32)>> {
+    /// The tasks of a stored config this pass may place, with their desired
+    /// counts, and the tasks held back by an unmet `dependsOn`. A `Live`
+    /// gate judges dependencies by the statuses workers reported; a
+    /// `Preview` gate (a dry run) ignores them and treats every batch
+    /// dependency as one that will succeed, so the preview shows the job's
+    /// full eventual placement.
+    fn tasks_for_plan_from_store(
+        &self,
+        job_config_id: &str,
+        gate: DependencyGate,
+    ) -> R<ReadyTasks> {
         let tasks = self
             .store
             .cached_task_configs_for_job_config(job_config_id)?
@@ -3886,7 +4404,14 @@ impl<'a> Scheduler<'a> {
                 (id, config, desired)
             })
             .collect::<Vec<_>>();
-        let status_by_id = self.store.task_statuses_for_job_config(job_config_id)?;
+        // A task with no dependencies never needs a status, and most jobs
+        // have none: skip the status read entirely for them.
+        let has_dependencies = tasks.iter().any(|(_, task, _)| !task.depends_on.is_empty());
+        let status_by_id = if has_dependencies && gate == DependencyGate::Live {
+            self.store.task_statuses_for_job_config(job_config_id)?
+        } else {
+            HashMap::new()
+        };
         let status_map = tasks
             .iter()
             .map(|(id, task, _)| {
@@ -3900,15 +4425,15 @@ impl<'a> Scheduler<'a> {
             })
             .collect::<HashMap<_, _>>();
 
-        let mut tasks = Self::ready_tasks(tasks, &status_map)?;
+        let mut ready = Self::ready_tasks(tasks, &status_map, gate)?;
         if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
             // Overrides first, keyed counts second: keyed tasks' desired
             // comes from live instances and must win (scaling keyed tasks
             // is rejected at the ScaleTask RPC anyway).
-            Self::apply_count_overrides(self.store, &job_id, &mut tasks)?;
-            Self::apply_keyed_instance_counts(self.store, &job_id, &mut tasks)?;
+            Self::apply_count_overrides(self.store, &job_id, &mut ready.ready)?;
+            Self::apply_keyed_instance_counts(self.store, &job_id, &mut ready.ready)?;
         }
-        Ok(tasks)
+        Ok(ready)
     }
 
     /// Overlay `legion job scale` count overrides (docs/autoscaling.md):
@@ -3997,10 +4522,9 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn tasks_for_plan(
-        job_config: &JobConfig,
-        status_map: &HashMap<String, TaskStatusState>,
-    ) -> R<Vec<(i64, TaskConfig, u32)>> {
+    /// The tasks of a not-yet-stored config a dry run places: every task
+    /// whose dependencies a preview considers satisfiable.
+    fn tasks_for_plan(job_config: &JobConfig) -> R<Vec<(i64, TaskConfig, u32)>> {
         let tasks = job_config
             .tasks
             .iter()
@@ -4008,13 +4532,14 @@ impl<'a> Scheduler<'a> {
             .map(|(index, config)| ((index + 1) as i64, config.clone(), config.count.num))
             .collect::<Vec<_>>();
 
-        Self::ready_tasks(tasks, status_map)
+        Ok(Self::ready_tasks(tasks, &HashMap::new(), DependencyGate::Preview)?.ready)
     }
 
     fn ready_tasks(
         tasks: Vec<(i64, TaskConfig, u32)>,
         status_map: &HashMap<String, TaskStatusState>,
-    ) -> R<Vec<(i64, TaskConfig, u32)>> {
+        gate: DependencyGate,
+    ) -> R<ReadyTasks> {
         let mut tasks_by_name: HashMap<String, &TaskConfig> = HashMap::new();
         for (_task_id, task, _count) in &tasks {
             tasks_by_name.insert(task.name.clone(), task);
@@ -4036,7 +4561,13 @@ impl<'a> Scheduler<'a> {
                     .copied()
                     .context("Task missing from task map")?;
                 let ready = task.depends_on.iter().all(|dependency| {
-                    Self::dependency_satisfied(dependency, status_map, &planned, &tasks_by_name)
+                    Self::dependency_satisfied(
+                        dependency,
+                        status_map,
+                        &planned,
+                        &tasks_by_name,
+                        gate,
+                    )
                 });
                 if ready {
                     planned.insert(task_name.clone());
@@ -4045,10 +4576,13 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        Ok(tasks
+        let (ready, held): (Vec<_>, Vec<_>) = tasks
             .into_iter()
-            .filter(|(_, task, _)| planned.contains(&task.name))
-            .collect())
+            .partition(|(_, task, _)| planned.contains(&task.name));
+        Ok(ReadyTasks {
+            ready,
+            held: held.into_iter().map(|(_, task, _)| task.name).collect(),
+        })
     }
 
     fn task_names_topologically_sorted(
@@ -4108,11 +4642,24 @@ impl<'a> Scheduler<'a> {
         Ok(ordered)
     }
 
+    /// Whether one `dependsOn` entry lets its task be placed in this pass.
+    ///
+    /// - `start`: the dependency has started, or is placed in this pass.
+    /// - `complete`: the dependency finished, whether it succeeded or
+    ///   failed (its worker reported an exit).
+    /// - `success`: the dependency finished successfully (exited 0).
+    ///
+    /// Under the `Live` gate only a reported status satisfies `complete` and
+    /// `success`. Counting a batch dependency that is merely placed in the
+    /// same pass — what this did before — started a whole chain of batch
+    /// steps at once and let a dependent run after its dependency failed.
+    /// The `Preview` gate keeps that optimistic reading for dry runs.
     fn dependency_satisfied(
         dependency: &crate::structs::TaskDependency,
         status_map: &HashMap<String, TaskStatusState>,
         planned: &HashSet<String>,
         tasks_by_name: &HashMap<String, &TaskConfig>,
+        gate: DependencyGate,
     ) -> bool {
         let dep_name = dependency.task.as_str();
         let dep_status = status_map
@@ -4124,18 +4671,19 @@ impl<'a> Scheduler<'a> {
             .map(|task| task.lifecycle.clone())
             .unwrap_or(TaskLifecycle::Service);
         let planned_dep = planned.contains(dep_name);
+        let preview_batch =
+            gate == DependencyGate::Preview && planned_dep && dep_lifecycle == TaskLifecycle::Batch;
 
         match dependency.condition {
             TaskDependencyCondition::Start => dep_status.is_started() || planned_dep,
             TaskDependencyCondition::Complete => {
-                dep_status != TaskStatusState::Failed
-                    && (dep_status.is_complete()
-                        || (planned_dep && dep_lifecycle == TaskLifecycle::Batch))
+                matches!(
+                    dep_status,
+                    TaskStatusState::Complete | TaskStatusState::Success | TaskStatusState::Failed
+                ) || preview_batch
             }
             TaskDependencyCondition::Success => {
-                dep_status != TaskStatusState::Failed
-                    && (dep_status.is_success()
-                        || (planned_dep && dep_lifecycle == TaskLifecycle::Batch))
+                dep_status.is_success() || (dep_status != TaskStatusState::Failed && preview_batch)
             }
         }
     }
@@ -6667,10 +7215,20 @@ mod tests {
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
 
-        let err = scheduler
-            .plan_and_apply(&job_config_id, PlanMode::Fresh)
-            .expect_err("expected resource scheduling failure");
+        // The node holds two: those are placed, the third is reported
+        // unplaced instead of failing the whole plan, and nothing overcommits.
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+        assert_eq!(outcome.unplaced.len(), 1);
+        assert_eq!(outcome.unplaced[0].count, 1);
+        assert!(outcome.unplaced[0]
+            .reason
+            .contains("no available nodes matching constraints, permit, or resources"));
 
+        // With the node full, the next pass places nothing and fails.
+        let err = scheduler
+            .plan_and_apply(&job_config_id, PlanMode::Reschedule)
+            .expect_err("expected resource scheduling failure");
         assert!(err
             .to_string()
             .contains("no available nodes matching constraints, permit, or resources"));
@@ -6826,12 +7384,11 @@ mod tests {
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
 
-        let err = scheduler
-            .plan_and_apply(&job_config_id, PlanMode::Fresh)
-            .expect_err("expected max allocations failure");
-
-        assert!(err
-            .to_string()
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1, "maxAllocations = 1");
+        assert_eq!(outcome.unplaced.len(), 1);
+        assert!(outcome.unplaced[0]
+            .reason
             .contains("no available nodes matching constraints, permit, or resources"));
 
         Ok(())
@@ -7103,15 +7660,17 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        // build runs first; api waits for it to exit 0.
+        let first = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(first.allocations.len(), 1);
+        assert_eq!(first.held_tasks, vec!["api".to_string()]);
+        store.complete_allocation(first.allocations[0].id, true)?;
 
-        assert_eq!(outcome.allocations.len(), 2);
-        let node_ids: HashSet<_> = outcome
-            .allocations
-            .iter()
-            .map(|alloc| alloc.node_id.as_str())
-            .collect();
-        assert_eq!(node_ids.len(), 1);
+        // The completed build row still pins the group, so api lands beside it.
+        let second = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert_eq!(second.allocations.len(), 1);
+        assert!(second.held_tasks.is_empty());
+        assert_eq!(second.allocations[0].node_id, first.allocations[0].node_id);
 
         Ok(())
     }
@@ -7151,11 +7710,19 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let first = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(first.allocations.len(), 1, "web waits for seed to exit");
+        store.complete_allocation(first.allocations[0].id, true)?;
+        let second = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
 
-        assert_eq!(outcome.allocations.len(), 2);
+        let placed = first
+            .allocations
+            .iter()
+            .chain(second.allocations.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(placed.len(), 2);
         let mut roles = HashSet::new();
-        for allocation in &outcome.allocations {
+        for allocation in placed {
             let node = store.get_node(&allocation.node_id)?;
             let role = node
                 .config_attrs
@@ -7223,7 +7790,7 @@ mod tests {
 
         let mut allocations_by_node = allocations_by_node;
         let job_index = job_index_for(&allocations_by_node, "job-1");
-        let (own_by_node, freed_nodes) = Scheduler::index_own_allocations(
+        let (own_by_node, freed_nodes, _) = Scheduler::index_own_allocations(
             "cfg-1",
             "job-1",
             &job_index,
@@ -7310,7 +7877,7 @@ mod tests {
 
         let mut allocations_by_node = allocations_by_node;
         let job_index = job_index_for(&allocations_by_node, "job-1");
-        let (own_by_node, _freed_nodes) = Scheduler::index_own_allocations(
+        let (own_by_node, _freed_nodes, _) = Scheduler::index_own_allocations(
             "cfg-1",
             "job-1",
             &job_index,
@@ -7379,7 +7946,7 @@ mod tests {
         // planned config's rows, by node, and no list is touched.
         let mut untouched = snapshot();
         let job_index = job_index_for(&untouched, "job-1");
-        let (own, freed) = Scheduler::index_own_allocations(
+        let (own, freed, _) = Scheduler::index_own_allocations(
             "cfg-1",
             "job-1",
             &job_index,
@@ -7398,7 +7965,7 @@ mod tests {
         // with the job's.
         let mut dropped = snapshot();
         let job_index = job_index_for(&dropped, "job-1");
-        let (own, freed) = Scheduler::index_own_allocations(
+        let (own, freed, _) = Scheduler::index_own_allocations(
             "cfg-1",
             "job-1",
             &job_index,
@@ -7419,7 +7986,7 @@ mod tests {
         // node-b stays (and is counted), so only node-a's list changes.
         let mut previewed = snapshot();
         let job_index = job_index_for(&previewed, "job-1");
-        let (own, freed) = Scheduler::index_own_allocations(
+        let (own, freed, _) = Scheduler::index_own_allocations(
             "cfg-1",
             "job-1",
             &job_index,
@@ -7456,13 +8023,113 @@ mod tests {
             ..TaskConfig::new("api", "noop")
         };
 
-        let ready = Scheduler::ready_tasks(
-            vec![(1, build, 1), (2, seed, 1), (3, api, 1)],
-            &HashMap::new(),
-        )?;
+        let tasks = vec![(1, build, 1), (2, seed, 1), (3, api, 1)];
 
-        assert_eq!(ready.len(), 3);
+        // A dry run shows the whole chain: planned batch steps count.
+        let preview =
+            Scheduler::ready_tasks(tasks.clone(), &HashMap::new(), DependencyGate::Preview)?;
+        assert_eq!(preview.ready.len(), 3);
+        assert!(preview.held.is_empty());
+
+        // Real placement: only the root, until it has actually exited.
+        let live = Scheduler::ready_tasks(tasks.clone(), &HashMap::new(), DependencyGate::Live)?;
+        assert_eq!(
+            live.ready
+                .iter()
+                .map(|(_, task, _)| task.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["build"]
+        );
+        assert_eq!(live.held, vec!["seed".to_string(), "api".to_string()]);
+
+        // build exited 0: seed is next, api still waits on seed.
+        let statuses = HashMap::from([("build".to_string(), TaskStatusState::Success)]);
+        let live = Scheduler::ready_tasks(tasks.clone(), &statuses, DependencyGate::Live)?;
+        assert_eq!(live.ready.len(), 2);
+        assert_eq!(live.held, vec!["api".to_string()]);
         Ok(())
+    }
+
+    #[test]
+    fn dependency_conditions_follow_reported_status() {
+        let dependency = |condition| crate::structs::TaskDependency {
+            task: "step".into(),
+            condition,
+        };
+        let step = TaskConfig {
+            lifecycle: TaskLifecycle::Batch,
+            ..TaskConfig::new("step", "exec")
+        };
+        let tasks_by_name = HashMap::from([("step".to_string(), &step)]);
+        let planned = HashSet::from(["step".to_string()]);
+        let none = HashSet::new();
+        let satisfied = |condition, status: TaskStatusState, planned: &HashSet<String>| {
+            Scheduler::dependency_satisfied(
+                &dependency(condition),
+                &HashMap::from([("step".to_string(), status)]),
+                planned,
+                &tasks_by_name,
+                DependencyGate::Live,
+            )
+        };
+
+        // Being placed in the same pass satisfies only `start`.
+        assert!(satisfied(
+            TaskDependencyCondition::Start,
+            TaskStatusState::Pending,
+            &planned
+        ));
+        assert!(!satisfied(
+            TaskDependencyCondition::Complete,
+            TaskStatusState::Pending,
+            &planned
+        ));
+        assert!(!satisfied(
+            TaskDependencyCondition::Success,
+            TaskStatusState::Pending,
+            &planned
+        ));
+        // Running is not finished.
+        assert!(!satisfied(
+            TaskDependencyCondition::Success,
+            TaskStatusState::Running,
+            &none
+        ));
+        assert!(!satisfied(
+            TaskDependencyCondition::Complete,
+            TaskStatusState::Running,
+            &none
+        ));
+        // Exited 0.
+        assert!(satisfied(
+            TaskDependencyCondition::Success,
+            TaskStatusState::Success,
+            &none
+        ));
+        assert!(satisfied(
+            TaskDependencyCondition::Complete,
+            TaskStatusState::Success,
+            &none
+        ));
+        // Exited non-zero: finished, but not a success.
+        assert!(!satisfied(
+            TaskDependencyCondition::Success,
+            TaskStatusState::Failed,
+            &none
+        ));
+        assert!(satisfied(
+            TaskDependencyCondition::Complete,
+            TaskStatusState::Failed,
+            &none
+        ));
+        // A preview never lets a failed dependency through `success`.
+        assert!(!Scheduler::dependency_satisfied(
+            &dependency(TaskDependencyCondition::Success),
+            &HashMap::from([("step".to_string(), TaskStatusState::Failed)]),
+            &planned,
+            &tasks_by_name,
+            DependencyGate::Preview,
+        ));
     }
 
     #[test]
@@ -7530,11 +8197,15 @@ mod tests {
         let scheduler = Scheduler::new(&store)?;
         let outcome_one =
             scheduler.plan_and_apply(&store.get_job_config("job-one")?.id(), PlanMode::Fresh)?;
-        let outcome_two =
-            scheduler.plan_and_apply(&store.get_job_config("job-two")?.id(), PlanMode::Fresh)?;
+        let job_two_config = store.get_job_config("job-two")?.id();
+        let outcome_two = scheduler.plan_and_apply(&job_two_config, PlanMode::Fresh)?;
 
         assert_eq!(outcome_one.allocations.len(), 2);
-        assert_eq!(outcome_two.allocations.len(), 2);
+        // `worker` waits for `prepare` to exit 0, then places.
+        assert_eq!(outcome_two.allocations.len(), 1);
+        store.complete_allocation(outcome_two.allocations[0].id, true)?;
+        let outcome_two_rest = scheduler.plan_and_apply(&job_two_config, PlanMode::Reschedule)?;
+        assert_eq!(outcome_two_rest.allocations.len(), 1);
 
         let ledger = store.get_ledger()?;
         for entry in ledger {
@@ -7794,9 +8465,11 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
-        let result = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh);
-        assert!(
-            result.is_err(),
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(
+            outcome.unplaced.len(),
+            1,
             "second allocation cannot claim an already-consumed gpu item"
         );
 
@@ -8238,6 +8911,230 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
         assert_eq!(outcome.allocations.len(), 1);
 
+        Ok(())
+    }
+
+    fn static_port_task(name: &str, port: u16, count: u32) -> TaskConfig {
+        TaskConfig {
+            count: TaskCount::new(count),
+            network: Some(crate::structs::network::NetworkConfig {
+                labels: Default::default(),
+                egress: None,
+                ingress: None,
+                mode: "host".into(),
+                ports: vec![crate::structs::network::PortConfig {
+                    name: "http".into(),
+                    static_port: Some(port),
+                    to: None,
+                }],
+            }),
+            ..TaskConfig::new(name, "noop")
+        }
+    }
+
+    /// P1-2: two replicas of a static-port task on a one-node cluster. The
+    /// planner used to put both on the node, the apply refused the second,
+    /// the whole plan was rejected as a conflict, and the eval requeued
+    /// forever with nothing placed. Now one replica places and the other is
+    /// reported unplaced, naming the port.
+    #[test]
+    fn static_port_replicas_place_what_fits_and_report_the_rest() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        let job_config_id = submit_job(&store, "web", vec![static_port_task("web", 18080, 2)])?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.unplaced.len(), 1);
+        assert_eq!(outcome.unplaced[0].count, 1);
+        assert_eq!(outcome.unplaced[0].static_port, Some(18080));
+        assert!(
+            outcome.unplaced[0].reason.contains("static port 18080"),
+            "{}",
+            outcome.unplaced[0].reason
+        );
+
+        // The reschedule that follows places nothing more and is a typed
+        // placement failure, not a plan conflict (which would requeue it).
+        let error = scheduler
+            .plan_and_apply(&job_config_id, PlanMode::Reschedule)
+            .expect_err("no node has the port free");
+        assert!(
+            error.downcast_ref::<PlacementBlocked>().is_some(),
+            "{error:#}"
+        );
+        assert!(!crate::structs::Eval::error_is_plan_conflict(&error));
+        Ok(())
+    }
+
+    #[test]
+    fn static_port_replicas_spread_one_per_node() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+        let job_config_id = submit_job(&store, "web", vec![static_port_task("web", 18080, 2)])?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+        assert!(outcome.unplaced.is_empty());
+        let nodes: HashSet<_> = outcome
+            .allocations
+            .iter()
+            .map(|allocation| allocation.node_id.as_str())
+            .collect();
+        assert_eq!(nodes.len(), 2, "a static port fits one replica per node");
+        Ok(())
+    }
+
+    /// The planner sees ports held by OTHER jobs too, so it picks the free
+    /// node instead of planning onto the taken one and losing at apply.
+    #[test]
+    fn a_node_whose_static_port_is_taken_is_not_a_candidate() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let first = submit_job(&store, "first", vec![static_port_task("first", 18080, 1)])?;
+        let held = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
+        assert_eq!(held.allocations.len(), 1);
+        let taken = held.allocations[0].node_id.clone();
+
+        let second = submit_job(&store, "second", vec![static_port_task("second", 18080, 1)])?;
+        for _ in 0..5 {
+            let probe = scheduler.plan_only(&second, PlanMode::Fresh)?;
+            assert_eq!(probe.len(), 1);
+            assert_ne!(probe[0].node_id, taken);
+            assert!(!probe[0].candidates.contains(&taken));
+        }
+        let outcome = scheduler.plan_and_apply(&second, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_ne!(outcome.allocations[0].node_id, taken);
+        Ok(())
+    }
+
+    /// A finished allocation keeps its row (its slot stays spent) but holds
+    /// neither its static port nor its resources: both the planner and the
+    /// apply let the next job have them.
+    #[test]
+    fn a_finished_allocation_frees_its_static_port() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let first_task = TaskConfig {
+            lifecycle: TaskLifecycle::Batch,
+            ..static_port_task("first", 18080, 1)
+        };
+        let first = submit_job(&store, "first", vec![first_task])?;
+        let held = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
+        assert_eq!(held.allocations.len(), 1);
+
+        let second = submit_job(&store, "second", vec![static_port_task("second", 18080, 1)])?;
+        let error = scheduler
+            .plan_and_apply(&second, PlanMode::Fresh)
+            .expect_err("the port is held while first runs");
+        assert!(
+            error.downcast_ref::<PlacementBlocked>().is_some(),
+            "{error:#}"
+        );
+
+        store.complete_allocation(held.allocations[0].id, true)?;
+        let outcome = scheduler.plan_and_apply(&second, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert!(store
+            .get_allocation_by_id(held.allocations[0].id)?
+            .is_some());
+        Ok(())
+    }
+
+    /// The same for resources: a node full of a finished task's allocation
+    /// has room again, in the read model's pools and in the apply's cached
+    /// usage alike.
+    #[test]
+    fn a_finished_allocation_frees_its_resources() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-a",
+            json!({}),
+            json!({
+                "memory_total": "1073741824",
+                "cpus": { "cpu-1": { "frequency": "1000" } }
+            }),
+            json!({}),
+        ))?;
+        let scheduler = Scheduler::new(&store)?;
+        let big = |name: &str, lifecycle| TaskConfig {
+            lifecycle,
+            resources: json!({ "memory": 768 }),
+            ..TaskConfig::new(name, "noop")
+        };
+
+        let first = submit_job(&store, "first", vec![big("first", TaskLifecycle::Batch)])?;
+        let held = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
+        assert_eq!(held.allocations.len(), 1);
+        let second = submit_job(
+            &store,
+            "second",
+            vec![big("second", TaskLifecycle::Service)],
+        )?;
+        assert!(scheduler.plan_and_apply(&second, PlanMode::Fresh).is_err());
+
+        store.complete_allocation(held.allocations[0].id, true)?;
+        let outcome = scheduler.plan_and_apply(&second, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        Ok(())
+    }
+
+    /// A plan that can place nothing at all still fails, as before partial
+    /// placement, but with a typed error a rollout or eval can inspect.
+    #[test]
+    fn a_plan_that_places_nothing_fails_with_a_typed_error() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        let job_config_id = submit_job(
+            &store,
+            "huge",
+            vec![TaskConfig {
+                resources: json!({ "memory": 999_999 }),
+                ..TaskConfig::new("huge", "noop")
+            }],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let error = scheduler
+            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+            .expect_err("nothing fits");
+        let blocked = error
+            .downcast_ref::<PlacementBlocked>()
+            .expect("typed placement failure");
+        assert_eq!(blocked.unplaced.len(), 1);
+        assert_eq!(blocked.static_port(), None);
+        assert!(format!("{error:#}").contains("Failed to place task huge"));
+        Ok(())
+    }
+
+    /// P1-3: the stateful pin message only calls a node unavailable (and
+    /// only suggests deleting data) when it really is gone.
+    #[test]
+    fn pinned_node_message_does_not_blame_a_healthy_node() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let healthy = scheduler.pinned_node_absent_reason("node-a");
+        assert!(healthy.contains("healthy"), "{healthy}");
+        assert!(!healthy.contains("unavailable"), "{healthy}");
+        assert!(!healthy.contains("volume delete"), "{healthy}");
+
+        store.set_node_availability("node-a", "drained")?;
+        let drained = scheduler.pinned_node_absent_reason("node-a");
+        assert!(drained.contains("uncordon"), "{drained}");
+        assert!(!drained.contains("volume delete"), "{drained}");
+
+        let missing = scheduler.pinned_node_absent_reason("node-gone");
+        assert!(missing.contains("volume delete"), "{missing}");
         Ok(())
     }
 
@@ -8930,19 +9827,33 @@ mod tests {
         scheduler.plan_and_apply(&tool, PlanMode::Fresh)?;
         age_allocations(&store)?;
 
-        // One slot is available by eviction; two are not.
+        // One slot is available by eviction; two are not. The plan places
+        // the replica that fits (evicting one tool allocation) and reports
+        // the other unplaced, naming the floor.
         let api = submit_banded(&store, "api", Band::High, 2, None)?;
-        let err = scheduler
-            .plan_and_apply(&api, PlanMode::Fresh)
-            .expect_err("the floor must bind the second placement");
+        let outcome = scheduler.plan_and_apply(&api, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.unplaced.len(), 1);
         assert!(
-            err.to_string().contains("disruption.minAvailable"),
-            "the error names the floor: {err}"
+            outcome.unplaced[0]
+                .reason
+                .contains("disruption.minAvailable"),
+            "the reason names the floor: {}",
+            outcome.unplaced[0].reason
         );
 
-        // And the floor is a HARD rule, not a score: nothing was evicted at
-        // all, because the plan that would have crossed it failed whole.
-        assert_eq!(store.allocs_for_node("node-a")?.len(), 2);
+        // And the floor is a HARD rule, not a score: exactly one tool
+        // allocation was taken, never the second.
+        assert_eq!(outcome.evictions.len(), 1);
+        let remaining = store.allocs_for_node("node-a")?;
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|allocation| allocation.job_id == "internal-tool")
+                .count(),
+            1
+        );
         Ok(())
     }
 

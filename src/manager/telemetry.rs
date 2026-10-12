@@ -1655,7 +1655,7 @@ impl Metrics {
         let nodes_recovered_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_nodes_recovered_total",
-                help: "Lost nodes that came back, by path: 'heartbeat' (the node beat again) or 'reregistration' (the worker re-registered). marked_lost minus recovered is the net loss, and a fleet that flaps shows here instead of showing nothing.",
+                help: "Lost nodes that came back, by path: 'heartbeat' (the node beat again), 'reregistration' (the worker re-registered), or 'reconcile' (an active, heartbeating node whose stored availability still said unavailable was returned to the scheduling pool by the liveness owner's reconcile pass). marked_lost minus recovered is the net loss, and a fleet that flaps shows here instead of showing nothing.",
                 labels: &["path"],
             },
             series: Series::new(),

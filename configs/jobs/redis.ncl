@@ -32,15 +32,17 @@
       },
 
       config = {
+        # The exec runtime runs argv directly, not through a shell, so
+        # `$LEGION_STORAGE_DIR` would reach redis-server as literal text.
+        # `sh -c` expands the env Legion sets for the task.
+        #
+        # appendonly is the point: without it a restart loses everything
+        # written since the last background save, which makes the volume
+        # mostly decorative.
         command = [
-          "redis-server",
-          "--dir", "$LEGION_STORAGE_DIR",
-          # appendonly is the point: without it a restart loses everything
-          # written since the last background save, which makes the volume
-          # mostly decorative.
-          "--appendonly", "yes",
-          "--appendfsync", "everysec",
-          "--port", "$LEGION_PORT_REDIS",
+          "sh",
+          "-c",
+          "exec redis-server --dir \"$LEGION_STORAGE_DIR\" --appendonly yes --appendfsync everysec --port \"$LEGION_PORT_REDIS\"",
         ],
       },
 
@@ -50,11 +52,13 @@
       },
       service = { name = "redis", port = "redis" },
 
+      # A TCP check: exec checks run without the task's env or a shell, so
+      # `$LEGION_PORT_REDIS` would not expand there.
       checks = [{
         type = "health",
         name = "ping",
-        kind = "exec",
-        command = ["redis-cli", "-p", "$LEGION_PORT_REDIS", "ping"],
+        kind = "tcp",
+        port = "redis",
         every = "10s",
         timeout = "3s",
       }],
@@ -62,7 +66,7 @@
       # Day-2 operations. Exec-runtime actions run as sibling host processes with
       # the task's env, so $LEGION_PORT_REDIS resolves inside the shell:
       #   legion action run redis cli --tty
-      #   legion action run redis command -p cmd='INFO keyspace'
+      #   legion action run redis command --param cmd='INFO keyspace'
       #   legion action run redis save
       actions = [
         {
@@ -111,13 +115,11 @@
       # under stateful.storage.
 
       config = {
+        # No RDB snapshots (--save ''), no AOF, LRU eviction at 256 MiB.
         command = [
-          "redis-server",
-          "--save", "",            # no RDB snapshots
-          "--appendonly", "no",    # no AOF
-          "--maxmemory", "256mb",
-          "--maxmemory-policy", "allkeys-lru",
-          "--port", "$LEGION_PORT_REDIS",
+          "sh",
+          "-c",
+          "exec redis-server --save '' --appendonly no --maxmemory 256mb --maxmemory-policy allkeys-lru --port \"$LEGION_PORT_REDIS\"",
         ],
       },
 
@@ -127,11 +129,13 @@
       },
       service = { name = "redis-cache", port = "redis" },
 
+      # A TCP check: exec checks run without the task's env or a shell, so
+      # `$LEGION_PORT_REDIS` would not expand there.
       checks = [{
         type = "health",
         name = "ping",
-        kind = "exec",
-        command = ["redis-cli", "-p", "$LEGION_PORT_REDIS", "ping"],
+        kind = "tcp",
+        port = "redis",
         every = "10s",
         timeout = "3s",
       }],

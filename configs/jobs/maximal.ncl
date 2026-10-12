@@ -900,6 +900,29 @@
                 env = {
                     LEGION_TASK = "container",
                 },
+                # Linux only (Apple `container` runs each container in its
+                # own VM with its own defaults; see docs/task-runtime-container.md).
+                security = {
+                    # Adjust the default capability set (Docker's defaults
+                    # without NET_RAW). Case-insensitive, CAP_ prefix
+                    # optional; ALL means every capability. `drop = ["ALL"]`
+                    # plus a short `add` list is the least-privilege form.
+                    # Drops always work; an add needs the node's worker type
+                    # to allow it (container.allowCaps in
+                    # configs/workers/*.ncl), or the start fails there.
+                    capabilities = {
+                        add = ["NET_RAW"],
+                        drop = ["MKNOD"],
+                    },
+                },
+                # setrlimit for the container's process. A number sets soft
+                # and hard alike; also "unlimited" or { soft, hard }. The
+                # only default is nofile = 1048576 (or the worker's own hard
+                # limit, if lower).
+                ulimits = {
+                    nofile = 65536,
+                    nproc = { soft = 4096, hard = 8192 },
+                },
             },
             resources = {
                 # Real limits on Linux when the worker runs with

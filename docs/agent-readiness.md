@@ -53,7 +53,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | Tool | Mutates | Purpose |
 | --- | --- | --- |
 | `legion_capabilities` | no | List the operation catalog. |
-| `legion_job_list` | no | List jobs, optionally only those in one `status`. The reply's `status_counts` gives per-status totals. |
+| `legion_job_list` | no | List jobs, optionally only those in one `status`. The reply's `statusCounts` gives per-status totals. |
 | `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
 | `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
@@ -67,10 +67,10 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Use it to find out why a job was rejected for plugin X. |
 | `legion_snapshot_list` | no | List instance [snapshots](suspend-and-resume.md), newest first. Filters by job, instance, and state. |
 | `legion_snapshot_get` | no | Inspect one snapshot by id (or name plus job), including its manifest and, for a failed one, why. |
-| `legion_node_list` | no | List worker nodes. Each carries `heartbeat_source` (see the freshness note below). |
+| `legion_node_list` | no | List worker nodes. Each carries `heartbeatSource` (see the freshness note below). |
 | `legion_node_cadence` | no | Check whether the fleet is keeping up with its heartbeat cadence. Returns the freshness ratio, lost window, sustainable fleet size, and the `heartbeatSeconds` to set if it is falling behind ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). |
 | `legion_node_usage` | no | One node's memory and CPU: capacity, reservations, and measured usage per allocation (current and peak memory, CPU, idle seconds). Also the node's oversubscription ratio and memory pressure status, and each allocation's place in the pressure order (`pressure_rank`, `pressure_steps`): which allocations a short node would stop first. Use it to compare reservations with real use before resizing a job ([resource-enforcement.md](resource-enforcement.md#memory-pressure)). |
-| `legion_node_usage_list` | no | Memory and CPU for many nodes in one call (`ListNodeUsage`): per node, capacity with the oversubscription ratio, reservations, measured use, and memory pressure status, plus CPU `cores` and `used_millicores` (filled even where the platform reports no clock speed). Per-allocation rows only with `include_allocations`. Empty `node_ids` means every node, up to 500. Use it to find tight or pressured nodes before drilling in with `legion_node_usage` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
+| `legion_node_usage_list` | no | Memory and CPU for many nodes in one call (`ListNodeUsage`): per node, capacity with the oversubscription ratio, reservations, measured use, and memory pressure status, plus CPU `cores` and `usedMillicores` (filled even where the platform reports no clock speed). Per-allocation rows only with `include_allocations`. Empty `node_ids` means every node, up to 500. Use it to find tight or pressured nodes before drilling in with `legion_node_usage` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
 | `legion_node_content` | no | What one node holds for content locality: the content it advertises to the manager's location index (digest, bytes, holder count, and the snapshot and part role it belongs to), whether its worker can publish and checkpoint, and its snapshots with `parts_here` of `parts_total`. `index_reported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork ([artifacts.md](artifacts.md)). |
 | `legion_scheduler_concurrency` | no | How many evals the manager will plan at once, and why: the current limit against `evalThreads`, the plan-conflict and fallback rates, goodput, and a `state` of steady/throttled/probing/**saturated**. `throttled` means work will drain, so wait. `saturated` means the conflicts are capacity-driven, so ask for nodes rather than resubmitting ([adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md)). |
 | `legion_keyring_status` | no | KV encryption at rest on the answering manager ([kv-encryption.md](kv-encryption.md)): `state` (`unlocked`, `locked`, `pending_upgrade`, …), the root key provider and location, each data key with how many values it protects, plaintext rows, rewrap progress, and a one-line `hint` with the next step when something needs doing. |
@@ -90,7 +90,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_net_policy_apply` | **yes** | Create or replace a network policy object. `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_events` | no | List scheduler events. Poll with `after_id` to tail. `instance_id` narrows to one stateful instance (its own events plus its allocations'), `allocation_id` to one allocation. |
-| `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
+| `legion_job_logs` | no | Fetch captured task stdout/stderr for a job, including allocations removed in the last 24 hours (`removed`, `removalCause`). |
 | `legion_state_query` | no | Read-only SQL against the state store. |
 | `legion_state_schema` | no | Describe state store tables. |
 | `legion_template_list` | no | List job templates (name, latest version, variable count). |
@@ -106,8 +106,8 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_template_delete` | **yes** | Delete a template and all of its versions (running jobs are unaffected). |
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id, supports `idempotency_key`). `from_snapshot` restores the new instance(s) from a snapshot of the job (an id or a name), on the snapshot's node, at most 64 per call. Needs `snapshot:read` too. |
 | `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, and drop its storage (supports `idempotency_key`). |
-| `legion_instance_suspend` | **yes** | [Suspend](suspend-and-resume.md) a keyed instance: its node checkpoints it (`checkpoint = "memory"` or `"disk"`, default the best it can take), stops it, and frees its reservation. Returns at once, so poll `legion_instance_get` until `state` is `suspended`, or until `pending_op` clears with the reason in `detail` (a failed capture leaves the instance running). A memory checkpoint needs `snapshot:write`. Supports `idempotency_key`. |
-| `legion_instance_start` | **yes** | Start a stopped keyed instance, or resume a suspended one from its checkpoint (`cold = true` boots fresh instead). Returns at once with `resuming_from`. Poll `legion_instance_get` until `state` is `active` with no `pending_op`, or read `instance.resumed` / `instance.restore_failed`. Then check `cold_boot`: when set, the restore failed and the instance booted fresh on its volume (`onRestoreFailure = "cold"`), so its running processes are gone. Supports `idempotency_key`. |
+| `legion_instance_suspend` | **yes** | [Suspend](suspend-and-resume.md) a keyed instance: its node checkpoints it (`checkpoint = "memory"` or `"disk"`, default the best it can take), stops it, and frees its reservation. Returns at once, so poll `legion_instance_get` until `state` is `suspended`, or until `pendingOp` clears with the reason in `detail` (a failed capture leaves the instance running). A memory checkpoint needs `snapshot:write`. Supports `idempotency_key`. |
+| `legion_instance_start` | **yes** | Start a stopped keyed instance, or resume a suspended one from its checkpoint (`cold = true` boots fresh instead). Returns at once with `resumingFrom`. Poll `legion_instance_get` until `state` is `active` with no `pendingOp`, or read `instance.resumed` / `instance.restore_failed`. Then check `coldBoot`: when set, the restore failed and the instance booted fresh on its volume (`onRestoreFailure = "cold"`), so its running processes are gone. Supports `idempotency_key`. |
 | `legion_instance_fork` | **yes** | [Fork](suspend-and-resume.md#fork) a running keyed instance into `count` new instances (`<id>-f<n>`), each with its own cloned volume and identity, on the origin's node, or with `spread: true` each on its own node from a published checkpoint. The origin keeps running. Returns the fork ids at once. Poll `legion_snapshot_get` on the returned `snapshot` until `local` (forks being placed, or `published` for a spread fork) or `failed` (origin unaffected, forks terminated). Needs `job:write` and `snapshot:write`. Supports `idempotency_key`, and a retry returns the same forks. |
 | `legion_instance_replace` | **yes** | Force-replace an instance's allocation that is stuck on a LOST node. Skips the `onLost.replaceAfter` loss-confirmation gate, so it risks split-brain if the node is only partitioned. Supports `idempotency_key`. |
 | `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA. `force = true` tombstones without driver confirmation, for a node that is gone for good. Supports `idempotency_key`. |
@@ -117,6 +117,9 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_snapshot_alias_set` | **yes** | Point a snapshot name at a local or published manual snapshot of the job, creating or moving the name, so `legion_instance_create` with `from_snapshot` = the name picks up the new snapshot. Supports `idempotency_key`. |
 | `legion_snapshot_warm` | **yes** | Pre-fetch a `published` snapshot's parts onto available nodes matching `constraints` (`key=value` node attributes) that could restore it, so a later resume there starts from local bytes. Best effort and idempotent. Only needs `snapshot:read`, but it starts downloads, so it is gated behind `--allow-write`. The reply lists the nodes asked, the ones already warm, and the incompatible ones with the reason. Supports `idempotency_key`. |
 | `legion_boot_ticket_create` | **yes** | Mint a boot ticket: a short-lived capability that lets one edge node start one workload without a manager call ([edge-boot.md](edge-boot.md)). It can only be revoked by expiry, so prefer short TTLs. Supports `idempotency_key`. |
+| `legion_action_list` | no | List the actions declared on a job's tasks, with their parameters. |
+| `legion_exec_run` | **yes** | Run a one-shot command inside a running allocation; returns `exitCode`, `stdout`, `stderr`, `message`. Needs `exec:write`. |
+| `legion_action_run` | **yes** | Run a declared action against a running allocation (the newest of the job when `allocation_id` is omitted); same result shape. |
 
 Tool errors come back in-band (`result.isError = true` with a text payload),
 following MCP convention. Transport and protocol errors use JSON-RPC `error`.
@@ -126,10 +129,10 @@ console logs to stderr, so stdout carries only the protocol stream.
 
 ### Reading a node's last heartbeat honestly
 
-`NodeMsg.last_heartbeat` is not always a live clock. An agent that treats it as
+A node's `lastHeartbeat` is not always a live clock. An agent that treats it as
 one will draw wrong conclusions. Heartbeats live in the memory of the manager
 that owns node status, and only status transitions are replicated. So every
-node carries `heartbeat_source`:
+node carries `heartbeatSource`:
 
 - `live`: the answering manager observed the beat itself. It is current.
 - `checkpoint`: from a periodic replicated checkpoint, up to
@@ -137,7 +140,7 @@ node carries `heartbeat_source`:
 - `""`: no beat observed, or checkpoints are disabled.
 
 The node's `status` is accurate on every manager, so branch on `status`. Use
-`last_heartbeat` for display and ordering, and don't treat it as evidence that
+`lastHeartbeat` for display and ordering, and don't treat it as evidence that
 a node just died. When many nodes look stale at once, call
 `legion_node_cadence` before concluding anything. A low freshness ratio means
 the control plane is behind, and the machines are probably still there. See
@@ -145,12 +148,13 @@ the control plane is behind, and the machines are probably still there. See
 
 ## 2. Structured output envelope
 
-The agent-facing commands accept `--json` / `-j` and emit one of two shapes.
-These include `job`, `instance`, `volume`, `snapshot`, `state`, `node`, `kv`, `keyring`,
-`service`, `net`, `events`, `template`, `sandbox`, `boot-ticket`, `ledger`,
-`acl`, `join-token`, `login`, and `capabilities`. Bootstrap and cluster-admin
-commands such as `start`, `join`, and `raft` are for operators. They don't
-take `--json` and are not part of the agent surface.
+Every command accepts `--json` / `-j` and emits one of two shapes, `raft`,
+`exec`, `action`, and `docs` included. The only exceptions are the commands
+that are not a request with a result: the daemons (`start manager`,
+`start worker`, `join`) and `mcp serve`, whose stdout is the JSON-RPC stream
+itself. A unit test walks the whole command tree and fails the build when a
+command lacks the flag (`every_command_accepts_json` in
+[`src/cmd/mod.rs`](../src/cmd/mod.rs)).
 
 ```json
 { "ok": true,  "data": <command-specific value> }
@@ -162,6 +166,35 @@ mirrors the gRPC status code (`NotFound`, `Unavailable`, `InvalidArgument`, …)
 `retryable` tells the agent whether retrying the same request may succeed. It is
 true for `Unavailable`, `DeadlineExceeded`, `Aborted`, and `ResourceExhausted`.
 Commands exit non-zero on failure.
+
+The `message` carries the manager's own reason. A request the cluster's state
+refuses is `FailedPrecondition` with that reason, for example `job destroy` on
+a running job: `Job web must be stopped before it can be destroyed (it is
+running); run legion job stop web first`. An unexpected server failure is
+`Internal` and still names its cause. An error a worker returned (exec, logs)
+keeps the worker's code and message, and an unreachable worker is
+`Unavailable` naming the node, its address, and the port. `hint` is the next
+step: the server's own `Hint:` line when it sent one, else a per-code default
+(`legion acl whoami` for `PermissionDenied`, `legion login` for
+`Unauthenticated`, LEGION_ADDR for a manager that cannot be reached). Human
+output prints the same message and hint, ending in `[code=FailedPrecondition]`.
+
+A lookup that finds nothing is a failure too: `legion kv get` on a missing key
+returns `NotFound` and exits 1 rather than `{ "ok": true, "data": null }`, so
+`legion kv get k || legion kv put k v` works.
+
+**Every key is camelCase**, in every command's `data` and in the MCP tools'
+results alike: `currentAllocId`, `heartbeatSource`, `statusCounts`,
+`instanceIds`, `exitCode`. The API messages and the CLI's own envelopes use
+the same rule. Map keys that are data, such as node attributes or environment
+variable names, are printed as they are. MCP tool *arguments* keep their
+snake_case names (`allocation_id`, `idempotency_key`).
+
+`legion exec … --json -- <cmd>` (and `legion action run … --json`) collects a
+one-shot command's output into `{ allocationId, exitCode, stdout, stderr,
+message }`. The process still exits with the remote exit code, so a non-zero
+command means `ok: true` with a non-zero `exitCode` and a non-zero exit.
+`--json` cannot be combined with `--tty` or `--stdin`.
 
 Implemented in [`src/cmd/output.rs`](../src/cmd/output.rs).
 
@@ -412,20 +445,20 @@ the node's reason when the capture failed, in which case the instance keeps
 running), and `legion instance start … --wait` blocks until it is `active`
 and the restore has reported (non-zero with `RestoreFailed` when
 `onRestoreFailure = "fail"` left it suspended). Under the default `"cold"`, a
-restore that fails still ends `active`, so check the envelope's `cold_boot`:
+restore that fails still ends `active`, so check the envelope's `coldBoot`:
 when it is set, the instance booted fresh on its volume and lost its running
 processes.
 
 An instance can also become `suspended` without any call: through its task's
 [idle policy](suspend-and-resume.md#idle-policy), or the node's `suspend`
-memory pressure step. `legion_instance_get` says which in `suspend_reason`
+memory pressure step. `legion_instance_get` says which in `suspendReason`
 (`manual`, `idle`, `pressure`), and while the idle policy is watching a
-running instance it reports `idle_since` and `idle_after_seconds`, so an
+running instance it reports `idleSince` and `idleAfterSeconds`, so an
 agent can see a suspend coming and keep a workspace awake by using it.
 
 Fork waits on its checkpoint: `legion instance fork … --wait` blocks until
 the origin's capture lands and the forks are released for placement, and
-fills in `pause_ms`. With `--spread` it also waits for the publish, through
+fills in `pauseMs`. With `--spread` it also waits for the publish, through
 the manager's retries. It exits non-zero with `ForkFailed` and the node's
 reason when the capture (or a spread fork's publish) failed, in which case
 the origin keeps running and the forks are terminated. The envelope's
@@ -438,7 +471,7 @@ until the capture is `local` or `failed` (with `--publish`, until it is
 snapshot restore … --wait` blocks until the node reports the restore's
 outcome. Both exit non-zero on failure, with the node's reason in the error
 envelope ([suspend-and-resume.md](suspend-and-resume.md)). A suspended
-instance's `checkpoint_state` (`local` or `published`) in
+instance's `checkpointState` (`local` or `published`) in
 `legion_instance_get` tells an agent whether a resume can leave the node.
 
 Other signals an agent can use to close the loop:
@@ -447,7 +480,7 @@ Other signals an agent can use to close the loop:
   event stream (see below).
 - `legion job rollout events --id <ID> --json`: the rollout's event history.
 - `legion job rollout status --id <ID> --json`: per-allocation health, including
-  per-artifact staging states (`artifact_states`) for tasks that declare
+  per-artifact staging states (`artifactStates`) for tasks that declare
   [artifacts](artifacts.md).
 - `legion job logs <NAME> --json`: captured task stdout/stderr (see below).
 - `legion state query "<SQL>" --json`: inspect `task_status`, `allocation_health`,
@@ -511,10 +544,19 @@ collector. See [Logging](logging.md) for capture, the `LogSink` seam, rotation
 config, tailing, external shipping, and exporting Legion's own traces over
 OpenTelemetry.
 
-Each returned allocation carries its `allocationId`, `nodeId`, `taskName`, the
-captured `streams` (with `sizeBytes` and a `truncated` flag), and a per-allocation
-`error` string. One unreachable node returns an error for its allocations
-without failing the whole request.
+Each returned allocation carries its `allocationId`, `nodeId`, `taskName`,
+`status`, the captured `streams` (with `sizeBytes` and a `truncated` flag),
+and a per-allocation `error` string. One unreachable node returns an error for
+its allocations without failing the whole request.
+
+Removed allocations stay readable for 24 hours, which is when an agent most
+needs them: the task failed and was rescheduled, the job was stopped, or it
+was destroyed. A job with no live allocation returns its most recently
+removed ones (newest first, at most 10), `--include-removed` (MCP:
+`include_removed`) adds them to a running job's, and `--allocation <ID>`
+reaches any one of them. Each carries `removed: true`, `removalCause` (`stop`,
+`update`, `reschedule`, `node_lost`, …), and `removedAtUnix`. See
+[Logging](logging.md#logs-of-removed-allocations).
 
 How it is wired (read-only, safe for agents):
 
@@ -538,9 +580,12 @@ without a manager on the request path, using a boot ticket
 legion boot-ticket create agent-sandboxes \
     --task workspace --id user-42 --pool edge-eu --gate boot --ttl 5m -j
 
-# On the request path, against the node itself:
+# Once: the cluster CA the node's certificate must chain to.
+legion net ca show > ca.pem
+
+# On the request path, against the node itself (mTLS; no manager call):
 legion sandbox start agent-sandboxes \
-    --id user-42 --node http://10.0.1.7:4848 --ticket "$TICKET" -j
+    --id user-42 --node https://10.0.1.7:4848 --ca-cert ca.pem --ticket "$TICKET" -j
 ```
 
 The command streams one frame per transition (`admitted`, `staged`/`booted`,
@@ -596,7 +641,7 @@ All client commands and the MCP server read:
 4. **Preview**: run `legion job plan` to see placements (dry-run), or
    `legion template render` to see the spec a template would submit. The
    `job plan --json` envelope also carries:
-   - `index_usage`: per task, which scheduling index generated the candidates,
+   - `indexUsage`: per task, which scheduling index generated the candidates,
      or why none did ([scheduling-indexes.md](scheduling-indexes.md)).
    - `preemptions`: every allocation the submit would displace, with its job,
      task, band, and grace window

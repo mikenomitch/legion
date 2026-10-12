@@ -599,10 +599,13 @@ fn default_success_exit_codes() -> Vec<i32> {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskRestartConfig {
-    /// `always` | `onFailure` | `never`. Defaults per lifecycle — see
-    /// [`RestartPolicy`] and [`TaskConfig::restart_policy`].
-    #[serde(default)]
-    pub policy: RestartPolicy,
+    /// `always` | `onFailure` | `never`. `None` (the key omitted) is the
+    /// lifecycle default — see [`RestartPolicy`] and
+    /// [`TaskConfig::restart_policy`] — so a block that only tunes `delay`
+    /// or `successExitCodes` does not quietly turn a batch task into one
+    /// that restarts on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<RestartPolicy>,
     /// Wait before relaunching. Defaults to `on_unhealthy.restart_delay` when
     /// unset, so a task that already tuned its restart pacing keeps it.
     #[serde(
@@ -619,7 +622,7 @@ pub struct TaskRestartConfig {
 impl Default for TaskRestartConfig {
     fn default() -> Self {
         Self {
-            policy: RestartPolicy::default(),
+            policy: None,
             delay: None,
             success_exit_codes: default_success_exit_codes(),
         }
@@ -2499,10 +2502,11 @@ impl TaskConfig {
 
     /// Effective restart policy for this task: the explicit `restart.policy`
     /// when set, else the lifecycle default (`always` for service/sidecar,
-    /// `onFailure` for batch).
+    /// `onFailure` for batch) — also when a `restart` block is declared
+    /// without a `policy`.
     pub fn restart_policy(&self) -> RestartPolicy {
-        match self.restart.as_ref() {
-            Some(restart) => restart.policy,
+        match self.restart.as_ref().and_then(|restart| restart.policy) {
+            Some(policy) => policy,
             None => match self.lifecycle {
                 TaskLifecycle::Batch => RestartPolicy::OnFailure,
                 TaskLifecycle::Service | TaskLifecycle::Sidecar => RestartPolicy::Always,

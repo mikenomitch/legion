@@ -3,12 +3,18 @@
 //! One-shot (`legion exec 42 -- cat /etc/hostname`) or interactive
 //! (`legion exec 42 -it -- /bin/sh`). Streams stdin/stdout/stderr over the
 //! manager's `ExecAllocation` bidi RPC and exits with the remote exit code.
+//!
+//! With `--json` a one-shot exec collects the output instead of streaming it
+//! and prints one envelope: `{ok:true,data:{allocationId, exitCode, stdout,
+//! stderr, message}}`. The process still exits with the remote exit code, so
+//! `&&` chains behave the same in both formats.
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::cmd::helpers::{connect_manager_client, friendly_status};
+use crate::cmd::helpers::{connect_manager_client, json_flag};
+use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
     exec_client_frame, exec_server_frame, ExecClientFrame, ExecInput, ExecResize, ExecStart,
@@ -56,17 +62,51 @@ pub fn config() -> Command {
                 .last(true)
                 .required(true),
         )
+        .arg(json_flag().help(
+            "Collect the output and print one JSON envelope with the exit code (one-shot \
+             only; not with --tty or --stdin)",
+        ))
+}
+
+/// `--json` is a one-shot capture; an interactive session has no single
+/// result to report.
+pub(crate) fn reject_interactive_json(
+    format: OutputFormat,
+    tty: bool,
+    stdin: bool,
+) -> Result<(), anyhow::Error> {
+    if format.is_json() && (tty || stdin) {
+        return Err(output::fail_local(
+            format,
+            CliError::local(
+                "InvalidArgument",
+                "--json collects the output of a one-shot exec; it cannot be combined with \
+                 --tty or --stdin",
+                Some("drop --json for an interactive session"),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn handle(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
     let command: Vec<String> = matches
         .get_many::<String>("command")
         .map(|vals| vals.cloned().collect())
         .unwrap_or_default();
     if command.is_empty() {
-        bail!("a command is required: legion exec <alloc> -- <cmd> [args...]");
+        return Err(output::fail_local(
+            format,
+            CliError::local(
+                "InvalidArgument",
+                "a command is required: legion exec <alloc> -- <cmd> [args...]",
+                None,
+            ),
+        ));
     }
     let tty = matches.get_flag("tty");
+    reject_interactive_json(format, tty, matches.get_flag("stdin"))?;
     let want_stdin = matches.get_flag("stdin") || tty;
     let task = matches
         .get_one::<String>("task")
@@ -75,7 +115,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 
     let mut client = connect_manager_client().await?;
 
-    let allocation_id = resolve_allocation(&mut client, matches).await?;
+    let allocation_id = resolve_allocation(&mut client, matches, format).await?;
 
     let winsize = if tty { current_winsize() } else { None };
 
@@ -90,7 +130,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         bearer_token: String::new(),
     };
 
-    run_session(&mut client, start, want_stdin, tty).await
+    run_session(&mut client, start, want_stdin, tty, format).await
 }
 
 /// Resolve which allocation to target: an explicit id, or the newest running
@@ -98,27 +138,48 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 async fn resolve_allocation(
     client: &mut crate::cmd::helpers::AuthedManagerClient,
     matches: &ArgMatches,
+    format: OutputFormat,
 ) -> R<i64> {
     if let Some(raw) = matches.get_one::<String>("allocation") {
-        return raw
-            .parse::<i64>()
-            .with_context(|| format!("invalid allocation id `{raw}`"));
+        return raw.parse::<i64>().map_err(|_| {
+            output::fail_local(
+                format,
+                CliError::local(
+                    "InvalidArgument",
+                    format!("invalid allocation id `{raw}`"),
+                    None,
+                ),
+            )
+        });
     }
     let Some(job) = matches.get_one::<String>("job") else {
-        bail!("provide an allocation id or --job <name>");
+        return Err(output::fail_local(
+            format,
+            CliError::local(
+                "InvalidArgument",
+                "provide an allocation id or --job <name>",
+                None,
+            ),
+        ));
     };
+    newest_running_allocation(client, job, format).await
+}
 
-    let ledger = client
-        .get_ledger(GetLedgerRequest {})
-        .await
-        .map_err(|e| friendly_status("exec", e))?
-        .into_inner();
+/// The newest (highest id) running allocation of `job`. Ids are never
+/// reused, so the highest is the most recently placed.
+pub(crate) async fn newest_running_allocation(
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
+    job: &str,
+    format: OutputFormat,
+) -> R<i64> {
+    let ledger =
+        output::resolve(format, "exec", client.get_ledger(GetLedgerRequest {}).await)?.into_inner();
 
     // Newest (highest id) running allocation for the job.
     let mut best: Option<i64> = None;
     for node in ledger.nodes {
         for alloc in node.allocations {
-            if &alloc.job_id == job
+            if alloc.job_id == job
                 && (alloc.status == "placed"
                     || alloc.status == "active"
                     || alloc.status == "running")
@@ -127,7 +188,16 @@ async fn resolve_allocation(
             }
         }
     }
-    best.ok_or_else(|| anyhow!("no running allocation found for job `{job}`"))
+    best.ok_or_else(|| {
+        output::fail_local(
+            format,
+            CliError::local(
+                "NotFound",
+                format!("no running allocation found for job `{job}`"),
+                Some("pass an allocation id explicitly; `legion job info <job>` lists them"),
+            ),
+        )
+    })
 }
 
 /// Shared entry for `legion action run`: drives the same bidi stream with an
@@ -137,8 +207,9 @@ pub(crate) async fn run_action_session(
     start: ExecStart,
     want_stdin: bool,
     tty: bool,
+    format: OutputFormat,
 ) -> R<()> {
-    run_session(client, start, want_stdin, tty).await
+    run_session(client, start, want_stdin, tty, format).await
 }
 
 /// Drive the bidi exec stream: pump local stdin/resize up, remote output down,
@@ -148,7 +219,9 @@ async fn run_session(
     start: ExecStart,
     want_stdin: bool,
     tty: bool,
+    format: OutputFormat,
 ) -> R<()> {
+    let allocation_id = start.allocation_id;
     let (tx, rx) = mpsc::channel::<ExecClientFrame>(64);
 
     // First frame: start.
@@ -183,17 +256,28 @@ async fn run_session(
         spawn_resize_watcher(tx.clone());
     }
 
-    let mut inbound = client
-        .exec_allocation(ReceiverStream::new(rx))
-        .await
-        .map_err(|e| friendly_status("exec", e))?
-        .into_inner();
+    let mut inbound = output::resolve(
+        format,
+        "exec",
+        client.exec_allocation(ReceiverStream::new(rx)).await,
+    )?
+    .into_inner();
 
     let mut exit_code = 0;
+    // `--json` collects instead of streaming.
+    let mut captured_stdout: Vec<u8> = Vec::new();
+    let mut captured_stderr: Vec<u8> = Vec::new();
+    let mut exit_message = String::new();
     use std::io::Write;
     loop {
         match inbound.message().await {
             Ok(Some(frame)) => match frame.frame {
+                Some(exec_server_frame::Frame::Stdout(out)) if format.is_json() => {
+                    captured_stdout.extend_from_slice(&out.data);
+                }
+                Some(exec_server_frame::Frame::Stderr(out)) if format.is_json() => {
+                    captured_stderr.extend_from_slice(&out.data);
+                }
                 Some(exec_server_frame::Frame::Stdout(out)) => {
                     let mut stdout = std::io::stdout();
                     stdout.write_all(&out.data).ok();
@@ -206,9 +290,10 @@ async fn run_session(
                 }
                 Some(exec_server_frame::Frame::Exit(exit)) => {
                     exit_code = exit.code;
-                    if !exit.message.is_empty() {
+                    if !exit.message.is_empty() && !format.is_json() {
                         eprintln!("\r\nexec ended: {}", exit.message);
                     }
+                    exit_message = exit.message;
                     break;
                 }
                 Some(exec_server_frame::Frame::Started(_))
@@ -218,16 +303,43 @@ async fn run_session(
             Ok(None) => break,
             Err(status) => {
                 drop(_raw_guard);
-                return Err(friendly_status("exec", status));
+                return output::resolve(format, "exec", Err(status));
             }
         }
     }
 
     drop(_raw_guard);
+    if format.is_json() {
+        output::print_success(&exec_result(
+            allocation_id,
+            exit_code,
+            &captured_stdout,
+            &captured_stderr,
+            &exit_message,
+        ));
+    }
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
     Ok(())
+}
+
+/// The `--json` result of a one-shot exec. Output is decoded as UTF-8 with
+/// invalid bytes replaced; use the streaming form for binary output.
+fn exec_result(
+    allocation_id: i64,
+    exit_code: i32,
+    stdout: &[u8],
+    stderr: &[u8],
+    message: &str,
+) -> Value {
+    json!({
+        "allocationId": allocation_id,
+        "exitCode": exit_code,
+        "stdout": String::from_utf8_lossy(stdout),
+        "stderr": String::from_utf8_lossy(stderr),
+        "message": message,
+    })
 }
 
 /// Read local stdin on a blocking thread and forward it as stdin frames.
@@ -318,5 +430,29 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_exec_result_is_camel_case_with_the_exit_code() {
+        let result = exec_result(42, 3, b"out\n", b"err\n", "");
+        assert_eq!(result["allocationId"], 42);
+        assert_eq!(result["exitCode"], 3);
+        assert_eq!(result["stdout"], "out\n");
+        assert_eq!(result["stderr"], "err\n");
+    }
+
+    #[test]
+    fn json_is_one_shot_only() {
+        assert!(reject_interactive_json(OutputFormat::Human, true, true).is_ok());
+        assert!(reject_interactive_json(OutputFormat::Json, false, false).is_ok());
+        let matches = config()
+            .try_get_matches_from(["exec", "7", "--json", "--", "true"])
+            .expect("--json parses");
+        assert!(matches.get_flag("json"));
     }
 }

@@ -220,7 +220,14 @@ pub fn plugin_paths(kind: &str, name: &str, root_dir: &Path) -> PluginPaths {
     PluginPaths { root, dylib }
 }
 
-#[instrument(err, skip_all)]
+/// Read and check `<plugin_root>/plugin.json`.
+///
+/// Errors are returned, never logged here: whether a missing manifest is a
+/// problem is the caller's call. A plugin a job or config named is an error
+/// worth logging; an optional plugin probed at startup (the worker looks for
+/// `noop` on every boot) is not, and logging it at `ERROR` here made every
+/// worker report a "missing plugin manifest" it did not need.
+#[instrument(skip_all)]
 pub fn validate_manifest(kind: &str, name: &str, plugin_root: &Path) -> R<PluginManifest> {
     let manifest_path = plugin_root.join("plugin.json");
     let bytes = std::fs::read(&manifest_path)

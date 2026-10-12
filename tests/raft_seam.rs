@@ -181,6 +181,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "mark_nodes_as_lost",
     "prune_allocation_health_orphans",
     "prune_node_health_orphans",
+    "reset_task_statuses",
     "seed_missing_task_statuses",
     "seed_node_health",
     "seed_task_statuses",
@@ -220,6 +221,9 @@ const DELEGATED_BODIES: &[&str] = &[
     // `insert_plan_submission_apply` with the format-1 wrapper.
     "insert_plan_submission_with_candidates",
     "request_job_restart",
+    // A DAG restart puts every task status of a job config back to
+    // `pending` in one inlined UPDATE (dependency readiness reads them).
+    "reset_task_statuses",
     // Plan §8 D1 reconciler: inlines its INSERT..SELECT closure and shares
     // seed_task_statuses_apply's semantics (ON CONFLICT DO NOTHING seed).
     "seed_missing_task_statuses",
@@ -365,6 +369,7 @@ fn lane_for(method: &str) -> Lane {
         | "mark_nodes_as_lost"
         | "prune_allocation_health_orphans"
         | "prune_node_health_orphans"
+        | "reset_task_statuses"
         | "seed_missing_task_statuses"
         | "seed_node_health"
         | "seed_task_statuses"

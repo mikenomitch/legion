@@ -321,7 +321,7 @@ fn an_idle_apple_container_sandbox_suspends_and_resumes_cold_on_its_volume() {
     let measured = cluster.wait_for("an idle window", Duration::from_secs(60), || {
         let instance = cluster.instance("user-1");
         instance
-            .get("idle_since")
+            .get("idleSince")
             .and_then(Value::as_str)
             .map(str::to_string)
     });
@@ -333,12 +333,12 @@ fn an_idle_apple_container_sandbox_suspends_and_resumes_cold_on_its_volume() {
         (instance.get("state").and_then(Value::as_str) == Some("suspended")).then_some(instance)
     });
     assert_eq!(
-        suspended.get("suspend_reason").and_then(Value::as_str),
+        suspended.get("suspendReason").and_then(Value::as_str),
         Some("idle"),
         "{suspended}"
     );
     assert_eq!(
-        suspended.get("checkpoint_kind").and_then(Value::as_str),
+        suspended.get("checkpointKind").and_then(Value::as_str),
         Some("disk"),
         "{suspended}"
     );
