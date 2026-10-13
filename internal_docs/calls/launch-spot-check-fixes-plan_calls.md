@@ -1658,3 +1658,92 @@ add a wire field and a second credential path for one cross-region case
 nobody has asked for yet. A blanket ambient chain would quietly sign
 requests to buckets the operator never named, and on a non-AWS host it can
 stall on instance-metadata lookups before it fails.
+## 64. `job plan` previews a preemption that only waits on `victimExemptAge`, and the submit retries on the clock
+
+*Workstream: Scheduling (2026-10-12 re-run papercut).*
+
+**The call.** Seconds after `band-fill` landed, `job plan` for the high-band
+claim failed "no available nodes", while the `job run` right after it
+preempted a minute later. Both ran the same pass. The victims were younger
+than `victimExemptAge`, so the plan failed honestly for that instant, and the
+submit blocked and happened to be woken by later churn. Now a pass that finds
+nothing re-runs with the guard lifted. When that finds room, the guard alone
+is in the way:
+
+- A dry run places on it and lists the victims with `eligibleInSeconds`,
+  printed as `once past victimExemptAge in 23s`.
+- An applying plan still evicts nothing. The blocked placement carries a
+  `retry_after`, and the eval worker requeues the eval for that moment
+  instead of blocking it. A partial plan queues a delayed `job_reschedule`.
+
+**Alternatives.**
+- Keep the plan's error and only reword it. The preview would still
+  contradict what the submit does a minute later, which is the bug.
+- Lift the guard in the plan without saying so. The plan would claim an
+  eviction the submit cannot make yet.
+- Leave the submit blocked and rely on capacity events. Nothing marks a
+  victim getting older, so a quiet cluster could leave the claim blocked
+  indefinitely, and the preview's "in 23s" would be wrong.
+
+**Trade-off.** One more pass over the candidate nodes when the guard rejects
+something and nothing else fits, and a timed requeue that runs even if the
+cluster changed meanwhile (it re-plans and blocks again if so). The retry is
+set only in `enforce` mode, since `observe` never acts on it.
+
+**Why.** The plan's job is to preview what the submit converges to. Saying
+"would preempt, in 23s" is that answer, and the clock-based retry makes it
+true instead of probable. Simplicity: one more field on an existing message,
+no new knob.
+
+## 65. The macOS in-process worker stops its tasks on a clean shutdown, and the next start runs them again
+
+*Workstream: macOS local dev (2026-10-12 re-run papercut).*
+
+**The call.** SIGTERM to `legion start manager --run-worker` left Apple
+containers running. On macOS only, the in-process worker now stops every task
+on SIGTERM or SIGINT, after session checkpoints, with each task's stop signal
+and `killAfter` inside a 30 second cap. It leaves the worker state file alone,
+so the next start finds the processes gone and re-runs the same allocations.
+The in-process worker also no longer calls `process::exit` on any platform:
+it returns, and the manager waits for it before finishing its own drain and
+persistence shutdown. Before, the worker's exit could cut the manager's
+drain short.
+
+**Alternatives.**
+- Leave tasks running and rely on re-adoption, which already works while the
+  `container run` process lives. It keeps VMs holding memory after the
+  developer stopped the cluster, which is the complaint.
+- Stop tasks on every in-process worker, Linux included. A combined
+  manager-and-worker node under systemd would restart every task on each
+  upgrade, breaking the documented `KillMode=process` re-adoption story.
+- Add a flag to choose. More surface for a dev-mode default nobody has asked
+  to turn off.
+
+**Trade-off.** Containers restart across a dev cluster restart, so in-memory
+state is lost (volumes keep their data). A SIGKILL or crash still stops
+nothing, and there is no opt-out.
+
+**Why.** On macOS the single process is the cluster a developer runs in a
+terminal, and stopping it should stop its work, as `docker compose up` does.
+Keeping the state file means nothing new has to happen at start: the existing
+dead-pid path and the manager's desired set bring the work back. Ease of use
+for local dev, at no cost to the Linux operations story.
+
+## 66. An instance's node is read from its current allocation, not stored on the row
+
+*Workstream: Stateful (2026-10-12 re-run papercut).*
+
+**The call.** `InstanceInfo.node_id` was only ever set for sessions, so every
+row-backed instance read `nodeId: null`. `map_instance_info` now loads the
+current allocation once (it already did, for the loss diagnostic) and reports
+its node. `instance list` gained a NODE column.
+
+**Alternatives.** Add a `node_id` column to `instance` and keep it in sync on
+every bind, rebind, and release.
+
+**Trade-off.** One allocation read per bound instance on get and list, the
+same read the loss diagnostic already paid.
+
+**Why.** The allocation is the source of truth for where an instance runs. A
+second copy would need every placement path to update it, and the spot check
+shows what happens when one copy is set on only some paths. Simplicity.

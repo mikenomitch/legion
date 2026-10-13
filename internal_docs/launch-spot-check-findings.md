@@ -84,6 +84,9 @@ landed, and this run needed no shims at the end.
   whole single-process cluster. CLI calls now have deadlines.
 - The UI Managers page showed only managers that had led (old P2-12).
 - `legion session nodes` reported live nodes as `down`.
+- `job plan` errored where `job run` would preempt: the victims were younger
+  than `victimExemptAge`. The plan now shows them with the wait, and the
+  submit retries when they age past the guard. *Unit-tested.*
 
 **P2, fixed:** destroyed volumes listed by default, the CLI hanging on a
 leaderless cluster, misleading gating warning on macOS, and leader-only
@@ -91,6 +94,10 @@ ERROR noise on followers. Later: one `~/.legion/token` for every cluster
 (now one per manager address), the CLI panicking on a closed pipe,
 `state query` user errors coming back `Internal`, server errors naming proto
 fields instead of CLI flags, and node attributes as JSON strings in MCP.
+leaderless cluster, misleading gating warning on macOS, leader-only ERROR
+noise on followers, instance JSON showing `nodeId: null`, and stopping the
+macOS manager leaving its Apple containers running (the last two
+unit-tested only).
 
 **Still open:** listed in [TODO.md](TODO.md) under the 2026-10-12 groups.
 The notable ones:
@@ -101,6 +108,9 @@ The notable ones:
 - Stopping the macOS manager leaves its Apple containers running.
 - `job plan` errors where `job run` would preempt.
 - Instance JSON shows `nodeId: null` for an active instance.
+- One `~/.legion/token` serves every cluster, so a second local manager
+  silently gets the wrong token.
+- The CLI panics on a closed pipe (`legion ... | head`).
 - Memory restore took 5.9 s on nested virtualization, against the 300 ms
   bare-metal target. Treat it as a data point.
 

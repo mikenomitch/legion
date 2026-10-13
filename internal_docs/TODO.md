@@ -4106,6 +4106,21 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
         failed "no available nodes", while the run preempted and placed.
   - [ ] **Instance JSON shows `nodeId: null`** for an active instance with a
         current allocation.
+        until rescheduled. Document it in `docs/upgrades.md`, or keep the
+        datapath alive across a worker restart.
+  - [ ] **One `~/.legion/token` for every cluster.** A second local manager
+        logs "token already exists and was left alone" and the CLI then
+        presents the other cluster's token ("unknown or revoked ACL
+        token"). Key stored tokens by manager address.
+  - [ ] **The CLI panics on a closed pipe.** `legion raft status | head`
+        prints "failed printing to stdout: Broken pipe" and a panic.
+  - [ ] **`job plan` of an unsubmitted job uses positional task ids.**
+        `Scheduler::tasks_for_plan` numbers its tasks 1, 2, ..., and
+        `place_task_allocations` looks up volume and restore pins by task
+        config id, so a preview can pick up another job's pins for the task
+        whose real id matches. Found while fixing the plan's preemption
+        preview, not seen on the rig. Skip the pin lookups for configs with no
+        stored id.
   - [ ] **No CLI lists a job's allocations.** `job info` shows none, and
         there is no `job status`, so finding a failing allocation means
         `legion state query`.
@@ -5565,6 +5580,29 @@ Bug fixes, no plan. Uncommitted at the time of writing.
       for a worker that is not root. Root bypasses the mode, so the Linux
       worker is unaffected. Deferring directory modes to the end of a layer,
       as `tar::Archive::unpack` does, would fix it.
+- [x] **`job plan` errored where `job run` would preempt.** The victims were
+      younger than `victimExemptAge`, so the plan failed "no available
+      nodes", and the submit blocked until unrelated churn woke it. The plan
+      now shows the victims with how long the submit waits
+      (`PlannedPreemption.eligible_in_seconds`), and the submit's eval
+      retries when they age past the guard instead of waiting for a capacity
+      event
+      ([preemption-and-eviction.md](../docs/preemption-and-eviction.md#previewing-before-you-displace-anyone),
+      [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md#what-blocks),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#64-job-plan-previews-a-preemption-that-only-waits-on-victimexemptage-and-the-submit-retries-on-the-clock)).
+- [x] **Instance JSON showed `nodeId: null`** for every active row-backed
+      instance. `nodeId` is now the current allocation's node, and
+      `instance list` has a NODE column
+      ([stateful-workloads.md](../docs/stateful-workloads.md),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#66-an-instances-node-is-read-from-its-current-allocation-not-stored-on-the-row)).
+- [x] **Stopping the macOS manager left its Apple containers running.** The
+      in-process worker of `--run-worker` on macOS now stops every task on
+      SIGTERM or SIGINT, and the next start runs them again. On every
+      platform the in-process worker no longer exits the process under the
+      manager's drain
+      ([task-runtime-container.md](../docs/task-runtime-container.md#stopping-a-single-process-cluster-macos),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#65-the-macos-in-process-worker-stops-its-tasks-on-a-clean-shutdown-and-the-next-start-runs-them-again)).
+      *Unit-tested; not yet re-run on a Mac.*
 
 ## Architecture audit (2026-10-09)
 
