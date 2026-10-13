@@ -500,6 +500,37 @@ command, for example:
 A start fails, a teardown logs a warning and goes on to reap the task's
 process, and a usage report leaves the Apple containers out.
 
+## Stopping a single-process cluster (macOS)
+
+On macOS, `legion start manager --run-worker` runs the whole cluster in one
+process in your terminal. Stopping it (Ctrl-C, or SIGTERM) stops the
+containers it started too. Each Apple container is a VM, and leaving them
+running after the cluster stopped only holds memory for work nothing manages.
+
+On the signal, the in-process worker first checkpoints sessions that ask for
+it (`suspend.onWorkerStop`), then stops every task at once the way a
+`job stop` would: the task's `stop.signal`, its `stop.killAfter` to exit,
+then `container stop` by name. The whole step is capped at 30 seconds. The
+manager waits for it before it exits. A second signal exits at once.
+
+The worker keeps its record of the stopped tasks, and the manager still wants
+them. The next `legion start manager --run-worker` finds their processes gone
+and starts the same allocations again. The containers restart, so in-memory
+state is lost, but node-local volumes keep their data.
+
+This is specific to the single-process dev mode on macOS:
+
+- A standalone worker (`legion join`, `legion start worker`) on macOS or
+  Linux leaves its tasks running when it stops, and the next start re-adopts
+  them ([Running a worker under a service manager](architecture-managers-workers.md#running-a-worker-under-a-service-manager)).
+- `--run-worker` on Linux behaves like a standalone worker. Its tasks outlive
+  the process.
+- A process killed with SIGKILL, or one that crashes, stops nothing. The
+  containers keep running, and the next start re-adopts them while their
+  `container run` process is still alive. One whose process is gone is
+  started again, and the start first removes the old container if its
+  `legion.node` label names this node.
+
 ## Graceful stop
 
 Stopping a container sends a signal, waits, and only then kills it. You can

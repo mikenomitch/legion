@@ -211,6 +211,52 @@ pub struct DrainingAllocation {
     until: std::time::Instant,
 }
 
+/// One task an exiting in-process worker stops on its way out
+/// ([`WorkerTaskManager::take_tasks_for_shutdown`]), with everything the
+/// stop needs once the task manager is no longer involved.
+pub struct ShutdownStop {
+    allocation: Allocation,
+    task: TaskConfig,
+    instance: TaskInstance,
+    plugin: Arc<crate::task_plugins::LoadedTaskPlugin>,
+}
+
+impl ShutdownStop {
+    pub fn allocation_id(&self) -> i64 {
+        self.allocation.id
+    }
+
+    /// Stop the task the way a reconcile does, signal first and hard
+    /// teardown last, with the grace window cut short at `deadline`. Blocks,
+    /// so callers run each on its own blocking thread.
+    pub fn run(mut self, deadline: std::time::Instant) {
+        let stop = self.task.stop_config();
+        let grace = stop
+            .kill_after
+            .min(deadline.saturating_duration_since(std::time::Instant::now()));
+        // No stop notice: the platform is not moving this work anywhere, and
+        // the next start brings it back under the same allocation.
+        let ctx = StopContext::with_ladder(StopCause::Unknown, &stop.signal, grace);
+        let plugin = &self.plugin.plugin;
+        let signalled = plugin
+            .stop_with(&self.allocation, &self.task, &mut self.instance, &ctx)
+            .unwrap_or(false);
+        if signalled {
+            while !ctx.expired() && WorkerTaskManager::instance_process_alive(&mut self.instance) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        if let Err(err) = plugin.stop(&self.allocation, &self.task, &mut self.instance) {
+            warn!(
+                allocation_id = self.allocation.id,
+                task_name = %self.task.name,
+                error = ?err,
+                "Failed to stop task at worker shutdown"
+            );
+        }
+    }
+}
+
 /// Why [`WorkerTaskManager::reap_terminating`] finished an allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReapOutcome {
@@ -2704,6 +2750,52 @@ impl WorkerTaskManager {
             self.cleanup_alloc_dir(allocation_id);
         }
         self.persist_state();
+    }
+
+    /// Hand over every task this worker is running or still stopping, for
+    /// an in-process worker that stops its work when the process exits
+    /// (macOS single-process dev mode; docs/task-runtime-container.md,
+    /// "Stopping a single-process cluster").
+    ///
+    /// The worker state file is deliberately left as it is. The next start
+    /// finds these processes gone, skips them, and runs what the manager
+    /// still wants on this node again: the same allocations, restarted
+    /// rather than re-adopted.
+    pub fn take_tasks_for_shutdown(&mut self) -> Vec<ShutdownStop> {
+        let mut tasks: Vec<(Allocation, TaskConfig, TaskInstance)> = Vec::new();
+        for (allocation_id, instance) in std::mem::take(&mut self.instances) {
+            if let (Some(allocation), Some(task)) = (
+                self.allocations.get(&allocation_id).cloned(),
+                self.task_configs.get(&allocation_id).cloned(),
+            ) {
+                tasks.push((allocation, task, instance));
+            }
+        }
+        for (_, entry) in std::mem::take(&mut self.draining) {
+            tasks.push((entry.allocation, entry.task, entry.instance));
+        }
+        for (_, entry) in std::mem::take(&mut self.terminating) {
+            tasks.push((entry.allocation, entry.task, entry.instance));
+        }
+        tasks
+            .into_iter()
+            .filter_map(|(allocation, task, instance)| {
+                let Some(plugin) = self.registry.plugin_handle(&task.runtime) else {
+                    warn!(
+                        allocation_id = allocation.id,
+                        runtime = %task.runtime,
+                        "No runtime plugin to stop a task at worker shutdown"
+                    );
+                    return None;
+                };
+                Some(ShutdownStop {
+                    allocation,
+                    task,
+                    instance,
+                    plugin,
+                })
+            })
+            .collect()
     }
 
     /// Finish every terminating allocation whose process has exited, and hard
@@ -8504,6 +8596,60 @@ mod tests {
                 .is_empty(),
             "a finished stop leaves nothing persisted"
         );
+        Ok(())
+    }
+
+    /// Spot check 2026-10-12: stopping `legion start manager --run-worker`
+    /// on macOS left its Apple containers running. The in-process worker
+    /// there stops every task on its way out, signal first, and leaves the
+    /// state file alone, so the next start finds the process gone and runs
+    /// the allocation again rather than adopting a stranger.
+    #[test]
+    fn a_shutdown_stop_ends_running_and_stopping_tasks_and_keeps_their_records() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let ready = temp_dir.path().join("ready");
+        let stopped = temp_dir.path().join("stopped");
+        // Exits on SIGTERM, leaving a mark that it got the signal rather
+        // than a SIGKILL.
+        let task = TaskConfig {
+            config: json!({
+                "command": [
+                    "sh",
+                    "-c",
+                    format!(
+                        "trap ': > \"{}\"; exit 0' TERM; : > '{}'; while :; do sleep 0.1; done",
+                        stopped.display(),
+                        ready.display()
+                    ),
+                ],
+            }),
+            ..TaskConfig::new("api", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        wait_for_marker(&ready);
+        let pid = manager.allocation_pid(alloc().id).expect("pid");
+
+        let stops = manager.take_tasks_for_shutdown();
+        assert_eq!(
+            stops
+                .iter()
+                .map(ShutdownStop::allocation_id)
+                .collect::<Vec<_>>(),
+            vec![alloc().id]
+        );
+        for stop in stops {
+            stop.run(std::time::Instant::now() + Duration::from_secs(10));
+        }
+        assert!(!pid_is_running(pid), "the task is gone");
+        assert!(stopped.exists(), "it got its stop signal before any kill");
+
+        // The record stays, so a restart knows the allocation, finds its
+        // process gone, and leaves it for the manager to run again.
+        let persisted = WorkerStateStore::new(temp_dir.path().join("worker_state.json")).load()?;
+        assert_eq!(persisted.len(), 1);
+        let mut restarted = manager_in(&temp_dir);
+        assert!(restarted.restore_allocations()?.is_empty());
         Ok(())
     }
 

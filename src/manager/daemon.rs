@@ -723,23 +723,29 @@ pub async fn run_manager_with(
         } else {
             None
         };
-    let worker_fut = async move {
-        if run_worker {
+    // Its own task rather than one of the background loops: it stops on the
+    // same signal the manager does (stopping its tasks first on macOS), and
+    // the shutdown below waits for that instead of aborting it mid-stop.
+    let worker_task = run_worker.then(|| {
+        tokio::spawn(async move {
             info!(%manager_addr, "Starting in-process worker");
-            run_worker_local(
+            let result = run_worker_local(
                 crate::worker::daemon::WorkerJoin {
                     manager_addr,
                     worker_type: "default".to_string(),
                     join_secret: local_worker_join_secret,
                     ca_pin: local_worker_ca_pin,
                     advertise_addr: local_worker_advertise,
+                    in_process: true,
                 },
                 None,
             )
-            .await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    };
+            .await;
+            if let Err(err) = result {
+                error!(error = ?err, "In-process worker exited");
+            }
+        })
+    });
     let rotation_fut = async move {
         if let Some(state) = workload_identity_state {
             start_workload_identity_rotation(store_for_rotation, state).await?;
@@ -750,11 +756,10 @@ pub async fn run_manager_with(
     // The background loops run as one task the daemon can abort: without an
     // API and raft transport they must not keep acting on the cluster.
     let background = tokio::spawn(async move {
-        let (checker, evals, concurrency, worker, rotation, keyring) = join!(
+        let (checker, evals, concurrency, rotation, keyring) = join!(
             node_checker_fut,
             eval_loop_fut,
             concurrency_fut,
-            worker_fut,
             rotation_fut,
             keyring_fut
         );
@@ -762,7 +767,6 @@ pub async fn run_manager_with(
             ("node status checker", checker),
             ("eval loop", evals),
             ("adaptive scheduler concurrency", concurrency),
-            ("in-process worker", worker),
             ("workload identity rotation", rotation),
             ("keyring maintenance", keyring),
         ] {
@@ -780,6 +784,9 @@ pub async fn run_manager_with(
     let signal = tokio::select! {
         serve_result = &mut start_server_fut => {
             background.abort();
+            if let Some(worker) = &worker_task {
+                worker.abort();
+            }
             let err = manager_server_exit_error(&addr, serve_result);
             shutdown_persistence(&store_for_shutdown).await;
             return Err(err);
@@ -805,6 +812,26 @@ pub async fn run_manager_with(
             warn!(signal = second, "Second shutdown signal; exiting now");
             background.abort();
             return Ok(());
+        }
+    }
+    // The in-process worker heard the same signal and is stopping too. Wait
+    // for it, so the process does not exit under its session checkpoints or
+    // (on macOS) the task stops. A second signal still exits at once.
+    if let Some(worker) = worker_task {
+        tokio::select! {
+            stopped = tokio::time::timeout(IN_PROCESS_WORKER_STOP_TIMEOUT, worker) => {
+                if stopped.is_err() {
+                    warn!(
+                        timeout_secs = IN_PROCESS_WORKER_STOP_TIMEOUT.as_secs(),
+                        "In-process worker did not stop in time; exiting anyway"
+                    );
+                }
+            }
+            second = shutdown_signal() => {
+                warn!(signal = second, "Second shutdown signal; exiting now");
+                background.abort();
+                return Ok(());
+            }
         }
     }
     // Leader-only loops stop before the store does, so nothing proposes
@@ -850,6 +877,12 @@ fn in_process_worker_advertise_host(
 /// How long a graceful shutdown waits for in-flight RPCs and open streams
 /// (event streams, worker connections) once the listener stops accepting.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a graceful shutdown waits for the in-process worker
+/// (`--run-worker`) to stop: its session checkpoints
+/// (`edgeBoot.stopCheckpointTimeout`, 60s by default) plus, on macOS, its
+/// task stops (30s).
+const IN_PROCESS_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Budget for the persistence backend's orderly stop: the final streaming
 /// replica sync plus lease release, or the raft lane shutdown. Drain plus

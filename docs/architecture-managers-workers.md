@@ -289,6 +289,15 @@ systemd's `LoadCredential=join-token:/etc/legion/join-token` with
 `--token-file ${CREDENTIALS_DIRECTORY}/join-token` works too, and keeps the
 file out of the unit's own filesystem view.
 
+The in-process worker of `legion start manager --run-worker` shares the
+manager's process, so it stops when the manager does and the manager waits
+for it (session checkpoints first) before exiting. On Linux its tasks
+outlive it and the next start re-adopts them, the same as a standalone
+worker. On macOS it stops every task before the process exits, so its Apple
+containers do not keep running after the cluster has gone. The next start
+runs them again under the same allocations. See
+[Stopping a single-process cluster](task-runtime-container.md#stopping-a-single-process-cluster-macos).
+
 A restarted worker re-registers with the node token it persisted, not the
 join token's secret, so revoking the join token after the first
 registration does not strand the node. The worker still reads the join

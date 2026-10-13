@@ -227,6 +227,11 @@ pub struct WorkerJoin {
     pub ca_pin: Option<String>,
     /// `--advertise-addr`: the host (or `host:port`) managers dial.
     pub advertise_addr: Option<String>,
+    /// Set for the in-process worker (`legion start manager --run-worker`).
+    /// It shares its process with the manager, so on a shutdown signal it
+    /// stops and returns rather than exiting the process under the
+    /// manager's own drain.
+    pub in_process: bool,
 }
 
 #[instrument(err, skip_all)]
@@ -244,6 +249,7 @@ pub async fn run_worker(
             join_secret: Some(join_token.secret),
             ca_pin: Some(join_token.ca_hash),
             advertise_addr: advertise_addr.map(str::to_string),
+            in_process: false,
         },
         name_override,
     )
@@ -277,6 +283,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         join_secret,
         ca_pin,
         advertise_addr,
+        in_process,
     } = join;
     let server_port = worker_server_port();
     let bind = crate::worker::plane::bind_address(server_port)?;
@@ -858,7 +865,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             )
         } => {}
         signal = worker_shutdown_signal() => {
-            stop_worker_daemon(shutdown_task_manager, signal, stop_checkpoint_timeout).await;
+            stop_worker_daemon(
+                shutdown_task_manager,
+                signal,
+                stop_checkpoint_timeout,
+                WorkerExit::for_worker(in_process),
+            )
+            .await;
         }
     }
 
@@ -1048,10 +1061,78 @@ async fn worker_shutdown_signal() -> &'static str {
 /// and exit. Workloads keep running, as on any worker stop: a restarted
 /// worker re-adopts them, and restores from these checkpoints only the
 /// sessions whose process died meanwhile.
+/// What a stopping worker does with its tasks and its process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerExit {
+    /// Stop every task before returning. Only the in-process worker on
+    /// macOS does: there the cluster is one process in a developer's
+    /// terminal, and its Apple containers (each a VM) would otherwise keep
+    /// running after it stops. Everywhere else tasks outlive the worker and
+    /// the next start re-adopts them.
+    stop_tasks: bool,
+    /// Exit the process once stopped. False for the in-process worker,
+    /// whose manager finishes its own drain and exits.
+    exit_process: bool,
+}
+
+impl WorkerExit {
+    fn for_worker(in_process: bool) -> Self {
+        Self {
+            stop_tasks: in_process && cfg!(target_os = "macos"),
+            exit_process: !in_process,
+        }
+    }
+}
+
+/// Budget for stopping every task at an in-process worker's shutdown. Each
+/// task gets its own `stop.killAfter` inside it, then a hard teardown.
+const SHUTDOWN_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stop every task the worker runs, all at once, each on a blocking thread
+/// ([`crate::worker::task_manager::ShutdownStop::run`]).
+async fn stop_tasks_for_shutdown(task_manager: &Arc<Mutex<WorkerTaskManager>>) {
+    let stops = task_manager
+        .lock()
+        .expect("task manager")
+        .take_tasks_for_shutdown();
+    if stops.is_empty() {
+        return;
+    }
+    info!(
+        tasks = stops.len(),
+        "Stopping this node's tasks before exiting"
+    );
+    let deadline = std::time::Instant::now() + SHUTDOWN_TASK_STOP_TIMEOUT;
+    let handles: Vec<_> = stops
+        .into_iter()
+        .map(|stop| {
+            let allocation_id = stop.allocation_id();
+            (
+                allocation_id,
+                tokio::task::spawn_blocking(move || stop.run(deadline)),
+            )
+        })
+        .collect();
+    // The hard teardown after the deadline has its own CLI deadlines, so
+    // allow it a little past the stop budget.
+    let all = futures::future::join_all(handles.into_iter().map(|(id, handle)| async move {
+        if let Err(err) = handle.await {
+            warn!(allocation_id = id, error = %err, "Task stop at shutdown panicked");
+        }
+    }));
+    if tokio::time::timeout(SHUTDOWN_TASK_STOP_TIMEOUT + Duration::from_secs(30), all)
+        .await
+        .is_err()
+    {
+        warn!("Some tasks did not stop in time; exiting anyway");
+    }
+}
+
 async fn stop_worker_daemon(
     task_manager: Arc<Mutex<WorkerTaskManager>>,
     signal: &'static str,
     timeout: Duration,
+    exit: WorkerExit,
 ) {
     info!(signal, "Worker stopping");
     let deadline = std::time::Instant::now() + timeout;
@@ -1077,7 +1158,13 @@ async fn stop_worker_daemon(
         Ok(_) => {}
         Err(_) => warn!("Stop checkpoints did not finish in time; exiting anyway"),
     }
-    std::process::exit(0);
+    if exit.stop_tasks {
+        stop_tasks_for_shutdown(&task_manager).await;
+    }
+    if exit.exit_process {
+        std::process::exit(0);
+    }
+    info!("In-process worker stopped");
 }
 
 /// The worker type's `exec` block, from the security payload.
@@ -4417,6 +4504,27 @@ mod tests {
         // exact shape of a manager partition.
         let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
         ManagerClient::new(channel)
+    }
+
+    /// Only the in-process worker stays in its process at shutdown, and only
+    /// on macOS does it stop its tasks: a standalone worker exits and leaves
+    /// its tasks for the next start to re-adopt.
+    #[test]
+    fn only_the_in_process_worker_on_macos_stops_its_tasks_at_shutdown() {
+        assert_eq!(
+            WorkerExit::for_worker(false),
+            WorkerExit {
+                stop_tasks: false,
+                exit_process: true,
+            }
+        );
+        assert_eq!(
+            WorkerExit::for_worker(true),
+            WorkerExit {
+                stop_tasks: cfg!(target_os = "macos"),
+                exit_process: false,
+            }
+        );
     }
 
     /// A heartbeat whose `onChange = "update"` file content moved rewrites
