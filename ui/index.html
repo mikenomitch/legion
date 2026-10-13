@@ -7,6 +7,18 @@
     <meta name="theme-color" content="#f7f6f3" media="(prefers-color-scheme: light)" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Legion</title>
+    <script>
+      // Apply the saved appearance before first paint, so a reload never
+      // flashes the default theme or the wrong mode. Mirrors applyToDocument
+      // in src/appearance/store.ts; the app re-applies (and sanitizes) the
+      // choice once it loads.
+      try {
+        var a = JSON.parse(localStorage.getItem('legion-appearance') || '{}') || {}
+        var root = document.documentElement
+        if (a.mode === 'dark' || (a.mode !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches)) root.classList.add('dark')
+        if (typeof a.theme === 'string' && /^[a-z-]+$/.test(a.theme) && a.theme !== 'command-post') root.setAttribute('data-theme', a.theme)
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

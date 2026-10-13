@@ -26,7 +26,9 @@ accent, dark-first with a full light theme) lives in a few central places:
   `--c-brass`, …) mapped into Tailwind color names in
   `ui/tailwind.config.js` (`bg-surface`, `text-muted`, `border-line`,
   `text-brass`, …). Light and dark themes switch by swapping variables on
-  `.dark`. Pages never write `dark:` variants for theme colors.
+  `.dark`, and the color themes in the appearance picker swap the same
+  variables on `data-theme` (see [Appearance](#appearance)). Pages never write
+  `dark:` variants for theme colors.
 - **Primitives**: `ui/src/components/ui.tsx` exports the shared components
   every page builds on: `Icon`, `Badge`/`StatusBadge`/`MonoBadge`,
   `Card`/`SectionCard`/`PageHeader`/`StatCard`, `Tabs`, `Note`,
@@ -44,6 +46,61 @@ accent, dark-first with a full light theme) lives in a few central places:
 - **Favicon and tab title**: `ui/public/favicon.svg` is the brand mark.
   `document.title` reads innermost-first (`web · api · Jobs · Legion`), so
   you can tell open tabs apart by their first word.
+
+## Appearance
+
+The palette icon in the top bar, or **Appearance** in ⌘K, opens the appearance
+picker. It has two controls, and every change applies as you click:
+
+- **Mode**: Light, Dark, or System. System, the default, follows the
+  operating system and switches when it does. The sun/moon button in the top
+  bar flips between Light and Dark and leaves the theme alone.
+- **Theme**: one of five color themes. Each tile previews the theme in the
+  current mode.
+
+| Theme | Light | Dark |
+| --- | --- | --- |
+| Command Post (default) | Warm stone, brass accent | Near-black stone, gold accent |
+| Forge | Steel-grey paper, burnt orange | Charcoal, molten orange |
+| Nord | Snow-storm greys, frost blue | Polar-night slate, frost |
+| Sage | Pale green, forest accent | Dark moss, leaf green |
+| Porcelain | Cool white, indigo | Deep ink blue, periwinkle |
+
+Themes change colors only. Typefaces, spacing, corner radii, the status
+colors (green, amber, red, blue) and the exec terminal look the same in every
+theme. Every theme but Command Post holds body text to 7:1 contrast and
+secondary text, links and button labels to 4.5:1 in both modes; Command
+Post's values are the original ones, and its lightest secondary text sits
+just under 4.5:1 in light mode.
+
+**Where the choice lives.** The choice is saved in the browser, not on the
+manager, so it follows neither your token nor you to another browser:
+
+```
+localStorage['legion-appearance'] = {"theme":"nord","mode":"dark"}
+<html class="dark" data-theme="nord">
+```
+
+The defaults (Command Post, System) are never written, and **Reset to
+defaults** removes the key. A stored value this build does not recognise,
+such as a removed theme, falls back to the default. If site data is blocked,
+the choice still applies until the page is reloaded. Other open tabs follow a
+change.
+
+**No flash on reload.** An inline script in `ui/index.html` reads the key and
+sets the class and attribute before the page paints; `ui/src/appearance/store.ts`
+re-applies and sanitizes the choice once the app loads. The two must agree;
+the store's header comment says so.
+
+**Adding a theme.** Add a light block (`[data-theme='id']`) and a dark block
+(`.dark[data-theme='id'], .dark [data-theme='id']`) of the ten `--c-*`
+tokens to `ui/src/appearance/themes.css`, and an entry to `THEMES` in
+`ui/src/appearance/themes.ts`. The blocks match any element, which is how
+the picker paints each swatch in its own theme.
+
+The light/dark toggle before this picker stored its choice under
+`ui-theme`. That key is no longer read, so a browser that had pinned a mode
+starts on System once.
 
 ## Entry Points
 
@@ -76,7 +133,8 @@ Routes in `App.tsx`:
 - anything else renders a not-found card naming the path
 
 A shared layout provides the grouped sidebar nav, a slim topbar
-(breadcrumbs, ⌘K search, the shortcut sheet, theme toggle), and page headers
+(breadcrumbs, ⌘K search, the shortcut sheet, the light/dark toggle, the
+appearance picker), and page headers
 for top-level routes. Detail pages render their own `PageHeader`. The sidebar
 footer shows the current identity (principal and source, or "ACLs off" / "Not
 logged in") with a link to Access. It also shows the manager address with a
@@ -95,7 +153,7 @@ setting or mode to turn on. Press `?` anywhere for a sheet that lists it all.
 
 | Keys | What it does |
 | --- | --- |
-| `⌘K` / `Ctrl+K` | Command palette: recent pages, every page, every row of the index you are on, and actions (theme, shortcuts) |
+| `⌘K` / `Ctrl+K` | Command palette: recent pages, every page, every row of the index you are on, and actions (light/dark, Appearance, shortcuts) |
 | `?` | The keyboard shortcut sheet |
 | `j` / `k`, `↑` / `↓` | Move the selection down/up the current index |
 | `o` / `Enter` | Open the selected row |

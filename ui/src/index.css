@@ -11,7 +11,10 @@
  * of these RGB triplets, so light/dark stay consistent across the whole app.
  *
  * The palette is "command post": warm stone neutrals, a brass accent for the
- * standard, and restrained semantic colors for status.
+ * standard, and restrained semantic colors for status. It is the default
+ * theme; the others the appearance picker offers live in
+ * src/appearance/themes.css, which repeats these values under
+ * [data-theme='command-post'] for the picker's swatch. Change both together.
  */
 :root {
   --c-canvas: 247 246 243;
